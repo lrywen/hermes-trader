@@ -113,7 +113,9 @@ def producer_daemon(
     # Install signal handlers
     _install_shutdown_handlers(stop_event)
 
-    # Install tick timeout alarm (only main thread can do this)
+    # Install SIGALRM handler once (only the main thread can do this).
+    # The alarm is armed/disarmed *per tick* inside the loop so each scan_fn
+    # call has independent timeout protection.
     has_alarm = _arm_tick_alarm(tick_timeout)
 
     tick_count = 0
@@ -141,7 +143,7 @@ def producer_daemon(
                 with scanner_lock(name, timeout=10.0):
                     try:
                         if has_alarm:
-                            _disarm_tick_alarm()  # reset before starting
+                            _arm_tick_alarm(tick_timeout)  # arm per tick
 
                         scan_fn()
                         status = "ok"
@@ -154,6 +156,11 @@ def producer_daemon(
                         status = "error"
                         tick_error = str(e)
                         error_count += 1
+                    finally:
+                        # Always disarm at the end of a tick so the alarm
+                        # never fires into the sleep / next tick.
+                        if has_alarm:
+                            _disarm_tick_alarm()
 
             except TimeoutError:
                 status = "locked"

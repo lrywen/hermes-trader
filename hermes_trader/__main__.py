@@ -320,7 +320,7 @@ def cmd_start():
     """Start autonomous scanning loop in background."""
     import subprocess
 
-    pid_file = os.path.expanduser("~/.hermes.pid")
+    from hermes_trader import PID_FILE as pid_file
     if os.path.exists(pid_file):
         old_pid = open(pid_file).read().strip()
         try:
@@ -346,7 +346,7 @@ def cmd_start():
 
 def cmd_stop():
     """Stop autonomous scanning loop."""
-    pid_file = os.path.expanduser("~/.hermes.pid")
+    from hermes_trader import PID_FILE as pid_file
     if not os.path.exists(pid_file):
         print("  Scanner not running.\n")
         return

@@ -79,7 +79,7 @@ async def _append_session_log(entry: Dict[str, Any]) -> None:
 
 # ── PID file helpers (start/stop) ──────────────────────────────────────────────
 
-PID_FILE = os.path.expanduser("~/.hermes-trader.pid")
+from hermes_trader import PID_FILE
 
 
 def _is_alive(pid: int) -> bool:

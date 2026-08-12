@@ -6,6 +6,11 @@ import certifi
 
 __version__ = "0.3.0"
 
+# Shared PID file path — used by both the CLI (__main__.py) and the
+# web dashboard (server.py) so /api/agent/start|stop can manage the
+# scanner process regardless of which interface started it.
+PID_FILE = os.path.expanduser("~/.hermes.pid")
+
 # Fix SSL cert verification on macOS (system Python lacks cacert.pem)
 if not os.environ.get("NO_SSL_FIX"):
     os.environ["REQUESTS_CA_BUNDLE"] = certifi.where()
