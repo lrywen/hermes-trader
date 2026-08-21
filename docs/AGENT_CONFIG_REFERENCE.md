@@ -129,9 +129,31 @@
 | `composite_force_execute` | **false** | 复合分强制升级 |
 | `ta_sidestep_force_execute` | **true** | TA 旁路强制升级 |
 | `force_execute_slow_burn_count` | **2** | slow-burn 触发数量门槛 |
-| `ta_sidestep_min_slow_burn_count` | **99** | TA 旁路 slow-burn 数量门槛 |
+| `ta_sidestep_min_slow_burn_count` | **2** | TA 旁路 slow-burn 数量门槛（**硬门槛**，见下） |
 | `breakout_force_execute` | **false** | 突破强制升级（O'Neil） |
 | `whale_force_execute` | **false** | 鲸鱼信号强制升级 |
+
+### 3.1 `ta_sidestep_strong` 的 AND 语义（2026-08-21 收紧）
+
+`executor.py` 的 `ta_sidestep_strong` 曾把三个条件用 `or` 连接，任意一条成立就触发升级，
+`ta_sidestep_min_slow_burn_count` 因此成为**死配置**——实盘 2026-08-20 的 5 次 override
+全部是 `slow_burn_count=1` 对 `min=2`，靠单条 `momentum_burst_fired` 通过。
+
+现行语义（与相邻的 `breakout_strong` 结构一致）：
+
+```
+ta_sidestep_strong =
+      ta_sidestep_force_execute
+  AND slow_burn_count >= ta_sidestep_min_slow_burn_count      ← 硬门槛，不可绕过
+  AND ( composite_score >= force_execute_composite
+        OR momentum_burst_fired )                             ← 确认信号，二选一
+```
+
+即：**积累基础是必要条件，动能确认二选一**。调 `ta_sidestep_min_slow_burn_count`
+现在会真实改变行为——设 `99` 等于彻底关闭该通道，设 `1` 只要求一根 slow-burn。
+
+`route_verdict` 里的 `sidestep_hint` 必须与此保持 lockstep：hint 更宽松只会把候选路由到
+executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 
 ---
 
@@ -161,8 +183,8 @@
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `allow_shorts` | **false** | 禁止做空 |
-| `bypass_sidestep_overrides` | **true** | 旁路 TA 覆盖 |
-| `min_confidence` | **0.7** | 最低置信度 |
+| `bypass_sidestep_overrides` | **false** | 是否让 sidestep override 绕过本闸门（`AND` 语义，仅对 `sidestep_override=true` 的候选生效） |
+| `min_confidence` | **0.7** | 最低置信度。structural override 会把 `confidence` 抬到 `min_ai_confidence`，本闸门判的是抬升前的 `ai_confidence_raw`（无该字段时回退 `confidence`） |
 | `min_composite` | **30** | 最低复合分 |
 | `min_hip3_composite` | **50** | HIP-3 最低复合分 |
 | `min_short_confidence` | **0.72** | 做空最低置信度 |

@@ -1121,7 +1121,7 @@ def test_mcp_stub_table_and_tool_coverage():
     # Each stubbed tool returns an explicit `not_implemented` error so LLM
     # callers don't silently consume placeholder data.
     assert len(mod._STUB_TOOL_NAMES) == 48
-    assert len({t["name"] for t in mod.TOOLS}) == 100
+    assert len({t["name"] for t in mod.TOOLS}) == 101
     handler = mod._make_stub_handler("get_rewards")
     res = json.loads(handler({}))
     assert res["error"] == "not_implemented"
@@ -1142,7 +1142,7 @@ def test_mcp_server_stdio_end_to_end():
     resps = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
     assert len(resps) == 3, proc.stderr
     assert resps[0]["result"]["serverInfo"]["name"] == "hermes-trader"
-    assert len(resps[1]["result"]["tools"]) == 100
+    assert len(resps[1]["result"]["tools"]) == 101
     call = json.loads(resps[2]["result"]["content"][0]["text"])
     assert call["error"] == "not_implemented"
     assert call["tool"] == "get_rewards"
@@ -1154,7 +1154,7 @@ def test_fetch_account_state_aggregates_hip3_dexes(monkeypatch):
     concatenates positions, and prefixes bare HIP-3 coins with the dex name."""
     from hermes_trader.client import hl_client
 
-    def _fake_http_post(path, payload):
+    def _fake_http_post(path, payload, **kwargs):
         kind = payload.get("type")
         if kind == "clearinghouseState" and "dex" not in payload:
             return {
@@ -1205,7 +1205,7 @@ def test_fetch_account_state_main_only_default(monkeypatch):
     free-margin calculations don't bleed in idle HIP-3 USDC."""
     from hermes_trader.client import hl_client
 
-    def _fake_http_post(path, payload):
+    def _fake_http_post(path, payload, **kwargs):
         if payload.get("type") == "clearinghouseState":
             assert "dex" not in payload  # must NOT query HIP-3 dexes
             return {
@@ -1481,7 +1481,7 @@ def test_whale_scan_bypass_surfaces_subgate_accumulation(monkeypatch):
     # Flat candles → no momentum/breakout/trend triggers fire → score below gate.
     flat = [Candle(t=i, o=100.0, h=100.0, l=100.0, c=100.0, v=10.0) for i in range(120)]
     monkeypatch.setattr(perception, "_fetch_candles_sync",
-                        lambda coin, interval, count, ttl: flat)
+                        lambda coin, interval, count, ttl, **kwargs: flat)
     market = {"coin": "TRX", "type": "perp", "dex": None}
     whale_signals = {"TRX": {"signal": "oi_funding_anomaly", "score": 0.8}}
 
@@ -1656,6 +1656,51 @@ def test_executor_structural_override_promotes_pass_to_long(monkeypatch):
     # executor doesn't directly gate on verdict; it relies on side). With
     # equity=0 it'll hit the same gate. We're just verifying no crash.
     assert isinstance(res2, dict)
+
+
+def test_runner_gate_judges_override_on_raw_confidence_not_floored():
+    """结构性 override 把 confidence 抬到 min_ai_confidence 后，闸门必须仍看原始值。
+
+    否则 min_ai_confidence == min_confidence 时 max(floor, raw) 恒等于门槛，
+    置信度这道闸门对所有 override 候选都形同虚设（实盘 CASHCAT conf=0.40 成交）。
+    """
+    from hermes_trader.agents import executor
+
+    analysis = {
+        "coin": "CASHCAT",
+        "side": "long",
+        "confidence": 0.70,          # 已被 _conf_floor 抬高后的值
+        "ai_confidence_raw": 0.40,   # 模型真实置信度
+        "composite_score": 44.1,
+        "volume_spike_fired": True,
+        "momentum_burst_fired": True,
+        "slow_burn_count": 1,
+    }
+    cfg = {"runner_entry_gate": {"enabled": True, "min_confidence": 0.70,
+                                 "min_composite": 30, "min_hip3_composite": 50}}
+
+    reason = executor._runner_entry_block_reason(analysis, cfg)
+
+    assert "confidence 0.40 < 0.70" in reason
+
+
+def test_runner_gate_uses_confidence_when_no_raw_field():
+    """非 override 候选没有 ai_confidence_raw，必须回退到 confidence 本身。"""
+    from hermes_trader.agents import executor
+
+    analysis = {
+        "coin": "BOME",
+        "side": "long",
+        "confidence": 0.75,
+        "composite_score": 44.0,
+        "volume_spike_fired": True,
+        "breakout_fired": True,
+        "slow_burn_count": 1,
+    }
+    cfg = {"runner_entry_gate": {"enabled": True, "min_confidence": 0.70,
+                                 "min_composite": 30, "min_hip3_composite": 50}}
+
+    assert executor._runner_entry_block_reason(analysis, cfg) == ""
 
 
 def test_regime_gate_bypasses_on_slow_burn():
@@ -1861,7 +1906,7 @@ def test_maybe_execute_refuses_when_no_atr(monkeypatch):
     monkeypatch.setattr(executor, "set_leverage", lambda c, lev: {"ok": True})
     # gates pass
     monkeypatch.setattr(executor, "eval_all_gates",
-                        lambda ctx, cfg, lt: {"blocked": False, "results": {}})
+                        lambda ctx, cfg, lt, **kwargs: {"blocked": False, "results": {}})
     # the coin under test: no candle history → ATR 0
     monkeypatch.setattr(executor, "get_hl_atr", lambda *a, **k: 0.0)
     placed = {"n": 0}
@@ -2036,7 +2081,7 @@ def test_route_verdict_pass_with_ta_sidestep_hint_routes_to_executor(monkeypatch
     calls = {}
     r = executor.route_verdict(
         {"verdict": "PASS", "coin": "PURR", "slow_burn_count": 1,
-         "composite_score": 0.0},
+         "momentum_burst_fired": True, "composite_score": 0.0},
         execute_fn=lambda a: calls.setdefault("e", a) or {"executed": True},
         close_fn=lambda c: calls.setdefault("c", c),
     )
@@ -2056,6 +2101,29 @@ def test_route_verdict_ta_sidestep_respects_min_slow_burn(monkeypatch):
     r = executor.route_verdict(
         {"verdict": "PASS", "coin": "PURR", "slow_burn_count": 1,
          "composite_score": 0.0},
+        execute_fn=lambda a: calls.setdefault("e", a) or {"executed": True},
+        close_fn=lambda c: calls.setdefault("c", c),
+    )
+    assert r["action"] == "none"
+    assert not calls
+
+
+def test_route_verdict_ta_sidestep_min_slow_burn_not_bypassed_by_burst(monkeypatch):
+    """momentum_burst 单条不得绕过 ta_sidestep_min_slow_burn_count。
+
+    三个条件曾用 or 连接，一条 momentum_burst_fired 就满足整个子句，
+    slow-burn 门槛成了死配置（实盘 2026-08-20 五次 override 全是 slow=1 对 min=2）。
+    """
+    from hermes_trader.agents import executor
+    monkeypatch.setattr(executor, "read_agent_config", lambda: {
+        "ta_sidestep_force_execute": True,
+        "ta_sidestep_min_slow_burn_count": 2,
+        "force_execute_composite": 30,
+    })
+    calls = {}
+    r = executor.route_verdict(
+        {"verdict": "PASS", "coin": "CASHCAT", "slow_burn_count": 1,
+         "momentum_burst_fired": True, "composite_score": 44.1},
         execute_fn=lambda a: calls.setdefault("e", a) or {"executed": True},
         close_fn=lambda c: calls.setdefault("c", c),
     )
@@ -2116,6 +2184,7 @@ def test_maybe_execute_ta_sidestep_can_bypass_runner_gate(monkeypatch):
         "verdict": "PASS",
         "confidence": 0.30,
         "composite_score": 0.0,
+        "momentum_burst_fired": True,
         "slow_burn_count": 1,
     })
 
@@ -2269,6 +2338,7 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
         "dsl_exit": {"max_loss_pct": 2.0, "max_loss_roe_pct": 30.0,
                      "protect_pct": 0.5, "retrace_threshold": 0.3,
                      "hard_timeout_minutes": 180.0},
+        "debate_gate": {"enabled": False},
     }
     cfg.update(cfg_overrides or {})
     state = {"equity": 1000.0, "available": 500.0, "total_ntl": 0.0,

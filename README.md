@@ -234,12 +234,12 @@ both resolve (`max_trade_notional_usd` ≡ `maxTradeNotionalUsd`).
     "sizing_basis": "primary_stop"
   },
   "ta_sidestep_force_execute": true,
-  "ta_sidestep_min_slow_burn_count": 99,
+  "ta_sidestep_min_slow_burn_count": 2,
   "force_execute_composite": 30,
   "runner_entry_gate": {
     "enabled": true,
     "allow_shorts": false,
-    "bypass_sidestep_overrides": true,
+    "bypass_sidestep_overrides": false,
     "min_confidence": 0.7,
     "min_composite": 30.0,
     "min_hip3_composite": 50.0
@@ -303,9 +303,21 @@ defaults for missing keys; keep the tracked `.agent-config.json` explicit.
 - **`force_execute_composite` / `composite_force_execute` / `breakout_force_execute`
   / `whale_force_execute` / `ta_sidestep_force_execute`** — structural-override
   gates that can upgrade an AI PASS to a trade on strong TA/whale signals. Current
-  live keeps the broad composite override disabled, keeps sidestep modeling enabled
-  with `ta_sidestep_min_slow_burn_count=99`, and lets the runner gate bypass that
-  sidestep suppression for high-quality runner entries.
+  live keeps the broad composite override disabled and keeps the sidestep path
+  enabled with `ta_sidestep_min_slow_burn_count=2`. That count is a **hard floor**,
+  not one of several interchangeable alternatives:
+  `ta_sidestep_strong = force_execute AND slow_burn_count >= min AND (composite >= bar OR momentum_burst)`
+  — an accumulation base is required, and momentum confirmation is the either/or
+  part. It was an `OR` until 2026-08-21, which made the count dead config (live
+  2026-08-20: 5/5 overrides fired at `slow_burn_count=1` against `min=2` on a lone
+  `momentum_burst`). The router's `sidestep_hint` mirrors this expression and must
+  stay in lockstep — a looser hint only routes candidates the executor will refuse.
+- **`runner_entry_gate.min_confidence`** judges a structural override on
+  `ai_confidence_raw` (the model's pre-floor conviction), not on the value that the
+  override's `min_ai_confidence` floor rewrote. With `min_ai_confidence ==
+  min_confidence` the floored number cleared this bar by construction, so the
+  confidence gate was a no-op for every override. Plain candidates carry no such
+  field and fall back to `confidence` unchanged.
 
 Trigger internals (weights, sigma thresholds, candle interval) live separately in
 `hermes_trader/agents/config.py` — edit there to tune the scan itself.

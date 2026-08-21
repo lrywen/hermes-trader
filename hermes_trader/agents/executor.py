@@ -31,6 +31,7 @@ from hermes_trader.client.exchange import (
     get_hl_atr,
     get_hl_price,
     get_max_leverage,
+    get_orderbook_spread,
     min_entry_notional_usd,
     place_hl_order,
     place_hl_trigger_order,
@@ -49,6 +50,10 @@ logger = logging.getLogger(__name__)
 # but tight enough to cap the gap-throughs that were the asymmetry killer). Config-tunable.
 _DEFAULT_SL_ATR_MULT = 1.5
 TP_ATR_MULT = 1.0
+
+# Pending SL retry queue — positions whose server-side SL failed twice
+# and need aggressive retry at sub-60s intervals.
+_pending_sl_retries: Dict[str, Dict[str, Any]] = {}
 
 # Static fallback 24h volumes, used ONLY when the live universe lookup fails.
 # WIRING FIX 2026-06-11: these constants used to be the ONLY volume source for
@@ -225,6 +230,55 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         except Exception as _sh_e:
             logger.debug(f"[shadow-signals] dispatch failed (non-fatal): {_sh_e}")
 
+    # AI zero-confidence guard.
+    #
+    # confidence=0 can mean two very different things:
+    #   (1) AI is DOWN (empty response → ai_down=True), OR the response was
+    #       unparseable prose with no extractable verdict at all (neither the
+    #       JSON block nor the NLP fallback produced one).
+    #       In both cases this PASS is an error code, not an opinion — block.
+    #   (2) AI returned a valid but low-conviction opinion — either structured
+    #       JSON ({"verdict":"PASS","confidence":0}) or prose that NLP extracted
+    #       (HTA "neutral, low confidence"). This is a real verdict; structural
+    #       override below should be allowed to upgrade strong momentum setups.
+    #
+    # We only block case (1). Case (2) flows through so the override logic and
+    # confidence gates can make an informed decision.
+    _ai_conf = float(analysis.get("confidence", 0) or 0)
+    _verdict_raw = (analysis.get("verdict") or "").upper()
+    _ai_down_flag = bool(analysis.get("ai_down", False))
+    _nlp_parsed_flag = bool(analysis.get("nlp_parsed", False))
+    _json_parsed_flag = bool(analysis.get("json_parsed", False))
+    # Records written before these flags existed (and hand-built analysis dicts)
+    # carry neither. Absence is not evidence of a parse failure, so fail OPEN
+    # there and let the downstream gates judge — blocking on a missing key would
+    # silently kill every legacy record.
+    _parse_flags_present = ("json_parsed" in analysis) or ("nlp_parsed" in analysis)
+    _unparseable = _parse_flags_present and not (_json_parsed_flag or _nlp_parsed_flag)
+    if _ai_conf <= 0 and _verdict_raw in ("PASS", "LONG", "SHORT"):
+        # Genuine failure: empty response OR text that yielded no verdict.
+        #
+        # ai_down + PASS is deliberately NOT blocked here: the dedicated
+        # override_blocked_ai_down branch below owns that case and reports a
+        # more specific reason (and honours override_requires_ai=false). We
+        # only pre-empt it for a directional verdict, which has no such branch.
+        _defer_to_ai_down_branch = _ai_down_flag and _verdict_raw == "PASS"
+        if (_ai_down_flag or _unparseable) and not _defer_to_ai_down_branch:
+            _why = "ai_down (empty/failed response)" if _ai_down_flag \
+                else "unparseable response (no JSON, no NLP verdict)"
+            logger.warning(
+                f"[executor] SKIP {analysis.get('coin')}: AI confidence=0 "
+                f"({_why}; verdict={_verdict_raw}, "
+                f"entry={analysis.get('entry')}, stop={analysis.get('stop')}, "
+                f"tp={analysis.get('tp')})) — not executing with default params"
+            )
+            return {
+                "executed": False, "mode": mode,
+                "analysis_id": analysis["id"],
+                "reason": f"ai_zero_confidence ({_why})",
+            }
+        # else: NLP extracted a real (low-conviction) opinion — fall through.
+
     # Structural-override: don't let a hedging AI PASS leave an objectively
     # strong accumulation setup on the table. Upgrade to LONG conf 0.70 and
     # let the gates do the real risk check. Two independent triggers, both
@@ -298,13 +352,20 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         bool(config.get("composite_force_execute", False))
         and float(analysis.get("composite_score", 0) or 0) >= override_composite
     )
+    # TA sidestep. The slow-burn count is a HARD floor, not one of three
+    # interchangeable alternatives: when these were OR'd, a lone
+    # momentum_burst_fired satisfied the whole clause and
+    # ta_sidestep_min_slow_burn_count was dead config (live 2026-08-20: 5/5
+    # overrides fired at slow_burn_count=1 against min=2). Require the
+    # accumulation base AND at least one confirmation, mirroring
+    # breakout_strong's shape.
     ta_sidestep_strong = (
         bool(config.get("ta_sidestep_force_execute", False))
+        and int(analysis.get("slow_burn_count", 0) or 0) >=
+        int(config.get("ta_sidestep_min_slow_burn_count", 1) or 1)
         and (
             float(analysis.get("composite_score", 0) or 0) >= override_composite
             or bool(analysis.get("momentum_burst_fired"))
-            or int(analysis.get("slow_burn_count", 0) or 0) >=
-            int(config.get("ta_sidestep_min_slow_burn_count", 1) or 1)
         )
     )
     override_strong = (
@@ -368,14 +429,66 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         # is raised. Otherwise raising min_ai_confidence would silently kill the
         # whale overrides — empirically the one flat-positive bucket.
         _conf_floor = float(config.get("min_ai_confidence", 0.70))
+        _ai_conf_raw = float(analysis.get("confidence", 0) or 0)
+        _ai_down = bool(analysis.get("ai_down", False))
+        _nlp_parsed = bool(analysis.get("nlp_parsed", False))
+        _reasoning = (analysis.get("reasoning", "") or "")[:200]
+        _composite = float(analysis.get("composite_score", 0) or 0)
+        _slow_count = int(analysis.get("slow_burn_count", 0) or 0)
+        _fired = analysis.get("fired_triggers") or []
+        # Detailed override decision audit — logs every input so a post-mortem
+        # can reconstruct why a PASS was upgraded (composite, each slow-burn
+        # trigger, and the five override booleans) and what confidence it landed
+        # on. Kept on one logger.info call per block for grep-ability.
         logger.info(
-            f"[executor] Structural override on {analysis['coin']}: "
-            f"AI PASS but {trigger} → upgrading to LONG conf {_conf_floor:.2f}"
+            f"[override] {analysis['coin']} STRUCTURAL OVERRIDE FIRE — "
+            f"trigger={trigger}"
         )
+        logger.info(
+            f"[override] {analysis['coin']} scoring — "
+            f"composite={_composite:.1f} (bar={override_composite:.0f}), "
+            f"slow_burn_count={_slow_count} (min={override_min_slow_burn}), "
+            f"fired_triggers={_fired}"
+        )
+        logger.info(
+            f"[override] {analysis['coin']} gates — "
+            f"slow_burn_strong={slow_burn_strong}, whale_fired={whale_fired}, "
+            f"breakout_strong={breakout_strong}, composite_strong={composite_strong}, "
+            f"ta_sidestep_strong={ta_sidestep_strong}, override_strong={override_strong}"
+        )
+        logger.info(
+            f"[override] {analysis['coin']} AI diagnostics — "
+            f"verdict=PASS, raw_confidence={_ai_conf_raw:.3f}, "
+            f"ai_down={_ai_down}, nlp_parsed={_nlp_parsed}, "
+            f"reasoning={_reasoning!r}"
+        )
+        # Fetch order book spread/depth for forced-trade diagnostics
+        _ob = get_orderbook_spread(analysis["coin"])
+        if _ob.get("ok"):
+            logger.info(
+                f"[executor]   Order book — bid={_ob['best_bid']}, ask={_ob['best_ask']}, "
+                f"spread={_ob['spread_pct']:.3f}%, "
+                f"bid_depth_1%=${_ob['bid_depth_1pct_usd']:,.0f}, "
+                f"ask_depth_1%=${_ob['ask_depth_1pct_usd']:,.0f}"
+            )
+        else:
+            logger.warning(
+                f"[executor]   Order book fetch failed: {_ob.get('error', 'unknown')}"
+            )
         analysis = dict(analysis)
         analysis["verdict"] = "LONG"
         analysis["side"] = "long"
+        # Preserve the model's own conviction before the floor masks it. The
+        # runner gate judges on this raw value so a structural override can
+        # still route/size as a LONG without laundering a 0.40 PASS into a
+        # 0.70 that trivially clears min_confidence.
+        analysis["ai_confidence_raw"] = _ai_conf_raw
         analysis["confidence"] = max(_conf_floor, float(analysis.get("confidence", 0) or 0))
+        logger.info(
+            f"[override] {analysis['coin']} UPGRADED PASS → LONG — "
+            f"confidence {_ai_conf_raw:.3f} → {analysis['confidence']:.3f} "
+            f"(floor={_conf_floor:.2f})"
+        )
         if ta_sidestep_strong:
             analysis["sidestep_override"] = True
         analysis["reasoning"] = (
@@ -703,13 +816,28 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
     try:
         min_notional = min_entry_notional_usd(coin, mid_price)
         if min_notional > 0 and trade_notional < min_notional:
-            return {
-                "executed": False, "mode": mode,
-                "analysis_id": analysis["id"],
-                "reason": (f"below_min_order_notional ({coin}: sized "
-                           f"${trade_notional:.2f}, HL minimum after precision "
-                           f"${min_notional:.2f})"),
-            }
+            # Minimum-order floor: ATR equal-risk sizing can produce a notional
+            # below Hyperliquid's per-coin minimum (e.g. (0.02×$10)/0.02=$10
+            # vs HL min ~$10.50). Instead of rejecting, BUMP UP to the exchange
+            # minimum so the order is valid. This slightly increases risk on
+            # tiny accounts; the gap is small (<10% in practice) and the max-loss
+            # stop still caps downside. If the gap is absurd (>50%), reject to
+            # avoid unintended oversized risk.
+            bump_gap = (min_notional - trade_notional) / trade_notional if trade_notional > 0 else 999
+            if bump_gap <= 0.50:
+                logger.info(
+                    f"[executor] {coin} notional ${trade_notional:.2f} below HL minimum "
+                    f"${min_notional:.2f} — bumping up (+{bump_gap*100:.1f}% risk)"
+                )
+                trade_notional = min_notional
+            else:
+                return {
+                    "executed": False, "mode": mode,
+                    "analysis_id": analysis["id"],
+                    "reason": (f"below_min_order_notional ({coin}: sized "
+                               f"${trade_notional:.2f}, HL minimum after precision "
+                               f"${min_notional:.2f}; gap {bump_gap*100:.0f}% > 50% — refusing auto-bump)"),
+                }
         size_in_coin = entry_size_for_notional(coin, trade_notional, mid_price)
     except Exception as e:
         return {
@@ -786,7 +914,13 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         peak_daily_pnl=memory.peak_daily_pnl(),
     )
 
-    gate_output = eval_all_gates(ctx, config, last_trade_time)
+    gate_output = eval_all_gates(
+        ctx,
+        config,
+        last_trade_time,
+        analysis=analysis,
+        trace_id=str(analysis.get("trace_id") or ""),
+    )
 
     if gate_output["blocked"]:
         # ── Capital-rotation (Phase-1 lever) — SHADOW by default ─────────────
@@ -892,6 +1026,34 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
             }
 
     set_leverage(coin, leverage)
+
+    # Pre-trade spread gate: skip coins with illiquid order books to avoid
+    # catastrophic slippage on testnet / low-cap names.
+    _max_spread_pct = float(os.environ.get("HERMES_MAX_SPREAD_PCT", "1.0"))
+    _ob = get_orderbook_spread(coin)
+    if _ob.get("ok"):
+        logger.info(
+            f"[executor] Pre-trade {coin}: spread={_ob['spread_pct']:.3f}%, "
+            f"bid_depth=${_ob['bid_depth_1pct_usd']:,.0f}, "
+            f"ask_depth=${_ob['ask_depth_1pct_usd']:,.0f}, "
+            f"notional=${trade_notional:,.0f}"
+        )
+        if _ob["spread_pct"] > _max_spread_pct:
+            logger.warning(
+                f"[executor] SKIPPING {coin}: spread {_ob['spread_pct']:.3f}% "
+                f"> {_max_spread_pct:.1f}% max (bid={_ob['best_bid']}, ask={_ob['best_ask']})"
+            )
+            return {
+                "executed": False, "mode": mode,
+                "analysis_id": analysis["id"],
+                "reason": f"spread_too_wide ({_ob['spread_pct']:.2f}% > {_max_spread_pct:.1f}%)",
+            }
+    else:
+        logger.warning(
+            f"[executor] Pre-trade {coin}: orderbook unavailable "
+            f"({_ob.get('error', 'unknown')}) — proceeding without spread check"
+        )
+
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin)
 
     if not order_res.get("ok"):
@@ -901,124 +1063,138 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
             "gate_results": gate_output["results"],
         }
 
-    arrival_mid = float(mid_price or 0)
+    # Phase-1: local state persistence — wrap in try/except to prevent
+    # orphaned positions (exchange has position but local state doesn't).
     try:
-        filled_px = float(order_res.get("avg_px") or 0)
-    except (TypeError, ValueError):
-        filled_px = 0.0
-    try:
-        filled_size = float(order_res.get("total_sz") or 0)
-    except (TypeError, ValueError):
-        filled_size = 0.0
-    entry_px = filled_px if filled_px > 0 else mid_price
-    if filled_size > 0:
-        size_in_coin = filled_size
-    position_notional = abs(size_in_coin) * entry_px
-
-    # Register the position with the DSL tracker; it re-evaluates the exit
-    # floor on every scan tick (loss protection -> profit locking).
-    dsl_config = config.get("dsl_exit", {})
-    # Regime-aware exits: scalp (base) in chop/down to bank fast; trend-ride params
-    # when regime=='up' to ride rippers. detect_regime is cached (TTL) and already
-    # computed by the market_regime gate in this same execute flow — no extra fetch.
-    _regime = "neutral"
-    try:
-        from hermes_trader.agents.market_regime import detect_regime
-        _regime = detect_regime(analysis["coin"])
-    except Exception as _re_e:
-        logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
-    _ex_protect, _ex_retrace, _tiers_raw, _ex_label = select_exit_params(dsl_config, _regime)
-    # phase2_tiers is optional in config; when present it OVERRIDES the class
-    # default ladder so profit-locking tightness is tunable without code edits.
-    _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
-    _atr_cfg = dsl_config.get("atr_stop", {}) or {}
-    _noise_cfg = dsl_config.get("noise_band", {}) or {}
-    logger.info(f"[executor] exit policy = {_ex_label} (regime={_regime}) "
-                f"protect={_ex_protect} retrace={_ex_retrace}")
-    policy = ExitPolicy(
-        max_loss_pct=dsl_config.get("max_loss_pct", 2.5),
-        max_loss_roe_pct=dsl_config.get("max_loss_roe_pct", 50.0),
-        protect_pct=_ex_protect,
-        retrace_threshold=_ex_retrace,
-        hard_timeout_minutes=dsl_config.get("hard_timeout_minutes", 180.0),
-        breakeven_trigger_pct=dsl_config.get("breakeven_trigger_pct", 0.0),
-        breakeven_lock_pct=dsl_config.get("breakeven_lock_pct", 0.0),
-        atr_stop_enabled=bool(_atr_cfg.get("enabled", False)),
-        atr_stop_mult=float(_atr_cfg.get("atr_mult", 1.5)),
-        atr_stop_floor_pct=float(_atr_cfg.get("floor_pct", 1.0)),
-        atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
-        stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
-        consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
-        noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
-        noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
-        phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
-    )
-    # ATR as % of entry — captured once here so the DSL stop width is stable
-    # for the life of the trade (the atr_stop feature scales off this).
-    entry_atr_pct = (atr / entry_px * 100) if entry_px > 0 else 0.0
-    register_position(coin, trade_side, entry_px, policy=policy, leverage=leverage,
-                      entry_atr_pct=entry_atr_pct)
-    logger.info(f"[executor] Registered DSL exit for {coin} {trade_side} @ {entry_px} ({leverage}x)")
-
-    _entry_ts = int(time.time() * 1000)
-    memory.record_trade({
-        "id": str(uuid.uuid4()),
-        "analysis_id": analysis["id"],
-        "coin": coin,
-        "side": trade_side,
-        "entry_px": entry_px,
-        "size_usd": position_notional,
-        "order_id": order_res.get("order_id"),
-        "executed_at": _entry_ts,
-    })
-
-    # Entry-context snapshot for the forward signal backtest: record WHEN we opened
-    # and WHAT the free signals said at entry (cache-only — no network on the hot
-    # path) plus the enforcement decision. The matching close pulls this so each
-    # outcome row carries (entry_time, signals_at_entry) — the join the backtest
-    # needs and that the outcome store previously lacked.
-    try:
-        from hermes_trader.agents.shadow_signals import gather_shadow_signals
-        _entry_sig = gather_shadow_signals(coin, trade_side,
-                                           config.get("shadow_signals") or {}, allow_fetch=False)
-        # Execution-quality capture: arrival mid vs actual fill = real entry
-        # slippage (the # the backtests don't model). Signed as adverse cost bps
-        # (long paying above mid / short selling below = positive cost).
-        _arr_mid = arrival_mid
-        _fill = filled_px
-        _slip_bps = None
-        if _arr_mid > 0 and _fill > 0:
-            raw = (_fill - _arr_mid) / _arr_mid * 1e4
-            _slip_bps = round(raw if trade_side == "long" else -raw, 1)
-        # Funding carry: capture the latest hourly funding rate at entry (one call;
-        # entries are rare so this isn't the rate-sensitive scan path). Realized
-        # funding cost is estimated at close from rate × hold_hrs × notional × side.
-        _funding_hr = None
+        arrival_mid = float(mid_price or 0)
         try:
-            from hermes_trader.client.hl_client import fetch_funding_history
-            _fh = fetch_funding_history(coin, int(time.time() * 1000) - 86_400_000)
-            if _fh:
-                _r = float(_fh[-1].get("fundingRate", 0) or 0)
-                _funding_hr = _r if _r == _r else None  # NaN guard
-        except Exception:
-            _funding_hr = None
-        memory.record_entry_context(coin, trade_side, {
-            "entry_time": _entry_ts,
-            "arrival_mid": _arr_mid,
-            "entry_fill": _fill,
-            "entry_slip_bps": _slip_bps,
-            "funding_rate_hr": _funding_hr,
-            "regime": _regime,          # market_regime at entry (already computed above)
-            "signals": _entry_sig,
-            "enforcement": ({"veto": _enf.veto, "veto_reason": _enf.veto_reason,
-                             "boost": _enf.boost, "boost_reason": _enf.boost_reason}
-                            if _enf is not None else {}),
-            "override_bar": override_composite,
-            "forced_override": analysis.get("verdict") == "LONG"
-                               and "[structural override]" in (analysis.get("reasoning") or ""),
+            filled_px = float(order_res.get("avg_px") or 0)
+        except (TypeError, ValueError):
+            filled_px = 0.0
+        try:
+            filled_size = float(order_res.get("total_sz") or 0)
+        except (TypeError, ValueError):
+            filled_size = 0.0
+        entry_px = filled_px if filled_px > 0 else mid_price
+        if filled_size > 0:
+            size_in_coin = filled_size
+        position_notional = abs(size_in_coin) * entry_px
+
+        # Register the position with the DSL tracker; it re-evaluates the exit
+        # floor on every scan tick (loss protection -> profit locking).
+        dsl_config = config.get("dsl_exit", {})
+        # Regime-aware exits: scalp (base) in chop/down to bank fast; trend-ride params
+        # when regime=='up' to ride rippers. detect_regime is cached (TTL) and already
+        # computed by the market_regime gate in this same execute flow — no extra fetch.
+        _regime = "neutral"
+        try:
+            from hermes_trader.agents.market_regime import detect_regime
+            _regime = detect_regime(analysis["coin"])
+        except Exception as _re_e:
+            logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
+        _ex_protect, _ex_retrace, _tiers_raw, _ex_label = select_exit_params(dsl_config, _regime)
+        # phase2_tiers is optional in config; when present it OVERRIDES the class
+        # default ladder so profit-locking tightness is tunable without code edits.
+        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        _atr_cfg = dsl_config.get("atr_stop", {}) or {}
+        _noise_cfg = dsl_config.get("noise_band", {}) or {}
+        logger.info(f"[executor] exit policy = {_ex_label} (regime={_regime}) "
+                    f"protect={_ex_protect} retrace={_ex_retrace}")
+        policy = ExitPolicy(
+            max_loss_pct=dsl_config.get("max_loss_pct", 2.5),
+            max_loss_roe_pct=dsl_config.get("max_loss_roe_pct", 50.0),
+            protect_pct=_ex_protect,
+            retrace_threshold=_ex_retrace,
+            hard_timeout_minutes=dsl_config.get("hard_timeout_minutes", 180.0),
+            breakeven_trigger_pct=dsl_config.get("breakeven_trigger_pct", 0.0),
+            breakeven_lock_pct=dsl_config.get("breakeven_lock_pct", 0.0),
+            atr_stop_enabled=bool(_atr_cfg.get("enabled", False)),
+            atr_stop_mult=float(_atr_cfg.get("atr_mult", 1.5)),
+            atr_stop_floor_pct=float(_atr_cfg.get("floor_pct", 1.0)),
+            atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
+            stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
+            consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
+            noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
+            noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
+            phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
+        )
+        # ATR as % of entry — captured once here so the DSL stop width is stable
+        # for the life of the trade (the atr_stop feature scales off this).
+        entry_atr_pct = (atr / entry_px * 100) if entry_px > 0 else 0.0
+        # Use actual fill time from the exchange response when available;
+        # this gives the DSL hard_timeout an accurate baseline instead of
+        # counting from "now" (which would be early for slow fills).
+        _fill_ms = order_res.get("filled_at_ms")
+        _entry_time_sec = (_fill_ms / 1000.0) if _fill_ms else time.time()
+        register_position(coin, trade_side, entry_px, entry_time=_entry_time_sec,
+                          policy=policy, leverage=leverage,
+                          entry_atr_pct=entry_atr_pct)
+        logger.info(f"[executor] Registered DSL exit for {coin} {trade_side} @ {entry_px} ({leverage}x)")
+
+        _entry_ts = int(time.time() * 1000)
+        memory.record_trade({
+            "id": str(uuid.uuid4()),
+            "analysis_id": analysis["id"],
+            "coin": coin,
+            "side": trade_side,
+            "entry_px": entry_px,
+            "size_usd": position_notional,
+            "order_id": order_res.get("order_id"),
+            "executed_at": _entry_ts,
         })
-    except Exception as _ec_e:
-        logger.debug(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
+
+        # Entry-context snapshot for the forward signal backtest: record WHEN we opened
+        # and WHAT the free signals said at entry (cache-only — no network on the hot
+        # path) plus the enforcement decision. The matching close pulls this so each
+        # outcome row carries (entry_time, signals_at_entry) — the join the backtest
+        # needs and that the outcome store previously lacked.
+        try:
+            from hermes_trader.agents.shadow_signals import gather_shadow_signals
+            _entry_sig = gather_shadow_signals(coin, trade_side,
+                                               config.get("shadow_signals") or {}, allow_fetch=False)
+            # Execution-quality capture: arrival mid vs actual fill = real entry
+            # slippage (the # the backtests don't model). Signed as adverse cost bps
+            # (long paying above mid / short selling below = positive cost).
+            _arr_mid = arrival_mid
+            _fill = filled_px
+            _slip_bps = None
+            if _arr_mid > 0 and _fill > 0:
+                raw = (_fill - _arr_mid) / _arr_mid * 1e4
+                _slip_bps = round(raw if trade_side == "long" else -raw, 1)
+            # Funding carry: capture the latest hourly funding rate at entry (one call;
+            # entries are rare so this isn't the rate-sensitive scan path). Realized
+            # funding cost is estimated at close from rate × hold_hrs × notional × side.
+            _funding_hr = None
+            try:
+                from hermes_trader.client.hl_client import fetch_funding_history
+                _fh = fetch_funding_history(coin, int(time.time() * 1000) - 86_400_000)
+                if _fh:
+                    _r = float(_fh[-1].get("fundingRate", 0) or 0)
+                    _funding_hr = _r if _r == _r else None  # NaN guard
+            except Exception:
+                _funding_hr = None
+            memory.record_entry_context(coin, trade_side, {
+                "entry_time": _entry_ts,
+                "arrival_mid": _arr_mid,
+                "entry_fill": _fill,
+                "entry_slip_bps": _slip_bps,
+                "funding_rate_hr": _funding_hr,
+                "regime": _regime,          # market_regime at entry (already computed above)
+                "signals": _entry_sig,
+                "enforcement": ({"veto": _enf.veto, "veto_reason": _enf.veto_reason,
+                                 "boost": _enf.boost, "boost_reason": _enf.boost_reason}
+                                if _enf is not None else {}),
+                "override_bar": override_composite,
+                "forced_override": analysis.get("verdict") == "LONG"
+                                   and "[structural override]" in (analysis.get("reasoning") or ""),
+            })
+        except Exception as _ec_e:
+            logger.debug(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
+    except Exception as _state_e:
+        logger.critical(f"[executor] LOCAL STATE WRITE FAILED after {coin} order "
+                        f"placed on exchange — position is ORPHANED: {_state_e}")
+        # Fall through: exchange position exists, next rehydrate cycle will
+        # pick it up via DSL dsl_exit_manager.rehydrate_from_exchange().
 
     # Backup exchange stop-loss bracket — fires server-side (instantly, between our
     # 60s DSL checks) to cap the gap-throughs the DSL loop misses. DSL is still the
@@ -1039,7 +1215,16 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         else:
             sl_missing = True
             logger.error(f"[executor] Backup SL FAILED twice for {coin} — POSITION HAS "
-                         f"NO SERVER-SIDE STOP (DSL loop is sole protection): {sl_res.get('error')}")
+                         f"NO SERVER-SIDE STOP (DSL loop is sole protection): "
+                         f"target_px={sl_px}, is_buy={is_buy}, size={size_in_coin}")
+            _pending_sl_retries[coin] = {
+                "is_buy": is_buy,
+                "size": size_in_coin,
+                "sl_px": sl_px,
+                "coin": coin,
+                "retry_count": 0,
+                "last_attempt": time.time(),
+            }
 
     # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
     # fraction of the position SERVER-SIDE at the TP target so a winner is
@@ -1056,7 +1241,9 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
             logger.info(f"[executor] Placed TP scale-out {tp_scale_fraction:.0%} "
                         f"at {tp_px_trig} ({TP_ATR_MULT}x ATR)")
         else:
-            logger.error(f"[executor] TP scale-out FAILED for {coin}: {tp_res.get('error')}")
+            logger.error(f"[executor] TP scale-out FAILED for {coin}: "
+                         f"target_px={tp_px_trig}, size={tp_size}, "
+                         f"error={tp_res.get('error')}")
 
     final_sl = (entry_px - atr * sl_atr_mult) if is_buy else (entry_px + atr * sl_atr_mult) if atr > 0 else stop_px
     final_tp = (entry_px + atr * TP_ATR_MULT) if is_buy else (entry_px - atr * TP_ATR_MULT) if atr > 0 else tp_px
@@ -1155,13 +1342,15 @@ def route_verdict(analysis: Dict[str, Any], *, execute_fn=None, close_fn=None) -
             bool(_rv_cfg.get("composite_force_execute", False))
             and float(analysis.get("composite_score", 0) or 0) >= _bar
         )
+        # Keep this in lockstep with ta_sidestep_strong in maybe_execute — a
+        # looser hint here just routes candidates the executor will refuse.
         sidestep_hint = (
             bool(_rv_cfg.get("ta_sidestep_force_execute", False))
+            and int(analysis.get("slow_burn_count", 0) or 0) >=
+            int(_rv_cfg.get("ta_sidestep_min_slow_burn_count", 1) or 1)
             and (
                 float(analysis.get("composite_score", 0) or 0) >= _bar
                 or bool(analysis.get("momentum_burst_fired"))
-                or int(analysis.get("slow_burn_count", 0) or 0) >=
-                int(_rv_cfg.get("ta_sidestep_min_slow_burn_count", 1) or 1)
             )
         )
         if has_whale or slow_burn_hint or breakout_hint or composite_hint or sidestep_hint:
@@ -1190,6 +1379,12 @@ def _runner_entry_block_reason(analysis: Dict[str, Any], config: Dict[str, Any])
     is_hip3 = ":" in coin
     side = (analysis.get("side") or "").lower()
     conf = float(analysis.get("confidence", 0) or 0)
+    # A structural override rewrites confidence up to min_ai_confidence, which is
+    # normally the same number as min_confidence — so the floored value clears
+    # this gate by construction and the confidence bar becomes a no-op. Judge on
+    # the model's pre-floor conviction when it is available; plain (non-override)
+    # candidates have no such field and fall back to confidence unchanged.
+    gate_conf = float(analysis.get("ai_confidence_raw", conf) or 0)
     score = float(analysis.get("composite_score", 0) or 0)
     min_conf = float(gate.get("min_confidence", 0.70))
     min_score = float(gate.get("min_composite", 30.0))
@@ -1206,8 +1401,8 @@ def _runner_entry_block_reason(analysis: Dict[str, Any], config: Dict[str, Any])
     forced = "[structural override]" in (analysis.get("reasoning") or "")
 
     fresh_impulse = (volume and (breakout or burst)) or (burst and score >= min_score)
-    if conf < min_conf:
-        return f"runner_gate_blocked (confidence {conf:.2f} < {min_conf:.2f})"
+    if gate_conf < min_conf:
+        return f"runner_gate_blocked (confidence {gate_conf:.2f} < {min_conf:.2f})"
 
     if side == "short":
         if not bool(gate.get("allow_shorts", False)):
@@ -1231,7 +1426,7 @@ def _runner_entry_block_reason(analysis: Dict[str, Any], config: Dict[str, Any])
 
     structured_daily_mover = (
         daily_mover
-        and conf >= float(gate.get("mover_min_confidence", 0.80))
+        and gate_conf >= float(gate.get("mover_min_confidence", 0.80))
         and score >= float(gate.get("mover_min_composite", 45.0))
         and (slow_count >= 1 or volume or breakout or burst)
     )
@@ -1421,3 +1616,34 @@ def close_position_market(coin: str) -> Dict[str, Any]:
                 except Exception as e:
                     logger.warning(f"[executor] loss-cooldown arm failed for {coin}: {e}")
     return out
+
+
+def retry_pending_sl(max_retries: int = 5, retry_interval: int = 15) -> None:
+    """Retry server-side SL placement for positions that failed previously.
+
+    Called every scan cycle; retries at most every `retry_interval` seconds.
+    Position is removed from queue after `max_retries` attempts or success.
+    """
+    from hermes_trader.client.exchange import place_hl_trigger_order
+    now = time.time()
+    for coin in list(_pending_sl_retries.keys()):
+        entry = _pending_sl_retries[coin]
+        if now - entry["last_attempt"] < retry_interval:
+            continue
+        entry["retry_count"] += 1
+        entry["last_attempt"] = now
+        try:
+            res = place_hl_trigger_order(
+                entry["is_buy"], entry["size"], entry["sl_px"], "sl", entry["coin"]
+            )
+            if res.get("ok"):
+                logger.info(f"[executor] Pending SL retry SUCCEEDED for {coin}")
+                del _pending_sl_retries[coin]
+            elif entry["retry_count"] >= max_retries:
+                logger.error(f"[executor] Pending SL retry EXHAUSTED for {coin} "
+                             f"after {max_retries} attempts — manual intervention required")
+                del _pending_sl_retries[coin]
+        except Exception as e:
+            logger.error(f"[executor] Pending SL retry error for {coin}: {e}")
+            if entry["retry_count"] >= max_retries:
+                del _pending_sl_retries[coin]
