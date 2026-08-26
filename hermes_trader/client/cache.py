@@ -81,6 +81,11 @@ class _Cache:
             self.misses = 0
             self.evictions = 0
 
+    def delete(self, key: str) -> None:
+        """Invalidate a single key (used by force-refresh paths)."""
+        with self._lock:
+            self._store.pop(key, None)
+
 # Module-level cache for global (non-client) memoization
 _global_cache: Optional[_Cache] = None
 _global_cache_lock = threading.Lock()

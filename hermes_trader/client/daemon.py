@@ -218,7 +218,7 @@ def check_daemon_state(name: str, state_dir: Optional[str] = None) -> Dict[str, 
         except (ValueError, FileNotFoundError):
             pass
 
-    from .lock import check_lock_status
+    from .lock import check_lock_status, is_pid_alive
     lock_status = check_lock_status(name, state_dir)
 
     heartbeat = None
@@ -231,18 +231,7 @@ def check_daemon_state(name: str, state_dir: Optional[str] = None) -> Dict[str, 
     return {
         "name": name,
         "pid": pid,
-        "pid_alive": _is_pid_alive(pid),
+        "pid_alive": is_pid_alive(pid),
         "lock": lock_status,
         "heartbeat": heartbeat,
     }
-
-
-def _is_pid_alive(pid: Optional[int]) -> bool:
-    """Check if a PID is still running."""
-    if pid is None:
-        return False
-    try:
-        os.kill(pid, 0)
-        return True
-    except (OSError, ProcessLookupError):
-        return False

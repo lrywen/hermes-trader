@@ -28,6 +28,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# P3-17: mark this process as a backtest BEFORE importing any hermes_trader
+# client modules, so exchange._make_exchange() refuses to load a live mainnet
+# private key into the simulation process.
+os.environ["HERMES_BACKTEST"] = "1"
+
 # load .env.local (HL is public; we just want the same module imports working)
 _REPO = Path(__file__).resolve().parents[1]
 _env = _REPO / ".env.local"
@@ -36,11 +41,14 @@ if _env.is_file():
         _line = _line.strip()
         if _line and not _line.startswith("#") and "=" in _line:
             _k, _, _v = _line.partition("=")
+            # Never let .env.local inject a live signing key into a backtest.
+            if _k.strip() == "HYPERLIQUID_PRIVATE_KEY":
+                continue
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
 from hermes_trader.indicators import math as ind
@@ -81,38 +89,49 @@ class DSL:
     def check_bar(self, bar_idx: int, bar: Candle) -> Tuple[bool, float, str]:
         """Did this bar trigger an exit? Stops fire intra-bar at the stop price."""
         is_long = self.side == "long"
-        # Update peak using the bar's high/low (long peaks on high, short on low)
-        if is_long and bar.h > self.peak_px:
-            self.peak_px = bar.h
-        if not is_long and bar.l < self.peak_px:
-            self.peak_px = bar.l
+        # NOTE: the peak is deliberately NOT updated before the stop checks below.
+        # Deriving this bar's trailing floor from this bar's own high, then testing
+        # it against this bar's own low, is intra-bar lookahead: as retrace -> 0 the
+        # floor -> bar.h and `bar.l <= floor` becomes unconditionally true, so the
+        # sim sells at every bar's exact high. Stops must only ever be evaluated
+        # against a floor that was already known when the bar opened; the peak is
+        # advanced at the end of the bar instead.
 
         if bar_idx - self.entry_bar >= self.hard_timeout_bars:
             return True, bar.c, "hard_timeout"
 
-        # Max-loss stop
+        # Max-loss stop. On a gap through the stop the fill is the open, not the
+        # stop price -- a resting stop cannot fill better than the market.
         max_loss_px = (self.entry_px * (1 - self.max_loss_pct / 100) if is_long
                        else self.entry_px * (1 + self.max_loss_pct / 100))
         if is_long and bar.l <= max_loss_px:
-            return True, max_loss_px, f"max_loss {self.max_loss_pct}%"
+            return True, min(max_loss_px, bar.o), f"max_loss {self.max_loss_pct}%"
         if not is_long and bar.h >= max_loss_px:
-            return True, max_loss_px, f"max_loss {self.max_loss_pct}%"
+            return True, max(max_loss_px, bar.o), f"max_loss {self.max_loss_pct}%"
 
-        # Phase-2 trailing floor (only active once protect_pct profit reached)
+        # Phase-2 trailing floor (only active once protect_pct profit reached).
+        # Uses the peak as of the *previous* bar's close, so the floor is knowable
+        # before this bar trades.
         if is_long:
             peak_profit_pct = (self.peak_px - self.entry_px) / self.entry_px * 100
             if peak_profit_pct >= self.protect_pct:
                 profit_range = self.peak_px - self.entry_px
                 floor = self.entry_px + profit_range * (1 - self.retrace_threshold)
                 if bar.l <= floor:
-                    return True, floor, "trailing_stop"
+                    return True, min(floor, bar.o), "trailing_stop"
         else:
             peak_profit_pct = (self.entry_px - self.peak_px) / self.entry_px * 100
             if peak_profit_pct >= self.protect_pct:
                 profit_range = self.entry_px - self.peak_px
                 ceiling = self.entry_px - profit_range * (1 - self.retrace_threshold)
                 if bar.h >= ceiling:
-                    return True, ceiling, "trailing_stop"
+                    return True, max(ceiling, bar.o), "trailing_stop"
+
+        # Bar survived: now advance the peak so the *next* bar sees this extreme.
+        if is_long and bar.h > self.peak_px:
+            self.peak_px = bar.h
+        if not is_long and bar.l < self.peak_px:
+            self.peak_px = bar.l
 
         return False, 0.0, ""
 
@@ -123,7 +142,12 @@ def _evaluate(window: List[Candle], cfg: Dict[str, Any]) -> Tuple[float, list]:
     hits = [
         trig.pct_move_spike(window, th["sigmaThreshold"]),
         trig.volume_spike(window, th["sigmaThreshold"]),
-        trig.breakout(window, th["breakoutLookback"]),
+        trig.breakout(
+            window, th["breakoutLookback"],
+            min_rvol=th.get("breakoutMinRvol", 1.5),
+            rvol_window=th.get("breakoutRvolWindow", 20),
+            atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
+        ),
         trig.range_compression(window, th["bbLength"], th["bbStdDev"]),
         trig.trend_strength(window, th["adxPeriod"]),
         trig.momentum_burst(window, th["momentumLookback"], th["momentumPct"]),
@@ -309,10 +333,10 @@ def main() -> int:
     live_dsl = live.get("dsl_exit", {}) or {}
     live_atr = live_dsl.get("atr_stop", {}) or {}
     equity_fraction = float(args.equity_fraction or live.get("equity_fraction_per_trade", 0.10))
-    leverage_ceiling = int(args.leverage_ceiling or live.get("leverage", 8))
-    max_loss = float(args.max_loss if args.max_loss is not None else live_dsl.get("max_loss_pct", 2.5))
-    protect = float(args.protect if args.protect is not None else live_dsl.get("protect_pct", 1.5))
-    retrace = float(args.retrace if args.retrace is not None else live_dsl.get("retrace_threshold", 0.30))
+    leverage_ceiling = int(args.leverage_ceiling or cfg_get("leverage", config=live))
+    max_loss = float(args.max_loss if args.max_loss is not None else cfg_get("dsl_exit.max_loss_pct", config=live_dsl))
+    protect = float(args.protect if args.protect is not None else cfg_get("dsl_exit.protect_pct", config=live_dsl))
+    retrace = float(args.retrace if args.retrace is not None else cfg_get("dsl_exit.retrace_threshold", config=live_dsl))
     if args.atr_mult is not None:
         atr_mult = float(args.atr_mult)
     else:

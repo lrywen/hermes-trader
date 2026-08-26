@@ -7,13 +7,19 @@ from __future__ import annotations
 
 import logging
 import math
+import os
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
-from hermes_trader.indicators.math import adx, atr, candle_val, ema, rsi
+from hermes_trader.indicators.math import adx, atr, candle_val, ema, obv, rsi
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.models.types import Candle
 
 logger = logging.getLogger(__name__)
+
+# Per-fetch timeout for the parallel candle gather (H9). Without it a single
+# hung HTTP call blocks the whole TA layer indefinitely. Mirrors research.py.
+_FETCH_TIMEOUT_S = float(os.environ.get("HERMES_TA_FILTER_FETCH_TIMEOUT_S", "45"))
 
 
 def _assess_trend(candles: List[Candle]) -> str:
@@ -68,12 +74,47 @@ def _compute_adx(candles: List[Candle]) -> Optional[float]:
     return last if math.isfinite(last) else None
 
 
-def _check_volume_confirm(candles: List[Candle]) -> bool:
+def _check_volume_confirm(candles: List[Candle], mult: float = 1.2) -> bool:
     if len(candles) < 21:
         return False
     last_vol = candle_val(candles[-1], "v")
     avg_vol = sum(candle_val(c, "v") for c in candles[-21:-1]) / 20
-    return avg_vol == 0 or last_vol >= avg_vol * 0.8
+    # Volume confirmation requires a real surge: last bar >= 1.2x the prior
+    # 20-bar average. The old 0.8x threshold rubber-stamped below-average bars
+    # as "confirmed", which let weak breakouts through.
+    return avg_vol == 0 or last_vol >= avg_vol * mult
+
+
+def _extension_atr(candles: List[Candle]) -> Optional[float]:
+    """Distance of the last close from EMA21, measured in ATR(14) units.
+
+    Positive = price above EMA21 (extended long / late to chase up),
+    negative = below (extended short). Used to reject late momentum bursts.
+    """
+    if len(candles) < 30:
+        return None
+    closes = [candle_val(c, "c") for c in candles]
+    ema21_arr = ema(closes, 21)
+    atr_arr = atr(candles, 14)
+    e21 = ema21_arr[-1]
+    a = atr_arr[-1]
+    last_close = closes[-1]
+    if not all(math.isfinite(x) for x in (e21, a, last_close)) or a <= 0:
+        return None
+    return (last_close - e21) / a
+
+
+def _obv_slope(candles: List[Candle], lookback: int = 10) -> Optional[float]:
+    """OBV change over the last `lookback` bars (signed).
+
+    Positive = accumulation (volume on up-closes), negative = distribution.
+    Used to confirm that a breakout/impulse is backed by genuine participation
+    rather than a thin push. None if not enough data.
+    """
+    if len(candles) < lookback + 2:
+        return None
+    series = obv(candles)
+    return series[-1] - series[-lookback - 1]
 
 
 def _check_ema_cross_recent(candles: List[Candle]) -> bool:
@@ -99,9 +140,21 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
     """Run TA validation on a single perception, returning a TA-result dict."""
     coin = perception["coin"]
     try:
-        c1h = fetch_hl_candles(coin, "1h", 60)
-        c4h = fetch_hl_candles(coin, "4h", 60)
-        c1d = fetch_hl_candles(coin, "1d", 40)
+        # Parallel fetch for 3 timeframes — counts MUST match research.py
+        # so hl_client's 90s candle cache is shared (key = coin|interval|count).
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f_1h = pool.submit(fetch_hl_candles, coin, "1h", 100)
+            f_4h = pool.submit(fetch_hl_candles, coin, "4h", 100)
+            f_1d = pool.submit(fetch_hl_candles, coin, "1d", 60)
+            try:
+                c1h = f_1h.result(timeout=_FETCH_TIMEOUT_S)
+                c4h = f_4h.result(timeout=_FETCH_TIMEOUT_S)
+                c1d = f_1d.result(timeout=_FETCH_TIMEOUT_S)
+            except Exception:
+                for _f in (f_1h, f_4h, f_1d):
+                    if not _f.done():
+                        _f.cancel()
+                raise
 
         if len(c4h) < 30:
             return {
@@ -110,6 +163,7 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
                 "trend_aligned": False,
                 "rsi4h": None, "atr4pct": None, "adx4h": None,
                 "ema_cross": False, "volume_confirm": False,
+                "extension_atr": None,
                 "reason": "insufficient candle data",
             }
 
@@ -139,9 +193,68 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
         adx4h = _compute_adx(c4h)
         ema_cross = _check_ema_cross_recent(c4h)
         volume_confirm = _check_volume_confirm(c4h)
+        extension = _extension_atr(c4h)
+        obv_slope = _obv_slope(c4h, lookback=10)
+
+        # Infer the intended trade direction from the fired perception triggers,
+        # so the over-extension veto knows which way we'd be chasing.
+        fired_names = {
+            t.get("name") for t in (perception.get("triggers") or [])
+            if t.get("fired")
+        }
+        bullish_triggers = fired_names & {
+            "breakout", "momentumBurst", "uptrendMomentum",
+            "trendFlip1h", "higherLows1h", "volumeBuildup1h", "dailyMover",
+        }
+        # momentumBurst is direction-agnostic by name; disambiguate using the
+        # extension sign (price above EMA21 => the burst was up).
+        burst_up = "momentumBurst" in fired_names and (extension or 0) > 0
+        burst_down = "momentumBurst" in fired_names and (extension or 0) < 0
+        intend_long = bool(bullish_triggers) and not burst_down
+        intend_short = bool(fired_names & {"downtrendMomentum"}) or burst_down
 
         score = 0
         reasons = []
+
+        # Hard late-entry veto: don't even send an over-extended impulse to the
+        # paid AI. A momentum burst/breakout at RSI>75 AND >2.5xATR above EMA21
+        # is the textbook "top tick" long; the symmetric case for shorts.
+        overbought = rsi4h is not None and rsi4h > 75
+        oversold = rsi4h is not None and rsi4h < 25
+        ext_long = extension is not None and extension > 2.5
+        ext_short = extension is not None and extension < -2.5
+        if intend_long and (overbought or ext_long):
+            why = []
+            if overbought:
+                why.append(f"RSI {rsi4h:.0f}>75")
+            if ext_long:
+                why.append(f"extension +{extension:.1f}xATR")
+            logger.info(f"[ta_filter] {coin} -> REJECTED (late long: {', '.join(why)})")
+            return {
+                "signal": "REJECTED", "score": 0,
+                "trend1h": t1h, "trend4h": t4h, "trend1d": t1d,
+                "trend_aligned": trend_aligned,
+                "rsi4h": rsi4h, "atr4pct": atr4pct, "adx4h": adx4h,
+                "ema_cross": ema_cross, "volume_confirm": volume_confirm,
+                "extension_atr": extension,
+                "reason": f"late long ({', '.join(why)})",
+            }
+        if intend_short and (oversold or ext_short):
+            why = []
+            if oversold:
+                why.append(f"RSI {rsi4h:.0f}<25")
+            if ext_short:
+                why.append(f"extension {extension:.1f}xATR")
+            logger.info(f"[ta_filter] {coin} -> REJECTED (late short: {', '.join(why)})")
+            return {
+                "signal": "REJECTED", "score": 0,
+                "trend1h": t1h, "trend4h": t4h, "trend1d": t1d,
+                "trend_aligned": trend_aligned,
+                "rsi4h": rsi4h, "atr4pct": atr4pct, "adx4h": adx4h,
+                "ema_cross": ema_cross, "volume_confirm": volume_confirm,
+                "extension_atr": extension,
+                "reason": f"late short ({', '.join(why)})",
+            }
 
         # Directional alignment scoring (our edge is LONG/trend-aligned):
         # bullish HTF trend = full +20; bearish = +10 (tradeable short, lower edge);
@@ -168,6 +281,17 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
         if volume_confirm:
             score += 10
             reasons.append("volume confirmed")
+        # OBV direction confirmation: real accumulation/distribution behind
+        # the intended move. +8 when OBV slope agrees with the trade direction;
+        # a divergent slope (price up but OBV down for a long) is a warning sign
+        # but not a hard veto, so it just withholds the bonus.
+        if obv_slope is not None:
+            if intend_long and obv_slope > 0:
+                score += 8
+                reasons.append("OBV accumulation")
+            elif intend_short and obv_slope < 0:
+                score += 8
+                reasons.append("OBV distribution")
         score += min(15, perception["composite_score"] / 100 * 15)
 
         verdict = "CONFIRMED" if score >= 22 else "WEAK" if score >= 12 else "REJECTED"
@@ -182,6 +306,7 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
             "trend_aligned": trend_aligned,
             "rsi4h": rsi4h, "atr4pct": atr4pct, "adx4h": adx4h,
             "ema_cross": ema_cross, "volume_confirm": volume_confirm,
+            "extension_atr": extension,
             "reason": ", ".join(reasons) if reasons else "no signals",
         }
     except Exception as err:
@@ -193,5 +318,6 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
             "trend_aligned": False,
             "rsi4h": None, "atr4pct": None, "adx4h": None,
             "ema_cross": False, "volume_confirm": False,
+            "extension_atr": None,
             "reason": f"TA error: {err}",
         }

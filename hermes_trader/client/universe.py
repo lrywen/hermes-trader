@@ -227,10 +227,28 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
     spot_meta, spot_ctx = _fetch_spot_meta(force_refresh)
 
     # HIP-3: walk every non-null perpDex and merge its markets in.
+    # Apply the same allow/blocklist mute as the scanner (perception.py) and
+    # account aggregation (hl_client.py): on testnet list_hip3_dexes() returns
+    # ~250 unfunded venues, and walking them all would serialize ~250
+    # metaAndAssetCtxs POSTs behind the rate limiter, stalling loop startup.
     hip3_meta: Dict[str, Any] = {}
     hip3_ctx: Dict[str, Any] = {}
     if include_hip3:
-        for dex in list_hip3_dexes(force_refresh):
+        dexes = list_hip3_dexes(force_refresh)
+        try:
+            from hermes_trader.agents.config_store import read_agent_config
+            _cfg = read_agent_config()
+        except Exception:
+            _cfg = {}
+        allow = {d for d in (_cfg.get("hip3_dex_allowlist") or []) if d}
+        block = {d for d in (_cfg.get("hip3_dex_blocklist") or []) if d}
+        if allow:
+            dexes = [d for d in dexes if d in allow]
+        if block:
+            dexes = [d for d in dexes if d not in block]
+        if not dexes:
+            logger.info("[universe] HIP-3 loading skipped — no dexes after allow/block filter")
+        for dex in dexes:
             m, c = _fetch_hip3_meta(dex, force_refresh)
             hip3_meta.update(m)
             hip3_ctx.update(c)

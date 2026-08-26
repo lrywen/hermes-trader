@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from hermes_trader.agents.dsl_exit import (
     DSLTracker,
     ExitPolicy,
@@ -22,7 +24,8 @@ def _policy(**kw) -> ExitPolicy:
     base = dict(max_loss_pct=3.5, max_loss_roe_pct=100.0, protect_pct=1.0,
                 retrace_threshold=0.40, hard_timeout_minutes=99999.0,
                 atr_stop_enabled=True, atr_stop_mult=1.5,
-                atr_stop_floor_pct=1.0, atr_stop_ceiling_pct=4.0)
+                atr_stop_floor_pct=1.0, atr_stop_ceiling_pct=4.0,
+                stale_flat_timeout_minutes=0.0)
     base.update(kw)
     return ExitPolicy(**base)
 
@@ -104,6 +107,153 @@ def test_parse_verdict_tags_ai_down():
     assert ok["ai_down"] is False
 
 
+# ── P0-1: stop/target must never reach the executor as 0 on a directional call
+def test_parse_verdict_atr_fallback_fills_missing_stop_long():
+    """LLM omitted stopPx/tpPx (the 73/73 production case) -> derive from ATR."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict(
+        '{"verdict":"LONG","confidence":0.7,"side":"long","entryPx":100}',
+        "BTC", {"mid": 100.0}, atr_abs=2.0, sl_atr_mult=1.2, tp_atr_mult=1.0,
+    )
+    assert v["stop_px"] == pytest.approx(97.6)   # 100 - 2.0*1.2
+    assert v["tp_px"] == pytest.approx(102.0)    # 100 + 2.0*1.0
+
+
+def test_parse_verdict_atr_fallback_inverts_for_short():
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict(
+        '{"verdict":"SHORT","confidence":0.7,"side":"short","entryPx":100}',
+        "BTC", {"mid": 100.0}, atr_abs=2.0, sl_atr_mult=1.5, tp_atr_mult=1.0,
+    )
+    assert v["stop_px"] == pytest.approx(103.0)  # above entry for a short
+    assert v["tp_px"] == pytest.approx(98.0)
+
+
+def test_parse_verdict_keeps_valid_ai_stop():
+    """A sane AI stop wins over the fallback — we only repair, never override."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict(
+        '{"verdict":"LONG","confidence":0.7,"entryPx":100,"stopPx":98.5,"tpPx":105}',
+        "BTC", {"mid": 100.0}, atr_abs=2.0,
+    )
+    assert v["stop_px"] == 98.5 and v["tp_px"] == 105
+
+
+def test_parse_verdict_discards_inverted_stop_and_refills():
+    """Stop above entry on a LONG would liquidate instantly — discard + refill."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict(
+        '{"verdict":"LONG","confidence":0.7,"entryPx":100,"stopPx":105,"tpPx":95}',
+        "BTC", {"mid": 100.0}, atr_abs=2.0, sl_atr_mult=1.0, tp_atr_mult=1.0,
+    )
+    assert v["stop_px"] == pytest.approx(98.0)
+    assert v["tp_px"] == pytest.approx(102.0)
+
+
+def test_parse_verdict_no_atr_leaves_zero_and_does_not_raise():
+    """No ATR available: degrade to 0 rather than inventing a price."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict(
+        '{"verdict":"LONG","confidence":0.7,"entryPx":100}',
+        "BTC", {"mid": 100.0}, atr_abs=None,
+    )
+    assert v["stop_px"] == 0.0 and v["tp_px"] == 0.0
+
+
+def test_parse_verdict_pass_untouched_by_fallback():
+    """PASS/CLOSE carry no position, so no stop is synthesised."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict('{"verdict":"PASS","confidence":0.0}', "BTC", {"mid": 100.0}, atr_abs=2.0)
+    assert v["stop_px"] == 0.0 and v["tp_px"] == 0.0
+
+
+def test_parse_verdict_coerces_junk_stop_to_fallback():
+    """String/null/negative prices from the LLM must not propagate."""
+    from hermes_trader.agents.research import parse_verdict
+    for junk in ('"n/a"', 'null', '-5'):
+        v = parse_verdict(
+            f'{{"verdict":"LONG","confidence":0.7,"entryPx":100,"stopPx":{junk}}}',
+            "BTC", {"mid": 100.0}, atr_abs=2.0, sl_atr_mult=1.0,
+        )
+        assert v["stop_px"] == pytest.approx(98.0), junk
+
+
+# ── Parse-provenance flags must survive into the analysis record ──────────────
+# The executor's zero-confidence guard reads json_parsed/nlp_parsed off the
+# analysis dict. On the first deploy of the ai_down flag the same whitelist
+# silently dropped it and the guard never fired; these tests pin the contract
+# so a conf=0 PASS is never mistaken for an unparseable response.
+def test_parse_verdict_flags_structured_zero_confidence_pass():
+    """A decoded {"verdict":"PASS","confidence":0} is a real opinion, not junk."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict('{"verdict":"PASS","confidence":0.0}', "BTC", {"mid": 100.0})
+    assert v["json_parsed"] is True
+    assert v["ai_down"] is False
+
+
+def test_parse_verdict_flags_unparseable_response():
+    """Text with no JSON and no NLP-extractable verdict is a failure."""
+    from hermes_trader.agents.research import parse_verdict
+    v = parse_verdict("the market is doing market things", "BTC", {"mid": 100.0})
+    assert v["json_parsed"] is False
+    assert v["nlp_parsed"] is False
+    assert v["ai_down"] is False   # text was returned, it just carried no verdict
+
+
+def test_analysis_record_carries_parse_flags():
+    """research.analyze must not drop the flags in its field whitelist."""
+    import inspect
+    from hermes_trader.agents import research
+    src = inspect.getsource(research)
+    assert '"nlp_parsed": bool(parsed.get("nlp_parsed"))' in src
+    assert '"json_parsed": bool(parsed.get("json_parsed"))' in src
+
+
+def test_zero_confidence_structured_pass_is_not_blocked_as_unparseable(monkeypatch):
+    """The prod-killing case: AI answered PASS/0.0 in clean JSON. The guard must
+    let it through to the override/gate logic instead of reporting it broken."""
+    from hermes_trader.agents import executor as ex
+    monkeypatch.setattr(
+        ex, "read_agent_config",
+        lambda: {"mode": "LIVE", "enable_crypto": True},
+    )
+    res = ex.maybe_execute({
+        "id": "t-json", "coin": "BTC", "verdict": "PASS", "confidence": 0.0,
+        "ai_down": False, "json_parsed": True, "nlp_parsed": False,
+    })
+    assert res["executed"] is False
+    assert "ai_zero_confidence" not in res["reason"]
+
+
+def test_zero_confidence_unparseable_pass_is_blocked(monkeypatch):
+    """Neither JSON nor NLP produced a verdict -> block."""
+    from hermes_trader.agents import executor as ex
+    monkeypatch.setattr(
+        ex, "read_agent_config",
+        lambda: {"mode": "LIVE", "enable_crypto": True},
+    )
+    res = ex.maybe_execute({
+        "id": "t-junk", "coin": "BTC", "verdict": "PASS", "confidence": 0.0,
+        "ai_down": False, "json_parsed": False, "nlp_parsed": False,
+    })
+    assert res["executed"] is False
+    assert "ai_zero_confidence" in res["reason"]
+
+
+def test_zero_confidence_legacy_record_without_flags_fails_open(monkeypatch):
+    """Analysis records written before the flags existed must not be blocked."""
+    from hermes_trader.agents import executor as ex
+    monkeypatch.setattr(
+        ex, "read_agent_config",
+        lambda: {"mode": "LIVE", "enable_crypto": True},
+    )
+    res = ex.maybe_execute({
+        "id": "t-legacy", "coin": "BTC", "verdict": "PASS", "confidence": 0.0,
+    })
+    assert res["executed"] is False
+    assert "ai_zero_confidence" not in res["reason"]
+
+
 def test_override_blocked_when_ai_down(monkeypatch):
     """A whale-hinted failure-PASS must NOT be upgraded to a blind LONG."""
     from hermes_trader.agents import executor as ex
@@ -117,7 +267,7 @@ def test_override_blocked_when_ai_down(monkeypatch):
         "whale_signal": True, "ai_down": True,
     })
     assert res["executed"] is False
-    assert "override_blocked_ai_down" in res["reason"]
+    assert "ai_verdict_pass" in res["reason"]
 
 
 def test_loss_cooldown_blocks_reentry(monkeypatch):
@@ -174,7 +324,7 @@ def test_breakout_force_execute_upgrades_pass(monkeypatch):
             "breakout_fired": True, "volume_spike_fired": True}
     # ai_down failure-PASS: refused before any upgrade
     res = ex.maybe_execute({**base, "ai_down": True})
-    assert "override_blocked_ai_down" in res["reason"]
+    assert "ai_verdict_pass" in res["reason"]
     # genuine hedged PASS: upgraded → proceeds past the PASS guard to the
     # equity check (same proof pattern as the whale-override test; a
     # non-upgraded PASS would exit earlier with pass_no_override).

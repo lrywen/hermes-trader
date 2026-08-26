@@ -14,6 +14,7 @@
   "crowded_with_min_conf": 0.8,
   "min_available_margin_pct": 0.1,
   "cooldown_min": 30,
+  "research_cooldown_min": 15,
   "held_research_interval_min": 10,
   "min_ai_confidence": 0.7,
   "counter_regime_min_conf": 0.8,
@@ -32,7 +33,7 @@
   "hip3_dex_blocklist": [],
   "dsl_exit": {
     "max_loss_pct": 0.4,
-    "max_loss_roe_pct": 3.0,
+    "max_loss_roe_pct": 5.0,
     "protect_pct": 1.25,
     "retrace_threshold": 0.2,
     "hard_timeout_minutes": 1800.0,
@@ -56,7 +57,7 @@
     ],
     "stale_flat_timeout_minutes": 480,
     "regime_aware": {
-      "enabled": false,
+      "enabled": true,
       "trend_ride": {
         "protect_pct": 3.0,
         "retrace_threshold": 0.55,
@@ -74,6 +75,16 @@
             "retrace_threshold": 0.4
           }
         ]
+      },
+      "max_loss": {
+        "trend": {
+          "max_loss_pct": 0.8,
+          "max_loss_roe_pct": 10.0
+        },
+        "non_trend": {
+          "max_loss_pct": 0.4,
+          "max_loss_roe_pct": 5.0
+        }
       }
     }
   },
@@ -124,6 +135,19 @@
     "risk_per_trade_pct": 0.02,
     "sizing_basis": "primary_stop"
   },
+  "plan_b": {
+    "enabled": true,
+    "rsi_low": 40.0,
+    "rsi_high": 60.0,
+    "size_mult": 0.5
+  },
+  "min_trend_score": 0.55,
+  "regime_classifier": {
+    "fast_ema": 20,
+    "slow_ema": 30,
+    "slope_threshold": 0.002,
+    "chop_adx_max": 20.0
+  },
   "capital_rotation": {
     "enabled": false,
     "shadow_mode": false,
@@ -164,5 +188,17 @@
     "min_crypto_24h_pct": 10.0,
     "min_hip3_24h_pct": 8.0,
     "min_volume_usd": 5000000
+  },
+  "debate_gate": {
+    "enabled": true,
+    "min_agreement": 0.6,
+    "min_agree_count": 3
+  },
+  "debate_research": {
+    "enabled": true,
+    "max_latency_s": 20,
+    "cache_ttl_s": 30,
+    "parallel": true,
+    "use_structured_output": true
   }
 }

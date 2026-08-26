@@ -1,6 +1,6 @@
 # Hermes 交易系统完整参数清单
 
-> 本文档完整列出交易系统从 **Scan → TA → AI → Risk → Execute → DSL Exit** 全管线预设配置参数、14 道风控闸门及其他系统参数设定。
+> 本文档完整列出交易系统从 **Scan → TA → AI → Risk → Execute → DSL Exit** 全管线预设配置参数、16 道风控闸门及其他系统参数设定。
 >
 > **数据来源**：代码默认值（`config.py` / `risk_gates.py` / `executor.py` / `dsl_exit.py` 等）+ 线上生效配置 `.agent-config.json`。
 > **当前线上模式**：`mode: LIVE`。
@@ -12,7 +12,7 @@
 1. [Scan 扫描层](#一scan-扫描层)
 2. [TA 技术过滤层](#二ta-技术过滤层)
 3. [AI 研究层](#三ai-研究层)
-4. [Risk 风控层（14 道闸门）](#四risk-风控层14-道闸门)
+4. [Risk 风控层（16 道闸门）](#四risk-风控层16-道闸门)
 5. [Execute 执行层](#五execute-执行层)
 6. [DSL Exit 动态止损层](#六dsl-exit-动态止损层)
 7. [其他系统参数](#七其他系统参数)
@@ -73,7 +73,7 @@
 
 | 环境变量 | 默认值 | 说明 |
 |----------|--------|------|
-| `HERMES_SCAN_INTERVAL` | **60** | 扫描周期（秒） |
+| `HERMES_SCAN_INTERVAL` | **15** | 扫描周期（秒）；HYPE 事故后由 60s 缩短至 15s，缩小 DSL 轮询盲区 |
 | `HERMES_STARTUP_GRACE_S` | **12** | 启动宽限（让 HL 限流桶回充） |
 | `HERMES_MIN_SCORE` | 54 | 最小复合分 |
 | `HERMES_MAX_MARKETS` | **60** | 每轮 K 线拉取预算 |
@@ -124,12 +124,13 @@
 | `OPENROUTER_MODEL` | `x-ai/grok-4.3` | AI 研究模型（默认，可覆盖 Qwen） |
 | `override_requires_ai` | **true** | AI 挂掉时禁止盲升级 |
 | `held_research_interval_min` | **10** | 持仓重研间隔（分钟） |
+| `research_cooldown_min` | **15** | 同一候选两次研究的最小间隔（分钟，避免重复付费 LLM） |
 | `min_ai_close_hold_min` | **25** | AI 最小持仓后平仓（分钟） |
 | `force_execute_composite` | **30** | 结构化升级复合分门槛 |
 | `composite_force_execute` | **false** | 复合分强制升级 |
 | `ta_sidestep_force_execute` | **true** | TA 旁路强制升级 |
 | `force_execute_slow_burn_count` | **2** | slow-burn 触发数量门槛 |
-| `ta_sidestep_min_slow_burn_count` | **2** | TA 旁路 slow-burn 数量门槛（**硬门槛**，见下） |
+| `ta_sidestep_min_slow_burn_count` | **99** | TA 旁路 slow-burn 数量门槛；线上设 99 等于禁用该分支（slow_burn_count 不可能达到，见下） |
 | `breakout_force_execute` | **false** | 突破强制升级（O'Neil） |
 | `whale_force_execute` | **false** | 鲸鱼信号强制升级 |
 
@@ -157,7 +158,7 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 
 ---
 
-## 四、Risk 风控层（14 道闸门）
+## 四、Risk 风控层（16 道闸门）
 
 来源：`hermes_trader/agents/risk_gates.py`。`eval_all_gates` 顺序评估，任一不过即整单拦截（不做短路，全部收集用于遥测）。
 
@@ -174,16 +175,18 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | 9 | `cooldown` | `cooldown_min` | **30** | 交易冷却（分钟） |
 | 10 | `opposite_guard` | — | — | 持仓禁止反手/加仓（金字塔） |
 | 11 | `correlation` | `max_crypto_long_correlated` | **3** | 加密多头相关性上限 |
-| 12 | `equity_risk` | `max_total_notional_pct` | **10.0** | 总敞口上限（1000%，支持小账户） |
+| 12 | `equity_risk` | `max_total_notional_pct` | **10.0** | 总敞口上限（聚合权益名义上限的 10%） |
 | 13 | `market_regime` | `counter_regime_min_conf` / `block_counter_trend_bypass` / `crowded_with_min_conf` | **0.8** / **true** / **0.8** | 市场制度闸（逆势需高置信/评分） |
 | 14 | `news` | AI `news_risk` | negative 停手 | 二元新闻熔断 |
+| 15 | `debate` | `debate_gate` | enabled, min_agreement 0.6 | 多智能体共识闸（5 路投票，需 ≥3 票且比例 ≥0.6） |
+| 16 | `hta_risk` | `hta_risk_gate` | enabled, fail_closed_shorts true | HTA 三方风险评审闸（熔断时空单 fail-closed，多单 fail-open） |
 
 ### 4.1 runner_entry_gate 入口闸（额外，`enabled: true`）
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `allow_shorts` | **false** | 禁止做空 |
-| `bypass_sidestep_overrides` | **false** | 是否让 sidestep override 绕过本闸门（`AND` 语义，仅对 `sidestep_override=true` 的候选生效） |
+| `bypass_sidestep_overrides` | **true** | 是否让 sidestep override 绕过本闸门（`AND` 语义，仅对 `sidestep_override=true` 的候选生效） |
 | `min_confidence` | **0.7** | 最低置信度。structural override 会把 `confidence` 抬到 `min_ai_confidence`，本闸门判的是抬升前的 `ai_confidence_raw`（无该字段时回退 `confidence`） |
 | `min_composite` | **30** | 最低复合分 |
 | `min_hip3_composite` | **50** | HIP-3 最低复合分 |
@@ -191,6 +194,23 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | `min_short_composite` | **25** | 做空最低复合分 |
 | `mover_min_confidence` | **0.72** | 日波动者最低置信度 |
 | `mover_min_composite` | **20** | 日波动者最低复合分 |
+
+#### 4.1.1 fresh_impulse 公式（代码内固化，非 config）
+
+来源：[executor.py:1897-1907](file:///home/ldy/hermes-trader/hermes_trader/agents/executor.py#L1897-L1907)。
+
+```
+fresh_impulse = breakout
+             or (volume and burst)
+             or (burst and score >= min_composite)
+```
+
+- `breakout` 单独即可触发：`breakout_fired` 已内置 RVOL≥1.5x + 双 K 线收盘确认，成交量自证，不再外挂要求 2σ volumeSpike（2026-08 D1 优化，消除双重成交量门槛，放行率 +1.4pp）。
+- `volume` = `volume_spike_fired`（20 根 5m K 线均量 z-score ≥ 2.0σ）。
+- `burst` = `momentum_burst_fired`。
+- fresh_impulse 通过后仍需结构确认：`structured_runner = fresh_impulse and (slow_burn_count >= 1 or score >= min_composite)`。
+
+完整优化过程（D1–D5、前向盈亏、后续建议）见 [runner-gate-fresh-impulse-optimization-2026-08.md](file:///home/ldy/hermes-trader/docs/runner-gate-fresh-impulse-optimization-2026-08.md)。
 
 ### 4.2 其他风控
 
@@ -214,7 +234,8 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | `atr_risk_sizing.enabled` | **true** | 启用 ATR 等风险 sizing |
 | `atr_risk_sizing.risk_per_trade_pct` | **0.02** | 每笔风险 = 权益 2% |
 | `atr_risk_sizing.sizing_basis` | **primary_stop** | 以 DSL 主止损为基准 |
-| `sl_atr_mult` | **1.5** | 备份 SL = 1.5×ATR |
+| `sl_atr_mult` | **1.5** | 备份 SL ATR 宽度倍数（clamp 前） |
+| `sl_ceiling_pct` | **3.0** | 备份 SL 距入场价的硬上限（%）；HYPE 事故后新增的 ceiling clamp |
 | `TP_ATR_MULT` | **1.0** | TP = 1.0×ATR |
 | `equity_fraction_per_trade` | **0.2** | legacy 兜底权益比例 |
 | `leverage` | **12** | 杠杆（legacy） |
@@ -246,6 +267,43 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | `shadow_signals.gex / short_volume / crypto_whale / news` | **true** | 全部开启 |
 | `shadow_signals.whale_window_min` | **15** | 鲸鱼窗口（分钟） |
 
+### 5.4 HYPE 穿仓事故后的 P0 风控加固（2026-08-21）
+
+2026-08-19 的 HYPE 8x 多单在约 10 分钟内录得 **-252% ROE**（穿仓），根因是备份止损
+与 DSL floor 之间形成 40pp 的无保护缺口。以下三项改动同时上线：
+
+1. **备份 SL ceiling clamp**（`sl_ceiling_pct`，默认 3.0%）
+   - 旧公式：`sl_width_pct = (atr / entry) × sl_atr_mult × 100`（裸倍数，可任意宽）
+   - 新公式：`sl_width_pct = min(atr_pct × sl_atr_mult, sl_ceiling_pct)`
+   - 语义：交易所端的 trigger SL 永远不会比入场价宽过 3%，即使 4h ATR 巨大。
+   - 配置：在 agent config 中覆盖 `sl_ceiling_pct`，或修改代码常量
+     `_DEFAULT_SL_CEILING_PCT`。
+
+2. **开仓 ATR 闸门**（`HERMES_MAX_ATR_PCT`，默认 15.0%）
+   - 入场前若 `atr / mid_price × 100 > 15%`，直接拒绝开仓，返回
+     `reason: "atr_too_high (...% > 15.0%)"`。
+   - 原因：即使备份 SL 被 clamp 到 3%，在 ATR 28% 的币上 3% 止损会被 1-2 根
+     4h K 线的正常噪声打掉；这类品种本身就不该进入仓位簿。
+   - HYPE 入场时 ATR ≈ 28.75%，本闸门若已存在会直接拦下该笔交易。
+
+3. **DSL 轮询间隔 60s → 15s**（`HERMES_SCAN_INTERVAL`）
+   - DSL 软件止损依赖主循环轮询。60s 间隔在闪崩场景下意味着价格可在两次检查
+     之间跨过 DSL floor 数十个百分点；缩短到 15s 把最大轮询盲区压缩到 1/4。
+   - 异常兜底休眠也同步由 60s 缩短至 15s。
+
+> **参数差异速查（HYPE 入场时）**
+>
+> | 止损层 | 公式 | 距入场 | 实际价位（入场 $74.00） |
+> |--------|------|--------|--------------------------|
+> | 备份 SL（事故时） | `ATR×1.5` 无 clamp | **-43.1%** | $42.08 |
+> | DSL floor | `clamp(ATR×1.2, 1.2%, 3.0%)` | **-3.0%** | $71.78 |
+> | 无保护缺口 | 备份 - floor | **40.1pp** | 价格在此区间内只有软件轮询能挡 |
+>
+> 事故时备份 SL 实际上没有起到兜底作用——价格在 9.8 分钟内从 $74 跌到 $50.69，
+> DSL floor 虽然在 -3% 计算正确，但 60s 轮询 + 极端滑点导致最终在 -31.5%
+> 才被强平检测到。修复后：备份 SL 被 clamp 到 -3%（与 DSL floor 对齐），
+> 轮询 4× 更密，ATR > 15% 的币根本进不来。
+
 ---
 
 ## 六、DSL Exit 动态止损层
@@ -255,7 +313,7 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | 参数 | 线上值 | 说明 |
 |------|--------|------|
 | `max_loss_pct` | **0.4%** | 现货最大止损 |
-| `max_loss_roe_pct` | **3.0%** | 杠杆感知 ROE 止损（3.0 / lev） |
+| `max_loss_roe_pct` | **5.0%** | 杠杆感知 ROE 止损（5.0 / lev） |
 | `protect_pct` | **1.25%** | 进入 Phase 2 门槛 |
 | `retrace_threshold` | **0.2** | 默认回吐比例 |
 | `hard_timeout_minutes` | **1800**（30h） | 紧急超时退出 |
@@ -270,7 +328,7 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | `noise_band.enabled` | **false** | 噪声带抑制关闭 |
 | `noise_band.atr_mult` | **1.0** | 噪声带 ATR 倍数 |
 | `phase2_tiers` | 8%→35%；15%→40% | 利润锁定阶梯 |
-| `regime_aware.enabled` | **false** | 顺势放宽关闭 |
+| `regime_aware.enabled` | **true** | 顺势放宽开启（trend 0.8%/10% ROE，non-trend 0.4%/5% ROE） |
 | `regime_aware.trend_ride.protect_pct` | **3.0** | 顺势保护门槛 |
 | `regime_aware.trend_ride.retrace_threshold` | **0.55** | 顺势回吐 |
 | `regime_aware.trend_ride.phase2_tiers` | 3%/8%/15% | 顺势阶梯 |
@@ -313,7 +371,9 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | `BRAVE_API_KEY` | Brave Search 密钥 |
 | `HYPERLIQUID_WALLET_ADDRESS` / `HYPERLIQUID_PRIVATE_KEY` | Hyperliquid 钱包 / 私钥 |
 | `HYPERLIQUID_MASTER_ADDRESS` | 主账户地址（可选） |
-| `HERMES_SCAN_INTERVAL` | 扫描周期（默认 60s） |
+| `HERMES_SCAN_INTERVAL` | 扫描周期（默认 **15s**，2026-08-21 由 60s 下调） |
+| `HERMES_MAX_ATR_PCT` | 开仓 ATR 上限（默认 **15.0%**），4h ATR(14)/现价 超过则拒绝开仓（`reason: atr_too_high`） |
+| `HERMES_MAX_SPREAD_PCT` | 开仓盘口价差上限（默认 1.0%） |
 | `HERMES_MAX_MARKETS*` / `HERMES_BATCH_*` | 扫描预算 |
 | `HERMES_DSL_STATE_FILE` | DSL 状态文件路径 |
 | `HERMES_AGENT_CONFIG_FILE` | 代理配置路径（默认 `.agent-config.json`） |
@@ -325,7 +385,8 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 
 | 常量 | 值 | 说明 |
 |------|-----|------|
-| `_DEFAULT_SL_ATR_MULT` | **1.5** | 备份止损默认（`executor.py`） |
+| `_DEFAULT_SL_ATR_MULT` | **1.5** | 备份止损 ATR 倍数默认（`executor.py`） |
+| `_DEFAULT_SL_CEILING_PCT` | **3.0** | 备份止损距入场价的硬上限（%），`min(atr_pct×mult, ceiling)` |
 | `TP_ATR_MULT` | **1.0** | 止盈 ATR 倍数 |
 | `_DEFAULT_CONVICTION_TIERS` | [(0.80,1.5),(0.65,1.0),(0,0.7)] | 置信度分级倍率 |
 | `_CRYPTO_COINS` | 40 币 | 相关性上限币池 |

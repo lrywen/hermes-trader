@@ -14,3 +14,8 @@ _tmp = tempfile.mkdtemp(prefix="hermes-test-state-")
 os.environ["HERMES_AGENT_MEMORY_FILE"] = os.path.join(_tmp, ".agent-memory.json")
 os.environ["HERMES_AGENT_CONFIG_FILE"] = os.path.join(_tmp, ".agent-config.json")
 os.environ["HERMES_DSL_STATE_FILE"] = os.path.join(_tmp, ".dsl-state.json")
+# Redirect the authoritative event feed + operational heartbeat so tests that
+# exercise record_trade/record_close or session_log.append never touch the
+# live volume's events.jsonl / session-log.jsonl.
+os.environ["HERMES_EVENTS_FILE"] = os.path.join(_tmp, "events.jsonl")
+os.environ["SESSION_LOG_PATH"] = os.path.join(_tmp, "session-log.jsonl")

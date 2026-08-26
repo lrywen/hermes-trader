@@ -81,7 +81,7 @@ deploying a hosted multi-tenant version on top is your business decision.
 
 ## The trading pipeline
 
-One scan cycle (default 60s, env-tunable via `HERMES_SCAN_INTERVAL`):
+One scan cycle (default 15s, env-tunable via `HERMES_SCAN_INTERVAL`, shortened from 60s after the HYPE incident):
 
 ```
 1. HEARTBEAT
@@ -131,7 +131,7 @@ One scan cycle (default 60s, env-tunable via `HERMES_SCAN_INTERVAL`):
         sends to OpenRouter LLM (Grok-4 or similar), parses verdict
         (LONG / SHORT / PASS) + confidence (0-1) + entry/stop/tp prices.
         memory.record_analysis() persists the result.
-     d. Risk gates (risk_gates.eval_all_gates) — 11 independent gates,
+     d. Risk gates (risk_gates.eval_all_gates) — 16 independent gates,
         all evaluated (no short-circuit) for telemetry. Listed below.
      e. Executor (executor.maybe_execute) — defensive equity guard first
         (refuse if HL API returned equity=0). If all gates pass: size
@@ -144,7 +144,7 @@ One scan cycle (default 60s, env-tunable via `HERMES_SCAN_INTERVAL`):
      f. Log `execute` event with side, executed flag, order_id, blocked_by.
 ```
 
-### The 11 risk gates
+### The 16 risk gates
 
 All evaluated; results recorded for telemetry. Trade blocks if any returns
 `{pass: False}`. **All config keys are `snake_case`** — legacy camelCase
@@ -157,7 +157,9 @@ used by the old MCP-server status display.
 | `max_concurrent` | Open positions < `max_concurrent` |
 | `notional_cap` | Per-trade notional ≤ `max_trade_notional_usd` |
 | `daily_loss` | Daily PnL > `max_daily_loss_usd` (kill switch) |
+| `daily_giveback` | Halts new entries once realized+unrealized PnL gives back more than `daily_giveback_halt_pct` from the session peak (peak must exceed `daily_giveback_min_peak_usd`) |
 | `liquidity` | Asset-class-aware floor. Crypto: ≥ `min_market_volume_usd` (default 5M). HIP-3 (colon-namespaced): ≥ `min_hip3_volume_usd` (default 500k). Same floor would have wrongly blocked legitimately-liquid tokenized markets like `xyz:CRCL` ($4.7M) and `km:USTECH` ($1.06M). |
+| `short_liquidity` | Per-side floor for shorts: 24h volume on the coin must clear `min_short_volume_usd` (0 disables) so illiquid borrow/sell-side conditions don't trap a short |
 | `coin_filter` | Coin not in blocklist; if allowlist set, must be in it |
 | `cooldown` | Same-coin cooldown elapsed (`cooldown_min`). Keys off the most-recent REAL trade in memory (blocked attempts no longer pollute this — see fix in pipeline section). |
 | `opposite_guard` | No simultaneous opposite-direction position on the same coin |
@@ -165,6 +167,8 @@ used by the old MCP-server status display.
 | `equity_risk` | Total open notional ≤ `max_total_notional_pct × equity` |
 | `market_regime` | Counter-trend trades blocked unless confidence ≥ `counter_regime_min_conf`. Per-asset-class proxy: BTC for crypto, `xyz:SP500` for equity, own ticker for commodities. |
 | `news` | No binary news risk in research's news_context (Fed/CPI/earnings/etc.) |
+| `debate` | Multi-agent conviction debate (bull vs. bear vs. critic) must not produce a blocking dissent against the AI verdict |
+| `hta_risk` | HTA three-party risk review gate; fails **open** on timeout/unavailability so a missing AI advisor never blocks trading |
 
 ### Why the two-stage AI gating
 
@@ -485,9 +489,9 @@ hermes-trader/
 │   │   ├── perception.py        # scanner: volume-pre-filtered parallel scan
 │   │   ├── ta_filter.py         # multi-TF gate, pre-AI
 │   │   ├── research.py          # AI research via OpenRouter
-│   │   ├── executor.py          # Kelly sizing + risk gates + place order + DSL register
+│   │   ├── executor.py          # ATR equal-risk sizing + risk gates + place order + DSL register
 │   │   ├── dsl_exit.py          # two-phase trailing stop engine + persistence
-│   │   ├── risk_gates.py        # 12 independent gates (incl. market_regime)
+│   │   ├── risk_gates.py        # 16 independent gates (incl. market_regime, debate, hta_risk)
 │   │   ├── market_regime.py     # per-asset-class regime detection (new)
 │   │   ├── memory.py            # disk-backed singleton state
 │   │   ├── config.py / config_store.py  # config read/write
@@ -513,7 +517,7 @@ hermes-trader/
 │   └── backtest.py              # historical-candle backtest
 ├── skills/hermes-trader-agent/  # Hermes Agent skill (operator's manual + helper scripts)
 ├── tests/                       # offline unit + online + live-e2e
-├── docs/                        # this file + journal-schema
+├── docs/                        # this file (journal schema lives as dataclasses in hermes_trader/journal.py)
 ├── Dockerfile / fly.toml / DEPLOY.md   # one-machine Fly deploy
 └── .env.local / .agent-config.json / .agent-memory.json / .dsl-state.json
 ```
@@ -524,7 +528,7 @@ hermes-trader/
 
 ### What works at one-user scale today
 - Single wallet, ~10 concurrent positions, multi-asset (crypto + equity + commodity)
-- 60s scan cycle over top 60 markets stays under HL's 1200 weight/min rate limit
+- 15s scan cycle over top 60 markets stays under HL's 1200 weight/min rate limit
 - JSONL log + 4 JSON state files is sufficient persistence — no DB needed
 - Dashboard handles a single instance; SSE feed scales to ~100 simultaneous viewers
   on a free Fly tier
@@ -664,7 +668,7 @@ cp .env.local.example .env.local
 echo '{"mode":"OFF","minAiConfidence":0.8,"max_concurrent":3}' > .agent-config.json
 
 # 4. Run the trading loop and the dashboard
-python3 scripts/trading_loop.py &     # scans every 60s
+python3 scripts/trading_loop.py &     # scans every 15s (HERMES_SCAN_INTERVAL)
 python3 -m hermes_trader.server &      # dashboard at http://localhost:8000
 
 # 5. Watch one cycle — the dashboard's live feed shows scans + research verdicts
@@ -854,37 +858,49 @@ explosion, and most "wins" become noise.
 
 ---
 
-## Risk modeling — Kelly, retrace tiers, daily killswitch
+## Risk modeling — ATR equal-risk sizing, retrace tiers, daily killswitch
 
-### Half-Kelly sizing (in `executor.kelly_size`)
+### Position sizing — ATR equal-risk (primary stop)
 
-The classical Kelly criterion says: **fraction of capital to bet** =
-`(p × b − q) / b` where:
-- p = win probability (= AI confidence)
-- q = 1 − p
-- b = reward-to-risk ratio (= tp distance / sl distance)
+The live sizing path is **ATR equal-risk**, not Kelly. The legacy half-Kelly
+helper (`executor.kelly_size`) and its unit test were removed together —
+see the comment block at `executor.py` ~L159 — so there is no Kelly code
+path left to call. Sizing is driven by the `atr_risk_sizing` block in
+`.agent-config.json`:
 
-Full Kelly maximizes long-run growth but is brutally volatile (it'll cut
-your capital in half from peak with high probability before recovering).
-Standard practice is **half-Kelly** — divide the result by 2 — which gives
-~75% of full Kelly's expected growth at ~half the volatility.
-
-In the executor:
-
-```python
-def kelly_size(confidence, equity, reward_risk_ratio, max_trade_notional):
-    p = confidence; q = 1 - p; b = reward_risk_ratio
-    f_star = max(0, (p * b - q) / b) if b != 0 else 0
-    half_kelly = f_star / 2
-    return min(half_kelly * equity, max_trade_notional)
+```jsonc
+"atr_risk_sizing": {
+  "enabled": true,
+  "risk_per_trade_pct": 0.02,   // risk 2% of aggregate equity per trade
+  "sizing_basis": "primary_stop" // size off the DSL primary hard stop
+}
 ```
 
-**This is the historical implementation.** The *live* sizing in the current
-build actually uses a simpler fixed-fraction:
-`equity × equity_fraction_per_trade × leverage`. The Kelly function is kept
-as a reference implementation and is the model to switch back to when AI
-confidence + tp/sl ratios are well-calibrated. The fixed-fraction sizing
-is simpler to reason about during the calibration phase.
+With `sizing_basis: "primary_stop"`, notional is
+
+```
+notional = (risk_per_trade_pct × agg_equity) / stop_frac
+stop_frac = min(dsl_exit.max_loss_pct, dsl_exit.max_loss_roe_pct / leverage) / 100
+```
+
+so every trade risks the same dollar amount regardless of how wide the
+stop is. The result is then clamped by `max_trade_notional_usd`,
+remaining room under `max_total_notional_pct × agg_equity`, and per-coin
+/ config leverage. The `atr_stop` basis (the other branch in
+`sizing.atr_equal_risk_notional`) sizes off a 14-period 4h ATR ×
+`sl_atr_mult`; primary-stop is the online setting because it matches the
+actual stop the DSL engine will enforce.
+
+Two sizing layers sit around this core:
+
+- **`conviction_sizing`** (optional multiplier) — scales the legacy
+  fixed-fraction path by AI-confidence tiers. **Disabled in production**
+  while ATR equal-risk is active; retained only for the fallback path.
+- **Legacy fixed-fraction fallback** — when `atr_risk_sizing.enabled` is
+  false, notional = `equity × equity_fraction_per_trade × leverage`
+  (default `equity_fraction_per_trade = 0.2`) with the optional
+  conviction multiplier. This is the backstop, not the live sizing
+  method.
 
 ### Retrace tier theory (in `dsl_exit.ExitPolicy.phase2_tiers`)
 
@@ -935,13 +951,13 @@ existing positions still get DSL-managed.
 HL's `accountValue`, which occasionally returns `0` on a transient API
 hiccup before recovering. A zero reading mid-day looks like a catastrophic
 loss and trips the killswitch on phantom data. The mitigation is to
-sanity-check the heartbeat: if equity drops >50% in a single 60s tick AND
+sanity-check the heartbeat: if equity drops >50% in a single 15s tick AND
 no `dsl_exit` event explains it, treat the reading as transient and don't
 update daily PnL until the next clean tick. **TODO** in the loop.
 
 ### Risk gate composition philosophy
 
-The 12 gates evaluate in parallel (no short-circuit) and the trade blocks
+The 16 gates evaluate in parallel (no short-circuit) and the trade blocks
 if any returns `pass: False`. Two consequences:
 
 1. **You always see all gate results in the execute event's telemetry,
@@ -950,14 +966,17 @@ if any returns `pass: False`. Two consequences:
 2. **Adding a gate is additive.** Composition is a frozenset; you can't
    accidentally weaken safety by adding more gates, only by removing one.
 
-The 12 gates split into three layers conceptually:
+The 16 gates split into three layers conceptually:
 
-- **Position-level** (confidence, opposite_guard, cooldown) — about *this*
-  trade in *this* moment.
+- **Position-level** (confidence, opposite_guard, cooldown, debate,
+  hta_risk) — about *this* trade in *this* moment, including the
+  multi-agent conviction/HTA review overlays.
 - **Portfolio-level** (max_concurrent, notional_cap, equity_risk,
-  correlation) — about how this trade fits the rest of your book.
-- **Macro-level** (daily_loss, liquidity, coin_filter, market_regime,
-  news) — about external conditions independent of your book.
+  correlation, daily_giveback) — about how this trade fits the rest of
+  your book and the intraday profit giveback from peak.
+- **Macro-level** (daily_loss, liquidity, short_liquidity, coin_filter,
+  market_regime, news) — about external conditions independent of your
+  book.
 
 When a strategy fires too much or too little, look at which layer is
 binding. The session log's `gate_results` payload tells you exactly.

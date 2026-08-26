@@ -207,6 +207,22 @@ def test_parse_order_result_extracts_avg_px_and_total_sz():
     assert g["ok"] is True and "avg_px" not in g
 
 
+def test_parse_order_result_rejects_empty_statuses():
+    """An ok envelope with no statuses must NOT be treated as success.
+    Regression guard for the BCH TP 2026-08-21 incident where a trigger order
+    was accepted at placement then silently rejected on trigger (minTradeNtl);
+    the empty-statuses fallback previously returned {"ok": True}."""
+    from hermes_trader.client.exchange import _parse_order_result
+    empty = {"status": "ok", "response": {"data": {"statuses": []}}}
+    out = _parse_order_result(empty, accept_resting=True)
+    assert out["ok"] is False
+    assert "no order status" in out["error"]
+
+    weird = {"status": "ok", "response": {"data": {"statuses": [{"unknown": {}}]}}}
+    w = _parse_order_result(weird)
+    assert w["ok"] is False
+
+
 # ── research verdict parsing (camelCase fallback kept intentionally) ─────
 def test_parse_verdict_json_camelcase():
     from hermes_trader.agents.research import parse_verdict
@@ -264,14 +280,6 @@ def test_parse_verdict_extracts_news_risk():
     assert parse_verdict('{"verdict":"PASS","confidence":0}', "B", {"mid": 1})["news_risk"] == "none"
 
 
-# ── kelly sizing ────────────────────────────────────────────────────────
-def test_kelly_size():
-    from hermes_trader.agents.executor import kelly_size
-    assert kelly_size(0.9, 1000, 2.0, 500) > 0
-    assert kelly_size(0.3, 1000, 2.0, 500) == 0          # negative edge
-    assert kelly_size(0.99, 1_000_000, 5.0, 100) == 100  # capped
-
-
 # ── risk gates ──────────────────────────────────────────────────────────
 def _ctx(**kw):
     from hermes_trader.agents.risk_gates import GateContext
@@ -311,7 +319,7 @@ def test_aligned_min_conf_lets_aligned_shorts_through(monkeypatch):
     (SOL SHORT 0.72 was being blocked by the 0.78 long-calibrated bar)."""
     import hermes_trader.agents.market_regime as mr
     from hermes_trader.agents.risk_gates import eval_all_gates
-    monkeypatch.setattr(mr, "detect_regime", lambda coin, **k: "down")
+    monkeypatch.setattr(mr, "detect_regime_with_score", lambda coin, **k: ("down", 1.0))
     cfg = {"min_ai_confidence": 0.78, "aligned_min_conf": 0.70, "max_concurrent": 5,
            "max_trade_notional_usd": 500, "max_daily_loss_usd": -300,
            "min_market_volume_usd": 8e5, "max_total_notional_pct": 1.0,
@@ -644,25 +652,26 @@ def test_native_crypto_tickers_skips_namespaced_and_caches(monkeypatch):
 
 
 def test_trend_from_closes_up_down_neutral():
-    """EMA20>EMA50 + positive fast-slope → up; opposite → down; flat → neutral."""
-    from hermes_trader.agents.market_regime import _trend_from_closes
+    """EMA20>EMA30 + positive fast-slope → up; opposite → down; flat → neutral."""
+    from hermes_trader.agents.market_regime import trend_from_closes
     # Pure uptrend: prices rising linearly
-    assert _trend_from_closes([100 + i for i in range(60)]) == "up"
+    assert trend_from_closes([100 + i for i in range(60)]) == "up"
     # Pure downtrend
-    assert _trend_from_closes([200 - i for i in range(60)]) == "down"
+    assert trend_from_closes([200 - i for i in range(60)]) == "down"
     # Pure flat
-    assert _trend_from_closes([100.0] * 60) == "neutral"
+    assert trend_from_closes([100.0] * 60) == "neutral"
     # Too few candles
-    assert _trend_from_closes([100.0] * 20) == "neutral"
+    assert trend_from_closes([100.0] * 20) == "neutral"
 
 
 def test_detect_regime_caches_and_uses_proxy(monkeypatch):
     """detect_regime should call the proxy (BTC/NVDA/own) and cache the result."""
     from hermes_trader.agents import market_regime
     market_regime._regime_cache.clear()
+    market_regime._score_cache.clear()
     calls: list[str] = []
-    monkeypatch.setattr(market_regime, "_detect_for_proxy",
-                        lambda proxy: calls.append(proxy) or "up")
+    monkeypatch.setattr(market_regime, "_detect_for_proxy_with_score",
+                        lambda proxy: (calls.append(proxy) or "up", 1.0))
     # First call for an alt coin → fetches BTC proxy
     assert market_regime.detect_regime("PEPE") == "up"
     assert calls == ["BTC"]
@@ -683,7 +692,7 @@ def test_detect_regime_caches_and_uses_proxy(monkeypatch):
 def test_market_regime_gate_aligned_passes(monkeypatch):
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "up")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "assets": []})
     # Long when up → pass, regardless of confidence
@@ -697,7 +706,7 @@ def test_market_regime_gate_via_reports_trigger_bypass(monkeypatch):
     via='trigger:slow_burn' and counter context — this is the LINK/FARTCOIN case."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "SHORT_CROWDED",
                                  "regimes_by_class": {"crypto": "SHORT_CROWDED"}})
@@ -715,7 +724,7 @@ def test_market_regime_gate_via_reports_trigger_bypass(monkeypatch):
 def test_market_regime_gate_via_confidence_and_blocked(monkeypatch):
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "SHORT_CROWDED",
                                  "regimes_by_class": {"crypto": "SHORT_CROWDED"}})
@@ -732,7 +741,7 @@ def test_market_regime_gate_via_confidence_and_blocked(monkeypatch):
 def test_market_regime_gate_neutral_passes(monkeypatch):
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "assets": []})
     r = market_regime_gate(_ctx(confidence=0.1, trade_side="short"))
@@ -742,7 +751,7 @@ def test_market_regime_gate_neutral_passes(monkeypatch):
 def test_market_regime_gate_counter_low_conf_blocks(monkeypatch):
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "up")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "assets": []})
     r = market_regime_gate(_ctx(confidence=0.5, trade_side="short"))
@@ -755,7 +764,7 @@ def test_market_regime_gate_counter_high_conf_passes(monkeypatch):
     high-conviction contrarian trades are the whole point of the bypass."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "up")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "assets": []})
     r = market_regime_gate(_ctx(confidence=0.85, trade_side="short"))
@@ -767,7 +776,7 @@ def test_market_regime_gate_wired_into_eval_all(monkeypatch):
     right time — regression guard against forgetting to wire it in."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import eval_all_gates
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "up")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "assets": []})
     cfg = {"min_ai_confidence": 0.3, "max_concurrent": 10,
@@ -805,7 +814,7 @@ def test_funding_regime_short_crowded_blocks_low_conf_long(monkeypatch):
     through. This is the main reason for the patch."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "SHORT_CROWDED")
     r = market_regime_gate(
         _ctx(confidence=0.70, trade_side="long", composite_score=0),
@@ -820,7 +829,7 @@ def test_funding_regime_short_crowded_high_conf_long_passes(monkeypatch):
     we never want to hard-block strong individual signals."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "SHORT_CROWDED")
     r = market_regime_gate(
         _ctx(confidence=0.90, trade_side="long"),
@@ -835,7 +844,7 @@ def test_funding_regime_long_crowded_blocks_low_conf_short(monkeypatch):
     becoming long-only-restrictive when the regime flips."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "LONG_CROWDED")
     r = market_regime_gate(
         _ctx(confidence=0.70, trade_side="short", composite_score=0),
@@ -851,7 +860,7 @@ def test_funding_regime_aligned_no_extra_friction(monkeypatch):
     once we're at trend-regime neutral."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "SHORT_CROWDED")
     r = market_regime_gate(
         _ctx(confidence=0.40, trade_side="short"),
@@ -865,7 +874,7 @@ def test_funding_regime_neutral_doesnt_change_behavior(monkeypatch):
     pre-patch version — no elevated bar, only the trend-regime check."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "NEUTRAL")
     # Low-conf long in a neutral trend + neutral funding → pass (no friction).
     r = market_regime_gate(
@@ -881,7 +890,7 @@ def test_funding_regime_overlay_respects_binary_triggers(monkeypatch):
     for stale macro calls, and the user's spec said do not weaken them."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "SHORT_CROWDED")
     # Low-conf, low-score long in SHORT_CROWDED, but momentum_burst fired → pass
     r = market_regime_gate(
@@ -904,7 +913,7 @@ def test_funding_regime_overlay_score_threshold_elevated(monkeypatch):
     (vs the normal 50) to clear via the score bypass."""
     from hermes_trader.agents import market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     _patch_funding(monkeypatch, "SHORT_CROWDED")
     # Score 55 was enough pre-patch (>= 50), should now BLOCK against funding regime.
     r_block = market_regime_gate(
@@ -956,7 +965,7 @@ def test_funding_regime_per_class_crypto_short_crowded_does_not_gate_oil(monkeyp
     funding regime is SHORT_CROWDED — oil has its own funding market."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
         "regime": "SHORT_CROWDED",
         "regimes_by_class": {
@@ -980,7 +989,7 @@ def test_funding_regime_per_class_crypto_short_crowded_does_not_gate_arm(monkeyp
     bug that snuck xyz:ARM through the gate in production."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
         "regime": "SHORT_CROWDED",
         "regimes_by_class": {
@@ -1003,7 +1012,7 @@ def test_funding_regime_per_class_equity_short_crowded_gates_equity_long(monkeyp
     correctly to the matching asset class."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
         "regime": "NEUTRAL",
         "regimes_by_class": {
@@ -1028,7 +1037,7 @@ def test_funding_regime_per_class_falls_back_to_legacy_when_missing(monkeypatch)
     rather than silently disabling the overlay."""
     from hermes_trader.agents import market_regime, hyperfeed
     from hermes_trader.agents.risk_gates import market_regime_gate
-    monkeypatch.setattr(market_regime, "detect_regime", lambda c: "neutral")
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     # NO regimes_by_class key — legacy shape.
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
                         lambda: {"regime": "SHORT_CROWDED", "assets": []})
@@ -1183,6 +1192,11 @@ def test_fetch_account_state_aggregates_hip3_dexes(monkeypatch):
 
     monkeypatch.setattr(hl_client, "_http_post", _fake_http_post)
     monkeypatch.setattr("hermes_trader.client.universe.list_hip3_dexes", lambda: ["xyz", "vntl"])
+    # CANONICAL_DEFAULTS has hip3_dex_allowlist=["xyz"]; clear it so both
+    # mocked dexes are aggregated (the test exercises cross-dex summation).
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"hip3_dex_allowlist": [], "hip3_dex_blocklist": []})
 
     state = hl_client.fetch_account_state("0xUSER", include_hip3=True)
     # Aggregated equity = main 1000 + xyz 250 + vntl 50 = 1300
@@ -1866,7 +1880,7 @@ def test_maybe_execute_reentry_backstop_blocks_when_live_read_drops_position(mon
     monkeypatch.setattr(executor, "get_max_leverage", lambda c: 10)
     monkeypatch.setattr(executor, "min_entry_notional_usd", lambda c, mid: 10.5)
     monkeypatch.setattr(executor, "entry_size_for_notional", lambda c, n, mid: n / mid)
-    monkeypatch.setattr("hermes_trader.agents.market_regime.detect_regime", lambda c: "neutral")
+    monkeypatch.setattr("hermes_trader.agents.market_regime.detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr("hermes_trader.agents.hyperfeed.market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "regimes_by_class": {}})
     monkeypatch.setattr(executor, "place_hl_order",
@@ -2167,6 +2181,7 @@ def test_maybe_execute_ta_sidestep_can_bypass_runner_gate(monkeypatch):
         "enable_hip3": False,
         "min_ai_confidence": 0.70,
         "ta_sidestep_force_execute": True,
+        "ta_sidestep_min_slow_burn_count": 1,
         "force_execute_composite": 20,
         "runner_entry_gate": {
             "enabled": True,
@@ -2360,7 +2375,7 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
     # patch at the source module, not on executor.
     monkeypatch.setattr("hermes_trader.client.hl_client._http_post",
                         lambda p, pl: {"marginSummary": {"accountValue": "500"}})
-    monkeypatch.setattr("hermes_trader.agents.market_regime.detect_regime", lambda c: "neutral")
+    monkeypatch.setattr("hermes_trader.agents.market_regime.detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr("hermes_trader.agents.hyperfeed.market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "regimes_by_class": {}})
     def _place(is_buy, size, mid, coin):
@@ -2475,7 +2490,9 @@ def test_maybe_execute_conviction_sizing_high_conf(monkeypatch):
 
 def test_maybe_execute_whale_boosts_size(monkeypatch):
     """Whale signal multiplies sizing by 1.3 on top of the conf tier."""
-    ex, captured, _ = _exec_baseline(monkeypatch)
+    ex, captured, _ = _exec_baseline(monkeypatch, cfg_overrides={
+        "whale_size_multiplier": 1.3,
+    })
     ex.maybe_execute(_analysis(confidence=0.70, whale_signal={"confidence": 0.5}))
     # 1000 × 0.10 × 10 × (1.0 × 1.3) / 100 = 13 coins
     assert abs(captured["size"] - 13.0) < 1e-6
@@ -2609,50 +2626,6 @@ def test_oi_funding_anomaly_requires_flat_price(monkeypatch):
     out = whale_index.oi_funding_anomaly()
     coins = {s["coin"] for s in out}
     assert coins == {"FLAT"}
-
-
-def test_leaderboard_get_top_reads_registry(monkeypatch):
-    """leaderboard_get_top builds entries from WHALE_WALLETS via _http_post."""
-    from hermes_trader.agents import whale_index
-    monkeypatch.setattr(whale_index, "WHALE_WALLETS",
-                        {"0xABC": {"name": "alpha"}})
-    monkeypatch.setattr(whale_index, "_http_post", lambda path, body: {
-        "marginSummary": {"accountValue": "10000"},
-        "assetPositions": [
-            {"position": {"coin": "BTC", "szi": "1.5", "entryPx": "60000",
-                          "leverage": {"value": "10"}}},
-            {"position": {"coin": "ETH", "szi": "0"}},  # filtered out
-        ],
-    })
-    out = whale_index.leaderboard_get_top()
-    assert len(out) == 1
-    assert out[0]["account_value"] == 10000.0
-    assert [p["coin"] for p in out[0]["positions"]] == ["BTC"]
-
-
-def test_get_trader_state_returns_none_without_perp(monkeypatch):
-    from hermes_trader.agents import whale_index
-    monkeypatch.setattr(whale_index, "_fetch_clearinghouse", lambda u: None)
-    monkeypatch.setattr(whale_index, "_fetch_user_fills", lambda u, limit=20: [])
-    assert whale_index.get_trader_state("0xABC") is None
-
-
-def test_get_trader_state_merges_positions_and_fills(monkeypatch):
-    from hermes_trader.agents import whale_index
-    monkeypatch.setattr(whale_index, "_fetch_clearinghouse", lambda u: {
-        "marginSummary": {"accountValue": "5000", "totalNtlPos": "12000"},
-        "assetPositions": [
-            {"position": {"coin": "SOL", "szi": "-20", "entryPx": "150",
-                          "leverage": {"value": "5"}, "unrealizedPnl": "-30"}},
-        ],
-    })
-    monkeypatch.setattr(whale_index, "_fetch_user_fills", lambda u, limit=20: [
-        {"coin": "SOL", "side": "A", "px": "150", "sz": "20", "fee": "0.1", "time": 1},
-    ])
-    st = whale_index.get_trader_state("0xABC")
-    assert st["account_value"] == 5000.0
-    assert st["positions"][0]["side"] == "short"
-    assert len(st["recent_trades"]) == 1
 
 
 # ── Coverage: hyperfeed market-data lookups ─────────────────────────────
@@ -2937,7 +2910,7 @@ def test_closed_trades_payload_estimates_leverage_and_side(monkeypatch):
          "unrealized_pct": -1.0, "reason": "stop"},
     ]
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
-    monkeypatch.setattr(dashboard, "read_agent_config", lambda: {"leverage": 20})
+    monkeypatch.setattr(dashboard, "cfg_get", lambda key, config=None: 20 if key == "leverage" else None)
     monkeypatch.setattr(dashboard, "_load_max_lev_table", lambda: {"ETH": 25})
     out = dashboard._closed_trades_payload()
     row = out[0]
@@ -3142,3 +3115,419 @@ def test_news_blackout_gate_reason_includes_match():
     r = news_blackout_gate(blocked)
     assert r["pass"] is False
     assert "Coin hacked for $1M" in r["reason"]
+
+
+# ── P0/P1/P2 late-entry & quality optimizations (2026-08) ───────────────────
+
+def _mk_candle(t, o, h, l, c, v):
+    return Candle(t=t, o=o, h=h, l=l, c=c, v=v)
+
+
+def _flat_candles(n, price=100.0, vol=1000.0, rng=0.5):
+    """Choppy/flat candles oscillating around `price` (produces low ADX)."""
+    out = []
+    for i in range(n):
+        s = 1.0 if (i % 2 == 0) else -1.0
+        c = price + s * (i % 3) * 0.1
+        out.append(_mk_candle(i, c, c + rng, c - rng, c, vol))
+    return out
+
+
+def _trend_candles(n, start=100.0, step=0.5, vol=1000.0):
+    """Steadily rising candles (produces high ADX)."""
+    out = []
+    for i in range(n):
+        c = start + i * step
+        out.append(_mk_candle(i, c, c + 0.8, c - 0.2, c, vol + i))
+    return out
+
+
+# ── math.obv ────────────────────────────────────────────────────────────────
+
+def test_obv_accumulates_on_up_closes():
+    from hermes_trader.indicators.math import obv
+    # three up closes: OBV should be cumulative positive volume
+    cs = [
+        _mk_candle(0, 100, 101, 99, 100, 1000),
+        _mk_candle(1, 100, 101, 99, 101, 500),
+        _mk_candle(2, 101, 102, 100, 102, 300),
+    ]
+    series = obv(cs)
+    assert series[0] == 0.0
+    assert series[1] == 500.0     # up bar +500
+    assert series[2] == 800.0     # up bar +300
+
+
+def test_obv_distributes_on_down_closes():
+    from hermes_trader.indicators.math import obv
+    cs = [
+        _mk_candle(0, 100, 101, 99, 100, 1000),
+        _mk_candle(1, 100, 100, 98, 99, 400),
+        _mk_candle(2, 99, 99, 97, 98, 200),
+    ]
+    series = obv(cs)
+    assert series[1] == -400.0
+    assert series[2] == -600.0
+
+
+# ── ta_filter helpers: extension / OBV slope / volume confirm ───────────────
+
+def test_extension_atr_sign_and_magnitude():
+    from hermes_trader.agents import ta_filter
+    # A strong uptrend puts price well above EMA21 -> positive extension
+    up = _trend_candles(60, start=100.0, step=1.0)
+    ext_up = ta_filter._extension_atr(up)
+    assert ext_up is not None and ext_up > 0
+
+    # Downtrend -> negative extension
+    down = [_mk_candle(i, 100 - i, 101 - i, 99 - i, 100 - i, 1000) for i in range(60)]
+    ext_down = ta_filter._extension_atr(down)
+    assert ext_down is not None and ext_down < 0
+
+    # Too short -> None
+    assert ta_filter._extension_atr(up[:10]) is None
+
+
+def test_obv_slope_sign():
+    from hermes_trader.agents import ta_filter
+    up = _trend_candles(40, start=100.0, step=0.5)
+    assert ta_filter._obv_slope(up, lookback=10) > 0
+    down = [_mk_candle(i, 100 - i * 0.5, 101 - i * 0.5, 99 - i * 0.5, 100 - i * 0.5, 1000)
+            for i in range(40)]
+    assert ta_filter._obv_slope(down, lookback=10) < 0
+
+
+def test_volume_confirm_threshold_is_1_2x():
+    """The volume confirmation bar must be >= 1.2x the prior 20-bar average.
+    The old 0.8x threshold let below-average bars through."""
+    from hermes_trader.agents import ta_filter
+    # 20 baseline bars at vol=1000, last bar at 1000 (= 1.0x avg) -> NOT confirmed
+    flat = [_mk_candle(i, 100, 101, 99, 100, 1000) for i in range(21)]
+    assert ta_filter._check_volume_confirm(flat) is False
+    # Last bar at 1500 (= 1.5x avg) -> confirmed
+    surge = flat[:-1] + [_mk_candle(20, 100, 101, 99, 100, 1500)]
+    assert ta_filter._check_volume_confirm(surge) is True
+    # Exactly 1.2x boundary -> confirmed
+    edge = flat[:-1] + [_mk_candle(20, 100, 101, 99, 100, 1200)]
+    assert ta_filter._check_volume_confirm(edge) is True
+
+
+# ── ta_filter late-entry veto (P0) ──────────────────────────────────────────
+
+def test_ta_filter_rejects_overbought_long(monkeypatch):
+    """A long-intending impulse at 4h RSI>75 must be REJECTED before paid AI."""
+    from hermes_trader.agents import ta_filter
+
+    # Bullish 4h trend but RSI overbought.
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    flat = _flat_candles(100)
+    monkeypatch.setattr(ta_filter, "fetch_hl_candles",
+                        lambda *a, **k: bull if a[1] in ("1h", "4h") else flat)
+
+    perception = {
+        "coin": "TEST",
+        "composite_score": 80,
+        "triggers": [
+            {"name": "breakout", "fired": True, "score": 8},
+            {"name": "momentumBurst", "fired": True, "score": 9},
+        ],
+    }
+    res = ta_filter.analyze_perception(perception)
+    rsi = res.get("rsi4h")
+    assert rsi is not None and rsi > 75, f"test setup: RSI should be >75, got {rsi}"
+    assert res["signal"] == "REJECTED"
+    assert "late long" in res["reason"]
+
+
+def test_ta_filter_rejects_oversold_short(monkeypatch):
+    """A short-intending impulse at 4h RSI<25 must be REJECTED."""
+    from hermes_trader.agents import ta_filter
+
+    bear = [_mk_candle(i, 100 - i * 0.6, 101 - i * 0.6, 99 - i * 0.6, 100 - i * 0.6, 1000)
+            for i in range(100)]
+    flat = _flat_candles(100)
+    monkeypatch.setattr(ta_filter, "fetch_hl_candles",
+                        lambda *a, **k: bear if a[1] in ("1h", "4h") else flat)
+
+    perception = {
+        "coin": "TEST",
+        "composite_score": 80,
+        "triggers": [
+            {"name": "downtrendMomentum", "fired": True, "score": 8},
+        ],
+    }
+    res = ta_filter.analyze_perception(perception)
+    rsi = res.get("rsi4h")
+    assert rsi is not None and rsi < 25, f"test setup: RSI should be <25, got {rsi}"
+    assert res["signal"] == "REJECTED"
+    assert "late short" in res["reason"]
+
+
+def _healthy_trend_candles(n=100, start=100.0, vol=1000.0):
+    """Rising trend with regular pullbacks so RSI lands in a healthy 50-70
+    band. Pattern: 2 up bars then 1 down bar with a deeper retracement."""
+    out = []
+    price = start
+    for i in range(n):
+        if i % 3 == 2:
+            price -= 0.5  # deeper pullback
+        else:
+            price += 0.4  # impulse
+        out.append(_mk_candle(i, price, price + 0.3, price - 0.1, price, vol + i))
+    return out
+
+
+def test_ta_filter_passes_healthy_long(monkeypatch):
+    """A bullish impulse with RSI in a healthy range must not be vetoed."""
+    from hermes_trader.agents import ta_filter
+
+    up = _healthy_trend_candles(100)
+    flat = _flat_candles(100)
+    monkeypatch.setattr(ta_filter, "fetch_hl_candles",
+                        lambda *a, **k: up if a[1] in ("1h", "4h") else flat)
+
+    perception = {
+        "coin": "TEST",
+        "composite_score": 80,
+        "triggers": [{"name": "breakout", "fired": True, "score": 8}],
+    }
+    res = ta_filter.analyze_perception(perception)
+    rsi = res.get("rsi4h")
+    assert rsi is not None and 40 < rsi < 75, f"test setup: RSI should be 40-75, got {rsi}"
+    # Not the late-long veto. It may be WEAK/CONFIRMED, but reason must not be veto.
+    assert "late long" not in (res.get("reason") or "")
+    assert res["signal"] != "REJECTED" or "late long" not in (res.get("reason") or "")
+
+
+# ── executor runner-gate RSI / extension veto (P0) ──────────────────────────
+
+def _runner_gate_config(**over):
+    gate = {
+        "enabled": True,
+        "min_confidence": 0.70,
+        "min_composite": 30.0,
+        "allow_shorts": True,
+        "rsi_overbought": 75.0,
+        "rsi_oversold": 25.0,
+        "max_extension_atr": 2.5,
+    }
+    gate.update(over)
+    return {"runner_entry_gate": gate}
+
+
+def test_runner_gate_blocks_overbought_long():
+    from hermes_trader.agents.executor import _runner_entry_block_reason
+    analysis = {
+        "coin": "TEST", "side": "long", "confidence": 0.9,
+        "ai_confidence_raw": 0.9, "composite_score": 60,
+        "volume_spike_fired": True, "breakout_fired": True,
+        "rsi4h": 82.0,
+    }
+    reason = _runner_entry_block_reason(analysis, _runner_gate_config())
+    assert "RSI 82 > 75" in reason
+    assert "late long chase" in reason
+
+
+def test_runner_gate_blocks_overextended_long():
+    from hermes_trader.agents.executor import _runner_entry_block_reason
+    # close 10 ATR above EMA21 -> way over the 2.5x threshold
+    analysis = {
+        "coin": "TEST", "side": "long", "confidence": 0.9,
+        "ai_confidence_raw": 0.9, "composite_score": 60,
+        "volume_spike_fired": True, "breakout_fired": True,
+        "rsi4h": 55.0,
+        "atr4h": 1.0, "ema21_4h": 100.0, "close4h": 110.0,
+    }
+    reason = _runner_entry_block_reason(analysis, _runner_gate_config())
+    assert "extension" in reason and "over-extended long" in reason
+
+
+def test_runner_gate_allows_healthy_long():
+    from hermes_trader.agents.executor import _runner_entry_block_reason
+    analysis = {
+        "coin": "TEST", "side": "long", "confidence": 0.9,
+        "ai_confidence_raw": 0.9, "composite_score": 60,
+        "volume_spike_fired": True, "breakout_fired": True,
+        "rsi4h": 55.0,
+        "atr4h": 1.0, "ema21_4h": 100.0, "close4h": 101.0,
+    }
+    assert _runner_entry_block_reason(analysis, _runner_gate_config()) == ""
+
+
+def test_runner_gate_blocks_oversold_short():
+    from hermes_trader.agents.executor import _runner_entry_block_reason
+    analysis = {
+        "coin": "TEST", "side": "short", "confidence": 0.9,
+        "ai_confidence_raw": 0.9, "composite_score": 60,
+        "downtrend_momentum_fired": True,
+        "rsi4h": 18.0,
+    }
+    reason = _runner_entry_block_reason(analysis, _runner_gate_config())
+    assert "RSI 18 < 25" in reason and "late short chase" in reason
+
+
+# ── breakout confirmation (N-bar hold) (P1) ─────────────────────────────────
+
+def _breakout_candles(prior_n=48, base=100.0, vol=1000.0):
+    """`prior_n` ranging bars capped at `base`, then the caller appends breaks."""
+    cs = []
+    for i in range(prior_n):
+        # range [base-1, base], high = base
+        cs.append(_mk_candle(i, base - 0.5, base, base - 1, base - 0.2, vol))
+    return cs
+
+
+def test_breakout_requires_two_bars_to_hold():
+    """A single close above the prior high must NOT fire (fakeout risk); two
+    consecutive closes above must fire when RVOL confirms."""
+    from hermes_trader.indicators.triggers import breakout
+    # 50 prior bars + 2 confirm bars = 52 >= lookback(48)+confirm_bars(2)+1 = 51
+    prior = _breakout_candles(prior_n=50, base=100.0, vol=1000)
+
+    # First confirm bar closes back INSIDE the range (99.5 below prior high
+    # 100), then the last bar breaks above (102). Only 1 of 2 confirm bars is
+    # above the high -> "not held 2 bars", fired=False (fakeout risk).
+    one_bar = prior + [
+        _mk_candle(50, 100, 100.2, 99, 99.5, 1000),
+        _mk_candle(51, 99.5, 102, 99.5, 102, 4000),
+    ]
+    r = breakout(one_bar, lookback=48, min_rvol=1.5, confirm_bars=2)
+    assert r["fired"] is False
+    assert "not held 2 bars" in r["reason"] or "unconfirmed" in r["reason"]
+
+    # Two consecutive closes above the high on high volume -> fires.
+    two_bar = prior + [
+        _mk_candle(50, 100, 102, 100, 102, 4000),
+        _mk_candle(51, 102, 103, 101, 102.5, 4000),
+    ]
+    r = breakout(two_bar, lookback=48, min_rvol=1.5, confirm_bars=2)
+    assert r["fired"] is True
+    assert "held 2 bars" in r["reason"]
+
+
+def test_breakout_confirm_bars_equals_one_restores_old_behavior():
+    """confirm_bars=1 must still fire on a single strong close (back-compat)."""
+    from hermes_trader.indicators.triggers import breakout
+    # 50 prior + 1 = 51 >= lookback(48)+confirm_bars(1)+1 = 50
+    prior = _breakout_candles(prior_n=50, base=100.0, vol=1000)
+    one_bar = prior + [_mk_candle(50, 100, 103, 100, 102, 4000)]
+    r = breakout(one_bar, lookback=48, min_rvol=1.5, confirm_bars=1)
+    assert r["fired"] is True
+
+
+# ── ADX late-trend grading (P2) ─────────────────────────────────────────────
+
+def test_trend_strength_halves_score_above_adx_45(monkeypatch):
+    """ADX>45 is a late/extended trend — its score must be HALF the raw
+    last_adx/4 map, so the composite stops surfacing trend-exhaustion names."""
+    from hermes_trader.indicators import triggers
+    cs = _trend_candles(100)
+    # Force a finite, very high ADX reading.
+    monkeypatch.setattr(triggers, "adx", lambda candles, period: [float("nan")] * (len(candles) - 1) + [50.0])
+    r = triggers.trend_strength(cs)
+    assert r["fired"] is True
+    assert "late/extended" in r["reason"]
+    # raw 50/4 = 12.5 -> capped 10 -> halved = 5.0
+    assert abs(r["score"] - 5.0) < 1e-9
+
+
+def test_trend_strength_full_score_in_mature_trend(monkeypatch):
+    from hermes_trader.indicators import triggers
+    cs = _trend_candles(100)
+    monkeypatch.setattr(triggers, "adx", lambda candles, period: [float("nan")] * (len(candles) - 1) + [30.0])
+    r = triggers.trend_strength(cs)
+    assert r["fired"] is True
+    assert "late/extended" not in r["reason"]
+    # raw 30/4 = 7.5, not halved
+    assert abs(r["score"] - 7.5) < 1e-9
+
+
+# ── squeeze-breakout coupling (P2) ──────────────────────────────────────────
+
+def test_squeeze_breakout_coupling_boosts_breakout():
+    from hermes_trader.agents.perception import _apply_squeeze_breakout_coupling
+    hits = [
+        {"name": "breakout", "score": 6.0, "reason": "breakout above high", "fired": True},
+        {"name": "rangeCompression", "score": 9.0, "reason": "BB squeeze", "fired": True},
+    ]
+    _apply_squeeze_breakout_coupling(hits)
+    bo = next(h for h in hits if h["name"] == "breakout")
+    assert bo["score"] == 8.0
+    assert "[squeeze-resolved]" in bo["reason"]
+
+
+def test_squeeze_breakout_coupling_caps_at_10():
+    from hermes_trader.agents.perception import _apply_squeeze_breakout_coupling
+    hits = [
+        {"name": "breakout", "score": 9.5, "reason": "breakout above high", "fired": True},
+        {"name": "rangeCompression", "score": 9.0, "reason": "BB squeeze", "fired": True},
+    ]
+    _apply_squeeze_breakout_coupling(hits)
+    bo = next(h for h in hits if h["name"] == "breakout")
+    assert bo["score"] == 10.0
+
+
+def test_squeeze_breakout_coupling_noop_without_squeeze():
+    from hermes_trader.agents.perception import _apply_squeeze_breakout_coupling
+    hits = [
+        {"name": "breakout", "score": 6.0, "reason": "breakout above high", "fired": True},
+        {"name": "rangeCompression", "score": 0.0, "reason": "BB normal", "fired": False},
+    ]
+    _apply_squeeze_breakout_coupling(hits)
+    bo = next(h for h in hits if h["name"] == "breakout")
+    assert bo["score"] == 6.0
+    assert "[squeeze-resolved]" not in bo["reason"]
+
+
+# ── market regime: chop detection (P2) ──────────────────────────────────────
+
+def test_classify_candles_detects_chop_on_low_adx():
+    """EMA-neutral + low ADX → 'chop'. A strong trend must win over chop."""
+    from hermes_trader.agents.market_regime import _classify_candles
+    flat = _flat_candles(100, price=100.0)
+    regime = _classify_candles(flat)
+    assert regime == "chop", f"flat/low-ADX tape should be chop, got {regime}"
+
+
+def test_classify_candles_trend_overrides_chop():
+    from hermes_trader.agents.market_regime import _classify_candles
+    up = _trend_candles(100, start=100.0, step=0.5)
+    assert _classify_candles(up) == "up"
+    down = [_mk_candle(i, 200 - i * 0.5, 201 - i * 0.5, 199 - i * 0.5, 200 - i * 0.5, 1000)
+            for i in range(100)]
+    assert _classify_candles(down) == "down"
+
+
+def test_chop_regime_gate_raises_conviction_bar(monkeypatch):
+    """In chop, a weak long must be blocked; high conviction or momentum burst
+    must pass. slow_burn/whale alone must NOT bypass chop."""
+    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents.risk_gates import market_regime_gate
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("chop", 0.0))
+    monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
+                        lambda: {"regime": "NEUTRAL", "assets": []})
+
+    # weak conviction, no momentum -> blocked
+    weak = _ctx(confidence=0.5, composite_score=30, trade_side="long",
+                momentum_burst_fired=False, slow_burn_fired=True)
+    r = market_regime_gate(weak)
+    assert r["pass"] is False
+    assert r["via"] == "chop_blocked"
+    assert r.get("chop") is True
+
+    # high confidence -> passes
+    strong = _ctx(confidence=0.8, composite_score=30, trade_side="long")
+    r = market_regime_gate(strong)
+    assert r["pass"] is True and r["via"] == "chop_conviction"
+
+    # momentum burst -> passes (genuine impulse out of the range)
+    burst = _ctx(confidence=0.4, composite_score=20, trade_side="long",
+                 momentum_burst_fired=True)
+    r = market_regime_gate(burst)
+    assert r["pass"] is True and r["via"] == "trigger:momentum_burst"
+
+    # slow_burn alone must NOT bypass chop (those fire constantly in ranges)
+    slow_only = _ctx(confidence=0.4, composite_score=20, trade_side="long",
+                     slow_burn_fired=True)
+    r = market_regime_gate(slow_only)
+    assert r["pass"] is False and r["via"] == "chop_blocked"

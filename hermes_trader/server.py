@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any, Dict
 
 
@@ -44,7 +46,7 @@ from hermes_trader.metrics import render_metrics                      # noqa: E4
 
 from hermes_trader import __version__, dashboard, session_log         # noqa: E402
 from hermes_trader.dashboard import _require_operator                 # noqa: E402
-from hermes_trader.agents.config_store import read_agent_config, write_agent_config  # noqa: E402
+from hermes_trader.agents.config_store import read_agent_config, write_agent_config, _deep_merge  # noqa: E402
 from hermes_trader.agents.executor import maybe_execute               # noqa: E402
 from hermes_trader.agents.memory import memory                        # noqa: E402
 from hermes_trader.agents.perception import scan_once                 # noqa: E402
@@ -64,6 +66,7 @@ logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s %(message)s",
 )
 logger = logging.getLogger("hermes-server")
+
 
 # ── Session log ────────────────────────────────────────────────────────────────
 # Shared activity feed (hermes_trader.session_log) — the same JSONL file the
@@ -103,6 +106,32 @@ async def lifespan(app: FastAPI):
     """Load persisted memory on startup, flush it on shutdown."""
     memory.load()
     logger.info("Hermes server started — memory loaded")
+
+    # Pre-warm candle cache for top tickers in a background thread so the
+    # first research request doesn't pay cold-start HTTP latency for 3 TFs.
+    def _warm_candles():
+        from concurrent.futures import ThreadPoolExecutor
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        tickers = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
+        t0 = time.monotonic()
+        warmed = 0
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            futures = []
+            for coin in tickers:
+                for interval, count in [("1h", 100), ("4h", 100), ("1d", 60)]:
+                    futures.append(pool.submit(fetch_hl_candles, coin, interval, count))
+            for f in futures:
+                try:
+                    if f.result() is not None:
+                        warmed += 1
+                except Exception:
+                    pass
+        logger.info("Candle pre-warm: %d/%d cached in %.1fs",
+                    warmed, len(tickers) * 3, time.monotonic() - t0)
+
+    import threading
+    threading.Thread(target=_warm_candles, daemon=True, name="candle-prewarm").start()
+
     yield
     memory.flush()
     logger.info("Hermes server stopped — memory flushed")
@@ -191,20 +220,91 @@ async def run_scan(request: Request):
 
     body = await request.json() if await request.body() else {}
     min_score = body.get("minScore", 20)
+    coin = body.get("coin")
+    if coin:
+        coin = str(coin).strip().upper() or None
 
     universe = get_universe()
     _last_scan_at = time.time()
 
-    perceptions = scan_once(universe=universe, min_score=min_score)
+    perceptions = scan_once(universe=universe, min_score=min_score, coin=coin)
 
-    result = {"perceptions": perceptions, "count": len(perceptions)}
-    await _append_session_log({"event": "scan", "perceptions": len(perceptions)})
+    result = {"perceptions": perceptions, "count": len(perceptions),
+              "coin": coin or None}
+    await _append_session_log({"event": "scan", "perceptions": len(perceptions),
+                               "coin": coin or None})
     return JSONResponse(content=result)
+
+
+# --- Short-lived per-coin research cache (HTTP edge) -----------------------
+# Collapses high-concurrency bursts on POST /research/{coin}: the first caller
+# computes, concurrent same-coin callers await the same in-flight future, and
+# later callers within the TTL get the cached dict immediately. TTL is short on
+# purpose (default 30s) so a stale verdict is never served for long.
+_RESEARCH_CACHE_TTL_S = float(os.environ.get("HERMES_RESEARCH_HTTP_CACHE_S", "30"))
+_research_cache: Dict[str, tuple] = {}  # coin -> (expiry_epoch, analysis_dict)
+_research_inflight: Dict[str, asyncio.Future] = {}
+_research_cache_lock = asyncio.Lock()
+
+
+async def _research_cached(coin: str, perception: Dict[str, Any]) -> Dict[str, Any]:
+    loop = asyncio.get_running_loop()
+    now = time.time()
+
+    async with _research_cache_lock:
+        entry = _research_cache.get(coin)
+        if entry and entry[0] > now:
+            logger.info(
+                f"[research-cache] HIT coin={coin} ttl_remaining_s="
+                f"{int(entry[0] - now)} verdict={entry[1].get('verdict')}"
+            )
+            return dict(entry[1])
+        fut = _research_inflight.get(coin)
+        if fut is None:
+            fut = loop.create_future()
+            _research_inflight[coin] = fut
+            owner = True
+        else:
+            owner = False
+
+    if not owner:
+        # Wait for the in-flight computation started by another request.
+        logger.info(f"[research-cache] COALESCE coin={coin} (await in-flight)")
+        return dict(await fut)
+
+    t0 = time.time()
+    try:
+        analysis = await loop.run_in_executor(None, lambda: research(coin=coin, perception=perception))
+        async with _research_cache_lock:
+            if _RESEARCH_CACHE_TTL_S > 0:
+                _research_cache[coin] = (time.time() + _RESEARCH_CACHE_TTL_S, dict(analysis))
+        if not fut.done():
+            fut.set_result(dict(analysis))
+        logger.info(
+            f"[research-cache] MISS→COMPUTE coin={coin} elapsed_ms="
+            f"{int((time.time() - t0) * 1000)} verdict={analysis.get('verdict')} "
+            f"ttl_s={_RESEARCH_CACHE_TTL_S}"
+        )
+        return analysis
+    except Exception as e:
+        if not fut.done():
+            fut.set_exception(e)
+        raise
+    finally:
+        async with _research_cache_lock:
+            _research_inflight.pop(coin, None)
 
 
 @app.post("/api/agent/research/{coin}", dependencies=[Depends(_require_operator)])
 async def run_research(coin: str, request: Request):
-    """POST /api/agent/research/{coin} — full AI analysis for one coin."""
+    """POST /api/agent/research/{coin} — full AI analysis for one coin.
+
+    A short per-coin TTL cache (``HERMES_RESEARCH_HTTP_CACHE_S``, default 30s)
+    collapses high-concurrency bursts: the first request computes, concurrent
+    requests for the same coin wait on the same in-flight result, and later
+    ones within the window return the cached verdict instantly. This is an
+    HTTP-edge cache on top of (not replacing) the in-agent debate cache.
+    """
     memory.load()
 
     # Build a minimal perception from memory or request
@@ -227,9 +327,66 @@ async def run_research(coin: str, request: Request):
                     perception = p
                     break
 
-    analysis = research(coin=coin, perception=perception)
+    analysis = await _research_cached(coin, perception)
     await _append_session_log({"event": "research", "coin": coin, "verdict": analysis.get("verdict")})
     return JSONResponse(content=analysis)
+
+
+@app.post("/api/agent/research/{coin}/stream", dependencies=[Depends(_require_operator)])
+async def run_research_stream(coin: str, request: Request):
+    """SSE streaming research endpoint.
+
+    RETIRED: streaming research has been replaced by the in-process native
+    multi-perspective debate (``research._debate_research`` +
+    ``research_schema``), which runs inside the hermes-trader process with no
+    cross-service call. It emits a single ``retired`` event pointing callers
+    at the non-streaming research endpoint.
+    """
+    from fastapi.responses import StreamingResponse
+
+    async def _event_stream():
+        yield f"event: meta\ndata: {json.dumps({'coin': coin})}\n\n"
+        yield (
+            f"event: retired\ndata: {json.dumps({'message': 'Streaming research retired; use POST /api/agent/research/{coin} (native in-process debate)'})}\n\n"
+        )
+        yield f"event: done\ndata: {json.dumps({'coin': coin, 'status': 'retired'})}\n\n"
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.post("/api/risk/review/stream", dependencies=[Depends(_require_operator)])
+async def risk_review_stream(request: Request):
+    """SSE streaming endpoint for risk review.
+
+    RETIRED: previously proxied the external research service's
+    ``/risk/review/stream``. External risk review has been retired; risk
+    gating is now handled in-process (``risk_gates`` + the native research
+    debate). Emits a single ``retired`` event.
+    """
+    from fastapi.responses import StreamingResponse
+
+    async def _event_stream():
+        yield (
+            f"event: retired\ndata: {json.dumps({'message': 'HTA risk-review streaming retired; risk gating runs in-process.'})}\n\n"
+        )
+
+    return StreamingResponse(
+        _event_stream(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 
 @app.post("/api/agent/execute", dependencies=[Depends(_require_operator)])
@@ -338,7 +495,7 @@ async def update_config(request: Request):
     except Exception:
         raise HTTPException(400, "invalid JSON")
 
-    merged = {**existing, **body}
+    merged = _deep_merge(existing, body)
     write_agent_config(merged)
     return JSONResponse(content={"ok": True, "config": merged})
 
@@ -668,6 +825,200 @@ async def metrics():
     scraper needs no operator token; reads local state only — never hits HL."""
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
+
+
+# ── Postmortem report viewer ─────────────────────────────────────────────────
+# Public read-only endpoints so the "view full report" button in Feishu push
+# cards can open the markdown in a browser without an operator token. Reports
+# contain no secrets — only market data, scores, and trigger metadata.
+
+_POSTMORTEM_DIR = Path(os.environ.get(
+    "HERMES_POSTMORTEM_DIR", "/data/postmortems"))
+
+
+def _render_markdown_html(md: str) -> str:
+    """Minimal markdown→HTML for postmortem reports (no external deps).
+
+    Handles: headings (#..######), tables, hr, bold (**x**), inline code,
+    fenced code blocks, bullet lists, and paragraphs. Sufficient for the
+    report format produced by surge_postmortem._render_markdown().
+    """
+    import html as _html
+    import re as _re
+
+    lines = md.split("\n")
+    out: list[str] = []
+    i = 0
+    in_code = False
+    in_list = False
+    while i < len(lines):
+        line = lines[i]
+
+        # Fenced code block
+        if line.strip().startswith("```"):
+            if in_code:
+                out.append("</code></pre>")
+                in_code = False
+            else:
+                if in_list:
+                    out.append("</ul>")
+                    in_list = False
+                out.append("<pre><code>")
+                in_code = True
+            i += 1
+            continue
+        if in_code:
+            out.append(_html.escape(line))
+            i += 1
+            continue
+
+        stripped = line.strip()
+
+        # Horizontal rule
+        if _re.match(r"^(-{3,}|\*{3,}|_{3,})$", stripped):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            out.append("<hr>")
+            i += 1
+            continue
+
+        # Heading
+        m = _re.match(r"^(#{1,6})\s+(.*)$", stripped)
+        if m:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            level = len(m.group(1))
+            text = _inline_md(m.group(2))
+            out.append(f"<h{level}>{text}</h{level}>")
+            i += 1
+            continue
+
+        # Table (header row, separator, data rows)
+        if "|" in stripped and i + 1 < len(lines) and _re.match(
+                r"^\s*\|?[\s:|-]+\|?\s*$", lines[i + 1].strip()):
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            def _split_row(row: str) -> list[str]:
+                cells = [c.strip() for c in row.strip().strip("|").split("|")]
+                return cells
+            headers = _split_row(stripped)
+            i += 2  # skip separator
+            out.append("<table><thead><tr>")
+            for h in headers:
+                out.append(f"<th>{_inline_md(h)}</th>")
+            out.append("</tr></thead><tbody>")
+            while i < len(lines) and "|" in lines[i].strip() and lines[i].strip():
+                cells = _split_row(lines[i].strip())
+                out.append("<tr>")
+                for c in cells:
+                    out.append(f"<td>{_inline_md(c)}</td>")
+                out.append("</tr>")
+                i += 1
+            out.append("</tbody></table>")
+            continue
+
+        # Bullet list
+        if _re.match(r"^[-*]\s+", stripped):
+            if not in_list:
+                out.append("<ul>")
+                in_list = True
+            item = _re.sub(r"^[-*]\s+", "", stripped)
+            out.append(f"<li>{_inline_md(item)}</li>")
+            i += 1
+            continue
+
+        # Blank line
+        if not stripped:
+            if in_list:
+                out.append("</ul>")
+                in_list = False
+            i += 1
+            continue
+
+        # Paragraph
+        if in_list:
+            out.append("</ul>")
+            in_list = False
+        out.append(f"<p>{_inline_md(stripped)}</p>")
+        i += 1
+
+    if in_list:
+        out.append("</ul>")
+    if in_code:
+        out.append("</code></pre>")
+    return "\n".join(out)
+
+
+def _inline_md(text: str) -> str:
+    """Render inline markdown: **bold**, `code`, [link](url)."""
+    import html as _html
+    import re as _re
+    safe = _html.escape(text)
+    safe = _re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", safe)
+    safe = _re.sub(r"`([^`]+)`", r"<code>\1</code>", safe)
+    safe = _re.sub(
+        r"\[([^\]]+)\]\(([^)]+)\)",
+        r'<a href="\2" target="_blank">\1</a>', safe)
+    return safe
+
+
+_POSTMORTEM_CSS = """
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+max-width:860px;margin:24px auto;padding:0 20px;color:#1a1a1a;line-height:1.6}
+h1{border-bottom:2px solid #e74c3c;padding-bottom:8px;color:#c0392b}
+h2{margin-top:28px;border-bottom:1px solid #eee;padding-bottom:6px}
+table{border-collapse:collapse;width:100%;margin:14px 0;font-size:14px}
+th,td{border:1px solid #ddd;padding:8px 12px;text-align:left}
+th{background:#f8f9fa} tr:nth-child(even){background:#fafafa}
+code{background:#f4f4f4;padding:2px 5px;border-radius:3px;font-size:13px}
+pre{background:#1e1e1e;color:#d4d4d4;padding:14px;border-radius:6px;overflow-x:auto}
+pre code{background:none;color:inherit;padding:0}
+hr{border:none;border-top:1px solid #eee;margin:24px 0}
+.badge{display:inline-block;background:#e74c3c;color:#fff;padding:3px 10px;
+border-radius:12px;font-size:12px;font-weight:600}
+a{color:#2980b9}
+.back{margin-bottom:16px}
+"""
+
+
+@app.get("/postmortems")
+async def list_postmortems():
+    """List all surge postmortem reports (public, read-only)."""
+    try:
+        files = sorted(
+            _POSTMORTEM_DIR.glob("*.md"),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
+    except FileNotFoundError:
+        files = []
+    items = [{"name": f.name, "size": f.stat().st_size,
+              "mtime": int(f.stat().st_mtime)} for f in files]
+    return {"count": len(items), "reports": items}
+
+
+@app.get("/postmortems/{name}")
+async def view_postmortem(name: str):
+    """Render a single postmortem markdown as an HTML page (public)."""
+    # Path traversal guard: only allow bare filenames.
+    if "/" in name or "\\" in name or ".." in name or not name.endswith(".md"):
+        raise HTTPException(status_code=400, detail="Invalid report name")
+    path = _POSTMORTEM_DIR / name
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Report not found")
+    md = path.read_text(encoding="utf-8", errors="replace")
+    body = _render_markdown_html(md)
+    html_doc = f"""<!DOCTYPE html>
+<html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>暴涨复盘 — {name}</title>
+<style>{_POSTMORTEM_CSS}</style></head>
+<body><div class="back"><a href="./">← 返回报告列表</a></div>
+{body}
+</body></html>"""
+    return Response(content=html_doc, media_type="text/html; charset=utf-8")
 
 
 # Dashboard, SSE feed, and operator console all live in hermes_trader.dashboard.

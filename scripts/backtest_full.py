@@ -27,6 +27,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# P3-17: backtest process — never load a live mainnet private key.
+os.environ["HERMES_BACKTEST"] = "1"
+
 # .env.local + repo root
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
@@ -36,14 +39,16 @@ if _env.exists():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
+            if k.strip() == "HYPERLIQUID_PRIVATE_KEY":
+                continue
             os.environ.setdefault(k.strip(), v.strip())
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.market_regime import trend_from_closes
 from hermes_trader.client.hl_client import _http_post
 from hermes_trader.client.universe import get_universe
 from hermes_trader.indicators import triggers as trigger_mod
-from hermes_trader.indicators.math import ema
 from hermes_trader.models.types import Candle
 
 logging.basicConfig(level=logging.WARNING, format="%(message)s")
@@ -87,25 +92,14 @@ class SimTrade:
 
 
 def detect_regime_at(end_ms: int, proxy: str = "BTC") -> str:
-    """Same logic as market_regime._trend_from_closes, ad-hoc on historical candles."""
+    """Regime at a historical point — delegates to the canonical
+    market_regime.trend_from_closes so backtest uses production's calibrated
+    EMA20/30 + slope thresholds (previously an ad-hoc EMA20/50 copy that had
+    drifted from the live classifier)."""
     candles = fetch_candles_at(proxy, "1h", 100, end_ms)
     if len(candles) < 50:
         return "neutral"
-    closes = [c.c for c in candles]
-    fast = ema(closes, 20)
-    slow = ema(closes, 50)
-    if len(fast) < 9 or len(slow) < 1:
-        return "neutral"
-    f_now, s_now = fast[-1], slow[-1]
-    f_prev = fast[-9]
-    if f_prev == 0:
-        return "neutral"
-    slope = (f_now - f_prev) / abs(f_prev)
-    if f_now > s_now and slope > 0.002:
-        return "up"
-    if f_now < s_now and slope < -0.002:
-        return "down"
-    return "neutral"
+    return trend_from_closes([c.c for c in candles])
 
 
 def evaluate_triggers(c5m: List[Candle], c1h: List[Candle], cfg: Dict[str, Any]) -> Tuple[float, List[Dict[str, Any]]]:
@@ -145,11 +139,11 @@ def simulate_dsl_exit(entry_px: float, side: str, leverage: int,
     phase-2 trailing once profit_pct >= protect_pct, retrace_threshold of peak gains
     locked, hard_timeout_minutes ceiling.
     """
-    max_loss_pct = float(dsl_cfg.get("max_loss_pct", 2.0))
-    max_loss_roe_pct = float(dsl_cfg.get("max_loss_roe_pct", 40.0))
-    protect_pct = float(dsl_cfg.get("protect_pct", 0.5))
-    retrace = float(dsl_cfg.get("retrace_threshold", 0.30))
-    hard_timeout_min = float(dsl_cfg.get("hard_timeout_minutes", 180.0))
+    max_loss_pct = float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg))
+    max_loss_roe_pct = float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg))
+    protect_pct = float(cfg_get("dsl_exit.protect_pct", config=dsl_cfg))
+    retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl_cfg))
+    hard_timeout_min = float(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg))
     timeout_bars = int(hard_timeout_min // 5)  # 5m bars
 
     lev = max(1, leverage)
@@ -251,12 +245,12 @@ def main() -> int:
     cfg = get_config()
     live_cfg = read_agent_config()
     dsl_cfg = live_cfg.get("dsl_exit", {})
-    counter_regime_min_conf = float(live_cfg.get("counter_regime_min_conf", 0.65))
+    counter_regime_min_conf = float(cfg_get("counter_regime_min_conf", config=live_cfg))
     enable_hip3 = bool(live_cfg.get("enable_hip3", False))
     enable_crypto = bool(live_cfg.get("enable_crypto", True))
     equity_fraction = float(live_cfg.get("equity_fraction_per_trade", 0.04))
-    base_leverage = int(live_cfg.get("leverage", 10))
-    min_ai_conf = float(live_cfg.get("min_ai_confidence", 0.35))
+    base_leverage = int(cfg_get("leverage", config=live_cfg))
+    min_ai_conf = float(cfg_get("min_ai_confidence", config=live_cfg))
     round_trip_cost_roe = ((args.taker_fee_bps + args.slippage_bps) * 2 * base_leverage / 100.0)
 
     now_ms = int(time.time() * 1000)
@@ -355,8 +349,8 @@ def main() -> int:
 
             entry_px = c5m[-1].c
             notional = args.equity * equity_fraction * base_leverage
-            forward_5m = fetch_candles_at(coin, "5m", int(dsl_cfg.get("hard_timeout_minutes", 180.0) // 5) + 5,
-                                          tick_ms_t + int(dsl_cfg.get("hard_timeout_minutes", 180.0) * 60_000))
+            forward_5m = fetch_candles_at(coin, "5m", int(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg) // 5) + 5,
+                                          tick_ms_t + int(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg) * 60_000))
             candle_fetches += 1
             # We need bars STRICTLY AFTER entry. Filter.
             forward_5m = [b for b in forward_5m if b.t > tick_ms_t]

@@ -31,7 +31,7 @@ from backtest_logged import (  # reuse validated primitives
     fetch_candles_at, detect_regime_at, passes_counter_regime,
     _load_disk_cache, _save_disk_cache,
 )
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.executor import _runner_entry_block_reason
 from hermes_trader.models.types import Candle
 from _memory_io import load_memory
@@ -47,10 +47,10 @@ class Position:
         self.lev, self.notional, self.margin = lev, notional, margin
         self.cost_rate = cost_rate
         self.peak = entry_px
-        self.max_loss = min(float(dsl.get("max_loss_pct", 0.75)),
-                            float(dsl.get("max_loss_roe_pct", 6.0)) / max(1, lev))
-        self.protect = float(dsl.get("protect_pct", 1.5))
-        self.retrace = float(dsl.get("retrace_threshold", 0.30))
+        self.max_loss = min(float(cfg_get("dsl_exit.max_loss_pct", config=dsl)),
+                            float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl)) / max(1, lev))
+        self.protect = float(cfg_get("dsl_exit.protect_pct", config=dsl))
+        self.retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl))
 
     def step(self, bar: Candle):
         is_long = self.side == "long"
@@ -189,7 +189,7 @@ def build_candidates(args, cfg) -> List[Dict[str, Any]]:
 def run(args, cfg, max_concurrent, max_notional_pct) -> Dict[str, Any]:
     dsl_cfg = cfg.get("dsl_exit", {})
     frac = float(cfg.get("equity_fraction_per_trade", 0.12))
-    lev = args.leverage or int(cfg.get("leverage", 10))
+    lev = args.leverage or int(cfg_get("leverage", config=cfg))
     min_margin = float(cfg.get("min_available_margin_pct", 0.10))
     equity = args.equity
     cands = sorted(_CANDS, key=lambda c: c["ts"])
@@ -206,7 +206,7 @@ def run(args, cfg, max_concurrent, max_notional_pct) -> Dict[str, Any]:
     loss_block_until: Dict[str, int] = {}
     closes, peak_eq, max_dd = [], equity, 0.0
     blk_conc = blk_notional = blk_margin = blk_dup = blk_size = blk_cooldown = blk_loss_cool = 0
-    cooldown_ms = int(float(cfg.get("cooldown_min", 0) or 0) * 60_000)
+    cooldown_ms = int(float(cfg_get("cooldown_min", config=cfg) or 0) * 60_000)
     loss_cooldown_ms = int(float(args.loss_cooldown_min or 0) * 60_000)
     clock = t0
     while clock <= t1 or open_pos:
@@ -379,13 +379,13 @@ def main():
     global _CANDS
     print("# building candidates from real AI verdicts (fetching forward candles)...")
     _CANDS = build_candidates(args, cfg)
-    mnp = args.max_notional_pct or float(cfg.get("max_total_notional_pct", 8.0))
-    lev = args.leverage or int(cfg.get("leverage", 10))
+    mnp = args.max_notional_pct or float(cfg_get("max_total_notional_pct", config=cfg))
+    lev = args.leverage or int(cfg_get("leverage", config=cfg))
     print(f"# {len(_CANDS)} admitted candidates | equity ${args.equity:.0f} | lev {lev}x | "
           f"gross cap {mnp:.0f}x | last {args.hours}h")
     print(f"# runner gate: {'skipped' if args.skip_runner_gate else cfg.get('runner_entry_gate', {})}\n")
     concs = [int(x) for x in args.sweep_concurrent.split(",")] if args.sweep_concurrent \
-        else [args.max_concurrent or int(cfg.get("max_concurrent", 15))]
+        else [args.max_concurrent or int(cfg_get("max_concurrent", config=cfg))]
     print(f"{'max_conc':>9} {'trades':>7} {'win%':>6} {'exp/trade':>10} {'net':>9} "
           f"{'endEq':>8} {'maxDD':>7}  blocks(conc/notnl/margin/size/cool/loss)")
     for mc in concs:

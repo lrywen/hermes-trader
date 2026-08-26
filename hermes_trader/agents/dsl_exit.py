@@ -27,12 +27,16 @@ Usage:
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
+import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
+
+from hermes_trader.client.hl_client import _http_post
 
 logger = logging.getLogger(__name__)
 
@@ -42,7 +46,173 @@ DSL_STATE_FILE = os.environ.get(
     "HERMES_DSL_STATE_FILE",
     os.path.join(_REPO_ROOT, ".dsl-state.json"),
 )
-_STATE_VERSION = 1
+_STATE_VERSION = 2
+
+# Cross-process lock file so concurrent writers (trading loop, rehydrate,
+# dashboard) can't interleave tmp+replace and clobber each other's peak/floor.
+DSL_STATE_LOCK_FILE = DSL_STATE_FILE + ".lock"
+
+
+def _resolve_fill_time_ms(user: str, coin: str, side: str) -> Optional[float]:
+    """Query the exchange's userFills for the most recent fill matching coin+side.
+
+    Returns the fill time in seconds (epoch) or None on any failure.
+    """
+    try:
+        fills = _http_post(
+            "/info", {"type": "userFills", "user": user, "limit": 5}, timeout=5
+        )
+        if not isinstance(fills, list):
+            return None
+        # userFills returns newest-first; match the first fill for this coin+side.
+        for f in fills:
+            f_coin = f.get("coin", "")
+            f_side = "long" if f.get("side") == "B" else "short" if f.get("side") == "A" else None
+            if f_coin == coin and f_side == side:
+                return int(f["time"]) / 1000.0
+    except Exception:
+        logger.debug(f"[dsl] fill-time lookup failed for {coin} {side} (non-fatal)")
+    return None
+
+
+def resolve_close_fill(user: str, coin: str, side: str,
+                       since_ts: float) -> Optional[Dict[str, Any]]:
+    """Find the most recent REDUCING fill for this position after ``since_ts``.
+
+    Used to attribute an externally-closed position (an exchange-side SL/TP
+    trigger, manual close, or liquidation that the DSL monitor never saw in
+    real time) so the close/outcome record can be backfilled. Returns the fill
+    dict (px, sz, time, closedPnl, fee, oid, …) or None when no reducing fill
+    is found / the lookup fails.
+
+    ``since_ts`` is epoch seconds; only fills newer than it are considered so a
+    prior round-trip on the same coin isn't mis-attributed. A reducing fill is
+    one whose side is opposite the position (A for a long, B for a short) OR
+    that carries a non-zero ``closedPnl`` (HL tags the closing leg of a round
+    trip with realized PnL). Newest-first ordering means the first match is the
+    close.
+    """
+    try:
+        fills = _http_post(
+            "/info", {"type": "userFills", "user": user, "limit": 50}, timeout=8
+        )
+        if not isinstance(fills, list):
+            return None
+        want = "A" if side == "long" else "B"
+        for f in fills:
+            if f.get("coin") != coin:
+                continue
+            try:
+                f_ts = int(f.get("time", 0)) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if f_ts < since_ts:
+                break  # fills are newest-first; nothing newer remains
+            try:
+                closed_pnl = float(f.get("closedPnl", 0) or 0)
+            except (TypeError, ValueError):
+                closed_pnl = 0.0
+            if f.get("side") == want or closed_pnl != 0.0:
+                return f
+    except Exception as e:
+        logger.debug(f"[dsl] close-fill lookup failed for {coin} {side}: {e}")
+    return None
+
+
+def _fetch_open_orders(user: str) -> List[Dict[str, Any]]:
+    """Fetch the user's resting orders from the HL REST endpoint. [] on failure."""
+    try:
+        data = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.debug(f"[dsl] openOrders lookup failed (non-fatal): {e}")
+        return []
+
+
+def _order_trigger_px(o: Dict[str, Any]) -> Optional[float]:
+    """Extract the trigger price from a resting trigger order.
+
+    HL's openOrders exposes it as `triggerPx` for some order shapes and as
+    `limitPx` for market tpsl orders; accept either.
+    """
+    for key in ("triggerPx", "limitPx"):
+        v = o.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def backfill_brackets_from_exchange(user: Optional[str]) -> int:
+    """Fill in missing sl_oid/tp_oid on trackers by scanning the user's open orders.
+
+    Used on restart: a v1 state file (or a tracker synthesized before bracket
+    persistence shipped) has no oids, so query the exchange once and match
+    resting reduce-only trigger orders to trackers by coin + direction relative
+    to entry. Only fills fields that are currently None — never overwrites an
+    oid the trading path already set. Returns the number of trackers updated.
+    Best-effort; never raises.
+    """
+    if not user or not _active_positions:
+        return 0
+    # Only query if at least one tracker is missing bracket info.
+    if all(t.sl_oid is not None for t in _active_positions.values()):
+        return 0
+    orders = _fetch_open_orders(user)
+    if not orders:
+        logger.debug("[dsl] backfill: openOrders empty or unavailable")
+        return 0
+    updated = 0
+    for tracker in _active_positions.values():
+        # Consider every reduce-only resting order for this coin. HL's
+        # openOrders does NOT reliably expose a trigger marker: live mainnet
+        # market-tpsl orders come back with only `limitPx` (the trigger price)
+        # and NO `triggerPx` / `orderType` fields. Requiring either would wrongly
+        # drop the real backup SL/TP. Because these orders are reduceOnly on a
+        # coin we hold, the trigger price's position relative to entry_px is
+        # enough to classify SL (adverse side) vs TP (favourable side) below.
+        coin_orders = [
+            o for o in orders
+            if o.get("coin") == tracker.coin
+            and o.get("reduceOnly") is True
+        ]
+        if not coin_orders:
+            continue
+        for o in coin_orders:
+            oid = _opt_int(o.get("oid"))
+            tpx = _order_trigger_px(o)
+            if oid is None or tpx is None:
+                logger.debug(
+                    f"[dsl] backfill: skipping {tracker.coin} order "
+                    f"oid={oid} (no parseable trigger px; raw={o})"
+                )
+                continue
+            # Classify by direction relative to entry: a backup SL for a long is
+            # BELOW entry (sell trigger); a TP scale-out for a long is ABOVE entry.
+            # Shorts are the mirror. This is robust even when the exchange payload
+            # omits an explicit tpsl tag.
+            is_sl_side = (tracker.is_long() and tpx < tracker.entry_px) or \
+                         (not tracker.is_long() and tpx > tracker.entry_px)
+            try:
+                sz = abs(float(o.get("sz", 0) or 0))
+            except (TypeError, ValueError):
+                sz = None
+            if is_sl_side and tracker.sl_oid is None:
+                tracker.sl_oid = oid
+                tracker.sl_px = tpx
+                if sz:
+                    tracker.sl_size = sz
+                updated += 1
+            elif not is_sl_side and tracker.tp_oid is None:
+                tracker.tp_oid = oid
+                tracker.tp_px = tpx
+                updated += 1
+    if updated:
+        _save_state()
+        logger.info(f"[dsl] backfilled {updated} bracket oid(s) from exchange openOrders")
+    return updated
 
 
 @dataclass
@@ -68,6 +238,10 @@ class ExitVerdict:
     coin: str = ""
     position_side: str = ""  # "long" or "short" (distinct from `phase`)
     leverage: int = 1
+    # Exit telemetry (populated by DSLTracker.check on exit verdicts):
+    entry_regime: str = ""     # market regime captured at entry (up/down/neutral/chop)
+    hold_min: float = 0.0      # minutes held from entry to exit
+    mfe_pct: float = 0.0       # max favorable excursion (spot %), peak profit reached
 
 
 @dataclass
@@ -79,16 +253,16 @@ class ExitPolicy:
       Moderate:     max_loss_pct=2.5, retrace=7, protect=1.5, hard_timeout=180min
       Aggressive:   max_loss_pct=1.5, retrace=5, protect=0.8, hard_timeout=90min
     """
-    max_loss_pct: float = 2.5  # Max loss SPOT % below entry (hard stop)
-    # Max loss ROE (margin) % — leverage-aware safety net. At 40x leverage a
-    # 2.5% spot move = 100% ROE = entire margin gone, so the spot threshold
-    # alone is meaningless on high-lev trades. The effective floor used at
-    # check time is min(max_loss_pct, max_loss_roe_pct / leverage). Set to a
-    # high value (e.g. 100) to disable the leveraged cap and use spot only.
-    max_loss_roe_pct: float = 50.0
-    protect_pct: float = 1.5  # Price must rise this % above entry before Phase 2
-    retrace_threshold: float = 0.30  # Give back 30% of peak profit (Phase 2 default)
-    hard_timeout_minutes: float = 180.0  # Emergency exit after this long
+    max_loss_pct: float = 0.4  # Max loss SPOT % below entry (hard stop)
+    # Max loss ROE (margin) % — leverage-aware safety net. At 12x leverage a
+    # 0.4% spot move ≈ 5% ROE, so the spot threshold alone is meaningless on
+    # high-lev trades. The effective floor used at check time is
+    # min(max_loss_pct, max_loss_roe_pct / leverage). Set to a high value
+    # (e.g. 100) to disable the leveraged cap and use spot only.
+    max_loss_roe_pct: float = 5.0
+    protect_pct: float = 1.25  # Price must rise this % above entry before Phase 2
+    retrace_threshold: float = 0.20  # Give back 20% of peak profit (Phase 2 default)
+    hard_timeout_minutes: float = 1800.0  # Emergency exit after this long
     # ── Breakeven ratchet (guaranteed-profit lock) ──────────────────────
     # Once a position's PEAK profit clears `breakeven_trigger_pct` (spot %),
     # the trailing floor may never fall below `breakeven_lock_pct` (spot %)
@@ -119,12 +293,10 @@ class ExitPolicy:
     # max_concurrent. Positions that ever reached protect are EXEMPT (the
     # hard_timeout bucket's +3.41% avg is driven by agers that peaked).
     # 0 = off.
-    stale_flat_timeout_minutes: float = 0.0
+    stale_flat_timeout_minutes: float = 480.0
     phase2_tiers: List[RetraceTier] = field(default_factory=lambda: [
-        RetraceTier(5.0, 0.30),   # 5% profit → give back 30%
-        RetraceTier(10.0, 0.40),  # 10% profit → lock tighter, give back 40%
-        RetraceTier(20.0, 0.50),  # 20% profit → lock even tighter
-        RetraceTier(50.0, 0.60),  # 50% profit → lock most profit
+        RetraceTier(8.0, 0.35),   # 8% profit → give back 35%
+        RetraceTier(15.0, 0.40),  # 15% profit → give back 40% (let winners run)
     ])
     consecutive_breaches_required: int = 1  # Number of consecutive floor breaches before exit
     # ── Patch A: don't exit inside the noise band (sub-first-tier) ──────────
@@ -148,13 +320,18 @@ class DSLTracker:
     """
     def __init__(self, coin: str, side: str, entry_px: float,
                  entry_time: float, policy: Optional[ExitPolicy] = None,
-                 leverage: int = 1, entry_atr_pct: float = 0.0) -> None:
+                 leverage: int = 1, entry_atr_pct: float = 0.0,
+                 entry_regime: str = "") -> None:
         self.coin = coin
         self.side = side  # "long" | "short"
         self.entry_px = entry_px
         self.entry_time = entry_time
         self.policy = policy or ExitPolicy()
         self.leverage = int(leverage) if leverage else 1
+        # Market regime at entry (up/down/neutral/chop); used for exit telemetry
+        # so we can audit per-regime stop behavior (e.g. trailing-stop conservatism
+        # in TREND vs STRONG_TREND). Empty when not provided (back-compat).
+        self.entry_regime = entry_regime or ""
         # ATR as % of entry price, captured ONCE at registration so the stop
         # width is stable for the life of the trade (never recomputed per tick).
         self.entry_atr_pct = float(entry_atr_pct or 0.0)
@@ -163,6 +340,16 @@ class DSLTracker:
         self.peak_px = entry_px
         self.consecutive_breaches = 0
         self._last_floor: Optional[float] = None
+
+        # Exchange-side bracket order IDs (for the static backup SL / TP scale-out).
+        # Persisted across restarts so the dynamic SL mover (batchModify) can target
+        # the correct resting order and reconcile after an oid change (HL implements
+        # modify as cancel+replace, so the oid changes on every move).
+        self.sl_oid: Optional[int] = None
+        self.sl_px: Optional[float] = None     # last-known trigger price of the backup SL
+        self.sl_size: Optional[float] = None   # size covered by the backup SL
+        self.tp_oid: Optional[int] = None
+        self.tp_px: Optional[float] = None     # trigger price of the TP scale-out
 
     def is_long(self) -> bool:
         return self.side == "long"
@@ -174,8 +361,17 @@ class DSLTracker:
 
     def _verdict(self, **kwargs: Any) -> ExitVerdict:
         """ExitVerdict pre-filled with coin/side/leverage so callers don't repeat."""
+        # Max favorable excursion (spot %): peak_px is maintained as the
+        # favorable extreme, so this is the largest open profit the trade saw.
+        if self.is_long():
+            mfe = (self.peak_px - self.entry_px) / self.entry_px * 100
+        else:
+            mfe = (self.entry_px - self.peak_px) / self.entry_px * 100
         return ExitVerdict(coin=self.coin, position_side=self.side,
-                           leverage=self.leverage, **kwargs)
+                           leverage=self.leverage,
+                           entry_regime=self.entry_regime,
+                           hold_min=(time.time() - self.entry_time) / 60.0,
+                           mfe_pct=mfe, **kwargs)
 
     def _active_tier(self, mark_px: float) -> RetraceTier:
         """Find the highest active retrace tier based on current profit."""
@@ -219,7 +415,12 @@ class DSLTracker:
             spot_cap = min(max(self.entry_atr_pct * pol.atr_stop_mult,
                                pol.atr_stop_floor_pct),
                            pol.atr_stop_ceiling_pct)
-        effective_max_loss = min(spot_cap, pol.max_loss_roe_pct / lev)
+        # Guard against a misconfigured (zero/negative) cap, which would
+        # otherwise make effective_max_loss == 0 and stop out the position on
+        # the first tick. A non-positive cap means "disabled" → infinity.
+        roe_cap = (pol.max_loss_roe_pct / lev) if pol.max_loss_roe_pct > 0 else float("inf")
+        spot_cap = spot_cap if spot_cap > 0 else float("inf")
+        effective_max_loss = min(spot_cap, roe_cap)
         # Reason string surfaces both inputs so it's obvious post-hoc
         # which cap was binding for a given exit.
 
@@ -250,12 +451,21 @@ class DSLTracker:
         # ── Compute floor ───────────────────────────────────────────
         # Floor only moves UP (for longs) — once it rises above entry,
         # it never falls back. This prevents giving back locked profit.
+        # retrace_used is logged on every floor change so the dynamic
+        # trail can be verified against peak/tier in the logs.
+        retrace_used = 0.0
         if is_long:
             profit_pct = (mark_px - self.entry_px) / self.entry_px * 100
             loss_pct = (self.entry_px - mark_px) / self.entry_px * 100
 
             # Max loss check (uses leverage-aware effective floor)
-            if loss_pct >= effective_max_loss:
+            # Use isclose on the boundary so a mark sitting exactly at the hard
+            # stop (within floating-point noise) reports max_loss rather than
+            # falling through to the phase-1 floor_breach — the hard stop must
+            # win on priority even when the two floors coincide.
+            if loss_pct >= effective_max_loss or math.isclose(
+                loss_pct, effective_max_loss, rel_tol=1e-9, abs_tol=1e-9
+            ):
                 roe_loss = loss_pct * lev
                 return self._verdict(
                     exit=True,
@@ -270,6 +480,7 @@ class DSLTracker:
             if profit_pct >= pol.protect_pct:
                 # Phase 2: floor = entry + profit_range * (1 - retrace)
                 tier = self._active_tier(self.peak_px)  # Use PEAK for tier, not current
+                retrace_used = tier.retrace_threshold
                 profit_range = self.peak_px - self.entry_px
                 floor = self.entry_px + profit_range * (1 - tier.retrace_threshold)
             else:
@@ -280,7 +491,9 @@ class DSLTracker:
             profit_pct = (self.entry_px - mark_px) / self.entry_px * 100
             loss_pct = (mark_px - self.entry_px) / self.entry_px * 100
 
-            if loss_pct >= effective_max_loss:
+            if loss_pct >= effective_max_loss or math.isclose(
+                loss_pct, effective_max_loss, rel_tol=1e-9, abs_tol=1e-9
+            ):
                 roe_loss = loss_pct * lev
                 return self._verdict(
                     exit=True,
@@ -294,6 +507,7 @@ class DSLTracker:
 
             if profit_pct >= pol.protect_pct:
                 tier = self._active_tier(self.peak_px)
+                retrace_used = tier.retrace_threshold
                 profit_range = self.entry_px - self.peak_px
                 floor = self.entry_px - profit_range * (1 - tier.retrace_threshold)
             else:
@@ -323,11 +537,30 @@ class DSLTracker:
                 floor = min(floor, prev_floor)
 
         self._last_floor = floor
-        if peak_changed or prev_floor != floor:
+        # Use a relative tolerance so floating-point noise between two
+        # essentially-equal floors doesn't trigger a spurious save/log (which
+        # also amplifies lock contention with other processes).
+        floor_moved = prev_floor is None or not math.isclose(
+            prev_floor, floor, rel_tol=1e-9, abs_tol=1e-12
+        )
+        if peak_changed or floor_moved:
             _save_state()
+            # Log every floor update so the dynamic trail can be verified:
+            # peak, active retrace %, new floor, and what moved it.
+            logger.info(
+                f"[dsl:floor] {self.coin} {self.side} "
+                f"phase={'phase2' if retrace_used > 0 else 'phase1'} "
+                f"entry={self.entry_px:.6g} mark={mark_px:.6g} "
+                f"peak={self.peak_px:.6g} retrace={retrace_used*100:.0f}% "
+                f"floor={floor:.6g} "
+                f"(peak_changed={peak_changed}, prev_floor={prev_floor})"
+            )
 
         # ── Floor breach check ────────────────────────────────────────
-        breached = (is_long and mark_px < floor) or (not is_long and mark_px > floor)
+        # Use <=/>= (not strict inequality) so a mark sitting exactly on the
+        # floor counts as a breach — matches exchange trigger-order semantics
+        # and avoids the local/remote boundary disagreeing at the tick.
+        breached = (is_long and mark_px <= floor) or (not is_long and mark_px >= floor)
         # Patch A — noise-band suppression (sub-first-tier only). The hard
         # max_loss stop already returned above; this only governs the trailing
         # give-back of a barely-green position. If peak profit hasn't yet cleared
@@ -400,10 +633,17 @@ def _tracker_to_dict(t: DSLTracker) -> Dict[str, Any]:
         "entry_px": t.entry_px,
         "entry_time": t.entry_time,
         "entry_atr_pct": t.entry_atr_pct,
+        "entry_regime": t.entry_regime,
         "peak_px": t.peak_px,
         "consecutive_breaches": t.consecutive_breaches,
         "last_floor": t._last_floor,
         "policy": asdict(t.policy),
+        # v2: exchange bracket order IDs / prices (None when no resting order).
+        "sl_oid": t.sl_oid,
+        "sl_px": t.sl_px,
+        "sl_size": t.sl_size,
+        "tp_oid": t.tp_oid,
+        "tp_px": t.tp_px,
     }
 
 
@@ -431,28 +671,65 @@ def _tracker_from_dict(d: Dict[str, Any]) -> DSLTracker:
     t = DSLTracker(d["coin"], d["side"], float(d["entry_px"]),
                    float(d.get("entry_time") or time.time()), policy,
                    leverage=int(d.get("leverage", 1) or 1),
-                   entry_atr_pct=float(d.get("entry_atr_pct", 0.0) or 0.0))
+                   entry_atr_pct=float(d.get("entry_atr_pct", 0.0) or 0.0),
+                   entry_regime=str(d.get("entry_regime") or ""))
     t.peak_px = float(d.get("peak_px", d["entry_px"]))
     t.consecutive_breaches = int(d.get("consecutive_breaches", 0))
     lf = d.get("last_floor")
     t._last_floor = float(lf) if lf is not None else None
+    # v2 fields (absent in v1 state files -> None, backfilled on next rehydrate).
+    t.sl_oid = _opt_int(d.get("sl_oid"))
+    t.sl_px = _opt_float(d.get("sl_px"))
+    t.sl_size = _opt_float(d.get("sl_size"))
+    t.tp_oid = _opt_int(d.get("tp_oid"))
+    t.tp_px = _opt_float(d.get("tp_px"))
     return t
+
+
+def _opt_int(v: Any) -> Optional[int]:
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _opt_float(v: Any) -> Optional[float]:
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def _save_state() -> None:
     """Atomically write the tracker registry to disk. Best-effort — never raises."""
+    lock_fd = None
     try:
         payload = {
             "version": _STATE_VERSION,
             "saved_at": int(time.time() * 1000),
             "positions": [_tracker_to_dict(t) for t in _active_positions.values()],
         }
+        # Cross-process exclusive lock prevents lost updates when the trading
+        # loop races a rehydrate/dashboard write through the same file.
+        lock_fd = os.open(DSL_STATE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         tmp = DSL_STATE_FILE + ".tmp"
         with open(tmp, "w") as f:
             json.dump(payload, f)
         os.replace(tmp, DSL_STATE_FILE)
     except OSError as e:
         logger.warning(f"[dsl] failed to persist state: {e}")
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
 
 
 def load_state(force: bool = False) -> None:
@@ -467,7 +744,12 @@ def load_state(force: bool = False) -> None:
     if _loaded_from_disk and not force:
         return
     _loaded_from_disk = True
+    lock_fd = None
     try:
+        # Shared lock pairs with the exclusive lock in _save_state so a
+        # force-reload never observes a torn write.
+        lock_fd = os.open(DSL_STATE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_SH)
         with open(DSL_STATE_FILE) as f:
             payload = json.load(f)
     except FileNotFoundError:
@@ -475,6 +757,13 @@ def load_state(force: bool = False) -> None:
     except (OSError, json.JSONDecodeError) as e:
         logger.warning(f"[dsl] state file unreadable, ignoring: {e}")
         return
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
     if force:
         _active_positions.clear()
     for d in payload.get("positions", []):
@@ -491,11 +780,13 @@ def register_position(coin: str, side: str, entry_px: float,
                       entry_time: Optional[float] = None,
                       policy: Optional[ExitPolicy] = None,
                       leverage: int = 1,
-                      entry_atr_pct: float = 0.0) -> DSLTracker:
+                      entry_atr_pct: float = 0.0,
+                      entry_regime: str = "") -> DSLTracker:
     """Register a new position for DSL tracking."""
     key = f"{coin}_{side}"
     tracker = DSLTracker(coin, side, entry_px, entry_time or time.time(), policy,
-                         leverage=leverage, entry_atr_pct=entry_atr_pct)
+                         leverage=leverage, entry_atr_pct=entry_atr_pct,
+                         entry_regime=entry_regime)
     _active_positions[key] = tracker
     _save_state()
     atr_note = ""
@@ -528,6 +819,40 @@ def deregister_position(coin: str, side: str) -> bool:
         logger.info(f"[dsl] Deregistered {key}")
         return True
     return False
+
+
+def get_tracker(coin: str, side: str) -> Optional[DSLTracker]:
+    """Return the active tracker for a coin+side, or None."""
+    return _active_positions.get(f"{coin}_{side}")
+
+
+def set_bracket(coin: str, side: str, **fields: Any) -> bool:
+    """Atomically update one or more exchange-bracket fields on a tracker and persist.
+
+    Supported keyword fields: sl_oid, sl_px, sl_size, tp_oid, tp_px.
+    Returns True if the tracker existed and was updated. Used after SL/TP
+    placement and after every batchModify (which returns a NEW oid) so the
+    persisted oid stays valid across restarts.
+    """
+    tracker = _active_positions.get(f"{coin}_{side}")
+    if tracker is None:
+        return False
+    allowed = {"sl_oid", "sl_px", "sl_size", "tp_oid", "tp_px"}
+    changed = False
+    for k, v in fields.items():
+        if k not in allowed:
+            continue
+        if k.endswith("_oid"):
+            v = _opt_int(v)
+        elif k.endswith("_px") or k == "sl_size":
+            v = _opt_float(v)
+        if getattr(tracker, k, None) != v:
+            setattr(tracker, k, v)
+            changed = True
+    if changed:
+        _save_state()
+        logger.debug(f"[dsl] bracket updated for {coin}_{side}: {fields}")
+    return True
 
 
 def _policy_from_config() -> ExitPolicy:
@@ -570,18 +895,26 @@ def _policy_from_config() -> ExitPolicy:
 def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
                             policy: Optional[ExitPolicy] = None,
                             default_leverage: int = 1,
-                            queried_dexes: Optional[set] = None) -> None:
+                            queried_dexes: Optional[set] = None,
+                            user: Optional[str] = None) -> List["DSLTracker"]:
     """Reconcile the tracker registry with the exchange's live position list.
 
     Synthesizes a tracker for any open position without one (entry_time =
-    now, since the original is unknown), and drops trackers for coins no
-    longer open. When `queried_dexes` is given, a tracker is only dropped
-    if its dex *successfully responded* this cycle — protecting trackers
-    on timed-out dexes from being reset to fresh state next tick.
+    resolved from userFills when `user` is supplied, else now), and drops
+    trackers for coins no longer open. When `queried_dexes` is given, a
+    tracker is only dropped if its dex *successfully responded* this cycle
+    — protecting trackers on timed-out dexes from being reset to fresh
+    state next tick.
+
+    Returns the list of trackers that were dropped because the exchange no
+    longer reports the position (i.e. externally-closed fills: exchange-side
+    SL/TP trigger, manual close, or liquidation). The caller uses this to
+    backfill the close/outcome record so PnL accounting is not silently lost.
     """
     load_state()
     live_keys = set()
     added = 0
+    dropped: List["DSLTracker"] = []
     for p in asset_positions or []:
         pos = p.get("position", {}) if isinstance(p, dict) else {}
         coin = pos.get("coin")
@@ -592,7 +925,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
             entry = float(pos.get("entryPx") or 0)
         except (TypeError, ValueError):
             continue
-        if szi == 0 or entry <= 0:
+        if abs(szi) < 1e-12 or entry <= 0:
             continue
         side = "long" if szi > 0 else "short"
         key = f"{coin}_{side}"
@@ -609,10 +942,61 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
             # the default silently widened live stops ("policy drift"). Pull
             # config when the caller didn't pass an explicit policy.
             synth_policy = policy if policy is not None else _policy_from_config()
-            _active_positions[key] = DSLTracker(coin, side, entry, time.time(), synth_policy,
+            # Try to resolve the actual fill time so the hard_timeout is accurate.
+            _entry_time = _resolve_fill_time_ms(user, coin, side) if user else None
+            if _entry_time is None:
+                # Resolution failed (API timeout/rate-limit) OR no user was
+                # supplied. Falling back to now() is safe for genuinely new
+                # positions but would RESET the timeout clock for an old
+                # position being re-synthesized after a state wipe. Log loudly
+                # so an operator can verify the position isn't being held past
+                # its hard_timeout; do NOT silently pretend we know the age.
+                if user:
+                    logger.error(
+                        f"[dsl] fill-time resolution FAILED for {key} @ {entry}; "
+                        f"synthesizing with entry_time=now. hard_timeout clock is "
+                        f"reset — verify this position is not stale."
+                    )
+                _entry_time = time.time()
+            _active_positions[key] = DSLTracker(coin, side, entry, _entry_time, synth_policy,
                                                 leverage=lev)
             added += 1
             logger.info(f"[dsl] Synthesized tracker for existing {key} @ {entry} ({lev}x)")
+            # Record the open in the outcome store so rehydrated positions
+            # aren't orphaned in memory.trades[] (previously only a tracker
+            # was synthesized; the close would later arrive with no matching
+            # open row — breaking the trades↔closes join and win-rate stats).
+            # Idempotency check: skip if a trade for this coin/side already
+            # exists within a 2% price band of the exchange entry, so a
+            # blackout-induced re-synthesize does not double-count.
+            try:
+                from hermes_trader.agents.memory import memory as _mem
+                import uuid as _uuid
+                _already = any(
+                    t.get("coin") == coin and t.get("side") == side
+                    and abs(float(t.get("entry_px") or 0) - entry) / entry < 0.02
+                    for t in _mem._trades
+                )
+                if not _already:
+                    _mem.record_trade({
+                        "id": str(_uuid.uuid4()),
+                        "analysis_id": "rehydrate_synth",
+                        "coin": coin,
+                        "side": side,
+                        "entry_px": entry,
+                        "size_usd": None,
+                        "order_id": None,
+                        "executed_at": int(_entry_time * 1000),
+                        "close_source": "rehydrate_synth",
+                        "backfill_note": "tracker synthesized from live exchange position",
+                    })
+                    logger.info(
+                        f"[dsl] rehydrated open recorded in outcome store: "
+                        f"{key} @ {entry} ({lev}x)")
+            except Exception as _rt_e:
+                logger.warning(
+                    f"[dsl] rehydrate record_trade failed for {key} "
+                    f"(non-fatal): {_rt_e}")
 
     def _key_in_queried_scope(k: str) -> bool:
         """True iff the dex behind this tracker key was queried this cycle.
@@ -626,7 +1010,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
     stale = [k for k in _active_positions
              if k not in live_keys and _key_in_queried_scope(k)]
     for k in stale:
-        del _active_positions[k]
+        dropped.append(_active_positions.pop(k))
         logger.info(f"[dsl] Dropped stale tracker {k} (no live exchange position)")
     skipped = [k for k in _active_positions
                if k not in live_keys and not _key_in_queried_scope(k)]
@@ -639,6 +1023,17 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
 
     if added or stale:
         _save_state()
+
+    # Best-effort: fill in any missing exchange bracket oids (e.g. after a restart
+    # from a v1 state file, or a just-synthesized tracker). Skips the network call
+    # when every tracker already has an sl_oid.
+    if user:
+        try:
+            backfill_brackets_from_exchange(user)
+        except Exception as e:
+            logger.debug(f"[dsl] bracket backfill failed (non-fatal): {e}")
+
+    return dropped
 
 
 def check_all_positions(mids: Dict[str, float]) -> List[ExitVerdict]:

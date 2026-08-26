@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -29,13 +30,27 @@ from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
-from hermes_trader import session_log
+from hermes_trader import event_log, session_log
 from hermes_trader.agents import dsl_exit
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import (
+    CANONICAL_DEFAULTS,
+    backup_config,
+    cfg_get,
+    create_snapshot,
+    list_snapshots,
+    read_agent_config,
+    restore_backup,
+    restore_snapshot,
+    write_agent_config,
+)
 from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 from hermes_trader.positions_snapshot import read_snapshot as read_position_snapshot
+
+logger = logging.getLogger("hermes-dashboard")
 
 _LOG_PATH = Path(session_log.SESSION_LOG_FILE)
 
@@ -102,6 +117,42 @@ def _read_log_lines() -> List[Dict[str, Any]]:
             except json.JSONDecodeError:
                 continue
     return out
+
+
+_EVENTS_PATH = Path(event_log.EVENTS_FILE)
+
+
+def _read_outcome_lines() -> List[Dict[str, Any]]:
+    """Read events.jsonl — the authoritative outcome log that holds reconciled
+    `close` events (exchange-triggered / manual-backfill) which may never appear
+    in the high-frequency session-log. Each record is nested as
+    ``{event, trace_id, timestamp, payload}``."""
+    if not _EVENTS_PATH.exists():
+        return []
+    out: List[Dict[str, Any]] = []
+    with _EVENTS_PATH.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _iso_to_ms(ts: Any) -> Optional[int]:
+    """Parse an ISO-8601 timestamp (as written to events.jsonl) to epoch ms."""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        from datetime import datetime, timezone
+        s = ts.rstrip("Z")
+        dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        return None
 
 
 def _last_event(events: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
@@ -265,9 +316,24 @@ def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
-    """Walk the session log for close events (dsl_exit, close_position).
+    """Walk both the session log and the outcome log for close events.
 
-    Returns newest-first. Each row carries:
+    Recognised events:
+      - ``dsl_exit`` (session-log) — DSL/trailing-stop exits, full PnL when the
+        close logged an actual fill, otherwise estimated.
+      - ``close_position`` (session-log) — operator manual close from the UI.
+      - ``external_close_recorded`` (session-log) — exchange-side closes detected
+        by the reconciler (stop/take-profit fired on the exchange).
+      - ``close`` (events.jsonl) — authoritative reconciled close records with
+        the richest fields (realized PnL, fees, hold time, close source).
+      - ``ai_close`` (session-log) — AI-driven close; usually lacks price/PnL
+        fields so it is recorded as a zero/unknown row for audit visibility.
+
+    Events describing the same fill (a ``dsl_exit`` backfill and its
+    ``external_close_recorded`` sibling, or an events.jsonl ``close``) are merged
+    so the UI never lists one position exit twice. Returns newest-first.
+
+    Each row carries:
       - `spot_pct`: raw price-move %. This is what the DSL engine measures
         and what HL would show you as "unrealized PnL %" on the position.
       - `pnl_pct`: leveraged margin PnL — what shows up in the HL P&L view.
@@ -291,9 +357,9 @@ def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
         nonlocal cfg_leverage
         if cfg_leverage is None:
             try:
-                cfg_leverage = int(read_agent_config().get("leverage", 1) or 1)
+                cfg_leverage = int(cfg_get("leverage"))
             except Exception:
-                cfg_leverage = 1
+                cfg_leverage = int(cfg_get("leverage"))
         return cfg_leverage
 
     def _estimate_leverage(coin: str) -> int:
@@ -304,7 +370,9 @@ def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
         cfg = _cfg_leverage()
         return min(cfg, coin_max) if coin_max else cfg
 
-    out: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
+
+    # ── session-log: dsl_exit / close_position / external_close_recorded / ai_close ──
     for i in range(n - 1, -1, -1):
         e = events[i]
         ev = e.get("event")
@@ -331,7 +399,7 @@ def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
                 net_pnl_pct = gross_pnl_pct - fees_pct
                 pnl_source = "estimated"
 
-            out.append({
+            rows.append({
                 "ts": e.get("ts"),
                 "coin": coin,
                 "source": "dsl",
@@ -351,22 +419,202 @@ def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
             })
         elif ev == "close_position":
             coin = e.get("coin", "?")
-            out.append({
+            side = e.get("side") or _find_open_side(coin, i) or "?"
+            has_explicit_lev = e.get("leverage") is not None
+            leverage = int(e["leverage"]) if has_explicit_lev else _estimate_leverage(coin)
+            # The manual-close endpoint may attach realized fill data
+            # (entry_px/fill_px or realized_pnl_pct); use it when present.
+            entry_px = e.get("entry_px")
+            fill_px = e.get("fill_px") or e.get("exit_px")
+            realized_pct = e.get("realized_pnl_pct")
+            if realized_pct is not None:
+                spot_pct = float(e.get("realized_spot_pct")
+                                 or e.get("spot_pct") or 0)
+                net_pnl_pct = float(realized_pct)
+                gross_pnl_pct = spot_pct * leverage
+                fees_pct = float(e.get("fees_pct")
+                                 or (HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage))
+                pnl_source = "fill"
+            elif entry_px and fill_px and float(entry_px) > 0:
+                spot_pct = (float(fill_px) - float(entry_px)) / float(entry_px) * 100.0
+                if side == "short":
+                    spot_pct = -spot_pct
+                gross_pnl_pct = spot_pct * leverage
+                fees_pct = HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage
+                net_pnl_pct = gross_pnl_pct - fees_pct
+                pnl_source = "fill"
+            else:
+                spot_pct = 0.0
+                gross_pnl_pct = 0.0
+                fees_pct = 0.0
+                net_pnl_pct = 0.0
+                pnl_source = "unknown"
+            rows.append({
                 "ts": e.get("ts"),
                 "coin": coin,
                 "source": "manual",
-                "side": _find_open_side(coin, i) or "?",
-                "leverage": _estimate_leverage(coin),
-                "leverage_estimated": True,
-                "reason": "manual_close",
-                "pnl_pct": 0.0,
-                "spot_pct": 0.0,
-                "executed": bool(e.get("ok")),
-                "detail": None,
+                "side": side,
+                "leverage": leverage,
+                "leverage_estimated": not has_explicit_lev,
+                "reason": e.get("reason") or "manual_close",
+                "pnl_pct": net_pnl_pct,
+                "pnl_pct_gross": gross_pnl_pct,
+                "pnl_source": pnl_source,
+                "fees_pct": fees_pct,
+                "spot_pct": spot_pct,
+                "fill_px": fill_px,
+                "entry_px": entry_px,
+                "executed": bool(e.get("ok", e.get("executed"))),
+                "detail": e.get("detail"),
             })
-        if len(out) >= limit:
-            break
-    return out
+        elif ev == "external_close_recorded":
+            # Exchange-side close (stop/TP fired off-box). The reconciler also
+            # emits a dsl_exit mirror; this branch is kept so older logs that
+            # only contain external_close_recorded are still surfaced, and the
+            # merge step below de-duplicates against the mirror.
+            coin = e.get("coin", "?")
+            side = e.get("side") or _find_open_side(coin, i) or "?"
+            has_explicit_lev = e.get("leverage") is not None
+            leverage = int(e["leverage"]) if has_explicit_lev else _estimate_leverage(coin)
+            entry_px = e.get("entry_px")
+            exit_px = e.get("exit_px")
+            realized_usd = e.get("realized_pnl_usd")
+            spot_pct = float(e.get("spot_pct") or 0)
+            if realized_usd is not None and entry_px and exit_px:
+                size_coin = abs(float(realized_usd)
+                                / max(abs(exit_px - entry_px), 1e-12))
+                notional = size_coin * float(entry_px)
+                if notional > 0:
+                    net_pnl_pct = float(realized_usd) / notional * 100.0 * leverage
+                else:
+                    net_pnl_pct = spot_pct * leverage
+                gross_pnl_pct = spot_pct * leverage
+                fees_pct = gross_pnl_pct - net_pnl_pct
+                pnl_source = "fill"
+            else:
+                gross_pnl_pct = spot_pct * leverage
+                fees_pct = HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage
+                net_pnl_pct = gross_pnl_pct - fees_pct
+                pnl_source = "estimated"
+            rows.append({
+                "ts": e.get("ts"),
+                "coin": coin,
+                "source": "external",
+                "side": side,
+                "leverage": leverage,
+                "leverage_estimated": not has_explicit_lev,
+                "reason": "exchange_trigger",
+                "pnl_pct": net_pnl_pct,
+                "pnl_pct_gross": gross_pnl_pct,
+                "pnl_source": pnl_source,
+                "fees_pct": fees_pct,
+                "spot_pct": spot_pct,
+                "fill_px": exit_px,
+                "entry_px": entry_px,
+                "executed": True,
+                "detail": f"oid={e.get('oid')}" if e.get("oid") else None,
+            })
+        elif ev == "ai_close":
+            # AI verdict close. The event does not carry fill prices/PnL (the
+            # actual order result is in close_position_market's return value),
+            # so record an audit row with pnl_source="unknown" rather than a
+            # misleading 0% that looks like a breakeven trade.
+            coin = e.get("coin", "?")
+            side = e.get("side") or _find_open_side(coin, i) or "?"
+            leverage = _estimate_leverage(coin)
+            rows.append({
+                "ts": e.get("ts"),
+                "coin": coin,
+                "source": "ai",
+                "side": side,
+                "leverage": leverage,
+                "leverage_estimated": True,
+                "reason": (e.get("reasoning") or "ai_close")[:120],
+                "pnl_pct": None,
+                "pnl_pct_gross": None,
+                "pnl_source": "unknown",
+                "fees_pct": None,
+                "spot_pct": None,
+                "fill_px": None,
+                "entry_px": None,
+                "executed": bool(e.get("executed")),
+                "detail": e.get("detail"),
+            })
+
+    # ── events.jsonl: authoritative reconciled `close` records ──
+    for rec in _read_outcome_lines():
+        if rec.get("event") != "close":
+            continue
+        p = rec.get("payload") or {}
+        coin = p.get("coin", "?")
+        ts = p.get("closed_at") or _iso_to_ms(rec.get("timestamp"))
+        leverage = int(p.get("leverage") or 0) or _estimate_leverage(coin)
+        entry_px = p.get("entry_px")
+        fill_px = p.get("exit_px")
+        realized_pct = p.get("realized_pnl_pct")
+        spot_pct = float(p.get("spot_pct") or 0)
+        if realized_pct is not None:
+            net_pnl_pct = float(realized_pct)
+            gross_pnl_pct = spot_pct * leverage if leverage else 0.0
+            notional = float(p.get("notional_usd") or 0)
+            fee_usd = float(p.get("fee_usd") or 0)
+            if notional > 0 and leverage:
+                fees_pct = fee_usd / notional * 100.0 * leverage
+            else:
+                fees_pct = gross_pnl_pct - net_pnl_pct
+            pnl_source = "fill"
+        else:
+            gross_pnl_pct = spot_pct * leverage if leverage else 0.0
+            fees_pct = HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage if leverage else 0.0
+            net_pnl_pct = gross_pnl_pct - fees_pct
+            pnl_source = "estimated"
+        close_source = p.get("close_source") or "reconcile"
+        rows.append({
+            "ts": ts,
+            "coin": coin,
+            "source": "reconcile",
+            "side": p.get("side") or "?",
+            "leverage": leverage,
+            "leverage_estimated": p.get("leverage") is None,
+            "reason": close_source,
+            "pnl_pct": net_pnl_pct,
+            "pnl_pct_gross": gross_pnl_pct,
+            "pnl_source": pnl_source,
+            "fees_pct": fees_pct,
+            "spot_pct": spot_pct,
+            "fill_px": fill_px,
+            "entry_px": entry_px,
+            "executed": True,
+            "detail": f"hold={p.get('hold_minutes')}m oid={p.get('close_oid')}"
+                      if p.get("hold_minutes") is not None else None,
+        })
+
+    # ── De-duplicate: same coin within a 5s window describes one fill.
+    #    Prefer the richest row (events.jsonl `reconcile`, then `external`,
+    #    then `dsl`, then `manual`, then `ai`). ──
+    source_rank = {"reconcile": 0, "external": 1, "dsl": 2, "manual": 3, "ai": 4}
+    rows.sort(key=lambda r: (
+        -(r.get("ts") or 0),
+        source_rank.get(r.get("source"), 9),
+    ))
+    merged: List[Dict[str, Any]] = []
+    DEDUP_WINDOW_MS = 5_000
+    for r in rows:
+        dup = None
+        for m in merged:
+            if (m.get("coin") == r.get("coin")
+                    and m.get("ts") and r.get("ts")
+                    and abs(int(m["ts"]) - int(r["ts"])) <= DEDUP_WINDOW_MS):
+                dup = m
+                break
+        if dup is None:
+            merged.append(r)
+        elif source_rank.get(r.get("source"), 9) < source_rank.get(dup.get("source"), 9):
+            merged.remove(dup)
+            merged.append(r)
+
+    merged.sort(key=lambda r: -(r.get("ts") or 0))
+    return merged[:limit]
 
 
 def _equity_curve_payload(range_s: int) -> List[Dict[str, Any]]:
@@ -411,36 +659,56 @@ def _equity_curve_payload(range_s: int) -> List[Dict[str, Any]]:
 
 
 async def _tail_log_sse() -> AsyncIterator[str]:
-    """Stream new session-log lines as SSE events. Replays the last 50 first."""
+    """Stream new session-log lines as SSE events. Replays the last 500 first."""
     # Replay buffer so a fresh connection sees the recent past, not just future events.
-    for e in session_log.tail(50):
+    # session_log.tail() reads backward from end of file in chunks; offload to a
+    # thread so it doesn't block the event loop for other routes / SSE clients.
+    replay = await asyncio.to_thread(session_log.tail, 500)
+    for e in replay:
         yield f"data: {json.dumps(e)}\n\n"
 
-    last_size = _LOG_PATH.stat().st_size if _LOG_PATH.exists() else 0
+    def _stat_size() -> int:
+        return _LOG_PATH.stat().st_size if _LOG_PATH.exists() else 0
+
+    last_size = await asyncio.to_thread(_stat_size)
     # Heartbeat every 15s keeps proxies (nginx, Cloudflare) from closing idle SSE.
     last_heartbeat = time.time()
 
+    def _read_new_lines(prev_size: int) -> tuple[list[str], int]:
+        """Read & validate new lines appended since prev_size. Runs in a thread
+        because open()/read() on a multi-MB log would block the event loop."""
+        if not _LOG_PATH.exists():
+            return [], prev_size
+        cur = _LOG_PATH.stat().st_size
+        if cur < prev_size:
+            prev_size = 0  # file rotated
+        if cur <= prev_size:
+            return [], cur
+        out: list[str] = []
+        with _LOG_PATH.open() as f:
+            f.seek(prev_size)
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                out.append(line)
+        return out, cur
+
     while True:
         await asyncio.sleep(1.0)
-        if not _LOG_PATH.exists():
-            continue
-        size = _LOG_PATH.stat().st_size
-        if size < last_size:
-            # File rotated; start over.
-            last_size = 0
-        if size > last_size:
-            with _LOG_PATH.open() as f:
-                f.seek(last_size)
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        json.loads(line)  # validate before sending
-                    except json.JSONDecodeError:
-                        continue
-                    yield f"data: {line}\n\n"
-            last_size = size
+        new_lines, new_size = await asyncio.to_thread(_read_new_lines, last_size)
+        if new_size < last_size:
+            last_size = 0  # rotated
+        if new_lines:
+            for line in new_lines:
+                yield f"data: {line}\n\n"
+            last_size = new_size
+        elif new_size != last_size:
+            last_size = new_size
 
         if time.time() - last_heartbeat > 15:
             yield ": keepalive\n\n"
@@ -450,8 +718,21 @@ async def _tail_log_sse() -> AsyncIterator[str]:
 # ── operator gate ────────────────────────────────────────────────────────────
 
 
+def _extract_bearer(request: Request) -> str:
+    """Return the bearer token from ``Authorization: Bearer <token>`` or ``''``."""
+    auth = request.headers.get("Authorization") or request.headers.get("authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[len("Bearer "):].strip()
+    return ""
+
+
 def _require_operator(request: Request) -> None:
-    """401 unless `?token=` or `X-Operator-Token` matches `HERMES_OPERATOR_TOKEN`.
+    """401 unless a valid operator token is supplied.
+
+    Accepted token transports (in priority order):
+      1. Standard ``Authorization: Bearer <token>`` header (preferred)
+      2. Legacy ``X-Operator-Token`` header
+      3. ``?token=<token>`` query parameter (deprecated, kept for browser panels)
 
     Checking at request time (not import time) means rotating the token doesn't
     need a restart. Missing env var = operator surface is closed.
@@ -459,9 +740,19 @@ def _require_operator(request: Request) -> None:
     expected = os.environ.get("HERMES_OPERATOR_TOKEN", "")
     if not expected:
         raise HTTPException(status_code=503, detail="operator surface disabled (set HERMES_OPERATOR_TOKEN)")
-    provided = request.query_params.get("token") or request.headers.get("X-Operator-Token", "")
+    provided = (
+        _extract_bearer(request)
+        or request.headers.get("X-Operator-Token", "")
+        or request.query_params.get("token", "")
+    )
     if provided != expected:
-        raise HTTPException(status_code=401, detail="invalid operator token")
+        # Send a WWW-Authenticate challenge so standard HTTP clients know to
+        # present a bearer token (P0-2).
+        raise HTTPException(
+            status_code=401,
+            detail="invalid operator token",
+            headers={"WWW-Authenticate": 'Bearer realm="hermes-trader"'},
+        )
 
 
 # ── HTML ─────────────────────────────────────────────────────────────────────
@@ -1596,161 +1887,877 @@ setInterval(rotateHamsterQuote, 7000);
 """
 
 
-_CONFIG_HTML = """<!doctype html>
-<html lang="en">
+_CONFIG_HTML = r"""<!doctype html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>hermes-trader · config</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="https://unpkg.com/nes.css@2.3.0/css/nes.min.css">
-<script src="https://cdn.tailwindcss.com"></script>
+<title>Hermes Trader · 配置中心</title>
+<!--
+  LAN-safe: zero external CDN/font dependencies.
+  All styles are inlined so the page loads on isolated local networks.
+-->
 <style>
-  body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0a0a0a;color:#e5e5e5}
-  .pixel{font-family:'Press Start 2P',ui-monospace,monospace;letter-spacing:.02em;line-height:1.4}
-  .lcd{background:#052e1c;border:2px solid #34d399;box-shadow:inset 0 0 0 1px #022c1e,4px 4px 0 #064e3b;padding:8px 12px;color:#6ee7b7;text-shadow:0 0 6px #34d39966}
-  section.bg-zinc-900{border:2px solid #27272a;box-shadow:4px 4px 0 #18181b;border-radius:0;background:#0f0f10}
-  /* Config rows render as a two-col grid: pixel-font key on the left,
-     value (color-coded by type) on the right. */
-  .cfg-grid{display:grid;grid-template-columns:minmax(220px,32%) 1fr;gap:6px 16px;align-items:baseline}
-  .cfg-key{font-family:'Press Start 2P',monospace;font-size:9px;color:#34d399;text-shadow:0 0 4px rgba(52,211,153,0.45);padding:6px 0;letter-spacing:.06em;word-break:break-all}
-  .cfg-val{font-family:ui-monospace,monospace;font-size:13px;padding:6px 0;border-left:2px solid #1f2937;padding-left:14px;word-break:break-word}
-  .cfg-val.num{color:#a7f3d0}
-  .cfg-val.bool{color:#fde68a}
-  .cfg-val.str{color:#bae6fd}
-  .cfg-val.null{color:#71717a;font-style:italic}
-  .cfg-val.obj{color:#f9a8d4}
-  .cfg-val pre{margin:0;font-family:ui-monospace,monospace;font-size:11px;white-space:pre-wrap;color:#e5e5e5;background:#020a05;border:1px solid #064e3b;padding:6px 8px;max-width:100%;overflow-x:auto}
-  /* Section break inside the cfg grid */
-  .cfg-section-head{grid-column:1/-1;font-family:'Press Start 2P',monospace;font-size:8px;color:#71717a;letter-spacing:.2em;padding:12px 0 4px;border-top:1px solid #1f2937;margin-top:8px}
-  .cfg-section-head:first-child{border-top:0;margin-top:0;padding-top:4px}
-  /* Tip pill at the bottom */
-  .cfg-tip{font-family:'Press Start 2P',monospace;font-size:9px;color:#fbbf24;letter-spacing:.06em;text-align:center;padding:8px;margin-top:14px;border:2px dashed #78350f;background:#1f1300}
-  /* Mode pill */
-  .cfg-mode{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;font-family:'Press Start 2P',monospace;font-size:10px;border:2px solid currentColor;letter-spacing:.1em}
-  .cfg-mode.LIVE{background:#064e3b;color:#6ee7b7}
-  .cfg-mode.OFF{background:#450a0a;color:#fca5a5}
-  /* Primary navbar — must match dashboard.html's nav-link rules */
-  .nav-link{display:inline-block;padding:7px 11px;font-size:9px;letter-spacing:.12em;color:#a3a3a3;background:#18181b;border:2px solid #3f3f46;box-shadow:2px 2px 0 #0a0a0a;text-decoration:none;transition:transform .08s ease,box-shadow .08s ease}
-  .nav-link:hover{color:#a7f3d0;border-color:#047857;box-shadow:2px 2px 0 #022c1e}
-  .nav-link:active{transform:translate(2px,2px);box-shadow:none}
-  .nav-link.nav-active{background:#064e3b;color:#6ee7b7;border-color:#34d399;box-shadow:2px 2px 0 #022c1e}
+  /* ===== Design tokens: eye-friendly dark palette, low-glare for long sessions ===== */
+  :root {
+    --bg:        #1b1e25;
+    --surface:   #232730;
+    --surface2:  #2a2f3a;
+    --border:    #353b47;
+    --border-soft:#2d323c;
+    --text:      #d4d9e2;
+    --text-2:    #9aa3b2;
+    --text-3:    #6b7280;
+    --accent:    #5b9df9;
+    --accent-soft:rgba(91,157,249,.14);
+    --success:   #4caf82;
+    --success-soft:rgba(76,175,130,.14);
+    --warn:      #d4a056;
+    --warn-soft: rgba(212,160,86,.14);
+    --danger:    #d46b6b;
+    --danger-soft:rgba(212,107,107,.14);
+    --radius:    10px;
+    --radius-sm: 6px;
+    --mono: ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+    --han: "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Source Han Sans SC","WenQuanYi Micro Hei",system-ui,sans-serif;
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:var(--han);
+    background:var(--bg);
+    color:var(--text);
+    line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+    -moz-osx-font-smoothing:grayscale;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 48px}
+
+  /* ===== Overview stat strip (错落有致的概览栏) ===== */
+  .stat-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+  .stat{
+    background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:var(--radius);padding:14px 16px;position:relative;overflow:hidden;
+  }
+  .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+  .stat.s-warn::before{background:var(--warn)}
+  .stat.s-ok::before{background:var(--success)}
+  .stat.s-danger::before{background:var(--danger)}
+  .stat:nth-child(2n){transform:translateY(6px)}
+  .stat-label{font-size:11.5px;color:var(--text-3);font-weight:500;letter-spacing:.04em;text-transform:uppercase}
+  .stat-value{font-size:20px;font-weight:600;margin-top:4px;font-family:var(--mono);letter-spacing:.01em}
+  .stat-sub{font-size:11px;color:var(--text-3);margin-top:2px}
+
+  /* ===== Section cards (分组卡片，错落阴影) ===== */
+  .cfg-card{
+    background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:var(--radius);padding:0;margin-bottom:16px;overflow:hidden;
+    box-shadow:0 1px 3px rgba(0,0,0,.18);
+  }
+  .cfg-card:nth-child(even){box-shadow:0 3px 10px rgba(0,0,0,.12)}
+  .cfg-card-head{
+    display:flex;align-items:center;gap:10px;padding:13px 18px;cursor:pointer;
+    background:linear-gradient(180deg,var(--surface2),var(--surface));
+    border-bottom:1px solid var(--border-soft);user-select:none;
+  }
+  .cfg-card-head .chev{font-size:9px;color:var(--text-3);transition:transform .15s}
+  .cfg-card.collapsed .chev{transform:rotate(-90deg)}
+  .cfg-card.collapsed .cfg-card-body{display:none}
+  .cfg-card-title{font-size:14px;font-weight:600;color:var(--text)}
+  .cfg-card-count{margin-left:auto;font-size:11px;color:var(--text-3);font-family:var(--mono)}
+  .cfg-card-body{padding:6px 18px 14px}
+
+  /* ===== Nested field hint (嵌套字段中文提示) ===== */
+  .nested-hint{
+    border:1px dashed var(--border);border-radius:var(--radius-sm);
+    background:rgba(0,0,0,.15);padding:10px 12px;margin:6px 0 4px;
+  }
+  .nested-hint summary{
+    cursor:pointer;font-size:12px;color:var(--accent);font-weight:600;
+    list-style:none;display:flex;align-items:center;gap:8px;
+  }
+  .nested-hint summary::-webkit-details-marker{display:none}
+  .nested-hint summary::before{content:"\25B6";font-size:8px;transition:transform .15s}
+  .nested-hint[open] summary::before{transform:rotate(90deg)}
+  .field-map{margin-top:8px;display:grid;grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:4px 16px}
+  .field-map .fm{display:flex;gap:6px;font-size:11.5px;line-height:1.4}
+  .field-map .fm code{font-family:var(--mono);color:var(--accent);white-space:nowrap}
+  .field-map .fm span{color:var(--text-2)}
+
+  /* ===== Header ===== */
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .brand-mark{
+    width:38px;height:38px;border-radius:10px;
+    background:linear-gradient(135deg,var(--accent),#7c5cff);
+    display:flex;align-items:center;justify-content:center;
+    font-weight:700;color:#fff;font-size:18px;flex-shrink:0;
+    box-shadow:0 4px 14px rgba(91,157,249,.25);
+  }
+  .brand-title{font-size:18px;font-weight:600;letter-spacing:.02em}
+  .brand-sub{font-size:12px;color:var(--text-3);font-family:var(--mono);letter-spacing:.04em}
+
+  /* ===== Nav ===== */
+  nav{display:flex;gap:6px;margin-bottom:22px;flex-wrap:wrap;background:var(--surface);padding:6px;border-radius:var(--radius);border:1px solid var(--border-soft)}
+  .nav-link{
+    padding:8px 16px;font-size:13px;font-weight:500;color:var(--text-2);
+    text-decoration:none;border-radius:var(--radius-sm);transition:all .15s ease;
+    font-family:var(--han);
+  }
+  .nav-link:hover{color:var(--text);background:var(--surface2)}
+  .nav-link.nav-active{color:#fff;background:var(--accent);box-shadow:0 2px 8px rgba(91,157,249,.3)}
+
+  /* ===== Cards ===== */
+  .card{background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);padding:20px;margin-bottom:18px}
+  .card-title{font-size:13px;color:var(--text-3);margin:0 0 14px;font-weight:500;display:flex;align-items:center;gap:8px}
+  .card-title .dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success)}
+
+  /* ===== Token bar ===== */
+  .token-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .token-bar label{font-size:13px;color:var(--text-2);white-space:nowrap;font-weight:500}
+  .token-bar input{
+    flex:1;min-width:220px;background:var(--bg);border:1px solid var(--border);
+    color:var(--text);font-family:var(--mono);font-size:13px;padding:9px 12px;
+    border-radius:var(--radius-sm);outline:none;transition:border-color .15s,box-shadow .15s;
+  }
+  .token-bar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .auth-badge{font-size:11px;padding:4px 10px;border-radius:20px;font-weight:600;letter-spacing:.03em;white-space:nowrap}
+  .auth-badge.on{color:var(--success);background:var(--success-soft);border:1px solid rgba(76,175,130,.3)}
+  .auth-badge.off{color:var(--text-3);background:var(--surface2);border:1px solid var(--border)}
+
+  /* ===== Toolbar ===== */
+  .toolbar{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:18px}
+  .toolbar-meta{font-size:12px;color:var(--text-3);font-family:var(--mono)}
+  .toolbar-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .cfg-mode{display:inline-flex;align-items:center;gap:6px;padding:5px 12px;font-size:12px;font-weight:600;border-radius:20px;border:1px solid}
+  .cfg-mode.LIVE{color:var(--success);background:var(--success-soft);border-color:rgba(76,175,130,.35)}
+  .cfg-mode.OFF{color:var(--warn);background:var(--warn-soft);border-color:rgba(212,160,86,.35)}
+
+  /* ===== Buttons ===== */
+  .btn{
+    font-family:var(--han);font-size:13px;font-weight:500;padding:8px 16px;
+    border-radius:var(--radius-sm);border:1px solid transparent;cursor:pointer;
+    transition:all .15s ease;white-space:nowrap;
+  }
+  .btn:disabled{opacity:.38;cursor:not-allowed}
+  .btn-save{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn-save:hover:not(:disabled){background:#4a8ce8;border-color:#4a8ce8}
+  .btn-reset{background:transparent;color:var(--warn);border-color:rgba(212,160,86,.4)}
+  .btn-reset:hover:not(:disabled){background:var(--warn-soft)}
+  .btn-rollback{background:transparent;color:var(--danger);border-color:rgba(212,107,107,.4)}
+  .btn-rollback:hover:not(:disabled){background:var(--danger-soft)}
+  .btn-history{background:transparent;color:var(--text-2);border-color:var(--border)}
+  .btn-history:hover:not(:disabled){background:var(--surface2);color:var(--text)}
+  .btn-token{background:var(--accent);color:#fff;border:none;padding:9px 18px;border-radius:var(--radius-sm);font-size:13px;font-weight:500;cursor:pointer;font-family:var(--han)}
+  .btn-token:hover{background:#4a8ce8}
+
+  /* ===== Config grid: key(label) | value ===== */
+  .cfg-grid{display:grid;grid-template-columns:minmax(180px,28%) 1fr;gap:0;border-top:1px solid var(--border-soft)}
+  .cfg-section-head{
+    grid-column:1/-1;font-size:12px;font-weight:600;color:var(--accent);
+    padding:16px 0 8px;letter-spacing:.08em;text-transform:uppercase;
+    border-bottom:1px solid var(--border-soft);margin-top:8px;
+    display:flex;align-items:center;gap:8px;
+  }
+  .cfg-section-head::before{content:"";width:3px;height:14px;background:var(--accent);border-radius:2px}
+  .cfg-section-head:first-child{margin-top:0}
+  .cfg-key{
+    padding:12px 14px 12px 0;border-bottom:1px solid var(--border-soft);
+    display:flex;flex-direction:column;gap:2px;
+  }
+  .cfg-key .k-label{font-size:13.5px;font-weight:500;color:var(--text);line-height:1.4}
+  .cfg-key .k-code{font-family:var(--mono);font-size:10.5px;color:var(--text-3);letter-spacing:.02em;word-break:break-all}
+  .cfg-val{padding:10px 0 10px 14px;border-bottom:1px solid var(--border-soft);display:flex;align-items:center;gap:10px}
+  .cfg-val .cfg-input{flex:1;min-width:0}
+
+  /* ===== Inputs ===== */
+  .cfg-input{
+    width:100%;background:var(--bg);border:1px solid var(--border);color:var(--text);
+    font-family:var(--mono);font-size:13px;padding:8px 11px;border-radius:var(--radius-sm);
+    outline:none;transition:border-color .15s,box-shadow .15s;
+  }
+  .cfg-input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .cfg-input.changed{border-color:var(--warn);background:var(--warn-soft)}
+  .cfg-input[type=checkbox]{width:20px;height:20px;accent-color:var(--accent);flex:0 0 auto;cursor:pointer}
+  .cfg-input:disabled{opacity:.5;cursor:not-allowed}
+  .cfg-input:disabled[type=checkbox]{cursor:not-allowed}
+  textarea.cfg-input{font-size:12.5px;line-height:1.5;resize:vertical}
+  .cfg-row-dirty{display:inline-block;width:8px;height:8px;background:var(--warn);border-radius:50%;flex-shrink:0;opacity:0;transition:opacity .15s}
+  .cfg-row-dirty.show{opacity:1;box-shadow:0 0 6px var(--warn)}
+
+  /* ===== History ===== */
+  details{margin-top:6px}
+  details summary{
+    cursor:pointer;font-size:13px;font-weight:500;color:var(--text-2);padding:10px 0;
+    list-style:none;display:flex;align-items:center;gap:8px;user-select:none;
+  }
+  details summary::-webkit-details-marker{display:none}
+  details summary::before{content:"\25B6";font-size:9px;color:var(--text-3);transition:transform .15s}
+  details[open] summary::before{transform:rotate(90deg)}
+  details summary:hover{color:var(--text)}
+  .history-panel{max-height:340px;overflow:auto;margin-top:8px;border:1px solid var(--border-soft);border-radius:var(--radius-sm)}
+  .history-panel table{width:100%;border-collapse:collapse;font-size:12.5px}
+  .history-panel th{
+    text-align:left;color:var(--text-3);font-weight:600;font-size:11px;
+    padding:9px 12px;border-bottom:1px solid var(--border);background:var(--surface2);
+    position:sticky;top:0;
+  }
+  .history-panel td{padding:8px 12px;border-bottom:1px solid var(--border-soft);vertical-align:top}
+  .history-panel tr:last-child td{border-bottom:none}
+  .history-panel .ts{color:var(--text-3);white-space:nowrap;font-family:var(--mono);font-size:11.5px}
+  .history-panel .ev-update{color:var(--success)}
+  .history-panel .ev-rollback{color:var(--danger)}
+
+  /* ===== Toast ===== */
+  #toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:10px}
+  .toast{
+    padding:12px 18px;font-size:13px;border-radius:var(--radius-sm);max-width:420px;
+    word-break:break-word;animation:slidein .22s ease;box-shadow:0 8px 24px rgba(0,0,0,.35);
+    border:1px solid;
+  }
+  .toast.ok{background:var(--success-soft);color:var(--success);border-color:rgba(76,175,130,.3)}
+  .toast.err{background:var(--danger-soft);color:var(--danger);border-color:rgba(212,107,107,.3)}
+  .toast.info{background:var(--accent-soft);color:var(--accent);border-color:rgba(91,157,249,.3)}
+  @keyframes slidein{from{transform:translateY(16px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+  /* ===== Footer ===== */
+  footer{text-align:center;font-size:12px;color:var(--text-3);margin-top:28px;font-family:var(--mono)}
+
+  /* ===== Responsive: stack to single column on narrow screens ===== */
+  @media (max-width:680px){
+    .wrap{padding:16px 14px 40px}
+    .stat-strip{grid-template-columns:repeat(2,1fr);gap:10px}
+    .stat:nth-child(2n){transform:none}
+    .stat-value{font-size:17px}
+    .cfg-grid{grid-template-columns:1fr}
+    .cfg-key{padding:12px 0 4px;border-bottom:none}
+    .cfg-val{padding:0 0 12px 0}
+    .toolbar{flex-direction:column;align-items:stretch}
+    .toolbar-actions{justify-content:flex-start}
+    .btn{flex:1;text-align:center}
+    .token-bar input{min-width:0}
+    nav{overflow-x:auto}
+    .nav-link{white-space:nowrap}
+    .cfg-card-body{padding:6px 12px 12px}
+  }
 </style>
 </head>
-<body class="min-h-screen">
-<div class="max-w-[1100px] mx-auto px-6 py-6">
+<body>
+<div class="wrap">
 
-  <header class="flex items-center justify-between mb-3 gap-3 flex-wrap">
-    <div class="flex items-center gap-3">
-      <span class="lcd pixel text-sm tracking-tight">HERMES-TRADER · CONFIG</span>
+  <header>
+    <div class="brand">
+      <div class="brand-mark">H</div>
+      <div>
+        <div class="brand-title">Hermes Trader</div>
+        <div class="brand-sub">configuration console</div>
+      </div>
     </div>
   </header>
 
-  <nav class="flex items-center gap-2 mb-6 flex-wrap" id="hermes-nav">
-    <a href="/" data-nav="/" class="nav-link pixel">DASHBOARD</a>
-    <a href="/config" data-nav="/config" class="nav-link pixel">CONFIG</a>
-    <a href="/operator" data-nav="/operator" class="nav-link pixel">OPERATOR</a>
+  <nav id="hermes-nav">
+    <a href="/" data-nav="/" class="nav-link">监控面板</a>
+    <a href="/config" data-nav="/config" class="nav-link">配置中心</a>
+    <a href="/operator" data-nav="/operator" class="nav-link">运维台</a>
   </nav>
 
-  <section class="bg-zinc-900 p-6 mb-6">
-    <div class="flex items-center justify-between mb-4">
-      <span class="pixel text-[10px] text-zinc-500">.agent-config.json (live, hot-reloaded every cycle)</span>
-      <span id="cfg-mode-pill" class="cfg-mode OFF">—</span>
+  <!-- 错落有致的概览统计栏 -->
+  <div class="stat-strip">
+    <div class="stat" id="stat-mode">
+      <div class="stat-label">运行模式</div>
+      <div class="stat-value" id="ov-mode">—</div>
+      <div class="stat-sub" id="ov-mode-sub">实时交易开关</div>
     </div>
-    <div id="cfg-grid" class="cfg-grid">
-      <div class="cfg-section-head">loading…</div>
+    <div class="stat s-ok" id="stat-crypto">
+      <div class="stat-label">加密货币</div>
+      <div class="stat-value" id="ov-crypto">—</div>
+      <div class="stat-sub" id="ov-crypto-sub">crypto 扫描</div>
     </div>
-    <div class="cfg-tip">
-      to change a value: open Cmd+K terminal · `set &lt;key&gt; &lt;value&gt;` · type auto-inferred
+    <div class="stat" id="stat-gates">
+      <div class="stat-label">风险闸门</div>
+      <div class="stat-value" id="ov-gates">—</div>
+      <div class="stat-sub" id="ov-gates-sub">已启用的闸门数</div>
+    </div>
+    <div class="stat s-warn" id="stat-concurrent">
+      <div class="stat-label">并发 / 杠杆</div>
+      <div class="stat-value" id="ov-concurrent">—</div>
+      <div class="stat-sub" id="ov-concurrent-sub">最大持仓 · 杠杆倍数</div>
+    </div>
+  </div>
+
+  <!-- Token bar -->
+  <section class="card">
+    <div class="token-bar">
+      <label for="token-input">运维令牌</label>
+      <input id="token-input" type="password" placeholder="粘贴 HERMES_OPERATOR_TOKEN 以解锁编辑…" autocomplete="off" />
+      <button id="token-save" class="btn-token">设定</button>
+      <span id="auth-badge" class="auth-badge off">只读</span>
     </div>
   </section>
 
-  <footer class="text-[10px] text-zinc-600 mt-6 text-center pixel">
-    one wallet · live · not financial advice
-  </footer>
+  <section class="card">
+    <div class="toolbar">
+      <span class="toolbar-meta">.agent-config.json · 每 5 秒热重载</span>
+      <div class="toolbar-actions">
+        <span id="cfg-mode-pill" class="cfg-mode OFF">—</span>
+        <button id="btn-save" class="btn btn-save" disabled>保存更改</button>
+        <button id="btn-reset" class="btn btn-reset" disabled>撤销</button>
+        <button id="btn-rollback" class="btn btn-rollback" disabled>回滚备份</button>
+        <button id="btn-history" class="btn btn-history">变更历史</button>
+      </div>
+    </div>
+
+    <div id="cfg-grid" class="cfg-grid">
+      <div class="cfg-section-head">加载中…</div>
+    </div>
+
+    <details id="history-details">
+      <summary>变更历史记录</summary>
+      <div id="history-panel" class="history-panel">
+        <table><thead><tr><th>时间</th><th>事件</th><th>详情</th></tr></thead>
+        <tbody id="history-body"><tr><td colspan="3" style="color:var(--text-3)">加载中…</td></tr></tbody></table>
+      </div>
+    </details>
+  </section>
+
+  <div id="toast-container"></div>
+
+  <footer>Hermes Trader · 单钱包运行 · 不构成投资建议</footer>
 </div>
 
 <script>
-// Group the live agent config into named sections for readability. Anything
-// not in the explicit grouping falls into "other" so future config keys
-// still appear without code changes.
+// ===== Section grouping (Chinese label + config keys) =====
 const SECTIONS = [
-  { label: 'mode + sizing', keys: ['mode','equity_fraction_per_trade','leverage','max_concurrent','max_trade_notional_usd','max_total_notional_pct'] },
-  { label: 'safety',        keys: ['max_daily_loss_usd','cooldown_min','min_ai_confidence','counter_regime_min_conf','max_crypto_long_correlated'] },
-  { label: 'liquidity',     keys: ['min_market_volume_usd','min_hip3_volume_usd'] },
-  { label: 'filters',       keys: ['coin_allowlist','coin_blocklist'] },
-  { label: 'markets',       keys: ['enable_crypto','enable_hip3'] },
-  { label: 'dsl exit',      keys: ['dsl_exit'] },
+  { label: '模式与仓位', keys: ['mode','equity_fraction_per_trade','leverage','max_concurrent','max_trade_notional_usd','max_total_notional_pct'] },
+  { label: '安全控制',   keys: ['max_daily_loss_usd','daily_giveback_halt_pct','daily_giveback_min_peak_usd','cooldown_min','loss_cooldown_min','min_ai_confidence','counter_regime_min_conf','chop_min_conf','chop_min_score','max_crypto_long_correlated'] },
+  { label: '流动性',     keys: ['min_market_volume_usd','min_hip3_volume_usd','min_short_volume_usd','max_atr_pct','max_spread_pct'] },
+  { label: '筛选器',     keys: ['coin_allowlist','coin_blocklist'] },
+  { label: '市场',       keys: ['enable_crypto','enable_hip3','block_counter_trend_bypass'] },
+  { label: '闸门',       keys: ['runner_entry_gate','debate_gate','signal_enforcement'] },
+  { label: '仓位与退出', keys: ['atr_risk_sizing','dsl_exit','plan_b','sl_atr_mult','min_ai_close_hold_min'] },
 ];
 const SECTION_KEYS = new Set(SECTIONS.flatMap(s => s.keys));
 
-function classifyVal(v) {
-  if (v === null || v === undefined) return 'null';
-  const t = typeof v;
-  if (t === 'number') return 'num';
-  if (t === 'boolean') return 'bool';
-  if (t === 'string') return 'str';
-  return 'obj';
+// Chinese display labels for each config key. English key code shown as smaller auxiliary text.
+const KEY_LABELS = {
+  mode: '运行模式',
+  equity_fraction_per_trade: '单笔权益占比',
+  leverage: '杠杆倍数',
+  max_concurrent: '最大并发持仓',
+  max_trade_notional_usd: '单笔最大名义金额 (USD)',
+  max_total_notional_pct: '总名义金额上限占比',
+  max_daily_loss_usd: '单日最大亏损 (USD)',
+  daily_giveback_halt_pct: '日内回撤熔断比例',
+  daily_giveback_min_peak_usd: '回撤熔断最低峰值 (USD)',
+  cooldown_min: '全局冷静期 (分钟)',
+  loss_cooldown_min: '亏损后冷静期 (分钟)',
+  min_ai_confidence: 'AI 最低置信度',
+  counter_regime_min_conf: '逆势交易最低置信度',
+  chop_min_conf: '震荡市最低置信度',
+  chop_min_score: '震荡市最低评分',
+  max_crypto_long_correlated: '加密多头最大相关持仓',
+  min_market_volume_usd: '最低市场成交量 (USD)',
+  min_hip3_volume_usd: 'HIP3 最低成交量 (USD)',
+  min_short_volume_usd: '做空最低成交量 (USD)',
+  max_atr_pct: '最大 ATR 百分比',
+  max_spread_pct: '最大价差百分比',
+  coin_allowlist: '币种白名单',
+  coin_blocklist: '币种黑名单',
+  enable_crypto: '启用加密货币',
+  enable_hip3: '启用 HIP3',
+  block_counter_trend_bypass: '阻止逆势绕过',
+  runner_entry_gate: '入场闸门',
+  debate_gate: '辩论闸门',
+  signal_enforcement: '信号强制执行',
+  atr_risk_sizing: 'ATR 风险仓位',
+  dsl_exit: 'DSL 退出',
+  plan_b: 'B 计划',
+  sl_atr_mult: '止损 ATR 倍数',
+  min_ai_close_hold_min: 'AI 平仓最短持有 (分钟)',
+};
+
+// 嵌套对象的子字段中文示意。键为顶层配置键，值为 { 子字段: 中文名 } 映射。
+// 在对应 JSON 编辑区上方以可折叠"字段说明"展示，避免在无 schema 的情况下盲改。
+const NESTED_LABELS = {
+  dsl_exit: {
+    max_loss_pct: '单笔最大亏损百分比', max_loss_roe_pct: '单笔最大 ROE 亏损百分比',
+    protect_pct: '盈利保护百分比', retrace_threshold: '回撤阈值（0-1）',
+    hard_timeout_minutes: '硬性超时（分钟）', breakeven_trigger_pct: '保本触发百分比',
+    breakeven_lock_pct: '保本锁定百分比', stale_flat_timeout_minutes: '停滞平仓超时（分钟）',
+    atr_stop: 'ATR 动态止损', phase2_tiers: '二阶段分层止盈', regime_aware: '市况自适应',
+    consecutive_breaches_required: '连续触发所需次数', noise_band: '噪音带过滤',
+  },
+  runner_entry_gate: {
+    enabled: '启用闸门', allow_shorts: '允许做空', bypass_sidestep_overrides: '绕过回避覆盖',
+    min_confidence: '最低置信度（做多）', min_composite: '最低综合评分（做多）',
+    min_hip3_composite: 'HIP3 最低综合评分', min_short_confidence: '做空最低置信度',
+    min_short_composite: '做空最低综合评分', mover_min_confidence: '异动最低置信度',
+    mover_min_composite: '异动最低综合评分', pullback_long: '回调做多参数',
+  },
+  plan_b: {
+    enabled: '启用 B 计划', rsi_low: 'RSI 低位阈值', rsi_high: 'RSI 高位阈值', size_mult: '仓位乘数',
+  },
+  atr_risk_sizing: {
+    enabled: '启用 ATR 仓位', risk_per_trade_pct: '单笔风险百分比', sizing_basis: '仓位计算基准',
+  },
+  regime_classifier: {
+    fast_ema: '快速 EMA 周期', slow_ema: '慢速 EMA 周期',
+    slope_threshold: '斜率阈值', chop_adx_max: '震荡 ADX 上限',
+  },
+  debate_gate: {
+    enabled: '启用辩论闸门', min_agreement: '最低同意比例', min_agree_count: '最低同意人数',
+  },
+  signal_enforcement: {
+    enabled: '启用信号强制执行', veto: '否决生效', boost: '加权生效',
+    gex_veto: 'GEX 否决生效', boost_bar_delta: '加权 K 线 Delta 阈值',
+    whale_window_min: '巨鲸观察窗口（分钟）', whale_veto_min_usd: '巨鲸否决阈值（USD）',
+    whale_boost_min_usd: '巨鲸加权阈值（USD）',
+  },
+  momentum_continuation: {
+    enabled: '启用动量延续', log_near_miss: '记录擦肩而过', min_trend_pct: '最低趋势百分比',
+    max_pullback_pct: '最大回调百分比', weight: '信号权重',
+  },
+  candlestick_patterns: {
+    enabled: '启用 K 线形态', wick_body_ratio: '影线/实体比阈值',
+    context_lookback: '上下文回看 K 线数', context_pct: '上下文幅度百分比',
+  },
+  capital_rotation: {
+    enabled: '启用资金轮动', shadow_mode: '影子模式（不实盘）',
+    min_candidate_composite: '候选最低综合评分', min_hold_minutes: '最短持有（分钟）',
+    protect_winner_roe_pct: '盈利保护 ROE 百分比',
+  },
+  gex_signal: {
+    enabled: '启用 GEX 信号', shadow_mode: '影子模式', caution_near_wall_pct: '临近墙警戒百分比',
+  },
+  shadow_signals: {
+    enabled: '启用影子信号', gex: 'GEX 影子', short_volume: '做空量影子',
+    crypto_whale: '加密巨鲸影子', news: '新闻影子', whale_window_min: '巨鲸窗口（分钟）',
+  },
+  momentum_reentry: {
+    enabled: '启用动量再入', reclaim_pct: '收复百分比', min_composite: '最低综合评分',
+  },
+  runner_mover_surface: {
+    enabled: '启用异动扫描面', min_crypto_24h_pct: '加密 24h 最低涨幅',
+    min_hip3_24h_pct: 'HIP3 24h 最低涨幅', min_volume_usd: '最低成交量（USD）',
+  },
+};
+
+// 顶层缺失键的中文补充（这些键存在于实时配置但未列入分组）。
+const EXTRA_KEY_LABELS = {
+  tp_scale_fraction: '止盈分批比例', crowded_with_min_conf: '拥挤交易最低置信度',
+  min_available_margin_pct: '最低可用保证金比例', research_cooldown_min: '研究冷静期（分钟）',
+  held_research_interval_min: '持仓研究间隔（分钟）', hip3_dex_allowlist: 'HIP3 DEX 白名单',
+  hip3_dex_blocklist: 'HIP3 DEX 黑名单', force_execute_composite: '强制执行综合评分',
+  composite_force_execute: '综合分强制执行', ta_sidestep_force_execute: '技术回避强制执行',
+  ta_sidestep_min_slow_burn_count: '技术回避最低慢燃次数',
+  force_execute_slow_burn_count: '强制执行慢燃次数', conviction_sizing: '信念仓位',
+  whale_regime_bypass: '巨鲸市况绕过', whale_force_execute: '巨鲸强制执行',
+  whale_size_multiplier: '巨鲸仓位乘数', trend_surface_enabled: '启用趋势扫描面',
+  min_trend_score: '最低趋势评分', against_funding_min_conf: '逆资金费最低置信度',
+  against_funding_min_score: '逆资金费最低评分', strong_trend_threshold: '强趋势阈值',
+  trend_threshold: '趋势阈值', neutral_threshold: '中性阈值',
+  spread_gate_fail_open: '价差闸门失败放行',
+  _comment: '配置注释', override_requires_ai: '覆盖需 AI 确认',
+  research_rescore_delta: '研究重评差值', momentum_continuation: '动量延续',
+  candlestick_patterns: 'K 线形态', whale_scan_bypass: '巨鲸扫描绕过',
+  capital_rotation: '资金轮动', gex_signal: 'GEX 信号', shadow_signals: '影子信号',
+  momentum_reentry: '动量再入', runner_mover_surface: '异动扫描面',
+};
+Object.assign(KEY_LABELS, EXTRA_KEY_LABELS);
+
+let liveConfig = {};
+let schema = {};
+let pendingChanges = {};
+let operatorToken = localStorage.getItem('hermes-op-token') || '';
+
+function toast(msg, kind) {
+  kind = kind || 'ok';
+  var c = document.getElementById('toast-container');
+  var d = document.createElement('div');
+  d.className = 'toast ' + kind;
+  d.textContent = msg;
+  c.appendChild(d);
+  setTimeout(function(){ d.style.opacity = '0'; d.style.transition = 'opacity .3s'; setTimeout(function(){ d.remove(); }, 300); }, 4000);
 }
-function formatVal(v) {
-  if (v === null || v === undefined) return 'null';
-  if (typeof v === 'object') return `<pre>${JSON.stringify(v, null, 2)}</pre>`;
-  if (typeof v === 'string') return `"${v}"`;
-  return String(v);
+
+function authHeaders() {
+  return operatorToken ? { 'Authorization': 'Bearer ' + operatorToken } : {};
+}
+
+function updateAuthUI() {
+  var badge = document.getElementById('auth-badge');
+  var inputs = document.querySelectorAll('.cfg-input');
+  if (operatorToken) {
+    badge.textContent = '可编辑';
+    badge.className = 'auth-badge on';
+    inputs.forEach(function(el){ el.disabled = false; });
+    document.getElementById('btn-rollback').disabled = false;
+  } else {
+    badge.textContent = '只读';
+    badge.className = 'auth-badge off';
+    inputs.forEach(function(el){ el.disabled = true; });
+    document.getElementById('btn-save').disabled = true;
+    document.getElementById('btn-reset').disabled = true;
+    document.getElementById('btn-rollback').disabled = true;
+    pendingChanges = {};
+  }
+}
+
+function renderInput(key, val) {
+  var t = (schema[key] && schema[key].type) || 'any';
+  var wrap = document.createElement('div');
+  wrap.className = 'cfg-val';
+
+  // 嵌套对象：在 JSON 编辑框上方插入可折叠的中文字段说明。
+  var nested = NESTED_LABELS[key];
+  if (nested && (t === 'object' || t === 'any' || val !== null && typeof val === 'object' && !Array.isArray(val))) {
+    var det = document.createElement('details');
+    det.className = 'nested-hint';
+    var sum = document.createElement('summary');
+    sum.textContent = '字段说明（' + Object.keys(nested).length + ' 项）';
+    var map = document.createElement('div');
+    map.className = 'field-map';
+    Object.keys(nested).forEach(function(sk) {
+      var row = document.createElement('div');
+      row.className = 'fm';
+      var code = document.createElement('code');
+      code.textContent = sk;
+      var txt = document.createElement('span');
+      txt.textContent = nested[sk];
+      row.appendChild(code);
+      row.appendChild(txt);
+      map.appendChild(row);
+    });
+    det.appendChild(sum);
+    det.appendChild(map);
+    wrap.appendChild(det);
+  }
+
+  var input;
+  if (t === 'bool') {
+    input = document.createElement('input');
+    input.type = 'checkbox';
+    input.className = 'cfg-input';
+    input.checked = !!val;
+    input.addEventListener('change', function(){ onChange(key, input.checked); });
+  } else if (t === 'int') {
+    input = document.createElement('input');
+    input.type = 'number';
+    input.step = '1';
+    input.className = 'cfg-input';
+    input.value = val !== null && val !== undefined ? val : '';
+    input.addEventListener('input', function(){ onChange(key, parseInt(input.value, 10)); });
+  } else if (t === 'float') {
+    input = document.createElement('input');
+    input.type = 'number';
+    input.step = 'any';
+    input.className = 'cfg-input';
+    input.value = val !== null && val !== undefined ? val : '';
+    input.addEventListener('input', function(){ onChange(key, parseFloat(input.value)); });
+  } else if (t === 'str') {
+    input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'cfg-input';
+    input.value = val !== null && val !== undefined ? val : '';
+    input.addEventListener('input', function(){ onChange(key, input.value); });
+  } else if (t === 'list' || t === 'object' || t === 'any') {
+    input = document.createElement('textarea');
+    input.className = 'cfg-input';
+    input.rows = t === 'object' ? 8 : 2;
+    input.value = val !== null && val !== undefined ? JSON.stringify(val, null, 2) : '';
+    input.addEventListener('input', function(){
+      try {
+        var parsed = JSON.parse(input.value);
+        input.style.borderColor = '';
+        onChange(key, parsed);
+      } catch(e) {
+        input.style.borderColor = 'var(--danger)';
+        delete pendingChanges[key];
+        updateActionButtons();
+      }
+    });
+  }
+
+  if (!operatorToken) input.disabled = true;
+
+  var dot = document.createElement('span');
+  dot.className = 'cfg-row-dirty';
+  dot.id = 'dirty-' + key;
+  dot.title = '未保存的更改';
+
+  wrap.appendChild(input);
+  wrap.appendChild(dot);
+  return wrap;
+}
+
+function onChange(key, newVal) {
+  var oldVal = liveConfig[key];
+  if (JSON.stringify(newVal) === JSON.stringify(oldVal)) {
+    delete pendingChanges[key];
+    var el = document.querySelector('[data-key="' + key + '"] .cfg-input');
+    if (el) el.classList.remove('changed');
+    var d = document.getElementById('dirty-' + key);
+    if (d) d.classList.remove('show');
+  } else {
+    pendingChanges[key] = newVal;
+    var el2 = document.querySelector('[data-key="' + key + '"] .cfg-input');
+    if (el2) el2.classList.add('changed');
+    var d2 = document.getElementById('dirty-' + key);
+    if (d2) d2.classList.add('show');
+  }
+  updateActionButtons();
+}
+
+function updateActionButtons() {
+  var has = Object.keys(pendingChanges).length > 0;
+  document.getElementById('btn-save').disabled = !has || !operatorToken;
+  document.getElementById('btn-reset').disabled = !has;
+}
+
+function renderOverview(cfg) {
+  var mode = cfg.mode || 'OFF';
+  var ovMode = document.getElementById('ov-mode');
+  if (ovMode) {
+    ovMode.textContent = mode;
+    ovMode.style.color = mode === 'LIVE' ? 'var(--success)' : 'var(--warn)';
+  }
+  var ovCrypto = document.getElementById('ov-crypto');
+  if (ovCrypto) ovCrypto.textContent = cfg.enable_crypto ? '已启用' : '已停用';
+  var gateCount = ['runner_entry_gate','debate_gate','signal_enforcement']
+    .filter(function(g){ return cfg[g] && cfg[g].enabled; }).length;
+  var ovGates = document.getElementById('ov-gates');
+  if (ovGates) ovGates.textContent = gateCount + ' / 3';
+  var ovConc = document.getElementById('ov-concurrent');
+  if (ovConc) ovConc.textContent = (cfg.max_concurrent ?? '—') + ' · ' + (cfg.leverage ?? '—') + 'x';
+}
+
+function renderConfig(cfg) {
+  liveConfig = cfg;
+  renderOverview(cfg);
+  var grid = document.getElementById('cfg-grid');
+  grid.innerHTML = '';
+
+  var mode = cfg.mode || 'OFF';
+  var pill = document.getElementById('cfg-mode-pill');
+  pill.textContent = '\u25c6 ' + mode;
+  pill.className = 'cfg-mode ' + (mode === 'LIVE' ? 'LIVE' : 'OFF');
+
+  var renderSection = function(label, keys) {
+    var present = keys.filter(function(k){ return k in cfg; });
+    if (!present.length) return;
+    // 可折叠分区卡片（错落有致：偶数卡片更深阴影）
+    var card = document.createElement('div');
+    card.className = 'cfg-card';
+    var head = document.createElement('div');
+    head.className = 'cfg-card-head';
+    head.innerHTML = '<span class="chev">\u25BC</span><span class="cfg-card-title">' +
+      label + '</span><span class="cfg-card-count">' + present.length + ' 项</span>';
+    var body = document.createElement('div');
+    body.className = 'cfg-card-body';
+    var inner = document.createElement('div');
+    inner.className = 'cfg-grid';
+    head.addEventListener('click', function(){ card.classList.toggle('collapsed'); });
+    present.forEach(function(k) {
+      var keyEl = document.createElement('div');
+      keyEl.className = 'cfg-key';
+      var labelEl = document.createElement('span');
+      labelEl.className = 'k-label';
+      labelEl.textContent = KEY_LABELS[k] || k;
+      var codeEl = document.createElement('span');
+      codeEl.className = 'k-code';
+      codeEl.textContent = k;
+      keyEl.appendChild(labelEl);
+      keyEl.appendChild(codeEl);
+      var valWrap = renderInput(k, cfg[k]);
+      valWrap.dataset.key = k;
+      inner.appendChild(keyEl);
+      inner.appendChild(valWrap);
+    });
+    body.appendChild(inner);
+    card.appendChild(head);
+    card.appendChild(body);
+    grid.appendChild(card);
+  };
+  SECTIONS.forEach(function(s){ renderSection(s.label, s.keys); });
+  var otherKeys = Object.keys(cfg).filter(function(k){ return !SECTION_KEYS.has(k); });
+  if (otherKeys.length) renderSection('其他设置', otherKeys);
+}
+
+async function loadSchema() {
+  try {
+    var r = await fetch('/api/dashboard/config/schema');
+    if (r.ok) schema = await r.json();
+  } catch(e) {}
 }
 
 async function loadConfig() {
   try {
-    const r = await fetch('/api/dashboard/config');
+    var r = await fetch('/api/dashboard/config');
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    const cfg = await r.json();
-    const grid = document.getElementById('cfg-grid');
-    grid.innerHTML = '';
-    // Mode pill at the top
-    const mode = cfg.mode || 'OFF';
-    const pill = document.getElementById('cfg-mode-pill');
-    pill.textContent = '◆ ' + mode;
-    pill.className = 'cfg-mode ' + (mode === 'LIVE' ? 'LIVE' : 'OFF');
-    // Render section by section
-    const renderSection = (label, keys) => {
-      const present = keys.filter(k => k in cfg);
-      if (!present.length) return;
-      const head = document.createElement('div');
-      head.className = 'cfg-section-head';
-      head.textContent = '── ' + label + ' ──';
-      grid.appendChild(head);
-      for (const k of present) {
-        const keyEl = document.createElement('div'); keyEl.className = 'cfg-key'; keyEl.textContent = k;
-        const valEl = document.createElement('div'); valEl.className = 'cfg-val ' + classifyVal(cfg[k]);
-        valEl.innerHTML = formatVal(cfg[k]);
-        grid.appendChild(keyEl); grid.appendChild(valEl);
+    var cfg = await r.json();
+    var pending = Object.assign({}, pendingChanges);
+    renderConfig(cfg);
+    // Re-apply unsaved edits so the 5s hot-refresh doesn't wipe user input.
+    Object.keys(pending).forEach(function(k) {
+      var el = document.querySelector('[data-key="' + k + '"] .cfg-input');
+      if (!el) return;
+      var t = (schema[k] && schema[k].type) || 'any';
+      if (t === 'bool') {
+        el.checked = !!pending[k];
+      } else if (t === 'list' || t === 'object' || t === 'any') {
+        el.value = JSON.stringify(pending[k], null, 2);
+      } else {
+        el.value = pending[k];
       }
-    };
-    for (const s of SECTIONS) renderSection(s.label, s.keys);
-    // "other" — anything not in the grouping
-    const otherKeys = Object.keys(cfg).filter(k => !SECTION_KEYS.has(k));
-    if (otherKeys.length) renderSection('other', otherKeys);
+      el.classList.add('changed');
+      var d = document.getElementById('dirty-' + k);
+      if (d) d.classList.add('show');
+    });
+    pendingChanges = pending;
+    updateActionButtons();
   } catch (e) {
     document.getElementById('cfg-grid').innerHTML =
-      '<div class="cfg-section-head">load failed: ' + (e.message || e) + '</div>';
+      '<div class="cfg-section-head">加载失败: ' + (e.message || e) + '</div>';
   }
 }
 
-loadConfig();
-setInterval(loadConfig, 5000); // hot-reloads alongside the trading loop
+async function saveChanges() {
+  if (!Object.keys(pendingChanges).length) return;
+  var btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  btn.textContent = '保存中…';
+  try {
+    var r = await fetch('/api/dashboard/config', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, authHeaders()),
+      body: JSON.stringify({ updates: pendingChanges }),
+    });
+    var data = await r.json().catch(function(){ return {}; });
+    if (!r.ok) {
+      var msg = (data && data.detail) ? data.detail : ('HTTP ' + r.status);
+      if (typeof msg === 'string' && msg.indexOf('{') === 0) {
+        try { var parsed = JSON.parse(msg); msg = (parsed.errors || []).join('; '); } catch(e){}
+      }
+      toast('保存失败: ' + msg, 'err');
+    } else {
+      toast('已保存 ' + Object.keys(pendingChanges).length + ' 项配置', 'ok');
+      pendingChanges = {};
+      await loadConfig();
+      loadHistory();
+    }
+  } catch(e) {
+    toast('保存出错: ' + e.message, 'err');
+  } finally {
+    btn.textContent = '保存更改';
+    updateActionButtons();
+  }
+}
 
-// Highlight the active page + carry the operator token across navigation.
+function resetChanges() {
+  pendingChanges = {};
+  renderConfig(liveConfig);
+  updateActionButtons();
+  toast('已撤销未保存的更改', 'info');
+}
+
+async function rollback() {
+  if (!confirm('确定回滚到上一次备份的配置？当前设置将被覆盖。')) return;
+  try {
+    var r = await fetch('/api/dashboard/config/rollback', {
+      method: 'POST',
+      headers: authHeaders(),
+    });
+    if (!r.ok) {
+      var d = await r.json().catch(function(){ return {}; });
+      toast('回滚失败: ' + (d.detail || r.status), 'err');
+    } else {
+      toast('配置已回滚', 'ok');
+      pendingChanges = {};
+      await loadConfig();
+      loadHistory();
+    }
+  } catch(e) {
+    toast('回滚出错: ' + e.message, 'err');
+  }
+}
+
+async function loadHistory() {
+  if (!operatorToken) {
+    document.getElementById('history-body').innerHTML =
+      '<tr><td colspan="3" style="color:var(--text-3)">设定运维令牌后可查看历史记录</td></tr>';
+    return;
+  }
+  try {
+    var r = await fetch('/api/dashboard/config/history', { headers: authHeaders() });
+    if (r.status === 401) {
+      operatorToken = '';
+      localStorage.removeItem('hermes-op-token');
+      updateAuthUI();
+      return;
+    }
+    var data = await r.json();
+    var h = data.history || [];
+    if (!h.length) {
+      document.getElementById('history-body').innerHTML =
+        '<tr><td colspan="3" style="color:var(--text-3)">暂无变更记录</td></tr>';
+      return;
+    }
+    document.getElementById('history-body').innerHTML = h.reverse().map(function(e) {
+      var ts = new Date(e.ts || Date.now()).toLocaleString();
+      var cls = e.event === 'config_rollback' ? 'ev-rollback' : 'ev-update';
+      var detail = '';
+      if (e.event === 'config_update' && e.updates) {
+        detail = Object.keys(e.updates).map(function(k) {
+          return k + ' = ' + JSON.stringify(e.updates[k]);
+        }).join(', ');
+      } else if (e.event === 'config_rollback') {
+        detail = '已从 .bak 恢复';
+      }
+      return '<tr><td class="ts">' + ts + '</td><td class="' + cls + '">' + e.event.replace('config_','') + '</td><td>' + detail + '</td></tr>';
+    }).join('');
+  } catch(e) {
+    document.getElementById('history-body').innerHTML =
+      '<tr><td colspan="3" style="color:var(--danger)">历史记录加载失败</td></tr>';
+  }
+}
+
+// ===== Token bar events =====
+document.getElementById('token-save').addEventListener('click', function() {
+  var v = document.getElementById('token-input').value.trim();
+  operatorToken = v;
+  if (v) localStorage.setItem('hermes-op-token', v);
+  else localStorage.removeItem('hermes-op-token');
+  updateAuthUI();
+  loadHistory();
+  if (v) toast('运维令牌已设定', 'ok');
+});
+document.getElementById('token-input').addEventListener('keydown', function(e) {
+  if (e.key === 'Enter') document.getElementById('token-save').click();
+});
+
+document.getElementById('btn-save').addEventListener('click', saveChanges);
+document.getElementById('btn-reset').addEventListener('click', resetChanges);
+document.getElementById('btn-rollback').addEventListener('click', rollback);
+document.getElementById('btn-history').addEventListener('click', function() {
+  var d = document.getElementById('history-details');
+  d.open = !d.open;
+  if (d.open) loadHistory();
+});
+
+// ===== Init =====
 (function(){
-  const here = window.location.pathname.replace(/\\/$/, '') || '/';
-  const tok = new URLSearchParams(window.location.search).get('token')
-           || localStorage.getItem('hermes-op-token') || '';
-  document.querySelectorAll('a[data-nav]').forEach(a => {
+  if (operatorToken) document.getElementById('token-input').value = operatorToken;
+  updateAuthUI();
+  loadSchema().then(loadConfig);
+  setInterval(loadConfig, 5000);
+
+  // Nav active state + token carry across pages
+  var here = window.location.pathname.replace(/\/$/, '') || '/';
+  document.querySelectorAll('a[data-nav]').forEach(function(a) {
     if (a.dataset.nav === here) a.classList.add('nav-active');
-    if (tok) {
-      const u = new URL(a.href, window.location.origin);
-      u.searchParams.set('token', tok);
+    if (operatorToken) {
+      var u = new URL(a.href, window.location.origin);
+      u.searchParams.set('token', operatorToken);
       a.href = u.toString();
     }
   });
@@ -1761,156 +2768,494 @@ setInterval(loadConfig, 5000); // hot-reloads alongside the trading loop
 """
 
 
-_OPERATOR_HTML = """<!doctype html>
-<html lang="en">
+_OPERATOR_HTML = r"""<!doctype html>
+<html lang="zh-CN">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>hermes-trader · operator</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
-<script src="https://cdn.tailwindcss.com"></script>
+<title>Hermes Trader · 运维台</title>
+<!--
+  LAN-safe: zero external CDN/font dependencies.
+  All styles are inlined so the page loads on isolated local networks.
+-->
 <style>
-  body{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#0a0a0a;color:#e5e5e5}
-  .pixel{font-family:'Press Start 2P',ui-monospace,monospace;letter-spacing:.02em;line-height:1.4}
-  .lcd{background:#052e1c;border:2px solid #34d399;box-shadow:inset 0 0 0 1px #022c1e,4px 4px 0 #064e3b;padding:8px 12px;color:#6ee7b7;text-shadow:0 0 6px #34d39966}
-  section.bg-zinc-900{border:2px solid #27272a;box-shadow:4px 4px 0 #18181b;border-radius:0;background:#0f0f10}
-  .btn{padding:6px 12px;border-radius:6px;background:#27272a;color:#e5e5e5;font-size:12px}
-  .btn:hover{background:#3f3f46}
-  .btn.danger{background:#7f1d1d;color:#fecaca}
-  .btn.danger:hover{background:#991b1b}
-  pre{font-size:11px;line-height:1.5}
-  /* Primary navbar (mirrors / and /config) */
-  .nav-link{display:inline-block;padding:7px 11px;font-size:9px;letter-spacing:.12em;color:#a3a3a3;background:#18181b;border:2px solid #3f3f46;box-shadow:2px 2px 0 #0a0a0a;text-decoration:none;transition:transform .08s ease,box-shadow .08s ease}
-  .nav-link:hover{color:#a7f3d0;border-color:#047857;box-shadow:2px 2px 0 #022c1e}
-  .nav-link:active{transform:translate(2px,2px);box-shadow:none}
-  .nav-link.nav-active{background:#064e3b;color:#6ee7b7;border-color:#34d399;box-shadow:2px 2px 0 #022c1e}
-  .op-banner{font-family:'Press Start 2P',monospace;font-size:9px;color:#fbbf24;text-align:center;padding:6px;border:2px dashed #78350f;background:#1f1300;margin-bottom:14px;letter-spacing:.06em}
-  .op-banner.op-ok{color:#6ee7b7;border-color:#047857;background:#022c1e}
+  :root {
+    --bg:        #1b1e25;
+    --surface:   #232730;
+    --surface2:  #2a2f3a;
+    --border:    #353b47;
+    --border-soft:#2d323c;
+    --text:      #d4d9e2;
+    --text-2:    #9aa3b2;
+    --text-3:    #6b7280;
+    --accent:    #5b9df9;
+    --accent-soft:rgba(91,157,249,.14);
+    --success:   #4caf82;
+    --success-soft:rgba(76,175,130,.14);
+    --warn:      #d4a056;
+    --warn-soft: rgba(212,160,86,.14);
+    --danger:    #d46b6b;
+    --danger-soft:rgba(212,107,107,.14);
+    --radius:    10px;
+    --radius-sm: 6px;
+    --mono: ui-monospace,"SF Mono","Cascadia Code",Menlo,Consolas,"Liberation Mono",monospace;
+    --han: "PingFang SC","Hiragino Sans GB","Microsoft YaHei","Noto Sans SC","Source Han Sans SC","WenQuanYi Micro Hei",system-ui,sans-serif;
+  }
+  *,*::before,*::after{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    font-family:var(--han);background:var(--bg);color:var(--text);
+    line-height:1.6;-webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  }
+  .wrap{max-width:1180px;margin:0 auto;padding:24px 20px 48px}
+
+  /* ===== Header ===== */
+  header{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+  .brand{display:flex;align-items:center;gap:12px}
+  .brand-mark{
+    width:38px;height:38px;border-radius:10px;
+    background:linear-gradient(135deg,var(--accent),#7c5cff);
+    display:flex;align-items:center;justify-content:center;
+    font-weight:700;color:#fff;font-size:18px;flex-shrink:0;
+    box-shadow:0 4px 14px rgba(91,157,249,.25);
+  }
+  .brand-title{font-size:18px;font-weight:600;letter-spacing:.02em}
+  .brand-sub{font-size:12px;color:var(--text-3);font-family:var(--mono);letter-spacing:.04em}
+
+  /* ===== Nav ===== */
+  nav{display:flex;gap:6px;margin-bottom:22px;flex-wrap:wrap;background:var(--surface);padding:6px;border-radius:var(--radius);border:1px solid var(--border-soft)}
+  .nav-link{
+    padding:8px 16px;font-size:13px;font-weight:500;color:var(--text-2);
+    text-decoration:none;border-radius:var(--radius-sm);transition:all .15s ease;
+    font-family:var(--han);
+  }
+  .nav-link:hover{color:var(--text);background:var(--surface2)}
+  .nav-link.nav-active{color:#fff;background:var(--accent);box-shadow:0 2px 8px rgba(91,157,249,.3)}
+
+  /* ===== Stat strip ===== */
+  .stat-strip{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+  .stat{
+    background:var(--surface);border:1px solid var(--border-soft);
+    border-radius:var(--radius);padding:14px 16px;position:relative;overflow:hidden;
+  }
+  .stat::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--accent)}
+  .stat.s-warn::before{background:var(--warn)}
+  .stat.s-ok::before{background:var(--success)}
+  .stat.s-danger::before{background:var(--danger)}
+  .stat:nth-child(2n){transform:translateY(6px)}
+  .stat-label{font-size:11.5px;color:var(--text-3);font-weight:500;letter-spacing:.04em}
+  .stat-value{font-size:20px;font-weight:600;margin-top:4px;font-family:var(--mono);letter-spacing:.01em}
+  .stat-sub{font-size:11px;color:var(--text-3);margin-top:2px}
+
+  /* ===== Card ===== */
+  .card{background:var(--surface);border:1px solid var(--border-soft);border-radius:var(--radius);padding:20px;margin-bottom:18px}
+  .card-title{
+    font-size:14px;font-weight:600;color:var(--text);margin:0 0 14px;
+    display:flex;align-items:center;gap:8px;
+  }
+  .card-title .dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 8px var(--success)}
+  .card-title .dot.warn{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+  .card-title .dot.danger{background:var(--danger);box-shadow:0 0 8px var(--danger)}
+  .card-title .meta{margin-left:auto;font-size:11px;color:var(--text-3);font-family:var(--mono);font-weight:400}
+
+  /* ===== Token bar ===== */
+  .token-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .token-bar label{font-size:13px;color:var(--text-2);white-space:nowrap;font-weight:500}
+  .token-bar input{
+    flex:1;min-width:220px;background:var(--bg);border:1px solid var(--border);
+    color:var(--text);font-family:var(--mono);font-size:13px;padding:9px 12px;
+    border-radius:var(--radius-sm);outline:none;transition:border-color .15s,box-shadow .15s;
+  }
+  .token-bar input:focus{border-color:var(--accent);box-shadow:0 0 0 3px var(--accent-soft)}
+  .auth-badge{font-size:11px;padding:4px 10px;border-radius:20px;font-weight:600;letter-spacing:.03em;white-space:nowrap}
+  .auth-badge.on{color:var(--success);background:var(--success-soft);border:1px solid rgba(76,175,130,.3)}
+  .auth-badge.off{color:var(--text-3);background:var(--surface2);border:1px solid var(--border)}
+
+  /* ===== Buttons ===== */
+  .btn{
+    font-family:var(--han);font-size:13px;font-weight:500;padding:8px 16px;
+    border-radius:var(--radius-sm);border:1px solid transparent;cursor:pointer;
+    transition:all .15s ease;white-space:nowrap;
+  }
+  .btn:disabled{opacity:.38;cursor:not-allowed}
+  .btn-primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+  .btn-primary:hover:not(:disabled){background:#4a8ce8;border-color:#4a8ce8}
+  .btn-danger{background:var(--danger);color:#fff;border-color:var(--danger)}
+  .btn-danger:hover:not(:disabled){background:#c05555;border-color:#c05555}
+  .btn-warn{background:transparent;color:var(--warn);border-color:rgba(212,160,86,.4)}
+  .btn-warn:hover:not(:disabled){background:var(--warn-soft)}
+  .btn-ghost{background:transparent;color:var(--text-2);border-color:var(--border)}
+  .btn-ghost:hover:not(:disabled){background:var(--surface2);color:var(--text)}
+  .btn-sm{padding:5px 12px;font-size:12px}
+
+  /* ===== Positions table ===== */
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th{
+    text-align:left;color:var(--text-3);font-weight:600;font-size:11.5px;
+    padding:9px 12px;border-bottom:1px solid var(--border);
+    letter-spacing:.04em;text-transform:uppercase;
+  }
+  td{padding:10px 12px;border-bottom:1px solid var(--border-soft);vertical-align:middle}
+  tr:last-child td{border-bottom:none}
+  tr:hover td{background:rgba(255,255,255,.015)}
+  .mono{font-family:var(--mono)}
+  .text-right{text-align:right}
+  .pos-long{color:var(--success);font-weight:600}
+  .pos-short{color:var(--danger);font-weight:600}
+  .pnl-pos{color:var(--success)}
+  .pnl-neg{color:var(--danger)}
+
+  /* ===== Trackers pre ===== */
+  pre{
+    font-family:var(--mono);font-size:12px;line-height:1.6;
+    background:var(--bg);border:1px solid var(--border-soft);border-radius:var(--radius-sm);
+    padding:14px;overflow-x:auto;margin:0;color:var(--text-2);
+  }
+  .empty-state{
+    text-align:center;padding:32px 16px;color:var(--text-3);font-size:13px;
+  }
+  .empty-state .icon{font-size:28px;display:block;margin-bottom:8px;opacity:.5}
+
+  /* ===== Mode badge ===== */
+  .mode-badge{display:inline-flex;align-items:center;gap:6px;padding:5px 14px;font-size:13px;font-weight:600;border-radius:20px;border:1px solid}
+  .mode-badge.LIVE{color:var(--success);background:var(--success-soft);border-color:rgba(76,175,130,.35)}
+  .mode-badge.OFF{color:var(--warn);background:var(--warn-soft);border-color:rgba(212,160,86,.35)}
+  .mode-badge::before{content:"";width:7px;height:7px;border-radius:50%;background:currentColor}
+
+  /* ===== Toast ===== */
+  #toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:10px}
+  .toast{
+    padding:12px 18px;font-size:13px;border-radius:var(--radius-sm);max-width:420px;
+    word-break:break-word;animation:slidein .22s ease;box-shadow:0 8px 24px rgba(0,0,0,.35);
+    border:1px solid;font-family:var(--han);
+  }
+  .toast.ok{background:var(--success-soft);color:var(--success);border-color:rgba(76,175,130,.3)}
+  .toast.err{background:var(--danger-soft);color:var(--danger);border-color:rgba(212,107,107,.3)}
+  .toast.info{background:var(--accent-soft);color:var(--accent);border-color:rgba(91,157,249,.3)}
+  @keyframes slidein{from{transform:translateY(16px);opacity:0}to{transform:translateY(0);opacity:1}}
+
+  /* ===== Danger zone ===== */
+  .danger-zone{border-color:rgba(212,107,107,.3)}
+  .danger-zone .card-title{color:var(--danger)}
+  .danger-zone .card-title .dot{background:var(--danger);box-shadow:0 0 8px var(--danger)}
+  .btn-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+
+  /* ===== Refresh indicator ===== */
+  .refresh-dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--success);margin-right:6px;animation:pulse 2s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.3}}
+
+  footer{text-align:center;font-size:12px;color:var(--text-3);margin-top:28px;font-family:var(--mono)}
+
+  /* ===== Responsive ===== */
+  @media (max-width:680px){
+    .wrap{padding:16px 14px 40px}
+    .stat-strip{grid-template-columns:repeat(2,1fr);gap:10px}
+    .stat:nth-child(2n){transform:none}
+    .stat-value{font-size:17px}
+    .btn-row{flex-direction:column}
+    .btn-row .btn{width:100%;text-align:center}
+  }
 </style>
 </head>
-<body class="min-h-screen">
-<div class="max-w-[1100px] mx-auto px-6 py-6">
+<body>
+<div class="wrap">
 
-  <header class="flex items-center justify-between mb-3 gap-3 flex-wrap">
-    <div class="flex items-center gap-3">
-      <span class="lcd pixel text-sm tracking-tight">HERMES-TRADER · OPERATOR</span>
+  <header>
+    <div class="brand">
+      <div class="brand-mark">H</div>
+      <div>
+        <div class="brand-title">Hermes Trader</div>
+        <div class="brand-sub">operator console</div>
+      </div>
     </div>
   </header>
 
-  <nav class="flex items-center gap-2 mb-4 flex-wrap" id="hermes-nav">
-    <a href="/" data-nav="/" class="nav-link pixel">DASHBOARD</a>
-    <a href="/config" data-nav="/config" class="nav-link pixel">CONFIG</a>
-    <a href="/operator" data-nav="/operator" class="nav-link pixel">OPERATOR</a>
+  <nav id="hermes-nav">
+    <a href="/" data-nav="/" class="nav-link">监控面板</a>
+    <a href="/config" data-nav="/config" class="nav-link">配置中心</a>
+    <a href="/operator" data-nav="/operator" class="nav-link">运维台</a>
   </nav>
 
-  <div id="op-banner" class="op-banner">checking operator token…</div>
+  <!-- Stat strip -->
+  <div class="stat-strip">
+    <div class="stat" id="stat-mode">
+      <div class="stat-label">运行模式</div>
+      <div class="stat-value" id="ov-mode">—</div>
+      <div class="stat-sub" id="ov-mode-sub">实时交易开关</div>
+    </div>
+    <div class="stat s-ok" id="stat-positions">
+      <div class="stat-label">持仓数量</div>
+      <div class="stat-value" id="ov-positions">—</div>
+      <div class="stat-sub">当前活跃持仓</div>
+    </div>
+    <div class="stat" id="stat-trackers">
+      <div class="stat-label">DSL 追踪器</div>
+      <div class="stat-value" id="ov-trackers">—</div>
+      <div class="stat-sub">内存 + 持久化</div>
+    </div>
+    <div class="stat s-warn" id="stat-auth">
+      <div class="stat-label">认证状态</div>
+      <div class="stat-value" id="ov-auth">—</div>
+      <div class="stat-sub">操作员令牌</div>
+    </div>
+  </div>
 
-  <section class="bg-zinc-900 rounded-lg p-4">
-    <div class="text-xs text-zinc-500 mb-2">positions — force close</div>
-    <div id="positions" class="text-sm">loading…</div>
+  <!-- Token bar -->
+  <section class="card">
+    <div class="token-bar">
+      <label for="token-input">运维令牌</label>
+      <input id="token-input" type="password" placeholder="粘贴 HERMES_OPERATOR_TOKEN 以解锁操作…" autocomplete="off" />
+      <button id="token-save" class="btn btn-primary">设定</button>
+      <span id="auth-badge" class="auth-badge off">未认证</span>
+    </div>
   </section>
 
-  <section class="bg-zinc-900 rounded-lg p-4">
-    <div class="text-xs text-zinc-500 mb-2">DSL trackers (in-memory + persisted)</div>
-    <pre id="trackers" class="text-zinc-300 overflow-x-auto">loading…</pre>
+  <!-- Positions -->
+  <section class="card">
+    <div class="card-title">
+      <span class="dot"></span>
+      持仓管理 — 强制平仓
+      <span class="meta"><span class="refresh-dot"></span>每 10 秒自动刷新</span>
+    </div>
+    <div id="positions-wrap">
+      <div class="empty-state"><span class="icon">◌</span>加载中…</div>
+    </div>
   </section>
 
-  <section class="bg-zinc-900 rounded-lg p-4">
-    <div class="text-xs text-zinc-500 mb-2">danger zone</div>
-    <button class="btn danger" onclick="setMode('OFF')">set mode OFF (halt new trades)</button>
-    <button class="btn" onclick="setMode('LIVE')">set mode LIVE</button>
+  <!-- DSL trackers -->
+  <section class="card">
+    <div class="card-title">
+      <span class="dot warn"></span>
+      DSL 追踪器
+      <span class="meta">内存 + 持久化状态</span>
+    </div>
+    <div id="trackers-wrap">
+      <pre id="trackers">加载中…</pre>
+    </div>
   </section>
+
+  <!-- Danger zone -->
+  <section class="card danger-zone">
+    <div class="card-title">
+      <span class="dot"></span>
+      危险操作区
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-danger" onclick="setMode('OFF')">⏸ 切换至暂停模式（停止新开仓）</button>
+      <button class="btn btn-warn" onclick="setMode('LIVE')">▶ 切换至运行模式</button>
+      <span id="mode-display" style="margin-left:auto"></span>
+    </div>
+  </section>
+
+  <footer>
+    Hermes Trader Operator Console · 令牌仅存储于浏览器 localStorage
+  </footer>
 </div>
 
+<div id="toast-container"></div>
+
 <script>
-// Token resolution mirrors the public dashboard: ?token= in URL wins,
-// then localStorage `hermes-op-token`, else empty. If a fresh URL token
-// is present, persist it so navigating between pages keeps the session.
+// ===== Token resolution =====
 const params = new URLSearchParams(location.search);
 const tokenFromUrl = params.get('token') || '';
-const tokenFromStore = localStorage.getItem('hermes-op-token') || '';
-const token = tokenFromUrl || tokenFromStore;
+let token = tokenFromUrl || localStorage.getItem('hermes-op-token') || '';
 if (tokenFromUrl) localStorage.setItem('hermes-op-token', tokenFromUrl);
+
+const tokenInput = document.getElementById('token-input');
+const tokenSave = document.getElementById('token-save');
+const authBadge = document.getElementById('auth-badge');
+tokenInput.value = token;
+
+function setAuth(on) {
+  authBadge.textContent = on ? '已认证' : '未认证';
+  authBadge.className = 'auth-badge ' + (on ? 'on' : 'off');
+  document.getElementById('ov-auth').textContent = on ? '已认证' : '未认证';
+  document.getElementById('stat-auth').className = 'stat ' + (on ? 's-ok' : 's-warn');
+}
+setAuth(!!token);
+
+tokenSave.addEventListener('click', () => {
+  token = tokenInput.value.trim();
+  if (token) {
+    localStorage.setItem('hermes-op-token', token);
+    setAuth(true);
+    toast('令牌已保存', 'ok');
+    loadTrackers(); loadPositions();
+    // Carry token to nav links
+    carryTokenToNav();
+  } else {
+    localStorage.removeItem('hermes-op-token');
+    setAuth(false);
+    toast('令牌已清除', 'info');
+  }
+});
+
 const auth = () => ({'X-Operator-Token': token || ''});
 
-function setBanner(msg, ok) {
-  const el = document.getElementById('op-banner');
-  if (!el) return;
+// ===== Toast =====
+function toast(msg, kind) {
+  kind = kind || 'info';
+  const c = document.getElementById('toast-container');
+  const el = document.createElement('div');
+  el.className = 'toast ' + kind;
   el.textContent = msg;
-  el.className = 'op-banner' + (ok ? ' op-ok' : '');
+  c.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transition = 'opacity .3s'; setTimeout(() => el.remove(), 300); }, 3500);
 }
 
-// Highlight the active page in the navbar. Carry the operator token across
-// navigation so clicking DASHBOARD / CONFIG doesn't lose the session.
-(function(){
-  const here = window.location.pathname.replace(/\\/$/, '') || '/';
+// ===== Nav: highlight active + carry token =====
+function carryTokenToNav() {
   document.querySelectorAll('a[data-nav]').forEach(a => {
-    if (a.dataset.nav === here) a.classList.add('nav-active');
     if (token) {
       const u = new URL(a.href, window.location.origin);
       u.searchParams.set('token', token);
       a.href = u.toString();
     }
   });
+}
+(function(){
+  const here = window.location.pathname.replace(/\/$/, '') || '/';
+  document.querySelectorAll('a[data-nav]').forEach(a => {
+    if (a.dataset.nav === here) a.classList.add('nav-active');
+  });
+  carryTokenToNav();
 })();
 
-if (!token) {
-  setBanner('NO TOKEN · go to / and click 🔒 op to enter one', false);
-} else {
-  setBanner('operator session ACTIVE · token loaded', true);
-}
+// ===== Positions =====
+async function loadPositions() {
+  try {
+    const r = await fetch('/api/dashboard/positions');
+    const ps = await r.json();
+    const wrap = document.getElementById('positions-wrap');
+    document.getElementById('ov-positions').textContent = ps.length;
 
-// Config dump moved to its own /config page (linked in the navbar above) —
-// the operator console focuses on actions (close, set mode) and live state.
-async function loadTrackers() {
-  if (!token) return;
-  const r = await fetch('/api/dashboard/operator/trackers', {headers: auth()});
-  if (r.status === 401) { setBanner('TOKEN REJECTED by server (401) · re-enter via 🔒 op', false); return; }
-  const data = await r.json();
-  const el = document.getElementById('trackers');
-  if (!Array.isArray(data) || data.length === 0) {
-    el.textContent = 'no active DSL trackers — nothing currently being managed.\n(this is normal when 0 positions are open.)';
-    el.style.color = '#71717a';
-    el.style.fontStyle = 'italic';
-  } else {
-    el.textContent = JSON.stringify(data, null, 2);
-    el.style.color = '';
-    el.style.fontStyle = '';
+    if (!ps.length) {
+      wrap.innerHTML = '<div class="empty-state"><span class="icon">◌</span>当前无持仓</div>';
+      return;
+    }
+
+    let html = '<table><thead><tr>'
+      + '<th>币种</th><th>方向</th><th class="text-right">数量</th>'
+      + '<th class="text-right">开仓价</th><th class="text-right">未实现盈亏</th>'
+      + '<th class="text-right">操作</th>'
+      + '</tr></thead><tbody>';
+    ps.forEach(p => {
+      const sideCls = p.side === 'long' ? 'pos-long' : 'pos-short';
+      const sideTxt = p.side === 'long' ? '做多' : '做空';
+      const pnlCls = p.unrealized_pct >= 0 ? 'pnl-pos' : 'pnl-neg';
+      const pnlSign = p.unrealized_pct >= 0 ? '+' : '';
+      html += '<tr>'
+        + '<td class="mono" style="font-weight:600">' + p.coin + '</td>'
+        + '<td><span class="' + sideCls + '">' + sideTxt + '</span></td>'
+        + '<td class="text-right mono">' + p.size.toFixed(4) + '</td>'
+        + '<td class="text-right mono">' + p.entry_px.toFixed(2) + '</td>'
+        + '<td class="text-right mono ' + pnlCls + '">' + pnlSign + p.unrealized_pct.toFixed(2) + '%</td>'
+        + '<td class="text-right"><button class="btn btn-danger btn-sm" onclick="closeCoin(\'' + p.coin + '\')">强平</button></td>'
+        + '</tr>';
+    });
+    html += '</tbody></table>';
+    wrap.innerHTML = html;
+  } catch (e) {
+    document.getElementById('positions-wrap').innerHTML = '<div class="empty-state">持仓数据加载失败</div>';
   }
 }
-async function loadPositions() {
-  const r = await fetch('/api/dashboard/positions');
-  const ps = await r.json();
-  const el = document.getElementById('positions');
-  if (!ps.length) { el.innerHTML = '<div class="text-zinc-500 text-xs">none</div>'; return; }
-  el.innerHTML = ps.map(p => `<div class="flex items-center justify-between py-1 border-b border-zinc-800 last:border-0">
-    <span><b>${p.coin}</b> ${p.side} ${p.size.toFixed(4)} @ ${p.entry_px.toFixed(2)} (${p.unrealized_pct >= 0 ? '+' : ''}${p.unrealized_pct.toFixed(2)}%)</span>
-    <button class="btn danger" onclick="closeCoin('${p.coin}')">close</button>
-  </div>`).join('');
-}
-async function closeCoin(coin) {
-  if (!confirm('Force close ' + coin + '?')) return;
-  const r = await fetch('/api/dashboard/operator/close', {
-    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
-    body: JSON.stringify({coin})
-  });
-  alert(JSON.stringify(await r.json(), null, 2));
-  loadPositions();
-}
-async function setMode(mode) {
-  if (mode === 'LIVE' && !confirm('Switch to LIVE mode?')) return;
-  const r = await fetch('/api/dashboard/operator/mode', {
-    method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
-    body: JSON.stringify({mode})
-  });
-  alert('mode → ' + (await r.json()).mode);
+
+// ===== Trackers =====
+async function loadTrackers() {
+  if (!token) {
+    document.getElementById('trackers').textContent = '未设置运维令牌，请在上方输入 HERMES_OPERATOR_TOKEN 后查看。';
+    document.getElementById('trackers').style.color = 'var(--text-3)';
+    document.getElementById('ov-trackers').textContent = '—';
+    return;
+  }
+  try {
+    const r = await fetch('/api/dashboard/operator/trackers', {headers: auth()});
+    if (r.status === 401) {
+      setAuth(false);
+      document.getElementById('trackers').textContent = '令牌被服务器拒绝（401），请重新输入。';
+      document.getElementById('trackers').style.color = 'var(--danger)';
+      return;
+    }
+    if (r.status === 503) {
+      document.getElementById('trackers').textContent = '后端未配置 HERMES_OPERATOR_TOKEN，运维功能已禁用。';
+      document.getElementById('trackers').style.color = 'var(--warn)';
+      return;
+    }
+    const data = await r.json();
+    const el = document.getElementById('trackers');
+    document.getElementById('ov-trackers').textContent = Array.isArray(data) ? data.length : 0;
+
+    if (!Array.isArray(data) || data.length === 0) {
+      el.textContent = '无活跃 DSL 追踪器 — 当前没有持仓被追踪。\n（空仓时这是正常状态。）';
+      el.style.color = 'var(--text-3)';
+      el.style.fontStyle = 'italic';
+    } else {
+      el.textContent = JSON.stringify(data, null, 2);
+      el.style.color = '';
+      el.style.fontStyle = '';
+    }
+  } catch (e) {
+    document.getElementById('trackers').textContent = '追踪器数据加载失败：' + e.message;
+    document.getElementById('trackers').style.color = 'var(--danger)';
+  }
 }
 
-loadTrackers(); loadPositions();
-setInterval(loadTrackers, 10000);
+// ===== Actions =====
+async function closeCoin(coin) {
+  if (!confirm('确认强制平仓 ' + coin + '？此操作不可撤销。')) return;
+  try {
+    const r = await fetch('/api/dashboard/operator/close', {
+      method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+      body: JSON.stringify({coin})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      toast(coin + ' 平仓指令已发送', 'ok');
+    } else {
+      toast('平仓失败：' + (data.detail || JSON.stringify(data)), 'err');
+    }
+    loadPositions();
+  } catch (e) {
+    toast('请求失败：' + e.message, 'err');
+  }
+}
+
+async function setMode(mode) {
+  if (mode === 'LIVE' && !confirm('确认切换至运行模式？将允许新开仓。')) return;
+  if (mode === 'OFF' && !confirm('确认切换至暂停模式？将停止所有新开仓。')) return;
+  try {
+    const r = await fetch('/api/dashboard/operator/mode', {
+      method: 'POST', headers: {...auth(), 'Content-Type': 'application/json'},
+      body: JSON.stringify({mode})
+    });
+    const data = await r.json();
+    if (r.ok) {
+      toast('模式已切换为：' + (data.mode || mode), 'ok');
+      updateModeDisplay(data.mode || mode);
+    } else {
+      toast('模式切换失败：' + (data.detail || JSON.stringify(data)), 'err');
+    }
+  } catch (e) {
+    toast('请求失败：' + e.message, 'err');
+  }
+}
+
+function updateModeDisplay(mode) {
+  const el = document.getElementById('mode-display');
+  const ovMode = document.getElementById('ov-mode');
+  const ovSub = document.getElementById('ov-mode-sub');
+  const label = mode === 'LIVE' ? '运行中' : '已暂停';
+  el.innerHTML = '<span class="mode-badge ' + mode + '">' + label + '</span>';
+  ovMode.textContent = label;
+  ovSub.textContent = mode === 'LIVE' ? '允许新开仓' : '停止新开仓';
+  document.getElementById('stat-mode').className = 'stat ' + (mode === 'LIVE' ? 's-ok' : 's-warn');
+}
+
+// ===== Init + auto-refresh =====
+loadPositions();
+loadTrackers();
 setInterval(loadPositions, 10000);
+setInterval(loadTrackers, 10000);
 </script>
 </body>
 </html>
@@ -1923,13 +3268,57 @@ setInterval(loadPositions, 10000);
 def register_routes(app: FastAPI) -> None:
     """Mount dashboard + SSE + operator routes onto an existing FastAPI app."""
 
+    # ── Vue SPA (hermes-web) static hosting ─────────────────────────────
+    # Production build mounted at /web/. Built with `--base=/web/`.
+    _WEB_DIST = "/app/web-dist"
     # no-store on both dashboards so a server restart isn't masked by a cached
     # HTML shell that pre-dates the new JS. The JSON endpoints below are fine
     # to cache for their poll interval.
     _NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-    @app.get("/", response_class=HTMLResponse)
-    async def public_dashboard() -> HTMLResponse:
+    if os.path.isdir(_WEB_DIST):
+
+        class _SPAStaticFiles(StaticFiles):
+            """StaticFiles that falls back to index.html for unknown paths.
+
+            The Vue router uses history mode, so deep links like /web/positions
+            or /web/closed-trades don't correspond to files on disk. The default
+            StaticFiles returns 404; this subclass serves the SPA shell instead
+            so client-side routing can take over.
+            """
+
+            async def get_response(self, path: str, scope):
+                try:
+                    response = await super().get_response(path, scope)
+                except StarletteHTTPException as exc:
+                    if exc.status_code != 404:
+                        raise
+                    response = None
+                if response is None or response.status_code == 404:
+                    # Don't intercept real asset requests (missing CSS/JS
+                    # should be a real 404, not the SPA shell).
+                    if not path.startswith("assets/"):
+                        index = os.path.join(self.directory, "index.html")
+                        if os.path.isfile(index):
+                            return FileResponse(index,
+                                                headers=_NO_CACHE_HEADERS)
+                if response is not None:
+                    return response
+                # Re-raise 404 for genuinely missing assets.
+                raise StarletteHTTPException(status_code=404)
+
+        app.mount("/web", _SPAStaticFiles(directory=_WEB_DIST, html=True),
+                  name="hermes-web")
+        logger.info("hermes-web SPA mounted at /web/ from %s", _WEB_DIST)
+
+    @app.get("/", include_in_schema=False)
+    async def public_dashboard() -> RedirectResponse:
+        # Root now redirects to the Vue SPA (Command Center). The legacy
+        # pixel-style dashboard remains available at /legacy for fallback.
+        return RedirectResponse(url="/web/", status_code=302)
+
+    @app.get("/legacy", response_class=HTMLResponse)
+    async def legacy_dashboard() -> HTMLResponse:
         return HTMLResponse(content=_PUBLIC_HTML, headers=_NO_CACHE_HEADERS)
 
     @app.get("/operator", response_class=HTMLResponse)
@@ -1949,25 +3338,264 @@ def register_routes(app: FastAPI) -> None:
     async def dashboard_config() -> JSONResponse:
         """Read-only JSON dump of `.agent-config.json` for the /config page.
         Hot-reloads alongside the trading loop (no caching)."""
-        return JSONResponse(read_agent_config())
+        cfg = await asyncio.to_thread(read_agent_config)
+        return JSONResponse(cfg)
+
+    # ── config write API (operator-gated) ─────────────────────────────────
+
+    _CONFIG_TYPES: Dict[str, type] = {
+        "mode": str,
+        "enable_crypto": bool, "enable_hip3": bool,
+        "equity_fraction_per_trade": float, "leverage": int,
+        "max_concurrent": int, "max_trade_notional_usd": float,
+        "max_total_notional_pct": float, "max_daily_loss_usd": float,
+        "daily_giveback_halt_pct": float, "daily_giveback_min_peak_usd": float,
+        "cooldown_min": int, "min_ai_confidence": float,
+        "counter_regime_min_conf": float, "max_crypto_long_correlated": int,
+        "min_market_volume_usd": float, "min_hip3_volume_usd": float,
+        "min_short_volume_usd": float, "chop_min_conf": float,
+        "chop_min_score": float, "max_atr_pct": float, "max_spread_pct": float,
+        "loss_cooldown_min": int, "min_ai_close_hold_min": int,
+        "sl_atr_mult": float, "min_trend_score": float,
+        "block_counter_trend_bypass": bool, "whale_regime_bypass": bool,
+        "conviction_sizing": bool, "breakout_force_execute": bool,
+        "spread_gate_fail_open": bool,
+        "override_requires_ai": bool,
+        "whale_scan_bypass": bool,
+        "research_rescore_delta": float,
+    }
+
+    def _validate_config_updates(updates: Dict[str, Any]) -> List[str]:
+        """Validate a partial update dict. Returns a list of error strings."""
+        errors: List[str] = []
+        for key, val in updates.items():
+            if key not in CANONICAL_DEFAULTS:
+                errors.append(f"unknown key: {key}")
+                continue
+            expected = _CONFIG_TYPES.get(key)
+            if expected is not None:
+                if expected is int:
+                    if not isinstance(val, int) or isinstance(val, bool):
+                        errors.append(f"{key}: expected int, got {type(val).__name__}")
+                elif expected is float:
+                    if not isinstance(val, (int, float)) or isinstance(val, bool):
+                        errors.append(f"{key}: expected number, got {type(val).__name__}")
+                elif expected is bool:
+                    if not isinstance(val, bool):
+                        errors.append(f"{key}: expected bool, got {type(val).__name__}")
+                elif expected is str:
+                    if not isinstance(val, str):
+                        errors.append(f"{key}: expected string, got {type(val).__name__}")
+            # List/dict values (coin_allowlist, dsl_exit, debate_gate etc.)
+            # are accepted as-is if the default is also list/dict.
+            elif isinstance(CANONICAL_DEFAULTS.get(key), list) and not isinstance(val, list):
+                errors.append(f"{key}: expected list, got {type(val).__name__}")
+            elif isinstance(CANONICAL_DEFAULTS.get(key), dict) and not isinstance(val, dict):
+                errors.append(f"{key}: expected object, got {type(val).__name__}")
+        # Range checks
+        if "leverage" in updates and isinstance(updates["leverage"], int):
+            if updates["leverage"] < 1 or updates["leverage"] > 50:
+                errors.append("leverage: must be 1–50")
+        if "max_concurrent" in updates and isinstance(updates["max_concurrent"], int):
+            if updates["max_concurrent"] < 0:
+                errors.append("max_concurrent: must be >= 0")
+        if "min_ai_confidence" in updates and isinstance(updates["min_ai_confidence"], (int, float)):
+            if not (0.0 <= updates["min_ai_confidence"] <= 1.0):
+                errors.append("min_ai_confidence: must be 0.0–1.0")
+        if "equity_fraction_per_trade" in updates and isinstance(updates["equity_fraction_per_trade"], (int, float)):
+            if not (0.0 < updates["equity_fraction_per_trade"] <= 1.0):
+                errors.append("equity_fraction_per_trade: must be > 0 and <= 1.0")
+        return errors
+
+    @app.post("/api/dashboard/config")
+    async def dashboard_config_write(request: Request) -> JSONResponse:
+        """Apply a partial config update. Operator token required.
+
+        Body: ``{"updates": {"key": value, ...}}``.
+        Validates types/ranges, backs up the current config, writes atomically,
+        and appends an audit event to the session log.
+        """
+        _require_operator(request)
+        body = await request.json()
+        updates = body.get("updates")
+        if not isinstance(updates, dict) or not updates:
+            raise HTTPException(400, "updates must be a non-empty object")
+
+        errors = _validate_config_updates(updates)
+        if errors:
+            raise HTTPException(422, json.dumps({"errors": errors}))
+
+        def _apply() -> Dict[str, Any]:
+            cfg = read_agent_config()
+            old_snapshot = {k: cfg.get(k) for k in updates}
+            cfg.update(updates)
+            write_agent_config(cfg, backup=True)
+            return {"old": old_snapshot, "new": {k: cfg[k] for k in updates}}
+
+        result = await asyncio.to_thread(_apply)
+        session_log.append({
+            "event": "config_update",
+            "ts": int(time.time() * 1000),
+            "updates": {k: v for k, v in updates.items()},
+            "old": result["old"],
+        })
+        logger.info("config update via dashboard: %s", list(updates.keys()))
+        return JSONResponse({"ok": True, "applied": result["new"]})
+
+    @app.get("/api/dashboard/config/backup")
+    async def dashboard_config_backup(request: Request) -> JSONResponse:
+        """Return the last backed-up config (before the last write)."""
+        _require_operator(request)
+        bak = await asyncio.to_thread(backup_config)
+        if bak is None:
+            return JSONResponse({"available": False, "config": None})
+        return JSONResponse({"available": True, "config": bak})
+
+    @app.post("/api/dashboard/config/backup")
+    async def dashboard_config_snapshot(request: Request) -> JSONResponse:
+        """Create a named manual snapshot of the current config.
+
+        Unlike the rolling ``.bak`` (overwritten on every write), manual
+        snapshots are immutable, timestamped, and retained up to a cap so the
+        operator can checkpoint a known-good config before risky edits.
+        """
+        _require_operator(request)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        reason = "manual"
+        if isinstance(body, dict):
+            r = body.get("reason")
+            if isinstance(r, str) and r.strip():
+                reason = r.strip()[:80]
+        try:
+            snap = await asyncio.to_thread(create_snapshot, reason)
+        except OSError as e:
+            raise HTTPException(500, f"snapshot failed: {e}")
+        session_log.append({
+            "event": "config_snapshot",
+            "ts": int(time.time() * 1000),
+            "snapshot_id": snap["id"],
+            "reason": reason,
+        })
+        logger.info("manual config snapshot created: %s", snap["id"])
+        return JSONResponse({"ok": True, "snapshot": snap})
+
+    @app.post("/api/dashboard/config/rollback")
+    async def dashboard_config_rollback(request: Request) -> JSONResponse:
+        """Restore the config.
+
+        Body is optional. ``{"id": "snap-<ts>"}`` restores a specific manual
+        snapshot; with no body (or no id) it restores the rolling ``.bak``
+        produced by the last write.
+        """
+        _require_operator(request)
+        target = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                target = body.get("id")
+        except Exception:
+            target = None
+
+        if isinstance(target, str) and target.startswith("snap-"):
+            try:
+                ts = int(target[len("snap-"):])
+            except ValueError:
+                raise HTTPException(400, "invalid snapshot id")
+            ok = await asyncio.to_thread(restore_snapshot, ts)
+            if not ok:
+                raise HTTPException(404, f"snapshot {target} not found")
+            restored_from = target
+        else:
+            ok = await asyncio.to_thread(restore_backup)
+            if not ok:
+                raise HTTPException(409, "no backup available to restore")
+            restored_from = "backup"
+        session_log.append({
+            "event": "config_rollback",
+            "ts": int(time.time() * 1000),
+            "from": restored_from,
+        })
+        logger.warning("config rolled back via dashboard (from=%s)", restored_from)
+        cfg = await asyncio.to_thread(read_agent_config)
+        return JSONResponse({"ok": True, "from": restored_from, "config": cfg})
+
+    @app.get("/api/dashboard/config/history")
+    async def dashboard_config_history(request: Request) -> JSONResponse:
+        """Recent config activity plus available manual snapshots.
+
+        Returns ``{"history": [...], "snapshots": [...]}``. History items are
+        config_update / config_rollback / config_snapshot events (newest
+        last, capped at 30). Snapshots are manual recovery points (newest
+        first) and can be passed as ``id`` to the rollback endpoint.
+        """
+        _require_operator(request)
+        events = await asyncio.to_thread(session_log.tail, 200)
+        history = [
+            e for e in (events or [])
+            if e.get("event") in (
+                "config_update", "config_rollback", "config_snapshot",
+            )
+        ][-30:]
+        snapshots = await asyncio.to_thread(list_snapshots)
+        return JSONResponse({"history": history, "snapshots": snapshots})
+
+    @app.get("/api/dashboard/config/schema")
+    async def dashboard_config_schema() -> JSONResponse:
+        """Return key metadata (type + default) for building the edit form."""
+        schema: Dict[str, Any] = {}
+        for key, default in CANONICAL_DEFAULTS.items():
+            t = _CONFIG_TYPES.get(key)
+            if t is int:
+                type_name = "int"
+            elif t is float:
+                type_name = "float"
+            elif t is bool:
+                type_name = "bool"
+            elif t is str:
+                type_name = "str"
+            elif isinstance(default, list):
+                type_name = "list"
+            elif isinstance(default, dict):
+                type_name = "object"
+            else:
+                type_name = "any"
+            schema[key] = {"type": type_name, "default": default}
+        return JSONResponse(schema)
 
     @app.get("/api/dashboard/summary")
     async def dashboard_summary() -> JSONResponse:
-        return JSONResponse(_ttl_cached("summary", 2.0, _summary_payload))
+        # Payload reads + parses the full session log on every cache miss
+        # (~150ms). Run it in a worker thread so a long read doesn't block
+        # the asyncio event loop and starve other routes / SSE clients.
+        payload = await asyncio.to_thread(_ttl_cached, "summary", 2.0, _summary_payload)
+        return JSONResponse(payload)
 
     @app.get("/api/dashboard/positions")
     async def dashboard_positions() -> JSONResponse:
-        return JSONResponse(_positions_payload())  # already 5s-cached internally
+        # Cache miss falls back to fetch_account_state (9 serial HL POSTs,
+        # ~1.3s on testnet). Run in a worker thread so the event loop stays
+        # responsive to / and SSE while the live fetch is in flight.
+        payload = await asyncio.to_thread(_positions_payload)
+        return JSONResponse(payload)
 
     @app.get("/api/dashboard/equity-curve")
     async def dashboard_equity_curve(range_s: int = Query(86400, ge=60, le=2_592_000)) -> JSONResponse:
-        return JSONResponse(_ttl_cached(f"equity-curve:{range_s}", 30.0,
-                                        lambda: _equity_curve_payload(range_s)))
+        payload = await asyncio.to_thread(
+            _ttl_cached, f"equity-curve:{range_s}", 30.0,
+            lambda: _equity_curve_payload(range_s),
+        )
+        return JSONResponse(payload)
 
     @app.get("/api/dashboard/closed-trades")
     async def dashboard_closed_trades(limit: int = Query(20, ge=1, le=200)) -> JSONResponse:
-        return JSONResponse(_ttl_cached(f"closed-trades:{limit}", 10.0,
-                                        lambda: _closed_trades_payload(limit)))
+        payload = await asyncio.to_thread(
+            _ttl_cached, f"closed-trades:{limit}", 10.0,
+            lambda: _closed_trades_payload(limit),
+        )
+        return JSONResponse(payload)
 
     @app.get("/api/feed/stream")
     async def feed_stream() -> StreamingResponse:
@@ -1980,6 +3608,17 @@ def register_routes(app: FastAPI) -> None:
                 "Connection": "keep-alive",
             },
         )
+
+    @app.get("/api/feed/history")
+    async def feed_history(limit: int = 500) -> JSONResponse:
+        """Return recent session-log events (oldest first), capped at 5000.
+
+        The portal channel page calls this on mount so reloads/visits restore
+        the full recent history instead of only the 500-line SSE replay buffer.
+        """
+        n = max(1, min(limit, 5000))
+        events = await asyncio.to_thread(session_log.tail, n)
+        return JSONResponse({"events": events})
 
     # ── operator (token-gated) ──
 
@@ -2400,3 +4039,21 @@ def register_routes(app: FastAPI) -> None:
             return JSONResponse({"response": content, "kind": "chat", "model": chat_model})
         except Exception as e:
             return JSONResponse({"response": f"chat error: {e}", "kind": "error"})
+
+    # ── SPA catch-all: serve index.html for any non-API GET route ───────
+    # Vue Router uses history mode, so deep links like /positions must
+    # return the SPA shell instead of FastAPI's default {"detail":"Not Found"}.
+    # API routes (/api/, /metrics, /postmortems) are already registered above
+    # and take precedence; this catches everything else.
+    _spa_index = os.path.join(_WEB_DIST, "index.html") if os.path.isdir(_WEB_DIST) else ""
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_catch_all(full_path: str):
+        # Never intercept API or known backend routes.
+        if (full_path.startswith("api/") or full_path.startswith("metrics")
+                or full_path.startswith("postmortems") or full_path.startswith("web/")):
+            raise HTTPException(status_code=404)
+        if _spa_index and os.path.isfile(_spa_index):
+            return FileResponse(_spa_index, headers=_NO_CACHE_HEADERS)
+        # SPA not built: fall back to redirect to root.
+        return RedirectResponse(url="/", status_code=302)

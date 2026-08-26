@@ -1,7 +1,16 @@
-"""Persistent agent memory — a disk-backed singleton loaded from .agent-memory.json."""
+"""Persistent agent memory — a disk-backed singleton loaded from .agent-memory.json.
+
+The JSON file is a per-component CACHE. The authoritative append-only record is
+``~/.hermes-trading/events.jsonl`` (shared with HTA). On ``load()`` the memory is
+hydrated from events.jsonl when present (P2-10); the JSON cache is used as a
+fast-path fallback. Every ``flush()`` is now guarded by an ``fcntl.flock``
+exclusive lock (4.5.1) so a second process (dashboard, MCP, backtest) can no
+longer truncate or race the live trading loop's memory file.
+"""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -18,6 +27,15 @@ _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__f
 MEMORY_FILE = os.environ.get(
     "HERMES_AGENT_MEMORY_FILE",
     os.path.join(_REPO_ROOT, ".agent-memory.json"),
+)
+# Cross-process exclusive lock guarding flush() (4.5.1). Held only for the
+# duration of the atomic tmp+replace; never held across long operations.
+MEMORY_LOCK_FILE = MEMORY_FILE + ".lock"
+
+# Authoritative append-only event log shared with HTA (P2-10).
+_EVENTS_FILE = os.environ.get(
+    "HERMES_EVENTS_FILE",
+    os.path.expanduser("~/.hermes-trading/events.jsonl"),
 )
 
 MAX_PERCEPTIONS = 500
@@ -56,10 +74,65 @@ class AgentMemory:
 
     # ── Persistence ─────────────────────────────────────────────────────────
 
+    def _rebuild_from_events(self) -> bool:
+        """Rebuild trade/close history from the shared events.jsonl (P2-10).
+
+        The per-component JSON is a cache; events.jsonl is the source of truth.
+        On startup we replay ``order``/``close``/``risk`` events to repopulate
+        ``_trades`` and ``_closes`` so a wiped/corrupt JSON cache never loses
+        realized outcomes. Returns True if at least one event was replayed.
+        """
+        if not os.path.exists(_EVENTS_FILE):
+            return False
+        try:
+            trades: List[Dict[str, Any]] = []
+            closes: List[Dict[str, Any]] = []
+            with open(_EVENTS_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    ev = rec.get("event")
+                    payload = rec.get("payload") or {}
+                    if not isinstance(payload, dict):
+                        continue
+                    # Stamp trace_id/timestamp onto the rebuilt record so the
+                    # in-memory shape stays self-describing.
+                    payload = dict(payload)
+                    payload.setdefault("trace_id", rec.get("trace_id", ""))
+                    payload.setdefault("event_ts", rec.get("timestamp", ""))
+                    if ev == "order":
+                        trades.append(payload)
+                    elif ev == "close":
+                        closes.append(payload)
+            if trades:
+                self._trades = trades[-MAX_TRADES:]
+            if closes:
+                self._closes = closes[-MAX_CLOSES:]
+            if trades or closes:
+                logger.info(
+                    f"[memory] rebuilt from events.jsonl: "
+                    f"{len(trades)} orders, {len(closes)} closes"
+                )
+                return True
+        except Exception as e:
+            logger.warning(f"[memory] rebuild from events.jsonl failed: {e}")
+        return False
+
     def load(self) -> None:
-        """Load state from disk."""
+        """Load state from disk.
+
+        Hydration order: the JSON cache restores all live/intraday fields;
+        then ``events.jsonl`` is replayed to guarantee trades/closes are never
+        lost even if the JSON cache was wiped (P2-10).
+        """
         if self._initialized:
             return
+        rebuilt = False
         try:
             with open(MEMORY_FILE, "r") as f:
                 data = json.load(f)
@@ -92,7 +165,16 @@ class AgentMemory:
         except Exception as e:
             logger.error(f"[memory] load failed: {e}")
 
+        # Source of truth: replay events.jsonl to backfill trades/closes.
+        rebuilt = self._rebuild_from_events()
+
         self._initialized = True
+        if rebuilt:
+            # Persist the merged view back to the JSON cache.
+            try:
+                self.flush()
+            except Exception:
+                pass
 
     def flush(self) -> None:
         """Save current state to disk.
@@ -106,6 +188,7 @@ class AgentMemory:
         """
         if not self._initialized:
             return
+        lock_fd = None
         try:
             data = {
                 "perceptions": self._perceptions,
@@ -120,12 +203,24 @@ class AgentMemory:
                 "dayStartTs": self._day_start_ts,
                 "openPositions": self._open_positions,
             }
+            # Cross-process exclusive lock (4.5.1) so a concurrent dashboard/MCP
+            # process can't interleave a tmp+replace with the trading loop.
+            # flock is auto-released by the kernel on process crash.
+            lock_fd = os.open(MEMORY_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
             tmp = MEMORY_FILE + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(data, f, indent=2)
             os.replace(tmp, MEMORY_FILE)
         except Exception as e:
             logger.error(f"[memory] save failed: {e}")
+        finally:
+            if lock_fd is not None:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    os.close(lock_fd)
+                except OSError:
+                    pass
 
     # ── Write operations ────────────────────────────────────────────────────
 
@@ -143,6 +238,17 @@ class AgentMemory:
         self._trades.append(t)
         if len(self._trades) > MAX_TRADES:
             self._trades.pop(0)
+        # Authoritative event feed: emit an "order" event so rebuild can
+        # reconstruct trades on a fresh/corrupt JSON cache (PURR record-loss
+        # fix 2026-08-22). Best-effort, never blocks trading.
+        try:
+            from hermes_trader import event_log
+            event_log.append("order", payload=t,
+                             trace_id=str(t.get("trace_id") or
+                                          t.get("analysis_id") or ""))
+        except Exception:
+            pass
+        self.flush()
 
     def record_entry_context(self, coin: str, side: str, ctx: Dict[str, Any]) -> None:
         """Stash entry time + signal snapshot for an opening position, so its close
@@ -170,6 +276,15 @@ class AgentMemory:
         self._closes.append(c)
         if len(self._closes) > MAX_CLOSES:
             self._closes.pop(0)
+        # Authoritative event feed: emit a "close" event so rebuild can
+        # reconstruct realized outcomes on a fresh/corrupt JSON cache (PURR
+        # record-loss fix 2026-08-22). Best-effort, never blocks trading.
+        try:
+            from hermes_trader import event_log
+            event_log.append("close", payload=c,
+                             trace_id=str(c.get("trace_id") or ""))
+        except Exception:
+            pass
         self.flush()
 
     def update_equity(self, eq: float) -> None:
@@ -187,7 +302,6 @@ class AgentMemory:
         old behavior).
         """
         from datetime import datetime, timezone
-        import time as _time
         # ── Partial-dex degraded-read filter ────────────────────────────
         # A flaky per-dex query can drop a whole clearinghouse from the
         # aggregate (observed 2026-06-12 08:06: aggregate momentarily read
@@ -198,19 +312,54 @@ class AgentMemory:
         # gross book without liquidation, so reject fast spikes and keep
         # the prior reading; a SUSTAINED move re-asserts itself after 180s
         # and is then accepted (genuine crash detection delayed ≤3min).
-        now_s = _time.time()
+        now_s = time.time()
         prev_eq = getattr(self, "_last_eq_reading", 0.0)
         prev_ts = getattr(self, "_last_eq_reading_ts", 0.0)
+        # H10: the original filter blind-rejected ANY >25% equity move within
+        # 180s, which masked real flash crashes — the daily-loss kill-switch
+        # would see a stale, optimistic reading for up to 3 minutes while the
+        # book was actually blowing up. Two corrections keep the false-positive
+        # protection for flaky per-dex reads while letting genuine crashes
+        # through promptly:
+        #   1. A large DOWN move beyond a crash threshold is accepted
+        #      immediately (a >40% equity drop at this gross leverage is not a
+        #      transient partial-dex artifact — fail-OPEN on real risk).
+        #   2. Otherwise, instead of a time-based 180s blackout, require the
+        #      implausible reading to RE-CONFIRM once before accepting. A
+        #      one-tick partial-dex blip stays rejected; a sustained move
+        #      (even a slower crash) is accepted on the very next tick.
+        _IMPLAUSIBLE_PCT = 0.25
+        _CRASH_DOWN_PCT = float(os.environ.get("HERMES_EQUITY_CRASH_DOWN_PCT", "0.40"))
         if (prev_eq > 0 and current_equity > 0
-                and (now_s - prev_ts) < 180
-                and abs(current_equity - prev_eq) / prev_eq > 0.25):
-            logger.error(
-                f"[memory] IMPLAUSIBLE equity swing ${prev_eq:.2f} -> "
-                f"${current_equity:.2f} in {now_s - prev_ts:.0f}s — suspected "
-                f"partial-dex degraded read; IGNORING this tick (kill-switch "
-                f"protected). If real, it will re-assert after 180s."
-            )
-            return
+                and (now_s - prev_ts) < 180):
+            move_frac = (current_equity - prev_eq) / prev_eq
+            if move_frac <= -_CRASH_DOWN_PCT:
+                logger.critical(
+                    f"[memory] EQUITY CRASH ${prev_eq:.2f} -> ${current_equity:.2f} "
+                    f"({move_frac*100:.1f}%) in {now_s - prev_ts:.0f}s — accepting "
+                    f"immediately (exceeds crash threshold; kill-switch MUST see this)"
+                )
+                # fall through to accept the reading
+            elif abs(move_frac) > _IMPLAUSIBLE_PCT:
+                streak = getattr(self, "_eq_implausible_streak", 0) + 1
+                self._eq_implausible_streak = streak
+                if streak < 2:
+                    logger.error(
+                        f"[memory] IMPLAUSIBLE equity swing ${prev_eq:.2f} -> "
+                        f"${current_equity:.2f} ({move_frac*100:+.1f}%) in "
+                        f"{now_s - prev_ts:.0f}s — suspected partial-dex degraded "
+                        f"read; IGNORING this tick (will accept if it re-confirms). "
+                        f"[streak={streak}]"
+                    )
+                    return
+                logger.warning(
+                    f"[memory] implausible equity move ${prev_eq:.2f} -> "
+                    f"${current_equity:.2f} re-confirmed across {streak} ticks — "
+                    f"accepting as a sustained move (no longer treating as blip)."
+                )
+                # fall through to accept
+        # Reset streak whenever we accept a reading.
+        self._eq_implausible_streak = 0
         self._last_eq_reading = current_equity
         self._last_eq_reading_ts = now_s
 
@@ -218,7 +367,12 @@ class AgentMemory:
             hour=0, minute=0, second=0, microsecond=0
         ).timestamp())
         if self._day_start_ts < today_utc or self._start_of_day_equity == 0:
-            self._start_of_day_equity = current_equity
+            # Re-baseline at day roll or after a memory reset. If there were
+            # already contributions today (e.g. operator transferred USDC
+            # spot→perp before starting the bot), the baseline must exclude
+            # them so the first PnL reading doesn't show -contributions as a
+            # loss: daily_pnl = equity_now - baseline - contributions = 0.
+            self._start_of_day_equity = current_equity - net_contributions
             self._day_start_ts = today_utc
             self._daily_pnl = 0
             self._peak_daily_pnl = 0  # reset high-water mark at the UTC day roll
@@ -248,8 +402,7 @@ class AgentMemory:
         exp = self._cooldowns.get(coin)
         if not exp:
             return 0.0
-        import time as _t
-        remaining = (int(exp) - int(_t.time() * 1000)) / 60_000
+        remaining = (int(exp) - int(time.time() * 1000)) / 60_000
         if remaining <= 0:
             self._cooldowns.pop(coin, None)
             return 0.0

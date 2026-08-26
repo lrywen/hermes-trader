@@ -6,6 +6,7 @@ stale lock file is reclaimed on the next acquire.
 """
 
 import fcntl
+import calendar
 import json
 import logging
 import os
@@ -33,8 +34,12 @@ def _read_lock_metadata(path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _is_pid_alive(pid: Optional[int]) -> bool:
-    """Check if a PID is still running."""
+def is_pid_alive(pid: Optional[int]) -> bool:
+    """Check if a PID is still running.
+
+    Single source of truth for PID-aliveness probes (daemon state checks and
+    stale-lock recovery both delegate here).
+    """
     if pid is None:
         return False
     try:
@@ -42,6 +47,10 @@ def _is_pid_alive(pid: Optional[int]) -> bool:
         return True
     except (OSError, ProcessLookupError):
         return False
+
+
+# Backwards-compatible alias for internal callers.
+_is_pid_alive = is_pid_alive
 
 
 def _write_metadata_inplace(fd: int, payload: Dict[str, Any]) -> None:
@@ -137,5 +146,5 @@ def check_lock_status(name: str, lock_dir: Optional[str] = None) -> Dict[str, An
         "pid_alive": alive,
         "start_iso": prev.get("start_iso"),
         "name": prev.get("name"),
-        "age_seconds": round(time.time() - time.mktime(time.strptime(prev.get("start_iso", ""), "%Y-%m-%dT%H:%M:%SZ")), 1),
+        "age_seconds": round(time.time() - calendar.timegm(time.strptime(prev.get("start_iso", ""), "%Y-%m-%dT%H:%M:%SZ")), 1),
     }
