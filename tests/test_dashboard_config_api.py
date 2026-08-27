@@ -10,7 +10,7 @@ Covers:
   * GET  /api/dashboard/config/backup     — operator-gated
   * POST /api/dashboard/config/rollback   — operator-gated round-trip
   * GET  /api/dashboard/config/history    — operator-gated audit events
-  * GET  /config                          — HTML page served
+  * GET  /config                          — SPA shell (200) or redirect (no dist)
 """
 
 import os
@@ -75,11 +75,20 @@ def test_get_config_schema_returns_types(client):
     assert schema["dsl_exit"]["type"] == "object"
 
 
-def test_config_page_html_served(client):
-    r = client.get("/config")
-    assert r.status_code == 200
-    assert "hermes-trader" in r.text.lower()
-    assert "cfg-grid" in r.text
+def test_config_page_served_by_spa(client):
+    # The inline /config page was removed (legacy HTML deletion); the path is
+    # now handled by the history-mode SPA catch-all: the index.html shell when
+    # /app/web-dist exists (200), otherwise a redirect to the SPA root (302).
+    r = client.get("/config", follow_redirects=False)
+    assert r.status_code in (200, 302)
+    if r.status_code == 302:
+        # No built SPA in the test env: catch-all bounces to /, which in
+        # turn redirects to /web/.
+        assert r.headers["location"] in ("/", "/web/")
+    else:
+        assert "<!doctype html" in r.text.lower()
+    # The old inline page's marker must be gone.
+    assert "cfg-grid" not in r.text
 
 
 # ── POST /api/dashboard/config ──────────────────────────────────────────────
@@ -170,6 +179,70 @@ def test_post_config_bool_rejects_non_bool(client):
         headers=_auth(),
     )
     assert r.status_code == 422
+
+
+# ── F19: type + range coverage for every numeric CANONICAL_DEFAULTS key ──────
+
+@pytest.mark.parametrize("key,bad_value", [
+    ("tp_scale_fraction", 1.5),
+    ("tp_scale_fraction", -0.1),
+    ("crowded_with_min_conf", 1.2),
+    ("min_available_margin_pct", -0.05),
+    ("against_funding_min_conf", 2.0),
+    ("against_funding_min_score", 150.0),
+    ("chop_burst_min_score", -1.0),
+    ("strong_trend_threshold", 1.5),
+    ("trend_threshold", -0.2),
+    ("neutral_threshold", 9.0),
+    ("whale_size_multiplier", -1.0),
+    ("force_execute_composite", 150),
+    ("research_cooldown_min", -5),
+    ("held_research_interval_min", -1),
+    ("ta_sidestep_min_slow_burn_count", -9),
+    ("force_execute_slow_burn_count", -2),
+    # wrong types must be rejected too
+    ("whale_size_multiplier", "big"),
+    ("research_cooldown_min", 3.5),
+    ("force_execute_composite", True),
+])
+def test_f19_newly_covered_numeric_keys_reject_invalid(key, bad_value):
+    from hermes_trader.dashboard import _validate_config_updates
+    errors = _validate_config_updates({key: bad_value})
+    assert any(key in e for e in errors), f"{key}={bad_value!r} not rejected: {errors}"
+
+
+def test_f19_newly_covered_keys_accept_canonical_defaults():
+    """Every F19-covered key's CANONICAL_DEFAULTS value must pass validation —
+    the default seed config must never be self-rejecting."""
+    from hermes_trader.dashboard import _validate_config_updates
+    covered = [
+        "tp_scale_fraction", "crowded_with_min_conf", "min_available_margin_pct",
+        "research_cooldown_min", "held_research_interval_min",
+        "force_execute_composite", "ta_sidestep_min_slow_burn_count",
+        "force_execute_slow_burn_count", "whale_size_multiplier",
+        "chop_burst_min_score", "against_funding_min_conf",
+        "against_funding_min_score", "strong_trend_threshold",
+        "trend_threshold", "neutral_threshold",
+    ]
+    updates = {k: config_store.CANONICAL_DEFAULTS[k] for k in covered}
+    assert _validate_config_updates(updates) == []
+
+
+# ── F26: tunable cache/SSE constants carry sane defaults ────────────────────
+
+def test_f26_tunable_constants_have_expected_defaults():
+    """The env-overridable ops constants exist with the prior hard-coded
+    defaults so behaviour is unchanged when no env is set."""
+    from hermes_trader import dashboard
+    from hermes_trader.dashboard_routes import public
+    assert dashboard._POSITIONS_CACHE_TTL_S == 5.0
+    assert dashboard._SSE_REPLAY_LINES == 500
+    assert dashboard._SSE_HEARTBEAT_S == 15.0
+    assert dashboard._EQUITY_DIP_RATIO == 0.7
+    assert dashboard._EQUITY_DIP_WINDOW == 15
+    assert public._SUMMARY_TTL_S == 2.0
+    assert public._EQUITY_CURVE_TTL_S == 30.0
+    assert public._CLOSED_TRADES_TTL_S == 10.0
 
 
 def test_post_config_creates_backup(client):
@@ -303,3 +376,210 @@ def test_post_config_list_wrong_type_422(client):
         headers=_auth(),
     )
     assert r.status_code == 422
+
+
+# ── manual trading surface (server.py place-order / close-position) ─────────
+#
+# These endpoints are registered on the SERVER app (server.py calls
+# dashboard.register_routes(app)), not on a bare dashboard-only app — so hit
+# them through server.app with the operator token env set.
+
+import pytest as _pytest  # noqa: E402
+
+
+@_pytest.fixture()
+def server_client(monkeypatch):
+    """TestClient over the real server app with a known operator token."""
+    from fastapi.testclient import TestClient
+    from hermes_trader import server
+    monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
+    return TestClient(server.app)
+
+
+def test_manual_place_order_blocked_in_off_mode(server_client, monkeypatch):
+    """Opening a NEW position via the manual endpoint must be refused while
+    Mode=OFF (the operator endpoint must not bypass the autonomous OFF gate)."""
+    from hermes_trader import server
+    monkeypatch.setattr(server, "read_agent_config",
+                        lambda: {"mode": "OFF", "leverage": 10})
+    r = server_client.post(
+        "/api/hl/place-order",
+        json={"coin": "BTC", "side": "long", "leverage": 5},
+        headers=_auth(),
+    )
+    assert r.status_code == 409
+
+
+def test_manual_place_order_rejects_invalid_side(server_client, monkeypatch):
+    """An unrecognized side is a 400 (input validation), reached only once the
+    OFF gate is cleared."""
+    from hermes_trader import server
+    monkeypatch.setattr(server, "read_agent_config",
+                        lambda: {"mode": "LIVE", "leverage": 10})
+    r = server_client.post(
+        "/api/hl/place-order",
+        json={"coin": "BTC", "side": "sideways", "leverage": 5},
+        headers=_auth(),
+    )
+    assert r.status_code == 400
+
+
+def test_manual_place_order_rejects_leverage_above_cap(server_client, monkeypatch):
+    """Leverage above the 10x canonical norm is clamped, but a non-numeric /
+    out-of-band value is rejected with 400 rather than silently applied."""
+    from hermes_trader import server
+    monkeypatch.setattr(server, "read_agent_config",
+                        lambda: {"mode": "LIVE", "leverage": 10})
+    r = server_client.post(
+        "/api/hl/place-order",
+        json={"coin": "BTC", "side": "long", "leverage": "not-a-number"},
+        headers=_auth(),
+    )
+    assert r.status_code == 400
+
+
+def test_manual_close_hip3_coin_name_not_upper_corrupted(server_client, monkeypatch):
+    """HIP-3 coin names (xyz:MU, vntl:*) carry a ':' and must NOT be .upper()'d
+    as a whole. A manual close in Mode=OFF is allowed (flatten is risk
+    reduction) and passes the coin through verbatim to close_position_market."""
+    from hermes_trader import server
+
+    captured = {}
+
+    def _fake_close(coin):
+        captured["coin"] = coin
+        return {"ok": True, "coin": coin, "side": "long"}
+
+    monkeypatch.setattr(server, "close_position_market", _fake_close)
+    # Mode stays OFF — close (flatten) must still go through.
+    monkeypatch.setattr(server, "read_agent_config",
+                        lambda: {"mode": "OFF", "leverage": 10})
+    r = server_client.post(
+        "/api/hl/close-position",
+        json={"coin": "xyz:MU"},
+        headers=_auth(),
+    )
+    assert r.status_code == 200, r.text
+    assert captured["coin"] == "xyz:MU"  # not "XYZ:MU"
+
+
+# ── F11: authenticated operator write rate limit ───────────────────────────
+
+def test_operator_write_rate_limit_returns_429(client, monkeypatch):
+    """F11: a valid token does not grant unlimited writes. Past the per-IP
+    sliding-window cap, state-changing requests get 429 + Retry-After; reads
+    are never limited."""
+    from hermes_trader import dashboard
+    monkeypatch.setattr(dashboard, "_WRITE_RATE_MAX", 3)
+    monkeypatch.setattr(dashboard, "_WRITE_RATE_WINDOW_S", 60.0)
+    dashboard._write_hits.clear()
+    # First 3 authenticated writes within the window succeed.
+    for _ in range(3):
+        r = client.post("/api/dashboard/operator/mode",
+                        json={"mode": "OFF"}, headers=_auth())
+        assert r.status_code == 200, r.text
+    # 4th write trips the cap.
+    r = client.post("/api/dashboard/operator/mode",
+                    json={"mode": "OFF"}, headers=_auth())
+    assert r.status_code == 429
+    assert r.headers.get("retry-after")
+    # Unauthenticated writes are still 401, not 429-masked.
+    r_bad = client.post("/api/dashboard/operator/mode", json={"mode": "OFF"})
+    assert r_bad.status_code == 401
+    # Reads (GET) are NOT rate-limited.
+    for _ in range(10):
+        rr = client.get("/api/dashboard/operator/config", headers=_auth())
+        assert rr.status_code == 200
+
+
+def test_operator_write_rate_disabled_when_max_zero(client, monkeypatch):
+    """HERMES_OP_WRITE_RATE_MAX=0 turns the limiter off (escape hatch)."""
+    from hermes_trader import dashboard
+    monkeypatch.setattr(dashboard, "_WRITE_RATE_MAX", 0)
+    dashboard._write_hits.clear()
+    for _ in range(6):
+        r = client.post("/api/dashboard/operator/mode",
+                        json={"mode": "OFF"}, headers=_auth())
+        assert r.status_code == 200, r.text
+
+
+# ── F22: operator manual-close audit trail ─────────────────────────────────
+
+def test_operator_close_writes_audit_event(client, monkeypatch, tmp_path):
+    """F22: a web operator close must persist an operator_action event to the
+    session log AND fork it into the authoritative events.jsonl."""
+    from hermes_trader import session_log, event_log
+    sess = tmp_path / "session.jsonl"
+    ev = tmp_path / "events.jsonl"
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(sess))
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev))
+    monkeypatch.setattr(
+        "hermes_trader.agents.executor.close_position_market",
+        lambda coin: {"ok": True, "coin": coin, "side": "long",
+                      "fill_px": 50000.0, "realized_pnl_pct": 1.2,
+                      "leverage": 10},
+    )
+    r = client.post("/api/dashboard/operator/close",
+                    json={"coin": "btc"}, headers=_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["ok"] is True
+
+    sess_rows = [json.loads(l) for l in sess.read_text().splitlines() if l.strip()]
+    op = [e for e in sess_rows if e.get("event") == "operator_action"]
+    assert op, "operator_action event missing from session log"
+    rec = op[-1]
+    assert rec["action"] == "close"
+    assert rec["coin"] == "BTC"          # bare ticker normalized to upper
+    assert rec["via"] == "web"
+    assert rec["result"]["ok"] is True
+    assert rec["result"]["fill_px"] == 50000.0
+
+    # Forked into events.jsonl (authoritative feed).
+    assert ev.exists()
+    ev_rows = [json.loads(l) for l in ev.read_text().splitlines() if l.strip()]
+    assert any(e.get("event") == "operator_action"
+               and e.get("payload", {}).get("action") == "close"
+               for e in ev_rows)
+
+
+# ── F20: legacy POST /api/agent/config RMW must be serialized ──────────────
+
+def test_legacy_agent_config_endpoint_concurrent_merge(server_client):
+    """F20: the legacy POST /api/agent/config endpoint used to do an unlocked
+    read → merge → write, so concurrent requests each merging their own key
+    lost all but the last writer's change. Under update_agent_config's flock
+    the merges serialize and every key survives."""
+    import threading
+    from fastapi.testclient import TestClient
+    from hermes_trader import server
+
+    # Seed a baseline (and guarantee the file exists).
+    cfg = read_agent_config()
+    cfg["legacy_rmw_seed"] = 1
+    write_agent_config(cfg, backup=False)
+
+    errors = []
+
+    def _merge_key(i: int) -> None:
+        # Each thread gets its own TestClient (portal threads are not shared
+        # safely); the endpoint itself is the system under test.
+        c = TestClient(server.app)
+        r = c.post(
+            "/api/agent/config",
+            json={f"legacy_rmw_key_{i}": True},
+            headers=_auth(),
+        )
+        if r.status_code != 200:
+            errors.append((i, r.status_code, r.text))
+
+    threads = [threading.Thread(target=_merge_key, args=(i,)) for i in range(5)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, errors
+    final = read_agent_config()
+    for i in range(5):
+        assert final.get(f"legacy_rmw_key_{i}") is True
+    assert final.get("legacy_rmw_seed") == 1

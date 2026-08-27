@@ -9,7 +9,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, AsyncIterator, Dict
 
 
 def _load_env_local_early() -> None:
@@ -40,14 +40,14 @@ _load_env_local_early()
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response  # noqa: E402
 from fastapi.middleware.cors import CORSMiddleware                   # noqa: E402
-from fastapi.responses import JSONResponse                            # noqa: E402
+from fastapi.responses import JSONResponse, StreamingResponse         # noqa: E402
 
 from hermes_trader.metrics import render_metrics                      # noqa: E402
 
 from hermes_trader import __version__, dashboard, session_log         # noqa: E402
 from hermes_trader.dashboard import _require_operator                 # noqa: E402
-from hermes_trader.agents.config_store import read_agent_config, write_agent_config, _deep_merge  # noqa: E402
-from hermes_trader.agents.executor import maybe_execute               # noqa: E402
+from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
+from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
 from hermes_trader.agents.memory import memory                        # noqa: E402
 from hermes_trader.agents.perception import scan_once                 # noqa: E402
 from hermes_trader.agents.research import research                    # noqa: E402
@@ -102,7 +102,7 @@ _SCAN_MIN_SECONDS = 30
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Load persisted memory on startup, flush it on shutdown."""
     memory.load()
     logger.info("Hermes server started — memory loaded")
@@ -189,7 +189,7 @@ def _hip3_on() -> bool:
 
 
 @app.get("/api/agent/state", dependencies=[Depends(_require_operator)])
-async def get_agent_state():
+async def get_agent_state() -> JSONResponse:
     """GET /api/agent/state — full state snapshot for the UI."""
     memory.load()
     state = memory.get_full_state()
@@ -206,7 +206,7 @@ async def get_agent_state():
 
 
 @app.post("/api/agent/scan", dependencies=[Depends(_require_operator)])
-async def run_scan(request: Request):
+async def run_scan(request: Request) -> JSONResponse:
     """POST /api/agent/scan — sweep markets for trigger signals."""
     global _last_scan_at
 
@@ -296,7 +296,7 @@ async def _research_cached(coin: str, perception: Dict[str, Any]) -> Dict[str, A
 
 
 @app.post("/api/agent/research/{coin}", dependencies=[Depends(_require_operator)])
-async def run_research(coin: str, request: Request):
+async def run_research(coin: str, request: Request) -> JSONResponse:
     """POST /api/agent/research/{coin} — full AI analysis for one coin.
 
     A short per-coin TTL cache (``HERMES_RESEARCH_HTTP_CACHE_S``, default 30s)
@@ -333,7 +333,7 @@ async def run_research(coin: str, request: Request):
 
 
 @app.post("/api/agent/research/{coin}/stream", dependencies=[Depends(_require_operator)])
-async def run_research_stream(coin: str, request: Request):
+async def run_research_stream(coin: str, request: Request) -> StreamingResponse:
     """SSE streaming research endpoint.
 
     RETIRED: streaming research has been replaced by the in-process native
@@ -363,7 +363,7 @@ async def run_research_stream(coin: str, request: Request):
 
 
 @app.post("/api/risk/review/stream", dependencies=[Depends(_require_operator)])
-async def risk_review_stream(request: Request):
+async def risk_review_stream(request: Request) -> StreamingResponse:
     """SSE streaming endpoint for risk review.
 
     RETIRED: previously proxied the external research service's
@@ -390,7 +390,7 @@ async def risk_review_stream(request: Request):
 
 
 @app.post("/api/agent/execute", dependencies=[Depends(_require_operator)])
-async def run_execute(request: Request):
+async def run_execute(request: Request) -> JSONResponse:
     """POST /api/agent/execute — run risk gates and execute an analysis."""
     memory.load()
 
@@ -417,20 +417,20 @@ async def run_execute(request: Request):
 
 
 @app.get("/api/agent/trades", dependencies=[Depends(_require_operator)])
-async def get_trades():
+async def get_trades() -> JSONResponse:
     """GET /api/agent/trades — all recorded trades."""
     memory.load()
     return JSONResponse(content=memory.get_all_trades())
 
 
 @app.get("/api/agent/session-log", dependencies=[Depends(_require_operator)])
-async def get_session_log():
+async def get_session_log() -> JSONResponse:
     """GET /api/agent/session-log — last 50 log entries."""
     return JSONResponse(content=session_log.tail(50))
 
 
 @app.get("/api/agent/start", dependencies=[Depends(_require_operator)])
-async def agent_start():
+async def agent_start() -> JSONResponse:
     """GET /api/agent/start — report whether the scanner process is running."""
     if not os.path.exists(PID_FILE):
         return JSONResponse(content={"running": False, "cycle": 0, "lastUpdate": None})
@@ -441,7 +441,7 @@ async def agent_start():
 
 
 @app.post("/api/agent/start", dependencies=[Depends(_require_operator)])
-async def agent_start_post():
+async def agent_start_post() -> JSONResponse:
     """POST /api/agent/start — report scanner status.
 
     The Python agent runs as its own process; this endpoint does not spawn it.
@@ -460,7 +460,7 @@ async def agent_start_post():
 
 
 @app.post("/api/agent/stop", dependencies=[Depends(_require_operator)])
-async def agent_stop():
+async def agent_stop() -> JSONResponse:
     """POST /api/agent/stop — terminate the scanner process."""
     if not os.path.exists(PID_FILE):
         return JSONResponse(content={"status": "not_running"})
@@ -481,30 +481,41 @@ async def agent_stop():
 
 
 @app.get("/api/agent/config", dependencies=[Depends(_require_operator)])
-async def get_config():
+async def get_config() -> JSONResponse:
     """GET /api/agent/config — read the agent config."""
     return JSONResponse(content=read_agent_config())
 
 
 @app.post("/api/agent/config", dependencies=[Depends(_require_operator)])
-async def update_config(request: Request):
-    """POST /api/agent/config — merge new values into the agent config."""
-    existing = read_agent_config()
+async def update_config(request: Request) -> JSONResponse:
+    """POST /api/agent/config — merge new values into the agent config.
+
+    F20: the merge happens inside update_agent_config()'s cross-process
+    exclusive flock, so a concurrent dashboard/CLI write cannot be lost
+    (two requests both merging into the same old config used to clobber
+    each other)."""
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "invalid JSON")
-
-    merged = _deep_merge(existing, body)
-    write_agent_config(merged)
-    return JSONResponse(content={"ok": True, "config": merged})
+    if not isinstance(body, dict):
+        raise HTTPException(400, "body must be a JSON object")
+    try:
+        with update_agent_config() as cfg:
+            merged = _deep_merge(cfg, body)
+            cfg.clear()
+            cfg.update(merged)
+    except RuntimeError as e:
+        # Missing/corrupt on-disk config: refuse to overwrite blindly.
+        raise HTTPException(503, str(e))
+    return JSONResponse(content={"ok": True, "config": cfg})
 
 
 # ── HL endpoints ──────────────────────────────────────────────────────────────
 
 
 @app.get("/api/hl/account", dependencies=[Depends(_require_operator)])
-async def get_account():
+async def get_account() -> JSONResponse:
     """GET /api/hl/account — perp + spot account state."""
     user = resolve_user_address()
     if not user:
@@ -518,7 +529,7 @@ async def get_account():
 
 
 @app.get("/api/hl/all-mids")
-async def get_all_mids():
+async def get_all_mids() -> JSONResponse:
     """GET /api/hl/all-mids — all mid prices (incl. HIP-3 when enabled)."""
     try:
         mids = fetch_all_mids(include_hip3=_hip3_on())
@@ -528,7 +539,7 @@ async def get_all_mids():
 
 
 @app.get("/api/hl/universe")
-async def get_market_universe():
+async def get_market_universe() -> JSONResponse:
     """GET /api/hl/universe — full market universe (incl. HIP-3 when enabled)."""
     try:
         universe = get_universe(include_hip3=_hip3_on())
@@ -538,7 +549,7 @@ async def get_market_universe():
 
 
 @app.get("/api/hl/price")
-async def get_price(coin: str = Query("BTC")):
+async def get_price(coin: str = Query("BTC")) -> JSONResponse:
     """GET /api/hl/price — mid price for a coin.
 
     Always includes HIP-3 dexes in the mid lookup so a request for
@@ -559,7 +570,7 @@ async def get_candles(
     coin: str = Query("BTC"),
     interval: str = Query("5m"),
     count: int = Query(100),
-):
+) -> JSONResponse:
     """GET /api/hl/candles — OHLCV candles."""
     try:
         candles = fetch_hl_candles(coin, interval, count)
@@ -569,7 +580,7 @@ async def get_candles(
 
 
 @app.get("/api/hl/portfolio", dependencies=[Depends(_require_operator)])
-async def get_portfolio():
+async def get_portfolio() -> JSONResponse:
     """GET /api/hl/portfolio — positions and equity."""
     user = resolve_user_address()
     if not user:
@@ -617,7 +628,7 @@ async def get_portfolio():
 
 
 @app.get("/api/hl/orderbook")
-async def get_orderbook(coin: str = Query("BTC")):
+async def get_orderbook(coin: str = Query("BTC")) -> JSONResponse:
     """GET /api/hl/orderbook — top-of-book L2 levels."""
     try:
         from hermes_trader.client.hl_client import _http_post
@@ -633,7 +644,7 @@ async def get_orderbook(coin: str = Query("BTC")):
 
 
 @app.post("/api/hl/place-order", dependencies=[Depends(_require_operator)])
-async def place_order(request: Request):
+async def place_order(request: Request) -> JSONResponse:
     """POST /api/hl/place-order — manual order with ATR-based SL/TP brackets."""
     try:
         body = await request.json()
@@ -641,9 +652,27 @@ async def place_order(request: Request):
         raise HTTPException(400, "invalid JSON")
 
     side = body.get("side", "long")
-    coin = (body.get("coin") or "BTC").upper()
-    leverage = body.get("leverage", 5)
-    is_buy = side.lower() in ("long", "buy")
+    # HIP-3 coin names (e.g. xyz:MU, vntl:*) carry a ':' and must NOT be
+    # upper-cased as a whole — that corrupted them into non-existent tickers.
+    # Only plain main-universe tickers get the case normalization.
+    coin = body.get("coin") or "BTC"
+    if ":" not in coin:
+        coin = coin.upper()
+    # Manual order surface opens a NEW position: refuse while Mode=OFF (the
+    # autonomous loop also declines entries in OFF; the operator endpoint must
+    # not become a loophole around that). Flatten/close stays allowed.
+    if str(read_agent_config().get("mode", "OFF")).upper() == "OFF":
+        raise HTTPException(409, f"manual order blocked: Mode=OFF (coin={coin})")
+    side_l = str(side).lower()
+    if side_l not in ("long", "short", "buy", "sell"):
+        raise HTTPException(400, f"invalid side '{side}' (want long/short/buy/sell)")
+    is_buy = side_l in ("long", "buy")
+    # Leverage clamp: canonical production norm is 10x; reject typo'd /
+    # oversized manual leverage rather than silently applying it.
+    try:
+        leverage = max(1, min(int(float(body.get("leverage", 5))), 10))
+    except (TypeError, ValueError):
+        raise HTTPException(400, f"invalid leverage '{body.get('leverage')}'")
 
     try:
         from hermes_trader.client.exchange import (
@@ -660,7 +689,9 @@ async def place_order(request: Request):
         if mid_price <= 0:
             raise HTTPException(400, f"invalid price for {coin}")
 
-        set_leverage(coin, leverage)
+        lev_res = set_leverage(coin, leverage)
+        if not (lev_res or {}).get("ok"):
+            raise HTTPException(400, f"set_leverage failed: {(lev_res or {}).get('error')}")
         atr = get_hl_atr("4h", 14, coin)
 
         # Sizing: use riskUSD if provided, else riskPct of live equity.
@@ -734,49 +765,35 @@ async def place_order(request: Request):
 
 
 @app.post("/api/hl/close-position", dependencies=[Depends(_require_operator)])
-async def close_position(request: Request):
-    """POST /api/hl/close-position — close an open position for a coin."""
+async def close_position(request: Request) -> JSONResponse:
+    """POST /api/hl/close-position — close an open position for a coin.
+
+    Routed through executor.close_position_market so a manual close gets the
+    same reduce_only=True flatten, DSL-tracker deregister, open-order cancel,
+    SL-retry bookkeeping cleanup, realized-PnL record_close, loss cooldown and
+    tiered circuit-breaker arming as an autonomous DSL exit. The previous
+    direct place_hl_order bypassed all of that (and, without reduce_only, could
+    flip a sub-$10 position to the opposite side).
+    """
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(400, "invalid JSON")
 
-    coin = (body.get("coin") or "BTC").upper()
-    user = resolve_user_address()
+    # HIP-3 coin names (xyz:MU, vntl:*) keep their ':' and mixed case; only
+    # plain main-universe tickers are upper-cased (previous .upper() corrupted
+    # every HIP-3 close into a 404 against the real position).
+    coin = body.get("coin") or "BTC"
+    if ":" not in coin:
+        coin = coin.upper()
+    # Flatten is a risk-REDUCTION action and stays available in Mode=OFF
+    # (trading_loop: "OFF — skipping scan/research/execution; exits still
+    # monitored"). Only new-position opens are gated to 409.
 
     try:
-        from hermes_trader.client.exchange import get_hl_price, place_hl_order
-
-        # include_hip3=True so a manual close request for xyz:MU/vntl:* can
-        # locate the position on the right dex; main-only would 404 every
-        # HIP-3 close.
-        state = fetch_account_state(user, include_hip3=True)
-        pos = None
-        for p in (state.get("asset_positions") or []):
-            p_coin = p.get("position", {}).get("coin", "")
-            if p_coin == coin:
-                pos = p
-                break
-
-        if not pos:
-            raise HTTPException(400, f"no open position for {coin}")
-
-        szi = float(pos.get("position", {}).get("szi", "0"))
-        if szi == 0:
-            raise HTTPException(400, f"no open position for {coin}")
-
-        is_long = szi > 0
-        mid_price = get_hl_price(coin)
-        if mid_price <= 0:
-            raise HTTPException(400, f"invalid price for {coin}")
-
-        # Close: trade in the opposite direction.
-        result = place_hl_order(
-            is_buy=not is_long,
-            size=abs(szi),
-            mid_price=mid_price,
-            coin=coin,
-        )
+        # close_position_market is a blocking SDK/HTTP path; run it off the
+        # event loop. Returns ok + side (long/short), or a noop/error dict.
+        result = await asyncio.to_thread(close_position_market, coin)
 
         await _append_session_log({
             "event": "close_position",
@@ -784,7 +801,9 @@ async def close_position(request: Request):
             "ok": result.get("ok"),
         })
 
-        return JSONResponse(content={**result, "coin": coin, "side": "long" if is_long else "short"})
+        if not result.get("ok"):
+            raise HTTPException(400, f"close failed: {result.get('error')}")
+        return JSONResponse(content=result)
     except HTTPException:
         raise
     except Exception as e:
@@ -792,7 +811,7 @@ async def close_position(request: Request):
 
 
 @app.post("/api/hl/cancel-order", dependencies=[Depends(_require_operator)])
-async def cancel_order(request: Request):
+async def cancel_order(request: Request) -> JSONResponse:
     """POST /api/hl/cancel-order — cancel an order by OID."""
     try:
         body = await request.json()
@@ -815,12 +834,12 @@ async def cancel_order(request: Request):
 # ── Root ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
-async def health():
+async def health() -> Dict[str, Any]:
     return {"service": "Hermes-Trader", "version": __version__, "status": "running"}
 
 
 @app.get("/metrics")
-async def metrics():
+async def metrics() -> Response:
     """Prometheus scrape target. Unauthenticated (like /api/health) so the
     scraper needs no operator token; reads local state only — never hits HL."""
     body, content_type = render_metrics()
@@ -985,7 +1004,7 @@ a{color:#2980b9}
 
 
 @app.get("/postmortems")
-async def list_postmortems():
+async def list_postmortems() -> Dict[str, Any]:
     """List all surge postmortem reports (public, read-only)."""
     try:
         files = sorted(
@@ -1000,7 +1019,7 @@ async def list_postmortems():
 
 
 @app.get("/postmortems/{name}")
-async def view_postmortem(name: str):
+async def view_postmortem(name: str) -> Response:
     """Render a single postmortem markdown as an HTML page (public)."""
     # Path traversal guard: only allow bare filenames.
     if "/" in name or "\\" in name or ".." in name or not name.endswith(".md"):

@@ -12,6 +12,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, List, Optional
 
 from hermes_trader.indicators.math import adx, atr, candle_val, ema, obv, rsi
+from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.models.types import Candle
 
@@ -198,10 +199,8 @@ def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
 
         # Infer the intended trade direction from the fired perception triggers,
         # so the over-extension veto knows which way we'd be chasing.
-        fired_names = {
-            t.get("name") for t in (perception.get("triggers") or [])
-            if t.get("fired")
-        }
+        # P2-6: canonical extraction via the shared helper.
+        fired_names = set(extract_fired_triggers(perception))
         bullish_triggers = fired_names & {
             "breakout", "momentumBurst", "uptrendMomentum",
             "trendFlip1h", "higherLows1h", "volumeBuildup1h", "dailyMover",

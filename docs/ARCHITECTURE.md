@@ -386,20 +386,23 @@ the agent needs than to have to teach the agent a new tool mid-session.
 
 `hermes_trader/dashboard.py` — single-file FastAPI extension that adds:
 
-- `GET /` — public dashboard (no auth): how-it-works blurb, equity curve
-  (LTTB-decimated, gradient fill), KPIs (equity / today PnL / open / last tick),
-  open positions with leveraged ROE matching HL's display, recent closes with
-  fees-net PnL, streaming live activity feed via SSE.
-- `GET /operator?token=…` — token-gated console: config JSON, in-memory DSL
-  trackers, per-position force-close, OFF/LIVE mode toggle.
-- `POST /api/dashboard/operator/terminal?token=…` — Hermes terminal endpoint.
-  Built-in commands resolve locally (`status`, `pause`, `resume`,
-  `close <coin>`, `regime`, `config`, `help`); free-form text falls through
-  to **Nous Hermes 3 70B** via OpenRouter, primed with a structured
-  world-state snapshot (last 8 real trades from memory, live positions
-  with uPnL, recent research verdicts with reasoning, DSL exits with
-  reason+PnL, ta_skips) so the chat answers about what the bot is
-  actually doing, not in a vacuum.
+- `GET /` — redirects to the Vue SPA at `/web/`. The SPA (built from the
+  separate `hermes-web` repo, served from `/app/web-dist`) renders the
+  dashboard: how-it-works blurb, equity curve (LTTB-decimated, gradient
+  fill), KPIs (equity / today PnL / open / last tick), open positions with
+  leveraged ROE, recent closes with fees-net PnL, and a streaming live
+  activity feed backed by the SSE endpoint below.
+- `GET /web/operator` — SPA operator console (unlocked in-page with the
+  operator token, sent via `X-Operator-Token` header): config viewer,
+  in-memory DSL trackers, per-position force-close, OFF/LIVE mode toggle.
+- `POST /api/dashboard/operator/terminal` (operator token via
+  `X-Operator-Token` header) — Hermes terminal endpoint. Built-in commands
+  resolve locally (`status`, `pause`, `resume`, `close <coin>`, `regime`,
+  `config`, `help`); free-form text falls through to **Nous Hermes 3 70B**
+  via OpenRouter, primed with a structured world-state snapshot (last 8 real
+  trades from memory, live positions with uPnL, recent research verdicts with
+  reasoning, DSL exits with reason+PnL, ta_skips) so the chat answers about
+  what the bot is actually doing, not in a vacuum.
 - `GET /api/feed/stream` — Server-Sent Events tailing the JSONL log.
   Replays last 50 events on connect; heartbeats every 15s to defeat proxy
   idle-kill.
@@ -407,53 +410,32 @@ the agent needs than to have to teach the agent a new tool mid-session.
   JSON endpoints driving the dashboard JS. Reusable for a future Next.js
   frontend or any other consumer.
 
-### UI layer — Tamagotchi-meets-Matrix
+### UI layer — Vue SPA (hermes-web)
 
-Single-file static HTML, no build step. The dashboard intentionally has
-personality:
+The UI is a separate Vue 3 SPA, built from the `hermes-web` repository with
+Vite (`--base=/web/`). The backend serves its built `dist/` from
+`/app/web-dist` (in docker-compose it's a read-only bind-mount) at the
+`/web/` prefix; `/` 302-redirects to `/web/`, and a history-mode catch-all
+serves the SPA shell for deep links (`/positions`, `/trades`, `/analysis`,
+`/agents`, `/channels`, `/config`, `/operator`). The Python backend is API +
+SSE only — no inline HTML/CSS/JS ships inside `dashboard.py` anymore.
 
-- **Press Start 2P font + NES.css** — pixel-bordered cards with hard 4px
-  shadows on every section. Title block (`HERMES-TRADER`) is an emerald-glow
-  LCD strip.
-- **Matrix-rain sidebar** — the live activity feed sits in a sticky 440px
-  right column with CRT scanline overlay, fade-in row animation, and
-  brighter glow on the newest entry (the "head" of the rain).
-- **White-rabbit habitat** — a hand-rolled 16×16 inline-SVG pixel rabbit
-  sits at the top of the matrix sidebar, bouncing on a spinning ⚙ wheel.
-  An NES speech balloon next to it cycles through 24 law-of-attraction
-  affirmations every 7s.
-- **Reactive header pet** — separate emoji widget that swaps on the
-  current `status` × `daily_pnl_pct` (scanning → 👀, executing → ⚡ shake,
-  profitable → 🤑/😎, losing → 😰 [pixel-SVG sprite] / 😱). Live trading
-  events animate the rabbit too: `execute` → yellow celebrate + ⚡ burst,
-  `dsl_exit` profit → green victory wiggle + 💰, `dsl_exit` loss → red
-  defeat shake + 💀.
-- **Heartbeat config insight line** — every heartbeat in the feed shows
-  the compact live config alongside the equity/PnL/open line:
-  `♥ perp=$X avail=$Y daily=±$Z open=N  ⚙ 5.0%×40x slots=20 cap=40x cool=60m hip3:on`.
-- **Currency + language selectors** — Intl.NumberFormat with USD-base FX
-  rates from open.er-api.com (15 currencies); 10 languages with a static
-  i18n dict applied via `data-i18n` attributes. Both persist in localStorage.
-- **Discreet mode** (`👁` toggle) — flips every $ amount to `•••` while
-  leaving every % visible. For screenshots / public sharing without
-  disclosing capital size.
-- **Operator-mode toggle** (`🔒 op` / `🔓 op` button) — prompts for the
-  `HERMES_OPERATOR_TOKEN`, stashes it in localStorage, reloads with
-  `?token=`. No more hand-editing the URL to unlock the terminal.
-- **Hermes terminal modal** — **Cmd+K** (Ctrl+K) opens a NES-styled
-  black console with an emerald prompt. Operator-token gated. Esc closes.
+The dashboard intentionally keeps its personality (live activity feed,
+reactive status indicators, multi-currency/language formatting, discreet
+mode, Cmd+K operator terminal); those now live in the Vue components under
+`hermes-web` rather than in an inline template.
 
-Design choice worth knowing: still **static HTML + Tailwind CDN +
-Chart.js CDN + NES.css CDN + vanilla JS**. No build step, no bundler, no
-SPA. This stays the right choice at this scale because:
-- Anyone can fork and modify in 5 minutes
-- No npm dependency surface to maintain
-- Server-side trivially deployable as one Python process
-- Looks indie-but-real, which is right for a public trading wallet
+Design choice: a real framework pays off once the dashboard is multi-page
+— and it is (8 routes). The backend contract is unchanged: the same
+`/api/dashboard/*` JSON endpoints and `/api/feed/stream` SSE, so any
+non-browser consumer (feed script, future BFF) is unaffected.
 
-Move to a real framework (Lit, Alpine, HTMX, or Svelte) once the
-dashboard grows multi-page, auth-multi-tenant, or marketplace-y — not
-before.
+**Deploy caveat:** the repository Dockerfile does not build or `COPY` the
+SPA. Images without `/app/web-dist` (e.g. Fly) therefore serve no UI — only
+the JSON API. The docker-compose deployment gets the SPA via bind-mount;
+image-based deploys need a pipeline step that bakes `hermes-web/dist` into
+`/app/web-dist`. Without a built SPA, unknown non-API paths 302 to `/`,
+which redirects to `/web/` (then 404 on assets).
 
 ---
 
@@ -675,7 +657,7 @@ python3 -m hermes_trader.server &      # dashboard at http://localhost:8000
 open http://localhost:8000
 
 # 6. When you're satisfied, flip mode to LIVE
-#    Either edit .agent-config.json directly, or use /operator?token=… and click "set mode LIVE"
+#    Either edit .agent-config.json directly, or use the Cmd+K terminal in /web/operator
 ```
 
 The config is read **fresh on every trade** — no restart needed for changes.
@@ -725,7 +707,8 @@ What you see:
 - **Recent closes**: realized PnL net of taker fees, with `~estimated` marker on pre-fill-capture trades
 - **Live feed**: SSE stream of every event the engine emits, with hover-tooltips for AI reasoning + full prices
 
-The operator console at `/operator?token=<HERMES_OPERATOR_TOKEN>` adds:
+The operator console at `/web/operator` (unlocked with the operator token,
+sent via the `X-Operator-Token` header) adds:
 - **Config viewer** — current `.agent-config.json` rendered as JSON
 - **DSL tracker viewer** — every position's peak/floor/phase/leverage
 - **Force-close buttons** — one click per coin to market-close + deregister

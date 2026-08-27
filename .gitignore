@@ -110,3 +110,6 @@ backtest-trades.csv
 *.bak-*
 *.bak2-*
 *.bak3-*
+.agent-config.json.lock
+.agent-memory.json.lock
+.dsl-state.json.lock

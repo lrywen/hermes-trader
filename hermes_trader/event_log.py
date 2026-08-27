@@ -62,6 +62,13 @@ _FORKABLE_EVENTS = frozenset({
     "hard_killswitch",
     "risk",
     "risk_gate",
+    # F22: operator audit trail must also survive in the authoritative feed so
+    # a mode switch / config change / manual close can be traced after a
+    # restart. These are low-churn (human-driven) events; memory replay ignores
+    # unknown types.
+    "mode_switch",
+    "config_update",
+    "operator_action",
 })
 
 

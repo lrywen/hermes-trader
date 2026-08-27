@@ -259,7 +259,12 @@ def test_fetch_news_sends_freshness_window(monkeypatch):
     def fake_get(url, params=None, headers=None, timeout=None):
         captured["params"] = params
         return _Resp()
-    monkeypatch.setattr(research.httpx, "get", fake_get)
+    # P1-9: outbound calls go through the shared httpx.Client (_http()),
+    # not the module-level httpx.get function.
+    class _FakeClient:
+        def get(self, url, **kw):
+            return fake_get(url, **kw)
+    monkeypatch.setattr(research, "_http", lambda: _FakeClient())
     out = research._fetch_news("AIXBT")
     assert out == "fresh headline"
     fr = captured["params"]["freshness"]
@@ -295,11 +300,33 @@ def test_risk_gates_pass_and_block():
     from hermes_trader.agents.risk_gates import eval_all_gates
     cfg = {"min_ai_confidence": 0.8, "max_concurrent": 3, "max_trade_notional_usd": 200,
            "max_daily_loss_usd": -100, "min_market_volume_usd": 5e6,
-           "max_total_notional_pct": 1.0, "cooldown_min": 60}
+           "max_total_notional_pct": 1.0, "cooldown_min": 60,
+           # debate_gate is fail-closed default-on (P0-A) with analyst3 default
+           # False (P0-D); this case exercises the generic gates, so opt out
+           # explicitly instead of relying on implicit debate defaults.
+           "debate_gate": {"enabled": False}}
     assert eval_all_gates(_ctx(), cfg)["blocked"] is False
     blocked = eval_all_gates(_ctx(confidence=0.1), cfg)
     assert blocked["blocked"] is True
     assert any("confidence" in r for r in blocked["block_reasons"])
+
+
+def test_debate_gate_fail_closed_defaults():
+    """P0-A/P0-D: debate_gate enables itself with fail-closed defaults when no
+    debate_gate config exists, and analyst3 no longer casts a rubber-stamp
+    vote. A bare high-confidence ctx (no triggers/score/whale) must therefore
+    be BLOCKED (2/5 votes); analyst3_default=true restores the legacy pass."""
+    from hermes_trader.agents.risk_gates import debate_gate
+
+    bare = debate_gate(_ctx(), {})
+    assert bare["pass"] is False
+    assert bare["agree_count"] == 2  # news-clean + high-conf whale-boost only
+
+    assert debate_gate(_ctx(), {"debate_gate": {"enabled": False}})["pass"] is True
+
+    legacy = debate_gate(_ctx(), {"debate_gate": {"analyst3_default": True}})
+    assert legacy["pass"] is True
+    assert legacy["agree_count"] == 3
 
 
 def test_notional_cap_allows_exchange_precision_dust():
@@ -544,6 +571,55 @@ def test_close_position_market_computes_realized_pnl_from_fill(monkeypatch, tmp_
     assert "ARB_short" not in dsl_exit._active_positions
 
 
+def test_close_position_market_without_avgpx_still_records_and_arms(monkeypatch, tmp_path):
+    """P0 regression: when the close fill response omits avgPx, settlement must
+    STILL run record_close, loss cooldown and the single-coin circuit breaker
+    (falling back to mid_price). Previously all three were gated on avgPx, so a
+    losing close silently skipped every risk-bookkeeping action."""
+    from hermes_trader.agents import dsl_exit, executor
+    dsl_exit, _ = _isolate_dsl_state(monkeypatch, tmp_path)
+    # Long TESTX 10x, entry 100; mid 94 → −6% spot loss → −60% ROE net of fees.
+    dsl_exit.register_position("TESTX", "long", 100.0, leverage=10)
+
+    monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
+    monkeypatch.setattr(executor, "fetch_account_state", lambda u, **kw: {
+        "asset_positions": [{"position": {
+            "coin": "TESTX", "szi": "1", "entryPx": "100",
+            # Deliberately NO positionValue: forces the mid_price fallback.
+        }}],
+    })
+    monkeypatch.setattr(executor, "get_hl_price", lambda c: 94.0)
+    # ok=True but NO avg_px / total_sz — the response shape that skipped
+    # bookkeeping before the fix.
+    monkeypatch.setattr(executor, "place_hl_order",
+                        lambda is_buy, size, mid_price, coin, **kw: {"ok": True, "order_id": "x2"})
+    monkeypatch.setattr(executor, "cancel_open_orders_for_coin", lambda coin: None)
+
+    recorded = []
+    monkeypatch.setattr(executor.memory, "record_close", lambda c: recorded.append(c))
+    monkeypatch.setattr(executor.memory, "pop_entry_context", lambda coin, side: {})
+    monkeypatch.setattr(executor.memory, "record_loss_outcome", lambda coin, pct: None)
+    circuit_calls = []
+    monkeypatch.setattr(executor.memory, "set_coin_circuit",
+                        lambda coin, until: circuit_calls.append((coin, until)))
+    monkeypatch.setattr(executor.memory, "set_loss_cooldown", lambda coin, until: None)
+    monkeypatch.setattr(executor.memory, "get_start_of_day_equity", lambda: 0.0)
+    monkeypatch.setattr(executor.memory, "get_daily_pnl", lambda: 0.0)
+
+    res = executor.close_position_market("TESTX")
+    assert res["ok"] is True
+    # mid_price fallback fill: 94 vs entry 100 → −6.0% spot.
+    assert res["fill_px"] == 94.0
+    assert abs(res["spot_pct"] - (-6.0)) < 0.01
+    assert res["spot_pct"] < -5.0
+    # record_close ran unconditionally.
+    assert recorded and recorded[0]["coin"] == "TESTX"
+    # Single-coin breaker (3% spot threshold) armed for the losing coin.
+    assert circuit_calls and circuit_calls[0][0] == "TESTX"
+    # Tracker deregistered.
+    assert "TESTX_long" not in dsl_exit._active_positions
+
+
 # ── market regime + gate ─────────────────────────────────────────────────
 def test_classify_asset():
     from hermes_trader.agents.market_regime import classify_asset
@@ -587,6 +663,9 @@ def test_memory_flush_writes_atomically(monkeypatch, tmp_path):
     m = memory_mod.AgentMemory()
     m._initialized = True
     m._trades = [{"id": "t1", "coin": "BTC", "size_usd": 10}]
+    # P1-6: flush() skips a clean store — a direct field mutation must arm
+    # the dirty flag (as every real mutator does) for the write to happen.
+    m._dirty = True
 
     m.flush()
 
@@ -769,6 +848,26 @@ def test_market_regime_gate_counter_high_conf_passes(monkeypatch):
                         lambda: {"regime": "NEUTRAL", "assets": []})
     r = market_regime_gate(_ctx(confidence=0.85, trade_side="short"))
     assert r["pass"] is True
+
+
+def test_market_regime_gate_against_funding_empty_env_no_crash(monkeypatch):
+    """P3 defense: an empty-string HERMES_CFG_AGAINST_FUNDING_MIN_* override makes
+    cfg_get return '', and float('') raises ValueError. The gate must coerce to
+    the elevated-bar defaults instead of crashing (and still block a low-conv
+    counter-funding long)."""
+    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents.risk_gates import market_regime_gate
+    monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
+    monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
+                        lambda: {"regime": "SHORT_CROWDED",
+                                 "regimes_by_class": {"crypto": "SHORT_CROWDED"}})
+    monkeypatch.setattr(market_regime, "classify_asset", lambda c: "crypto")
+    monkeypatch.setenv("HERMES_CFG_AGAINST_FUNDING_MIN_CONF", "")
+    monkeypatch.setenv("HERMES_CFG_AGAINST_FUNDING_MIN_SCORE", "")
+    r = market_regime_gate(_ctx(confidence=0.1, trade_side="long",
+                                composite_score=0, coin="FARTCOIN"))
+    assert r["pass"] is False
+    assert r["against_funding"] is True
 
 
 def test_market_regime_gate_wired_into_eval_all(monkeypatch):
@@ -2090,6 +2189,7 @@ def test_route_verdict_pass_with_ta_sidestep_hint_routes_to_executor(monkeypatch
     from hermes_trader.agents import executor
     monkeypatch.setattr(executor, "read_agent_config", lambda: {
         "ta_sidestep_force_execute": True,
+        "ta_sidestep_min_slow_burn_count": 1,
         "force_execute_composite": 20,
     })
     calls = {}
@@ -2378,7 +2478,7 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
     monkeypatch.setattr("hermes_trader.agents.market_regime.detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr("hermes_trader.agents.hyperfeed.market_get_funding_regime",
                         lambda: {"regime": "NEUTRAL", "regimes_by_class": {}})
-    def _place(is_buy, size, mid, coin):
+    def _place(is_buy, size, mid, coin, **kw):
         captured["is_buy"] = is_buy; captured["size"] = size; captured["coin"] = coin
         return {"ok": True, "order_id": "OID1", "avg_px": mid}
     monkeypatch.setattr(executor, "place_hl_order", _place)
@@ -2475,7 +2575,7 @@ def test_maybe_execute_primary_stop_sizing_uses_dsl_risk(monkeypatch):
 def test_maybe_execute_order_failed(monkeypatch):
     ex, _, _ = _exec_baseline(monkeypatch)
     monkeypatch.setattr(ex, "place_hl_order",
-                        lambda b, s, m, c: {"ok": False, "error": "no match"})
+                        lambda b, s, m, c, **kw: {"ok": False, "error": "no match"})
     r = ex.maybe_execute(_analysis())
     assert r["executed"] is False and "order_failed" in r["reason"]
 
@@ -2796,6 +2896,32 @@ def test_fetch_funding_rate_na_when_empty(monkeypatch):
     assert research._fetch_funding_rate("BTC") == "N/A"
 
 
+def test_research_thin_history_pass_flags_ai_down(monkeypatch):
+    """P1-16: a thin-history (<30 4h candles) PASS skips the LLM entirely, so it
+    must flag ai_down=True — otherwise record/notify implies a live model made
+    the decision."""
+    from hermes_trader.agents import research
+
+    def _fake_prefetch(coin, skip_news_flag):
+        # 5 bars across all TFs → well under the 30-bar 4h threshold.
+        short = [{"t": i, "o": 100, "h": 101, "l": 99, "c": 100, "v": 10}
+                 for i in range(5)]
+        return {"c1h": short, "c4h": short, "c1d": short,
+                "funding_raw": "N/A", "news": "", "signals_block": ""}
+
+    monkeypatch.setattr(research, "_parallel_prefetch", _fake_prefetch)
+    monkeypatch.setattr(research, "_should_skip_news", lambda: True)
+    recorded = []
+    monkeypatch.setattr(research.memory, "record_analysis",
+                        lambda a: recorded.append(a))
+
+    out = research.research("TESTCOIN", {"id": "p1", "mid": 100,
+                                         "composite_score": 0})
+    assert out["verdict"] == "PASS"
+    assert out["ai_down"] is True
+    assert recorded and recorded[0]["ai_down"] is True
+
+
 def test_build_user_message_includes_whale_and_structure_blocks():
     from hermes_trader.agents.research import _build_user_message
     perception = {
@@ -2891,6 +3017,10 @@ def test_closed_trades_payload_dsl_realized_fill(monkeypatch):
          "realized_pnl_pct": 8.0, "realized_spot_pct": 0.8, "reason": "trail"},
     ]
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    # F13: _closed_trades_payload also merges events.jsonl (close events);
+    # other tests write real close rows into the conftest tmp events file,
+    # so isolate the reconcile source here.
+    monkeypatch.setattr(dashboard, "_read_outcome_lines", lambda: [])
     out = dashboard._closed_trades_payload()
     assert len(out) == 1
     row = out[0]
@@ -2910,6 +3040,8 @@ def test_closed_trades_payload_estimates_leverage_and_side(monkeypatch):
          "unrealized_pct": -1.0, "reason": "stop"},
     ]
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    # F13: isolate the events.jsonl reconcile source (see test above).
+    monkeypatch.setattr(dashboard, "_read_outcome_lines", lambda: [])
     monkeypatch.setattr(dashboard, "cfg_get", lambda key, config=None: 20 if key == "leverage" else None)
     monkeypatch.setattr(dashboard, "_load_max_lev_table", lambda: {"ETH": 25})
     out = dashboard._closed_trades_payload()
@@ -2928,7 +3060,36 @@ def test_closed_trades_payload_respects_limit(monkeypatch):
         events.append({"event": "dsl_exit", "coin": "BTC", "ts": i + 100,
                        "leverage": 5, "realized_pnl_pct": 1.0, "realized_spot_pct": 0.2})
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    monkeypatch.setattr(dashboard, "_read_outcome_lines", lambda: [])
     assert len(dashboard._closed_trades_payload(limit=3)) == 3
+
+
+def test_closed_trades_dedup_requires_cross_source_and_side(monkeypatch):
+    """F2: dedup merges ONLY cross-source mirrors of one fill. Same-source rows
+    are distinct trades even within the window; a cross-source pair of OPPOSITE
+    sides (long close vs short close) must never collapse."""
+    from hermes_trader import dashboard
+    now = int(dashboard.time.time() * 1000)
+    events = [
+        # two distinct DSL closes 800ms apart — same source, same coin/side
+        {"event": "dsl_exit", "coin": "SOL", "side": "long", "ts": now,
+         "leverage": 5, "realized_pnl_pct": 1.0, "realized_spot_pct": 0.2},
+        {"event": "dsl_exit", "coin": "SOL", "side": "long", "ts": now + 800,
+         "leverage": 5, "realized_pnl_pct": 0.5, "realized_spot_pct": 0.1},
+        # a manual-close mirror of the FIRST fill (same ts window, same side) → merges
+        {"event": "close_position", "coin": "SOL", "side": "long", "ts": now + 200,
+         "leverage": 5, "ok": True},
+        # an external close on the OPPOSITE side within the window → must stay
+        {"event": "external_close_recorded", "coin": "SOL", "side": "short",
+         "ts": now + 400, "leverage": 5, "spot_pct": -0.3},
+    ]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    monkeypatch.setattr(dashboard, "_read_outcome_lines", lambda: [])
+    rows = dashboard._closed_trades_payload(limit=20)
+    # 2 DSL longs (one absorbs the manual mirror) + 1 external short = 3 rows
+    assert len(rows) == 3
+    sources = sorted(r["source"] for r in rows)
+    assert sources == ["dsl", "dsl", "external"]
 
 
 def test_summary_payload_offline_when_no_heartbeat(monkeypatch):
@@ -2979,6 +3140,50 @@ def test_equity_curve_payload_filters_by_range_and_zero(monkeypatch):
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
     out = dashboard._equity_curve_payload(range_s=3600)  # last hour only
     assert [p["equity"] for p in out] == [240.0]
+
+
+def _hb_equities(now_ms, equities):
+    return [{"event": "loop_heartbeat", "ts": now_ms - (len(equities) - i) * 60_000,
+             "equity": float(eq)} for i, eq in enumerate(equities)]
+
+
+def test_equity_curve_keeps_and_flags_degraded_dip(monkeypatch):
+    """F1: a far-below-median point is FLAGGED, not silently dropped — a genuine
+    flash-crash must stay visible on the curve."""
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    events = _hb_equities(now_ms, [200.0, 200.0, 200.0, 88.0, 205.0])
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    out = dashboard._equity_curve_payload(range_s=3600)
+    # The dip point is retained (no longer dropped)...
+    assert [p["equity"] for p in out] == [200.0, 200.0, 200.0, 88.0, 205.0]
+    flags = [p["flag"] for p in out]
+    assert flags == ["ok", "ok", "ok", "degraded", "ok"]
+
+
+def test_equity_curve_gradual_decline_not_flagged(monkeypatch):
+    """A sustained gradual move (real drawdown/growth) never trips the dip
+    detector — each step stays above the ratio of the trailing median."""
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    events = _hb_equities(now_ms, [100.0, 95.0, 90.0, 85.0, 80.0])
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    out = dashboard._equity_curve_payload(range_s=3600)
+    assert all(p["flag"] == "ok" for p in out)
+
+
+def test_equity_curve_dip_ratio_env_override(monkeypatch):
+    """HERMES-equivalent tuning: lowering the ratio widens what counts as ok."""
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    events = _hb_equities(now_ms, [200.0, 200.0, 120.0])
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    # Default ratio 0.7: 120 < 0.7*200=140 → degraded.
+    monkeypatch.setattr(dashboard, "_EQUITY_DIP_RATIO", 0.7)
+    assert dashboard._equity_curve_payload(3600)[-1]["flag"] == "degraded"
+    # Ratio 0.5: 120 >= 0.5*200=100 → ok.
+    monkeypatch.setattr(dashboard, "_EQUITY_DIP_RATIO", 0.5)
+    assert dashboard._equity_curve_payload(3600)[-1]["flag"] == "ok"
 
 
 def test_positions_snapshot_round_trip(tmp_path, monkeypatch):

@@ -96,6 +96,34 @@ def test_session_log_forks_outcome_events(tmp_path, monkeypatch):
     assert len(sess) == 2
 
 
+def test_operator_action_forks_to_events_feed(tmp_path, monkeypatch):
+    """F22: operator_action (manual close / kill / mode / config via web or
+    terminal) is in the fork whitelist and lands in events.jsonl so the audit
+    trail survives a restart."""
+    assert "operator_action" in event_log._FORKABLE_EVENTS
+
+    sess_file = tmp_path / "session.jsonl"
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(sess_file))
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+
+    session_log.append({
+        "event": "operator_action",
+        "action": "close",
+        "via": "web",
+        "coin": "BTC",
+        "result": {"ok": True, "fill_px": 50000.0, "leverage": 10},
+    })
+
+    events = _read_events(str(ev_file))
+    ops = [e for e in events if e["event"] == "operator_action"]
+    assert len(ops) == 1
+    assert ops[0]["payload"]["action"] == "close"
+    assert ops[0]["payload"]["via"] == "web"
+    assert ops[0]["payload"]["coin"] == "BTC"
+    assert ops[0]["timestamp"].endswith("Z")
+
+
 def test_fork_from_session_schema(tmp_path, monkeypatch):
     ev_file = tmp_path / "events.jsonl"
     monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
@@ -109,3 +137,55 @@ def test_fork_from_session_schema(tmp_path, monkeypatch):
     assert events[0]["trace_id"] == "t1"
     assert events[0]["payload"]["coin"] == "SOL"
     assert events[0]["timestamp"].endswith("Z")
+
+
+def test_risk_gate_block_durably_recorded(tmp_path, monkeypatch):
+    """P1-5: a gate block must write a structured `risk_gate` record to
+    events.jsonl (coin/side/reasons/gates/ctx), not just a debug log line."""
+    from hermes_trader.agents import executor
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+
+    executor._record_risk_gate_block(
+        {"coin": "BTC", "side": "long", "verdict": "LONG",
+         "confidence": 0.72, "composite_score": 55, "trace_id": "tr-1"},
+        {"block_reasons": ["cooldown active", "max concurrent positions"],
+         "results": {
+             "cooldown": {"pass": False, "reason": "cooldown active"},
+             "max_concurrent": {"pass": False,
+                                "reason": "max concurrent positions"},
+             "trend_gate": {"pass": True, "reason": "ok"},
+         }},
+    )
+    events = _read_events(str(ev_file))
+    blocks = [e for e in events if e["event"] == "risk_gate"]
+    assert len(blocks) == 1
+    p = blocks[0]["payload"]
+    assert p["coin"] == "BTC"
+    assert p["side"] == "long"
+    assert blocks[0]["trace_id"] == "tr-1"
+    assert "cooldown active" in p["block_reasons"]
+    # Only the vetoing gates are carried, each mapped to its reason.
+    assert set(p["gates"].keys()) == {"cooldown", "max_concurrent"}
+    assert p["gates"]["cooldown"] == "cooldown active"
+
+
+def test_dashboard_redact_scrubs_secrets():
+    """F17: _redact must mask Authorization/Bearer/api_key fields and a raw
+    key string interpolated into a message, before it reaches a response."""
+    from hermes_trader.dashboard import _redact
+    out = _redact({
+        "Authorization": "Bearer sk-secret-123",
+        "openrouter_api_key": "sk-secret-123",
+        "coin": "BTC",
+        "nested": {"token": "abc", "ok": 1},
+    })
+    assert out["Authorization"] == "<redacted>"
+    assert out["openrouter_api_key"] == "<redacted>"
+    assert out["coin"] == "BTC"
+    assert out["nested"]["token"] == "<redacted>"
+    assert out["nested"]["ok"] == 1
+
+    msg = _redact("request failed: Bearer sk-secret-123 not authorized")
+    assert "sk-secret-123" not in msg
+    assert "Bearer <redacted>" in msg

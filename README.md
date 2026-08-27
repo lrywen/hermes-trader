@@ -135,7 +135,7 @@ Replicates the Hyperfeed MCP plugin's data directly from HL API:
 | `hermes_trader/client/exchange.py` | Order placement, leverage setting, trigger orders (SL/TP) |
 | `hermes_trader/indicators/math.py` | TA indicators: EMA, SMA, ATR, RSI, ADX |
 | `hermes_trader/models/types.py` | Shared data type: `Candle` (OHLCV) |
-| `hermes_trader/server.py` | FastAPI server — 22 REST routes for frontend/dashboard |
+| `hermes_trader/server.py` | FastAPI server — 27 REST routes for frontend/dashboard |
 
 ---
 
@@ -366,7 +366,7 @@ scripts/restart.sh status
 # Follow logs
 tail -f logs/trading_loop.log
 ```
-The API is available at `http://localhost:8000`. Health check: `GET /` returns `{"service": "Hermes-Trader", "version": "0.3.0", "status": "running"}`.
+The API is available at `http://localhost:8000`. Health check: `GET /api/health` returns `{"service": "Hermes-Trader", "version": "0.3.0", "status": "running"}`.
 
 `scripts/restart.sh` manages the autonomous trading loop and the FastAPI server,
 including stop/verify/start and log files under `logs/`. The MCP stdio server is
@@ -386,7 +386,7 @@ The `--env prod --daemon` flags are informational only; they do not fork the
 process. Use `scripts/restart.sh` for normal operation.
 
 **Trading Loop Behavior:**
-- Scans top 60 markets every 60 seconds
+- Scans top 60 markets every 15 seconds
 - Each tick, reconciles DSL trackers with live exchange positions and runs an exit pass — market-closes anything whose dynamic floor, hard stop, or timeout has tripped
 - Runs the TA filter on each trigger — only CONFIRMED signals (or fired momentum bursts) reach AI research
 - Researches qualifying signals with the OpenRouter model configured in `.env.local`
@@ -432,7 +432,7 @@ sample is large enough.
 
 hermes-trader is a standalone Python application; **Hermes Agent operates it through this MCP server** — that is the whole integration boundary. The agent calls the tools below; the trading engine itself has no Hermes-framework dependency.
 
-The MCP server (`scripts/hermes-mcp-server.py`) exposes 100 tools over stdio transport. The 14 primary tools are listed below; the remainder are Hyperliquid data passthroughs (some are placeholders pending SDK wiring).
+The MCP server (`scripts/hermes-mcp-server.py`) exposes 101 tools over stdio transport. The 14 primary tools are listed below; the remainder are Hyperliquid data passthroughs (some are placeholders pending SDK wiring).
 
 | Tool | Description |
 |------|-------------|
@@ -581,7 +581,7 @@ hermes-trader/
 ├── hermes_trader/                  # Pure Python agent
 │   ├── __init__.py
 │   ├── __main__.py                # Entry point
-│   ├── server.py                  # FastAPI server — 22 routes
+│   ├── server.py                  # FastAPI server — 27 routes
 │   ├── agents/                    # Core agent logic
 │   │   ├── config.py              # Agent configuration model
 │   │   ├── config_store.py        # Config persistence
@@ -610,7 +610,7 @@ hermes-trader/
 │   └── models/                    # Shared data types
 │       └── types.py               # Candle (OHLCV)
 ├── scripts/
-│   ├── hermes-mcp-server.py       # MCP server (stdio, 100 tools)
+│   ├── hermes-mcp-server.py       # MCP server (stdio, 101 tools)
 │   └── trading_loop.py            # Continuous trading loop
 ├── skills/hermes-trader-agent/    # Hermes Agent skill
 ├── tests/                         # pytest suite — offline / online / live e2e

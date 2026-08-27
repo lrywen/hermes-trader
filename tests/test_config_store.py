@@ -7,9 +7,10 @@ Validates:
   * Environment-variable type coercion (int/float/bool/list)
   * read_agent_config deep-merge (new keys present even when absent on disk)
   * write_agent_config backup / restore_backup round-trip
-  * The previously-drifted production values (leverage=12, max_daily_loss=-30,
-    daily_giveback_halt_pct=0.35, min_short_volume=50M, counter_regime=0.8,
-    dsl_exit.protect_pct=1.25, etc.) are returned correctly.
+  * The production values that were once at risk of fallback drift
+    (leverage=10, max_daily_loss=-30, daily_giveback_halt_pct=0.35,
+    min_short_volume=50M, counter_regime=0.8, dsl_exit.protect_pct=1.25,
+    etc.) are returned correctly.
 """
 
 import json
@@ -39,7 +40,7 @@ def test_canonical_defaults_contain_all_production_keys():
     """Every key previously at risk of fallback drift must exist with the
     correct production value."""
     expected = {
-        "leverage": 12,
+        "leverage": 10,
         "max_trade_notional_usd": 800,
         "max_concurrent": 10,
         "max_total_notional_pct": 10.0,
@@ -154,7 +155,7 @@ def test_coerce_list():
 
 def test_cfg_get_returns_canonical_default_when_key_absent():
     cfg = {}
-    assert cfg_get("leverage", config=cfg) == 12
+    assert cfg_get("leverage", config=cfg) == 10
     assert cfg_get("dsl_exit.protect_pct", config=cfg) == 1.25
 
 
@@ -217,7 +218,7 @@ def test_cfg_get_production_values_no_drift():
 def test_read_agent_config_returns_canonical_when_file_missing():
     # conftest points HERMES_AGENT_CONFIG_FILE at a temp path that doesn't exist
     result = read_agent_config()
-    assert result["leverage"] == 12
+    assert result["leverage"] == 10
     assert result["dsl_exit"]["protect_pct"] == 1.25
 
 
@@ -246,7 +247,7 @@ def test_read_agent_config_corrupt_file_falls_back(tmp_path, monkeypatch):
     monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
 
     result = read_agent_config()
-    assert result["leverage"] == 12  # canonical fallback
+    assert result["leverage"] == 10  # canonical fallback
 
 
 # ── write / backup / restore ────────────────────────────────────────────────
@@ -304,6 +305,44 @@ def test_restore_backup_returns_false_when_no_backup(tmp_path, monkeypatch):
     monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
     monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
     assert restore_backup() is False
+
+
+def test_restore_snapshot_does_not_self_deadlock(tmp_path, monkeypatch):
+    """restore_snapshot must NOT hold the config flock itself: flock is bound to
+    the open file description, so a second fd in the same process (opened by
+    write_agent_config) blocking on LOCK_EX would self-deadlock forever. The
+    restore runs in a worker thread; a 10s join timeout fails the regression."""
+    import threading
+    from hermes_trader.agents.config_store import restore_snapshot, _snap_path
+
+    cfg_file = tmp_path / ".agent-config.json"
+    monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
+    monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
+    monkeypatch.setattr(config_store, "_SNAP_PREFIX", str(cfg_file) + ".snap.")
+    monkeypatch.setattr(config_store, "_SNAP_SUFFIX", ".json")
+
+    ts = 1700000123
+    # Original config → snapshot file; then a divergent live config.
+    write_agent_config({"mode": "ORIGINAL", "leverage": 7}, backup=False)
+    snap_path = _snap_path(ts)
+    with open(snap_path, "w") as f:
+        json.dump(read_agent_config(), f)
+    write_agent_config({"mode": "CHANGED", "leverage": 99}, backup=False)
+    assert read_agent_config()["mode"] == "CHANGED"
+
+    result = {}
+    def _worker():
+        result["ok"] = restore_snapshot(ts)
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+    t.join(timeout=10)
+    assert not t.is_alive(), "restore_snapshot self-deadlocked on the config flock"
+    assert result.get("ok") is True
+    restored = read_agent_config()
+    assert restored["mode"] == "ORIGINAL"
+    assert restored["leverage"] == 7
 
 
 # ── _env_override key mapping ───────────────────────────────────────────────

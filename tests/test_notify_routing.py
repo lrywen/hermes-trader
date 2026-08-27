@@ -323,3 +323,21 @@ def test_dispatch_killswitch_uses_risk_category():
     with mock.patch.object(notify_dispatch.notify, "send_card") as m:
         notify_dispatch.dispatch(record)
     assert m.call_args.kwargs["category"] == "risk"
+
+
+def test_dispatch_killswitch_none_fields_does_not_raise():
+    """P1-17: a killswitch record with None numerics must not crash card
+    rendering (the f-string fields). Previously the TypeError was swallowed at
+    debug level and the high-severity alert silently vanished. None renders as
+    $0 and the card still goes out under the risk category."""
+    record = {"event": "hard_killswitch", "daily_pnl": None,
+              "limit": None, "flattened": None}
+    with mock.patch.object(notify_dispatch.notify, "send_card") as m:
+        # Must not raise.
+        notify_dispatch.dispatch(record)
+    m.assert_called_once()
+    assert m.call_args.kwargs["category"] == "risk"
+    fields = m.call_args.kwargs.get("fields") or {}
+    # None coerced to 0 in the money f-strings.
+    assert "$0.00" in fields.get("当日盈亏", "")
+    assert "$0" in fields.get("亏损上限", "")

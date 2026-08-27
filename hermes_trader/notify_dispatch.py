@@ -59,9 +59,18 @@ def dispatch(record: Dict[str, Any]) -> None:
             notify.send_card("交易循环已停止（用户手动停止）",
                              category="system", level="warn")
         # scan / ta_skip / near_miss / loop_heartbeat: deliberately ignored.
-    except Exception as e:  # never let notification break the caller
-        logger.debug("notify_dispatch failed for %s: %r",
-                     record.get("event"), e)
+    except Exception:  # never let notification break the caller
+        # P1-17: this was logged at debug, so a malformed record (None where a
+        # float f-string expected) silently swallowed high-severity alerts
+        # (e.g. hard killswitch). Surface it and count it for /metrics.
+        logger.exception("notify_dispatch failed for event=%r record=%r",
+                         record.get("event"), record)
+        try:
+            from hermes_trader import metrics
+
+            metrics.NOTIFY_DISPATCH_ERRORS.inc()
+        except Exception:  # noqa: BLE001 — metrics must never mask the original
+            pass
 
 
 def _on_execute(r: Dict[str, Any]) -> None:
@@ -123,9 +132,14 @@ def _on_dsl_exit(r: Dict[str, Any]) -> None:
 
 
 def _on_killswitch(r: Dict[str, Any]) -> None:
+    # None-safe: a malformed killswitch record (daily_pnl/limit missing) must
+    # not raise and get swallowed — that would drop the single most important
+    # alert. Missing numerics render as $0.
+    pnl = r.get("daily_pnl")
+    limit = r.get("limit")
     fields = {
-        "当日盈亏": f"${r.get('daily_pnl'):.2f}",
-        "亏损上限": f"${r.get('limit'):.0f}",
+        "当日盈亏": f"${(pnl or 0):.2f}",
+        "亏损上限": f"${(limit or 0):.0f}",
         "强平仓位": r.get("flattened"),
     }
     notify.send_card("硬日亏熔断触发 — 已全仓平仓",

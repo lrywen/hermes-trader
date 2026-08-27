@@ -292,3 +292,32 @@ def get_market_by_coin(coin: str) -> Optional[Dict[str, Any]]:
         if m["coin"] == coin:
             return m
     return None
+
+
+def get_day_ntl_vlm(coin: str) -> float:
+    """24h notional volume for a single coin via O(1) cache lookup.
+
+    For native perps the disk-cached `asset_ctx_dict` is keyed by coin name, so
+    we can read the volume without materializing/sorting the whole universe
+    list (the executor calls this once per candidate in the hot path). HIP-3
+    markets are namespaced `<dex>:<symbol>` while their ctx dict is keyed by
+    bare symbol, so those fall back to the (already-cached) linear scan.
+    Returns 0.0 when the coin/volume is unavailable.
+    """
+    try:
+        if ":" not in coin:
+            _, perp_ctx = _fetch_perp_meta()
+            ctx = perp_ctx.get(coin)
+            if ctx:
+                vol = float(ctx.get("dayNtlVlm", 0) or 0)
+                if vol > 0:
+                    return vol
+        for m in get_universe(include_hip3=(":" in coin)):
+            if m.get("coin") == coin:
+                vol = float(m.get("dayNtlVlm", 0) or 0)
+                if vol > 0:
+                    return vol
+                break
+    except Exception:
+        pass
+    return 0.0

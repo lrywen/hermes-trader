@@ -87,7 +87,8 @@ def structured_to_analysis_fields(
     derivation, ATR fallback) so downstream consumers (risk_gates, executor)
     see an identical shape regardless of which path produced the verdict.
     """
-    from .research import _coerce_px  # local import avoids cycle at import time
+    # local import avoids cycle at import time
+    from .research import _atr_bracket, _coerce_px
 
     verdict = str(sv.get("verdict", "PASS")).upper()
     if verdict not in ("LONG", "SHORT", "PASS"):
@@ -129,9 +130,9 @@ def structured_to_analysis_fields(
         if stop_pct and stop_pct > 0:
             stop_px = entry_ref * (1 - stop_pct) if is_long else entry_ref * (1 + stop_pct)
         elif _coerce_px(atr_abs) > 0:
-            atr = _coerce_px(atr_abs)
-            stop_px = (entry_ref - atr * sl_atr_mult) if is_long else (entry_ref + atr * sl_atr_mult)
-            tp_px = (entry_ref + atr * tp_atr_mult) if is_long else (entry_ref - atr * tp_atr_mult)
+            # P2-1: single ATR bracket formula shared with parse_verdict.
+            stop_px, tp_px = _atr_bracket(entry_ref, _coerce_px(atr_abs),
+                                          is_long, sl_atr_mult, tp_atr_mult)
         stop_px = max(0.0, stop_px)
         tp_px = max(0.0, tp_px)
 

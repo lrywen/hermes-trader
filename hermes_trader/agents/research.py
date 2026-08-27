@@ -2,25 +2,33 @@
 
 from __future__ import annotations
 
-import asyncio
+import hashlib
 import json
 import logging
 import math
 import os
 import re
 import sys
-import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
+
+import asyncio
+import threading
 
 import httpx
-import yaml
 
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.market_regime import _obv_slope_sign
+from hermes_trader.agents.research_schema import (
+    ResearchVerdict,
+    parse_structured,
+    structured_to_analysis_fields,
+)
 from hermes_trader.agents.memory import memory
+from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.agents.system_prompt import build_system_prompt
 from hermes_trader.client.hl_client import (
     fetch_account_state,
@@ -30,6 +38,50 @@ from hermes_trader.client.hl_client import (
 )
 from hermes_trader.indicators.math import adx, atr, candle_val, ema, rsi
 from hermes_trader.models.types import Candle
+from hermes_trader.shared_config import load_shared_config
+
+# ── P1-1: one shared thread pool for all research fan-outs ──────────────
+# Previously the 6-worker data-fetch pool created a nested 3-worker pool
+# inside _signals_block (6 coins × 4 tasks = up to 24 concurrent HTTP calls),
+# and every debate/synth block spun up its own short-lived pool — thread
+# churn + burst concurrency that tripped OpenRouter/Binance/CBOE rate limits.
+# All sites now submit here; the pool bounds total research concurrency.
+_POOL: Optional[ThreadPoolExecutor] = None
+_POOL_WORKERS = int(os.environ.get("HERMES_RESEARCH_POOL_WORKERS", "16"))
+
+
+def _get_pool() -> ThreadPoolExecutor:
+    global _POOL
+    if _POOL is None:
+        _POOL = ThreadPoolExecutor(
+            max_workers=_POOL_WORKERS,
+            thread_name_prefix="research",
+        )
+    return _POOL
+
+
+# ── P1-9: one reused HTTP client for all outbound LLM/news calls ────────
+# httpx.get/httpx.post build a fresh Client (new TCP+TLS handshake, no
+# connection reuse, no HTTP/2) on every call. A module-level Client keeps a
+# warm keepalive pool and negotiates HTTP/2. Lazy: httpx is imported at
+# module top already, but constructing the client lazily avoids opening
+# sockets at import time (tests / offline tooling).
+_HTTP: Optional[httpx.Client] = None
+_HTTP_LOCK = threading.Lock()
+
+
+def _http() -> httpx.Client:
+    global _HTTP
+    if _HTTP is None or _HTTP.is_closed:
+        with _HTTP_LOCK:
+            if _HTTP is None or _HTTP.is_closed:
+                _HTTP = httpx.Client(
+                    http2=True,
+                    limits=httpx.Limits(max_keepalive_connections=8,
+                                        max_connections=16),
+                )
+    return _HTTP
+
 
 # ── Shared infrastructure (cross-component single source of truth) ──────
 _SHARED_DIR = os.path.expanduser("~/.hermes-trading")
@@ -54,168 +106,86 @@ except Exception:  # pragma: no cover - shared dir optional
     _SHARED_OK = False
 
 # ── Shared config (跨组件单一配置源) ────────────────────────────────
-_SHARED_CONFIG_PATH = os.path.expanduser("~/.hermes-trading/config.yaml")
-
-# Shared httpx client with connection pooling for LLM calls.
-_LLM_CLIENT_LOCK = threading.Lock()
-_LLM_CLIENT: Optional[httpx.AsyncClient] = None
-_LLM_CLIENT_REFCNT = 0
-
-
-def _get_llm_client() -> httpx.AsyncClient:
-    """Get or create the shared LLM HTTP client with connection pooling."""
-    global _LLM_CLIENT, _LLM_CLIENT_REFCNT
-    with _LLM_CLIENT_LOCK:
-        if _LLM_CLIENT is None:
-            _LLM_CLIENT = httpx.AsyncClient(
-                timeout=httpx.Timeout(120.0),
-                limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
-            )
-        _LLM_CLIENT_REFCNT += 1
-        return _LLM_CLIENT
-
-
-def _release_llm_client() -> None:
-    """Release a reference to the shared LLM client; close when last ref drops."""
-    global _LLM_CLIENT, _LLM_CLIENT_REFCNT
-    with _LLM_CLIENT_LOCK:
-        _LLM_CLIENT_REFCNT -= 1
-        if _LLM_CLIENT_REFCNT <= 0 and _LLM_CLIENT is not None:
-            try:
-                import asyncio
-                loop = asyncio.new_event_loop()
-                loop.run_until_complete(_LLM_CLIENT.aclose())
-                loop.close()
-            except Exception:
-                pass
-            _LLM_CLIENT = None
-            _LLM_CLIENT_REFCNT = 0
-
-
-def _load_shared_config() -> dict:
-    """Load the cross-component shared config from ~/.hermes-trading/config.yaml.
-    Returns an empty dict if the file doesn't exist or can't be parsed.
-    """
-    try:
-        with open(_SHARED_CONFIG_PATH) as f:
-            return yaml.safe_load(f) or {}
-    except Exception:
-        return {}
-
-
-def _call_hta_service(
-    ticker: str,
-    analysis_date: str,
-    system_prompt: str,
-    user_message: str,
-    *,
-    trace_id: str = "",
-) -> Optional[str]:
-    """Call the HTA FastAPI resident service for multi-agent analysis (B1/B5).
-
-    Reads the HTA service URL from the shared config, with fallback to 8766.
-    Returns the HTA analysis text, or None if the service is unavailable.
-    Successful responses are routed through the Signal Bus for validation,
-    audit logging (events.jsonl), and circuit-breaker bookkeeping.
-    """
-    cfg = _load_shared_config()
-    hta_cfg = cfg.get("hta_service", {})
-    if not hta_cfg.get("enabled", True):
-        return None
-
-    url = hta_cfg.get("url") or os.environ.get("HTA_SERVICE_URL", "http://localhost:8766")
-    try:
-        resp = httpx.post(
-            f"{url}/research/short",
-            json={
-                "ticker": ticker,
-                "date": analysis_date,
-                "asset_type": "crypto",
-                # Ship the prompt pair: without it HTA falls back to its own
-                # 2-sentence prose prompt and the verdict/confidence JSON we
-                # parse downstream never appears, collapsing every analysis
-                # onto the NLP keyword fallback.
-                "system_prompt": system_prompt,
-                "user_message": user_message,
-            },
-            timeout=float(os.environ.get("HTA_TIMEOUT", "60")),
-        )
-        if resp.is_success:
-            data = resp.json()
-            decision = data.get("decision", "")
-            if decision:
-                logger.info(f"[research] HTA analysis OK for {ticker} ({len(decision)} chars)")
-                # Feed the signal bus for schema validation + audit log.
-                # The bus only records a signal when the decision parses cleanly
-                # into BUY/SELL/HOLD; raw text flows through regardless.
-                if get_bus is not None and Signal is not None:
-                    try:
-                        parsed_verdict = _infer_verdict_from_text(decision)
-                        raw_conf = _infer_confidence_from_text(decision)
-                        bus = get_bus()
-                        bus.ingest(
-                            {
-                                "ticker": ticker,
-                                "as_of_date": analysis_date,
-                                "asset_type": "crypto",
-                                "verdict": parsed_verdict,
-                                "confidence": raw_conf,
-                                "reasoning": decision[:500],
-                                "trace_id": trace_id,
-                                "source": "hta",
-                            },
-                            source="hta",
-                            trace_id=trace_id,
-                        )
-                    except Exception as e:  # pragma: no cover - bus is advisory
-                        logger.debug(f"[research] signal_bus ingest skipped: {e}")
-                return decision
-        logger.warning(f"[research] HTA service returned {resp.status_code} for {ticker}")
-        if get_bus is not None:
-            try:
-                get_bus().report_failure(f"http {resp.status_code}")
-            except Exception:
-                pass
-    except Exception as e:
-        logger.warning(f"[research] HTA service unavailable for {ticker}: {e}")
-        if get_bus is not None:
-            try:
-                get_bus().report_failure(str(e))
-            except Exception:
-                pass
-
-    return None
-
-
-def _infer_verdict_from_text(text: str) -> str:
-    """Best-effort verdict extraction used for audit logging only."""
-    if not text:
-        return "HOLD"
-    upper = text.upper()
-    # Prefer an explicit JSON verdict if present.
-    m = re.search(r'"verdict"\s*:\s*"(LONG|SHORT|CLOSE|PASS|BUY|SELL|HOLD)"', upper)
-    if m:
-        v = m.group(1)
-        return {"LONG": "BUY", "SHORT": "SELL", "PASS": "HOLD"}.get(v, v)
-    if "BUY" in upper or "LONG" in upper:
-        return "BUY"
-    if "SELL" in upper or "SHORT" in upper:
-        return "SELL"
-    return "HOLD"
-
-
-def _infer_confidence_from_text(text: str) -> float:
-    if not text:
-        return 0.0
-    m = re.search(r'"confidence"\s*:\s*([0-9]*\.?[0-9]+)', text)
-    if m:
-        try:
-            return max(0.0, min(1.0, float(m.group(1))))
-        except ValueError:
-            return 0.0
-    return 0.0
+# Canonical loader lives in hermes_trader.shared_config; kept as a thin
+# private alias so the module's existing call sites don't all change.
+_load_shared_config = load_shared_config
 
 logger = logging.getLogger(__name__)
+
+
+# P3-2: research-path LLM circuit breaker. Without it, a dead OpenRouter
+# upstream means every coin on every scan tick pays a full 60s timeout across
+# every research/debate/HTA call — an avalanche that stalls the loop. After N
+# consecutive hard failures the breaker opens for M seconds and
+# _call_openrouter short-circuits to "" (every caller already degrades
+# gracefully on empty). Mirrors the dashboard chat breaker (F15) but reads its
+# thresholds from canonical config (llm_circuit_breaker.fail_threshold /
+# cooldown_s) with the same env-style fallback the rest of research.py uses.
+_LLM_CB_FAILURES = 0
+_LLM_CB_OPEN_UNTIL = 0.0
+_LLM_CB_LOCK = threading.Lock()
+_LLM_CB_FAIL_THRESHOLD_FALLBACK = 3
+_LLM_CB_COOLDOWN_S_FALLBACK = 300.0
+
+
+def _llm_cb_settings() -> tuple[int, float]:
+    try:
+        threshold = int(cfg_get("llm_circuit_breaker.fail_threshold",
+                                _LLM_CB_FAIL_THRESHOLD_FALLBACK))
+    except (TypeError, ValueError):
+        threshold = _LLM_CB_FAIL_THRESHOLD_FALLBACK
+    try:
+        cooldown = float(cfg_get("llm_circuit_breaker.cooldown_s",
+                                 _LLM_CB_COOLDOWN_S_FALLBACK))
+    except (TypeError, ValueError):
+        cooldown = _LLM_CB_COOLDOWN_S_FALLBACK
+    if threshold <= 0:
+        threshold = _LLM_CB_FAIL_THRESHOLD_FALLBACK
+    if cooldown <= 0:
+        cooldown = _LLM_CB_COOLDOWN_S_FALLBACK
+    return threshold, cooldown
+
+
+def _llm_circuit_open() -> bool:
+    return time.time() < _LLM_CB_OPEN_UNTIL
+
+
+def _llm_record_success() -> None:
+    global _LLM_CB_FAILURES
+    with _LLM_CB_LOCK:
+        _LLM_CB_FAILURES = 0
+    try:
+        from hermes_trader import metrics
+
+        if not _llm_circuit_open():
+            metrics.LLM_CIRCUIT_STATE.set(0.0)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _llm_record_failure() -> None:
+    global _LLM_CB_FAILURES, _LLM_CB_OPEN_UNTIL
+    threshold, cooldown = _llm_cb_settings()
+    tripped = False
+    with _LLM_CB_LOCK:
+        _LLM_CB_FAILURES += 1
+        if _LLM_CB_FAILURES >= threshold:
+            _LLM_CB_OPEN_UNTIL = time.time() + cooldown
+            _LLM_CB_FAILURES = 0
+            tripped = True
+            logger.warning(
+                "[research] LLM circuit OPEN for %.0fs after %d consecutive failures",
+                cooldown, threshold,
+            )
+    if tripped:
+        # P3-1: count trips and flip the state gauge outside the lock.
+        try:
+            from hermes_trader import metrics
+
+            metrics.LLM_CIRCUIT_TRIPS.inc()
+            metrics.LLM_CIRCUIT_STATE.set(1.0)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _compute_indicators(candles: List[Candle]) -> Dict[str, Any]:
@@ -265,7 +235,15 @@ def _compute_indicators(candles: List[Candle]) -> Dict[str, Any]:
 
 def _fetch_funding_rate(coin: str) -> str:
     """Latest hourly funding rate for a coin, or 'N/A' if unavailable."""
-    start_time = int(time.time() * 1000) - 86_400_000
+    # P2-3: lookback window is config-driven (funding_lookback_hours,
+    # default 24h); fetch_funding_history walks back from start_time.
+    try:
+        lookback_h = int(cfg_get("funding_lookback_hours", 24))
+        if lookback_h <= 0:
+            lookback_h = 24
+    except (TypeError, ValueError):
+        lookback_h = 24
+    start_time = int(time.time() * 1000) - lookback_h * 3_600_000
     history = fetch_funding_history(coin, start_time)
     if history:
         rate = float(history[-1].get("fundingRate", "0"))
@@ -280,6 +258,13 @@ def _fetch_funding_rate(coin: str) -> str:
 # stale headlines are noise — both to the gate and to the LLM prompt.
 NEWS_FRESHNESS_DAYS = 2
 
+# Short-TTL news cache: Brave headlines don't change second-to-second, and a
+# 2-min cache avoids duplicate API calls when research fires for multiple coins
+# in quick succession (e.g. a 3-trigger scan cycle).
+_NEWS_CACHE: Dict[str, tuple] = {}
+_NEWS_CACHE_TTL_S = 120
+_NEWS_CACHE_LOCK = threading.Lock()
+
 
 def _fetch_news(coin: str) -> str:
     """Recent (last NEWS_FRESHNESS_DAYS) news headlines for a coin via the
@@ -289,6 +274,14 @@ def _fetch_news(coin: str) -> str:
     BRAVE_API_KEY is set or the request fails — news is a supplementary
     signal, so a fetch failure degrades gracefully and never blocks research.
     """
+    # Cache check
+    with _NEWS_CACHE_LOCK:
+        cached = _NEWS_CACHE.get(coin)
+        if cached is not None:
+            _ts, _val = cached
+            if time.monotonic() - _ts < _NEWS_CACHE_TTL_S:
+                return _val
+
     key = os.environ.get("BRAVE_API_KEY", "")
     if not key:
         return "no news"
@@ -299,7 +292,7 @@ def _fetch_news(coin: str) -> str:
     start = today - timedelta(days=NEWS_FRESHNESS_DAYS)
     freshness = f"{start.isoformat()}to{today.isoformat()}"
     try:
-        resp = httpx.get(
+        resp = _http().get(
             "https://api.search.brave.com/res/v1/news/search",
             params={"q": f"{coin} crypto", "count": 5, "freshness": freshness},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
@@ -309,7 +302,12 @@ def _fetch_news(coin: str) -> str:
             return "no news"
         results = resp.json().get("results", []) or []
         headlines = [str(r.get("title", "")).strip() for r in results if r.get("title")]
-        return " | ".join(headlines[:5]) if headlines else "no news"
+        _news = " | ".join(headlines[:5]) if headlines else "no news"
+        # Cache the result (including "no news") so repeated coins in a scan
+        # cycle don't each hit the Brave API.
+        with _NEWS_CACHE_LOCK:
+            _NEWS_CACHE[coin] = (time.monotonic(), _news)
+        return _news
     except Exception:
         return "no news"
 
@@ -349,15 +347,19 @@ def _signals_block(coin: str) -> str:
             return catalyst_scan(base, timespan="1h")
 
         # All sources are independent (different APIs, separate caches).
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_gex = pool.submit(_fetch_gex)
-            f_sv = pool.submit(_fetch_short_vol)
-            f_whale = pool.submit(_fetch_whale)
-            f_cat = pool.submit(_fetch_catalyst)
-            g = f_gex.result()
-            sv = f_sv.result()
-            w = f_whale.result()
-            n = f_cat.result()
+        # P1-1: submit to the shared pool (no nested-pool burst). Each source
+        # has its own internal timeout; give the futures a bound too so a hung
+        # source can't wedge this block forever.
+        _sig_timeout = float(os.environ.get("HERMES_RESEARCH_SIGNALS_TIMEOUT_S", "40"))
+        pool = _get_pool()
+        f_gex = pool.submit(_fetch_gex)
+        f_sv = pool.submit(_fetch_short_vol)
+        f_whale = pool.submit(_fetch_whale)
+        f_cat = pool.submit(_fetch_catalyst)
+        g = f_gex.result(timeout=_sig_timeout)
+        sv = f_sv.result(timeout=_sig_timeout)
+        w = f_whale.result(timeout=_sig_timeout)
+        n = f_cat.result(timeout=_sig_timeout)
 
         if g:
             lines.append(
@@ -547,7 +549,7 @@ def _build_user_message(
         "",
         f"Mode: {mode} — {'your verdict will execute against real funds' if mode == 'LIVE' else 'analysis only, no execution'}",
         "",
-        'Respond with 3-5 bullet points of reasoning, then output your decision as VALID JSON on the very last line:',
+        'Respond with 2-3 bullet points of reasoning, then output your decision as VALID JSON on the very last line:',
         '{"verdict":"PASS"|"LONG"|"SHORT"|"CLOSE","confidence":0.0-1.0,"side":"long"|"short"|"null","entryPx":number,"stopPx":number,"tpPx":number,"reasoning":"brief"}',
         # stopPx is not decoration: equal-risk sizing divides by the stop
         # distance and the SL bracket order needs a price. A zero stop silently
@@ -561,48 +563,50 @@ def _build_user_message(
 
 
 def _call_ai(system_prompt: str, user_message: str, *, trace_id: str = "") -> str:
-    """Call the AI for analysis — tries HTA resident service first (B1/B5),
-    falls back to direct OpenRouter call.
+    """Call the AI for analysis via the in-process OpenRouter path.
 
-    When HTA is enabled in the shared config, the request is routed to the
-    HTA FastAPI multi-agent pipeline for a deeper multi-analyst debate.
-    If HTA is unavailable or disabled, the existing OpenRouter path is used.
-    A ``DEGRADED`` marker is appended when falling back so downstream
-    telemetry can distinguish the two paths.
+    Uses the native in-process multi-perspective debate (``_debate_research``,
+    enabled via ``debate_research.enabled``) when available; otherwise goes
+    straight to the OpenAI-compatible gateway.
     """
-    # Try HTA resident service first (B1/B5)
-    cfg = _load_shared_config()
-    hta_cfg = cfg.get("hta_service", {})
-    if hta_cfg.get("enabled", True):
-        # Extract ticker from user_message (first line after "Candidate:")
-        ticker = ""
-        for line in user_message.split("\n"):
-            if line.startswith("Candidate:"):
-                ticker = line.split("Candidate:")[-1].strip().split(" ")[0]
-                break
-        if ticker:
-            analysis_date = today_utc_str()
-            hta_result = _call_hta_service(
-                ticker, analysis_date, system_prompt, user_message, trace_id=trace_id
-            )
-            if hta_result:
-                return hta_result
-            logger.info(
-                f"[research] HTA unavailable for {ticker}, falling back to OpenRouter "
-                f"(trace_id={trace_id})"
-            )
-            degraded_marker = "\n[DEGRADED: legacy_openrouter]\n"
-        else:
-            degraded_marker = ""
-    else:
-        degraded_marker = "\n[DEGRADED: hta_disabled]\n"
-
-    # Fallback: direct OpenRouter call
+    t0 = time.time()
     result = _call_openrouter(system_prompt, user_message)
-    return result + degraded_marker if (degraded_marker and result) else result
+    elapsed_ms = int((time.time() - t0) * 1000)
+    if result:
+        logger.info(
+            f"[research] OpenRouter-OK | elapsed_ms={elapsed_ms} chars={len(result)} "
+            f"trace_id={trace_id}"
+        )
+    else:
+        logger.error(
+            f"[research] OpenRouter-EMPTY | elapsed_ms={elapsed_ms} trace_id={trace_id}"
+        )
+    return result
 
 
-def _call_openrouter(system_prompt: str, user_message: str) -> str:
+def _llm_metric_outcome(path: str, outcome: str, started: float) -> None:
+    """P3-1: record one LLM request outcome + duration. Best-effort only —
+    a metrics failure must never affect the LLM hot path."""
+    try:
+        from hermes_trader import metrics
+
+        metrics.LLM_REQUESTS.labels(path=path, outcome=outcome).inc()
+        metrics.LLM_REQUEST_DURATION.labels(path=path, outcome=outcome).observe(
+            max(0.0, time.time() - started)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _call_openrouter(
+    system_prompt: str,
+    user_message: str,
+    *,
+    response_format: Optional[dict] = None,
+    timeout: float = 60.0,
+    max_tokens: int = 500,
+    path: str = "call_ai",
+) -> str:
     """Call the LLM API via OpenAI-compatible endpoint (synchronous httpx).
 
     Supports OpenRouter, Volcengine Ark, or any OpenAI-compatible gateway via:
@@ -610,61 +614,210 @@ def _call_openrouter(system_prompt: str, user_message: str) -> str:
       OPENROUTER_MODEL    — model name (default: deepseek-v4-flash)
       OPENROUTER_BASE_URL — base URL without /chat/completions
                             (default: https://openrouter.ai/api/v1)
+
+    ``path`` is a bounded P3-1 metrics label identifying the caller
+    (call_ai/debate_direct); it never carries a coin or free text.
     """
+    _t_started = time.time()
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     model = os.environ.get("OPENROUTER_MODEL", "deepseek-v4-flash")
     base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
 
     if not openrouter_key:
         logger.warning("[research] OPENROUTER_API_KEY not set — returning empty response")
+        _llm_metric_outcome(path, "no_key", _t_started)
         return ""
+
+    # P3-2: breaker open — don't even attempt the call; return "" and let the
+    # caller degrade (the whole research path already handles empty).
+    if _llm_circuit_open():
+        logger.warning("[research] LLM circuit OPEN — short-circuiting call to openrouter")
+        _llm_metric_outcome(path, "circuit_open", _t_started)
+        return ""
+
+    # P3-1: reflect the breaker state on every real attempt.
+    try:
+        from hermes_trader import metrics
+
+        metrics.LLM_CIRCUIT_STATE.set(0.0)
+    except Exception:  # noqa: BLE001
+        pass
 
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {openrouter_key}"}
 
-    def _post(max_toks: int):
-        return httpx.post(
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_message},
+        ],
+        "stream": False,
+        "max_tokens": max_tokens,
+        "temperature": 0.1,
+    }
+    if response_format:
+        # Only attached when the caller opts in (debate synthesis). Models that
+        # don't support it may 400; the callers catch/return "" and fall back.
+        payload["response_format"] = response_format
+
+    # P2-5: rate-limit retry budget. 429s (and the occasional 5xx) are retried
+    # with exponential backoff, honouring the provider Retry-After header when
+    # it is present; cap the sleep so a hostile header can't wedge the loop.
+    _MAX_429_RETRIES = 2
+    _BACKOFF_BASE_S = 1.0
+    _BACKOFF_CAP_S = 15.0
+    # P2-5: when finish_reason == "length" the JSON was cut mid-object; up to
+    # this many continuation turns are appended to complete it.
+    _MAX_LENGTH_CONTINUATIONS = 2
+
+    def _post(msgs: List[Dict[str, str]], max_toks: int):
+        body = dict(payload)
+        body["messages"] = msgs
+        body["max_tokens"] = max_toks
+        # Give the read (response body) phase the full timeout; connect/pool
+        # phases are fast but LLM inference can take several seconds, so a
+        # blanket timeout kills otherwise-successful slow reads.
+        return _http().post(
             url,
-            json={
-                "model": model,
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "stream": False,
-                "max_tokens": max_toks,
-                "temperature": 0.1,
-            },
+            json=body,
             headers=headers,
-            timeout=120.0,
+            timeout=httpx.Timeout(timeout, connect=5.0),
         )
 
+    def _retry_after_s(resp, attempt: int) -> float:
+        """Provider Retry-After (seconds), else exponential backoff, capped."""
+        try:
+            ra = (resp.headers.get("retry-after") or "").strip()
+            if ra:
+                return max(0.0, min(_BACKOFF_CAP_S, float(ra)))
+        except (TypeError, ValueError):
+            pass
+        return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+
+    def _send(msgs: List[Dict[str, str]], max_toks: int):
+        """POST with 429/5xx backoff. Returns the final response (any status)."""
+        resp = None
+        for attempt in range(_MAX_429_RETRIES + 1):
+            try:
+                resp = _post(msgs, max_toks)
+            except Exception as e:
+                # Network/timeout error: back off and retry like a 429 while
+                # the budget lasts, else surface as a failure response.
+                if attempt >= _MAX_429_RETRIES:
+                    raise
+                wait = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+                logger.warning(
+                    f"[research] LLM call EXCEPTION ({type(e).__name__}) — "
+                    f"retry {attempt + 1}/{_MAX_429_RETRIES} in {wait:.1f}s"
+                )
+                try:
+                    from hermes_trader import metrics
+
+                    metrics.LLM_RETRIES.labels(cause="network").inc()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(wait)
+                continue
+            if resp.status_code in (429, 502, 503) and attempt < _MAX_429_RETRIES:
+                wait = _retry_after_s(resp, attempt)
+                logger.warning(
+                    f"[research] HTTP {resp.status_code} rate-limit/unavailable — "
+                    f"retry {attempt + 1}/{_MAX_429_RETRIES} in {wait:.1f}s"
+                )
+                try:
+                    from hermes_trader import metrics
+
+                    metrics.LLM_RETRIES.labels(cause="rate_limit").inc()
+                except Exception:  # noqa: BLE001
+                    pass
+                time.sleep(wait)
+                continue
+            return resp
+        return resp  # pragma: no cover - loop always returns
+
+    messages: List[Dict[str, str]] = list(payload["messages"])
     try:
-        resp = _post(2048)
+        resp = _send(messages, max_tokens)
         if resp.status_code == 402:
             m = re.search(r"can only afford (\d+)", resp.text or "")
-            if m and int(m.group(1)) >= 500:
-                budget = int(m.group(1)) - 50
+            if m and int(m.group(1)) >= 300:
+                budget = max(300, int(m.group(1)) - 50)
                 logger.warning(
                     f"[research] 402 with affordability hint — retrying DEGRADED "
                     f"at max_tokens={budget}"
                 )
-                resp = _post(budget)
+                resp = _send(messages, budget)
 
-        if resp.is_success:
-            data = resp.json()
-            choices = data.get("choices", [])
-            if choices:
-                return choices[0].get("message", {}).get("content", "")
-            logger.error("[research] LLM returned 200 but no choices — empty response")
+        if not resp.is_success:
+            body = resp.text[:200] if resp.text else ""
+            logger.error(
+                f"[research] LLM call FAILED: HTTP {resp.status_code} — {body}"
+            )
+            _llm_record_failure()  # P3-2
+            _llm_metric_outcome(path, "error", _t_started)
             return ""
-        body = resp.text[:200] if resp.text else ""
-        logger.error(
-            f"[research] LLM call FAILED: HTTP {resp.status_code} — {body}"
-        )
-        return ""
+
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            logger.error("[research] LLM returned 200 but no choices — empty response")
+            _llm_record_failure()  # P3-2
+            _llm_metric_outcome(path, "empty", _t_started)
+            return ""
+        choice = choices[0]
+        content = choice.get("message", {}).get("content", "") or ""
+        finish_reason = choice.get("finish_reason") or ""
+
+        # P2-5: truncated output (finish_reason=length). Ask the model to keep
+        # going from where it stopped and concatenate the raw chunks, so a JSON
+        # object cut mid-stream is reassembled into something parse_structured
+        # can recover. Chat turn order: assistant chunk, then "continue".
+        if finish_reason == "length" and content.strip():
+            for cont_i in range(_MAX_LENGTH_CONTINUATIONS):
+                logger.warning(
+                    f"[research] finish_reason=length — continuation "
+                    f"{cont_i + 1}/{_MAX_LENGTH_CONTINUATIONS} "
+                    f"(partial_chars={len(content)})"
+                )
+                try:
+                    from hermes_trader import metrics
+
+                    metrics.LLM_RETRIES.labels(cause="continuation").inc()
+                except Exception:  # noqa: BLE001
+                    pass
+                cont_messages = messages + [
+                    {"role": "assistant", "content": content},
+                    {"role": "user", "content": (
+                        "Your previous response was cut off at the token limit. "
+                        "Continue EXACTLY where it stopped, without repeating "
+                        "anything, without rewrites or preamble. Output only the "
+                        "remaining part."
+                    )},
+                ]
+                cont_resp = _send(cont_messages, max_tokens)
+                if not cont_resp.is_success:
+                    logger.error(
+                        f"[research] continuation FAILED: HTTP "
+                        f"{cont_resp.status_code} — returning partial content"
+                    )
+                    break
+                cont_data = cont_resp.json()
+                cont_choices = cont_data.get("choices", [])
+                if not cont_choices:
+                    break
+                cont_choice = cont_choices[0]
+                chunk = cont_choice.get("message", {}).get("content", "") or ""
+                content += chunk
+                if (cont_choice.get("finish_reason") or "") != "length":
+                    break
+        _llm_record_success()  # P3-2: usable content closes any failure streak
+        _llm_metric_outcome(path, "ok", _t_started)
+        return content
     except Exception as e:
         logger.error(f"[research] LLM call EXCEPTION: {e}")
+        _llm_record_failure()  # P3-2
+        _llm_metric_outcome(path, "error", _t_started)
         return ""
 
 
@@ -737,39 +890,40 @@ def _coerce_px(value: Any) -> float:
     return px
 
 
-def parse_verdict(
-    ai_text: str,
-    coin: str,
-    perception: Dict[str, Any],
-    atr_abs: Optional[float] = None,
-    sl_atr_mult: float = 1.2,
-    tp_atr_mult: float = 1.0,
-) -> Dict[str, Any]:
-    """Parse the AI response: JSON on the last line, with a regex fallback.
+def _atr_bracket(entry_ref: float, atr_ref: float, is_long: bool,
+                 sl_mult: float, tp_mult: float) -> Tuple[float, float]:
+    """Derive (stop_px, tp_px) from entry ± ATR multiples, clamped at 0.
 
-    `atr_abs` (absolute ATR in price units, 4h) enables the stop/target
-    fallback: the LLM routinely omits stopPx/tpPx or returns 0, which leaves
-    the analysis record with no auditable risk plan. When that happens on a
-    LONG/SHORT we derive them from ATR rather than propagating zeros.
+    Single source of truth for the ATR bracket math shared by the legacy
+    `parse_verdict` repair path (research.py) and the structured-verdict
+    mapping (research_schema.py) — the two used identical formulas.
     """
-    if not ai_text:
-        ai_text = ""
+    stop_px = (entry_ref - atr_ref * sl_mult) if is_long else (entry_ref + atr_ref * sl_mult)
+    tp_px = (entry_ref + atr_ref * tp_mult) if is_long else (entry_ref - atr_ref * tp_mult)
+    return max(0.0, stop_px), max(0.0, tp_px)
 
+
+def _extract_verdict_json(ai_text: str, perception: Dict[str, Any]
+                          ) -> Tuple[str, Any, Optional[str], Any, float, float,
+                                     str, Any, bool, List[str]]:
+    """Decode the structured JSON verdict block from an AI response.
+
+    Looks for JSON on the last line first, then a regex fallback. Returns
+    (verdict, confidence, side, entry_px, stop_px, tp_px, news_risk,
+    reasoning, json_parsed, lines). On an unparseable/missing block the
+    verdict defaults to PASS and the first line is keyword-scanned for a
+    LONG/SHORT/CLOSE opinion.
+    """
+    lines = ai_text.strip().split("\n")
     verdict = "PASS"
-    confidence = 0.0
-    side = None
-    entry_px = perception.get("mid", 0)
+    confidence: Any = 0.0
+    side: Optional[str] = None
+    entry_px: Any = perception.get("mid", 0)
     stop_px = 0.0
     tp_px = 0.0
     news_risk = "none"
-    reasoning = ai_text.strip()
-    # True once a structured JSON verdict block was successfully decoded. A
-    # decoded {"verdict":"PASS","confidence":0} is a real AI opinion, whereas
-    # unparseable text is an error — the executor's zero-confidence guard needs
-    # to tell those apart and confidence alone cannot.
+    reasoning: Any = ai_text.strip()
     json_parsed = False
-
-    lines = ai_text.strip().split("\n")
 
     # Find JSON on the last line
     json_str = ""
@@ -816,6 +970,94 @@ def parse_verdict(
             elif re.search(r"CLOSE", first_line, re.IGNORECASE):
                 verdict = "CLOSE"
 
+    return (verdict, confidence, side, entry_px, stop_px, tp_px,
+            news_risk, reasoning, json_parsed, lines)
+
+
+def _repair_stop_target(coin: str, verdict: str, entry_px: Any,
+                        stop_px: float, tp_px: float,
+                        perception: Dict[str, Any],
+                        atr_abs: Optional[float],
+                        sl_atr_mult: float, tp_atr_mult: float) -> Tuple[float, float]:
+    """Validate/repair stop & target for a LONG/SHORT verdict.
+
+    Two failure modes seen in production: the LLM omits stopPx/tpPx entirely
+    (73/73 analyses on 2026-08-19 carried stop_px=0.0), or it returns a
+    stop on the wrong side of entry. Both leave the record with no auditable
+    risk plan and remove the executor's only bracket fallback for the atr<=0
+    path. Drop an inverted stop/target; derive missing ones from ATR.
+    """
+    entry_ref = _coerce_px(entry_px) or _coerce_px(perception.get("mid", 0))
+    atr_ref = _coerce_px(atr_abs)
+    is_long = verdict == "LONG"
+
+    if stop_px > 0 and entry_ref > 0:
+        if (is_long and stop_px >= entry_ref) or (not is_long and stop_px <= entry_ref):
+            logger.warning(
+                f"[research] {coin} {verdict}: AI stop {stop_px} on wrong side of "
+                f"entry {entry_ref} — discarding"
+            )
+            stop_px = 0.0
+    if tp_px > 0 and entry_ref > 0:
+        if (is_long and tp_px <= entry_ref) or (not is_long and tp_px >= entry_ref):
+            logger.warning(
+                f"[research] {coin} {verdict}: AI target {tp_px} on wrong side of "
+                f"entry {entry_ref} — discarding"
+            )
+            tp_px = 0.0
+
+    if entry_ref > 0 and atr_ref > 0:
+        if stop_px <= 0:
+            stop_px, _tp_derived = _atr_bracket(entry_ref, atr_ref, is_long,
+                                                sl_atr_mult, tp_atr_mult)
+            logger.info(
+                f"[research] {coin} {verdict}: stop_px missing from AI — "
+                f"ATR fallback {stop_px:.6g} (entry={entry_ref:.6g} atr={atr_ref:.6g} x{sl_atr_mult})"
+            )
+        if tp_px <= 0:
+            _stop_derived, tp_px = _atr_bracket(entry_ref, atr_ref, is_long,
+                                                sl_atr_mult, tp_atr_mult)
+            logger.info(
+                f"[research] {coin} {verdict}: tp_px missing from AI — "
+                f"ATR fallback {tp_px:.6g} (entry={entry_ref:.6g} atr={atr_ref:.6g} x{tp_atr_mult})"
+            )
+    elif stop_px <= 0:
+        logger.warning(
+            f"[research] {coin} {verdict}: no AI stop and no ATR "
+            f"(entry={entry_ref} atr={atr_abs}) — risk plan left empty"
+        )
+    return stop_px, tp_px
+
+
+def parse_verdict(
+    ai_text: str,
+    coin: str,
+    perception: Dict[str, Any],
+    atr_abs: Optional[float] = None,
+    sl_atr_mult: Optional[float] = None,
+    tp_atr_mult: float = 1.0,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Parse the AI response: JSON on the last line, with a regex fallback.
+
+    `atr_abs` (absolute ATR in price units, 4h) enables the stop/target
+    fallback: the LLM routinely omits stopPx/tpPx or returns 0, which leaves
+    the analysis record with no auditable risk plan. When that happens on a
+    LONG/SHORT we derive them from ATR rather than propagating zeros.
+
+    P2-1: the JSON decode and the stop/target repair live in the
+    `_extract_verdict_json` / `_repair_stop_target` helpers.
+    """
+    if sl_atr_mult is None:
+        # P1-2: thread the runtime config through so an operator-tuned
+        # sl_atr_mult is honoured instead of falling back to the default.
+        sl_atr_mult = float(cfg_get("sl_atr_mult", config=config))
+    if not ai_text:
+        ai_text = ""
+
+    (verdict, confidence, side, entry_px, stop_px, tp_px,
+     news_risk, reasoning, json_parsed, _lines) = _extract_verdict_json(ai_text, perception)
+
     # Coerce confidence to a clamped float — the LLM occasionally returns it
     # as a string ("0.8") or out of range; a string would TypeError at the
     # gate comparison (`ctx.confidence >= 0.85`) on a live trade.
@@ -849,52 +1091,11 @@ def parse_verdict(
         side = "short"
     # CLOSE/PASS keep whatever side was parsed (unused downstream).
 
-    # Stop/target repair for directional verdicts. Two failure modes seen in
-    # production: the LLM omits stopPx/tpPx entirely (73/73 analyses on
-    # 2026-08-19 carried stop_px=0.0), or it returns a stop on the wrong side
-    # of entry. Both leave the record with no auditable risk plan and remove
-    # the executor's only bracket fallback for the atr<=0 path. Derive from
-    # ATR when we have it; drop an inverted stop either way.
+    # Stop/target repair for directional verdicts (extracted to helper).
     if verdict in ("LONG", "SHORT"):
-        entry_ref = _coerce_px(entry_px) or _coerce_px(perception.get("mid", 0))
-        atr_ref = _coerce_px(atr_abs)
-        is_long = verdict == "LONG"
-
-        if stop_px > 0 and entry_ref > 0:
-            if (is_long and stop_px >= entry_ref) or (not is_long and stop_px <= entry_ref):
-                logger.warning(
-                    f"[research] {coin} {verdict}: AI stop {stop_px} on wrong side of "
-                    f"entry {entry_ref} — discarding"
-                )
-                stop_px = 0.0
-        if tp_px > 0 and entry_ref > 0:
-            if (is_long and tp_px <= entry_ref) or (not is_long and tp_px >= entry_ref):
-                logger.warning(
-                    f"[research] {coin} {verdict}: AI target {tp_px} on wrong side of "
-                    f"entry {entry_ref} — discarding"
-                )
-                tp_px = 0.0
-
-        if entry_ref > 0 and atr_ref > 0:
-            if stop_px <= 0:
-                stop_px = (entry_ref - atr_ref * sl_atr_mult) if is_long else (entry_ref + atr_ref * sl_atr_mult)
-                stop_px = max(0.0, stop_px)
-                logger.info(
-                    f"[research] {coin} {verdict}: stop_px missing from AI — "
-                    f"ATR fallback {stop_px:.6g} (entry={entry_ref:.6g} atr={atr_ref:.6g} x{sl_atr_mult})"
-                )
-            if tp_px <= 0:
-                tp_px = (entry_ref + atr_ref * tp_atr_mult) if is_long else (entry_ref - atr_ref * tp_atr_mult)
-                tp_px = max(0.0, tp_px)
-                logger.info(
-                    f"[research] {coin} {verdict}: tp_px missing from AI — "
-                    f"ATR fallback {tp_px:.6g} (entry={entry_ref:.6g} atr={atr_ref:.6g} x{tp_atr_mult})"
-                )
-        elif stop_px <= 0:
-            logger.warning(
-                f"[research] {coin} {verdict}: no AI stop and no ATR "
-                f"(entry={entry_ref} atr={atr_abs}) — risk plan left empty"
-            )
+        stop_px, tp_px = _repair_stop_target(
+            coin, verdict, entry_px, stop_px, tp_px,
+            perception, atr_abs, sl_atr_mult, tp_atr_mult)
 
     return {
         "verdict": verdict,
@@ -950,6 +1151,692 @@ def _should_skip_news() -> bool:
     return boundary.get("news", "both") == "hta"
 
 
+# ── Native multi-perspective debate (replaces external HTA :8766) ────────
+# Three in-process LLM calls (bull / bear in parallel, then arbiter synthesis)
+# using the SAME Hyperliquid perpetual context as the single-call path. This
+# retires the cross-service HTA call (≈52s, spot-domain mismatch) while keeping
+# the "second opinion" value. Off by default (debate_research.enabled=false).
+_BULL_SYS = (
+    "You are a Hyperliquid PERP futures LONG specialist. Given the perp data, "
+    "argue ONLY the bull case using concrete perp signals (funding, OI change, "
+    "orderbook/trend/whale flow). Never reference equities/spot. Output JSON: "
+    '{"stance":"bullish","confidence":0-1,"arguments":[2-3 short bullets]}.'
+)
+_BEAR_SYS = (
+    "You are a Hyperliquid PERP futures SHORT/sidestep specialist. Given the "
+    "perp data, argue ONLY the bear case or why to stand aside, using concrete "
+    "perp signals (funding, OI, trend/whale flow). Never reference "
+    "equities/spot. Output JSON: "
+    '{"stance":"bearish"|"neutral","confidence":0-1,"arguments":[2-3 short bullets]}.'
+)
+_SYNTH_SYS = (
+    "You are the arbiter for a Hyperliquid PERP trade. Given BULL, BEAR and the "
+    "perp data, return ONE compact JSON object only (no markdown, no prose):\n"
+    '{"verdict":"LONG|SHORT|PASS","confidence":0-1,"conviction":"low|med|high",'
+    '"thesis":"one short sentence","bull_case":"one short sentence",'
+    '"bear_case":"one short sentence","suggested_stop_pct":0.01-0.1 or null,'
+    '"key_risks":["short risk"]}. No equities/spot, no price targets.'
+)
+
+# Module-level TTL verdict cache. P2-2: key is (coin, score-bucket,
+# trigger-hash) so the same coin firing DIFFERENT signals (or crossing a
+# score bucket) no longer reuses a stale verdict; entries also carry a
+# capacity cap with an opportunistic expiry sweep.
+_debate_cache: Dict[str, tuple] = {}
+_debate_cache_lock = threading.Lock()
+_DEBATE_CACHE_MAX_ENTRIES = 128  # fallback bound; debate_research.cache_max_entries overrides
+
+
+def _debate_cache_key(coin: str, perception: Dict[str, Any]) -> str:
+    """Composite cache key: coin + composite-score bucket + fired-trigger hash.
+
+    P2-2: a coin-only key meant a second perception within the TTL with
+    different fired triggers (or a materially different composite score)
+    silently reused the old verdict. Score is bucketed to 0.05 so normal
+    float jitter still hits; the trigger set is hashed as a sorted tuple so
+    order does not matter.
+    """
+    try:
+        score = float(perception.get("composite_score") or 0.0)
+    except (TypeError, ValueError):
+        score = 0.0
+    bucket = round(score / 0.05)
+    triggers = ",".join(sorted(extract_fired_triggers(perception)))
+    digest = hashlib.sha1(triggers.encode("utf-8", "replace")).hexdigest()[:12]
+    return f"{coin}|s{bucket}|t{digest}"
+
+
+def _debate_cache_sweep_locked(now: float) -> None:
+    """Drop expired entries, then evict oldest-expiry if still over capacity.
+
+    Called with ``_debate_cache_lock`` held. Eviction order = nearest expiry
+    first (those entries would die soonest anyway).
+    """
+    expired = [k for k, v in _debate_cache.items() if v[0] <= now]
+    for k in expired:
+        _debate_cache.pop(k, None)
+    try:
+        cap = int(cfg_get("debate_research.cache_max_entries", _DEBATE_CACHE_MAX_ENTRIES))
+    except (TypeError, ValueError):
+        cap = _DEBATE_CACHE_MAX_ENTRIES
+    if cap <= 0:
+        cap = _DEBATE_CACHE_MAX_ENTRIES
+    evicted = 0
+    if len(_debate_cache) > cap:
+        over = sorted(_debate_cache.items(), key=lambda kv: kv[1][0])[: len(_debate_cache) - cap]
+        for k, _ in over:
+            _debate_cache.pop(k, None)
+        evicted = len(over)
+    # P3-1: eviction accounting (best-effort; called under the cache lock).
+    if expired or evicted:
+        try:
+            from hermes_trader import metrics
+
+            if expired:
+                metrics.DEBATE_CACHE_EVICTIONS.labels(reason="expired").inc(len(expired))
+            if evicted:
+                metrics.DEBATE_CACHE_EVICTIONS.labels(reason="capacity").inc(evicted)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _debate_cfg() -> Dict[str, Any]:
+    cfg = read_agent_config()
+    d = cfg.get("debate_research") or {}
+    return {
+        "enabled": bool(d.get("enabled", False)),
+        "max_latency_s": float(d.get("max_latency_s", 15)),
+        "cache_ttl_s": float(d.get("cache_ttl_s", 300)),
+        "parallel": bool(d.get("parallel", True)),
+        "use_structured_output": bool(d.get("use_structured_output", True)),
+    }
+
+
+def _debate_role(system_prompt: str) -> str:
+    """Fingerprint a debate system prompt into a short role tag for logs."""
+    low = system_prompt.lower()
+    if "arbiter" in low:
+        return "synth"
+    if "long specialist" in low:
+        return "bull"
+    if "sidestep specialist" in low:
+        return "bear"
+    return "unknown"
+
+
+def _debate_per_call_timeout() -> float:
+    """Per-LLM-call timeout (seconds) for bull/bear (parallel, ~1900 char prompts).
+
+    Bull/bear run in parallel (~5-10s each on Ark, but two simultaneous
+    requests can push P95 to ~15s). 18s gives enough headroom for P95.
+    """
+    dcfg = _debate_cfg()
+    return max(8.0, min(18.0, dcfg["max_latency_s"] * 0.7))
+
+
+def _debate_synth_timeout() -> float:
+    """Longer timeout for the synth/arbiter call.
+
+    Synth runs serially after bull/bear and its prompt is ~3300 chars (bull +
+    bear + market data), so P95 latency is higher than the individual bull/bear
+    calls. Give it up to 24s while staying under the overall max_latency cap.
+    """
+    dcfg = _debate_cfg()
+    return max(12.0, min(24.0, dcfg["max_latency_s"] * 0.92))
+
+
+def _debate_direct(
+    system_prompt: str,
+    user_message: str,
+    *,
+    structured: bool,
+    timeout: Optional[float] = None,
+) -> str:
+    """LLM call for the debate path — goes STRAIGHT to OpenRouter.
+
+    Deliberately bypasses ``_call_ai`` (which would re-enter the external HTA
+    service and its 60s timeout). A shorter timeout keeps the whole debate
+    within the latency cap.
+
+    NOTE: The arbiter (synth) now always calls this with ``structured=False``
+    because direct measurement showed Ark's ``response_format=json_schema``
+    adds ~11s (16s vs 5s for the same prompt). The ``structured`` parameter
+    is retained so future callers can opt in, but the arbiter path relies on
+    :func:`parse_structured` to extract JSON from prose/code-fences.
+    """
+    dcfg = _debate_cfg()
+    rf = ResearchVerdict.openrouter_response_format() if structured else None
+    per_call_timeout = timeout if timeout is not None else _debate_per_call_timeout()
+    role = _debate_role(system_prompt)
+    t0 = time.time()
+    logger.info(
+        f"[debate] call START | role={role} structured={structured} "
+        f"timeout_s={per_call_timeout:.1f} prompt_chars={len(user_message)}"
+    )
+    try:
+        out = _call_openrouter(
+            system_prompt,
+            user_message,
+            response_format=rf,
+            timeout=per_call_timeout,
+            max_tokens=350,
+            path="debate_direct",
+        )
+    except Exception as e:
+        logger.warning(
+            f"[debate] call ERROR | role={role} elapsed_ms={int((time.time()-t0)*1000)} "
+            f"err={type(e).__name__}: {e}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="failed").observe(
+                max(0.0, time.time() - t0)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    # _call_openrouter swallows HTTP/timeout errors and returns "" — treat that
+    # as a failure so the debate path falls back instead of feeding an empty
+    # string into the arbiter (which would always parse-fail).
+    if not out or not out.strip():
+        elapsed = int((time.time() - t0) * 1000)
+        logger.warning(
+            f"[debate] call EMPTY | role={role} elapsed_ms={elapsed} "
+            f"(timeout/HTTP error from LLM endpoint)"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="empty").observe(
+                max(0.0, time.time() - t0)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        raise TimeoutError(f"empty LLM response after {elapsed}ms (role={role})")
+    logger.info(
+        f"[debate] call OK | role={role} elapsed_ms={int((time.time()-t0)*1000)} "
+        f"resp_chars={len(out)}"
+    )
+    try:
+        from hermes_trader import metrics
+
+        metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="ok").observe(
+            max(0.0, time.time() - t0)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
+def _bull_analysis(ctx_msg: str) -> str:
+    logger.debug("[debate] bull analysis start")
+    return _debate_direct(_BULL_SYS, ctx_msg, structured=False)
+
+
+def _bear_analysis(ctx_msg: str) -> str:
+    logger.debug("[debate] bear analysis start")
+    return _debate_direct(_BEAR_SYS, ctx_msg, structured=False)
+
+
+def _synthesize(bull: str, bear: str, ctx_msg: str) -> Optional[Dict[str, Any]]:
+    """Arbiter step. Returns a validated ResearchVerdict dict or None.
+
+    Always uses unstructured (prose-JSON) mode: direct testing against the Ark
+    endpoint showed ``response_format=json_schema`` adds ~11s of latency (16s
+    vs 5s for the same prompt), while ``parse_structured`` reliably extracts
+    the JSON object from code fences or surrounding prose.
+    """
+    msg = (
+        f"=== PERP MARKET DATA ===\n{ctx_msg}\n\n"
+        f"=== BULL ARGUMENT ===\n{bull}\n\n"
+        f"=== BEAR ARGUMENT ===\n{bear}\n"
+    )
+    logger.info(
+        f"[debate] synth START | bull_chars={len(bull or '')} "
+        f"bear_chars={len(bear or '')} msg_chars={len(msg)}"
+    )
+    t0 = time.time()
+    raw = _debate_direct(_SYNTH_SYS, msg, structured=False, timeout=_debate_synth_timeout())
+    parsed = parse_structured(raw)
+    if parsed is None:
+        logger.warning(
+            f"[debate] synth PARSE-FAIL | elapsed_ms={int((time.time()-t0)*1000)} "
+            f"raw_chars={len(raw or '')} raw_head={(raw or '')[:200]!r}"
+        )
+    else:
+        logger.info(
+            f"[debate] synth OK | elapsed_ms={int((time.time()-t0)*1000)} "
+            f"verdict={parsed.get('verdict')} conf={parsed.get('confidence')} "
+            f"conviction={parsed.get('conviction')}"
+        )
+    return parsed
+
+
+def _debate_research(
+    coin: str, ctx_msg: str, perception: Dict[str, Any], *, atr_abs: Optional[float],
+    config: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Run bull/bear in parallel, then synthesize. Returns mapped fields or
+    None on any failure/timeout so the caller falls back to the single path."""
+    dcfg = _debate_cfg()
+    ttl = dcfg["cache_ttl_s"]
+    now = time.time()
+    logger.info(
+        f"[debate] RESEARCH-START | coin={coin} parallel={dcfg['parallel']} "
+        f"max_latency_s={dcfg['max_latency_s']} cache_ttl_s={ttl} "
+        f"structured={dcfg['use_structured_output']} ctx_chars={len(ctx_msg)} "
+        f"atr_abs={atr_abs}"
+    )
+    # P2-2: composite key (coin + score bucket + fired-trigger hash) so a
+    # different signal mix on the same coin never reuses the old verdict.
+    cache_key = _debate_cache_key(coin, perception)
+    with _debate_cache_lock:
+        hit = _debate_cache.get(cache_key)
+        if hit and hit[0] > now:
+            logger.info(
+                f"[debate] cache HIT | key={cache_key} ttl_remaining_s="
+                f"{int(hit[0] - now)} verdict={hit[1].get('verdict')}"
+            )
+            try:
+                from hermes_trader import metrics
+
+                metrics.DEBATE_CACHE_LOOKUPS.labels(result="hit").inc()
+            except Exception:  # noqa: BLE001
+                pass
+            return dict(hit[1])
+        if hit:
+            logger.info(f"[debate] cache STALE | key={cache_key} → refetch")
+            _cache_lookup = "stale"
+        else:
+            _cache_lookup = "miss"
+    try:
+        from hermes_trader import metrics
+
+        metrics.DEBATE_CACHE_LOOKUPS.labels(result=_cache_lookup).inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+    bb_start = time.time()
+    bull = ""
+    bear = ""
+    per_call = _debate_per_call_timeout()
+    try:
+        if dcfg["parallel"]:
+            logger.info(
+                f"[debate] bull/bear PARALLEL start | coin={coin} per_call_s={per_call:.1f}"
+            )
+            # P1-1: shared pool (no per-call pool churn). Each call has its own
+            # per-call httpx timeout; give the future a few seconds of slack
+            # beyond that so the inner timeout (not the future) is what
+            # enforces the cap and raises a clear error.
+            pool = _get_pool()
+            f_bull = pool.submit(_bull_analysis, ctx_msg)
+            f_bear = pool.submit(_bear_analysis, ctx_msg)
+            bull = f_bull.result(timeout=per_call + 4.0)
+            bear = f_bear.result(timeout=per_call + 4.0)
+        else:
+            logger.info(f"[debate] bull/bear SERIAL start | coin={coin}")
+            bull = _bull_analysis(ctx_msg)
+            bear = _bear_analysis(ctx_msg)
+    except Exception as e:
+        logger.warning(
+            f"[debate] bull/bear FAILED → single fallback | coin={coin} "
+            f"elapsed_ms={int((time.time()-bb_start)*1000)} "
+            f"err={type(e).__name__}: {e}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_STAGE_DURATION.labels(stage="bull_bear", outcome="failed").observe(
+                max(0.0, time.time() - bb_start)
+            )
+            metrics.DEBATE_FALLBACKS.labels(reason="bull_bear_failed").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    bb_elapsed = int((time.time() - bb_start) * 1000)
+    logger.info(
+        f"[debate] bull/bear DONE | coin={coin} elapsed_ms={bb_elapsed} "
+        f"bull_chars={len(bull or '')} bear_chars={len(bear or '')}"
+    )
+    try:
+        from hermes_trader import metrics
+
+        metrics.DEBATE_STAGE_DURATION.labels(stage="bull_bear", outcome="ok").observe(
+            max(0.0, time.time() - bb_start)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    if not bull and not bear:
+        logger.warning(
+            f"[debate] both empty → single fallback | coin={coin} "
+            f"elapsed_ms={bb_elapsed}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_FALLBACKS.labels(reason="both_empty").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+    if not bull:
+        logger.warning(f"[debate] bull empty, proceeding with bear only | coin={coin}")
+    if not bear:
+        logger.warning(f"[debate] bear empty, proceeding with bull only | coin={coin}")
+
+    synth_start = time.time()
+    try:
+        # Give synth its own (longer) per-call timeout; the wall-clock cap is
+        # enforced by the inner httpx timeout, not by starving the future.
+        synth_timeout = max(8.0, _debate_synth_timeout() + 4.0)
+        logger.info(
+            f"[debate] synth dispatch | coin={coin} timeout_s={synth_timeout:.1f} "
+            f"(elapsed_s={(synth_start-now):.1f})"
+        )
+        # P1-1: shared pool. Timeout enforced by the future (inner httpx call
+        # has its own longer cap for LLM inference).
+        f_synth = _get_pool().submit(_synthesize, bull, bear, ctx_msg)
+        sv = f_synth.result(timeout=synth_timeout)
+    except Exception as e:
+        logger.warning(
+            f"[debate] synth FAILED → single fallback | coin={coin} "
+            f"elapsed_ms={int((time.time()-synth_start)*1000)} "
+            f"err={type(e).__name__}: {e}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="failed").observe(
+                max(0.0, time.time() - synth_start)
+            )
+            metrics.DEBATE_FALLBACKS.labels(reason="synth_failed").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    if not sv:
+        logger.warning(
+            f"[debate] synth unparseable → single fallback | coin={coin} "
+            f"elapsed_ms={int((time.time()-synth_start)*1000)}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="empty").observe(
+                max(0.0, time.time() - synth_start)
+            )
+            metrics.DEBATE_FALLBACKS.labels(reason="synth_empty").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return None
+
+    try:
+        from hermes_trader import metrics
+
+        metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="ok").observe(
+            max(0.0, time.time() - synth_start)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+    fields = structured_to_analysis_fields(
+        sv, coin, perception,
+        atr_abs=atr_abs,
+        sl_atr_mult=float(cfg_get("sl_atr_mult", config=config)),
+    )
+    if ttl > 0:
+        with _debate_cache_lock:
+            _debate_cache[cache_key] = (time.time() + ttl, dict(fields))
+            # P2-2: opportunistic sweep — drop expired entries and enforce the
+            # capacity cap (nearest-expiry eviction) so the cache cannot grow
+            # unbounded across many (coin, signal-mix) combinations.
+            _debate_cache_sweep_locked(time.time())
+            _entries = len(_debate_cache)
+        logger.info(
+            f"[debate] cache WRITE | key={cache_key} ttl_s={ttl} "
+            f"entries={_entries}"
+        )
+        try:
+            from hermes_trader import metrics
+
+            metrics.DEBATE_CACHE_ENTRIES.set(float(_entries))
+        except Exception:  # noqa: BLE001
+            pass
+    logger.info(
+        f"[debate] DEBATE-OK | coin={coin} verdict={fields['verdict']} "
+        f"side={fields['side']} conf={fields['confidence']:.2f} "
+        f"stop_px={fields['stop_px']} tp_px={fields['tp_px']} "
+        f"elapsed_ms={int((time.time()-now)*1000)}"
+    )
+    try:
+        from hermes_trader import metrics
+
+        metrics.DEBATE_STAGE_DURATION.labels(stage="total", outcome="ok").observe(
+            max(0.0, time.time() - now)
+        )
+    except Exception:  # noqa: BLE001
+        pass
+    return fields
+
+
+def _timed_fetch(coin: str, label: str, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Any:
+    """Wrap a fetch call with start/end timing logs so the slowest source
+    is immediately visible in trader logs."""
+    _t0 = time.monotonic()
+    logger.info(f"[research] {coin}:   → {label} START")
+    try:
+        result = fn(*args, **kwargs)
+        _elapsed = time.monotonic() - _t0
+        logger.info(f"[research] {coin}:   ← {label} OK in {_elapsed:.2f}s")
+        return result
+    except Exception as _e:
+        _elapsed = time.monotonic() - _t0
+        logger.error(
+            f"[research] {coin}:   ← {label} FAIL after {_elapsed:.2f}s: "
+            f"{type(_e).__name__}: {_e}"
+        )
+        raise
+
+
+def _parallel_prefetch(coin: str, skip_news_flag: bool) -> Dict[str, Any]:
+    """Fetch all independent pre-LLM data in parallel: 3 candle timeframes +
+    funding rate + news + positioning signals. None depend on each other,
+    so issue them together to collapse serial latency into max(T).
+
+    Returns a dict with keys c1h/c4h/c1d/funding_raw/news/signals_block.
+    Raises RuntimeError if any future fails or exceeds the per-fetch timeout.
+    """
+    # Per-fetch timeout for the parallel pre-LLM data gather. Each individual
+    # HTTP call already has its own sub-timeout (hl_client: 5s+3 retries;
+    # funding/news/signals: their own), but if ANY of them hangs without
+    # raising, f.result() with no timeout blocks the whole research pipeline
+    # indefinitely — which is enough to trip the 600s watchdog during a
+    # 3-trigger cycle. Bound the gather and bail fast on a stuck future.
+    #
+    # P1-7: the outer ceiling is PER-SOURCE, not one flat 45s for every
+    # future. Funding/news are light calls that should return in seconds, so a
+    # hung funding future must not be allowed to burn 45s; candles carry
+    # hl_client retries and deserve more headroom. Each future's own HTTP
+    # timeout still applies underneath; these bounds only cap a HUNG future.
+    # HERMES_RESEARCH_FETCH_TIMEOUT_S remains honored as a fallback ceiling for
+    # any source without an explicit override.
+    _default_timeout = float(os.environ.get("HERMES_RESEARCH_FETCH_TIMEOUT_S", "45"))
+
+    def _src_timeout(name: str, default: float) -> float:
+        return float(os.environ.get(
+            f"HERMES_RESEARCH_FETCH_TIMEOUT_{name.upper()}",
+            str(default if default > 0 else _default_timeout),
+        ))
+
+    t_candles = _src_timeout("candles", 15.0)
+    t_funding = _src_timeout("funding", 8.0)
+    t_news = _src_timeout("news", 10.0)
+    t_signals = _src_timeout("signals", 12.0)
+    _fetch_t0 = time.monotonic()
+    logger.info(
+        f"[research] {coin}: parallel data-fetch START "
+        f"(timeouts candles={t_candles:.0f}s funding={t_funding:.0f}s "
+        f"news={t_news:.0f}s signals={t_signals:.0f}s)"
+    )
+
+    # P1-1: submit to the shared pool instead of a per-research 6-worker
+    # pool (which nested a further 3-worker pool — up to 24 concurrent HTTP
+    # calls per coin). The shared pool bounds total research concurrency.
+    pool = _get_pool()
+    f_1h = pool.submit(_timed_fetch, coin, "candles-1h", fetch_hl_candles, coin, "1h", 100)
+    f_4h = pool.submit(_timed_fetch, coin, "candles-4h", fetch_hl_candles, coin, "4h", 100)
+    f_1d = pool.submit(_timed_fetch, coin, "candles-1d", fetch_hl_candles, coin, "1d", 60)
+    f_funding = pool.submit(_timed_fetch, coin, "funding", _fetch_funding_rate, coin)
+    f_news = pool.submit(
+        _timed_fetch, coin, "news",
+        lambda: "news handled by HTA (B9 boundary)" if skip_news_flag else _fetch_news(coin),
+    )
+    f_signals = pool.submit(_timed_fetch, coin, "signals", _signals_block, coin)
+
+    # (future, result-key, source-label, per-source timeout). P1-7: wait each
+    # future with its OWN ceiling and report the specific source that stalled,
+    # instead of one flat timeout that lets a light call hang for 45s.
+    _specs = [
+        (f_1h, "c1h", "candles-1h", t_candles),
+        (f_4h, "c4h", "candles-4h", t_candles),
+        (f_1d, "c1d", "candles-1d", t_candles),
+        (f_funding, "funding_raw", "funding", t_funding),
+        (f_news, "news", "news", t_news),
+        (f_signals, "signals_block", "signals", t_signals),
+    ]
+    out: Dict[str, Any] = {}
+    timed_src = ""
+    timed_after = 0.0
+    try:
+        for fut, key, label, t in _specs:
+            try:
+                out[key] = fut.result(timeout=t)
+            except FuturesTimeoutError:
+                # Re-raise with the source label so the failure message (and
+                # the caller's log) names exactly which fetch stalled.
+                timed_src, timed_after = label, t
+                raise TimeoutError(f"{label} timed out after {t:.0f}s")
+    except Exception as _e:
+        # Cancel anything still running so a stuck HL/LLM call can't leak a
+        # thread; raise so the caller's per-coin try/except logs the failure
+        # and the trading loop moves on to the next trigger.
+        for fut, _key, _label, _t in _specs:
+            if not fut.done():
+                fut.cancel()
+        _total = time.monotonic() - _fetch_t0
+        logger.error(
+            f"[research] {coin}: parallel data-fetch FAILED after {_total:.2f}s: "
+            f"{type(_e).__name__}: {_e}"
+        )
+        _detail = (f"{timed_src} timed out after {timed_after:.0f}s"
+                   if timed_src else f"{type(_e).__name__}: {_e}")
+        raise RuntimeError(
+            f"parallel data-fetch for {coin} failed/timed out ({_detail})"
+        ) from _e
+
+    _fetch_total = time.monotonic() - _fetch_t0
+    logger.info(f"[research] {coin}: parallel data-fetch DONE in {_fetch_total:.2f}s")
+    return out
+
+
+def _build_analysis(coin: str, perception: Dict[str, Any], *,
+                    news: Any, parsed: Dict[str, Any], ai_text: str,
+                    debate_used: bool, trace_id: str,
+                    as_of_date: Optional[str],
+                    fired_names: set,
+                    tf1h: Dict[str, Any], tf4h: Dict[str, Any],
+                    c1h: List[Any]) -> Dict[str, Any]:
+    """Assemble the persisted analysis record from the researched verdict.
+
+    Pure assembly — every field is carried verbatim from the parsed verdict,
+    the perception, or the indicator frames; the trigger flags all derive
+    from the single extracted fired-trigger set. P2-1 extraction keeps
+    research() as the orchestration layer.
+    """
+    analysis = {
+        "id": str(uuid.uuid4()),
+        "trace_id": trace_id,
+        "perception_id": perception.get("id", "unknown"),
+        "coin": coin,
+        "verdict": parsed["verdict"],
+        "confidence": parsed["confidence"],
+        "side": parsed["side"],
+        "entry_px": parsed["entry_px"],
+        "stop_px": parsed["stop_px"],
+        "tp_px": parsed["tp_px"],
+        "reasoning": parsed["reasoning"],
+        "news_context": news,
+        # AI's good/bad judgment of the recent news — drives the news gate
+        # (only "negative" stands the trade down; an earnings beat is fine).
+        "news_risk": parsed["news_risk"],
+        # Failure-PASS marker — must survive this whitelist or the executor's
+        # override guard never sees it (it didn't, on first deploy).
+        "ai_down": bool(parsed.get("ai_down")),
+        # Same deal: the executor's zero-confidence guard uses nlp_parsed to
+        # tell "AI gave a real low-conviction opinion" apart from "AI response
+        # was unparseable". Dropping it here would block every conf=0 PASS.
+        "nlp_parsed": bool(parsed.get("nlp_parsed")),
+        "json_parsed": bool(parsed.get("json_parsed")),
+        "degraded": "[DEGRADED" in (ai_text or ""),
+        # Native multi-perspective debate provenance (replaces external HTA).
+        "debate_used": debate_used,
+        "structured": bool(parsed.get("structured")),
+        "conviction": parsed.get("conviction"),
+        "bull_case": parsed.get("bull_case", ""),
+        "bear_case": parsed.get("bear_case", ""),
+        "suggested_stop_pct": parsed.get("suggested_stop_pct"),
+        "key_risks": list(parsed.get("key_risks") or []),
+        "as_of_date": as_of_date,
+        "created_at": int(time.time() * 1000),
+        # Carry forward so risk gates can read own-coin signal strength.
+        "composite_score": float(perception.get("composite_score", 0) or 0),
+        # P2-6: all fired-trigger flags derive from the single extracted set.
+        "momentum_burst_fired": "momentumBurst" in fired_names,
+        "slow_burn_fired": bool(fired_names & {"volumeBuildup1h", "trendFlip1h", "higherLows1h"}),
+        "slow_burn_count": len(fired_names & {"volumeBuildup1h", "trendFlip1h", "higherLows1h"}),
+        # O'Neil breakout pair — feeds the breakout force-execute (a hedged AI
+        # PASS on a 20-period-high break WITH a volume surge gets upgraded;
+        # XPL +32% 2026-06-12 was researched 38x, PASSed 21x, never traded
+        # while both of these were fired hours before the move).
+        "breakout_fired": "breakout" in fired_names,
+        "volume_spike_fired": "volumeSpike" in fired_names,
+        "uptrend_momentum_fired": "uptrendMomentum" in fired_names,
+        "downtrend_momentum_fired": "downtrendMomentum" in fired_names,
+        "daily_mover_fired": "dailyMover" in fired_names,
+        # OI+funding accumulation signal (oi_funding_anomaly). When present,
+        # the coin shows whale-loading patterns (high OI, negative funding,
+        # flat price). Used as a counter-regime bypass for LONGs.
+        "whale_signal": perception.get("whale_signal"),
+        # Fired indicator names — used by the executor's structural-override
+        # diagnostics log so a post-mortem can see exactly which TA/slow-burn
+        # triggers upgraded a PASS to LONG.
+        "fired_triggers": extract_fired_triggers(perception),
+        # 4h indicator snapshot — feeds the executor's late-entry veto
+        # (RSI extremes + over-extension from EMA21). Already computed above
+        # for the AI prompt; carried forward so the executor doesn't refetch.
+        "rsi4h": tf4h.get("rsi14"),
+        "adx4h": tf4h.get("adx14"),
+        "atr4h": tf4h.get("atr14"),
+        "ema21_4h": tf4h.get("ema21"),
+        "close4h": tf4h.get("last_close"),
+        # 1h indicator snapshot — feeds the executor's Plan-B regime-strength
+        # score (5-component weighted, byte-aligned with backtest_ab_compare).
+        # Used to distinguish mid-strength TREND (size x0.5) from STRONG_TREND
+        # (full size); the 4-state production detect_regime() cannot make that
+        # split because it has no strength score.
+        "ema8_1h": tf1h.get("ema8"),
+        "ema21_1h": tf1h.get("ema21"),
+        "atr1h": tf1h.get("atr14"),
+        "adx1h": tf1h.get("adx14"),
+        "close1h": tf1h.get("last_close"),
+        "obv_slope_1h": _obv_slope_sign(c1h),
+    }
+    return analysis
+
+
 def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Full AI research pipeline for a perception — returns an analysis dict.
 
@@ -959,43 +1846,15 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
             N duplicate HTTP POSTs per cycle. When None, fetches its own.
     """
     as_of_date = _compute_as_of_date()
-    # Parallel fetch for all independent pre-LLM data: 3 candle timeframes +
-    # funding rate + news + positioning signals. None depend on each other,
-    # so issue them together to collapse serial latency into max(T).
-    skip_news_flag = _should_skip_news()
-    # Per-fetch timeout for the parallel pre-LLM data gather. Each individual
-    # HTTP call already has its own sub-timeout (hl_client: 5s+3 retries;
-    # funding/news/signals: their own), but if ANY of them hangs without
-    # raising, f.result() with no timeout blocks the whole research pipeline
-    # indefinitely — which is enough to trip the 600s watchdog during a
-    # 3-trigger cycle. Bound the gather and bail fast on a stuck future.
-    _fetch_timeout = float(os.environ.get("HERMES_RESEARCH_FETCH_TIMEOUT_S", "45"))
-    with ThreadPoolExecutor(max_workers=6) as pool:
-        f_1h = pool.submit(fetch_hl_candles, coin, "1h", 100)
-        f_4h = pool.submit(fetch_hl_candles, coin, "4h", 100)
-        f_1d = pool.submit(fetch_hl_candles, coin, "1d", 60)
-        f_funding = pool.submit(_fetch_funding_rate, coin)
-        f_news = pool.submit(
-            lambda: "news handled by HTA (B9 boundary)" if skip_news_flag else _fetch_news(coin)
-        )
-        f_signals = pool.submit(_signals_block, coin)
-        try:
-            c1h = f_1h.result(timeout=_fetch_timeout)
-            c4h = f_4h.result(timeout=_fetch_timeout)
-            c1d = f_1d.result(timeout=_fetch_timeout)
-            funding_raw = f_funding.result(timeout=_fetch_timeout)
-            news = f_news.result(timeout=_fetch_timeout)
-            signals_block = f_signals.result(timeout=_fetch_timeout)
-        except Exception as _e:
-            # Cancel anything still running so a stuck HL/LLM call can't leak
-            # a thread; raise so the caller's per-coin try/except logs the
-            # failure and the trading loop moves on to the next trigger.
-            for _f in (f_1h, f_4h, f_1d, f_funding, f_news, f_signals):
-                if not _f.done():
-                    _f.cancel()
-            raise RuntimeError(
-                f"parallel data-fetch for {coin} failed/timed out after {_fetch_timeout:.0f}s: {type(_e).__name__}: {_e}"
-            ) from _e
+    # Parallel pre-LLM data gather (3 candle TFs + funding + news + signals),
+    # extracted to _parallel_prefetch (P2-1).
+    _prefetched = _parallel_prefetch(coin, _should_skip_news())
+    c1h = _prefetched["c1h"]
+    c4h = _prefetched["c4h"]
+    c1d = _prefetched["c1d"]
+    funding_raw = _prefetched["funding_raw"]
+    news = _prefetched["news"]
+    signals_block = _prefetched["signals_block"]
 
     # Thin-history guard: multi-timeframe TA is meaningless without enough 4h
     # bars (EMA21/ADX need history). A near-empty series produced confident-
@@ -1011,12 +1870,13 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
             "news_context": news, "news_risk": "none",
             "created_at": int(time.time() * 1000),
             "composite_score": float(perception.get("composite_score", 0) or 0),
+            # P1-16: thin-history PASS skips the LLM entirely, so flag
+            # ai_down so downstream record/notify sees "no AI decision made"
+            # rather than implying a live model produced a PASS.
+            "ai_down": True,
             "momentum_burst_fired": False, "slow_burn_fired": False,
             "slow_burn_count": 0,
-            "daily_mover_fired": any(
-                t.get("name") == "dailyMover" and t.get("fired")
-                for t in (perception.get("triggers") or [])
-            ),
+            "daily_mover_fired": "dailyMover" in set(extract_fired_triggers(perception)),
             "whale_signal": perception.get("whale_signal"),
         }
         memory.record_analysis(analysis)
@@ -1025,6 +1885,9 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
     tf1h = _compute_indicators(c1h)
     tf4h = _compute_indicators(c4h)
     tf1d = _compute_indicators(c1d)
+
+    # P2-6: canonical fired-trigger names once, reused by every signal flag.
+    fired_names = set(extract_fired_triggers(perception))
 
     config = read_agent_config()
     mode = str(config.get("mode", "OFF"))
@@ -1069,96 +1932,64 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
     # and events.jsonl so a signal/order/close can be correlated later.
     trace_id = str(perception.get("trace_id") or new_trace_id("sig"))
 
-    ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id)
     # Pass the 4h ATR so parse_verdict can synthesise a stop/target when the
     # LLM omits them (it usually does). 4h matches the timeframe the executor
     # uses for its own bracket, so the two agree.
     _atr_4h = tf4h.get("atr14")
-    parsed = parse_verdict(
-        ai_text, coin, perception,
-        atr_abs=_atr_4h,
-        sl_atr_mult=float(config.get("sl_atr_mult", 1.2) or 1.2),
-    )
 
-    analysis = {
-        "id": str(uuid.uuid4()),
-        "trace_id": trace_id,
-        "perception_id": perception.get("id", "unknown"),
-        "coin": coin,
-        "verdict": parsed["verdict"],
-        "confidence": parsed["confidence"],
-        "side": parsed["side"],
-        "entry_px": parsed["entry_px"],
-        "stop_px": parsed["stop_px"],
-        "tp_px": parsed["tp_px"],
-        "reasoning": parsed["reasoning"],
-        "news_context": news,
-        # AI's good/bad judgment of the recent news — drives the news gate
-        # (only "negative" stands the trade down; an earnings beat is fine).
-        "news_risk": parsed["news_risk"],
-        # Failure-PASS marker — must survive this whitelist or the executor's
-        # override guard never sees it (it didn't, on first deploy).
-        "ai_down": bool(parsed.get("ai_down")),
-        # Same deal: the executor's zero-confidence guard uses nlp_parsed to
-        # tell "AI gave a real low-conviction opinion" apart from "AI response
-        # was unparseable". Dropping it here would block every conf=0 PASS.
-        "nlp_parsed": bool(parsed.get("nlp_parsed")),
-        "json_parsed": bool(parsed.get("json_parsed")),
-        "degraded": "[DEGRADED" in (ai_text or ""),
-        "as_of_date": as_of_date,
-        "created_at": int(time.time() * 1000),
-        # Carry forward so risk gates can read own-coin signal strength.
-        "composite_score": float(perception.get("composite_score", 0) or 0),
-        "momentum_burst_fired": any(
-            t.get("name") == "momentumBurst" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "slow_burn_fired": any(
-            t.get("name") in ("volumeBuildup1h", "trendFlip1h", "higherLows1h")
-            and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "slow_burn_count": sum(
-            1 for t in (perception.get("triggers") or [])
-            if t.get("name") in ("volumeBuildup1h", "trendFlip1h", "higherLows1h")
-            and t.get("fired")
-        ),
-        # O'Neil breakout pair — feeds the breakout force-execute (a hedged AI
-        # PASS on a 20-period-high break WITH a volume surge gets upgraded;
-        # XPL +32% 2026-06-12 was researched 38x, PASSed 21x, never traded
-        # while both of these were fired hours before the move).
-        "breakout_fired": any(
-            t.get("name") == "breakout" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "volume_spike_fired": any(
-            t.get("name") == "volumeSpike" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "uptrend_momentum_fired": any(
-            t.get("name") == "uptrendMomentum" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "downtrend_momentum_fired": any(
-            t.get("name") == "downtrendMomentum" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        "daily_mover_fired": any(
-            t.get("name") == "dailyMover" and t.get("fired")
-            for t in (perception.get("triggers") or [])
-        ),
-        # OI+funding accumulation signal (oi_funding_anomaly). When present,
-        # the coin shows whale-loading patterns (high OI, negative funding,
-        # flat price). Used as a counter-regime bypass for LONGs.
-        "whale_signal": perception.get("whale_signal"),
-        # Fired indicator names — used by the executor's structural-override
-        # diagnostics log so a post-mortem can see exactly which TA/slow-burn
-        # triggers upgraded a PASS to LONG.
-        "fired_triggers": [
-            t.get("name") for t in (perception.get("triggers") or [])
-            if t.get("fired") and t.get("name")
-        ],
-    }
+    # Native multi-perspective debate (in-process replacement for external HTA
+    # :8766). When enabled, run bull/bear in parallel + arbiter synthesis with
+    # a hard latency cap; on any failure/timeout fall back to the single-LLM
+    # path so behavior never degrades. Default off (C2).
+    dcfg = _debate_cfg()
+    parsed: Optional[Dict[str, Any]] = None
+    debate_used = False
+    if dcfg["enabled"]:
+        logger.info(
+            f"[debate] research() entry ENABLED | coin={coin} trace_id={trace_id} "
+            f"parallel={dcfg['parallel']} max_latency_s={dcfg['max_latency_s']} "
+            f"structured={dcfg['use_structured_output']}"
+        )
+        debate_fields = _debate_research(
+            coin, user_message, perception, atr_abs=_atr_4h, config=config
+        )
+        if debate_fields is not None:
+            parsed = debate_fields
+            debate_used = True
+            logger.info(
+                f"[debate] research() debate SUCCEEDED | coin={coin} "
+                f"verdict={parsed.get('verdict')} side={parsed.get('side')}"
+            )
+        else:
+            logger.warning(
+                f"[debate] research() debate returned None → single-LLM fallback | "
+                f"coin={coin}"
+            )
+    else:
+        logger.debug(
+            f"[debate] research() entry DISABLED | coin={coin} trace_id={trace_id}"
+        )
+
+    if parsed is None:
+        ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id)
+        parsed = parse_verdict(
+            ai_text, coin, perception,
+            atr_abs=_atr_4h,
+            sl_atr_mult=float(cfg_get("sl_atr_mult", config=config)),
+        )
+    else:
+        # Debate path does not touch _call_ai; synthesize a marker for telemetry.
+        ai_text = ""
+
+    # Analysis-record assembly extracted to _build_analysis (P2-1).
+    analysis = _build_analysis(
+        coin, perception,
+        news=news, parsed=parsed, ai_text=ai_text,
+        debate_used=debate_used, trace_id=trace_id,
+        as_of_date=as_of_date,
+        fired_names=fired_names,
+        tf1h=tf1h, tf4h=tf4h, c1h=c1h,
+    )
 
     memory.record_analysis(analysis)
     return analysis

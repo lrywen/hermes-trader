@@ -40,7 +40,9 @@ try:
     import certifi
     _SSL = ssl.create_default_context(cafile=certifi.where())
 except Exception:                     # pragma: no cover
-    _SSL = ssl._create_unverified_context()
+    # P1-15: never fall back to an unverified context (MITM risk). Use the
+    # system trust store with full verification; certifi is a pinned dep.
+    _SSL = ssl.create_default_context()
 
 _AGG = "https://api.binance.com/api/v3/aggTrades"
 

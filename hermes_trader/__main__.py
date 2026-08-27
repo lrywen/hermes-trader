@@ -23,7 +23,7 @@ import sys
 from hermes_trader import __version__
 
 
-def print_banner():
+def print_banner() -> None:
     print("""
 ╔═══════════════════════════════════════════════════╗
 ║        🦅  H E R M E S  —  Autonomous Agent      ║
@@ -53,7 +53,7 @@ def _import_memory():
 
 # ── Commands ──────────────────────────────────────────────────────────
 
-def cmd_scan():
+def cmd_scan() -> None:
     """Scan all markets for triggers."""
     from hermes_trader.agents.perception import scan_once
     from hermes_trader.client.universe import get_universe
@@ -69,16 +69,17 @@ def cmd_scan():
         return
 
     print(f"  {len(perceptions)} trigger(s) detected:\n")
+    from hermes_trader.agents.perception import extract_fired_triggers
     for i, p in enumerate(perceptions[:20], 1):
         score = p.get("composite_score", 0)
         coin = p.get("coin", "?")
         mid = p.get("mid", 0)
-        fired = [t.get("name", "?") for t in p.get("triggers", []) if t.get("fired")]
+        fired = extract_fired_triggers(p)
         print(f"  [{i:>2}] {coin:<12} score={score:>6.1f}  mid={mid:>12.2f}  triggers={', '.join(fired)}")
     print()
 
 
-def cmd_research(coin: str):
+def cmd_research(coin: str) -> None:
     """Run AI research on a coin."""
     from hermes_trader.agents.research import research
     from hermes_trader.agents.memory import memory
@@ -135,7 +136,7 @@ def cmd_research(coin: str):
     print(f"  {BOLD('ID:')}       {analysis.get('id', '?')}\n")
 
 
-def cmd_execute():
+def cmd_execute() -> None:
     """Execute trade from last confirmed analysis."""
     from hermes_trader.agents.executor import maybe_execute
 
@@ -161,7 +162,7 @@ def cmd_execute():
     print("  No CONFIRMED analysis to execute.\n")
 
 
-def cmd_status():
+def cmd_status() -> None:
     """Show full agent state."""
     from hermes_trader.agents.config_store import read_agent_config
 
@@ -193,7 +194,7 @@ def cmd_status():
     print()
 
 
-def cmd_trades():
+def cmd_trades() -> None:
     """Show trade history."""
     print_banner()
     memory = _import_memory()
@@ -229,7 +230,7 @@ def cmd_trades():
     print()
 
 
-def cmd_account():
+def cmd_account() -> None:
     """Show HL account state."""
     from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 
@@ -267,14 +268,14 @@ def cmd_account():
         print(f"  Error: {e}\n")
 
 
-def cmd_config(*args):
+def cmd_config(*args: str) -> None:
     """Show or set config."""
-    from hermes_trader.agents.config_store import read_agent_config, write_agent_config
+    from hermes_trader.agents.config_store import read_agent_config, update_agent_config
 
     print_banner()
-    config = read_agent_config()
 
     if not args:
+        config = read_agent_config()
         print("  Current config:\n")
         for key, val in sorted(config.items()):
             if isinstance(val, list) and not val:
@@ -286,37 +287,42 @@ def cmd_config(*args):
         print()
     else:
         print("  Updating config:\n")
-        for arg in args:
-            if "=" not in arg:
-                print(f"  Invalid: {arg} (use KEY=VALUE)")
-                continue
-            key, val = arg.split("=", 1)
-            key = key.strip()
-            val = val.strip()
-            old = config.get(key, "✗")
 
-            # Type coercion
-            if val.lower() == "true":
-                val = True
-            elif val.lower() == "false":
-                val = False
-            else:
-                try:
-                    val = int(val)
-                except ValueError:
+        def _mutate(config: dict) -> None:
+            for arg in args:
+                if "=" not in arg:
+                    print(f"  Invalid: {arg} (use KEY=VALUE)")
+                    continue
+                key, val = arg.split("=", 1)
+                key = key.strip()
+                val = val.strip()
+                old = config.get(key, "✗")
+
+                # Type coercion
+                if val.lower() == "true":
+                    val = True
+                elif val.lower() == "false":
+                    val = False
+                else:
                     try:
-                        val = float(val)
+                        val = int(val)
                     except ValueError:
-                        pass
+                        try:
+                            val = float(val)
+                        except ValueError:
+                            pass
 
-            config[key] = val
-            print(f"  {key}: {old!r:12} → {val!r}")
+                config[key] = val
+                print(f"  {key}: {old!r:12} → {val!r}")
 
-        write_agent_config(config)
+        # F20: read-modify-write under one cross-process exclusive flock so
+        # a concurrent dashboard/server write cannot be clobbered.
+        with update_agent_config() as config:
+            _mutate(config)
         print("\n  ✓ Config updated.\n")
 
 
-def cmd_start():
+def cmd_start() -> None:
     """Start autonomous scanning loop in background."""
     import subprocess
 
@@ -344,7 +350,7 @@ def cmd_start():
     print("  Monitor:  hermes status\n")
 
 
-def cmd_stop():
+def cmd_stop() -> None:
     """Stop autonomous scanning loop."""
     from hermes_trader import PID_FILE as pid_file
     if not os.path.exists(pid_file):
@@ -364,7 +370,7 @@ def cmd_stop():
             pass
 
 
-def cmd_version():
+def cmd_version() -> None:
     print_banner()
     print(f"  Hermes-Trader v{__version__}\n")
 
@@ -385,7 +391,7 @@ COMMANDS = {
 }
 
 
-def main():
+def main() -> None:
     if len(sys.argv) < 2:
         print_banner()
         print("  Usage: hermes <command> [args]")

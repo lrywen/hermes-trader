@@ -18,8 +18,11 @@ import fcntl
 import json
 import logging
 import os
+import threading
 import time
-from typing import Any, Dict, List, Optional, TypeVar
+from contextlib import contextmanager
+from copy import deepcopy
+from typing import Any, Dict, Iterator, List, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +39,35 @@ CONFIG_PATH = os.environ.get(
 )
 _CONFIG_LOCK_PATH = CONFIG_PATH + ".lock"
 _BACKUP_PATH = CONFIG_PATH + ".bak"
+
+# ── P1-10: mtime/size cache for the raw config read ─────────────────────
+# read_agent_config() is called on EVERY coin path (research/gates/executor)
+# — dozens of times per scan cycle. Each call took a flock(LOCK_SH) + open +
+# full json.load + deep_merge. The config only changes on operator writes, so
+# cache the parsed dict keyed by (mtime_ns, size): a cheap stat() decides
+# whether the heavy path is needed. write_agent_config() invalidates the
+# cache explicitly; cross-process changes (dashboard writes another file?)
+# are detected by the mtime/size stat. Lock guards the cache itself.
+_RAW_CACHE: Optional[Dict[str, Any]] = None
+_RAW_CACHE_SIG: Optional[tuple] = None
+_RAW_CACHE_LOCK = threading.Lock()
+
+
+def _config_sig() -> Optional[tuple]:
+    """Return (mtime_ns, size) for the config file, or None if missing."""
+    try:
+        st = os.stat(CONFIG_PATH)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _invalidate_raw_cache() -> None:
+    """Drop the cached raw config (call after a local write)."""
+    global _RAW_CACHE, _RAW_CACHE_SIG
+    with _RAW_CACHE_LOCK:
+        _RAW_CACHE = None
+        _RAW_CACHE_SIG = None
 
 # ---------------------------------------------------------------------------
 # Canonical defaults — MUST stay in sync with .agent-config.json.
@@ -127,6 +159,8 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
     # Regime classifier thresholds (chop / against-funding conviction bars)
     "chop_min_conf": 0.75,
     "chop_min_score": 55.0,
+    # P1-4: momentum-burst bypass in chop requires at least this composite score
+    "chop_burst_min_score": 20.0,
     "against_funding_min_conf": 0.85,
     "against_funding_min_score": 60.0,
     # Regime strength label thresholds
@@ -179,6 +213,9 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "enabled": False,
         "max_latency_s": 15.0,
         "cache_ttl_s": 300.0,
+        # P2-2: max entries in the in-process verdict cache (composite key of
+        # coin + score bucket + trigger hash); oldest-expiry evicted past cap.
+        "cache_max_entries": 128,
         "parallel": True,
         "use_structured_output": True,
     },
@@ -248,6 +285,29 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "min_crypto_24h_pct": 10.0,
         "min_hip3_24h_pct": 8.0,
         "min_volume_usd": 5_000_000,
+    },
+    # P2-3: in-process memory retention limits for AgentMemory. Previously
+    # hardcoded module constants; operators can now resize the JSON cache /
+    # event-log rebuild windows without code changes.
+    "memory_limits": {
+        "max_perceptions": 500,
+        "max_analyses": 200,
+        "max_trades": 100,
+        "max_closes": 500,
+    },
+    # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
+    # SL ratchet coordination); and the funding-rate history lookback window
+    # in hours (research display / against-funding context).
+    "sl_buffer_bps": 10.0,
+    "funding_lookback_hours": 24,
+    # P3-2: research-path LLM circuit breaker. After fail_threshold consecutive
+    # hard failures (non-success HTTP / network error) the breaker opens for
+    # cooldown_s and _call_openrouter short-circuits to "" so a dead upstream
+    # can't pile up 60s-timeout calls across every coin each tick; callers
+    # already degrade gracefully on empty. Mirrors the dashboard chat breaker.
+    "llm_circuit_breaker": {
+        "fail_threshold": 3,
+        "cooldown_s": 300,
     },
     # Per-coin parameter overrides; deep-merged on top of the base config by
     # with_coin_overrides() / executor. Empty by default.
@@ -418,30 +478,20 @@ def read_agent_config() -> Dict[str, Any]:
 
 
 def _read_raw_config() -> Optional[Dict[str, Any]]:
-    """Read and parse the raw JSON config, or None on any failure."""
+    """Read and parse the raw JSON config under a shared flock, or None on
+    any failure (see :func:`_read_raw_locked` for semantics).
+
+    F20: thin flock wrapper around :func:`_read_raw_locked` so the same read
+    body can run inside the exclusive lock held by :func:`update_agent_config`
+    without re-opening the lock file (flock binds to the open file
+    description — a second fd in the *same* process asking for LOCK_EX while
+    this one holds it would self-deadlock).
+    """
     lock_fd = None
     try:
         lock_fd = os.open(_CONFIG_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        with open(CONFIG_PATH, "r") as f:
-            cfg = json.load(f)
-        if not isinstance(cfg, dict):
-            logger.error(
-                f"[config] {CONFIG_PATH} top-level is {type(cfg).__name__}, "
-                f"expected object — falling back to CANONICAL_DEFAULTS"
-            )
-            return None
-        return cfg
-    except FileNotFoundError:
-        logger.warning(f"[config] {CONFIG_PATH} not found — using CANONICAL_DEFAULTS")
-        return None
-    except json.JSONDecodeError as e:
-        logger.error(
-            f"[config] {CONFIG_PATH} is CORRUPT (JSON error at line {e.lineno} col "
-            f"{e.colno}): {e.msg}. Falling back to CANONICAL_DEFAULTS — "
-            f"investigate before trading; do NOT overwrite the file blindly."
-        )
-        return None
+        return _read_raw_locked()
     except OSError as e:
         logger.error(
             f"[config] cannot read {CONFIG_PATH}: {e} — falling back to CANONICAL_DEFAULTS"
@@ -456,8 +506,80 @@ def _read_raw_config() -> Optional[Dict[str, Any]]:
                 pass
 
 
+def _read_raw_locked() -> Optional[Dict[str, Any]]:
+    """Read and parse the raw JSON config, assuming the caller already holds
+    a shared or exclusive flock on ``_CONFIG_LOCK_PATH``.
+
+    P1-10: the parsed dict is cached keyed by (mtime_ns, size). A cheap
+    ``stat()`` decides whether the open + json.load path is needed. The
+    cached object is never handed out directly: callers (via
+    ``_deep_merge``) may hold/mutate nested leaves, so every return — hit
+    or miss — is a ``deepcopy`` of a pristine copy.
+    """
+    global _RAW_CACHE, _RAW_CACHE_SIG
+    sig = _config_sig()
+    if sig is not None:
+        with _RAW_CACHE_LOCK:
+            if _RAW_CACHE is not None and sig == _RAW_CACHE_SIG:
+                return deepcopy(_RAW_CACHE)
+    try:
+        with open(CONFIG_PATH, "r") as f:
+            cfg = json.load(f)
+        if not isinstance(cfg, dict):
+            logger.error(
+                f"[config] {CONFIG_PATH} top-level is {type(cfg).__name__}, "
+                f"expected object — falling back to CANONICAL_DEFAULTS"
+            )
+            _invalidate_raw_cache()
+            return None
+        # Re-stat under the lock so the signature matches the bytes parsed.
+        sig = _config_sig()
+        if sig is not None:
+            with _RAW_CACHE_LOCK:
+                _RAW_CACHE = deepcopy(cfg)
+                _RAW_CACHE_SIG = sig
+        return deepcopy(cfg)
+    except FileNotFoundError:
+        logger.warning(f"[config] {CONFIG_PATH} not found — using CANONICAL_DEFAULTS")
+        _invalidate_raw_cache()
+        return None
+    except json.JSONDecodeError as e:
+        logger.error(
+            f"[config] {CONFIG_PATH} is CORRUPT (JSON error at line {e.lineno} col "
+            f"{e.colno}): {e.msg}. Falling back to CANONICAL_DEFAULTS — "
+            f"investigate before trading; do NOT overwrite the file blindly."
+        )
+        return None
+
+
 def write_agent_config(cfg: Dict[str, Any], *, backup: bool = True) -> None:
     """Write the agent config to .agent-config.json (atomic replace + lock).
+
+    F20: thin flock wrapper around :func:`_write_raw_locked` so the write
+    body can run inside the exclusive lock already held by
+    :func:`update_agent_config` (a second LOCK_EX fd in the same process
+    would self-deadlock — flock binds to the open file description).
+    """
+    lock_fd = None
+    try:
+        lock_fd = os.open(_CONFIG_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        _write_raw_locked(cfg, backup=backup)
+    except OSError as e:
+        logger.error(f"[config] FAILED to write {CONFIG_PATH}: {e}")
+        raise
+    finally:
+        if lock_fd is not None:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+
+def _write_raw_locked(cfg: Dict[str, Any], *, backup: bool = True) -> None:
+    """Write *cfg* to disk, assuming the caller already holds LOCK_EX on
+    ``_CONFIG_LOCK_PATH``. See :func:`write_agent_config` for semantics.
 
     When *backup* is True (default), the previous config is copied to
     ``.agent-config.json.bak`` before overwriting, enabling rollback.
@@ -469,53 +591,89 @@ def write_agent_config(cfg: Dict[str, Any], *, backup: bool = True) -> None:
     the exclusive flock, so concurrent readers see either the old or new
     contents rather than a torn file.
     """
+    # Backup the current config before overwriting
+    if backup:
+        try:
+            if os.path.exists(CONFIG_PATH):
+                with open(CONFIG_PATH, "r") as src:
+                    old_data = src.read()
+                with open(_BACKUP_PATH, "w") as dst:
+                    dst.write(old_data)
+                    dst.flush()
+                    os.fsync(dst.fileno())
+        except OSError as e:
+            logger.warning(f"[config] backup failed (non-fatal): {e}")
+
+    tmp = CONFIG_PATH + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, CONFIG_PATH)
+    except OSError as replace_err:
+        # EBUSY: single-file bind mount (e.g. docker -v host:guest).
+        # EXDEV/EPERM can surface on similarly restricted filesystems.
+        # Fall back to an in-place overwrite of the mounted target.
+        if replace_err.errno not in (getattr(os, "EBUSY", 16),):
+            raise
+        logger.warning(
+            f"[config] os.replace onto {CONFIG_PATH} hit EBUSY "
+            f"(bind-mounted file); rewriting in place instead"
+        )
+        with open(CONFIG_PATH, "w") as f:
+            json.dump(cfg, f, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    # P1-10: drop any cached raw config so the next read reloads from
+    # disk. Covers both the os.replace() and EBUSY in-place paths.
+    _invalidate_raw_cache()
+    logger.info(f"[config] written {len(cfg)} keys to {CONFIG_PATH}")
+
+
+@contextmanager
+def update_agent_config(*, backup: bool = True) -> Iterator[Dict[str, Any]]:
+    """F20: cross-process read-modify-write critical section for the agent
+    config.
+
+    Opens the flock file once and takes LOCK_EX for the whole RMW: reads the
+    current effective config (canonical defaults deep-merged over the raw
+    file), yields it for in-place mutation, then — if the body exits cleanly
+    — writes it back under the *same* lock. ``threading.Lock`` cannot
+    serialize a CLI/daemon process against the web process; flock can, so
+    every read-then-write config path (dashboard handler, the legacy
+    ``POST /api/agent/config`` endpoint, the ``config`` CLI) must go through
+    this context manager instead of calling read_agent_config() /
+    write_agent_config() separately.
+
+    Aborts (writes nothing) when:
+      * the body raises — the exception propagates, the on-disk file is
+        untouched;
+      * the on-disk config is missing, unreadable, or corrupt — the same
+        None the plain read path treats as "fall back to defaults". Writing
+        a defaults-blob here would silently clobber a corrupt file operators
+        are explicitly told to investigate, so raise instead.
+
+    Do NOT call read_agent_config()/write_agent_config() inside the body:
+    those open their own fd and flock self-deadlocks within one process.
+    """
     lock_fd = None
     try:
         lock_fd = os.open(_CONFIG_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-
-        # Backup the current config before overwriting
-        if backup:
-            try:
-                if os.path.exists(CONFIG_PATH):
-                    with open(CONFIG_PATH, "r") as src:
-                        old_data = src.read()
-                    with open(_BACKUP_PATH, "w") as dst:
-                        dst.write(old_data)
-                        dst.flush()
-                        os.fsync(dst.fileno())
-            except OSError as e:
-                logger.warning(f"[config] backup failed (non-fatal): {e}")
-
-        tmp = CONFIG_PATH + ".tmp"
-        try:
-            with open(tmp, "w") as f:
-                json.dump(cfg, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, CONFIG_PATH)
-        except OSError as replace_err:
-            # EBUSY: single-file bind mount (e.g. docker -v host:guest).
-            # EXDEV/EPERM can surface on similarly restricted filesystems.
-            # Fall back to an in-place overwrite of the mounted target.
-            if replace_err.errno not in (getattr(os, "EBUSY", 16),):
-                raise
-            logger.warning(
-                f"[config] os.replace onto {CONFIG_PATH} hit EBUSY "
-                f"(bind-mounted file); rewriting in place instead"
+        raw = _read_raw_locked()
+        if raw is None:
+            raise RuntimeError(
+                f"[config] {CONFIG_PATH} is missing or corrupt — refusing to "
+                f"overwrite blindly; investigate and restore from .bak first"
             )
-            with open(CONFIG_PATH, "w") as f:
-                json.dump(cfg, f, indent=2)
-                f.flush()
-                os.fsync(f.fileno())
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        logger.info(f"[config] written {len(cfg)} keys to {CONFIG_PATH}")
-    except OSError as e:
-        logger.error(f"[config] FAILED to write {CONFIG_PATH}: {e}")
-        raise
+        cfg = _deep_merge(CANONICAL_DEFAULTS, raw)
+        yield cfg
+        _write_raw_locked(cfg, backup=backup)
     finally:
         if lock_fd is not None:
             try:
@@ -636,12 +794,15 @@ def list_snapshots() -> List[Dict[str, Any]]:
 
 
 def restore_snapshot(ts: int) -> bool:
-    """Restore a specific manual snapshot by unix timestamp. Returns True."""
+    """Restore a specific manual snapshot by unix timestamp. Returns True.
+
+    Mirrors restore_backup(): do NOT hold the config flock here. flock locks
+    are bound to the open file description, so a second fd in this same
+    process (opened by write_agent_config) blocking on LOCK_EX would
+    self-deadlock. write_agent_config takes the lock itself.
+    """
     path = _snap_path(ts)
-    lock_fd = None
     try:
-        lock_fd = os.open(_CONFIG_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if not os.path.exists(path):
             return False
         with open(path, "r") as f:
@@ -654,13 +815,6 @@ def restore_snapshot(ts: int) -> bool:
     except (OSError, json.JSONDecodeError) as e:
         logger.error(f"[config] snapshot restore failed: {e}")
         return False
-    finally:
-        if lock_fd is not None:
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                os.close(lock_fd)
-            except OSError:
-                pass
 
 
 def _prune_snapshots_nolock() -> None:

@@ -28,5 +28,8 @@ __pycache__/
 docs/
 *.md
 !README.md
+# Exception: ship the ops DSL/SL manual inside the image.
+!docs/ops/
+!docs/ops/dsl_sl_manual.md
 skills/
 tests/

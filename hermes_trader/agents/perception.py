@@ -63,6 +63,26 @@ _CANDLE_CACHE_MAX = int(os.environ.get("HERMES_PERCEPTION_CACHE_MAX", "512"))
 _candle_cache: _Cache = _Cache(max_size=_CANDLE_CACHE_MAX, default_ttl=50.0)
 
 
+# P2-6: single canonical way to read fired trigger names off a perception.
+# Previously the same comprehension was inlined in research / ta_filter /
+# perception / __main__ (and a *string* lookup in the executor); any change to
+# the trigger shape had to be made in every site.
+def extract_fired_triggers(perception: Optional[Dict[str, Any]]) -> List[str]:
+    """Names of the triggers that fired for a perception (de-duplicated,
+    order-preserving). Accepts a perception dict; also tolerates a plain
+    ``{"fired_triggers": [...]}`` analysis dict."""
+    if not isinstance(perception, dict):
+        return []
+    if "fired_triggers" in perception and "triggers" not in perception:
+        # Already-normalized analysis payload (executor side).
+        return [str(n) for n in (perception.get("fired_triggers") or []) if n]
+    seen: Dict[str, None] = {}
+    for t in perception.get("triggers") or []:
+        if isinstance(t, dict) and t.get("fired") and t.get("name"):
+            seen.setdefault(str(t["name"]), None)
+    return list(seen.keys())
+
+
 def _make_cache_key(coin: str, interval: str, count: int) -> str:
     return f"{coin}:{interval}:{count}"
 

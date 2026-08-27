@@ -47,7 +47,7 @@ class HLSSLOptWebsocketManager(WebsocketManager):
             "ca_certs": certifi.where(),
         }
 
-    def run(self):
+    def run(self) -> None:
         """Override to inject SSL options into run_forever()."""
         self.ping_sender.start()
         self.ws.run_forever(sslopt=self._sslopt)

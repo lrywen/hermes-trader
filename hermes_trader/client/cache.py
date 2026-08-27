@@ -117,7 +117,7 @@ def cached_api_call(key_func: Callable, ttl: float = 3.0, max_size: int = 512) -
 
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             key = key_func(*args, **kwargs)
             cached = cache.get(key)
             if cached is not None:

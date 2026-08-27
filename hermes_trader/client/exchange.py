@@ -33,6 +33,7 @@ from hyperliquid.utils.signing import (
     OrderType,
     TriggerOrderType,
 )
+from hyperliquid.utils.types import Cloid
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
@@ -782,6 +783,7 @@ def place_hl_order(
     mid_price: float,
     coin: str = "BTC",
     reduce_only: bool = False,
+    cloid: Optional[Cloid] = None,
 ) -> Dict[str, Any]:
     """Place an IOC (immediate-or-cancel) limit order on Hyperliquid.
 
@@ -847,13 +849,18 @@ def place_hl_order(
         
         # SDK expects float for both size and price (signature: limit_px: float).
         # price_str was already rounded to HL's tick + sigfig rules, so float() is safe.
+        # cloid is an exchange-side idempotency key: a retried order with the same
+        # cloid is rejected by HL as a duplicate rather than filled twice.
+        order_kwargs = {"reduce_only": reduce_only}
+        if cloid is not None:
+            order_kwargs["cloid"] = cloid
         result = exchange.order(
             coin,
             is_buy,
             float(size_str),
             float(price_str),
             order_type,
-            reduce_only=reduce_only,
+            **order_kwargs,
         )
 
         parsed = _parse_order_result(result)
@@ -1105,30 +1112,55 @@ def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int]
 
 # ── ATR ────────────────────────────────────────────────────────────────────────
 
+# ATR is computed from 4h candles (24 candles/day); it changes slowly so a
+# short TTL safely eliminates redundant candle fetches within one execute()
+# call and across nearby calls. 0.0 results are also cached so a coin with
+# insufficient history doesn't trigger repeated network fetches.
+_ATR_CACHE: Dict[str, Tuple[float, float]] = {}
+_ATR_CACHE_LOCK = threading.Lock()
+_ATR_TTL_S = float(os.environ.get("HERMES_ATR_TTL_S", "60"))
+
+
 def get_hl_atr(
     interval: str = "4h",
     period: int = 14,
     coin: str = "BTC",
 ) -> float:
-    """Compute ATR(14) on a given HL interval (defaults to 4h)."""
+    """Compute ATR(period) on a given HL interval (defaults to 4h).
+
+    Results are cached for _ATR_TTL_S seconds keyed by (interval, period, coin).
+    ATR on 4h candles is stable over sub-minute windows, and the executor may
+    call this multiple times with identical arguments within one execution;
+    caching avoids redundant candle API round-trips.
+    """
+    cache_key = f"{interval}|{period}|{coin}"
+    now = _time.time()
+    with _ATR_CACHE_LOCK:
+        hit = _ATR_CACHE.get(cache_key)
+        if hit and (now - hit[0]) < _ATR_TTL_S:
+            return hit[1]
+
     candles = fetch_hl_candles(coin, interval, period + 10)
     if len(candles) < period + 1:
-        return 0.0
-    
-    tr = []
-    for i in range(1, len(candles)):
-        cur, pc = candles[i], candles[i - 1]
-        tr.append(max(
-            cur.h - cur.l,
-            abs(cur.h - pc.c),
-            abs(cur.l - pc.c),
-        ))
-    
-    if len(tr) < period:
-        return 0.0
-    
-    atr = sum(tr[:period]) / period
-    for i in range(period, len(tr)):
-        atr = (atr * (period - 1) + tr[i]) / period
+        result = 0.0
+    else:
+        tr = []
+        for i in range(1, len(candles)):
+            cur, pc = candles[i], candles[i - 1]
+            tr.append(max(
+                cur.h - cur.l,
+                abs(cur.h - pc.c),
+                abs(cur.l - pc.c),
+            ))
 
-    return atr
+        if len(tr) < period:
+            result = 0.0
+        else:
+            atr = sum(tr[:period]) / period
+            for i in range(period, len(tr)):
+                atr = (atr * (period - 1) + tr[i]) / period
+            result = atr
+
+    with _ATR_CACHE_LOCK:
+        _ATR_CACHE[cache_key] = (now, result)
+    return result
