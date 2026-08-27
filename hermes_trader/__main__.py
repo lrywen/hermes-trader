@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import signal
 import sys
+from typing import Any
 
 from hermes_trader import __version__
 
@@ -45,7 +46,9 @@ GRAY = lambda t: color(t, "\033[90m")
 BOLD = lambda t: color(t, "\033[1m")
 
 
-def _import_memory():
+def _import_memory() -> Any:
+    # Imported lazily inside the function; the return value is the shared
+    # ``memory`` singleton (agents.memory.Memory).
     from hermes_trader.agents.memory import memory
     memory.load()
     return memory

@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -157,7 +157,7 @@ def _cache_sweep(now: float, ttl: float, max_keep: int) -> None:
             _cache.pop(k, None)
 
 
-def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S):
+def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:

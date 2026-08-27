@@ -110,7 +110,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     # Pre-warm candle cache for top tickers in a background thread so the
     # first research request doesn't pay cold-start HTTP latency for 3 TFs.
-    def _warm_candles():
+    def _warm_candles() -> None:
         from concurrent.futures import ThreadPoolExecutor
         from hermes_trader.client.hl_client import fetch_hl_candles
         tickers = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
@@ -345,7 +345,7 @@ async def run_research_stream(coin: str, request: Request) -> StreamingResponse:
     """
     from fastapi.responses import StreamingResponse
 
-    async def _event_stream():
+    async def _event_stream() -> AsyncIterator[str]:
         yield f"event: meta\ndata: {json.dumps({'coin': coin})}\n\n"
         yield (
             f"event: retired\ndata: {json.dumps({'message': 'Streaming research retired; use POST /api/agent/research/{coin} (native in-process debate)'})}\n\n"
@@ -374,7 +374,7 @@ async def risk_review_stream(request: Request) -> StreamingResponse:
     """
     from fastapi.responses import StreamingResponse
 
-    async def _event_stream():
+    async def _event_stream() -> AsyncIterator[str]:
         yield (
             f"event: retired\ndata: {json.dumps({'message': 'HTA risk-review streaming retired; risk gating runs in-process.'})}\n\n"
         )

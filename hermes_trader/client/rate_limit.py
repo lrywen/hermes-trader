@@ -26,6 +26,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from typing import Union
 
 # Per-endpoint weights from HL docs. Default 20 (the expensive bucket) for
 # anything unknown so we never under-count and trip a 429.
@@ -67,7 +68,7 @@ class TokenBucket:
     """Thread-safe in-process token bucket. `acquire(weight)` blocks (up to
     max_wait) until enough tokens have refilled, then deducts them."""
 
-    def __init__(self, capacity: int, refill_per_sec: float):
+    def __init__(self, capacity: int, refill_per_sec: float) -> None:
         self._capacity = float(capacity)
         self._tokens = float(capacity)
         self._refill = float(refill_per_sec)
@@ -129,7 +130,7 @@ class SharedTokenBucket:
     by the SAME writer on consecutive writes).
     """
 
-    def __init__(self, capacity: int, refill_per_sec: float, path: str):
+    def __init__(self, capacity: int, refill_per_sec: float, path: str) -> None:
         self._capacity = float(capacity)
         self._refill = float(refill_per_sec)
         self._path = path
@@ -266,7 +267,7 @@ class SharedTokenBucket:
             self._thread_lock.release()
 
 
-def _build_limiter():
+def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
     cap = _capacity()
     rate = _refill_rate()
     shared = os.environ.get("HERMES_HL_RATE_SHARED", "1").strip().lower() in (

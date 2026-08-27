@@ -15,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.middleware.base import RequestResponseEndpoint
 
 from hermes_trader import session_log
 from hermes_trader.agents.config_store import read_agent_config
@@ -55,7 +56,9 @@ def register_public_routes(app: FastAPI) -> None:
     _deprecated_token_paths: set = set()
 
     @app.middleware("http")
-    async def _deprecate_query_token(request: Request, call_next):
+    async def _deprecate_query_token(
+        request: Request, call_next: RequestResponseEndpoint
+    ) -> Response:
         response = await call_next(request)
         # F9: security headers on every response. CSP on JSON endpoints is
         # harmless; X-Frame-Options/nosniff/Referrer-Policy are global.

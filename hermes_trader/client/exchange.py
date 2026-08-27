@@ -61,7 +61,7 @@ _POST_BACKOFF = 2.0  # seconds, doubles each attempt
 _SDK_TIMEOUT = float(os.environ.get("HERMES_HL_SDK_TIMEOUT_S", "30"))
 
 
-def _mount_retry_adapter(session) -> None:
+def _mount_retry_adapter(session: Any) -> None:
     retry = Retry(
         total=5,
         connect=5,
@@ -79,7 +79,7 @@ def _mount_retry_adapter(session) -> None:
 _orig_api_init = API.__init__
 
 
-def _patched_api_init(self, base_url=None, timeout=None):
+def _patched_api_init(self: Any, base_url: Optional[str] = None, timeout: Optional[float] = None) -> None:
     _orig_api_init(self, base_url, timeout)
     _mount_retry_adapter(self.session)
 
@@ -89,7 +89,7 @@ API.__init__ = _patched_api_init
 _orig_api_post = API.post
 
 
-def _patched_api_post(self, url_path, payload=None):
+def _patched_api_post(self: Any, url_path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
     payload = payload or {}
     last_err = None
     for attempt in range(_MAX_POST_RETRIES):

@@ -261,7 +261,7 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
         m = perp_meta.get(coin) or hip3_meta.get(coin) or spot_meta.get(coin, {})
         c = perp_ctx.get(coin) or hip3_ctx.get(coin) or spot_ctx.get(coin, {})
         
-        def _f(v, d=0):
+        def _f(v: Any, d: float = 0) -> float:
             return float(v) if v is not None else d
         
         asset = {

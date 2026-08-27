@@ -39,7 +39,7 @@ _WS_RECONNECT_JITTER = 0.5  # +/- jitter fraction
 class HLSSLOptWebsocketManager(WebsocketManager):
     """WebsocketManager that passes certifi SSL context to run_forever()."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str) -> None:
         super().__init__(base_url)
         # Prepare SSL options for run_forever
         self._sslopt = {
@@ -92,7 +92,7 @@ class HyperliquidWebSocket:
         ws.stop()
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._info: Optional[Info] = None
         self._ws_manager: Optional[HLSSLOptWebsocketManager] = None
@@ -265,9 +265,9 @@ class HyperliquidWebSocket:
             except Exception:
                 pass
 
-    def __enter__(self):
+    def __enter__(self) -> "HyperliquidWebSocket":
         self.start()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.stop()

@@ -321,25 +321,25 @@ def _signals_block(coin: str) -> str:
     try:
         skip_news = _should_skip_news()
 
-        def _fetch_gex():
+        def _fetch_gex() -> Optional[Any]:
             if not is_hip3:
                 return None
             from hermes_trader.agents.options_gex import gex_signal_cached
             return gex_signal_cached(coin)
 
-        def _fetch_short_vol():
+        def _fetch_short_vol() -> Optional[Any]:
             if not is_hip3:
                 return None
             from hermes_trader.agents.short_volume import short_volume_signal
             return short_volume_signal(coin)
 
-        def _fetch_whale():
+        def _fetch_whale() -> Optional[Any]:
             if is_hip3:
                 return None
             from hermes_trader.agents.crypto_whale import crypto_whale_signal
             return crypto_whale_signal(coin, window_minutes=15)
 
-        def _fetch_catalyst():
+        def _fetch_catalyst() -> Optional[Any]:
             if skip_news:
                 return None
             from hermes_trader.agents.news_catalyst import catalyst_scan
@@ -671,7 +671,7 @@ def _call_openrouter(
     # this many continuation turns are appended to complete it.
     _MAX_LENGTH_CONTINUATIONS = 2
 
-    def _post(msgs: List[Dict[str, str]], max_toks: int):
+    def _post(msgs: List[Dict[str, str]], max_toks: int) -> httpx.Response:
         body = dict(payload)
         body["messages"] = msgs
         body["max_tokens"] = max_toks
@@ -685,7 +685,7 @@ def _call_openrouter(
             timeout=httpx.Timeout(timeout, connect=5.0),
         )
 
-    def _retry_after_s(resp, attempt: int) -> float:
+    def _retry_after_s(resp: httpx.Response, attempt: int) -> float:
         """Provider Retry-After (seconds), else exponential backoff, capped."""
         try:
             ra = (resp.headers.get("retry-after") or "").strip()
@@ -695,7 +695,7 @@ def _call_openrouter(
             pass
         return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
 
-    def _send(msgs: List[Dict[str, str]], max_toks: int):
+    def _send(msgs: List[Dict[str, str]], max_toks: int) -> httpx.Response:
         """POST with 429/5xx backoff. Returns the final response (any status)."""
         resp = None
         for attempt in range(_MAX_429_RETRIES + 1):

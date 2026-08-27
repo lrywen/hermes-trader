@@ -604,7 +604,7 @@ def scan_once(
         crypto_sweep_floor = float(_cfg.get("min_market_volume_usd", movers_vol_floor) or movers_vol_floor)
         hip3_sweep_floor = float(_cfg.get("min_hip3_volume_usd", hip3_movers_floor) or hip3_movers_floor)
 
-        def _abs_pct_24h(m):
+        def _abs_pct_24h(m: Dict[str, Any]) -> float:
             prev = float(m.get("prevDayPx") or 0)
             # Current price MUST come from this cycle's fresh mids — the universe
             # dict's midPx is from the (up-to-24h-cached) metaAndAssetCtxs snapshot
@@ -616,7 +616,12 @@ def scan_once(
                 return 0.0
             return abs((cur - prev) / prev * 100)
 
-        def _pick_with_movers(pool, vol_budget, movers_budget, mv_floor):
+        def _pick_with_movers(
+            pool: List[Dict[str, Any]],
+            vol_budget: int,
+            movers_budget: int,
+            mv_floor: float,
+        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
             """Top-N by 24h volume + top-M by |24h%|, deduped, in that priority.
 
             Movers slot guarantees a budget for sub-top-volume big movers
