@@ -442,25 +442,22 @@ def _positions_payload_uncached() -> List[Dict[str, Any]]:
     return _rows_from_state(state)
 
 
-def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Transform a raw HL account state into dashboard position rows, overlaying
-    DSL tracker phase/floor from the shared state file. Pure — no network."""
-    rows: List[Dict[str, Any]] = []
-    for p in state.get("asset_positions", []):
-        pos = p.get("position", {})
-        coin = pos.get("coin")
-        try:
-            szi = float(pos.get("szi", "0") or 0)
-            entry = float(pos.get("entryPx") or 0)
-            mark = float(pos.get("positionValue", 0) or 0) / abs(szi) if szi else 0
-            unrealized_usd = float(pos.get("unrealizedPnl", 0) or 0)
-            margin_used = float(pos.get("marginUsed", 0) or 0)
-        except (TypeError, ValueError):
-            continue
-        if szi == 0 or not coin:
-            continue
-        side = "long" if szi > 0 else "short"
+def _parse_raw_position(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize one HL ``asset_positions[i]["position"]`` record into numeric
+    fields. F24: single source of truth shared by the dashboard view rows
+    (_rows_from_state) and the terminal command rows (_positions_from_state),
+    which used to hand-roll two divergent parsers.
 
+    Returns None for flat (szi==0), coin-less, or unparseable records — a
+    single malformed entry must not abort the whole position list.
+    """
+    coin = pos.get("coin")
+    try:
+        szi = float(pos.get("szi", "0") or 0)
+        entry = float(pos.get("entryPx") or 0)
+        unrealized_usd = float(pos.get("unrealizedPnl", 0) or 0)
+        margin_used = float(pos.get("marginUsed", 0) or 0)
+        position_value = float(pos.get("positionValue", 0) or 0)
         # HL stores leverage as {"value": N, "type": "cross"|"isolated"}; older
         # records (and synthesized stubs) may store it as a bare int.
         leverage_obj = pos.get("leverage")
@@ -468,6 +465,38 @@ def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
             leverage = int(leverage_obj.get("value", 1) or 1)
         else:
             leverage = int(leverage_obj or 1)
+    except (TypeError, ValueError):
+        return None
+    if szi == 0 or not coin:
+        return None
+    return {
+        "coin": coin,
+        "szi": szi,
+        "side": "long" if szi > 0 else "short",
+        "entry": entry,
+        "mark": (position_value / abs(szi)) if szi else 0.0,
+        "unrealized_usd": unrealized_usd,
+        "margin_used": margin_used,
+        "leverage": leverage,
+    }
+
+
+def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Transform a raw HL account state into dashboard position rows, overlaying
+    DSL tracker phase/floor from the shared state file. Pure — no network."""
+    rows: List[Dict[str, Any]] = []
+    for p in state.get("asset_positions") or []:
+        parsed = _parse_raw_position(p.get("position", {}))
+        if parsed is None:
+            continue
+        coin = parsed["coin"]
+        side = parsed["side"]
+        szi = parsed["szi"]
+        entry = parsed["entry"]
+        mark = parsed["mark"]
+        unrealized_usd = parsed["unrealized_usd"]
+        margin_used = parsed["margin_used"]
+        leverage = parsed["leverage"]
 
         spot_pct = ((mark - entry) / entry * 100 if side == "long"
                     else (entry - mark) / entry * 100) if entry else 0
@@ -1353,21 +1382,23 @@ def _positions_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 
     Each row carries coin / side / size / entry / szi / uPnL so the five
     terminal consumers (close-bulk, positions, kill, dump, LLM context) share
-    one extraction instead of five hand-rolled list comprehensions.
+    one extraction instead of five hand-rolled list comprehensions. F24: the
+    per-record normalization now comes from _parse_raw_position (shared with
+    the dashboard view rows); malformed entries are skipped rather than
+    raising and aborting the whole list.
     """
     rows: List[Dict[str, Any]] = []
-    for p in state.get("asset_positions", []) or []:
-        pos = p.get("position", {})
-        szi = float(pos.get("szi", "0") or 0)
-        if szi == 0:
+    for p in state.get("asset_positions") or []:
+        parsed = _parse_raw_position(p.get("position", {}))
+        if parsed is None:
             continue
         rows.append({
-            "coin": pos.get("coin"),
-            "side": "long" if szi > 0 else "short",
-            "size": abs(szi),
-            "entry": float(pos.get("entryPx", "0") or 0),
-            "szi": szi,
-            "uPnL": float(pos.get("unrealizedPnl", "0") or 0),
+            "coin": parsed["coin"],
+            "side": parsed["side"],
+            "size": abs(parsed["szi"]),
+            "entry": parsed["entry"],
+            "szi": parsed["szi"],
+            "uPnL": parsed["unrealized_usd"],
         })
     return rows
 
