@@ -160,7 +160,7 @@ DEBATE_STAGE_DURATION = Histogram(
 DEBATE_FALLBACKS = Counter(
     "hermes_debate_fallbacks_total",
     "Debate attempts that gave up and fell back to the single-LLM path, "
-    "labelled by bounded reason (bull_bear_failed/both_empty/synth_failed/"
+    "labelled by bounded reason (bull_bear_failed/synth_failed/"
     "synth_empty/other).",
     ["reason"],
 )

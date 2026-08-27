@@ -1534,17 +1534,9 @@ def _debate_research(
         {"stage": "bull_bear", "outcome": "ok"}, max(0.0, time.time() - bb_start),
     )
 
-    if not bull and not bear:
-        logger.warning(
-            f"[debate] both empty → single fallback | coin={coin} "
-            f"elapsed_ms={bb_elapsed}"
-        )
-        _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "both_empty"})
-        return None
-    if not bull:
-        logger.warning(f"[debate] bull empty, proceeding with bear only | coin={coin}")
-    if not bear:
-        logger.warning(f"[debate] bear empty, proceeding with bull only | coin={coin}")
+    # No emptiness check needed: _debate_direct raises on empty responses, so
+    # bull/bear are always non-empty strings here (any empty call already
+    # aborted above via the bull/bear FAILED fallback).
 
     synth_start = time.time()
     try:
