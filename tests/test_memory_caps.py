@@ -80,3 +80,61 @@ def test_cap_bounds_trades_list(small_limits, monkeypatch):
     assert len(m._trades) == 10
     assert m._trades[0]["seq"] == 5
     assert m._trades[-1]["seq"] == 14
+
+
+# ── R9/P3-4: age-based eviction ─────────────────────────────────────────────
+
+@pytest.fixture()
+def age_limits():
+    """Pin a 1-day max age for perceptions/analyses and leave trades at the
+    count-capped default (max_age_days.trades=0 → no age eviction)."""
+    cfg = read_agent_config()
+    saved = cfg.get("memory_limits")
+    ml = dict(saved or {})
+    ml["max_age_days"] = {"perceptions": 1, "analyses": 1, "trades": 0}
+    cfg["memory_limits"] = ml
+    write_agent_config(cfg, backup=False)
+    yield
+    restored = read_agent_config()
+    if saved is None:
+        restored.pop("memory_limits", None)
+    else:
+        restored["memory_limits"] = saved
+    write_agent_config(restored, backup=False)
+
+
+def test_age_evicts_old_perceptions(age_limits):
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    day_ms = 86400 * 1000
+    m = _mem()
+    m.record_perception({"seq": "old", "ts": now_ms - 5 * day_ms})
+    m.record_perception({"seq": "fresh", "ts": now_ms})
+    m.record_perception({"seq": "undatable"})  # no timestamp → kept
+    seqs = {p["seq"] for p in m._perceptions}
+    assert seqs == {"fresh", "undatable"}
+
+
+def test_age_evicts_old_analyses(age_limits):
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    day_ms = 86400 * 1000
+    m = _mem()
+    m.record_analysis({"seq": "old", "created_at": now_ms - 3 * day_ms})
+    m.record_analysis({"seq": "fresh", "created_at": now_ms})
+    seqs = {a["seq"] for a in m._analyses}
+    assert seqs == {"fresh"}
+
+
+def test_trades_not_age_evicted(age_limits, monkeypatch):
+    # trades max_age_days defaults to 0 (audit record): an old trade is kept
+    # and only the count cap applies.
+    from hermes_trader import event_log
+    monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
+    import time as _time
+    now_ms = int(_time.time() * 1000)
+    day_ms = 86400 * 1000
+    m = _mem()
+    m.record_trade({"seq": "ancient", "coin": "BTC",
+                    "executed_at": now_ms - 365 * day_ms})
+    assert [t["seq"] for t in m._trades] == ["ancient"]

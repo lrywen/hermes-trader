@@ -69,6 +69,9 @@ class _ConfigPatch(BaseModel):
     loss_cooldown_min: int = Field(default=CANONICAL_DEFAULTS["loss_cooldown_min"], ge=0, le=100_000)
     min_ai_close_hold_min: int = Field(default=CANONICAL_DEFAULTS["min_ai_close_hold_min"], ge=0, le=100_000)
     funding_lookback_hours: int = Field(default=CANONICAL_DEFAULTS["funding_lookback_hours"], ge=1, le=720)
+    # R9/P2-3: news gate freshness window (days) and Brave headline cache TTL (s).
+    news_freshness_days: int = Field(default=CANONICAL_DEFAULTS["news_freshness_days"], ge=1, le=365)
+    news_cache_ttl_s: int = Field(default=CANONICAL_DEFAULTS["news_cache_ttl_s"], ge=0, le=86_400)
     research_cooldown_min: int = Field(default=CANONICAL_DEFAULTS["research_cooldown_min"], ge=0, le=100_000)
     held_research_interval_min: int = Field(default=CANONICAL_DEFAULTS["held_research_interval_min"], ge=0, le=100_000)
     force_execute_composite: int = Field(default=CANONICAL_DEFAULTS["force_execute_composite"], ge=0, le=100)

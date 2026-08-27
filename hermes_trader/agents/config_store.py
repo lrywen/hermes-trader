@@ -294,12 +294,24 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "max_analyses": 200,
         "max_trades": 100,
         "max_closes": 500,
+        # R9/P3-4: age-based retention in days for the time-bounded lists.
+        # 0 disables age eviction (trades are an audit record — count-capped
+        # only). Records without a usable timestamp are never age-evicted.
+        "max_age_days": {
+            "perceptions": 30,
+            "analyses": 30,
+            "trades": 0,
+        },
     },
     # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
     # SL ratchet coordination); and the funding-rate history lookback window
     # in hours (research display / against-funding context).
     "sl_buffer_bps": 10.0,
     "funding_lookback_hours": 24,
+    # R9/P2-3: news gate freshness window (days) and the short-TTL Brave
+    # headline cache (seconds). Were hardcoded module constants in research.py.
+    "news_freshness_days": 2,
+    "news_cache_ttl_s": 120,
     # P3-2: research-path LLM circuit breaker. After fail_threshold consecutive
     # hard failures (non-success HTTP / network error) the breaker opens for
     # cooldown_s and _call_openrouter short-circuits to "" so a dead upstream

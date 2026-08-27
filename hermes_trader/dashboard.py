@@ -44,7 +44,6 @@ from hermes_trader.agents.config_store import (
     cfg_get,
     read_agent_config,
     update_agent_config,
-    write_agent_config,
 )
 from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 from hermes_trader.positions_snapshot import read_snapshot as read_position_snapshot
@@ -70,7 +69,7 @@ _max_lev_table_loaded_at: float = 0.0
 _MAX_LEV_TTL_S = float(os.environ.get("HERMES_MAX_LEV_TTL_S", "3600"))
 _max_lev_lock = threading.Lock()
 
-# F20: serializes dashboard-side config read-modify-write. write_agent_config
+# F20: serializes dashboard-side config read-modify-write. The config writer
 # is atomic and flock-guarded per call, but two concurrent requests can both
 # read the old config, each tweak their own key, and the later writer clobbers
 # the earlier one's change. This lock makes the whole RMW critical section

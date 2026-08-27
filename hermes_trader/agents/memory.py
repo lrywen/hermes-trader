@@ -57,6 +57,65 @@ MAX_CLOSES = 500  # realized trade outcomes — backs win-rate / payoff / risk-o
 # closes limit) so it cannot grow unboundedly; the read-time close-time window
 # filters older entries anyway.
 
+# R9/P3-4: age-based retention (days). The count caps above bound the list
+# length, but without an age cutoff a low-traffic deployment keeps months-old
+# perceptions/analyses in the agent's working context forever. 0 disables age
+# eviction for that list (trades are an audit record — count-capped only).
+MAX_AGE_DAYS_DEFAULT = {"perceptions": 30.0, "analyses": 30.0, "trades": 0.0}
+# Candidate timestamp keys (ms epoch) per list, in priority order. Records with
+# no usable timestamp are kept (never silently evict what we can't date).
+_AGE_TS_KEYS = {
+    "perceptions": ("ts", "created_at", "timestamp"),
+    "analyses": ("created_at", "ts", "timestamp"),
+    "trades": ("executed_at", "created_at", "ts", "timestamp"),
+}
+
+
+def _memory_max_age_days() -> Dict[str, float]:
+    """Configured max age in days for the time-bounded memory lists.
+
+    R9/P3-4: reads ``memory_limits.max_age_days.<list>`` via cfg_get with the
+    ``MAX_AGE_DAYS_DEFAULT`` fallbacks. A missing/invalid/negative value falls
+    back to the default; 0 means "do not evict by age" for that list.
+    """
+    from hermes_trader.agents.config_store import cfg_get
+    cfg = cfg_get("memory_limits.max_age_days", None)
+    if not isinstance(cfg, dict):
+        return dict(MAX_AGE_DAYS_DEFAULT)
+    out: Dict[str, float] = {}
+    for key, fallback in MAX_AGE_DAYS_DEFAULT.items():
+        try:
+            v = float(cfg.get(key, fallback))
+            out[key] = v if v >= 0 else fallback
+        except (TypeError, ValueError):
+            out[key] = fallback
+    return out
+
+
+def _evict_aged(records: List[Dict[str, Any]], list_key: str,
+                cutoff_ms: float) -> List[Dict[str, Any]]:
+    """Drop records older than ``cutoff_ms`` (ms epoch); keep undatable ones.
+
+    Returns a new list so callers can reassign under the lock.
+    """
+    keys = _AGE_TS_KEYS.get(list_key, ())
+    kept: List[Dict[str, Any]] = []
+    for rec in records:
+        ts_ms = None
+        for k in keys:
+            v = rec.get(k)
+            if v:
+                try:
+                    ts_ms = float(v)
+                    break
+                except (TypeError, ValueError):
+                    continue
+        # No usable timestamp → keep (matches the closes window convention of
+        # never aging out rows we can't date).
+        if ts_ms is None or ts_ms <= 0 or ts_ms >= cutoff_ms:
+            kept.append(rec)
+    return kept
+
 
 def _memory_limits() -> Dict[str, int]:
     """Configured retention limits for the in-process memory lists.
@@ -379,25 +438,45 @@ class AgentMemory:
 
     # ── Write operations ────────────────────────────────────────────────────
 
+    def _retention_sweep_nolock(self) -> None:
+        """R9/P3-4: apply age eviction + count cap to perceptions/analyses/trades.
+
+        Called under ``self._lock`` from the record_* writes. Count caps use a
+        cheap length check; the age sweep only runs for lists with a non-zero
+        max_age_days and rebuilds the list in place.
+        """
+        limits = _memory_limits()
+        ages = _memory_max_age_days()
+        now_ms = time.time() * 1000.0
+        for list_key, cap_key in (("perceptions", "perceptions"),
+                                  ("analyses", "analyses"),
+                                  ("trades", "trades")):
+            records = getattr(self, f"_{list_key}")
+            max_age = ages.get(list_key, 0.0)
+            if max_age and max_age > 0:
+                cutoff_ms = now_ms - max_age * 86400.0 * 1000.0
+                records = _evict_aged(records, list_key, cutoff_ms)
+                setattr(self, f"_{list_key}", records)
+            cap = limits[cap_key]
+            if len(records) > cap:
+                del records[:len(records) - cap]
+
     def record_perception(self, p: Dict[str, Any]) -> None:
         with self._lock:
             self._perceptions.append(p)
-            if len(self._perceptions) > _memory_limits()["perceptions"]:
-                self._perceptions.pop(0)
+            self._retention_sweep_nolock()
             self._dirty = True
 
     def record_analysis(self, a: Dict[str, Any]) -> None:
         with self._lock:
             self._analyses.append(a)
-            if len(self._analyses) > _memory_limits()["analyses"]:
-                self._analyses.pop(0)
+            self._retention_sweep_nolock()
             self._dirty = True
 
     def record_trade(self, t: Dict[str, Any]) -> None:
         with self._lock:
             self._trades.append(t)
-            if len(self._trades) > _memory_limits()["trades"]:
-                self._trades.pop(0)
+            self._retention_sweep_nolock()
             self._dirty = True
         # Authoritative event feed: emit an "order" event so rebuild can
         # reconstruct trades on a fresh/corrupt JSON cache (PURR record-loss

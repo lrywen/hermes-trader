@@ -142,11 +142,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Hermes-Trader", version=__version__, lifespan=lifespan)
 
-# Wildcard origins + credentials=True is invalid per the CORS spec and would be
-# silently rejected by browsers. Token auth happens via X-Operator-Token /
-# ?token=, neither of which is a credential the browser auto-sends, so we don't
-# need credentialed CORS. Keep wildcard origins for tool/curl access; flip
-# credentials off so a future cookie-auth flow can't be abused cross-origin.
+# Wildcard origins + credentials=True is invalid per the CORS spec and would
+# be silently rejected by browsers. Token auth happens via the X-Operator-Token
+# header (the legacy ?token= query transport is deprecated and only emits a
+# Warning header), which is not a credential the browser auto-sends, so we
+# don't need credentialed CORS. Keep wildcard origins for tool/curl access;
+# flip credentials off so a future cookie-auth flow can't be abused cross-origin.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

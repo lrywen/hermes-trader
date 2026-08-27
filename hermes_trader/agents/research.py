@@ -256,30 +256,40 @@ def _fetch_funding_rate(coin: str) -> str:
 # year-old articles (e.g. AIXBT's 2025 hack) that then tripped the binary-news
 # gate on a fresh 2026 trade. The gate reasons about *imminent* event risk, so
 # stale headlines are noise — both to the gate and to the LLM prompt.
-NEWS_FRESHNESS_DAYS = 2
+# R9/P2-3: the live value comes from config (news_freshness_days); this is
+# only the fallback used when config is missing/invalid.
+_NEWS_FRESHNESS_DAYS_DEFAULT = 2
 
 # Short-TTL news cache: Brave headlines don't change second-to-second, and a
 # 2-min cache avoids duplicate API calls when research fires for multiple coins
-# in quick succession (e.g. a 3-trigger scan cycle).
+# in quick succession (e.g. a 3-trigger scan cycle). TTL is config-driven
+# (news_cache_ttl_s); this is the fallback default.
 _NEWS_CACHE: Dict[str, tuple] = {}
-_NEWS_CACHE_TTL_S = 120
+_NEWS_CACHE_TTL_S_DEFAULT = 120
 _NEWS_CACHE_LOCK = threading.Lock()
 
 
 def _fetch_news(coin: str) -> str:
-    """Recent (last NEWS_FRESHNESS_DAYS) news headlines for a coin via the
-    Brave Search API.
+    """Recent (last `news_freshness_days` config days) news headlines for a
+    coin via the Brave Search API.
 
     Returns a compact ' | '-joined headline string, or 'no news' when no
     BRAVE_API_KEY is set or the request fails — news is a supplementary
     signal, so a fetch failure degrades gracefully and never blocks research.
     """
     # Cache check
+    try:
+        cache_ttl_s = float(cfg_get("news_cache_ttl_s",
+                                    _NEWS_CACHE_TTL_S_DEFAULT))
+        if cache_ttl_s < 0:
+            cache_ttl_s = _NEWS_CACHE_TTL_S_DEFAULT
+    except (TypeError, ValueError):
+        cache_ttl_s = _NEWS_CACHE_TTL_S_DEFAULT
     with _NEWS_CACHE_LOCK:
         cached = _NEWS_CACHE.get(coin)
         if cached is not None:
             _ts, _val = cached
-            if time.monotonic() - _ts < _NEWS_CACHE_TTL_S:
+            if time.monotonic() - _ts < cache_ttl_s:
                 return _val
 
     key = os.environ.get("BRAVE_API_KEY", "")
@@ -288,8 +298,15 @@ def _fetch_news(coin: str) -> str:
     # Brave `freshness` takes a YYYY-MM-DDtoYYYY-MM-DD range; a 2-day window
     # approximates "within 48h" (the closest the API offers to an hour-precise
     # bound without per-result age filtering).
+    try:
+        freshness_days = int(cfg_get("news_freshness_days",
+                                     _NEWS_FRESHNESS_DAYS_DEFAULT))
+        if freshness_days < 1:
+            freshness_days = _NEWS_FRESHNESS_DAYS_DEFAULT
+    except (TypeError, ValueError):
+        freshness_days = _NEWS_FRESHNESS_DAYS_DEFAULT
     today = datetime.now(timezone.utc).date()
-    start = today - timedelta(days=NEWS_FRESHNESS_DAYS)
+    start = today - timedelta(days=freshness_days)
     freshness = f"{start.isoformat()}to{today.isoformat()}"
     try:
         resp = _http().get(
