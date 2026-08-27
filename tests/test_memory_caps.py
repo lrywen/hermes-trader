@@ -138,3 +138,74 @@ def test_trades_not_age_evicted(age_limits, monkeypatch):
     m.record_trade({"seq": "ancient", "coin": "BTC",
                     "executed_at": now_ms - 365 * day_ms})
     assert [t["seq"] for t in m._trades] == ["ancient"]
+
+
+# ── R10/P3-3: incremental realized-PnL / exit-slip stats ───────────────────
+
+def _close_mem(monkeypatch):
+    """A memory instance with flush and the authoritative 'close' event feed
+    stubbed, and _day_start_ts pinned to today's UTC midnight (seconds)."""
+    from datetime import datetime, timezone
+    from hermes_trader import event_log
+    monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
+    m = _mem()
+    m._day_start_ts = int(datetime.now(timezone.utc)
+                          .replace(hour=0, minute=0, second=0, microsecond=0)
+                          .timestamp())
+    return m
+
+
+def test_daily_realized_pnl_sums_today(monkeypatch):
+    # Two same-coin closes today (one win, one loss): the per-coin daily total
+    # is their summed realized USD, expressed as % of start-of-day equity.
+    m = _close_mem(monkeypatch)
+    now_s = int(m._day_start_ts + 3600)  # 01:00 UTC today
+    m.record_close({"coin": "BTC", "side": "LONG", "realized_pnl_usd": 1.5,
+                    "exit_slip_bps": 10.0, "closed_at": now_s * 1000})
+    m.record_close({"coin": "BTC", "side": "SHORT", "realized_pnl_usd": -0.5,
+                    "exit_slip_bps": 20.0, "closed_at": (now_s + 60) * 1000})
+    # (1.5 - 0.5) = 1.0 USD on 100 start equity = 1.0%
+    assert m.coin_daily_realized_pnl_pct("BTC", 100.0) == pytest.approx(1.0)
+
+
+def test_daily_realized_pnl_excludes_yesterday(monkeypatch):
+    # A close stamped before the current UTC day start is not folded into the
+    # running total (mirrors the old scan's closed_at >= day_start filter).
+    m = _close_mem(monkeypatch)
+    yday_s = m._day_start_ts - 3600  # 23:00 UTC yesterday
+    m.record_close({"coin": "ETH", "side": "LONG", "realized_pnl_usd": 5.0,
+                    "exit_slip_bps": 10.0, "closed_at": yday_s * 1000})
+    m.record_close({"coin": "ETH", "side": "LONG", "realized_pnl_usd": 2.0,
+                    "exit_slip_bps": 10.0,
+                    "closed_at": (m._day_start_ts + 3600) * 1000})
+    # Only today's +2.0 USD counts → 2.0% of 100.
+    assert m.coin_daily_realized_pnl_pct("ETH", 100.0) == pytest.approx(2.0)
+
+
+def test_avg_exit_slip_requires_min_samples(monkeypatch):
+    # Fewer than min_samples adverse closes → 0.0 (do not widen on noise);
+    # at/above the threshold the mean of adverse (positive) slip is returned.
+    m = _close_mem(monkeypatch)
+    now_s = m._day_start_ts + 60
+    m.record_close({"coin": "SOL", "side": "LONG", "realized_pnl_usd": 0.1,
+                    "exit_slip_bps": 12.0, "closed_at": now_s * 1000})
+    m.record_close({"coin": "SOL", "side": "LONG", "realized_pnl_usd": 0.1,
+                    "exit_slip_bps": 18.0, "closed_at": (now_s + 60) * 1000})
+    assert m.avg_exit_slip_bps("SOL", min_samples=3) == 0.0
+    m.record_close({"coin": "SOL", "side": "LONG", "realized_pnl_usd": 0.1,
+                    "exit_slip_bps": 30.0, "closed_at": (now_s + 120) * 1000})
+    # mean(12, 18, 30) = 20.0; a favorable (negative) slip is never counted.
+    assert m.avg_exit_slip_bps("SOL", min_samples=3) == pytest.approx(20.0)
+    m.record_close({"coin": "SOL", "side": "LONG", "realized_pnl_usd": 0.1,
+                    "exit_slip_bps": -5.0, "closed_at": (now_s + 180) * 1000})
+    assert m.avg_exit_slip_bps("SOL", min_samples=3) == pytest.approx(20.0)
+
+
+def test_daily_realized_pnl_zero_equity_guard(monkeypatch):
+    # start_of_day_equity <= 0 must short-circuit to 0.0 (no division by zero).
+    m = _close_mem(monkeypatch)
+    m.record_close({"coin": "BTC", "side": "LONG", "realized_pnl_usd": 1.0,
+                    "exit_slip_bps": 10.0,
+                    "closed_at": (m._day_start_ts + 60) * 1000})
+    assert m.coin_daily_realized_pnl_pct("BTC", 0.0) == 0.0
+    assert m.coin_daily_realized_pnl_pct("BTC", -10.0) == 0.0

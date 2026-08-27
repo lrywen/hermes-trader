@@ -6,8 +6,6 @@ All gates are evaluated; results are collected for telemetry (no short-circuit).
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -20,15 +18,6 @@ from hermes_trader.shared_config import load_shared_config
 logger = logging.getLogger(__name__)
 
 GateResult = Dict[str, Any]  # {pass: bool, reason?: str}
-
-# ── Shared infrastructure (cross-component single source of truth) ──────
-_SHARED_DIR = os.path.expanduser("~/.hermes-trading")
-if _SHARED_DIR not in sys.path and os.path.isdir(_SHARED_DIR):
-    sys.path.insert(0, _SHARED_DIR)
-try:
-    from event_log import record_risk  # type: ignore
-except Exception:  # pragma: no cover - shared dir optional
-    record_risk = None  # type: ignore
 
 
 @dataclass
