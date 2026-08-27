@@ -112,7 +112,7 @@ _LLM_CB_FAIL_THRESHOLD = int(os.environ.get("HERMES_LLM_CB_FAILURES", "3"))
 _LLM_CB_COOLDOWN_S = float(os.environ.get("HERMES_LLM_CB_COOLDOWN_S", "300"))
 
 
-def _llm_client():
+def _llm_client() -> "httpx.AsyncClient":
     global _LLM_CLIENT
     if _LLM_CLIENT is None or _LLM_CLIENT.is_closed:
         import httpx
@@ -214,7 +214,7 @@ _TTL_INFLIGHT: Dict[str, "threading.Event"] = {}
 _TTL_LOAD_WAIT_S = 60.0
 
 
-def _ttl_cached(key: str, ttl: float, fn):
+def _ttl_cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
     now = time.time()
     with _TTL_CACHE_LOCK:
         hit = _TTL_CACHE.get(key)

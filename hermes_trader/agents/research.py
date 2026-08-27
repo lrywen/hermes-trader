@@ -1413,6 +1413,31 @@ def _synthesize(bull: str, bear: str, ctx_msg: str) -> Optional[Dict[str, Any]]:
     return parsed
 
 
+def _debate_metric(
+    kind: str, name: str, labels: Dict[str, str], value: Optional[float] = None
+) -> None:
+    """Best-effort Prometheus emit for the debate path. Replaces the repeated
+    inline `try: from hermes_trader import metrics ... except Exception: pass`
+    blocks: metrics are optional, so any failure is swallowed silently.
+
+    kind is one of "inc" (counter), "observe" (histogram), "set" (gauge).
+    """
+    try:
+        from hermes_trader import metrics
+
+        metric = getattr(metrics, name)
+        if labels:
+            metric = metric.labels(**labels)
+        if kind == "inc":
+            metric.inc()
+        elif kind == "observe":
+            metric.observe(value)
+        elif kind == "set":
+            metric.set(value)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def _debate_research(
     coin: str, ctx_msg: str, perception: Dict[str, Any], *, atr_abs: Optional[float],
     config: Optional[Dict[str, Any]] = None,
@@ -1438,24 +1463,14 @@ def _debate_research(
                 f"[debate] cache HIT | key={cache_key} ttl_remaining_s="
                 f"{int(hit[0] - now)} verdict={hit[1].get('verdict')}"
             )
-            try:
-                from hermes_trader import metrics
-
-                metrics.DEBATE_CACHE_LOOKUPS.labels(result="hit").inc()
-            except Exception:  # noqa: BLE001
-                pass
+            _debate_metric("inc", "DEBATE_CACHE_LOOKUPS", {"result": "hit"})
             return dict(hit[1])
         if hit:
             logger.info(f"[debate] cache STALE | key={cache_key} → refetch")
             _cache_lookup = "stale"
         else:
             _cache_lookup = "miss"
-    try:
-        from hermes_trader import metrics
-
-        metrics.DEBATE_CACHE_LOOKUPS.labels(result=_cache_lookup).inc()
-    except Exception:  # noqa: BLE001
-        pass
+    _debate_metric("inc", "DEBATE_CACHE_LOOKUPS", {"result": _cache_lookup})
 
     bb_start = time.time()
     bull = ""
@@ -1485,15 +1500,11 @@ def _debate_research(
             f"elapsed_ms={int((time.time()-bb_start)*1000)} "
             f"err={type(e).__name__}: {e}"
         )
-        try:
-            from hermes_trader import metrics
-
-            metrics.DEBATE_STAGE_DURATION.labels(stage="bull_bear", outcome="failed").observe(
-                max(0.0, time.time() - bb_start)
-            )
-            metrics.DEBATE_FALLBACKS.labels(reason="bull_bear_failed").inc()
-        except Exception:  # noqa: BLE001
-            pass
+        _debate_metric(
+            "observe", "DEBATE_STAGE_DURATION",
+            {"stage": "bull_bear", "outcome": "failed"}, max(0.0, time.time() - bb_start),
+        )
+        _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "bull_bear_failed"})
         return None
 
     bb_elapsed = int((time.time() - bb_start) * 1000)
@@ -1501,26 +1512,17 @@ def _debate_research(
         f"[debate] bull/bear DONE | coin={coin} elapsed_ms={bb_elapsed} "
         f"bull_chars={len(bull or '')} bear_chars={len(bear or '')}"
     )
-    try:
-        from hermes_trader import metrics
-
-        metrics.DEBATE_STAGE_DURATION.labels(stage="bull_bear", outcome="ok").observe(
-            max(0.0, time.time() - bb_start)
-        )
-    except Exception:  # noqa: BLE001
-        pass
+    _debate_metric(
+        "observe", "DEBATE_STAGE_DURATION",
+        {"stage": "bull_bear", "outcome": "ok"}, max(0.0, time.time() - bb_start),
+    )
 
     if not bull and not bear:
         logger.warning(
             f"[debate] both empty → single fallback | coin={coin} "
             f"elapsed_ms={bb_elapsed}"
         )
-        try:
-            from hermes_trader import metrics
-
-            metrics.DEBATE_FALLBACKS.labels(reason="both_empty").inc()
-        except Exception:  # noqa: BLE001
-            pass
+        _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "both_empty"})
         return None
     if not bull:
         logger.warning(f"[debate] bull empty, proceeding with bear only | coin={coin}")
@@ -1546,15 +1548,11 @@ def _debate_research(
             f"elapsed_ms={int((time.time()-synth_start)*1000)} "
             f"err={type(e).__name__}: {e}"
         )
-        try:
-            from hermes_trader import metrics
-
-            metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="failed").observe(
-                max(0.0, time.time() - synth_start)
-            )
-            metrics.DEBATE_FALLBACKS.labels(reason="synth_failed").inc()
-        except Exception:  # noqa: BLE001
-            pass
+        _debate_metric(
+            "observe", "DEBATE_STAGE_DURATION",
+            {"stage": "synth", "outcome": "failed"}, max(0.0, time.time() - synth_start),
+        )
+        _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "synth_failed"})
         return None
 
     if not sv:
@@ -1562,25 +1560,17 @@ def _debate_research(
             f"[debate] synth unparseable → single fallback | coin={coin} "
             f"elapsed_ms={int((time.time()-synth_start)*1000)}"
         )
-        try:
-            from hermes_trader import metrics
-
-            metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="empty").observe(
-                max(0.0, time.time() - synth_start)
-            )
-            metrics.DEBATE_FALLBACKS.labels(reason="synth_empty").inc()
-        except Exception:  # noqa: BLE001
-            pass
+        _debate_metric(
+            "observe", "DEBATE_STAGE_DURATION",
+            {"stage": "synth", "outcome": "empty"}, max(0.0, time.time() - synth_start),
+        )
+        _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "synth_empty"})
         return None
 
-    try:
-        from hermes_trader import metrics
-
-        metrics.DEBATE_STAGE_DURATION.labels(stage="synth", outcome="ok").observe(
-            max(0.0, time.time() - synth_start)
-        )
-    except Exception:  # noqa: BLE001
-        pass
+    _debate_metric(
+        "observe", "DEBATE_STAGE_DURATION",
+        {"stage": "synth", "outcome": "ok"}, max(0.0, time.time() - synth_start),
+    )
 
     fields = structured_to_analysis_fields(
         sv, coin, perception,
@@ -1599,26 +1589,17 @@ def _debate_research(
             f"[debate] cache WRITE | key={cache_key} ttl_s={ttl} "
             f"entries={_entries}"
         )
-        try:
-            from hermes_trader import metrics
-
-            metrics.DEBATE_CACHE_ENTRIES.set(float(_entries))
-        except Exception:  # noqa: BLE001
-            pass
+        _debate_metric("set", "DEBATE_CACHE_ENTRIES", {}, float(_entries))
     logger.info(
         f"[debate] DEBATE-OK | coin={coin} verdict={fields['verdict']} "
         f"side={fields['side']} conf={fields['confidence']:.2f} "
         f"stop_px={fields['stop_px']} tp_px={fields['tp_px']} "
         f"elapsed_ms={int((time.time()-now)*1000)}"
     )
-    try:
-        from hermes_trader import metrics
-
-        metrics.DEBATE_STAGE_DURATION.labels(stage="total", outcome="ok").observe(
-            max(0.0, time.time() - now)
-        )
-    except Exception:  # noqa: BLE001
-        pass
+    _debate_metric(
+        "observe", "DEBATE_STAGE_DURATION",
+        {"stage": "total", "outcome": "ok"}, max(0.0, time.time() - now),
+    )
     return fields
 
 
@@ -1837,6 +1818,68 @@ def _build_analysis(coin: str, perception: Dict[str, Any], *,
     return analysis
 
 
+def _thin_history_pass(coin: str, perception: Dict[str, Any], c4h: List[Any], news: Any) -> Dict[str, Any]:
+    """Thin-history guard: multi-timeframe TA is meaningless without enough 4h
+    bars (EMA21/ADX need history). Builds the ai_down PASS analysis, records it
+    and returns it so research() can short-circuit — no LLM call, no entry.
+    Extracted from research() (P2-1)."""
+    logger.warning(f"[research] thin 4h history for {coin}: only {len(c4h)} candles — PASS (skip)")
+    analysis = {
+        "id": str(uuid.uuid4()), "perception_id": perception.get("id", "unknown"),
+        "coin": coin, "verdict": "PASS", "confidence": 0.0, "side": None,
+        "entry_px": perception.get("mid", 0), "stop_px": 0.0, "tp_px": 0.0,
+        "reasoning": f"insufficient 4h history ({len(c4h)} candles) for reliable multi-TF TA",
+        "news_context": news, "news_risk": "none",
+        "created_at": int(time.time() * 1000),
+        "composite_score": float(perception.get("composite_score", 0) or 0),
+        # P1-16: thin-history PASS skips the LLM entirely, so flag
+        # ai_down so downstream record/notify sees "no AI decision made"
+        # rather than implying a live model produced a PASS.
+        "ai_down": True,
+        "momentum_burst_fired": False, "slow_burn_fired": False,
+        "slow_burn_count": 0,
+        "daily_mover_fired": "dailyMover" in set(extract_fired_triggers(perception)),
+        "whale_signal": perception.get("whale_signal"),
+    }
+    memory.record_analysis(analysis)
+    return analysis
+
+
+def _account_context(
+    account_snapshot: Optional[Dict[str, Any]],
+) -> Tuple[float, Dict[str, float], List[Dict[str, Any]]]:
+    """Resolve equity, per-DEX equity and open positions for the user prompt.
+    Uses the cycle-level snapshot when provided (avoids N duplicate account
+    POSTs per cycle); fetches via fetch_account_state() otherwise and pushes
+    equity to memory in that case. Extracted from research() (P2-1)."""
+    equity = 0.0
+    dex_equity: Dict[str, float] = {}
+    open_positions: List[Dict[str, Any]] = []
+    user = resolve_user_address()
+
+    if user:
+        state = account_snapshot if account_snapshot is not None else fetch_account_state(user, include_hip3=True)
+        equity = float(state.get("equity", "0"))
+        dex_equity = state.get("dex_equity") or {}
+        if account_snapshot is None:
+            memory.update_equity(equity)
+
+        open_positions = [
+            {
+                "coin": p.get("position", {}).get("coin", ""),
+                "side": "long" if float(p.get("position", {}).get("szi", "0")) > 0 else "short",
+                "size_usd": float(p.get("position", {}).get("positionValue", "0")) or (
+                    abs(float(p.get("position", {}).get("szi", "0"))) *
+                    float(p.get("position", {}).get("entryPx", "0"))
+                ),
+            }
+            for p in (state.get("asset_positions") or [])
+            if float(p.get("position", {}).get("szi", "0")) != 0
+        ]
+
+    return equity, dex_equity, open_positions
+
+
 def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Full AI research pipeline for a perception — returns an analysis dict.
 
@@ -1856,31 +1899,11 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
     news = _prefetched["news"]
     signals_block = _prefetched["signals_block"]
 
-    # Thin-history guard: multi-timeframe TA is meaningless without enough 4h
-    # bars (EMA21/ADX need history). A near-empty series produced confident-
-    # looking but baseless entries (e.g. WLD entered at 0.68 conf on "0 candles"
-    # then ran straight to the stop). Decline outright — PASS, no LLM call, no entry.
+    # Thin-history guard extracted to _thin_history_pass (P2-1): a near-empty
+    # 4h series produced confident-looking but baseless entries — decline with
+    # an ai_down PASS (no LLM call, no entry).
     if len(c4h) < 30:
-        logger.warning(f"[research] thin 4h history for {coin}: only {len(c4h)} candles — PASS (skip)")
-        analysis = {
-            "id": str(uuid.uuid4()), "perception_id": perception.get("id", "unknown"),
-            "coin": coin, "verdict": "PASS", "confidence": 0.0, "side": None,
-            "entry_px": perception.get("mid", 0), "stop_px": 0.0, "tp_px": 0.0,
-            "reasoning": f"insufficient 4h history ({len(c4h)} candles) for reliable multi-TF TA",
-            "news_context": news, "news_risk": "none",
-            "created_at": int(time.time() * 1000),
-            "composite_score": float(perception.get("composite_score", 0) or 0),
-            # P1-16: thin-history PASS skips the LLM entirely, so flag
-            # ai_down so downstream record/notify sees "no AI decision made"
-            # rather than implying a live model produced a PASS.
-            "ai_down": True,
-            "momentum_burst_fired": False, "slow_burn_fired": False,
-            "slow_burn_count": 0,
-            "daily_mover_fired": "dailyMover" in set(extract_fired_triggers(perception)),
-            "whale_signal": perception.get("whale_signal"),
-        }
-        memory.record_analysis(analysis)
-        return analysis
+        return _thin_history_pass(coin, perception, c4h, news)
 
     tf1h = _compute_indicators(c1h)
     tf4h = _compute_indicators(c4h)
@@ -1892,32 +1915,9 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
     config = read_agent_config()
     mode = str(config.get("mode", "OFF"))
 
-    equity = 0.0
-    dex_equity: Dict[str, float] = {}
-    open_positions: List[Dict[str, Any]] = []
-    user = resolve_user_address()
-
-    if user:
-        # Use cycle-level snapshot when provided by trading_loop to avoid
-        # re-fetching account state for every coin (N × (2+M) POSTs/cycle).
-        state = account_snapshot if account_snapshot is not None else fetch_account_state(user, include_hip3=True)
-        equity = float(state.get("equity", "0"))
-        dex_equity = state.get("dex_equity") or {}
-        if account_snapshot is None:
-            memory.update_equity(equity)
-
-        open_positions = [
-            {
-                "coin": p.get("position", {}).get("coin", ""),
-                "side": "long" if float(p.get("position", {}).get("szi", "0")) > 0 else "short",
-                "size_usd": float(p.get("position", {}).get("positionValue", "0")) or (
-                    abs(float(p.get("position", {}).get("szi", "0"))) *
-                    float(p.get("position", {}).get("entryPx", "0"))
-                ),
-            }
-            for p in (state.get("asset_positions") or [])
-            if float(p.get("position", {}).get("szi", "0")) != 0
-        ]
+    # Account/positions extraction moved to _account_context (P2-1). Uses the
+    # cycle-level snapshot when provided, else fetches (and updates equity).
+    equity, dex_equity, open_positions = _account_context(account_snapshot)
 
     wr = memory.get_win_rate()
     system_prompt = build_system_prompt(mode, wr.get("rate", 0), int(wr.get("total", 0)))
