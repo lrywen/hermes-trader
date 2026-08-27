@@ -47,6 +47,7 @@ from hermes_trader.metrics import render_metrics                      # noqa: E4
 from hermes_trader import __version__, dashboard, session_log         # noqa: E402
 from hermes_trader.dashboard import _require_operator                 # noqa: E402
 from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
+from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
 from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
 from hermes_trader.agents.memory import memory                        # noqa: E402
 from hermes_trader.agents.perception import scan_once                 # noqa: E402
@@ -500,6 +501,14 @@ async def update_config(request: Request) -> JSONResponse:
         raise HTTPException(400, "invalid JSON")
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
+    # F27: type/range gate before the merge. Unknown keys stay lenient
+    # (legacy callers persist custom keys); None means "delete key" in the
+    # deep merge and is excluded from validation.
+    errors = validate_config_updates(
+        {k: v for k, v in body.items() if v is not None}, strict_keys=False
+    )
+    if errors:
+        raise HTTPException(422, json.dumps({"errors": errors}))
     try:
         with update_agent_config() as cfg:
             merged = _deep_merge(cfg, body)

@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict
+from typing import Any, Dict, get_origin
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -27,8 +27,8 @@ from hermes_trader.agents.config_store import (
     restore_backup,
     restore_snapshot,
 )
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.dashboard import (
-    _CONFIG_TYPES,
     _config_apply,
     _require_operator,
     _validate_config_updates,
@@ -41,8 +41,9 @@ def register_config_routes(app: FastAPI) -> None:
     """Mount the operator-gated config write / backup / rollback routes."""
 
     # ── config write API (operator-gated) ─────────────────────────────────
-    # F25: _CONFIG_TYPES / _CONFIG_RANGES / _validate_config_updates live at
-    # module scope now, shared with the terminal `set` handler.
+    # F25/F27: the whitelist / type / range gate lives in
+    # agents/config_schema.py (Pydantic model as the single source of truth),
+    # shared with the terminal `set` handler, the CLI and the legacy endpoint.
 
     @app.post("/api/dashboard/config")
     async def dashboard_config_write(request: Request) -> JSONResponse:
@@ -187,18 +188,19 @@ def register_config_routes(app: FastAPI) -> None:
         """Return key metadata (type + default) for building the edit form."""
         schema: Dict[str, Any] = {}
         for key, default in CANONICAL_DEFAULTS.items():
-            t = _CONFIG_TYPES.get(key)
-            if t is int:
+            field = _ConfigPatch.model_fields.get(key)
+            annotation = field.annotation if field is not None else type(default)
+            if annotation is int:
                 type_name = "int"
-            elif t is float:
+            elif annotation is float:
                 type_name = "float"
-            elif t is bool:
+            elif annotation is bool:
                 type_name = "bool"
-            elif t is str:
+            elif annotation is str:
                 type_name = "str"
-            elif isinstance(default, list):
+            elif annotation is list or get_origin(annotation) is list or isinstance(default, list):
                 type_name = "list"
-            elif isinstance(default, dict):
+            elif annotation is dict or get_origin(annotation) is dict or isinstance(default, dict):
                 type_name = "object"
             else:
                 type_name = "any"

@@ -287,31 +287,31 @@ def cmd_config(*args: str) -> None:
         print()
     else:
         print("  Updating config:\n")
+        from hermes_trader.agents.config_schema import (
+            coerce_config_value,
+            validate_config_updates,
+        )
+
+        parsed: dict = {}
+        for arg in args:
+            if "=" not in arg:
+                print(f"  Invalid: {arg} (use KEY=VALUE)")
+                continue
+            key, val = arg.split("=", 1)
+            key = key.strip()
+            parsed[key] = coerce_config_value(val.strip())
+
+        # F27: same whitelist / type / range gate as the web API; reject the
+        # whole batch and write nothing if any key is unknown or malformed.
+        errors = validate_config_updates(parsed, strict_keys=True)
+        if errors:
+            print("  rejected: " + "; ".join(errors))
+            print("\n  ✗ Config not updated.\n")
+            return
 
         def _mutate(config: dict) -> None:
-            for arg in args:
-                if "=" not in arg:
-                    print(f"  Invalid: {arg} (use KEY=VALUE)")
-                    continue
-                key, val = arg.split("=", 1)
-                key = key.strip()
-                val = val.strip()
+            for key, val in parsed.items():
                 old = config.get(key, "✗")
-
-                # Type coercion
-                if val.lower() == "true":
-                    val = True
-                elif val.lower() == "false":
-                    val = False
-                else:
-                    try:
-                        val = int(val)
-                    except ValueError:
-                        try:
-                            val = float(val)
-                        except ValueError:
-                            pass
-
                 config[key] = val
                 print(f"  {key}: {old!r:12} → {val!r}")
 

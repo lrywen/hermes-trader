@@ -36,8 +36,11 @@ from fastapi.responses import JSONResponse
 
 from hermes_trader import event_log, session_log
 from hermes_trader.agents import dsl_exit
+from hermes_trader.agents.config_schema import (
+    coerce_config_value as _coerce_config_value,
+    validate_config_updates as _validate_config_updates,
+)
 from hermes_trader.agents.config_store import (
-    CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
     update_agent_config,
@@ -1194,146 +1197,11 @@ def _log_operator_action(action: str, *, via: str, result: Optional[Dict[str, An
 # ── web config API, the schema endpoint, and the terminal `set` handler all ──
 # ── share the same whitelist / type / range gate) ───────────────────────────
 
-_CONFIG_TYPES: Dict[str, type] = {
-    "mode": str,
-    "enable_crypto": bool, "enable_hip3": bool,
-    "equity_fraction_per_trade": float, "leverage": int,
-    "max_concurrent": int, "max_trade_notional_usd": float,
-    "max_total_notional_pct": float, "max_daily_loss_usd": float,
-    "daily_giveback_halt_pct": float, "daily_giveback_min_peak_usd": float,
-    "cooldown_min": int, "min_ai_confidence": float,
-    "counter_regime_min_conf": float, "max_crypto_long_correlated": int,
-    "min_market_volume_usd": float, "min_hip3_volume_usd": float,
-    "min_short_volume_usd": float, "chop_min_conf": float,
-    "chop_min_score": float, "max_atr_pct": float, "max_spread_pct": float,
-    "loss_cooldown_min": int, "min_ai_close_hold_min": int,
-    "sl_atr_mult": float, "min_trend_score": float,
-    "block_counter_trend_bypass": bool, "whale_regime_bypass": bool,
-    "conviction_sizing": bool, "breakout_force_execute": bool,
-    "spread_gate_fail_open": bool,
-    "override_requires_ai": bool,
-    "whale_scan_bypass": bool,
-    "research_rescore_delta": float,
-    # P2-3: SL ratchet buffer / funding-rate lookback (memory_limits is a
-    # nested dict — accepted as-object like the other dict defaults).
-    "sl_buffer_bps": float,
-    "funding_lookback_hours": int,
-    # F19: type-cover the remaining numeric CANONICAL_DEFAULTS keys.
-    "tp_scale_fraction": float, "crowded_with_min_conf": float,
-    "min_available_margin_pct": float, "against_funding_min_conf": float,
-    "against_funding_min_score": float, "chop_burst_min_score": float,
-    "strong_trend_threshold": float, "trend_threshold": float,
-    "neutral_threshold": float, "whale_size_multiplier": float,
-    "research_cooldown_min": int, "held_research_interval_min": int,
-    "force_execute_composite": int, "ta_sidestep_min_slow_burn_count": int,
-    "force_execute_slow_burn_count": int,
-}
-
-# F19: min/max bounds for numeric keys (None = open-ended). These reject
-# negatives / absurd values while staying wide enough for legitimate tuning.
-# leverage / max_concurrent / min_ai_confidence / equity_fraction_per_trade
-# keep their dedicated messages below; this table covers the rest.
-_CONFIG_RANGES: Dict[str, tuple] = {
-    # USD thresholds
-    "max_trade_notional_usd": (0.0, None),
-    "max_daily_loss_usd": (None, 0.0),       # negative loss limit (or 0)
-    "daily_giveback_min_peak_usd": (0.0, None),
-    "min_market_volume_usd": (0.0, None),
-    "min_hip3_volume_usd": (0.0, None),
-    "min_short_volume_usd": (0.0, None),
-    # fractions / ratios / probabilities (0..1)
-    "counter_regime_min_conf": (0.0, 1.0),
-    "chop_min_conf": (0.0, 1.0),
-    # percentages / multipliers / scores (> 0)
-    "daily_giveback_halt_pct": (0.0, 1.0),   # fraction of peak given back
-    "research_rescore_delta": (0.0, 100.0),  # composite-score delta
-    "max_total_notional_pct": (0.0, 50.0),   # equity multiplier
-    "max_atr_pct": (0.0, 100.0),             # percent
-    "max_spread_pct": (0.0, 100.0),          # percent
-    "chop_min_score": (0.0, 100.0),
-    "min_trend_score": (0.0, 1.0),
-    "sl_atr_mult": (0.0, 50.0),
-    # counts / minutes (non-negative ints)
-    "max_crypto_long_correlated": (0, 50),
-    "cooldown_min": (0, 100_000),
-    "loss_cooldown_min": (0, 100_000),
-    "min_ai_close_hold_min": (0, 100_000),
-    # P2-3 tunables (memory_limits is a dict, range-checked by consumers)
-    "sl_buffer_bps": (0.0, 1000.0),          # bps; 10% hard ceiling
-    "funding_lookback_hours": (1, 720),      # 1h .. 30d
-    # F19: bounds for the previously-uncovered numeric keys.
-    # fractions / confidences / thresholds (0..1)
-    "tp_scale_fraction": (0.0, 1.0),
-    "crowded_with_min_conf": (0.0, 1.0),
-    "min_available_margin_pct": (0.0, 1.0),
-    "against_funding_min_conf": (0.0, 1.0),
-    "strong_trend_threshold": (0.0, 1.0),
-    "trend_threshold": (0.0, 1.0),
-    "neutral_threshold": (0.0, 1.0),
-    # scores (0..100)
-    "against_funding_min_score": (0.0, 100.0),
-    "chop_burst_min_score": (0.0, 100.0),
-    "force_execute_composite": (0, 100),     # composite-score threshold
-    # multipliers (> 0)
-    "whale_size_multiplier": (0.0, None),
-    # counts / minutes (non-negative ints)
-    "research_cooldown_min": (0, 100_000),
-    "held_research_interval_min": (0, 100_000),
-    "ta_sidestep_min_slow_burn_count": (0, 100_000),
-    "force_execute_slow_burn_count": (0, 100_000),
-}
-
-
-def _validate_config_updates(updates: Dict[str, Any]) -> List[str]:
-    """Validate a partial update dict. Returns a list of error strings."""
-    errors: List[str] = []
-    for key, val in updates.items():
-        if key not in CANONICAL_DEFAULTS:
-            errors.append(f"unknown key: {key}")
-            continue
-        expected = _CONFIG_TYPES.get(key)
-        if expected is not None:
-            if expected is int:
-                if not isinstance(val, int) or isinstance(val, bool):
-                    errors.append(f"{key}: expected int, got {type(val).__name__}")
-            elif expected is float:
-                if not isinstance(val, (int, float)) or isinstance(val, bool):
-                    errors.append(f"{key}: expected number, got {type(val).__name__}")
-            elif expected is bool:
-                if not isinstance(val, bool):
-                    errors.append(f"{key}: expected bool, got {type(val).__name__}")
-            elif expected is str:
-                if not isinstance(val, str):
-                    errors.append(f"{key}: expected string, got {type(val).__name__}")
-        # List/dict values (coin_allowlist, dsl_exit, debate_gate etc.)
-        # are accepted as-is if the default is also list/dict.
-        elif isinstance(CANONICAL_DEFAULTS.get(key), list) and not isinstance(val, list):
-            errors.append(f"{key}: expected list, got {type(val).__name__}")
-        elif isinstance(CANONICAL_DEFAULTS.get(key), dict) and not isinstance(val, dict):
-            errors.append(f"{key}: expected object, got {type(val).__name__}")
-    # Range checks
-    if "leverage" in updates and isinstance(updates["leverage"], int):
-        if updates["leverage"] < 1 or updates["leverage"] > 50:
-            errors.append("leverage: must be 1–50")
-    if "max_concurrent" in updates and isinstance(updates["max_concurrent"], int):
-        if updates["max_concurrent"] < 0:
-            errors.append("max_concurrent: must be >= 0")
-    if "min_ai_confidence" in updates and isinstance(updates["min_ai_confidence"], (int, float)):
-        if not (0.0 <= updates["min_ai_confidence"] <= 1.0):
-            errors.append("min_ai_confidence: must be 0.0–1.0")
-    if "equity_fraction_per_trade" in updates and isinstance(updates["equity_fraction_per_trade"], (int, float)):
-        if not (0.0 < updates["equity_fraction_per_trade"] <= 1.0):
-            errors.append("equity_fraction_per_trade: must be > 0 and <= 1.0")
-    # F19: general min/max bounds for every other numeric key.
-    for key, (lo, hi) in _CONFIG_RANGES.items():
-        val = updates.get(key)
-        if not isinstance(val, (int, float)) or isinstance(val, bool):
-            continue
-        if lo is not None and val < lo:
-            errors.append(f"{key}: must be >= {lo}")
-        elif hi is not None and val > hi:
-            errors.append(f"{key}: must be <= {hi}")
-    return errors
+# F27: the whitelist / type / range gate used to be two hand-kept tables
+# (_CONFIG_TYPES + _CONFIG_RANGES) here. It now lives in
+# agents/config_schema.py as a Pydantic model (single source of truth shared
+# with the CLI and the legacy merge endpoint); _validate_config_updates and
+# _coerce_config_value are imported from there at the top of this module.
 
 
 def _config_apply(updates: Dict[str, Any], backup: bool = False) -> Dict[str, Any]:
@@ -1349,28 +1217,6 @@ def _config_apply(updates: Dict[str, Any], backup: bool = False) -> Dict[str, An
             old_snapshot = {k: cfg.get(k) for k in updates}
             cfg.update(updates)
         return {"old": old_snapshot, "new": {k: cfg.get(k) for k in updates}}
-
-
-def _coerce_config_value(s: str) -> Any:
-    """Terminal `set` type inference: bool → null → int → float → JSON → str."""
-    if s.lower() in ("true", "false"):
-        return s.lower() == "true"
-    if s.lower() in ("null", "none"):
-        return None
-    try:
-        return int(s)
-    except ValueError:
-        pass
-    try:
-        return float(s)
-    except ValueError:
-        pass
-    if (s.startswith("{") and s.endswith("}")) or (s.startswith("[") and s.endswith("]")):
-        try:
-            return json.loads(s)
-        except Exception:
-            pass
-    return s
 
 
 # ── terminal command center (F25: each built-in verb is a module-level ──────
