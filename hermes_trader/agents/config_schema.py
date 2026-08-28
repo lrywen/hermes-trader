@@ -253,4 +253,74 @@ def validate_config_updates(updates: Dict[str, Any], *, strict_keys: bool = True
     if isinstance(v, (int, float)) and not isinstance(v, bool):
         if not (0.0 < v <= 1.0):
             errors.append("equity_fraction_per_trade: must be > 0 and <= 1.0")
+
+    # ── P0-2: mode enum + sane-floors for safety-critical thresholds ─────
+    # The mode field used to be a free-form string — an operator typo
+    # ("mode=ON" / "mode=ENABLED" / "mode=live ") silently left the bot in
+    # OFF because the loop only acts on the canonical three. Reject anything
+    # else at the schema layer so a typo is loud, not silent.
+    if "mode" in updates:
+        _MODE_ENUM = ("OFF", "LIVE", "SHADOW")
+        if updates["mode"] not in _MODE_ENUM:
+            errors.append(
+                f"mode: must be one of {list(_MODE_ENUM)}, got {updates['mode']!r}"
+            )
+
+    # Sane-floors: each of these thresholds can disable a safety gate when
+    # set to an absurd value. Typos like max_daily_loss_usd=0 (kills the
+    # kill switch — any negative day still passes the `daily_pnl > 0`
+    # check), max_total_notional_pct=0 (caps every trade at $0 notional,
+    # silent no-op), or max_trade_notional_usd=0 (disables the per-trade
+    # cap entirely) all silently neuter a layer of defence. We reject
+    # them at the schema layer; if the operator genuinely wants to
+    # disable a gate they can set its key to a sane positive value
+    # (P0-3 will introduce an explicit disable flag for that class).
+    #
+    # The floors are deliberately generous so they only catch typos, not
+    # legitimate low-risk configurations.
+    if "max_daily_loss_usd" in updates and isinstance(
+        updates["max_daily_loss_usd"], (int, float)
+    ) and not isinstance(updates["max_daily_loss_usd"], bool):
+        # Daily loss must be negative (it's a *cap* on losses, not a
+        # target) AND not absurdly large in magnitude — anything more
+        # negative than -100k per day is almost certainly a typo (the
+        # account is 1k USDC testnet / 10k USDC live). Allowed range:
+        # [-100_000, 0].
+        v = float(updates["max_daily_loss_usd"])
+        if v > 0:
+            errors.append("max_daily_loss_usd: must be <= 0 (it's a loss cap)")
+        elif v < -100_000:
+            errors.append(
+                "max_daily_loss_usd: must be >= -100000 (sanity floor; "
+                "values more negative than that almost certainly indicate a typo)"
+            )
+
+    if "max_total_notional_pct" in updates and isinstance(
+        updates["max_total_notional_pct"], (int, float)
+    ) and not isinstance(updates["max_total_notional_pct"], bool):
+        # Equity-relative cap. A value of 0 silently kills the gate (the
+        # gate treats 0 as "no cap" → no block); < 1 (i.e. < 100% of
+        # equity) is the normal range; > 50 is reckless. Allowed range:
+        # [0.5, 50]. Set 0 to disable (the gate's own convention).
+        v = float(updates["max_total_notional_pct"])
+        if 0 < v < 0.5:
+            errors.append(
+                "max_total_notional_pct: must be >= 0.5 (values <0.5 "
+                "effectively freeze the account — likely a typo); use 0 "
+                "to disable the cap explicitly"
+            )
+
+    if "max_trade_notional_usd" in updates and isinstance(
+        updates["max_trade_notional_usd"], (int, float)
+    ) and not isinstance(updates["max_trade_notional_usd"], bool):
+        # Per-trade notional cap. 0 = disabled (gate convention).
+        # Below the HL minimum order size ($10) the gate is effectively
+        # the floor anyway, so anything < 10 in the positive range is a
+        # typo. Allowed range: [0, MAX_TRADE_NOTIONAL_USD].
+        v = float(updates["max_trade_notional_usd"])
+        if 0 < v < 10.0:
+            errors.append(
+                "max_trade_notional_usd: must be >= 10 (HL minimum order "
+                "size); use 0 to disable the cap explicitly"
+            )
     return errors
