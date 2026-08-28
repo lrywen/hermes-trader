@@ -677,10 +677,33 @@ while True:
             time.sleep(scan_interval)
             continue
 
+        # Hot-toggle `enable_hip3`: the universe is a startup snapshot (see the
+        # comment above line "HIP-3 toggle: read once at startup"), so flipping
+        # the flag mid-run previously required a restart to add/drop HIP-3
+        # tokenized markets. Detect the change each cycle and rebuild immediately.
+        # Read fresh here (do not rely on the perception-layer `include_hip3`,
+        # which only gates filtering of the already-prefetched list).
+        try:
+            _hip3_now = bool(read_agent_config().get("enable_hip3", False))
+        except Exception:
+            _hip3_now = _enable_hip3
+        if _hip3_now != _enable_hip3:
+            try:
+                universe = get_universe(force_refresh=True, include_hip3=_hip3_now)
+                _enable_hip3 = _hip3_now
+                _last_universe_refresh = time.time()
+                _n_hip3 = sum(1 for m in universe if m.get("dex"))
+                logger.info(
+                    f"[universe] enable_hip3 flipped to {_hip3_now} — rebuilt: "
+                    f"{len(universe)} markets ({_n_hip3} HIP-3)"
+                )
+            except Exception as e:
+                logger.warning(f"[universe] enable_hip3 flip rebuild failed, keeping prior snapshot: {e}")
+
         # Refresh the universe on a TTL so prevDayPx / dayNtlVlm / funding track
         # the live market instead of freezing at loop-start (stale fields make
         # the scanner rank yesterday's movers — see HERMES_UNIVERSE_REFRESH_S).
-        if universe_refresh_s > 0 and (time.time() - _last_universe_refresh) >= universe_refresh_s:
+        elif universe_refresh_s > 0 and (time.time() - _last_universe_refresh) >= universe_refresh_s:
             try:
                 universe = get_universe(force_refresh=True, include_hip3=_enable_hip3)
                 _last_universe_refresh = time.time()
