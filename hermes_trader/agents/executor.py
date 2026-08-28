@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from hermes_trader.agents.config_store import read_agent_config, cfg_get, apply_coin_override
 from hermes_trader.agents.dsl_exit import (
@@ -351,7 +351,7 @@ def _get_market_volume_24h(coin: str) -> float:
 _DEFAULT_CONVICTION_TIERS = [(0.80, 1.5), (0.65, 1.0), (0.0, 0.7)]
 
 
-def _parse_conviction_tiers(raw: Any) -> List[tuple]:
+def _parse_conviction_tiers(raw: Any) -> List[Tuple[float, float]]:
     """Parse `conviction_tiers` config into descending (threshold, mult) pairs.
 
     Accepts a list of [min_confidence, size_multiplier] pairs. Falls back to the
@@ -370,7 +370,7 @@ def _parse_conviction_tiers(raw: Any) -> List[tuple]:
     return tiers
 
 
-def _conviction_multiplier(confidence: float, tiers: List[tuple]) -> float:
+def _conviction_multiplier(confidence: float, tiers: List[Tuple[float, float]]) -> float:
     """First tier (descending) whose threshold `confidence` meets wins. Below
     every threshold → the lowest tier's multiplier."""
     for threshold, mult in tiers:
@@ -379,7 +379,7 @@ def _conviction_multiplier(confidence: float, tiers: List[tuple]) -> float:
     return tiers[-1][1]
 
 
-def select_exit_params(dsl_config: Dict[str, Any], regime: str) -> tuple:
+def select_exit_params(dsl_config: Dict[str, Any], regime: str) -> Tuple[float, float, Any, float, float, str]:
     """Regime-aware exit selection. The base dsl_config is the SCALP config
     (bank fast — +EV in chop/down per the controlled backtest: scalp +$1536/63%
     vs trend-ride -$757/47%). When regime is directional ('up'/'down') and
@@ -605,7 +605,7 @@ def regime_strength_label(analysis: Dict[str, Any]) -> str:
 
 
 def plan_b_size_multiplier(analysis: Dict[str, Any],
-                           plan_b_cfg: Dict[str, Any]) -> tuple:
+                           plan_b_cfg: Dict[str, Any]) -> Tuple[float, str]:
     """Plan B: in a mid-strength TREND (not STRONG_TREND), RSI 40-60 has no
     directional edge (backtest attribution: these bars bleed equally long/short).
     Halve size to cut risk while keeping signal coverage.
@@ -635,9 +635,9 @@ def plan_b_size_multiplier(analysis: Dict[str, Any],
                   f"in [{rsi_lo:.0f},{rsi_hi:.0f}), size x{mult:.2f})")
 
 
-def momentum_reentry_allowed(last_exit_px: float, last_side: str,
-                             current_mid: float, composite: float,
-                             cfg: Dict[str, Any]) -> tuple:
+def momentum_reentry_allowed(last_exit_px: Optional[float], last_side: Optional[str],
+                             current_mid: Optional[float], composite: Optional[float],
+                             cfg: Dict[str, Any]) -> Tuple[bool, str]:
     """Should we BYPASS the loss-cooldown because a stopped name has RESUMED its
     uptrend? (The autopsy leak: SPCX was force-entered, noise-stopped, then the
     180m loss-cooldown locked us out of its +29% run.) The cooldown is anti-revenge
@@ -684,7 +684,7 @@ def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
 def _place_backup_sl(
     atr: float, entry_px: float, sl_atr_mult: float,
     sl_floor_pct: float, sl_ceiling_pct: float, size_in_coin: float,
-    is_buy: bool, coin: str, trade_side: str, memory: Any
+    is_buy: bool, coin: str, trade_side: str, memory: Any,
 ) -> bool:
     """Place the server-side backup stop for a freshly filled position.
 
@@ -1298,7 +1298,7 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         dex_name = coin_for_dex_check.split(":", 1)[0]
         from hermes_trader.client.hl_client import _http_post
 
-        def _read_dex_value() -> tuple[bool, float]:
+        def _read_dex_value() -> Tuple[bool, float]:
             try:
                 state_resp = _http_post("/info", {
                     "type": "clearinghouseState", "user": user, "dex": dex_name,
@@ -1352,7 +1352,7 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
     # and vice versa. Main-dex (crypto) trades behave exactly as before.
     _target_dex = analysis["coin"].split(":", 1)[0] if ":" in analysis["coin"] else ""
 
-    def _read_state() -> tuple[dict, float, float]:
+    def _read_state() -> Tuple[Dict[str, Any], float, float]:
         st = fetch_account_state(user, include_hip3=True) or {}
         deq = st.get("dex_equity") or {}
         dav = st.get("dex_available") or {}
