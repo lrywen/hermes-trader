@@ -49,6 +49,7 @@ from hermes_trader.dashboard import _require_operator                 # noqa: E4
 from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
 from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
 from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
+from hermes_trader.agents.risk_gates import GateContext, eval_all_gates       # noqa: E402
 from hermes_trader.agents.memory import memory                        # noqa: E402
 from hermes_trader.agents.perception import scan_once                 # noqa: E402
 from hermes_trader.agents.research import research                    # noqa: E402
@@ -185,6 +186,56 @@ def _hip3_on() -> bool:
         return bool(read_agent_config().get("enable_hip3", False))
     except Exception:
         return False
+
+
+def _check_manual_order_gates(
+    *,
+    coin: str,
+    is_buy: bool,
+    position_notional: float,
+    live_equity: float,
+    total_open_notional: float,
+    market_vol_24h: float,
+    positions: list,
+) -> Dict[str, Any]:
+    """P0-1: gate manual ``/api/hl/place-order`` calls against the same 16-gate
+    risk chain that ``maybe_execute`` runs. Returns the raw ``eval_all_gates``
+    report dict so the caller can branch on ``report["blocked"]`` and surface
+    ``report["block_reasons"]`` to the operator. The function is pure-ish:
+    it only reads ``memory`` / ``read_agent_config`` for context; it never
+    places orders. Side effects (audit, alert) live in the caller so the
+    bypass path is explicit.
+
+    We keep ``confidence=1.0`` for the operator path — manual orders are
+    operator-vetted and we don't want to reject them on a low AI score; the
+    safety-critical gates (daily_loss / global_halt / coin_circuit /
+    equity_risk / max_concurrent / liquidity / market_regime) still fire.
+    """
+    try:
+        cfg = read_agent_config()
+    except Exception:
+        cfg = {}
+    try:
+        daily_pnl = float(getattr(memory, "daily_pnl", 0.0) or 0.0)
+    except Exception:
+        daily_pnl = 0.0
+    gate_ctx = GateContext(
+        confidence=1.0,
+        current_positions=list(positions or []),
+        trade_notional_usd=float(position_notional),
+        daily_pnl=daily_pnl,
+        market_volume_24h_usd=float(market_vol_24h),
+        coin=str(coin),
+        trade_side="long" if is_buy else "short",
+        has_binary_news_risk=False,
+        equity=float(live_equity),
+        total_open_notional=float(total_open_notional),
+    )
+    return eval_all_gates(
+        gate_ctx,
+        cfg,
+        trace_id=f"manual:{coin}:{int(time.time() * 1000)}",
+    )
 
 
 # ── Agent endpoints ───────────────────────────────────────────────────────────
@@ -655,7 +706,17 @@ async def get_orderbook(coin: str = Query("BTC")) -> JSONResponse:
 
 @app.post("/api/hl/place-order", dependencies=[Depends(_require_operator)])
 async def place_order(request: Request) -> JSONResponse:
-    """POST /api/hl/place-order — manual order with ATR-based SL/TP brackets."""
+    """POST /api/hl/place-order — manual order with ATR-based SL/TP brackets.
+
+    P0-1 (audit 2026-08-28): manual orders now pass through the same
+    ``eval_all_gates`` 16-risk-gate chain as autonomous ``maybe_execute``.
+    Without this, the operator endpoint was a full bypass of every
+    kill-switch (daily_loss, global_halt, coin_circuit, equity_risk,
+    notional_cap, max_concurrent, liquidity, market_regime …) — a manual
+    "open BTC 100x" could fire even while the bot was in daily-loss kill
+    switch state. A ``bypass_gates=true`` escape hatch remains for genuine
+    emergencies but it must be explicit + audited + alerted.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -710,6 +771,11 @@ async def place_order(request: Request) -> JSONResponse:
             risk_pct = body.get("riskPct", 0.01)
             equity = await _fetch_live_equity()
             risk_usd = max(2, equity * risk_pct)
+        else:
+            try:
+                risk_usd = float(risk_usd)
+            except (TypeError, ValueError):
+                raise HTTPException(400, f"invalid riskUSD '{risk_usd}'")
 
         cfg = read_agent_config()
         position_notional = risk_usd * leverage
@@ -719,6 +785,109 @@ async def place_order(request: Request) -> JSONResponse:
                 400,
                 f"order notional ${position_notional:.2f} is below HL minimum ${min_notional:.2f}",
             )
+
+        # ── P0-1: 16-risk-gate chain on manual orders ───────────────────
+        # The manual order endpoint was previously a complete bypass of
+        # every kill-switch. We now construct a GateContext mirroring what
+        # maybe_execute passes, evaluate eval_all_gates, and refuse with 403
+        # + audit if any gate trips. An explicit `bypass_gates=true` escape
+        # hatch stays for true emergencies (e.g. closing a stuck position
+        # outside the normal flow) but it must carry a `bypass_reason`,
+        # write an audit line, and trigger a high-priority alert.
+        bypass = bool(body.get("bypass_gates", False))
+        bypass_reason = str(body.get("bypass_reason") or "").strip()
+        if bypass and not bypass_reason:
+            raise HTTPException(
+                400,
+                "bypass_gates=true requires non-empty bypass_reason for audit",
+            )
+
+        # Live context for gates
+        try:
+            live_equity_for_gates = float(await _fetch_live_equity())
+        except Exception:
+            live_equity_for_gates = 0.0
+        try:
+            user = resolve_user_address()
+            acct = fetch_account_state(user, include_hip3=_hip3_on()) if user else {}
+        except Exception:
+            acct = {}
+        total_open_notional = 0.0
+        try:
+            for _p in (acct.get("assetPositions") or []):
+                _szi = abs(float((_p.get("position") or {}).get("szi") or 0.0))
+                _px = float((_p.get("position") or {}).get("entryPx") or _p.get("position", {}).get("markPx") or 0.0)
+                total_open_notional += _szi * _px
+        except Exception:
+            pass
+
+        market_vol_24h = 0.0
+        try:
+            from hermes_trader.client.hl_client import _http_post
+            _ctxs = _http_post("/info", {"type": "metaAndAssetCtxs"}, timeout=8) or []
+            for _c in _ctxs:
+                _ctx = _c.get("ctx") if isinstance(_c, dict) else None
+                if not _ctx:
+                    continue
+                if str(_c.get("coin") or "").upper() == coin.upper():
+                    market_vol_24h = float(_ctx.get("dayNtlVlm") or 0.0)
+                    break
+        except Exception:
+            pass
+
+        gate_report = _check_manual_order_gates(
+            coin=coin,
+            is_buy=is_buy,
+            position_notional=float(position_notional),
+            live_equity=locals().get("live_equity_for_gates", 0.0) or 0.0,
+            total_open_notional=locals().get("total_open_notional", 0.0) or 0.0,
+            market_vol_24h=float(market_vol_24h),
+            positions=locals().get("acct", {}).get("assetPositions") or [],
+        )
+
+        if gate_report.get("blocked") and not bypass:
+            blocked_by = gate_report.get("block_reasons") or []
+            await _append_session_log({
+                "event": "place_order_blocked_by_gates",
+                "coin": coin,
+                "side": side,
+                "blocked_by": blocked_by,
+                "notional_usd": float(position_notional),
+                "leverage": int(leverage),
+            })
+            raise HTTPException(
+                403,
+                {
+                    "error": "blocked_by_risk_gates",
+                    "blocked_by": blocked_by,
+                    "note": "set bypass_gates=true + bypass_reason to override (audited)",
+                },
+            )
+
+        if bypass:
+            # Bypass path: write audit + fire high-priority alert so any
+            # operator override is visible to the alerting layer (feishu /
+            # voice / structured log) and to the post-trade review.
+            try:
+                from hermes_trader.notify import send_text
+                send_text(
+                    f"⚠️ manual order BYPASS gates: {coin} {side} "
+                    f"notional=${position_notional:.2f} lev={leverage}x "
+                    f"reason={bypass_reason}",
+                    category="risk",
+                    priority="high",
+                )
+            except Exception:
+                pass
+            await _append_session_log({
+                "event": "place_order_bypass_gates",
+                "coin": coin,
+                "side": side,
+                "bypass_reason": bypass_reason,
+                "notional_usd": float(position_notional),
+                "leverage": int(leverage),
+            })
+
         size_in_coin = entry_size_for_notional(coin, position_notional, mid_price)
 
         result = place_hl_order(is_buy, size_in_coin, mid_price, coin)
