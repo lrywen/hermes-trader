@@ -2697,6 +2697,74 @@ def close_position_market(coin: str) -> Dict[str, Any]:
     out: Dict[str, Any] = {**res, "coin": coin, "side": side,
                             "entry_px": entry_px, "leverage": leverage}
 
+    # H5 / P0-5: partial-fill guard. A reduce-only close that fills less than
+    # the live szi leaves a residual position on the exchange. Deregistering
+    # the local tracker in that case would orphan the residual (local says flat
+    # but the exchange still holds szi), so we MUST detect the gap and either
+    # (a) auto-place a second reduce-only close for the remainder, or (b) hand
+    # off to manual review if the gap is wider than the absolute floor.
+    # Without this guard, partial closes silently leak inventory into the
+    # next decision cycle and the next "no position" close becomes a no-op
+    # while the residual keeps running PnL + funding.
+    #
+    # Defensive default: if `total_sz` is ABSENT from the response, we have
+    # no way to verify the fill, so we conservatively assume full fill and
+    # keep the well-tested settlement path. The HL response shape should
+    # always include total_sz, but missing/None must not false-positive
+    # every close into a partial-fill branch.
+    if res.get("ok") and "total_sz" in res:
+        try:
+            _filled = float(res.get("total_sz") or 0.0)
+        except (TypeError, ValueError):
+            _filled = 0.0
+        try:
+            _requested = abs(float(szi))
+        except (TypeError, ValueError):
+            _requested = 0.0
+        # 0.001 coin absolute floor (sub-step dust) + 5% relative tolerance.
+        _gap = max(0.0, _requested - _filled)
+        _tol = max(0.001, _requested * 0.05)
+        if _gap > _tol and _requested > 0:
+            # Partial fill. Do NOT deregister / cancel SL / write settlement —
+            # the residual position is still live. Try to mop it up with a
+            # second reduce-only close at the same direction; if that also
+            # partials, escalate to a high-priority alert for manual review.
+            _remain = _gap
+            try:
+                _follow = place_hl_order(is_buy=not is_long, size=_remain, mid_price=mid_price,
+                                         coin=coin, reduce_only=True)
+            except Exception as _follow_e:
+                _follow = {"ok": False, "error": f"follow_close_exc:{_follow_e!r}"}
+            try:
+                _follow_filled = float((_follow or {}).get("total_sz") or 0.0)
+            except (TypeError, ValueError):
+                _follow_filled = 0.0
+            _still_open = max(0.0, _remain - _follow_filled)
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"⚠️ close {coin} 部分成交: 需平 {_requested:g} 实平 "
+                    f"{_filled:g} 补单实平 {_follow_filled:g} 仍剩 {_still_open:g}；"
+                    f"本地 tracker 保留，需人工核对",
+                    category="risk")
+            except Exception:
+                pass
+            logger.error(
+                f"[executor] close {coin} PARTIAL: requested={_requested:g} "
+                f"filled={_filled:g} follow_filled={_follow_filled:g} "
+                f"still_open={_still_open:g} — NOT deregistering (residual alive)"
+            )
+            out["partial"] = True
+            out["requested_sz"] = _requested
+            out["filled_sz"] = _filled
+            out["follow_filled_sz"] = _follow_filled
+            out["residual_sz"] = _still_open
+            out["follow_result"] = _follow
+            # Skip the success-path bookkeeping: settlement, PnL record, loss
+            # cooldown, breakers — those belong to a fully-flat close. The
+            # residual will be re-detected on the next scan tick.
+            return out
+
     if res.get("ok"):
         deregister_position(coin, side)
         # Cancel the now-stranded reduce-only SL/TP trigger bracket so stale
