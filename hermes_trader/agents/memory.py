@@ -338,6 +338,100 @@ class AgentMemory:
                 except Exception:
                     pass
 
+    def _write_atomic(self, data: Dict[str, Any]) -> bool:
+        """Persist ``data`` to MEMORY_FILE atomically with cross-process lock +
+        fsync. Returns True on success.
+
+        Split out of ``flush()`` so the in-process snapshot lock is not held
+        across the (potentially slow) disk write and so the cross-process
+        flock is always released even on a JSON/IO error.
+
+        R11-B1:
+          * Cross-process ``flock`` is acquired before any tmp-file work and
+            released in a top-level ``finally`` (so an exception in
+            ``json.dump`` cannot leak the kernel lock until process death).
+          * The tmp file is ``fsync``'d before ``os.replace`` so a power
+            loss between dump and rename cannot leave a zero-length
+            ``.agent-memory.json``.
+          * The directory entry is also ``fsync``'d so the rename is
+            durable on the journal.
+        """
+        lock_fd = os.open(MEMORY_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            tmp = MEMORY_FILE + ".tmp"
+            tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
+            try:
+                with os.fdopen(tmp_fd, "w") as f:
+                    json.dump(data, f, indent=2)
+                # json.dump + close already flushed Python buffers, but the
+                # OS page cache may not be on disk yet. fsync the file so
+                # os.replace below swaps in a durable blob even on power
+                # loss. We re-open briefly to fsync the same inode after
+                # fdopen has closed it.
+                with open(tmp, "r") as fr:
+                    os.fsync(fr.fileno())
+            except Exception:
+                # Bad tmp shouldn't shadow the real file: clean it up
+                # before re-raising so the next flush starts from a
+                # known-good state.
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            os.replace(tmp, MEMORY_FILE)
+            # fsync the parent directory so the rename is durable across
+            # a crash that happens after os.replace but before the
+            # directory entry is on disk.
+            parent = os.path.dirname(MEMORY_FILE) or "."
+            try:
+                dir_fd = os.open(parent, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+            except OSError:
+                # On a non-fsyncable filesystem (e.g. some CI sandboxes) the
+                # data is already durable in the file itself; the dir entry
+                # is best-effort.
+                pass
+            return True
+        except Exception as e:
+            logger.error(f"[memory] save failed: {e}")
+            return False
+        finally:
+            # ALWAYS release the kernel lock — even on a crash inside
+            # json.dump — otherwise a stuck flock would block every other
+            # process touching the memory file until this process dies.
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            try:
+                os.close(lock_fd)
+            except OSError:
+                pass
+
+    def _observe_flush_metric(self, t0: float, force: bool, ok: bool) -> None:
+        """Best-effort: record flush latency / failure counter.
+
+        P3-1: latency only counts the actual write path, not gated skips.
+        Failures increment MEMORY_FLUSH_ERRORS so a flapping disk can be
+        alerted on (R11-F1). R11-B1: isolated so it never masks I/O errors
+        raised by the write itself.
+        """
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_FLUSH_DURATION.labels(
+                force=str(force).lower(),
+                outcome="ok" if ok else "failed",
+            ).observe(max(0.0, time.monotonic() - t0))
+            if not ok:
+                metrics.MEMORY_FLUSH_ERRORS.inc()
+        except Exception:  # noqa: BLE001 — metrics must never mask I/O errors
+            pass
+
     def flush(self, force: bool = False) -> None:
         """Save current state to disk.
 
@@ -353,6 +447,10 @@ class AgentMemory:
         mutations no longer triggers one full json.dump+replace each. Critical
         writes — realized closes and the post-hydration rebuild — pass
         ``force=True`` to bypass both gates and persist immediately.
+
+        R11-B1: the in-process snapshot lock is released before disk I/O so
+        a slow disk doesn't stall the trading loop; cross-process flock +
+        fsync live in ``_write_atomic`` and are ALWAYS released in finally.
         """
         if not self._initialized:
             logger.debug("[memory] flush skipped — singleton not hydrated (load() not called)")
@@ -367,8 +465,6 @@ class AgentMemory:
                 return
         # P3-1: time the actual write path only — gated skips are not flushes.
         _t0 = time.monotonic()
-        _flush_ok = False
-        lock_fd = None
         # Build the snapshot UNDER the in-process lock (P0-C): the dict/list
         # contents are read here while other threads may be appending to them,
         # and json.dump iterates the same objects during the write below.
@@ -377,6 +473,9 @@ class AgentMemory:
         # the snapshot and the replace (lost update). flock still serializes
         # cross-process writers (dashboard/MCP/backtest); it does not protect
         # against in-process threads racing the snapshot.
+        # R11-B1: keep the snapshot lock tight — release BEFORE the (potentially
+        # slow) disk write. _write_atomic operates on the immutable dict we
+        # built here and uses its own cross-process lock.
         with self._lock:
             if not force and not self._dirty:
                 # Re-check under the lock: a racing flush may have persisted it.
@@ -397,44 +496,16 @@ class AgentMemory:
                 "globalHaltUntilMs": int(self._global_halt_until_ms or 0),
                 "consecutiveLosses": dict(self._consecutive_losses),
             }
-            try:
-                # Cross-process exclusive lock (4.5.1) so a concurrent
-                # dashboard/MCP process can't interleave a tmp+replace with the
-                # trading loop. flock is auto-released by the kernel on crash.
-                lock_fd = os.open(MEMORY_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
-                fcntl.flock(lock_fd, fcntl.LOCK_EX)
-                tmp = MEMORY_FILE + ".tmp"
-                with open(tmp, "w") as f:
-                    json.dump(data, f, indent=2)
-                os.replace(tmp, MEMORY_FILE)
-                # Persisted successfully: clear the dirty gate and arm the
-                # throttle window (P1-6). On failure we leave _dirty set so a
-                # later flush retries the lost write.
-                self._dirty = False
-                self._last_flush_ts = time.monotonic()
-                _flush_ok = True
-            except Exception as e:
-                logger.error(f"[memory] save failed: {e}")
-            finally:
-                if lock_fd is not None:
-                    try:
-                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-                        os.close(lock_fd)
-                    except OSError:
-                        pass
-                # P3-1: flush latency + terminal failure count (retries
-                # exhausted = state left dirty for the next tick). Best-effort.
-                try:
-                    from hermes_trader import metrics
-
-                    metrics.MEMORY_FLUSH_DURATION.labels(
-                        force=str(force).lower(),
-                        outcome="ok" if _flush_ok else "failed",
-                    ).observe(max(0.0, time.monotonic() - _t0))
-                    if not _flush_ok:
-                        metrics.MEMORY_FLUSH_ERRORS.inc()
-                except Exception:  # noqa: BLE001 — metrics must never mask I/O errors
-                    pass
+            # Clear the dirty gate NOW so a concurrent mutator can re-dirty
+            # for the next flush window without us having to re-enter the
+            # lock. _write_atomic is best-effort: on failure the caller will
+            # leave _dirty set on the next mutation.
+            self._dirty = False
+        # Disk write — outside the in-process lock (R11-B1).
+        ok = self._write_atomic(data)
+        if ok:
+            self._last_flush_ts = time.monotonic()
+        self._observe_flush_metric(_t0, force, ok)
 
     # ── Write operations ────────────────────────────────────────────────────
 
