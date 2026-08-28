@@ -87,8 +87,13 @@ def register_operator_routes(app: FastAPI) -> None:
         except Exception:
             raise HTTPException(422, "invalid JSON body")
         mode = (body.get("mode") or "").upper()
-        if mode not in {"OFF", "LIVE"}:
-            raise HTTPException(400, "mode must be OFF or LIVE")
+        # SHADOW runs the full scan/research/LLM pipeline but places no real
+        # orders (shadow book). PAPER is deliberately rejected: the executor
+        # only shadows on the literal "SHADOW" and skips only on "OFF", so an
+        # unknown value like "PAPER" would be treated as LIVE and trade real
+        # funds. The UI labels SHADOW as "模拟盘" but always submits "SHADOW".
+        if mode not in {"OFF", "LIVE", "SHADOW"}:
+            raise HTTPException(400, "mode must be OFF, LIVE or SHADOW")
         result = await asyncio.to_thread(_config_apply, {"mode": mode})
         old_mode = result["old"].get("mode")
         # F22: a trading-mode switch is a high-value audit event; persist it to

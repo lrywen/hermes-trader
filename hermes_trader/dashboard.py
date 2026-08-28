@@ -1265,7 +1265,7 @@ async def _h_help(parts: List[str], cmd: str) -> JSONResponse:
         "  config                — dump current .agent-config.json\n"
         "  dump                  — full state (config + positions + last events)\n"
         "  regime                — cached regime per proxy\n"
-        "  pause / resume        — flip mode OFF/LIVE\n"
+        "  pause / resume / shadow — flip mode OFF / LIVE / SHADOW\n"
         "  close <coin>          — market-close a single position\n"
         "  close all             — market-close every open position\n"
         "  close losing          — market-close every position with uPnL < 0\n"
@@ -1309,6 +1309,27 @@ async def _h_pause_resume(parts: List[str], cmd: str) -> JSONResponse:
     except Exception:
         pass
     return JSONResponse({"response": f"mode {old} → {new_mode}", "kind": "action"})
+
+
+async def _h_shadow(parts: List[str], cmd: str) -> JSONResponse:
+    # SHADOW = shadow book: full pipeline, no real fills. Audited like
+    # pause/resume (F22) since it is the same high-value mode switch.
+    new_mode = "SHADOW"
+    result = await asyncio.to_thread(_config_apply, {"mode": new_mode})
+    old = result["old"].get("mode", "?")
+    try:
+        session_log.append({
+            "event": "mode_switch",
+            "ts": int(time.time() * 1000),
+            "old": old,
+            "new": new_mode,
+            "via": "terminal",
+        })
+    except Exception:
+        pass
+    return JSONResponse(
+        {"response": f"mode {old} → {new_mode} (shadow: no real orders)",
+         "kind": "action"})
 
 
 async def _h_close(parts: List[str], cmd: str) -> Optional[JSONResponse]:
@@ -1529,6 +1550,7 @@ _TERMINAL_HANDLERS: Dict[str, Callable[..., Any]] = {
     "status": _h_status,
     "pause": _h_pause_resume,
     "resume": _h_pause_resume,
+    "shadow": _h_shadow,
     "close": _h_close,
     "positions": _h_positions,
     "trades": _h_trades,

@@ -505,6 +505,26 @@ def test_operator_write_rate_disabled_when_max_zero(client, monkeypatch):
 
 # ── F22: operator manual-close audit trail ─────────────────────────────────
 
+def test_operator_mode_shadow_accepted_and_persisted(client):
+    """SHADOW is a first-class mode: the operator endpoint accepts it and the
+    canonical value "SHADOW" is persisted (full pipeline, no real orders)."""
+    r = client.post("/api/dashboard/operator/mode",
+                    json={"mode": "shadow"}, headers=_auth())
+    assert r.status_code == 200, r.text
+    assert r.json()["mode"] == "SHADOW"
+    assert read_agent_config()["mode"] == "SHADOW"
+
+
+def test_operator_mode_paper_rejected_400(client):
+    """PAPER must NOT be accepted: the executor only shadows on the literal
+    "SHADOW" and skips only on "OFF", so an unknown value like "PAPER" would
+    be treated as LIVE and trade real funds. Reject it at the boundary."""
+    r = client.post("/api/dashboard/operator/mode",
+                    json={"mode": "PAPER"}, headers=_auth())
+    assert r.status_code == 400, r.text
+    assert read_agent_config().get("mode") != "PAPER"
+
+
 def test_operator_close_writes_audit_event(client, monkeypatch, tmp_path):
     """F22: a web operator close must persist an operator_action event to the
     session log AND fork it into the authoritative events.jsonl."""
