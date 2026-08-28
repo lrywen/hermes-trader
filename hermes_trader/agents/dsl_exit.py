@@ -36,6 +36,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
 
+from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.hl_client import _http_post
 
 logger = logging.getLogger(__name__)
@@ -62,8 +63,11 @@ DSL_STATE_LOCK_FILE = DSL_STATE_FILE + ".lock"
 # is coalesced to at most once per this interval process-wide, with a
 # dirty flag ensuring a deferred floor move is flushed on the next tick.
 # Force-saves (register/deregister/exit verdict) bypass the throttle.
+# R13-B1: read from the canonical dsl_state_io block; legacy HERMES_DSL_*
+# env var still wins (operator override preserved for backward compat).
 _MIN_SAVE_INTERVAL_SEC = float(
-    os.environ.get("HERMES_DSL_SAVE_INTERVAL_SEC", "2.0")
+    os.environ.get("HERMES_DSL_SAVE_INTERVAL_SEC")
+    or cfg_get("dsl_state_io.save_min_interval_sec", config={})
 )
 _LAST_SAVE_TS: float = 0.0
 _SAVE_DIRTY: bool = False
@@ -74,8 +78,10 @@ _SAVE_DIRTY: bool = False
 # The DSL floor only changes on check() ticks (throttled above to ~2s), so
 # a force-reload fresher than this TTL returns the in-memory copy without
 # touching the lock file. Default 1s keeps the operator view near-live.
+# R13-B1: canonical-block read; legacy env still wins.
 _FORCE_LOAD_TTL_S = float(
-    os.environ.get("HERMES_DSL_FORCE_LOAD_TTL_S", "1.0")
+    os.environ.get("HERMES_DSL_FORCE_LOAD_TTL_S")
+    or cfg_get("dsl_state_io.force_load_ttl_s", config={})
 )
 _LAST_FORCE_LOAD_TS: float = 0.0
 
@@ -83,8 +89,10 @@ _LAST_FORCE_LOAD_TS: float = 0.0
 # trackers per scan; without this each one re-read and re-parsed the config
 # file. Config edits are operator-driven, so a short TTL (default 5s) keeps
 # newly applied stops near-immediate without per-tracker disk I/O.
+# R13-B1: canonical-block read; legacy env still wins.
 _POLICY_CACHE_TTL_S = float(
-    os.environ.get("HERMES_DSL_POLICY_CACHE_TTL_S", "5.0")
+    os.environ.get("HERMES_DSL_POLICY_CACHE_TTL_S")
+    or cfg_get("dsl_state_io.policy_cache_ttl_s", config={})
 )
 _POLICY_CACHE: Optional["ExitPolicy"] = None
 _POLICY_CACHE_TS: float = 0.0
@@ -1058,9 +1066,14 @@ def _opt_float(v: Any) -> Optional[float]:
 # make progress anyway), then give up, bump the Prometheus counter, push
 # a risk-category Feishu card, and leave _SAVE_DIRTY set so the next tick
 # retries. Override via env if the deployment's disk is known-slow.
-_SAVE_MAX_ATTEMPTS = int(os.environ.get("HERMES_DSL_SAVE_MAX_ATTEMPTS", "3"))
+# R13-B1: read from canonical dsl_state_io; legacy env still wins.
+_SAVE_MAX_ATTEMPTS = int(
+    os.environ.get("HERMES_DSL_SAVE_MAX_ATTEMPTS")
+    or cfg_get("dsl_state_io.save_max_attempts", config={})
+)
 _SAVE_BACKOFF_BASE_SEC = float(
-    os.environ.get("HERMES_DSL_SAVE_BACKOFF_BASE_SEC", "0.1")
+    os.environ.get("HERMES_DSL_SAVE_BACKOFF_BASE_SEC")
+    or cfg_get("dsl_state_io.save_backoff_base_sec", config={})
 )
 
 

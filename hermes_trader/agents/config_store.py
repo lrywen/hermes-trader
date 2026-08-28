@@ -396,6 +396,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "evaluateClosedBarsOnly": True,
         "postCloseForceRefreshMs": 15_000,
     },
+    # R13-B1: DSL state-file I/O tunables (dsl_exit.py L65/77/86/1061/1063).
+    # The five knobs (process-wide save throttle, dashboard force-reload TTL,
+    # ExitPolicy cache TTL, save retry attempts, save backoff base) were
+    # previously read only via os.environ.get(HERMES_DSL_*, <literal>) at
+    # module-load. They never appeared in CANONICAL_DEFAULTS, so MCP
+    # server / dashboard dump / validate_config_updates could neither
+    # observe nor override them — a real operational blind spot on the
+    # hot path (every WS mid tick reads them). Defaults match the existing
+    # literals verbatim; behaviour is unchanged. Legacy HERMES_DSL_* env
+    # vars continue to take precedence (operator override) and the
+    # canonical env route (HERMES_CFG_DSL_STATE_IO__*) also works.
+    "dsl_state_io": {
+        "save_min_interval_sec": 2.0,
+        "force_load_ttl_s": 1.0,
+        "policy_cache_ttl_s": 5.0,
+        "save_max_attempts": 3,
+        "save_backoff_base_sec": 0.1,
+    },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the
     # global min_ai_confidence applies uniformly). Was implicit via

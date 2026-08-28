@@ -147,6 +147,10 @@ class _ConfigPatch(BaseModel):
     # R13-A1: perception scan-tick block. Nested because perception reads it
     # as `config["scan"]` (and TRIGGER_CONFIG["scan"] is itself a dict).
     scan: dict[str, Any] = Field(default_factory=lambda: _dict_default("scan"))
+    # R13-B1: DSL state-file I/O tunables (dsl_exit.py). Five keys covering
+    # the write throttle / force-reload TTL / policy cache TTL / save retry
+    # / backoff base — all on the trade hot path.
+    dsl_state_io: dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_state_io"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
