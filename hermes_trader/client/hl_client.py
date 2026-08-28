@@ -23,7 +23,7 @@ import os
 import random
 import threading
 import time
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import requests
 
@@ -58,7 +58,7 @@ def _hl_api_base() -> str:
 
 
 HL_API = _hl_api_base()
-_MS_PER_CANDLE: Dict[str, int] = {
+_MS_PER_CANDLE: dict[str, int] = {
     "1m": 60_000,
     "5m": 300_000,
     "15m": 900_000,
@@ -179,7 +179,7 @@ def _parse_retry_after(value: Optional[str]) -> Optional[float]:
 
 def _http_post(
     path: str,
-    payload: Dict[str, Any],
+    payload: dict[str, Any],
     timeout: int = 5,
     max_wait: Optional[float] = None,
 ) -> Any:
@@ -347,8 +347,8 @@ else:
 # after restart issues 3 duplicate candleSnapshot calls (weight 60) instead of
 # one (weight 20), tripling rate-budget pressure during exactly the window
 # when the bucket is already drained.
-_inflight: Dict[str, "threading.Event"] = {}
-_inflight_results: Dict[str, Any] = {}
+_inflight: dict[str, "threading.Event"] = {}
+_inflight_results: dict[str, Any] = {}
 _inflight_lock = threading.Lock()
 
 
@@ -357,7 +357,7 @@ def fetch_hl_candles(
     interval: str = "5m",
     count: int = 100,
     opportunistic: bool = False,
-) -> List[Candle]:
+) -> list[Candle]:
     """Fetch candles via HTTP (short-TTL cached per coin+interval+count).
 
     `opportunistic=True` marks the call as observability-only: it takes at most
@@ -427,7 +427,7 @@ def _fetch_hl_candles_raw(
     count: int,
     cache_key: str,
     opportunistic: bool,
-) -> List[Candle]:
+) -> list[Candle]:
     """Internal: actual HTTP fetch + parse for fetch_hl_candles."""
     ms = _MS_PER_CANDLE.get(interval, 300_000)
     end_time = int(time.time() * 1000)
@@ -478,7 +478,7 @@ def _fetch_hl_candles_raw(
             )
 
     # Genuine empty history: HL returns []. Surface as [] (distinct from failure).
-    candles: List[Candle] = []
+    candles: list[Candle] = []
     prev_t: Optional[int] = None
     for c in raw:
         try:
@@ -502,7 +502,7 @@ def _fetch_hl_candles_raw(
     return candles
 
 
-def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]:
+def fetch_account_state(user: str, include_hip3: bool = False) -> dict[str, Any]:
     """Fetch perp + spot account state, optionally aggregating HIP-3 dexes.
 
     When `include_hip3=True`, queries each HIP-3 perpDex's clearinghouse
@@ -545,8 +545,8 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
     # actually free for new positions.
     available = max(0.0, equity - total_margin_used)
 
-    dex_equity: Dict[str, float] = {"": perp_equity}
-    dex_available: Dict[str, float] = {"": available}
+    dex_equity: dict[str, float] = {"": perp_equity}
+    dex_available: dict[str, float] = {"": available}
     queried_dexes: set = {""}
     available_aggregated = available  # starts as main; HIP-3 adds in
 
@@ -581,7 +581,7 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
         # Fan out the per-dex clearinghouse queries in parallel — serial loop
         # was 8 sequential POSTs × ~150ms each = 1.2s. Parallel finishes in
         # the slowest single call (~200ms), 4-6× speedup on the dashboard.
-        def _fetch_dex(dex_name: str) -> tuple[str, Optional[Dict[str, Any]]]:
+        def _fetch_dex(dex_name: str) -> tuple[str, Optional[dict[str, Any]]]:
             try:
                 return (dex_name, _http_post("/info", {
                     "type": "clearinghouseState", "user": user, "dex": dex_name,
@@ -756,7 +756,7 @@ def _get_ws_mids_instance() -> "HyperliquidWebSocket | None":
         return _ws_mids_instance
 
 
-def _try_ws_mids() -> Dict[str, str] | None:
+def _try_ws_mids() -> dict[str, str] | None:
     """Try to get mids from the persistent WebSocket (non-blocking).
 
     Returns None immediately if WS isn't running. Caller decides whether
@@ -771,7 +771,7 @@ def _try_ws_mids() -> Dict[str, str] | None:
     return None
 
 
-def fetch_all_mids(include_hip3: bool = False) -> Dict[str, str]:
+def fetch_all_mids(include_hip3: bool = False) -> dict[str, str]:
     """Get all mid prices.
 
     For one-shot commands: uses HTTP POST (reliable, fast).
@@ -792,7 +792,7 @@ def fetch_all_mids(include_hip3: bool = False) -> Dict[str, str]:
 
     # Native perp + spot mids (one HTTP POST).
     raw = _http_post("/info", {"type": "allMids"})
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     if raw and isinstance(raw, dict):
         out = {k: str(v) for k, v in raw.items()}
     elif ws_result:
@@ -839,7 +839,7 @@ def stop_ws_mids() -> None:
 
 def fetch_funding_history(
     coin: str, start_time: int, end_time: Optional[int] = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Fetch funding rate history.
 
     Funding rates update hourly on HL, so the latest rate is cacheable for a

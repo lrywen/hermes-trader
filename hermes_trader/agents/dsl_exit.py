@@ -34,7 +34,7 @@ import math
 import os
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Iterable, Optional
 
 from hermes_trader.client.hl_client import _http_post
 
@@ -167,7 +167,7 @@ def _resolve_fill_time_ms(
         cutoff_s = now_s - within_minutes * 60.0
         # First pass: collect all same-coin/same-direction opening fills
         # within the recency window, newest first.
-        candidates: List[Dict[str, Any]] = []
+        candidates: list[dict[str, Any]] = []
         for f in fills:
             if not isinstance(f, dict):
                 continue
@@ -232,7 +232,7 @@ def _fills_price_match(a: Any, b: float, rel_tol: float = 1e-4) -> bool:
 
 
 def resolve_close_fill(user: str, coin: str, side: str,
-                       since_ts: float) -> Optional[Dict[str, Any]]:
+                       since_ts: float) -> Optional[dict[str, Any]]:
     """Find the most recent REDUCING fill for this position after ``since_ts``.
 
     Used to attribute an externally-closed position (an exchange-side SL/TP
@@ -275,7 +275,7 @@ def resolve_close_fill(user: str, coin: str, side: str,
     return None
 
 
-def _fetch_open_orders(user: str) -> List[Dict[str, Any]]:
+def _fetch_open_orders(user: str) -> list[dict[str, Any]]:
     """Fetch the user's resting orders from the HL REST endpoint. [] on failure."""
     try:
         data = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8)
@@ -285,7 +285,7 @@ def _fetch_open_orders(user: str) -> List[Dict[str, Any]]:
         return []
 
 
-def _order_trigger_px(o: Dict[str, Any]) -> Optional[float]:
+def _order_trigger_px(o: dict[str, Any]) -> Optional[float]:
     """Extract the trigger price from a resting trigger order.
 
     HL's openOrders exposes it as `triggerPx` for some order shapes and as
@@ -450,7 +450,7 @@ class ExitPolicy:
     # hard_timeout bucket's +3.41% avg is driven by agers that peaked).
     # 0 = off.
     stale_flat_timeout_minutes: float = 480.0
-    phase2_tiers: List[RetraceTier] = field(default_factory=lambda: [
+    phase2_tiers: list[RetraceTier] = field(default_factory=lambda: [
         RetraceTier(8.0, 0.35),   # 8% profit → give back 35%
         RetraceTier(15.0, 0.40),  # 15% profit → give back 40% (let winners run)
     ])
@@ -848,7 +848,7 @@ class DSLTracker:
             unrealized_pct=upct,
         )
 
-    def status(self, mark_px: float) -> Dict[str, Any]:
+    def status(self, mark_px: float) -> dict[str, Any]:
         """Return a READ-ONLY DSL status snapshot (for logging/MCP/dashboard).
 
         This MUST NOT advance peak_px/_last_floor, increment the breach
@@ -904,11 +904,11 @@ class DSLTracker:
 
 # ── Global tracker registry ──────────────────────────────────────────
 
-_active_positions: Dict[str, DSLTracker] = {}
+_active_positions: dict[str, DSLTracker] = {}
 _loaded_from_disk = False
 
 
-def _tracker_to_dict(t: DSLTracker) -> Dict[str, Any]:
+def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
     return {
         "coin": t.coin,
         "side": t.side,
@@ -930,7 +930,7 @@ def _tracker_to_dict(t: DSLTracker) -> Dict[str, Any]:
     }
 
 
-def _migrate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
     """Bring an on-disk state payload up to ``_STATE_VERSION`` in place.
 
     Each ``_migrate_vN_to_vN+1`` is a pure structural transform: it adds
@@ -972,7 +972,7 @@ def _migrate_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _migrate_v1_to_v2(payload: dict[str, Any]) -> dict[str, Any]:
     """v1 → v2: add exchange bracket order IDs / prices (all default None).
 
     v1 was written before the static backup-SL/TP reconciler existed, so
@@ -993,7 +993,7 @@ def _migrate_v1_to_v2(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _tracker_from_dict(d: Dict[str, Any]) -> DSLTracker:
+def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
     pol_raw = d.get("policy") or {}
     tiers = [RetraceTier(**rt) for rt in pol_raw.get("phase2_tiers", [])]
     policy = ExitPolicy(
@@ -1253,14 +1253,14 @@ def reset_force_load_throttle() -> None:
     _LAST_FORCE_LOAD_TS = 0.0
 
 
-def active_tracker_snapshots() -> List[Dict[str, Any]]:
+def active_tracker_snapshots() -> list[dict[str, Any]]:
     """Return public snapshot dicts of all active DSL trackers (F23).
 
     Replaces direct dashboard access to ``_active_positions`` /
     ``tracker._last_floor``. Call ``load_state(force=True)`` first to pick up
     disk state written by the trading-loop process.
     """
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for key, t in _active_positions.items():
         out.append({
             "key": key, "coin": t.coin, "side": t.side,
@@ -1271,7 +1271,7 @@ def active_tracker_snapshots() -> List[Dict[str, Any]]:
     return out
 
 
-def tracker_view(coin: str, side: str) -> Optional[Dict[str, Any]]:
+def tracker_view(coin: str, side: str) -> Optional[dict[str, Any]]:
     """Return peak/floor/phase for one tracked position (F23 public accessor).
 
     Replaces dashboard poking ``_active_positions`` / ``tracker._last_floor``
@@ -1327,7 +1327,7 @@ def register_position(coin: str, side: str, entry_px: float,
     return tracker
 
 
-def active_position_coins() -> Dict[str, str]:
+def active_position_coins() -> dict[str, str]:
     """coin -> side for every coin with an active DSL tracker.
 
     Restart-safe backstop against re-entry stacking: the DSL registry rehydrates
@@ -1440,11 +1440,11 @@ def _build_policy_from_config() -> ExitPolicy:
         return ExitPolicy()
 
 
-def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
+def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
                             policy: Optional[ExitPolicy] = None,
                             default_leverage: int = 1,
                             queried_dexes: Optional[set] = None,
-                            user: Optional[str] = None) -> List["DSLTracker"]:
+                            user: Optional[str] = None) -> list["DSLTracker"]:
     """Reconcile the tracker registry with the exchange's live position list.
 
     Synthesizes a tracker for any open position without one (entry_time =
@@ -1462,7 +1462,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
     load_state()
     live_keys = set()
     added = 0
-    dropped: List["DSLTracker"] = []
+    dropped: list["DSLTracker"] = []
     for p in asset_positions or []:
         pos = p.get("position", {}) if isinstance(p, dict) else {}
         coin = pos.get("coin")
@@ -1589,7 +1589,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[Dict[str, Any]],
     return dropped
 
 
-def check_all_positions(mids: Dict[str, float]) -> List[ExitVerdict]:
+def check_all_positions(mids: dict[str, float]) -> list[ExitVerdict]:
     """Check all active positions against current mids. Call each scan tick.
 
     Returns list of ExitVerdict for positions that should be closed.

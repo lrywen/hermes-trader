@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Dict, Literal, Optional, Tuple
+from typing import Literal, Optional
 
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.indicators.math import adx, atr as _atr_ind, ema, obv as _obv_ind
@@ -207,11 +207,11 @@ _SLOW_EMA = 30
 
 REGIME_TTL_S = 300  # 5min cache — 1h trends can flip faster than 4h
 
-_regime_cache: Dict[str, Tuple[Regime, float]] = {}
+_regime_cache: dict[str, tuple[Regime, float]] = {}
 # Continuous 5-component trend-strength score (0..1) keyed by the same proxy as
 # _regime_cache. Populated alongside the regime on the same candle fetch so the
 # risk gate can read score>=0.55 without a second network call.
-_score_cache: Dict[str, Tuple[float, float]] = {}
+_score_cache: dict[str, tuple[float, float]] = {}
 
 # Bare tickers that trade as native (main-dex) HL perps — authoritatively
 # crypto. Built once from the universe and cached; lets `hyna:BTC`, `cash:ETH`,
@@ -272,7 +272,7 @@ def classify_asset(coin: str) -> AssetClass:
     return "crypto"
 
 
-def _classifier_params() -> Tuple[int, int, float, float]:
+def _classifier_params() -> tuple[int, int, float, float]:
     """Return (fast_ema, slow_ema, slope_up, chop_adx_max) from the live
     `regime_classifier` config block, falling back to the calibrated module
     defaults when the block/keys are absent. Lets the weekly calibration job
@@ -385,7 +385,7 @@ def _detect_for_proxy(proxy: str) -> Regime:
         return "neutral"
 
 
-def _detect_for_proxy_with_score(proxy: str) -> Tuple[Regime, float]:
+def _detect_for_proxy_with_score(proxy: str) -> tuple[Regime, float]:
     """Same candle fetch as _detect_for_proxy but returns (regime, score).
     Populates _score_cache so a subsequent detect_regime() reuses it."""
     try:
@@ -398,7 +398,7 @@ def _detect_for_proxy_with_score(proxy: str) -> Tuple[Regime, float]:
         return "neutral", 0.0
 
 
-def detect_regime_with_score(coin: str, *, force: bool = False) -> Tuple[Regime, float]:
+def detect_regime_with_score(coin: str, *, force: bool = False) -> tuple[Regime, float]:
     """Like detect_regime but also returns the continuous 5-component strength
     score (0..1) for the same proxy candles. The risk gate uses score>=0.55 as
     a strictness overlay on "aligned" entries to cut the 36% false-trend rate
@@ -446,10 +446,10 @@ def detect_regime(coin: str, *, force: bool = False) -> Regime:
     return regime
 
 
-def regime_snapshot() -> Dict[str, Dict[str, object]]:
+def regime_snapshot() -> dict[str, dict[str, object]]:
     """Operator-facing summary: every cached proxy + regime + score + cache age."""
     now = time.time()
-    out: Dict[str, Dict[str, object]] = {}
+    out: dict[str, dict[str, object]] = {}
     for proxy, (regime, ts) in _regime_cache.items():
         score = _score_cache.get(proxy, (0.0, 0.0))[0]
         out[proxy] = {"regime": regime, "score": round(score, 3),

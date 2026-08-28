@@ -49,7 +49,7 @@ import json
 import logging
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_trader.client.hl_client import _http_post
 
@@ -84,7 +84,7 @@ def _save_json_cached(path: Path, data: Any) -> None:
         logger.warning(f"[universe] Failed to cache {path}: {e}")
 
 
-def _fetch_perp_meta(force_refresh: bool = False) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _fetch_perp_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch perp metadata with asset context (volume, funding, etc.).
     
     Returns (meta_dict, asset_ctx_dict) where:
@@ -123,7 +123,7 @@ def _fetch_perp_meta(force_refresh: bool = False) -> Tuple[Dict[str, Any], Dict[
 # `xyz:NVDA`, `km:GLDMINE`. See README "Enabling HIP-3 markets" below.
 
 
-def list_hip3_dexes(force_refresh: bool = False) -> List[str]:
+def list_hip3_dexes(force_refresh: bool = False) -> list[str]:
     """Names of all non-null HIP-3 perp dexes registered on Hyperliquid.
 
     First entry of /info?perpDexs is null (the main HL perp dex); the rest
@@ -138,7 +138,7 @@ def list_hip3_dexes(force_refresh: bool = False) -> List[str]:
     return dexes
 
 
-def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch one HIP-3 perpDex universe + asset contexts, shape-compatible with `_fetch_perp_meta`."""
     cache_path = _CACHE_DIR / f"meta_{dex}.json"
     cache = _load_json_cached(cache_path, _CACHE_TTL_SECS) if not force_refresh else None
@@ -148,8 +148,8 @@ def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> Tuple[Dict[str, A
     if not (data and isinstance(data, list) and len(data) >= 2):
         return {}, {}
     meta, ctx = data[0], data[1]
-    meta_dict: Dict[str, Any] = {}
-    ctx_dict: Dict[str, Any] = {}
+    meta_dict: dict[str, Any] = {}
+    ctx_dict: dict[str, Any] = {}
     for i, u in enumerate(meta.get("universe", [])):
         coin = u.get("name")
         if not coin:
@@ -167,7 +167,7 @@ def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> Tuple[Dict[str, A
     return meta_dict, ctx_dict
 
 
-def _fetch_spot_meta(force_refresh: bool = False) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+def _fetch_spot_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
     """Fetch spot metadata with asset context.
     
     Returns (meta_dict, asset_ctx_dict) for spot assets.
@@ -198,7 +198,7 @@ def _fetch_spot_meta(force_refresh: bool = False) -> Tuple[Dict[str, Any], Dict[
     return cache[0], cache[1]
 
 
-def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> List[Dict[str, Any]]:
+def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> list[dict[str, Any]]:
     """Fetch the full market universe (perp + spot, optionally + HIP-3) with volume data.
 
     Args:
@@ -231,8 +231,8 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
     # account aggregation (hl_client.py): on testnet list_hip3_dexes() returns
     # ~250 unfunded venues, and walking them all would serialize ~250
     # metaAndAssetCtxs POSTs behind the rate limiter, stalling loop startup.
-    hip3_meta: Dict[str, Any] = {}
-    hip3_ctx: Dict[str, Any] = {}
+    hip3_meta: dict[str, Any] = {}
+    hip3_ctx: dict[str, Any] = {}
     if include_hip3:
         dexes = list_hip3_dexes(force_refresh)
         try:
@@ -286,7 +286,7 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
     return results
 
 
-def get_market_by_coin(coin: str) -> Optional[Dict[str, Any]]:
+def get_market_by_coin(coin: str) -> Optional[dict[str, Any]]:
     """Get a single market by coin name."""
     for m in get_universe():
         if m["coin"] == coin:

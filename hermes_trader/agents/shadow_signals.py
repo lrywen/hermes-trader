@@ -21,7 +21,7 @@ from __future__ import annotations
 import logging
 import threading
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,15 +34,15 @@ def _base_symbol(coin: str) -> str:
     return t
 
 
-def gather_shadow_signals(coin: str, side: str, sub: Optional[Dict[str, Any]] = None,
-                          allow_fetch: bool = True) -> Dict[str, Any]:
+def gather_shadow_signals(coin: str, side: str, sub: Optional[dict[str, Any]] = None,
+                          allow_fetch: bool = True) -> dict[str, Any]:
     """Compute every applicable free signal for `coin`. Each is individually
     try/excepted so one outage never blanks the rest. Returns a compact dict.
 
     allow_fetch=False = CACHE-ONLY (no network) — used to snapshot the signals AT
     ENTRY on the hot path for the forward backtest, without amplifying the path."""
     sub = sub or {}
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     is_hip3 = ":" in (coin or "")
 
     if is_hip3:
@@ -89,7 +89,7 @@ def gather_shadow_signals(coin: str, side: str, sub: Optional[Dict[str, Any]] = 
     return out
 
 
-def shadow_summary(sig: Dict[str, Any]) -> str:
+def shadow_summary(sig: dict[str, Any]) -> str:
     """One-line human summary for the log."""
     parts = []
     if "gex" in sig:
@@ -123,7 +123,7 @@ class Enforcement:
     boost_reason: str = ""
 
 
-def enforce_signals(coin: str, side: str, cfg: Dict[str, Any]) -> Enforcement:
+def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
     """Decide Veto/Boost for a forced-override LONG candidate from CACHED signals."""
     if (side or "long").lower() != "long":
         return Enforcement()
@@ -201,7 +201,7 @@ def enforce_signals(coin: str, side: str, cfg: Dict[str, Any]) -> Enforcement:
     return Enforcement(boost=boost, boost_reason="; ".join(boost_reasons))
 
 
-def run_shadow_async(coin: str, side: str, sub: Optional[Dict[str, Any]] = None) -> None:
+def run_shadow_async(coin: str, side: str, sub: Optional[dict[str, Any]] = None) -> None:
     """Fire-and-forget shadow gather+log on a daemon thread. NEVER blocks the
     caller (the execute path), so it can't add latency or amplify the hot path."""
     sub = dict(sub or {})

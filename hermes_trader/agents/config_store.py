@@ -22,7 +22,7 @@ import threading
 import time
 from contextlib import contextmanager
 from copy import deepcopy
-from typing import Any, Dict, Iterator, List, Optional, TypeVar
+from typing import Any, Iterator, Optional, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ _BACKUP_PATH = CONFIG_PATH + ".bak"
 # whether the heavy path is needed. write_agent_config() invalidates the
 # cache explicitly; cross-process changes (dashboard writes another file?)
 # are detected by the mtime/size stat. Lock guards the cache itself.
-_RAW_CACHE: Optional[Dict[str, Any]] = None
+_RAW_CACHE: Optional[dict[str, Any]] = None
 _RAW_CACHE_SIG: Optional[tuple] = None
 _RAW_CACHE_LOCK = threading.Lock()
 
@@ -76,7 +76,7 @@ def _invalidate_raw_cache() -> None:
 # calls whose defaults had drifted from production (e.g. max_daily_loss_usd
 # fell back to -100 in one place while production uses -30).
 # ---------------------------------------------------------------------------
-CANONICAL_DEFAULTS: Dict[str, Any] = {
+CANONICAL_DEFAULTS: dict[str, Any] = {
     "mode": "OFF",
     "enable_crypto": True,
     "enable_hip3": True,
@@ -388,7 +388,7 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
 }
 
 # Legacy alias — code that imports DEFAULT_CONFIG gets the full canonical set.
-DEFAULT_CONFIG: Dict[str, Any] = CANONICAL_DEFAULTS
+DEFAULT_CONFIG: dict[str, Any] = CANONICAL_DEFAULTS
 
 
 # ---------------------------------------------------------------------------
@@ -434,7 +434,7 @@ DEFAULT_CONFIG: Dict[str, Any] = CANONICAL_DEFAULTS
 # single source of truth.  Nested dict / list kinds use the *type* of the
 # canonical default (int / float / bool / str / list / dict).  Mode is
 # explicitly a 3-value enum and lives in its own per-key check below.
-_TYPE_KIND_BY_KEY: Dict[str, Any] = {
+_TYPE_KIND_BY_KEY: dict[str, Any] = {
     key: type(default) for key, default in CANONICAL_DEFAULTS.items()
 }
 
@@ -494,7 +494,7 @@ def _validate_cfg_value(key: str, value: Any) -> Optional[str]:
     return None
 
 
-def _validate_critical(cfg: Dict[str, Any]) -> List[str]:
+def _validate_critical(cfg: dict[str, Any]) -> list[str]:
     """R11-E1: run the FORBIDDEN_OVERRIDE contract against the merged view
     of *cfg*.
 
@@ -518,7 +518,7 @@ def _validate_critical(cfg: Dict[str, Any]) -> List[str]:
     return validate_forbidden_overrides(cfg)
 
 
-def validate_config_dict(cfg: Dict[str, Any], *, strict_keys: bool = True) -> List[str]:
+def validate_config_dict(cfg: dict[str, Any], *, strict_keys: bool = True) -> list[str]:
     """Validate a *whole* config dict (post-merge) against the canonical
     schema. Returns a list of human-readable error strings (empty on pass).
 
@@ -544,7 +544,7 @@ def validate_config_dict(cfg: Dict[str, Any], *, strict_keys: bool = True) -> Li
     if not isinstance(cfg, dict):
         return [f"config: expected object, got {type(cfg).__name__}"]
 
-    errors: List[str] = []
+    errors: list[str] = []
 
     # 1. Unknown-key gate.
     for key in cfg.keys():
@@ -587,7 +587,7 @@ def validate_config_dict(cfg: Dict[str, Any], *, strict_keys: bool = True) -> Li
 
 
 def _validate_or_raise(
-    cfg: Dict[str, Any], *, source: str, strict_keys: bool = True
+    cfg: dict[str, Any], *, source: str, strict_keys: bool = True
 ) -> None:
     """Run :func:`validate_config_dict` on *cfg*; raise ``RuntimeError`` with
     a joined error list if any errors are found.
@@ -608,8 +608,8 @@ def _validate_or_raise(
 
 
 def _log_validation_warnings(
-    cfg: Dict[str, Any], *, source: str, strict_keys: bool = True
-) -> List[str]:
+    cfg: dict[str, Any], *, source: str, strict_keys: bool = True
+) -> list[str]:
     """Run :func:`validate_config_dict` on *cfg* and log any errors as
     warnings.  Never raises.  Returns the list of errors (empty on pass) so
     the caller can decide whether to surface them in a metric / audit line.
@@ -632,7 +632,7 @@ def _log_validation_warnings(
     return errors
 
 
-def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge *overlay* into a copy of *base*.
 
     A value of ``None`` in *overlay* acts as a deletion marker: the
@@ -689,7 +689,7 @@ def _lookup_default(dotted_key: str) -> Any:
     return node
 
 
-def _lookup_in_dict(d: Dict[str, Any], dotted_key: str) -> Any:
+def _lookup_in_dict(d: dict[str, Any], dotted_key: str) -> Any:
     """Look up a dotted key in an arbitrary dict, raising KeyError if absent."""
     parts = dotted_key.split(".")
     node: Any = d
@@ -700,7 +700,7 @@ def _lookup_in_dict(d: Dict[str, Any], dotted_key: str) -> Any:
     return node
 
 
-def cfg_get(dotted_key: str, default: Any = None, *, config: Optional[Dict[str, Any]] = None) -> Any:
+def cfg_get(dotted_key: str, default: Any = None, *, config: Optional[dict[str, Any]] = None) -> Any:
     """Type-safe config lookup with env override and canonical fallback.
 
     Resolution order:
@@ -743,7 +743,7 @@ def cfg_get(dotted_key: str, default: Any = None, *, config: Optional[Dict[str, 
     return default
 
 
-def apply_coin_override(config: Dict[str, Any], coin: Optional[str]) -> Dict[str, Any]:
+def apply_coin_override(config: dict[str, Any], coin: Optional[str]) -> dict[str, Any]:
     """Return a copy of *config* with ``coin_overrides[coin]`` deep-merged on top.
 
     This is the single chokepoint for per-coin parameter isolation. Call it at
@@ -770,7 +770,7 @@ def apply_coin_override(config: Dict[str, Any], coin: Optional[str]) -> Dict[str
     return _deep_merge(base, overrides)
 
 
-def read_agent_config() -> Dict[str, Any]:
+def read_agent_config() -> dict[str, Any]:
     """Read the agent config from .agent-config.json.
 
     The returned dict is merged on top of CANONICAL_DEFAULTS so that newly
@@ -813,7 +813,7 @@ def read_agent_config() -> Dict[str, Any]:
     return merged
 
 
-def _read_raw_config() -> Optional[Dict[str, Any]]:
+def _read_raw_config() -> Optional[dict[str, Any]]:
     """Read and parse the raw JSON config under a shared flock, or None on
     any failure (see :func:`_read_raw_locked` for semantics).
 
@@ -842,7 +842,7 @@ def _read_raw_config() -> Optional[Dict[str, Any]]:
                 pass
 
 
-def _read_raw_locked() -> Optional[Dict[str, Any]]:
+def _read_raw_locked() -> Optional[dict[str, Any]]:
     """Read and parse the raw JSON config, assuming the caller already holds
     a shared or exclusive flock on ``_CONFIG_LOCK_PATH``.
 
@@ -888,7 +888,7 @@ def _read_raw_locked() -> Optional[Dict[str, Any]]:
         return None
 
 
-def write_agent_config(cfg: Dict[str, Any], *, backup: bool = True) -> None:
+def write_agent_config(cfg: dict[str, Any], *, backup: bool = True) -> None:
     """Write the agent config to .agent-config.json (atomic replace + lock).
 
     F20: thin flock wrapper around :func:`_write_raw_locked` so the write
@@ -923,7 +923,7 @@ def write_agent_config(cfg: Dict[str, Any], *, backup: bool = True) -> None:
                 pass
 
 
-def _write_raw_locked(cfg: Dict[str, Any], *, backup: bool = True) -> None:
+def _write_raw_locked(cfg: dict[str, Any], *, backup: bool = True) -> None:
     """Write *cfg* to disk, assuming the caller already holds LOCK_EX on
     ``_CONFIG_LOCK_PATH``. See :func:`write_agent_config` for semantics.
 
@@ -982,7 +982,7 @@ def _write_raw_locked(cfg: Dict[str, Any], *, backup: bool = True) -> None:
 
 
 @contextmanager
-def update_agent_config(*, backup: bool = True) -> Iterator[Dict[str, Any]]:
+def update_agent_config(*, backup: bool = True) -> Iterator[dict[str, Any]]:
     """F20: cross-process read-modify-write critical section for the agent
     config.
 
@@ -1038,7 +1038,7 @@ def update_agent_config(*, backup: bool = True) -> Iterator[Dict[str, Any]]:
                 pass
 
 
-def backup_config() -> Optional[Dict[str, Any]]:
+def backup_config() -> Optional[dict[str, Any]]:
     """Read and return the last backup config, or None if unavailable."""
     lock_fd = None
     try:
@@ -1102,7 +1102,7 @@ def _snap_path(ts: int) -> str:
     return f"{_SNAP_PREFIX}{ts}{_SNAP_SUFFIX}"
 
 
-def create_snapshot(reason: str = "manual") -> Dict[str, Any]:
+def create_snapshot(reason: str = "manual") -> dict[str, Any]:
     """Copy the current config to an immutable timestamped snapshot.
 
     Returns metadata ``{"id", "ts", "reason", "keys", "size"}``. Raises
@@ -1144,10 +1144,10 @@ def create_snapshot(reason: str = "manual") -> Dict[str, Any]:
                 pass
 
 
-def list_snapshots() -> List[Dict[str, Any]]:
+def list_snapshots() -> list[dict[str, Any]]:
     """Return all manual snapshots, newest first. Each item has id/ts/reason."""
     import glob
-    snaps: List[Dict[str, Any]] = []
+    snaps: list[dict[str, Any]] = []
     snap_basename_prefix = os.path.basename(_SNAP_PREFIX)
     for path in glob.glob(_SNAP_PREFIX + "*" + _SNAP_SUFFIX):
         fname = os.path.basename(path)

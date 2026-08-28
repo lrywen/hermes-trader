@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict
+from typing import Any
 
 from hermes_trader import notify
 
@@ -33,7 +33,7 @@ def _v(v: Any) -> str:
     return str(v)
 
 
-def dispatch(record: Dict[str, Any]) -> None:
+def dispatch(record: dict[str, Any]) -> None:
     """Translate one session-log record into a Feishu card (best-effort)."""
     try:
         event = record.get("event")
@@ -73,7 +73,7 @@ def dispatch(record: Dict[str, Any]) -> None:
             pass
 
 
-def _on_execute(r: Dict[str, Any]) -> None:
+def _on_execute(r: dict[str, Any]) -> None:
     coin = r.get("coin", "?")
     if r.get("executed"):
         fields = {
@@ -102,7 +102,7 @@ def _on_execute(r: Dict[str, Any]) -> None:
                          dedup_key=f"blocked:{coin}")
 
 
-def _on_ai_close(r: Dict[str, Any]) -> None:
+def _on_ai_close(r: dict[str, Any]) -> None:
     coin = r.get("coin", "?")
     fields = {
         "币种": coin,
@@ -115,7 +115,7 @@ def _on_ai_close(r: Dict[str, Any]) -> None:
                      category="trade", level="info")
 
 
-def _on_dsl_exit(r: Dict[str, Any]) -> None:
+def _on_dsl_exit(r: dict[str, Any]) -> None:
     coin = r.get("coin", "?")
     realized = r.get("realized_pnl_pct")
     fields = {
@@ -131,7 +131,7 @@ def _on_dsl_exit(r: Dict[str, Any]) -> None:
                      category="trade", level=level)
 
 
-def _on_killswitch(r: Dict[str, Any]) -> None:
+def _on_killswitch(r: dict[str, Any]) -> None:
     # None-safe: a malformed killswitch record (daily_pnl/limit missing) must
     # not raise and get swallowed — that would drop the single most important
     # alert. Missing numerics render as $0.
@@ -146,7 +146,7 @@ def _on_killswitch(r: Dict[str, Any]) -> None:
                      fields=fields, category="risk", level="danger")
 
 
-def _on_manual_order(r: Dict[str, Any]) -> None:
+def _on_manual_order(r: dict[str, Any]) -> None:
     notify.send_card(f"手动下单 — {r.get('coin', '?')}",
                      fields={"币种": r.get("coin"),
                              "方向": r.get("side"),
@@ -154,14 +154,14 @@ def _on_manual_order(r: Dict[str, Any]) -> None:
                      category="trade", level="info")
 
 
-def _on_manual_close(r: Dict[str, Any]) -> None:
+def _on_manual_close(r: dict[str, Any]) -> None:
     notify.send_card(f"手动平仓 — {r.get('coin', '?')}",
                      fields={"币种": r.get("coin"),
                              "结果": "成功" if r.get("ok") else "失败"},
                      category="trade", level="info")
 
 
-def _on_research(r: Dict[str, Any]) -> None:
+def _on_research(r: dict[str, Any]) -> None:
     verdict = str(r.get("verdict", "")).upper()
     if verdict not in _ACTIONABLE_VERDICTS:
         return
@@ -184,7 +184,7 @@ def _on_research(r: Dict[str, Any]) -> None:
                      dedup_key=f"research:{coin}:{verdict}")
 
 
-def _on_error(r: Dict[str, Any]) -> None:
+def _on_error(r: dict[str, Any]) -> None:
     scope = r.get("scope") or r.get("coin") or "loop"
     fields = {"来源": scope, "错误": r.get("error")}
     # Watchdog hangs and DSL monitor failures are the most dangerous runtime
@@ -196,7 +196,7 @@ def _on_error(r: Dict[str, Any]) -> None:
                      dedup_key=f"error:{scope}")
 
 
-def _on_loop_start(r: Dict[str, Any]) -> None:
+def _on_loop_start(r: dict[str, Any]) -> None:
     cfg = r.get("config") or {}
     scan = cfg.get("scan") or {}
     mode_raw = str(cfg.get("mode") or "").upper()

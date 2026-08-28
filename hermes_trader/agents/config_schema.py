@@ -17,18 +17,18 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, Dict, List, Optional, get_origin
+from typing import Any, Optional, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
 
 
-def _dict_default(key: str) -> Dict[str, Any]:
+def _dict_default(key: str) -> dict[str, Any]:
     return deepcopy(CANONICAL_DEFAULTS[key])
 
 
-def _list_default(key: str) -> List[Any]:
+def _list_default(key: str) -> list[Any]:
     return list(CANONICAL_DEFAULTS[key])
 
 
@@ -124,26 +124,26 @@ class _ConfigPatch(BaseModel):
     conviction_tiers: list = Field(default_factory=lambda: _list_default("conviction_tiers"))
 
     # ── nested objects (accepted as dicts, not deep-validated) ────────────
-    dsl_exit: Dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_exit"))
-    runner_entry_gate: Dict[str, Any] = Field(default_factory=lambda: _dict_default("runner_entry_gate"))
-    plan_b: Dict[str, Any] = Field(default_factory=lambda: _dict_default("plan_b"))
-    atr_risk_sizing: Dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
-    regime_classifier: Dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
-    debate_gate: Dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_gate"))
-    debate_research: Dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_research"))
-    signal_enforcement: Dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_enforcement"))
-    momentum_continuation: Dict[str, Any] = Field(default_factory=lambda: _dict_default("momentum_continuation"))
-    candlestick_patterns: Dict[str, Any] = Field(default_factory=lambda: _dict_default("candlestick_patterns"))
-    capital_rotation: Dict[str, Any] = Field(default_factory=lambda: _dict_default("capital_rotation"))
-    gex_signal: Dict[str, Any] = Field(default_factory=lambda: _dict_default("gex_signal"))
-    shadow_signals: Dict[str, Any] = Field(default_factory=lambda: _dict_default("shadow_signals"))
-    momentum_reentry: Dict[str, Any] = Field(default_factory=lambda: _dict_default("momentum_reentry"))
-    runner_mover_surface: Dict[str, Any] = Field(default_factory=lambda: _dict_default("runner_mover_surface"))
-    memory_limits: Dict[str, Any] = Field(default_factory=lambda: _dict_default("memory_limits"))
-    llm_circuit_breaker: Dict[str, Any] = Field(default_factory=lambda: _dict_default("llm_circuit_breaker"))
-    coin_overrides: Dict[str, Any] = Field(default_factory=lambda: _dict_default("coin_overrides"))
+    dsl_exit: dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_exit"))
+    runner_entry_gate: dict[str, Any] = Field(default_factory=lambda: _dict_default("runner_entry_gate"))
+    plan_b: dict[str, Any] = Field(default_factory=lambda: _dict_default("plan_b"))
+    atr_risk_sizing: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
+    regime_classifier: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
+    debate_gate: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_gate"))
+    debate_research: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_research"))
+    signal_enforcement: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_enforcement"))
+    momentum_continuation: dict[str, Any] = Field(default_factory=lambda: _dict_default("momentum_continuation"))
+    candlestick_patterns: dict[str, Any] = Field(default_factory=lambda: _dict_default("candlestick_patterns"))
+    capital_rotation: dict[str, Any] = Field(default_factory=lambda: _dict_default("capital_rotation"))
+    gex_signal: dict[str, Any] = Field(default_factory=lambda: _dict_default("gex_signal"))
+    shadow_signals: dict[str, Any] = Field(default_factory=lambda: _dict_default("shadow_signals"))
+    momentum_reentry: dict[str, Any] = Field(default_factory=lambda: _dict_default("momentum_reentry"))
+    runner_mover_surface: dict[str, Any] = Field(default_factory=lambda: _dict_default("runner_mover_surface"))
+    memory_limits: dict[str, Any] = Field(default_factory=lambda: _dict_default("memory_limits"))
+    llm_circuit_breaker: dict[str, Any] = Field(default_factory=lambda: _dict_default("llm_circuit_breaker"))
+    coin_overrides: dict[str, Any] = Field(default_factory=lambda: _dict_default("coin_overrides"))
     # R12-C1: single-coin / daily drawdown halt thresholds.
-    circuit_breaker: Dict[str, Any] = Field(default_factory=lambda: _dict_default("circuit_breaker"))
+    circuit_breaker: dict[str, Any] = Field(default_factory=lambda: _dict_default("circuit_breaker"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
@@ -204,14 +204,14 @@ def _type_ok(kind: Any, val: Any) -> bool:
     return isinstance(val, kind)
 
 
-def validate_config_updates(updates: Dict[str, Any], *, strict_keys: bool = True) -> List[str]:
+def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True) -> list[str]:
     """Validate a partial config update. Returns a list of error strings.
 
     ``strict_keys=True`` (web API, terminal ``set``, CLI): unknown keys are
     rejected. ``strict_keys=False`` (legacy ``POST /api/agent/config``):
     unknown keys are left for the deep-merge path to persist.
     """
-    errors: List[str] = []
+    errors: list[str] = []
     fields = _ConfigPatch.model_fields
     for key, val in updates.items():
         if key not in CANONICAL_DEFAULTS:
@@ -389,7 +389,7 @@ _FORCE_OVERRIDE_KEYS_FOR_GATE = (
 )
 
 
-def validate_forbidden_overrides(cfg: Dict[str, Any]) -> List[str]:
+def validate_forbidden_overrides(cfg: dict[str, Any]) -> list[str]:
     """R11-E1: run only the FORBIDDEN_OVERRIDE contract on a whole-config view.
 
     ``validate_config_updates`` is a *patch* gate — it only inspects what the
@@ -408,7 +408,7 @@ def validate_forbidden_overrides(cfg: Dict[str, Any]) -> List[str]:
     exist as booleans (a legacy "ON" string in a JSON file is a *type*
     failure, caught by ``_validate_cfg_value`` upstream of this call).
     """
-    errors: List[str] = []
+    errors: list[str] = []
     for fkey in _FORCE_OVERRIDE_KEYS_FOR_GATE:
         if cfg.get(fkey) is True and cfg.get("override_requires_ai") is not True:
             errors.append(

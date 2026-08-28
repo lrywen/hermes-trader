@@ -17,7 +17,7 @@ import os
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, List, Optional, Set, Tuple
+from typing import Any, Deque, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ _AGE_TS_KEYS = {
 }
 
 
-def _memory_max_age_days() -> Dict[str, float]:
+def _memory_max_age_days() -> dict[str, float]:
     """Configured max age in days for the time-bounded memory lists.
 
     R9/P3-4: reads ``memory_limits.max_age_days.<list>`` via cfg_get with the
@@ -82,7 +82,7 @@ def _memory_max_age_days() -> Dict[str, float]:
     cfg = cfg_get("memory_limits.max_age_days", None)
     if not isinstance(cfg, dict):
         return dict(MAX_AGE_DAYS_DEFAULT)
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for key, fallback in MAX_AGE_DAYS_DEFAULT.items():
         try:
             v = float(cfg.get(key, fallback))
@@ -92,14 +92,14 @@ def _memory_max_age_days() -> Dict[str, float]:
     return out
 
 
-def _evict_aged(records: List[Dict[str, Any]], list_key: str,
-                cutoff_ms: float) -> List[Dict[str, Any]]:
+def _evict_aged(records: list[dict[str, Any]], list_key: str,
+                cutoff_ms: float) -> list[dict[str, Any]]:
     """Drop records older than ``cutoff_ms`` (ms epoch); keep undatable ones.
 
     Returns a new list so callers can reassign under the lock.
     """
     keys = _AGE_TS_KEYS.get(list_key, ())
-    kept: List[Dict[str, Any]] = []
+    kept: list[dict[str, Any]] = []
     for rec in records:
         ts_ms = None
         for k in keys:
@@ -117,7 +117,7 @@ def _evict_aged(records: List[Dict[str, Any]], list_key: str,
     return kept
 
 
-def _memory_limits() -> Dict[str, int]:
+def _memory_limits() -> dict[str, int]:
     """Configured retention limits for the in-process memory lists.
 
     P2-3: these were hardcoded module constants. Read through cfg_get with
@@ -154,28 +154,28 @@ class AgentMemory:
         # concurrent mutation can either land after the snapshot (lost update)
         # or mutate a dict while json.dump iterates it (RuntimeError).
         self._lock = threading.RLock()
-        self._perceptions: List[Dict[str, Any]] = []
-        self._analyses: List[Dict[str, Any]] = []
-        self._trades: List[Dict[str, Any]] = []
-        self._closes: List[Dict[str, Any]] = []  # realized exits (the trade-outcome store)
+        self._perceptions: list[dict[str, Any]] = []
+        self._analyses: list[dict[str, Any]] = []
+        self._trades: list[dict[str, Any]] = []
+        self._closes: list[dict[str, Any]] = []  # realized exits (the trade-outcome store)
         # Entry context keyed by "COIN_side" — entry time + the signal snapshot at
         # entry, so the matching close can carry it for the forward signal backtest.
-        self._entry_ctx: Dict[str, Dict[str, Any]] = {}
-        self._cooldowns: Dict[str, int] = {}
+        self._entry_ctx: dict[str, dict[str, Any]] = {}
+        self._cooldowns: dict[str, int] = {}
         self._equity: float = 0
         self._daily_pnl: float = 0
         self._peak_daily_pnl: float = 0  # high-water mark of daily_pnl (intraday, resets at UTC roll)
         self._start_of_day_equity: float = 0
         self._day_start_ts: int = 0
-        self._open_positions: List[Dict[str, Any]] = []
+        self._open_positions: list[dict[str, Any]] = []
         # ── Tiered circuit-breaker state (sizing/risk-overhaul 2026-08-26) ──
         # coin -> epoch-ms until which new entries on that coin are blocked
         # (single-coin per-trade loss > threshold). Global halt is a single
         # expiry for the whole book (daily cumulative loss > equity threshold).
-        self._coin_circuit: Dict[str, int] = {}
+        self._coin_circuit: dict[str, int] = {}
         self._global_halt_until_ms: int = 0
         # Per-coin consecutive losing-close count (resets on a win or day roll).
-        self._consecutive_losses: Dict[str, int] = {}
+        self._consecutive_losses: dict[str, int] = {}
         # P1-6: dirty flag + flush throttle. Mutations set _dirty; flush()
         # skips a clean store and coalesces bursts of mutations within
         # FLUSH_THROTTLE_S into one json.dump+replace. force=True (realized
@@ -189,8 +189,8 @@ class AgentMemory:
         # per-coin daily loss breaker. Both are rebuilt once after hydration
         # (load/replay) and updated incrementally in record_close.
         self._close_stats_built: bool = False
-        self._slip_series: Dict[str, Deque[Tuple[float, float]]] = {}
-        self._day_realized_usd: Dict[str, float] = {}
+        self._slip_series: dict[str, Deque[tuple[float, float]]] = {}
+        self._day_realized_usd: dict[str, float] = {}
         self._day_stats_start_ts: int = 0
         self._initialized = False
 
@@ -217,8 +217,8 @@ class AgentMemory:
         if not os.path.exists(_EVENTS_FILE):
             return False
         try:
-            trades: List[Dict[str, Any]] = []
-            closes: List[Dict[str, Any]] = []
+            trades: list[dict[str, Any]] = []
+            closes: list[dict[str, Any]] = []
             with open(_EVENTS_FILE, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -338,7 +338,7 @@ class AgentMemory:
                 except Exception:
                     pass
 
-    def _write_atomic(self, data: Dict[str, Any]) -> bool:
+    def _write_atomic(self, data: dict[str, Any]) -> bool:
         """Persist ``data`` to MEMORY_FILE atomically with cross-process lock +
         fsync. Returns True on success.
 
@@ -532,19 +532,19 @@ class AgentMemory:
             if len(records) > cap:
                 del records[:len(records) - cap]
 
-    def record_perception(self, p: Dict[str, Any]) -> None:
+    def record_perception(self, p: dict[str, Any]) -> None:
         with self._lock:
             self._perceptions.append(p)
             self._retention_sweep_nolock()
             self._dirty = True
 
-    def record_analysis(self, a: Dict[str, Any]) -> None:
+    def record_analysis(self, a: dict[str, Any]) -> None:
         with self._lock:
             self._analyses.append(a)
             self._retention_sweep_nolock()
             self._dirty = True
 
-    def record_trade(self, t: Dict[str, Any]) -> None:
+    def record_trade(self, t: dict[str, Any]) -> None:
         with self._lock:
             self._trades.append(t)
             self._retention_sweep_nolock()
@@ -571,7 +571,7 @@ class AgentMemory:
                          type(e).__name__, e, t.get("coin"))
         self.flush()
 
-    def record_entry_context(self, coin: str, side: str, ctx: Dict[str, Any]) -> None:
+    def record_entry_context(self, coin: str, side: str, ctx: dict[str, Any]) -> None:
         """Stash entry time + signal snapshot for an opening position, so its close
         can carry it into the outcome store (forward signal backtest)."""
         with self._lock:
@@ -579,7 +579,7 @@ class AgentMemory:
             self._dirty = True
         self.flush()
 
-    def pop_entry_context(self, coin: str, side: str) -> Dict[str, Any]:
+    def pop_entry_context(self, coin: str, side: str) -> dict[str, Any]:
         """Retrieve + clear the entry context for a closing position (or {})."""
         with self._lock:
             ctx = self._entry_ctx.pop(f"{coin}_{side}", {})
@@ -589,7 +589,7 @@ class AgentMemory:
             self.flush()
         return ctx
 
-    def record_close(self, c: Dict[str, Any]) -> None:
+    def record_close(self, c: dict[str, Any]) -> None:
         """Append a realized exit to the outcome store and persist.
 
         This is THE source of realized PnL — previously outcomes only existed in
@@ -606,7 +606,7 @@ class AgentMemory:
             self._ensure_close_stats_nolock()
             self._recheck_day_stats_nolock()
             self._closes.append(c)
-            evicted: Optional[Dict[str, Any]] = None
+            evicted: Optional[dict[str, Any]] = None
             if len(self._closes) > _memory_limits()["closes"]:
                 evicted = self._closes.pop(0)
             self._accumulate_close_nolock(c)
@@ -814,7 +814,7 @@ class AgentMemory:
                 return 0.0
             return remaining
 
-    def circuit_snapshot(self) -> Dict[str, Any]:
+    def circuit_snapshot(self) -> dict[str, Any]:
         """Read-only (non-mutating) view of the tiered breaker state for metrics.
 
         Unlike the ``*_remaining_min`` accessors this never purges expired
@@ -864,7 +864,7 @@ class AgentMemory:
     # keep stale rows. Rebuilt once from _closes after hydration.
 
     @staticmethod
-    def _close_ts_s(c: Dict[str, Any]) -> Optional[float]:
+    def _close_ts_s(c: dict[str, Any]) -> Optional[float]:
         """Normalize a close row's closed_at to epoch seconds (0.0 when
         absent/unparseable). closed_at may arrive as epoch s or ms."""
         ts = c.get("closed_at")
@@ -897,7 +897,7 @@ class AgentMemory:
         if not self._close_stats_built:
             self._rebuild_close_stats_nolock()
 
-    def _accumulate_close_nolock(self, c: Dict[str, Any],
+    def _accumulate_close_nolock(self, c: dict[str, Any],
                                  day_start: Optional[int] = None) -> None:
         """Fold one close row into the slip deque and the per-coin
         realized-USD daily totals (call under lock)."""
@@ -936,7 +936,7 @@ class AgentMemory:
                 except (TypeError, ValueError):
                     pass
 
-    def _evict_close_stats_nolock(self, c: Dict[str, Any]) -> None:
+    def _evict_close_stats_nolock(self, c: dict[str, Any]) -> None:
         """Detach stats for a close row evicted from the bounded _closes list
         (call under lock). O(1): deque entries share append order with
         _closes, so the evicted close — the oldest for its coin — sits at the
@@ -973,7 +973,7 @@ class AgentMemory:
         if self._day_stats_start_ts == self._day_start_ts:
             return
         day_start = self._day_start_ts
-        day_totals: Dict[str, float] = {}
+        day_totals: dict[str, float] = {}
         for c in self._closes:
             ts_s = self._close_ts_s(c)
             if not ts_s or ts_s < float(day_start):
@@ -1030,12 +1030,12 @@ class AgentMemory:
             total = self._day_realized_usd.get(coin, 0.0)
         return total / start_of_day_equity * 100.0
 
-    def update_open_positions(self, pos: List[Dict[str, Any]]) -> None:
+    def update_open_positions(self, pos: list[dict[str, Any]]) -> None:
         with self._lock:
             self._open_positions = list(pos)
             self._dirty = True
 
-    def open_position_coins(self) -> Set[str]:
+    def open_position_coins(self) -> set[str]:
         """Set of coins with a live (non-zero) open position. The loop exempts
         these from the pre-research cooldown so the AI can still issue a CLOSE
         on something we already hold — AI-driven exits must never be starved by
@@ -1060,38 +1060,38 @@ class AgentMemory:
     # Readers take a shallow snapshot under the lock so a concurrent append/
     # trim can never mutate the list while the caller iterates it (P0-C).
 
-    def get_recent_perceptions(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_recent_perceptions(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return self._perceptions[-limit:]
 
-    def get_recent_analyses(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_recent_analyses(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return self._analyses[-limit:]
 
-    def get_recent_trades(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def get_recent_trades(self, limit: int = 20) -> list[dict[str, Any]]:
         with self._lock:
             return self._trades[-limit:]
 
-    def latest_trade_ts_by_coin(self, limit: int = 20) -> Dict[str, int]:
+    def latest_trade_ts_by_coin(self, limit: int = 20) -> dict[str, int]:
         """Map each coin to its NEWEST executed_at within the last `limit`
         trades. Backs the loop's pre-research cooldown — must be the newest,
         not the oldest, or a coin traded twice in the window keeps paying for
         redundant LLM research while it's still inside its cooldown."""
-        out: Dict[str, int] = {}
+        out: dict[str, int] = {}
         for t in self.get_recent_trades(limit):  # chronological → newest wins
             if t.get("coin") and t.get("executed_at"):
                 out[t["coin"]] = t["executed_at"]
         return out
 
-    def get_all_trades(self) -> List[Dict[str, Any]]:
+    def get_all_trades(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._trades)
 
-    def get_all_analyses(self) -> List[Dict[str, Any]]:
+    def get_all_analyses(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._analyses)
 
-    def get_analysis_by_id(self, id: str) -> Optional[Dict[str, Any]]:
+    def get_analysis_by_id(self, id: str) -> Optional[dict[str, Any]]:
         with self._lock:
             analyses = list(self._analyses)
         for a in analyses:
@@ -1099,7 +1099,7 @@ class AgentMemory:
                 return a
         return None
 
-    def get_win_rate(self) -> Dict[str, float]:
+    def get_win_rate(self) -> dict[str, float]:
         # Prefer the realized outcome store; fall back to the legacy (never-
         # populated) trades[].pnl shape for backward compat.
         with self._lock:
@@ -1114,7 +1114,7 @@ class AgentMemory:
         total = len(closed)
         return {"wins": wins, "total": total, "rate": wins / total if total > 0 else 0}
 
-    def get_payoff_stats(self, limit: int = 200) -> Dict[str, float]:
+    def get_payoff_stats(self, limit: int = 200) -> dict[str, float]:
         """Realized win-rate + payoff ratio (avg win / avg loss) from the outcome
         store — the inputs to risk-of-ruin and the Phase-3 report. Uses leveraged
         realized_pnl_pct (net fees). Returns zeros when there are no closes yet."""
@@ -1132,7 +1132,7 @@ class AgentMemory:
             "avg_loss_pct": avg_loss, "payoff_ratio": payoff,
         }
 
-    def last_close_for(self, coin: str) -> Optional[Dict[str, Any]]:
+    def last_close_for(self, coin: str) -> Optional[dict[str, Any]]:
         """Most recent realized close for `coin` (for momentum re-entry: the
         stop-out price to compare against). None if never closed."""
         with self._lock:
@@ -1142,7 +1142,7 @@ class AgentMemory:
                 return c
         return None
 
-    def get_closes(self, limit: int = 200) -> List[Dict[str, Any]]:
+    def get_closes(self, limit: int = 200) -> list[dict[str, Any]]:
         with self._lock:
             return self._closes[-limit:]
 
@@ -1157,7 +1157,7 @@ class AgentMemory:
         """Equity baseline at the current UTC day start (daily loss % denominator)."""
         return self._start_of_day_equity
 
-    def get_full_state(self) -> Dict[str, Any]:
+    def get_full_state(self) -> dict[str, Any]:
         with self._lock:
             open_positions = list(self._open_positions)
             equity = self._equity

@@ -32,7 +32,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
-from typing import Dict, List, Optional
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -71,7 +71,7 @@ class CatalystReport:
     n_recent: int              # articles in the window
     breaking: bool             # coverage surging vs its own baseline
     surge_x: float             # latest coverage bin / baseline median
-    headlines: List[Article]   # newest first
+    headlines: list[Article]   # newest first
     note: str = ""
 
 
@@ -85,8 +85,8 @@ def _parse_gdelt_date(s: str) -> Optional[datetime]:
         return None
 
 
-def parse_gdelt_artlist(payload: dict) -> List[Article]:
-    out: List[Article] = []
+def parse_gdelt_artlist(payload: dict) -> list[Article]:
+    out: list[Article] = []
     for a in (payload or {}).get("articles", []) or []:
         out.append(Article(
             title=(a.get("title") or "").strip(),
@@ -99,7 +99,7 @@ def parse_gdelt_artlist(payload: dict) -> List[Article]:
     return out
 
 
-def detect_surge(volume_points: List[float], min_baseline: float = 1e-9) -> tuple:
+def detect_surge(volume_points: list[float], min_baseline: float = 1e-9) -> tuple:
     """Given a coverage-volume timeline (oldest->newest), is the latest bin a
     SURGE vs the baseline (median of the earlier bins)? Returns (breaking, x)."""
     if len(volume_points) < 3:
@@ -111,7 +111,7 @@ def detect_surge(volume_points: List[float], min_baseline: float = 1e-9) -> tupl
     return (x >= 2.5 and latest > 0, round(x, 2))
 
 
-def parse_gdelt_timeline(payload: dict) -> List[float]:
+def parse_gdelt_timeline(payload: dict) -> list[float]:
     """Extract the coverage-volume series from a GDELT TimelineVol payload."""
     tl = (payload or {}).get("timeline") or []
     if not tl:
@@ -133,9 +133,9 @@ def _parse_rss_date(s: str) -> Optional[datetime]:
     return None
 
 
-def parse_rss(xml_text: str, source: str = "") -> List[Article]:
+def parse_rss(xml_text: str, source: str = "") -> list[Article]:
     """Parse an RSS/Atom feed into Articles. Tolerant of malformed feeds."""
-    out: List[Article] = []
+    out: list[Article] = []
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
@@ -153,7 +153,7 @@ def parse_rss(xml_text: str, source: str = "") -> List[Article]:
     return out
 
 
-def filter_keywords(articles: List[Article], keywords: List[str]) -> List[Article]:
+def filter_keywords(articles: list[Article], keywords: list[str]) -> list[Article]:
     """Keep articles whose title contains ANY keyword (case-insensitive)."""
     if not keywords:
         return articles
@@ -163,13 +163,13 @@ def filter_keywords(articles: List[Article], keywords: List[str]) -> List[Articl
 
 # ── thin cached fetch ────────────────────────────────────────────────────────
 _CACHE_TTL_S = 300.0           # news moves fast; 5-min cache
-_cache: Dict[str, tuple] = {}
+_cache: dict[str, tuple] = {}
 _lock = threading.Lock()
 
 # Single-flight coalescing: when N threads request the same cache key on a
 # cold miss, only ONE network fetch runs; the rest wait for its result.
-_inflight: Dict[str, threading.Event] = {}
-_inflight_results: Dict[str, object] = {}
+_inflight: dict[str, threading.Event] = {}
+_inflight_results: dict[str, object] = {}
 _inflight_lock = threading.Lock()
 
 # Bounded per-request timeout. GDELT's free tier frequently stalls near the
@@ -294,8 +294,8 @@ def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
             _evt.set()
 
 
-def rss_headlines(keywords: Optional[List[str]] = None, feeds: Optional[List[str]] = None,
-                  limit: int = 25, ttl: float = _CACHE_TTL_S) -> List[Article]:
+def rss_headlines(keywords: Optional[list[str]] = None, feeds: Optional[list[str]] = None,
+                  limit: int = 25, ttl: float = _CACHE_TTL_S) -> list[Article]:
     """Lowest-latency major-wire headlines, optionally keyword-filtered. Cached."""
     feeds = feeds or _RSS_FEEDS
     key = "rss::" + ",".join(sorted(feeds)) + "::" + ",".join(sorted(keywords or []))
@@ -304,7 +304,7 @@ def rss_headlines(keywords: Optional[List[str]] = None, feeds: Optional[List[str
         hit = _cache.get(key)
         if hit and (now - hit[0]) < ttl:
             return hit[1]
-    arts: List[Article] = []
+    arts: list[Article] = []
     for f in feeds:
         txt = _get_text(f)
         if txt:

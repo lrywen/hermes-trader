@@ -17,7 +17,7 @@ import time
 from contextlib import suppress
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 from .lock import scanner_lock
 
@@ -70,7 +70,7 @@ def _interruptible_sleep(seconds: float, stop_event: threading.Event) -> bool:
     return stop_event.is_set()
 
 
-def _atomic_write(path: Path, data: Dict[str, Any]) -> None:
+def _atomic_write(path: Path, data: dict[str, Any]) -> None:
     """Write JSON atomically (temp file + os.replace)."""
     tmp = path.with_suffix('.tmp')
     try:
@@ -203,7 +203,7 @@ def producer_daemon(
         logger.info(f"[daemon] {name} stopped — {tick_count} ticks, {error_count} errors, {time.time()-start_time:.0f}s uptime")
 
 
-def check_daemon_state(name: str, state_dir: Optional[str] = None) -> Dict[str, Any]:
+def check_daemon_state(name: str, state_dir: Optional[str] = None) -> dict[str, Any]:
     """Check the state of a running daemon."""
     state_dir = state_dir or _DEFAULT_STATE_DIR
     state_path = Path(state_dir)

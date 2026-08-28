@@ -32,7 +32,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -96,7 +96,7 @@ def _rotate_if_needed() -> None:
         logger.warning(f"[event_log] rotation failed: {e}")
 
 
-def append(event: str, payload: Optional[Dict[str, Any]] = None,
+def append(event: str, payload: Optional[dict[str, Any]] = None,
            trace_id: str = "", timestamp: Optional[str] = None) -> bool:
     """Append one event to events.jsonl.
 
@@ -130,7 +130,7 @@ def append(event: str, payload: Optional[Dict[str, Any]] = None,
         return False
 
 
-def fork_from_session(record: Dict[str, Any]) -> bool:
+def fork_from_session(record: dict[str, Any]) -> bool:
     """Fork a session-log record into events.jsonl when it is outcome-relevant.
 
     Called by :func:`hermes_trader.session_log.append` after the session log

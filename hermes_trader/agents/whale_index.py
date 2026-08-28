@@ -16,7 +16,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any
 
 from hermes_trader.client.universe import get_universe
 
@@ -36,7 +36,7 @@ _OI_HISTORY_FILE = os.path.join(
 def smart_money_concentration(
     lookback_days: int = 7,
     min_volume_usd: float = 1e6,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Identify assets with growing smart money concentration.
     
     Analyzes OI + volume distribution to find assets where large traders
@@ -96,7 +96,7 @@ def oi_funding_anomaly(
     min_oi_usd: float = 5e6,
     max_funding_threshold: float = -0.00001,
     funding_norm: float = 0.00008,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Detect assets where OI is high but price is flat while funding is
     negative — classic smart money accumulation pattern.
 
@@ -166,7 +166,7 @@ def oi_surge_accumulation(
     min_oi_growth_pct: float = 8.0,
     max_price_move_pct: float = 4.0,
     surge_norm_pct: float = 25.0,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Flag coins whose OPEN INTEREST surged since the last scan while price stayed
     flat — positions being built quietly = smart-money accumulation, about to move.
 
@@ -242,7 +242,7 @@ def oi_surge_accumulation(
 # These functions can be registered as MCP tools for autonomous agents
 # to query whale data as part of their scanning pipeline.
 
-def whale_accumulation_map(min_confidence: float = 0.05) -> Dict[str, Dict[str, Any]]:
+def whale_accumulation_map(min_confidence: float = 0.05) -> dict[str, dict[str, Any]]:
     """Return {coin: signal_dict} for coins flagged as smart-money accumulation.
 
     MERGES two self-sourced, verifiable signals (no external leaderboard needed):
@@ -253,7 +253,7 @@ def whale_accumulation_map(min_confidence: float = 0.05) -> Dict[str, Dict[str, 
     A coin flagged by EITHER (or both, taking the higher confidence) is returned.
     These feed perception.whale_signal -> executor force-execute + 1.3x size + regime bypass.
     """
-    merged: Dict[str, Dict[str, Any]] = {}
+    merged: dict[str, dict[str, Any]] = {}
     for s in oi_funding_anomaly() + oi_surge_accumulation():
         if s.get("confidence", 0) < min_confidence:
             continue
@@ -266,7 +266,7 @@ def whale_accumulation_map(min_confidence: float = 0.05) -> Dict[str, Dict[str, 
 def get_whale_signals(
     min_confidence: float = 0.1,
     top_n: int = 10,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Aggregate concentration + anomaly signals for MCP-tool callers.
 
     Kept for the MCP exposure (`whale_index` tool). Production perception
@@ -277,7 +277,7 @@ def get_whale_signals(
     anomalies = oi_funding_anomaly()
     
     # Merge signals by coin
-    merged: Dict[str, Dict[str, Any]] = {}
+    merged: dict[str, dict[str, Any]] = {}
     for sig in concentration + anomalies:
         coin = sig["coin"]
         if coin not in merged:

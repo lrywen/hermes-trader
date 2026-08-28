@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_trader.agents.config import get_config
 from hermes_trader.client.cache import _Cache
@@ -67,7 +67,7 @@ _candle_cache: _Cache = _Cache(max_size=_CANDLE_CACHE_MAX, default_ttl=50.0)
 # Previously the same comprehension was inlined in research / ta_filter /
 # perception / __main__ (and a *string* lookup in the executor); any change to
 # the trigger shape had to be made in every site.
-def extract_fired_triggers(perception: Optional[Dict[str, Any]]) -> List[str]:
+def extract_fired_triggers(perception: Optional[dict[str, Any]]) -> list[str]:
     """Names of the triggers that fired for a perception (de-duplicated,
     order-preserving). Accepts a perception dict; also tolerates a plain
     ``{"fired_triggers": [...]}`` analysis dict."""
@@ -76,7 +76,7 @@ def extract_fired_triggers(perception: Optional[Dict[str, Any]]) -> List[str]:
     if "fired_triggers" in perception and "triggers" not in perception:
         # Already-normalized analysis payload (executor side).
         return [str(n) for n in (perception.get("fired_triggers") or []) if n]
-    seen: Dict[str, None] = {}
+    seen: dict[str, None] = {}
     for t in perception.get("triggers") or []:
         if isinstance(t, dict) and t.get("fired") and t.get("name"):
             seen.setdefault(str(t["name"]), None)
@@ -95,7 +95,7 @@ def _fetch_candles_sync(
     max_retries: int = 3,
     backoff_base: float = 2.0,
     force_refresh: bool = False,
-) -> Optional[List[Candle]]:
+) -> Optional[list[Candle]]:
     """Fetch candles from the SDK with in-memory caching and retry on 429.
 
     When ``force_refresh`` is True the cache is bypassed and the result is
@@ -152,7 +152,7 @@ def _interval_seconds(interval: str) -> int:
     return _INTERVAL_SECONDS.get(interval, 300)
 
 
-def _last_bar_closed(candles: List[Candle], interval: str, now_ms: Optional[float] = None) -> bool:
+def _last_bar_closed(candles: list[Candle], interval: str, now_ms: Optional[float] = None) -> bool:
     """True if the final candle's close time has already passed."""
     if not candles:
         return False
@@ -163,7 +163,7 @@ def _last_bar_closed(candles: List[Candle], interval: str, now_ms: Optional[floa
     return cur_ms >= bar_open_ms + bar_dur_ms
 
 
-def _drop_forming_bar(candles: List[Candle], interval: str) -> Tuple[List[Candle], bool]:
+def _drop_forming_bar(candles: list[Candle], interval: str) -> tuple[list[Candle], bool]:
     """Return (candles_to_score, dropped). If the last bar is still forming,
     drop it so triggers evaluate the last CLOSED bar. ``dropped`` reports
     whether a forming bar was removed (for logging)."""
@@ -172,7 +172,7 @@ def _drop_forming_bar(candles: List[Candle], interval: str) -> Tuple[List[Candle
     return candles[:-1], True
 
 
-def _apply_squeeze_breakout_coupling(hits: List[Dict[str, Any]]) -> None:
+def _apply_squeeze_breakout_coupling(hits: list[dict[str, Any]]) -> None:
     """Mutate `hits` in place: when a Bollinger squeeze (rangeCompression)
     fired alongside a fired breakout, BOOST the breakout hit's score by +2
     (cap 10) and tag the reason. A breakout resolving out of a squeeze is a
@@ -195,14 +195,14 @@ def _apply_squeeze_breakout_coupling(hits: List[Dict[str, Any]]) -> None:
 # ── Scan single market (returns result or (False, error)) ────────────────────
 
 def _scan_single_market(
-    market: Dict[str, Any],
+    market: dict[str, Any],
     mid: float,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     min_score: float,
-    whale_signals: Optional[Dict[str, Dict[str, Any]]] = None,
+    whale_signals: Optional[dict[str, dict[str, Any]]] = None,
     whale_scan_bypass: bool = False,
     trend_surface_enabled: bool = True,
-) -> Tuple[bool, Dict[str, Any] | str | None]:
+) -> tuple[bool, dict[str, Any] | str | None]:
     """Run all triggers on a single market's candles.
 
     `whale_signals` is the per-scan whale_accumulation_map() result, keyed by
@@ -493,12 +493,12 @@ _sweep_offset = 0
 
 
 def scan_once(
-    universe: Optional[List[Dict[str, Any]]] = None,
+    universe: Optional[list[dict[str, Any]]] = None,
     min_score: float = 20,
-    config: Optional[Dict[str, Any]] = None,
+    config: Optional[dict[str, Any]] = None,
     parallel_workers: Optional[int] = None,
     coin: Optional[str] = None,
-) -> List[Dict[str, Any]]:
+) -> list[dict[str, Any]]:
     """Scan Hyperliquid markets for trigger signals.
 
     Returns perception dicts sorted by composite score descending. Markets are
@@ -553,7 +553,7 @@ def scan_once(
 
     # ── Step 1: Fetch mids (HTTP POST, ~150ms; +~8 per-dex POSTs if HIP-3 on) ─
     raw_mids = fetch_all_mids(include_hip3=include_hip3)
-    mids: Dict[str, float] = {}
+    mids: dict[str, float] = {}
     # 注意：循环变量不能用 `coin`，否则会遮蔽函数参数 `coin`（单币扫描目标），
     # Python 循环变量在循环结束后仍保留，导致下方 `if coin:` 恒为真。
     for sym, val in raw_mids.items():
@@ -608,7 +608,7 @@ def scan_once(
     # sweep selection and evaluate exactly the requested symbol. Match is
     # case-insensitive on the base coin (ignoring any HIP-3 "dex:" prefix only
     # when the user typed a bare symbol).
-    markets: List[Dict[str, Any]] = []
+    markets: list[dict[str, Any]] = []
     if coin:
         target = str(coin).strip().upper()
         def _coin_match(name: str) -> bool:
@@ -644,7 +644,7 @@ def scan_once(
         crypto_sweep_floor = float(_cfg.get("min_market_volume_usd", movers_vol_floor) or movers_vol_floor)
         hip3_sweep_floor = float(_cfg.get("min_hip3_volume_usd", hip3_movers_floor) or hip3_movers_floor)
 
-        def _abs_pct_24h(m: Dict[str, Any]) -> float:
+        def _abs_pct_24h(m: dict[str, Any]) -> float:
             prev = float(m.get("prevDayPx") or 0)
             # Current price MUST come from this cycle's fresh mids — the universe
             # dict's midPx is from the (up-to-24h-cached) metaAndAssetCtxs snapshot
@@ -657,11 +657,11 @@ def scan_once(
             return abs((cur - prev) / prev * 100)
 
         def _pick_with_movers(
-            pool: List[Dict[str, Any]],
+            pool: list[dict[str, Any]],
             vol_budget: int,
             movers_budget: int,
             mv_floor: float,
-        ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+        ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
             """Top-N by 24h volume + top-M by |24h%|, deduped, in that priority.
 
             Movers slot guarantees a budget for sub-top-volume big movers
@@ -792,7 +792,7 @@ def scan_once(
     else:
         whale_signals = {}
 
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     errors = 0
     completed = 0
 

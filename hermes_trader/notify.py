@@ -42,7 +42,7 @@ import os
 import time
 import threading
 import urllib.request
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 logger = logging.getLogger("hermes_trader.notify")
 
@@ -117,7 +117,7 @@ _CATEGORY_CN = {
 # Same (category, key) won't re-push within the throttle window, preventing
 # storms such as a per-coin gate firing every 60s scan cycle.
 _throttle_lock = threading.Lock()
-_last_sent: Dict[Tuple[str, str], float] = {}
+_last_sent: dict[tuple[str, str], float] = {}
 _THROTTLE_S = 600.0
 
 # ── R11-A1: send-side resilience (retry + circuit breaker + fallback) ────
@@ -144,7 +144,7 @@ _cb_open_until: float = 0.0  # epoch seconds; 0 = closed
 _cb_failures: int = 0
 # Per-channel failure counter so primary / signal / non-trade circuit
 # independently — one dead channel must not block the others.
-_cb_state_by_channel: Dict[str, Tuple[float, int]] = {}  # url -> (open_until, failures)
+_cb_state_by_channel: dict[str, tuple[float, int]] = {}  # url -> (open_until, failures)
 
 
 def _is_retryable_error(exc: BaseException, status: int) -> bool:
@@ -216,7 +216,7 @@ def _cb_record(channel_url: str, succeeded: bool) -> None:
 
 
 def _post_with_retry(
-    payload: Dict[str, Any], channel_url: str, channel_secret: str,
+    payload: dict[str, Any], channel_url: str, channel_secret: str,
 ) -> bool:
     """POST ``payload`` to ``channel_url`` with exponential-backoff retry.
 
@@ -322,7 +322,7 @@ def _post_with_retry(
     return False
 
 
-def _fallback_chain(category: str) -> List[Tuple[str, str]]:
+def _fallback_chain(category: str) -> list[tuple[str, str]]:
     """Return the ordered list of (url, secret) pairs to try for a category.
 
     The first entry is the channel returned by ``_resolve_webhook``; the
@@ -334,7 +334,7 @@ def _fallback_chain(category: str) -> List[Tuple[str, str]]:
       2) all other configured webhooks (primary, signal, non-trade)
     """
     seen: set = set()
-    chain: List[Tuple[str, str]] = []
+    chain: list[tuple[str, str]] = []
     primary_url, primary_secret = _resolve_webhook(category)
     if primary_url:
         chain.append((primary_url, primary_secret))
@@ -351,7 +351,7 @@ def _fallback_chain(category: str) -> List[Tuple[str, str]]:
 
 
 def _send_with_fallback(
-    title: str, fields: Optional[Dict[str, Any]], category: str,
+    title: str, fields: Optional[dict[str, Any]], category: str,
     level: str, markdown: str, button_text: str, button_url: str,
 ) -> bool:
     """Try the primary channel, then fall back to other configured webhooks.
@@ -370,7 +370,7 @@ def _send_with_fallback(
     # get re-applied inside _post_with_retry so we MUST NOT sign here.
     template = _LEVEL_TEMPLATE.get(level, "blue")
     emoji = _LEVEL_EMOJI.get(level, "ℹ️")
-    elements: List[Dict[str, Any]] = []
+    elements: list[dict[str, Any]] = []
     fields = fields or {}
     if fields:
         elements.append({
@@ -402,7 +402,7 @@ def _send_with_fallback(
         "elements": [{"tag": "plain_text",
                       "content": f"Hermes Trader · {cat_cn}"}],
     })
-    base_payload: Dict[str, Any] = {
+    base_payload: dict[str, Any] = {
         "msg_type": "interactive",
         "card": {
             "config": {"wide_screen_mode": True},
@@ -417,7 +417,7 @@ def _send_with_fallback(
     for idx, (url, secret) in enumerate(chain):
         # Re-build a fresh payload per channel so timestamp + sign reflect the
         # current time and the channel-specific secret.
-        channel_payload: Dict[str, Any] = {
+        channel_payload: dict[str, Any] = {
             "msg_type": base_payload["msg_type"],
             "card": base_payload["card"],
         }
@@ -453,7 +453,7 @@ def _sign(secret: str, timestamp: int) -> str:
     return base64.b64encode(h.digest()).decode("utf-8")
 
 
-def _resolve_webhook(category: str) -> Tuple[str, str]:
+def _resolve_webhook(category: str) -> tuple[str, str]:
     """Return (webhook_url, secret) to use for a given category.
 
     Routing order:
@@ -493,7 +493,7 @@ def _should_send_throttled(category: str, dedup_key: Optional[str]) -> bool:
 
 def send_card(
     title: str,
-    fields: Optional[Dict[str, Any]] = None,
+    fields: Optional[dict[str, Any]] = None,
     *,
     category: str = "system",
     level: str = "info",
@@ -549,7 +549,7 @@ def send_text(text: str, *, category: str = "report") -> bool:
             return False
         text = text[:30000]
         for idx, (url, secret) in enumerate(chain):
-            payload: Dict[str, Any] = {
+            payload: dict[str, Any] = {
                 "msg_type": "text",
                 "content": {"text": text},
             }

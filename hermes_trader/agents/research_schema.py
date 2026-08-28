@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -30,7 +30,7 @@ class ResearchVerdict(BaseModel):
     # absolute stopPx/tpPx because the arbiter is context-free on price; the
     # caller resolves absolute levels from entry + ATR just like parse_verdict.
     suggested_stop_pct: Optional[float] = Field(default=None, ge=0.0, le=1.0)
-    key_risks: List[str] = Field(default_factory=list)
+    key_risks: list[str] = Field(default_factory=list)
 
     @classmethod
     def openrouter_response_format(cls) -> dict:
@@ -73,14 +73,14 @@ def parse_structured(text: str) -> Optional[dict]:
 
 
 def structured_to_analysis_fields(
-    sv: Dict[str, Any],
+    sv: dict[str, Any],
     coin: str,
-    perception: Dict[str, Any],
+    perception: dict[str, Any],
     *,
     atr_abs: Optional[float] = None,
     sl_atr_mult: float = 1.5,
     tp_atr_mult: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Map a validated structured verdict onto the fields ``research()`` needs.
 
     Mirrors ``parse_verdict``'s output contract (entry/stop/tp repair, side
@@ -105,7 +105,7 @@ def structured_to_analysis_fields(
     entry_ref = entry_px
 
     # Build an auditable reasoning string that preserves both cases + thesis.
-    reasoning_parts: List[str] = []
+    reasoning_parts: list[str] = []
     if sv.get("thesis"):
         reasoning_parts.append(str(sv["thesis"]))
     if sv.get("bull_case"):

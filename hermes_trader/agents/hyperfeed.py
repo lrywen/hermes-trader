@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import logging
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_trader.client.hl_client import _http_post, fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
@@ -22,7 +22,7 @@ TRUSTED_WALLETS: set[str] = set()
 # Funding-regime cache. Funding rates settle hourly so a 5-min TTL is safe
 # and avoids hitting get_universe() on every risk-gate evaluation.
 _FUNDING_REGIME_TTL_S = 300
-_funding_regime_cache: Optional[Tuple[Dict[str, Any], float]] = None
+_funding_regime_cache: Optional[tuple[dict[str, Any], float]] = None
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -37,7 +37,7 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 # ═══════════════════════════════════════════════════════════════
 
 
-def leaderboard_get_markets(limit: int = 100) -> Dict[str, Any]:
+def leaderboard_get_markets(limit: int = 100) -> dict[str, Any]:
     """Top perp markets ranked by 24h notional volume.
 
     Returns {"markets": [{asset, rank, oi, volume_24h, funding_rate,
@@ -65,15 +65,15 @@ def leaderboard_get_markets(limit: int = 100) -> Dict[str, Any]:
 
 def leaderboard_get_top(time_frame: str = "DAILY",
                         sort_by: str = "PROFIT_AND_LOSS_UNREALIZED",
-                        consistency: Optional[List[str]] = None,
+                        consistency: Optional[list[str]] = None,
                         limit: int = 10,
-                        open_position_filter: bool = True) -> Dict[str, Any]:
+                        open_position_filter: bool = True) -> dict[str, Any]:
     """Top traders with their account values and positions.
 
     Returns empty unless TRUSTED_WALLETS is populated (HL's leaderboard
     endpoint is not publicly exposed).
     """
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for addr in TRUSTED_WALLETS:
         try:
             state = _http_post("/info", {
@@ -121,7 +121,7 @@ def leaderboard_get_top(time_frame: str = "DAILY",
     return {"traders": results}
 
 
-def leaderboard_get_trader_positions(trader_id: str) -> Dict[str, Any]:
+def leaderboard_get_trader_positions(trader_id: str) -> dict[str, Any]:
     """All open perp positions for a specific trader.
 
     HL position data is nested: {"position": {...}, "type": "oneWay"} —
@@ -167,15 +167,15 @@ def leaderboard_get_trader_positions(trader_id: str) -> Dict[str, Any]:
 def discovery_get_top_traders(
     time_frame: str = "MONTHLY",
     sort_by: str = "RETURN_ON_INVESTMENT",
-    consistency: Optional[List[str]] = None,
+    consistency: Optional[list[str]] = None,
     open_position_filter: bool = True,
     limit: int = 60,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Top traders with PnL / ROI / win-rate metrics, sorted by `sort_by`.
 
     Returns empty unless TRUSTED_WALLETS is populated.
     """
-    results: List[Dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
     for addr in TRUSTED_WALLETS:
         try:
             state = _http_post("/info", {
@@ -238,7 +238,7 @@ def discovery_get_top_traders(
     return {"data": {"traders": results}}
 
 
-def discovery_get_trader_state(trader_addresses: List[str]) -> Dict[str, Any]:
+def discovery_get_trader_state(trader_addresses: list[str]) -> dict[str, Any]:
     """Aggregated state (PnL, ROI, win rate, positions) for several traders.
 
     win_rate is a 0-100 percentage, not a 0-1 fraction.
@@ -306,7 +306,7 @@ def discovery_get_trader_state(trader_addresses: List[str]) -> Dict[str, Any]:
 
 
 def market_get_asset_data(asset: str,
-                          intervals: Optional[List[str]] = None) -> Dict[str, Any]:
+                          intervals: Optional[list[str]] = None) -> dict[str, Any]:
     """Comprehensive asset data: multi-interval candles plus funding/OI context."""
     if intervals is None:
         intervals = ["5m", "15m", "1h", "4h"]
@@ -338,7 +338,7 @@ def market_get_asset_data(asset: str,
     }
 
 
-def market_get_funding_regime() -> Dict[str, Any]:
+def market_get_funding_regime() -> dict[str, Any]:
     """Per-asset-class funding regime: flags LONG_CROWDED / SHORT_CROWDED / NEUTRAL.
 
     An asset is crowded when |funding| exceeds the threshold and open interest
@@ -375,7 +375,7 @@ def market_get_funding_regime() -> Dict[str, Any]:
     return result
 
 
-def _compute_funding_regime() -> Dict[str, Any]:
+def _compute_funding_regime() -> dict[str, Any]:
     # Pull the full universe INCLUDING HIP-3 so equity and commodity perps
     # are visible to the regime classifier. Without include_hip3=True, oil
     # (xyz:CL), semis (xyz:ARM), gold (xyz:GOLD), etc. would silently be
@@ -384,7 +384,7 @@ def _compute_funding_regime() -> Dict[str, Any]:
     universe = get_universe(include_hip3=True)
     assets = []
     # Per-class counters: {"crypto": {"long": N, "short": M}, ...}
-    counts: Dict[str, Dict[str, int]] = {
+    counts: dict[str, dict[str, int]] = {
         "crypto":    {"long": 0, "short": 0},
         "equity":    {"long": 0, "short": 0},
         "commodity": {"long": 0, "short": 0},
@@ -420,7 +420,7 @@ def _compute_funding_regime() -> Dict[str, Any]:
         })
 
     # Compute per-class regime: dominant side beats the other by margin.
-    def _decide(c: Dict[str, int]) -> str:
+    def _decide(c: dict[str, int]) -> str:
         if c["long"] > c["short"] + 5:
             return "LONG_CROWDED"
         if c["short"] > c["long"] + 5:
@@ -437,7 +437,7 @@ def _compute_funding_regime() -> Dict[str, Any]:
     }
 
 
-def market_list_instruments() -> Dict[str, Any]:
+def market_list_instruments() -> dict[str, Any]:
     """List all tradable instruments (perps + spot) with metadata."""
     universe = get_universe()
 
@@ -462,6 +462,6 @@ def market_list_instruments() -> Dict[str, Any]:
     }
 
 
-def market_get_mids() -> Dict[str, str]:
+def market_get_mids() -> dict[str, str]:
     """Get all current mid prices."""
     return fetch_all_mids()

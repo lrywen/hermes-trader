@@ -32,7 +32,7 @@ import json
 import os
 import threading
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 SESSION_LOG_FILE = os.environ.get(
     "SESSION_LOG_PATH",
@@ -101,7 +101,7 @@ def _should_rotate(line_count: int, byte_count: int, mtime_s: float) -> bool:
     return False
 
 
-def _stat_active() -> Optional[Dict[str, Any]]:
+def _stat_active() -> Optional[dict[str, Any]]:
     """Return (line_count, byte_count, mtime) for the active log, or
     None if it doesn't exist. We compute the line count by counting
     newlines so the rotate decision is based on actual record count
@@ -134,7 +134,7 @@ def _stat_active() -> Optional[Dict[str, Any]]:
     }
 
 
-def _list_rotated() -> List[str]:
+def _list_rotated() -> list[str]:
     """Return rotated files for ``SESSION_LOG_FILE``, oldest first by
     embedded timestamp in the filename."""
     pattern = SESSION_LOG_FILE + ".*.gz"
@@ -276,7 +276,7 @@ def rotate() -> Optional[str]:
                 pass
 
 
-def append(event: Dict[str, Any]) -> None:
+def append(event: dict[str, Any]) -> None:
     """Append one event as a JSONL line. A `ts` field is added automatically.
 
     Best-effort: a logging failure must never interrupt trading, so disk errors
@@ -322,7 +322,7 @@ def append(event: Dict[str, Any]) -> None:
         pass
 
 
-def tail(n: int = 10) -> List[Dict[str, Any]]:
+def tail(n: int = 10) -> list[dict[str, Any]]:
     """Return the last `n` parseable events, oldest first.
 
     Reads backward from the end of the file in chunks instead of loading the
@@ -346,7 +346,7 @@ def tail(n: int = 10) -> List[Dict[str, Any]]:
         lines = [ln for ln in data.splitlines() if ln.strip()]
     except (FileNotFoundError, OSError):
         return []
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     for ln in lines[-n:]:
         try:
             out.append(json.loads(ln))
@@ -355,7 +355,7 @@ def tail(n: int = 10) -> List[Dict[str, Any]]:
     return out
 
 
-def read_all_history(max_files: Optional[int] = None) -> List[Dict[str, Any]]:
+def read_all_history(max_files: Optional[int] = None) -> list[dict[str, Any]]:
     """Read the full session history: rotated gz files (oldest first),
     then the active log (newest on top so the most recent events win
     on dedup if the caller uses a set-based reducer).
@@ -366,7 +366,7 @@ def read_all_history(max_files: Optional[int] = None) -> List[Dict[str, Any]]:
     ``max_files`` is a safety cap — by default we read every rotated
     gz file. Pass a small number for tests / preview endpoints.
     """
-    out: List[Dict[str, Any]] = []
+    out: list[dict[str, Any]] = []
     files = _list_rotated()
     if max_files is not None:
         files = files[-max_files:]

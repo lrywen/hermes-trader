@@ -10,14 +10,14 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.shared_config import load_shared_config
 
 logger = logging.getLogger(__name__)
 
-GateResult = Dict[str, Any]  # {pass: bool, reason?: str}
+GateResult = dict[str, Any]  # {pass: bool, reason?: str}
 
 
 @dataclass
@@ -33,7 +33,7 @@ class GateContext:
     positions value becomes ``[]``.
     """
     confidence: float
-    current_positions: List[Dict[str, Any]]
+    current_positions: list[dict[str, Any]]
     trade_notional_usd: float
     daily_pnl: float
     market_volume_24h_usd: float
@@ -175,7 +175,7 @@ def short_liquidity_floor(ctx: GateContext, min_short_volume: float) -> GateResu
                        f"< short floor ${min_short_volume/1e6:.0f}M (squeeze risk)")}
 
 
-def coin_allowlist_gate(ctx: GateContext, allowlist: List[str], blocklist: List[str]) -> GateResult:
+def coin_allowlist_gate(ctx: GateContext, allowlist: list[str], blocklist: list[str]) -> GateResult:
     if blocklist and ctx.coin in blocklist:
         return {"pass": False, "reason": f"{ctx.coin} is on the coin blocklist"}
     if allowlist and ctx.coin not in allowlist:
@@ -318,7 +318,7 @@ def _funding_regime_for(coin: str) -> str:
         return "NEUTRAL"
 
 
-def _chop_decision(ctx: GateContext, base: Dict[str, Any],
+def _chop_decision(ctx: GateContext, base: dict[str, Any],
                    counter_regime_min_conf: float,
                    block_counter_trend_bypass: bool) -> GateResult:
     """Gate call for a chop tape (ADX<20, EMA-neutral).
@@ -352,7 +352,7 @@ def _chop_decision(ctx: GateContext, base: Dict[str, Any],
                        f"score {ctx.composite_score:.0f}")}
 
 
-def _counter_trend_decision(ctx: GateContext, base: Dict[str, Any],
+def _counter_trend_decision(ctx: GateContext, base: dict[str, Any],
                             regime: str, funding_regime: str,
                             aligned: bool, weak_aligned: bool,
                             effective_min_conf: float,
@@ -563,7 +563,7 @@ def _warn_debate_defaults() -> None:
 
 def debate_gate(
     ctx: GateContext,
-    config: Dict[str, Any],
+    config: dict[str, Any],
 ) -> GateResult:
     """Multi-agent debate risk gate (B4).
 
@@ -678,7 +678,7 @@ def debate_gate(
 _load_shared_config = load_shared_config
 
 
-def _cfg(config: Dict[str, Any], key: str, default: Any) -> Any:
+def _cfg(config: dict[str, Any], key: str, default: Any) -> Any:
     """Read a config value tolerating snake_case or camelCase keys."""
     if key in config:
         return config[key]
@@ -689,12 +689,12 @@ def _cfg(config: Dict[str, Any], key: str, default: Any) -> Any:
 
 def eval_all_gates(
     ctx: GateContext,
-    config: Dict[str, Any],
+    config: dict[str, Any],
     last_trade_time: Optional[int] = None,
     *,
-    analysis: Optional[Dict[str, Any]] = None,
+    analysis: Optional[dict[str, Any]] = None,
     trace_id: str = "",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Evaluate all risk gates and collect results."""
     results = {}
     # ── DEBUG: eval_all_gates entry — full trade proposal context ────────

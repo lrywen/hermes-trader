@@ -12,7 +12,7 @@ import asyncio
 import json
 import logging
 import time
-from typing import Any, Dict, get_origin
+from typing import Any, get_origin
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -67,7 +67,7 @@ def register_config_routes(app: FastAPI) -> None:
         if errors:
             raise HTTPException(422, json.dumps({"errors": errors}))
 
-        def _apply() -> Dict[str, Any]:
+        def _apply() -> dict[str, Any]:
             # F20: _config_apply holds the process-wide config lock across the
             # whole read-modify-write so concurrent updates can't clobber.
             return _config_apply(updates, backup=True)
@@ -186,7 +186,7 @@ def register_config_routes(app: FastAPI) -> None:
     @app.get("/api/dashboard/config/schema")
     async def dashboard_config_schema() -> JSONResponse:
         """Return key metadata (type + default) for building the edit form."""
-        schema: Dict[str, Any] = {}
+        schema: dict[str, Any] = {}
         for key, default in CANONICAL_DEFAULTS.items():
             field = _ConfigPatch.model_fields.get(key)
             annotation = field.annotation if field is not None else type(default)

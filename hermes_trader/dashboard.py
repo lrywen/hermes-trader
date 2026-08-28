@@ -29,7 +29,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, List, Optional, Tuple
+from typing import Any, AsyncIterator, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -64,7 +64,7 @@ HL_ROUND_TRIP_FILLS = 2
 # table for the whole process lifetime (leverage estimates would silently
 # degrade to the fallback until restart). Failure keeps the previous good
 # table (or None on the very first attempt).
-_max_lev_table: Optional[Dict[str, int]] = None
+_max_lev_table: Optional[dict[str, int]] = None
 _max_lev_table_loaded_at: float = 0.0
 _MAX_LEV_TTL_S = float(os.environ.get("HERMES_MAX_LEV_TTL_S", "3600"))
 _max_lev_lock = threading.Lock()
@@ -78,7 +78,7 @@ _max_lev_lock = threading.Lock()
 _config_rmw_lock = threading.Lock()
 
 
-def _load_max_lev_table() -> Dict[str, int]:
+def _load_max_lev_table() -> dict[str, int]:
     global _max_lev_table, _max_lev_table_loaded_at
     now = time.time()
     if _max_lev_table is not None and now - _max_lev_table_loaded_at < _MAX_LEV_TTL_S:
@@ -210,9 +210,9 @@ def _redact(value: Any) -> Any:
 # F14: per-key singleflight — when N concurrent polls miss the TTL at the same
 # instant (asyncio.to_thread pool), only ONE thread runs the loader; the rest
 # wait for its result instead of stampeding the disk/HL API.
-_TTL_CACHE: Dict[str, tuple] = {}
+_TTL_CACHE: dict[str, tuple] = {}
 _TTL_CACHE_LOCK = threading.Lock()
-_TTL_INFLIGHT: Dict[str, "threading.Event"] = {}
+_TTL_INFLIGHT: dict[str, "threading.Event"] = {}
 _TTL_LOAD_WAIT_S = 60.0
 
 
@@ -262,7 +262,7 @@ def _ttl_cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
             done.set()
 
 
-def _read_jsonl_incremental(path: Path, cache: Dict[str, Any], lock: "threading.Lock") -> List[Dict[str, Any]]:
+def _read_jsonl_incremental(path: Path, cache: dict[str, Any], lock: "threading.Lock") -> list[dict[str, Any]]:
     """F13: incremental JSONL reader. Keeps the parsed lines plus the byte
     offset / inode of the previous read; on the next call only newly appended
     bytes are parsed. Truncation/rotation (inode change or size shrink) resets
@@ -280,8 +280,8 @@ def _read_jsonl_incremental(path: Path, cache: Dict[str, Any], lock: "threading.
             return cache["lines"]
         rotated = cache.get("inode") != st.st_ino or st.st_size < cache.get("offset", 0)
         offset = 0 if rotated else cache.get("offset", 0)
-        lines: List[Dict[str, Any]] = [] if rotated else list(cache.get("lines", []))
-    new_lines: List[Dict[str, Any]] = []
+        lines: list[dict[str, Any]] = [] if rotated else list(cache.get("lines", []))
+    new_lines: list[dict[str, Any]] = []
     try:
         with path.open() as f:
             f.seek(offset)
@@ -307,20 +307,20 @@ def _read_jsonl_incremental(path: Path, cache: Dict[str, Any], lock: "threading.
     return lines
 
 
-_LOG_CACHE: Dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
+_LOG_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
 _LOG_CACHE_LOCK = threading.Lock()
 
 
-def _read_log_lines() -> List[Dict[str, Any]]:
+def _read_log_lines() -> list[dict[str, Any]]:
     return _read_jsonl_incremental(_LOG_PATH, _LOG_CACHE, _LOG_CACHE_LOCK)
 
 
 _EVENTS_PATH = Path(event_log.EVENTS_FILE)
-_OUTCOME_CACHE: Dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
+_OUTCOME_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
 _OUTCOME_CACHE_LOCK = threading.Lock()
 
 
-def _read_outcome_lines() -> List[Dict[str, Any]]:
+def _read_outcome_lines() -> list[dict[str, Any]]:
     """Read events.jsonl — the authoritative outcome log that holds reconciled
     `close` events (exchange-triggered / manual-backfill) which may never appear
     in the high-frequency session-log. Each record is nested as
@@ -348,14 +348,14 @@ def _iso_to_ms(ts: Any) -> Optional[int]:
         return None
 
 
-def _last_event(events: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
+def _last_event(events: list[dict[str, Any]], name: str) -> Optional[dict[str, Any]]:
     for e in reversed(events):
         if e.get("event") == name:
             return e
     return None
 
 
-def _summary_payload() -> Dict[str, Any]:
+def _summary_payload() -> dict[str, Any]:
     """Equity, daily PnL, open count, last-tick — derived from the session log so
     the dashboard works even if the live HL fetch is rate-limited."""
     events = _read_log_lines()
@@ -404,12 +404,12 @@ def _summary_payload() -> Dict[str, Any]:
     }
 
 
-_POSITIONS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": []}
+_POSITIONS_CACHE: dict[str, Any] = {"ts": 0.0, "data": []}
 # F26: acceptable staleness for the display positions endpoint (env-overridable).
 _POSITIONS_CACHE_TTL_S = float(os.environ.get("HERMES_POSITIONS_CACHE_TTL_S", "5.0"))
 
 
-def _positions_payload() -> List[Dict[str, Any]]:
+def _positions_payload() -> list[dict[str, Any]]:
     """Join live HL positions with DSL tracker state for the operator/public view.
 
     Cached for ~5s so repeated dashboard polls don't hammer HL with
@@ -426,7 +426,7 @@ def _positions_payload() -> List[Dict[str, Any]]:
     return data
 
 
-def _positions_payload_uncached() -> List[Dict[str, Any]]:
+def _positions_payload_uncached() -> list[dict[str, Any]]:
     dsl_exit.load_state(force=True)
 
     # Prefer the loop's snapshot: it already fetched account state this cycle,
@@ -460,7 +460,7 @@ def _positions_payload_uncached() -> List[Dict[str, Any]]:
     return _rows_from_state(state)
 
 
-def _parse_raw_position(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+def _parse_raw_position(pos: dict[str, Any]) -> Optional[dict[str, Any]]:
     """Normalize one HL ``asset_positions[i]["position"]`` record into numeric
     fields. F24: single source of truth shared by the dashboard view rows
     (_rows_from_state) and the terminal command rows (_positions_from_state),
@@ -499,10 +499,10 @@ def _parse_raw_position(pos: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Transform a raw HL account state into dashboard position rows, overlaying
     DSL tracker phase/floor from the shared state file. Pure — no network."""
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for p in state.get("asset_positions") or []:
         parsed = _parse_raw_position(p.get("position", {}))
         if parsed is None:
@@ -546,7 +546,7 @@ def _rows_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
 _CLOSE_SOURCE_RANK = {"reconcile": 0, "external": 1, "dsl": 2, "manual": 3, "ai": 4}
 
 
-def _find_open_side(events: List[Dict[str, Any]], coin: str, before_idx: int) -> Optional[str]:
+def _find_open_side(events: list[dict[str, Any]], coin: str, before_idx: int) -> Optional[str]:
     """Walk back through session events to the open (execute) for `coin`."""
     for j in range(before_idx - 1, -1, -1):
         pe = events[j]
@@ -555,7 +555,7 @@ def _find_open_side(events: List[Dict[str, Any]], coin: str, before_idx: int) ->
     return None
 
 
-def _estimate_close_leverage(coin: str, cfg_leverage: List[int]) -> int:
+def _estimate_close_leverage(coin: str, cfg_leverage: list[int]) -> int:
     """Estimate leverage for a close event that didn't record it.
 
     Mirrors executor.py: actual leverage = min(config.leverage, HL per-coin max).
@@ -587,7 +587,7 @@ def _estimate_close_leverage(coin: str, cfg_leverage: List[int]) -> int:
     return min(cfg, coin_max) if coin_max else cfg
 
 
-def _safe_live_positions_for_llm() -> List[Dict[str, Any]]:
+def _safe_live_positions_for_llm() -> list[dict[str, Any]]:
     """R12-B1 thin helper around the LLM-context `_live_positions()` call
     that previously used `except Exception: open_pos = []`. Same fallback
     ([]), now logged so an empty book going to the LLM is visible to the
@@ -606,11 +606,11 @@ def _safe_live_positions_for_llm() -> List[Dict[str, Any]]:
 
 
 def _close_side_and_leverage(
-    e: Dict[str, Any],
-    events: List[Dict[str, Any]],
+    e: dict[str, Any],
+    events: list[dict[str, Any]],
     idx: int,
     estimate_leverage: Callable[[str], int],
-) -> Tuple[str, int, bool]:
+) -> tuple[str, int, bool]:
     """Resolve (side, leverage, leverage_estimated) for a session-log close event.
 
     Newer closes carry `side`/`leverage`; older ones don't, so walk back to the
@@ -641,7 +641,7 @@ def _close_row(
     entry_px: Any,
     executed: bool,
     detail: Any,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """A single closed-trade row; field set is identical across all sources."""
     return {
         "ts": ts,
@@ -664,9 +664,9 @@ def _close_row(
 
 
 def _row_from_dsl_exit(
-    e: Dict[str, Any], events: List[Dict[str, Any]], idx: int,
+    e: dict[str, Any], events: list[dict[str, Any]], idx: int,
     estimate_leverage: Callable[[str], int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     coin = e.get("coin", "?")
     side, leverage, leverage_estimated = _close_side_and_leverage(e, events, idx, estimate_leverage)
 
@@ -698,9 +698,9 @@ def _row_from_dsl_exit(
 
 
 def _row_from_close_position(
-    e: Dict[str, Any], events: List[Dict[str, Any]], idx: int,
+    e: dict[str, Any], events: list[dict[str, Any]], idx: int,
     estimate_leverage: Callable[[str], int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     coin = e.get("coin", "?")
     side, leverage, leverage_estimated = _close_side_and_leverage(e, events, idx, estimate_leverage)
     # The manual-close endpoint may attach realized fill data
@@ -741,9 +741,9 @@ def _row_from_close_position(
 
 
 def _row_from_external_close(
-    e: Dict[str, Any], events: List[Dict[str, Any]], idx: int,
+    e: dict[str, Any], events: list[dict[str, Any]], idx: int,
     estimate_leverage: Callable[[str], int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # Exchange-side close (stop/TP fired off-box). The reconciler also emits a
     # dsl_exit mirror; this branch is kept so older logs that only contain
     # external_close_recorded are still surfaced, and the merge step below
@@ -782,9 +782,9 @@ def _row_from_external_close(
 
 
 def _row_from_ai_close(
-    e: Dict[str, Any], events: List[Dict[str, Any]], idx: int,
+    e: dict[str, Any], events: list[dict[str, Any]], idx: int,
     estimate_leverage: Callable[[str], int],
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     # AI verdict close. The event does not carry fill prices/PnL (the actual
     # order result is in close_position_market's return value), so record an
     # audit row with pnl_source="unknown" rather than a misleading 0% that
@@ -803,8 +803,8 @@ def _row_from_ai_close(
 
 
 def _row_from_outcome_close(
-    rec: Dict[str, Any], estimate_leverage: Callable[[str], int],
-) -> Dict[str, Any]:
+    rec: dict[str, Any], estimate_leverage: Callable[[str], int],
+) -> dict[str, Any]:
     # Authoritative reconciled `close` record from events.jsonl — richest fields.
     p = rec.get("payload") or {}
     coin = p.get("coin", "?")
@@ -844,7 +844,7 @@ def _row_from_outcome_close(
 
 
 # Session-log close-event parsers, keyed by event name.
-_SESSION_CLOSE_PARSERS: Dict[str, Callable] = {
+_SESSION_CLOSE_PARSERS: dict[str, Callable] = {
     "dsl_exit": _row_from_dsl_exit,
     "close_position": _row_from_close_position,
     "external_close_recorded": _row_from_external_close,
@@ -852,7 +852,7 @@ _SESSION_CLOSE_PARSERS: Dict[str, Callable] = {
 }
 
 
-def _deduplicate_close_rows(rows: List[Dict[str, Any]], window_ms: int) -> List[Dict[str, Any]]:
+def _deduplicate_close_rows(rows: list[dict[str, Any]], window_ms: int) -> list[dict[str, Any]]:
     """Merge cross-source duplicates of one fill; newest-first.
 
     A single fill can be reported by MULTIPLE sources (a dsl_exit backfill + its
@@ -867,7 +867,7 @@ def _deduplicate_close_rows(rows: List[Dict[str, Any]], window_ms: int) -> List[
         -(r.get("ts") or 0),
         _CLOSE_SOURCE_RANK.get(r.get("source"), 9),
     ))
-    merged: List[Dict[str, Any]] = []
+    merged: list[dict[str, Any]] = []
     for r in rows:
         dup = None
         r_side = (r.get("side") or "").lower() or None
@@ -890,7 +890,7 @@ def _deduplicate_close_rows(rows: List[Dict[str, Any]], window_ms: int) -> List[
     return merged
 
 
-def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
+def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
     """Walk both the session log and the outcome log for close events.
 
     Recognised events:
@@ -918,12 +918,12 @@ def _closed_trades_payload(limit: int = 20) -> List[Dict[str, Any]]:
         execute event (for side) and the live config (for leverage).
     """
     events = _read_log_lines()
-    cfg_leverage: List[int] = []  # lazy-fetched fallback memo
+    cfg_leverage: list[int] = []  # lazy-fetched fallback memo
 
     def _estimate_leverage(coin: str) -> int:
         return _estimate_close_leverage(coin, cfg_leverage)
 
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
 
     # ── session-log: dsl_exit / close_position / external_close_recorded / ai_close ──
     for i in range(len(events) - 1, -1, -1):
@@ -951,7 +951,7 @@ _EQUITY_DIP_RATIO = float(os.environ.get("HERMES_EQUITY_DIP_RATIO", "0.7"))
 _EQUITY_DIP_WINDOW = int(os.environ.get("HERMES_EQUITY_DIP_WINDOW", "15"))
 
 
-def _equity_curve_payload(range_s: int) -> List[Dict[str, Any]]:
+def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
     """Series of (ts, equity) points from loop_heartbeat events within `range_s`.
 
     Each point carries ``flag``: "ok" or "degraded". A point far below the
@@ -964,7 +964,7 @@ def _equity_curve_payload(range_s: int) -> List[Dict[str, Any]]:
     from statistics import median
 
     cutoff = int(time.time() * 1000) - range_s * 1000
-    raw: List[tuple] = []
+    raw: list[tuple] = []
     for e in _read_log_lines():
         if e.get("event") != "loop_heartbeat":
             continue
@@ -975,8 +975,8 @@ def _equity_curve_payload(range_s: int) -> List[Dict[str, Any]]:
             continue
         raw.append((e["ts"], eq))
 
-    series: List[Dict[str, Any]] = []
-    window: List[float] = []  # last N accepted equities (trailing reference)
+    series: list[dict[str, Any]] = []
+    window: list[float] = []  # last N accepted equities (trailing reference)
     for ts, eq in raw:
         ref = median(window) if window else eq
         degraded = bool(window) and eq < _EQUITY_DIP_RATIO * ref
@@ -1081,7 +1081,7 @@ async def _tail_log_sse() -> AsyncIterator[str]:
 _AUTH_MAX_FAILURES = int(os.environ.get("HERMES_AUTH_MAX_FAILURES", "5"))
 _AUTH_COOLDOWN_SEC = int(os.environ.get("HERMES_AUTH_COOLDOWN_SEC", str(5 * 60)))
 _AUTH_TRUST_PROXY = os.environ.get("HERMES_TRUST_PROXY", "") == "1"
-_auth_failures: Dict[str, Dict[str, float]] = {}
+_auth_failures: dict[str, dict[str, float]] = {}
 _auth_lock = threading.Lock()
 
 # F11: per-IP rate limit on AUTHENTICATED operator WRITES. The failure lockout
@@ -1093,7 +1093,7 @@ _auth_lock = threading.Lock()
 # HERMES_OP_WRITE_RATE_MAX=0 to disable.
 _WRITE_RATE_MAX = int(os.environ.get("HERMES_OP_WRITE_RATE_MAX", "30"))
 _WRITE_RATE_WINDOW_S = float(os.environ.get("HERMES_OP_WRITE_RATE_WINDOW_S", "60"))
-_write_hits: Dict[str, List[float]] = {}
+_write_hits: dict[str, list[float]] = {}
 
 
 def _check_operator_write_rate(ip: str) -> None:
@@ -1224,7 +1224,7 @@ def require_operator_write(request: Request) -> None:
     _require_operator(request, write=True)
 
 
-def _log_operator_action(action: str, *, via: str, result: Optional[Dict[str, Any]] = None,
+def _log_operator_action(action: str, *, via: str, result: Optional[dict[str, Any]] = None,
                          **extra: Any) -> None:
     """F22: persist a human-driven operator action to the session log.
 
@@ -1232,7 +1232,7 @@ def _log_operator_action(action: str, *, via: str, result: Optional[Dict[str, An
     so manual closes / kills survive restarts and are attributable. Best-effort
     like every session-log write; a disk failure must never block the action.
     """
-    record: Dict[str, Any] = {
+    record: dict[str, Any] = {
         "event": "operator_action",
         "ts": int(time.time() * 1000),
         "action": action,
@@ -1264,7 +1264,7 @@ def _log_operator_action(action: str, *, via: str, result: Optional[Dict[str, An
 # _coerce_config_value are imported from there at the top of this module.
 
 
-def _config_apply(updates: Dict[str, Any], backup: bool = False) -> Dict[str, Any]:
+def _config_apply(updates: dict[str, Any], backup: bool = False) -> dict[str, Any]:
     """F20: atomic read-modify-write of `.agent-config.json`. Takes the
     process-wide threading lock (cheap, avoids flock contention between
     dashboard threads) and then performs the RMW inside
@@ -1283,7 +1283,7 @@ def _config_apply(updates: Dict[str, Any], backup: bool = False) -> Dict[str, An
 # ── async handler; the endpoint dispatches through _TERMINAL_HANDLERS and ───
 # ── anything unrecognised falls through to the OpenRouter chat fallback) ────
 
-def _positions_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
+def _positions_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
     """Extract open positions from a fetch_account_state payload.
 
     Each row carries coin / side / size / entry / szi / uPnL so the five
@@ -1293,7 +1293,7 @@ def _positions_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     the dashboard view rows); malformed entries are skipped rather than
     raising and aborting the whole list.
     """
-    rows: List[Dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
     for p in state.get("asset_positions") or []:
         parsed = _parse_raw_position(p.get("position", {}))
         if parsed is None:
@@ -1309,7 +1309,7 @@ def _positions_from_state(state: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rows
 
 
-def _live_positions() -> List[Dict[str, Any]]:
+def _live_positions() -> list[dict[str, Any]]:
     """Fetch live open positions (main-dex + HIP-3). Raises on read failure;
     callers decide whether that is fatal (bulk close / kill) or informational."""
     user = resolve_user_address()
@@ -1317,7 +1317,7 @@ def _live_positions() -> List[Dict[str, Any]]:
     return _positions_from_state(state)
 
 
-async def _h_help(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_help(parts: list[str], cmd: str) -> JSONResponse:
     return JSONResponse({"response": (
         "commands:\n"
         "  status                — equity, daily PnL, open, tick, scan triggers\n"
@@ -1337,7 +1337,7 @@ async def _h_help(parts: List[str], cmd: str) -> JSONResponse:
     ), "kind": "help"})
 
 
-async def _h_status(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_status(parts: list[str], cmd: str) -> JSONResponse:
     try:
         events = session_log.tail(50) or []
         last_hb = next((e for e in reversed(events) if e.get("event") == "loop_heartbeat"), {})
@@ -1353,7 +1353,7 @@ async def _h_status(parts: List[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"status read failed: {e}", "kind": "error"})
 
 
-async def _h_pause_resume(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_pause_resume(parts: list[str], cmd: str) -> JSONResponse:
     new_mode = "OFF" if parts[0].lower() == "pause" else "LIVE"
     result = await asyncio.to_thread(_config_apply, {"mode": new_mode})
     old = result["old"].get("mode", "?")
@@ -1381,7 +1381,7 @@ async def _h_pause_resume(parts: List[str], cmd: str) -> JSONResponse:
     return JSONResponse({"response": f"mode {old} → {new_mode}", "kind": "action"})
 
 
-async def _h_shadow(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_shadow(parts: list[str], cmd: str) -> JSONResponse:
     # SHADOW = shadow book: full pipeline, no real fills. Audited like
     # pause/resume (F22) since it is the same high-value mode switch.
     new_mode = "SHADOW"
@@ -1409,7 +1409,7 @@ async def _h_shadow(parts: List[str], cmd: str) -> JSONResponse:
          "kind": "action"})
 
 
-async def _h_close(parts: List[str], cmd: str) -> Optional[JSONResponse]:
+async def _h_close(parts: list[str], cmd: str) -> Optional[JSONResponse]:
     # `close` with no argument falls through to the LLM fallback.
     if len(parts) < 2:
         return None
@@ -1469,7 +1469,7 @@ async def _h_close(parts: List[str], cmd: str) -> Optional[JSONResponse]:
     return JSONResponse({"response": f"close {coin}: {result}", "kind": "action"})
 
 
-async def _h_positions(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_positions(parts: list[str], cmd: str) -> JSONResponse:
     try:
         rows = _live_positions()
         if not rows:
@@ -1484,7 +1484,7 @@ async def _h_positions(parts: List[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"positions read failed: {e}", "kind": "error"})
 
 
-async def _h_trades(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_trades(parts: list[str], cmd: str) -> JSONResponse:
     try:
         from hermes_trader.agents.memory import memory as _mem
         _mem.load()
@@ -1509,7 +1509,7 @@ async def _h_trades(parts: List[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"trades read failed: {e}", "kind": "error"})
 
 
-async def _h_set(parts: List[str], cmd: str) -> Optional[JSONResponse]:
+async def _h_set(parts: list[str], cmd: str) -> Optional[JSONResponse]:
     # `set` with fewer than 3 tokens falls through to the LLM fallback.
     if len(parts) < 3:
         return None
@@ -1551,7 +1551,7 @@ async def _h_set(parts: List[str], cmd: str) -> Optional[JSONResponse]:
                          "kind": "action"})
 
 
-async def _h_kill(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_kill(parts: list[str], cmd: str) -> JSONResponse:
     from hermes_trader.agents.executor import close_position_market
     await asyncio.to_thread(_config_apply, {"mode": "OFF"})
     # F22: kill flips mode to OFF — audit the mode switch like pause/resume.
@@ -1603,7 +1603,7 @@ async def _h_kill(parts: List[str], cmd: str) -> JSONResponse:
                          "kind": "action"})
 
 
-async def _h_dump(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_dump(parts: list[str], cmd: str) -> JSONResponse:
     try:
         user = resolve_user_address()
         state = fetch_account_state(user, include_hip3=True) if user else {}
@@ -1619,7 +1619,7 @@ async def _h_dump(parts: List[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"dump failed: {e}", "kind": "error"})
 
 
-async def _h_regime(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_regime(parts: list[str], cmd: str) -> JSONResponse:
     try:
         from hermes_trader.agents.market_regime import regime_snapshot
         snap = regime_snapshot()
@@ -1631,14 +1631,14 @@ async def _h_regime(parts: List[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"regime fetch failed: {e}", "kind": "error"})
 
 
-async def _h_config(parts: List[str], cmd: str) -> JSONResponse:
+async def _h_config(parts: list[str], cmd: str) -> JSONResponse:
     cfg = read_agent_config()
     return JSONResponse({"response": json.dumps(cfg, indent=2), "kind": "info"})
 
 
 # Dispatch table for built-in terminal verbs. A handler returning None signals
 # "fall through to the LLM chat" (e.g. `close` / `set` without enough args).
-_TERMINAL_HANDLERS: Dict[str, Callable[..., Any]] = {
+_TERMINAL_HANDLERS: dict[str, Callable[..., Any]] = {
     "help": _h_help,
     "?": _h_help,
     "status": _h_status,

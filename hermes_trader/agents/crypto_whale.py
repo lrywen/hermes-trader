@@ -32,7 +32,7 @@ import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +87,8 @@ class WhaleReport:
     note: str = ""
 
 
-def parse_aggtrades(payload: list) -> List[Print]:
-    out: List[Print] = []
+def parse_aggtrades(payload: list) -> list[Print]:
+    out: list[Print] = []
     for t in payload or []:
         try:
             out.append(Print(
@@ -100,7 +100,7 @@ def parse_aggtrades(payload: list) -> List[Print]:
     return out
 
 
-def compute_whale_flow(prints: List[Print], min_usd: float = 100_000.0,
+def compute_whale_flow(prints: list[Print], min_usd: float = 100_000.0,
                        symbol: str = "") -> WhaleReport:
     """Net aggressive whale flow from large prints (>= min_usd)."""
     buy = sell = 0.0
@@ -132,12 +132,12 @@ def compute_whale_flow(prints: List[Print], min_usd: float = 100_000.0,
 # ── thin cached fetch ────────────────────────────────────────────────────────
 _CACHE_TTL_S = 120.0
 _CACHE_MAX = int(os.environ.get("HERMES_CRYPTO_WHALE_CACHE_MAX", "1024"))
-_cache: Dict[str, tuple] = {}
+_cache: dict[str, tuple] = {}
 _lock = threading.Lock()
 
 # Single-flight coalescing for cold misses.
-_inflight: Dict[str, threading.Event] = {}
-_inflight_results: Dict[str, object] = {}
+_inflight: dict[str, threading.Event] = {}
+_inflight_results: dict[str, object] = {}
 _inflight_lock = threading.Lock()
 
 # Binance is normally <1s, but a stalled edge can hold the default 10s for up
@@ -157,7 +157,7 @@ def _cache_sweep(now: float, ttl: float, max_keep: int) -> None:
             _cache.pop(k, None)
 
 
-def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
+def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[dict[str, Any]]:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
@@ -174,7 +174,7 @@ def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[Dict[str, 
 
 
 def fetch_aggtrades_window(symbol: str, window_minutes: float = 15.0,
-                           max_pages: int = 6, page_limit: int = 1000) -> List[Print]:
+                           max_pages: int = 6, page_limit: int = 1000) -> list[Print]:
     """Pull ALL aggTrades over the last `window_minutes` by forward-paginating from
     startTime (fromId), so the read covers real minutes — not the ~seconds that a
     single latest-1000 batch spans on a liquid pair. Bounded by max_pages."""

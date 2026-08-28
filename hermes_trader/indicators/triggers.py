@@ -7,13 +7,13 @@ trend strength, plus a weighted composite score across them.
 from __future__ import annotations
 
 import math
-from typing import Dict, List, Optional
+from typing import Optional
 
 from hermes_trader.indicators.math import adx, atr, ema, sma, candle_val
 from hermes_trader.models.types import Candle, TriggerHit
 
 
-def pct_move_spike(candles: List[Candle], sigma_threshold: float = 3) -> TriggerHit:
+def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHit:
     """Current-bar return z-score vs trailing 96-bar std."""
     if len(candles) < 3:
         return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False}
@@ -48,7 +48,7 @@ def pct_move_spike(candles: List[Candle], sigma_threshold: float = 3) -> Trigger
     }
 
 
-def volume_spike(candles: List[Candle], sigma_threshold: float = 3) -> TriggerHit:
+def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHit:
     """Current volume z-score vs 20-bar rolling window."""
     vols = [candle_val(c, "v") for c in candles]
     if len(vols) < 21:
@@ -82,7 +82,7 @@ def volume_spike(candles: List[Candle], sigma_threshold: float = 3) -> TriggerHi
 
 
 def breakout(
-    candles: List[Candle],
+    candles: list[Candle],
     lookback: int = 48,
     min_rvol: float = 1.5,
     rvol_window: int = 20,
@@ -253,7 +253,7 @@ def breakout(
 
 
 def range_compression(
-    candles: List[Candle],
+    candles: list[Candle],
     bb_length: int = 20,
     bb_std_dev: float = 2,
 ) -> TriggerHit:
@@ -315,7 +315,7 @@ def range_compression(
     }
 
 
-def trend_strength(candles: List[Candle], adx_period: int = 14) -> TriggerHit:
+def trend_strength(candles: list[Candle], adx_period: int = 14) -> TriggerHit:
     """Trend strength via ADX(14)."""
     if len(candles) < adx_period * 2 + 1:
         return {"name": "trendStrength", "score": 0, "reason": "flat", "fired": False}
@@ -351,7 +351,7 @@ def trend_strength(candles: List[Candle], adx_period: int = 14) -> TriggerHit:
 
 
 def momentum_burst(
-    candles: List[Candle],
+    candles: list[Candle],
     lookback: int = 2,
     pct_threshold: float = 4.0,
 ) -> TriggerHit:
@@ -383,7 +383,7 @@ def momentum_burst(
     }
 
 
-def _sustained_move_pct(candles: List[Candle], lookback: int) -> Optional[float]:
+def _sustained_move_pct(candles: list[Candle], lookback: int) -> Optional[float]:
     """% change over the last `lookback` bars (close-to-close). None if too short."""
     if len(candles) < lookback + 1:
         return None
@@ -394,7 +394,7 @@ def _sustained_move_pct(candles: List[Candle], lookback: int) -> Optional[float]
     return (end - start) / start * 100
 
 
-def uptrend_momentum(candles: List[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
+def uptrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
     """Sustained UPward move over `lookback` bars (default ~6h on 5m).
 
     Surfaces a coin in a steady uptrend that the fast spike triggers (which need
@@ -416,7 +416,7 @@ def uptrend_momentum(candles: List[Candle], lookback: int = 72, pct_threshold: f
     }
 
 
-def downtrend_momentum(candles: List[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
+def downtrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
     """Sustained DOWNward move over `lookback` bars (default ~6h on 5m).
 
     The bearish mirror of uptrend_momentum — surfaces a coin in a steady
@@ -438,7 +438,7 @@ def downtrend_momentum(candles: List[Candle], lookback: int = 72, pct_threshold:
     }
 
 
-def bearish_reversal_candle(candles: List[Candle], wick_body_ratio: float = 2.0,
+def bearish_reversal_candle(candles: list[Candle], wick_body_ratio: float = 2.0,
                             context_lookback: int = 6, context_pct: float = 1.5) -> TriggerHit:
     """Bearish reversal candlestick at the TOP of a short advance — a shooting star
     (long upper wick rejecting higher prices) or a bearish engulfing bar. Surfaces
@@ -480,7 +480,7 @@ def bearish_reversal_candle(candles: List[Candle], wick_body_ratio: float = 2.0,
     }
 
 
-def bullish_reversal_candle(candles: List[Candle], wick_body_ratio: float = 2.0,
+def bullish_reversal_candle(candles: list[Candle], wick_body_ratio: float = 2.0,
                             context_lookback: int = 6, context_pct: float = 1.5) -> TriggerHit:
     """Bullish reversal candlestick at the BOTTOM of a short decline — a hammer
     (long lower wick rejecting lower prices) or a bullish engulfing bar. Surfaces
@@ -521,7 +521,7 @@ def bullish_reversal_candle(candles: List[Candle], wick_body_ratio: float = 2.0,
     }
 
 
-def volume_buildup_1h(candles: List[Candle], ratio_threshold: float = 2.5) -> TriggerHit:
+def volume_buildup_1h(candles: list[Candle], ratio_threshold: float = 2.5) -> TriggerHit:
     """Notional-volume surge in the last 4h vs the prior 20h baseline.
 
     Catches accumulation phases where size is loading into a market before
@@ -546,7 +546,7 @@ def volume_buildup_1h(candles: List[Candle], ratio_threshold: float = 2.5) -> Tr
     }
 
 
-def trend_flip_1h(candles: List[Candle], lookback_bars: int = 3) -> TriggerHit:
+def trend_flip_1h(candles: list[Candle], lookback_bars: int = 3) -> TriggerHit:
     """1h EMA8 crossed above EMA21 within the last `lookback_bars` bars.
 
     Catches the inflection moment when a slow downtrend turns. By design
@@ -575,7 +575,7 @@ def trend_flip_1h(candles: List[Candle], lookback_bars: int = 3) -> TriggerHit:
     return {"name": "trendFlip1h", "score": 0, "reason": "no recent cross", "fired": False}
 
 
-def higher_lows_1h(candles: List[Candle], required: int = 4) -> TriggerHit:
+def higher_lows_1h(candles: list[Candle], required: int = 4) -> TriggerHit:
     """At least `required` of the last 6 1h closes printed a higher low.
 
     Pure structure signal — accumulation patterns where each pullback
@@ -598,7 +598,7 @@ def higher_lows_1h(candles: List[Candle], required: int = 4) -> TriggerHit:
 
 
 def momentum_continuation_1h(
-    candles: List[Candle],
+    candles: list[Candle],
     min_trend_pct: float = 8.0,
     max_pullback_pct: float = 6.0,
 ) -> TriggerHit:
@@ -641,7 +641,7 @@ def momentum_continuation_1h(
     }
 
 
-def composite_score(hits: List[TriggerHit], weights: Dict[str, float]) -> float:
+def composite_score(hits: list[TriggerHit], weights: dict[str, float]) -> float:
     """Weighted composite score from triggered hits, clamped 0-100.
 
     Normalizes against the sum of ALL trigger weights (not just fired ones),

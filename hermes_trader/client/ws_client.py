@@ -19,7 +19,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional
+from typing import Any, Optional
 
 import certifi
 from hyperliquid.info import Info
@@ -89,7 +89,7 @@ class RealtimeSnapshot:
     timestamp, so a server that stops emitting data but is still
     TCP-alive can be caught by the reconnect monitor.
     """
-    all_mids: Dict[str, str] = field(default_factory=dict)
+    all_mids: dict[str, str] = field(default_factory=dict)
     last_update_time: float = field(default_factory=time.time)
     last_seq: int = 0
     app_heartbeat_at: float = field(default_factory=time.time)
@@ -317,7 +317,7 @@ class HyperliquidWebSocket:
             except Exception as e:
                 logger.debug(f"[ws] heartbeat ping failed (non-fatal): {e}")
 
-    def get_diag(self) -> Dict[str, Any]:
+    def get_diag(self) -> dict[str, Any]:
         """R11-D1: return a diagnostic dict for ops / R11-F1 alerts.
 
         Keys:
@@ -376,7 +376,7 @@ class HyperliquidWebSocket:
                         _WS_RECONNECT_MAX_DELAY,
                     )
 
-    def get_all_mids(self) -> Dict[str, str]:
+    def get_all_mids(self) -> dict[str, str]:
         """Get latest all-mids snapshot.
         
         Returns dict like {"BTC": "50000.0", "ETH": "3000.0", ...}

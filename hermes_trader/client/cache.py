@@ -8,7 +8,7 @@ import threading
 import time
 from collections import OrderedDict
 from functools import wraps
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Optional
 
 
 class _CacheEntry:

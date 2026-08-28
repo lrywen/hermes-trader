@@ -13,12 +13,12 @@ the heavy agents subgraph.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any
 
 SHARED_CONFIG_PATH = os.path.expanduser("~/.hermes-trading/config.yaml")
 
 
-def load_shared_config(path: str = SHARED_CONFIG_PATH) -> Dict[str, Any]:
+def load_shared_config(path: str = SHARED_CONFIG_PATH) -> dict[str, Any]:
     """Load the cross-component shared config YAML.
 
     Returns an empty dict if the file does not exist, cannot be parsed, or

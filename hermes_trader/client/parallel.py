@@ -7,15 +7,15 @@ executor's internal queue holds the rest.
 
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 
 def parallel(
-    calls: List[Callable[[], Any]],
+    calls: list[Callable[[], Any]],
     max_workers: Optional[int] = None,
-) -> List[Tuple[bool, Any]]:
+) -> list[tuple[bool, Any]]:
     """Run independent calls in parallel, concurrency-bounded.
 
     Args:
@@ -38,7 +38,7 @@ def parallel(
     if max_workers is None:
         max_workers = min(32, n)
 
-    results: List[Tuple[bool, Any]] = [(False, None)] * n
+    results: list[tuple[bool, Any]] = [(False, None)] * n
 
     with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="hermes-par") as pool:
         future_to_idx = {

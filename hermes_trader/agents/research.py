@@ -13,7 +13,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import asyncio
 import threading
@@ -188,7 +188,7 @@ def _llm_record_failure() -> None:
             pass
 
 
-def _compute_indicators(candles: List[Candle]) -> Dict[str, Any]:
+def _compute_indicators(candles: list[Candle]) -> dict[str, Any]:
     """Compute EMA8/21, RSI, ATR, ADX for a set of candles."""
     if not candles:
         return {
@@ -264,7 +264,7 @@ _NEWS_FRESHNESS_DAYS_DEFAULT = 2
 # 2-min cache avoids duplicate API calls when research fires for multiple coins
 # in quick succession (e.g. a 3-trigger scan cycle). TTL is config-driven
 # (news_cache_ttl_s); this is the fallback default.
-_NEWS_CACHE: Dict[str, tuple] = {}
+_NEWS_CACHE: dict[str, tuple] = {}
 _NEWS_CACHE_TTL_S_DEFAULT = 120
 _NEWS_CACHE_LOCK = threading.Lock()
 
@@ -334,7 +334,7 @@ def _signals_block(coin: str) -> str:
     catalyst) formatted for the AI prompt. Fetches all independent sources in
     parallel so cold-cache latency is max(T) instead of sum(T)."""
     is_hip3 = ":" in (coin or "")
-    lines: List[str] = []
+    lines: list[str] = []
     try:
         skip_news = _should_skip_news()
 
@@ -416,17 +416,17 @@ def _signals_block(coin: str) -> str:
 
 def _build_user_message(
     coin: str,
-    perception: Dict[str, Any],
-    tf1h: Dict[str, Any],
-    tf4h: Dict[str, Any],
-    tf1d: Dict[str, Any],
+    perception: dict[str, Any],
+    tf1h: dict[str, Any],
+    tf4h: dict[str, Any],
+    tf1d: dict[str, Any],
     funding_rate: str,
     news: str,
     equity: float,
-    open_positions: List[Dict[str, Any]],
+    open_positions: list[dict[str, Any]],
     mode: str,
-    dex_equity: Dict[str, float] | None = None,
-    recent_candles: List[Candle] | None = None,
+    dex_equity: dict[str, float] | None = None,
+    recent_candles: list[Candle] | None = None,
     signals_block: str | None = None,
 ) -> str:
     """Build the user message passed to the LLM."""
@@ -496,7 +496,7 @@ def _build_user_message(
             return f"{p:.6f}"
         return f"{p:.8f}"
 
-    def _indicator_block(label: str, snap: Dict[str, Any]) -> str:
+    def _indicator_block(label: str, snap: dict[str, Any]) -> str:
         parts = []
         if snap.get("ema8") is not None and snap.get("ema21") is not None:
             direction = "bullish" if snap["ema8"] > snap["ema21"] else "bearish"
@@ -528,7 +528,7 @@ def _build_user_message(
     # Raw recent price action so the LLM can read candlestick/chart patterns
     # directly (shooting star, hammer, engulfing, flags) — the indicator blocks
     # above summarize away the candle bodies/wicks that patterns live in.
-    def _ohlc_block(candles: List[Candle] | None, n: int = 12) -> str:
+    def _ohlc_block(candles: list[Candle] | None, n: int = 12) -> str:
         if not candles:
             return ""
         rows = []
@@ -663,7 +663,7 @@ def _call_openrouter(
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {openrouter_key}"}
 
-    payload: Dict[str, Any] = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
@@ -688,7 +688,7 @@ def _call_openrouter(
     # this many continuation turns are appended to complete it.
     _MAX_LENGTH_CONTINUATIONS = 2
 
-    def _post(msgs: List[Dict[str, str]], max_toks: int) -> httpx.Response:
+    def _post(msgs: list[dict[str, str]], max_toks: int) -> httpx.Response:
         body = dict(payload)
         body["messages"] = msgs
         body["max_tokens"] = max_toks
@@ -712,7 +712,7 @@ def _call_openrouter(
             pass
         return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
 
-    def _send(msgs: List[Dict[str, str]], max_toks: int) -> httpx.Response:
+    def _send(msgs: list[dict[str, str]], max_toks: int) -> httpx.Response:
         """POST with 429/5xx backoff. Returns the final response (any status)."""
         resp = None
         for attempt in range(_MAX_429_RETRIES + 1):
@@ -753,7 +753,7 @@ def _call_openrouter(
             return resp
         return resp  # pragma: no cover - loop always returns
 
-    messages: List[Dict[str, str]] = list(payload["messages"])
+    messages: list[dict[str, str]] = list(payload["messages"])
     try:
         resp = _send(messages, max_tokens)
         if resp.status_code == 402:
@@ -852,7 +852,7 @@ _NLP_CONF_HINTS = [
 ]
 
 
-def _parse_nlp_verdict(text: str) -> Optional[Dict[str, Any]]:
+def _parse_nlp_verdict(text: str) -> Optional[dict[str, Any]]:
     """Extract a structured verdict from natural-language HTA prose.
 
     HTA /research/short returns sentences like:
@@ -908,7 +908,7 @@ def _coerce_px(value: Any) -> float:
 
 
 def _atr_bracket(entry_ref: float, atr_ref: float, is_long: bool,
-                 sl_mult: float, tp_mult: float) -> Tuple[float, float]:
+                 sl_mult: float, tp_mult: float) -> tuple[float, float]:
     """Derive (stop_px, tp_px) from entry ± ATR multiples, clamped at 0.
 
     Single source of truth for the ATR bracket math shared by the legacy
@@ -920,9 +920,9 @@ def _atr_bracket(entry_ref: float, atr_ref: float, is_long: bool,
     return max(0.0, stop_px), max(0.0, tp_px)
 
 
-def _extract_verdict_json(ai_text: str, perception: Dict[str, Any]
-                          ) -> Tuple[str, Any, Optional[str], Any, float, float,
-                                     str, Any, bool, List[str]]:
+def _extract_verdict_json(ai_text: str, perception: dict[str, Any]
+                          ) -> tuple[str, Any, Optional[str], Any, float, float,
+                                     str, Any, bool, list[str]]:
     """Decode the structured JSON verdict block from an AI response.
 
     Looks for JSON on the last line first, then a regex fallback. Returns
@@ -993,9 +993,9 @@ def _extract_verdict_json(ai_text: str, perception: Dict[str, Any]
 
 def _repair_stop_target(coin: str, verdict: str, entry_px: Any,
                         stop_px: float, tp_px: float,
-                        perception: Dict[str, Any],
+                        perception: dict[str, Any],
                         atr_abs: Optional[float],
-                        sl_atr_mult: float, tp_atr_mult: float) -> Tuple[float, float]:
+                        sl_atr_mult: float, tp_atr_mult: float) -> tuple[float, float]:
     """Validate/repair stop & target for a LONG/SHORT verdict.
 
     Two failure modes seen in production: the LLM omits stopPx/tpPx entirely
@@ -1049,12 +1049,12 @@ def _repair_stop_target(coin: str, verdict: str, entry_px: Any,
 def parse_verdict(
     ai_text: str,
     coin: str,
-    perception: Dict[str, Any],
+    perception: dict[str, Any],
     atr_abs: Optional[float] = None,
     sl_atr_mult: Optional[float] = None,
     tp_atr_mult: float = 1.0,
-    config: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
     """Parse the AI response: JSON on the last line, with a regex fallback.
 
     `atr_abs` (absolute ATR in price units, 4h) enables the stop/target
@@ -1199,12 +1199,12 @@ _SYNTH_SYS = (
 # trigger-hash) so the same coin firing DIFFERENT signals (or crossing a
 # score bucket) no longer reuses a stale verdict; entries also carry a
 # capacity cap with an opportunistic expiry sweep.
-_debate_cache: Dict[str, tuple] = {}
+_debate_cache: dict[str, tuple] = {}
 _debate_cache_lock = threading.Lock()
 _DEBATE_CACHE_MAX_ENTRIES = 128  # fallback bound; debate_research.cache_max_entries overrides
 
 
-def _debate_cache_key(coin: str, perception: Dict[str, Any]) -> str:
+def _debate_cache_key(coin: str, perception: dict[str, Any]) -> str:
     """Composite cache key: coin + composite-score bucket + fired-trigger hash.
 
     P2-2: a coin-only key meant a second perception within the TTL with
@@ -1257,7 +1257,7 @@ def _debate_cache_sweep_locked(now: float) -> None:
             pass
 
 
-def _debate_cfg() -> Dict[str, Any]:
+def _debate_cfg() -> dict[str, Any]:
     cfg = read_agent_config()
     d = cfg.get("debate_research") or {}
     return {
@@ -1396,7 +1396,7 @@ def _bear_analysis(ctx_msg: str) -> str:
     return _debate_direct(_BEAR_SYS, ctx_msg, structured=False)
 
 
-def _synthesize(bull: str, bear: str, ctx_msg: str) -> Optional[Dict[str, Any]]:
+def _synthesize(bull: str, bear: str, ctx_msg: str) -> Optional[dict[str, Any]]:
     """Arbiter step. Returns a validated ResearchVerdict dict or None.
 
     Always uses unstructured (prose-JSON) mode: direct testing against the Ark
@@ -1431,7 +1431,7 @@ def _synthesize(bull: str, bear: str, ctx_msg: str) -> Optional[Dict[str, Any]]:
 
 
 def _debate_metric(
-    kind: str, name: str, labels: Dict[str, str], value: Optional[float] = None
+    kind: str, name: str, labels: dict[str, str], value: Optional[float] = None
 ) -> None:
     """Best-effort Prometheus emit for the debate path. Replaces the repeated
     inline `try: from hermes_trader import metrics ... except Exception: pass`
@@ -1456,9 +1456,9 @@ def _debate_metric(
 
 
 def _debate_research(
-    coin: str, ctx_msg: str, perception: Dict[str, Any], *, atr_abs: Optional[float],
-    config: Optional[Dict[str, Any]] = None,
-) -> Optional[Dict[str, Any]]:
+    coin: str, ctx_msg: str, perception: dict[str, Any], *, atr_abs: Optional[float],
+    config: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
     """Run bull/bear in parallel, then synthesize. Returns mapped fields or
     None on any failure/timeout so the caller falls back to the single path."""
     dcfg = _debate_cfg()
@@ -1631,7 +1631,7 @@ def _timed_fetch(coin: str, label: str, fn: Callable[..., Any], *args: Any, **kw
         raise
 
 
-def _parallel_prefetch(coin: str, skip_news_flag: bool) -> Dict[str, Any]:
+def _parallel_prefetch(coin: str, skip_news_flag: bool) -> dict[str, Any]:
     """Fetch all independent pre-LLM data in parallel: 3 candle timeframes +
     funding rate + news + positioning signals. None depend on each other,
     so issue them together to collapse serial latency into max(T).
@@ -1697,7 +1697,7 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> Dict[str, Any]:
         (f_news, "news", "news", t_news),
         (f_signals, "signals_block", "signals", t_signals),
     ]
-    out: Dict[str, Any] = {}
+    out: dict[str, Any] = {}
     timed_src = ""
     timed_after = 0.0
     try:
@@ -1732,13 +1732,13 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> Dict[str, Any]:
     return out
 
 
-def _build_analysis(coin: str, perception: Dict[str, Any], *,
-                    news: Any, parsed: Dict[str, Any], ai_text: str,
+def _build_analysis(coin: str, perception: dict[str, Any], *,
+                    news: Any, parsed: dict[str, Any], ai_text: str,
                     debate_used: bool, trace_id: str,
                     as_of_date: Optional[str],
                     fired_names: set,
-                    tf1h: Dict[str, Any], tf4h: Dict[str, Any],
-                    c1h: List[Any]) -> Dict[str, Any]:
+                    tf1h: dict[str, Any], tf4h: dict[str, Any],
+                    c1h: list[Any]) -> dict[str, Any]:
     """Assemble the persisted analysis record from the researched verdict.
 
     Pure assembly — every field is carried verbatim from the parsed verdict,
@@ -1827,7 +1827,7 @@ def _build_analysis(coin: str, perception: Dict[str, Any], *,
     return analysis
 
 
-def _thin_history_pass(coin: str, perception: Dict[str, Any], c4h: List[Any], news: Any) -> Dict[str, Any]:
+def _thin_history_pass(coin: str, perception: dict[str, Any], c4h: list[Any], news: Any) -> dict[str, Any]:
     """Thin-history guard: multi-timeframe TA is meaningless without enough 4h
     bars (EMA21/ADX need history). Builds the ai_down PASS analysis, records it
     and returns it so research() can short-circuit — no LLM call, no entry.
@@ -1855,15 +1855,15 @@ def _thin_history_pass(coin: str, perception: Dict[str, Any], c4h: List[Any], ne
 
 
 def _account_context(
-    account_snapshot: Optional[Dict[str, Any]],
-) -> Tuple[float, Dict[str, float], List[Dict[str, Any]]]:
+    account_snapshot: Optional[dict[str, Any]],
+) -> tuple[float, dict[str, float], list[dict[str, Any]]]:
     """Resolve equity, per-DEX equity and open positions for the user prompt.
     Uses the cycle-level snapshot when provided (avoids N duplicate account
     POSTs per cycle); fetches via fetch_account_state() otherwise and pushes
     equity to memory in that case. Extracted from research() (P2-1)."""
     equity = 0.0
-    dex_equity: Dict[str, float] = {}
-    open_positions: List[Dict[str, Any]] = []
+    dex_equity: dict[str, float] = {}
+    open_positions: list[dict[str, Any]] = []
     user = resolve_user_address()
 
     if user:
@@ -1889,7 +1889,7 @@ def _account_context(
     return equity, dex_equity, open_positions
 
 
-def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Full AI research pipeline for a perception — returns an analysis dict.
 
     Args:
@@ -1951,7 +1951,7 @@ def research(coin: str, perception: Dict[str, Any], *, account_snapshot: Optiona
     # a hard latency cap; on any failure/timeout fall back to the single-LLM
     # path so behavior never degrades. Default off (C2).
     dcfg = _debate_cfg()
-    parsed: Optional[Dict[str, Any]] = None
+    parsed: Optional[dict[str, Any]] = None
     debate_used = False
     if dcfg["enabled"]:
         logger.info(

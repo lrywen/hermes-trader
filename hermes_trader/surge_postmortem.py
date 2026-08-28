@@ -49,7 +49,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from hermes_trader import notify
 
@@ -180,11 +180,11 @@ class SurgeDetector:
     def __init__(self, config: Optional[SurgeConfig] = None) -> None:
         self.cfg = config or SurgeConfig()
         # coin -> {"score": float, "ts": float}
-        self._last: Dict[str, Dict[str, float]] = {}
+        self._last: dict[str, dict[str, float]] = {}
         # coin -> last report epoch seconds
-        self._last_report: Dict[str, float] = {}
+        self._last_report: dict[str, float] = {}
         # Live async report workers, so drain() can wait for them.
-        self._workers: List[threading.Thread] = []
+        self._workers: list[threading.Thread] = []
         self._workers_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._state_dirty = False
@@ -265,8 +265,8 @@ class SurgeDetector:
         self,
         coin: str,
         score: float,
-        triggers: Optional[List[Dict[str, Any]]] = None,
-        perception: Optional[Dict[str, Any]] = None,
+        triggers: Optional[list[dict[str, Any]]] = None,
+        perception: Optional[dict[str, Any]] = None,
     ) -> bool:
         """Feed one cycle's reading for a coin. Returns True if a surge fired.
 
@@ -321,8 +321,8 @@ class SurgeDetector:
         coin: str,
         score: float,
         prev_score: Optional[float],
-        triggers: List[Dict[str, Any]],
-        perception: Optional[Dict[str, Any]],
+        triggers: list[dict[str, Any]],
+        perception: Optional[dict[str, Any]],
         fired_names: set,
     ) -> None:
         t = threading.Thread(
@@ -341,8 +341,8 @@ class SurgeDetector:
         coin: str,
         score: float,
         prev_score: Optional[float],
-        triggers: List[Dict[str, Any]],
-        perception: Optional[Dict[str, Any]],
+        triggers: list[dict[str, Any]],
+        perception: Optional[dict[str, Any]],
         fired_names: set,
     ) -> None:
         """Render the report and push the card. Never raises."""
@@ -419,7 +419,7 @@ class SurgeDetector:
 
 # ── Report generation ─────────────────────────────────────────────────────
 
-def _recent_candles(coin: str, cfg: SurgeConfig) -> List[Dict[str, Any]]:
+def _recent_candles(coin: str, cfg: SurgeConfig) -> list[dict[str, Any]]:
     """Best-effort fetch of recent closed candles for context. Empty on error."""
     try:
         from hermes_trader.client.hl_client import fetch_hl_candles
@@ -448,11 +448,11 @@ def _recent_candles(coin: str, cfg: SurgeConfig) -> List[Dict[str, Any]]:
         return []
 
 
-def _coin_trail(coin: str, limit: int) -> List[Dict[str, Any]]:
+def _coin_trail(coin: str, limit: int) -> list[dict[str, Any]]:
     """Recent session-log events for this coin (most recent first-ish)."""
     if not SESSION_LOG.exists():
         return []
-    trail: List[Dict[str, Any]] = []
+    trail: list[dict[str, Any]] = []
     try:
         # Stream the whole append-only log; it's small (~18k lines / 5MB).
         with SESSION_LOG.open("r", encoding="utf-8") as f:
@@ -476,10 +476,10 @@ def _render_markdown(
     coin: str,
     score: float,
     prev_score: Optional[float],
-    triggers: List[Dict[str, Any]],
-    perception: Optional[Dict[str, Any]],
-    candles: List[Dict[str, Any]],
-    trail: List[Dict[str, Any]],
+    triggers: list[dict[str, Any]],
+    perception: Optional[dict[str, Any]],
+    candles: list[dict[str, Any]],
+    trail: list[dict[str, Any]],
     cfg: SurgeConfig,
 ) -> str:
     now = _utc_now()
@@ -612,7 +612,7 @@ def _render_markdown(
         """将未知事件的扁平 dict 渲染成中文化的 key=value 文本。"""
         if not isinstance(obj, dict):
             return "" if obj is None else str(obj)
-        parts: List[str] = []
+        parts: list[str] = []
         for k, v in obj.items():
             if k in ("ts", "event", "coin", "coins"):
                 continue
@@ -699,7 +699,7 @@ def _render_markdown(
             s = s.replace(en, zh)
         return s
 
-    lines: List[str] = []
+    lines: list[str] = []
     lines.append(f"# 🚨 暴涨复盘 — {coin}")
     lines.append("")
     lines.append(f"- **生成时间**：{now.strftime('%Y-%m-%d %H:%M:%S UTC')}")
@@ -789,8 +789,8 @@ def generate_postmortem(
     coin: str,
     score: float,
     prev_score: Optional[float],
-    triggers: List[Dict[str, Any]],
-    perception: Optional[Dict[str, Any]] = None,
+    triggers: list[dict[str, Any]],
+    perception: Optional[dict[str, Any]] = None,
     config: Optional[SurgeConfig] = None,
 ) -> Optional[Path]:
     """Build and persist a markdown postmortem. Returns the file path or None."""

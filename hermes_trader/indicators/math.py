@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from typing import List
 
 from hermes_trader.models.types import Candle
 
@@ -14,7 +13,7 @@ def candle_val(c: Candle | dict[str, float], key: str) -> float:
     return getattr(c, key, 0)
 
 
-def ema(values: List[float], period: int) -> List[float]:
+def ema(values: list[float], period: int) -> list[float]:
     """Exponential moving average."""
     k = 2 / (period + 1)
     out = [float("nan")] * len(values)
@@ -29,7 +28,7 @@ def ema(values: List[float], period: int) -> List[float]:
     return out
 
 
-def sma(values: List[float], period: int) -> List[float]:
+def sma(values: list[float], period: int) -> list[float]:
     """Simple moving average."""
     out = [float("nan")] * len(values)
     acc = 0.0
@@ -42,7 +41,7 @@ def sma(values: List[float], period: int) -> List[float]:
     return out
 
 
-def atr(candles: List[Candle], period: int = 14) -> List[float]:
+def atr(candles: list[Candle], period: int = 14) -> list[float]:
     """Average true range."""
     tr = [0.0] * len(candles)
     for i in range(1, len(candles)):
@@ -61,7 +60,7 @@ def atr(candles: List[Candle], period: int = 14) -> List[float]:
     return out
 
 
-def rsi(candles: List[Candle], period: int = 14) -> List[float]:
+def rsi(candles: list[Candle], period: int = 14) -> list[float]:
     """Relative strength index."""
     out = [float("nan")] * len(candles)
     if len(candles) <= period:
@@ -91,7 +90,7 @@ def rsi(candles: List[Candle], period: int = 14) -> List[float]:
     return out
 
 
-def adx(candles: List[Candle], period: int = 14) -> List[float]:
+def adx(candles: list[Candle], period: int = 14) -> list[float]:
     """Average directional index."""
     n = len(candles)
     out = [float("nan")] * n
@@ -144,7 +143,7 @@ def adx(candles: List[Candle], period: int = 14) -> List[float]:
     return out
 
 
-def obv(candles: List[Candle]) -> List[float]:
+def obv(candles: list[Candle]) -> list[float]:
     """On-balance volume: cumulative volume signed by close direction.
 
     Rises when volume accumulates on up-closes, falls on down-closes. The

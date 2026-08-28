@@ -9,7 +9,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict
+from typing import Any, AsyncIterator
 
 
 def _load_env_local_early() -> None:
@@ -76,7 +76,7 @@ logger = logging.getLogger("hermes-server")
 # never blocks the event loop.
 
 
-async def _append_session_log(entry: Dict[str, Any]) -> None:
+async def _append_session_log(entry: dict[str, Any]) -> None:
     """Append one event to the shared session log (non-blocking)."""
     loop = asyncio.get_running_loop()
     await loop.run_in_executor(None, session_log.append, entry)
@@ -221,7 +221,7 @@ class _BoomForTest(RuntimeError):
     without colliding with production exception types."""
 
 
-def _parse_request_body_safe(request: Any, coin: str) -> Dict[str, Any]:
+def _parse_request_body_safe(request: Any, coin: str) -> dict[str, Any]:
     """Synchronous variant of the body-parse path. Production calls
     ``await request.json()`` directly; the test helper expects a
     pre-coro or sync value."""
@@ -265,7 +265,7 @@ def _safe_fetch_live_equity() -> float:
         return 0.0
 
 
-def _safe_fetch_account_state() -> Dict[str, Any]:
+def _safe_fetch_account_state() -> dict[str, Any]:
     """Read live account state; on failure, log + fall back to ``{}``.
 
     The function calls ``fetch_account_state`` (sync) at module scope.
@@ -283,7 +283,7 @@ def _safe_fetch_account_state() -> Dict[str, Any]:
         return {}
 
 
-def _sum_open_notional(state: Dict[str, Any]) -> float:
+def _sum_open_notional(state: dict[str, Any]) -> float:
     """Sum ``|szi| * entry_px`` over an asset_positions list, *keeping* any
     partial sum that accumulated before a malformed entry raised. Previously
     the except branch discarded the partial total silently."""
@@ -341,7 +341,7 @@ def _check_manual_order_gates(
     total_open_notional: float,
     market_vol_24h: float,
     positions: list,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """P0-1: gate manual ``/api/hl/place-order`` calls against the same 16-gate
     risk chain that ``maybe_execute`` runs. Returns the raw ``eval_all_gates``
     report dict so the caller can branch on ``report["blocked"]`` and surface
@@ -457,12 +457,12 @@ async def run_scan(request: Request) -> JSONResponse:
 # later callers within the TTL get the cached dict immediately. TTL is short on
 # purpose (default 30s) so a stale verdict is never served for long.
 _RESEARCH_CACHE_TTL_S = float(os.environ.get("HERMES_RESEARCH_HTTP_CACHE_S", "30"))
-_research_cache: Dict[str, tuple] = {}  # coin -> (expiry_epoch, analysis_dict)
-_research_inflight: Dict[str, asyncio.Future] = {}
+_research_cache: dict[str, tuple] = {}  # coin -> (expiry_epoch, analysis_dict)
+_research_inflight: dict[str, asyncio.Future] = {}
 _research_cache_lock = asyncio.Lock()
 
 
-async def _research_cached(coin: str, perception: Dict[str, Any]) -> Dict[str, Any]:
+async def _research_cached(coin: str, perception: dict[str, Any]) -> dict[str, Any]:
     loop = asyncio.get_running_loop()
     now = time.time()
 
@@ -523,7 +523,7 @@ async def run_research(coin: str, request: Request) -> JSONResponse:
     memory.load()
 
     # Build a minimal perception from memory or request
-    perception: Dict[str, Any] = {"coin": coin, "type": "perp", "mid": 0, "composite_score": 0}
+    perception: dict[str, Any] = {"coin": coin, "type": "perp", "mid": 0, "composite_score": 0}
 
     if request:
         try:
@@ -1228,7 +1228,7 @@ async def cancel_order(request: Request) -> JSONResponse:
 # ── Root ──────────────────────────────────────────────────────────────────────
 
 @app.get("/api/health")
-async def health() -> Dict[str, Any]:
+async def health() -> dict[str, Any]:
     return {"service": "Hermes-Trader", "version": __version__, "status": "running"}
 
 
@@ -1398,7 +1398,7 @@ a{color:#2980b9}
 
 
 @app.get("/postmortems")
-async def list_postmortems() -> Dict[str, Any]:
+async def list_postmortems() -> dict[str, Any]:
     """List all surge postmortem reports (public, read-only)."""
     try:
         files = sorted(

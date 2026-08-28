@@ -21,7 +21,7 @@ Principle blend of the greats:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -36,8 +36,8 @@ def decide_rotation(
     *,
     candidate_coin: str,
     candidate_composite: float,
-    blocked_reasons: List[str],
-    open_positions: List[Dict[str, Any]],   # each: {coin, roe_pct, age_minutes}
+    blocked_reasons: list[str],
+    open_positions: list[dict[str, Any]],   # each: {coin, roe_pct, age_minutes}
     min_candidate_composite: float,
     min_hold_minutes: float,
     protect_winner_roe_pct: float,

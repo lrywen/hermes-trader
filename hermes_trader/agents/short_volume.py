@@ -30,7 +30,7 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Dict, List, Optional
+from typing import Optional
 
 from hermes_trader.agents.options_gex import underlying_for  # xyz: -> underlying
 
@@ -67,14 +67,14 @@ class ShortVolReport:
     ratio: float            # latest-day short volume / total
     regime: str             # "crowded_short_squeeze_fuel" | "neutral" | "light_short"
     trend: str              # "rising" | "falling" | "flat" | "n/a"
-    series: List[float]     # oldest -> newest ratios
+    series: list[float]     # oldest -> newest ratios
     note: str = ""
 
 
-def parse_finra_shvol(text: str, want_symbol: Optional[str] = None) -> List[ShortVolDay]:
+def parse_finra_shvol(text: str, want_symbol: Optional[str] = None) -> list[ShortVolDay]:
     """Parse one FINRA CNMS daily short-volume file. If `want_symbol` is given,
     return only that symbol's row(s)."""
-    rows: List[ShortVolDay] = []
+    rows: list[ShortVolDay] = []
     want = want_symbol.upper() if want_symbol else None
     for line in text.splitlines():
         parts = line.split("|")
@@ -107,7 +107,7 @@ def classify_short_regime(ratio: float) -> str:
     return "neutral"
 
 
-def _trend(series: List[float]) -> str:
+def _trend(series: list[float]) -> str:
     if len(series) < 2:
         return "n/a"
     d = series[-1] - series[0]
@@ -118,7 +118,7 @@ def _trend(series: List[float]) -> str:
     return "flat"
 
 
-def build_report(symbol: str, days: List[ShortVolDay]) -> Optional[ShortVolReport]:
+def build_report(symbol: str, days: list[ShortVolDay]) -> Optional[ShortVolReport]:
     """Assemble a report from per-day rows (oldest->newest expected; we sort)."""
     days = sorted([d for d in days if d.symbol == symbol.upper()], key=lambda d: d.date)
     if not days:
@@ -136,7 +136,7 @@ def build_report(symbol: str, days: List[ShortVolDay]) -> Optional[ShortVolRepor
 
 # ── thin cached fetch ────────────────────────────────────────────────────────
 _CACHE_TTL_S = 3600.0          # the file is daily; an hour is plenty
-_cache: Dict[str, tuple] = {}  # symbol -> (epoch, ShortVolReport|None)
+_cache: dict[str, tuple] = {}  # symbol -> (epoch, ShortVolReport|None)
 _lock = threading.Lock()
 
 
@@ -169,7 +169,7 @@ def short_volume_signal(coin_or_ticker: str, lookback_days: int = 5,
     if not allow_fetch:
         return hit[1] if hit else None
 
-    rows: List[ShortVolDay] = []
+    rows: list[ShortVolDay] = []
     d = datetime.now(timezone.utc).date()
     checked = 0
     while len(rows) < lookback_days and checked < lookback_days + 6:

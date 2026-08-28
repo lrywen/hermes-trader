@@ -30,7 +30,7 @@ import threading
 import time
 import urllib.request
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -91,11 +91,11 @@ def parse_occ(sym: str) -> Optional[tuple]:
     return root, yymmdd, (cp == "C"), int(strike8) / 1000.0
 
 
-def rows_from_cboe(payload: Dict[str, Any]) -> tuple:
+def rows_from_cboe(payload: dict[str, Any]) -> tuple:
     """(spot, [OptRow]) from a CBOE delayed_quotes/options JSON payload."""
     data = payload.get("data", {}) or {}
     spot = float(data.get("current_price") or 0)
-    rows: List[OptRow] = []
+    rows: list[OptRow] = []
     for o in (data.get("options") or []):
         p = parse_occ(o.get("option", ""))
         if not p:
@@ -116,16 +116,16 @@ def _gex_dollars(gamma: float, oi: float, spot: float) -> float:
     return gamma * oi * _CONTRACT_MULT * spot * spot * 0.01
 
 
-def compute_gex(rows: List[OptRow], spot: float) -> Dict[str, Any]:
+def compute_gex(rows: list[OptRow], spot: float) -> dict[str, Any]:
     """Net dealer GEX (SqueezeMetrics convention: call gamma +, put gamma −,
     i.e. dealers long calls / short puts). Per-strike + total + walls + flip.
     Returns dollars in MILLIONS."""
     if spot <= 0 or not rows:
         return {"total": 0.0, "by_strike": {}, "call_wall": None, "put_wall": None,
                 "gamma_flip": None, "regime": "unknown"}
-    by_strike: Dict[float, float] = {}
-    call_gex: Dict[float, float] = {}
-    put_gex: Dict[float, float] = {}
+    by_strike: dict[float, float] = {}
+    call_gex: dict[float, float] = {}
+    put_gex: dict[float, float] = {}
     for r in rows:
         g = _gex_dollars(r.gamma, r.oi, spot)
         if r.is_call:
@@ -158,7 +158,7 @@ def compute_gex(rows: List[OptRow], spot: float) -> Dict[str, Any]:
     }
 
 
-def compute_max_pain(rows: List[OptRow], nearest_expiry_only: bool = True) -> Optional[float]:
+def compute_max_pain(rows: list[OptRow], nearest_expiry_only: bool = True) -> Optional[float]:
     """Strike that minimizes total option-holder intrinsic value (writers' pin)."""
     if not rows:
         return None
@@ -181,7 +181,7 @@ def compute_max_pain(rows: List[OptRow], nearest_expiry_only: bool = True) -> Op
     return best_k
 
 
-def fetch_cboe(ticker: str, timeout: float = 12.0) -> Optional[Dict[str, Any]]:
+def fetch_cboe(ticker: str, timeout: float = 12.0) -> Optional[dict[str, Any]]:
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -216,7 +216,7 @@ def gex_signal(coin_or_ticker: str) -> Optional[GexReport]:
 # path uncached (the ATR-sizing API-amplification lesson). Dealer gamma is a
 # structural/daily map on a ~15-min delayed feed, so a 15-min cache is lossless.
 _GEX_TTL_S = 900.0
-_gex_cache: Dict[str, tuple] = {}      # ticker -> (epoch, GexReport|None)
+_gex_cache: dict[str, tuple] = {}      # ticker -> (epoch, GexReport|None)
 _gex_lock = threading.Lock()
 
 

@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 from hermes_trader.indicators.math import adx, atr, candle_val, ema, obv, rsi
 from hermes_trader.agents.perception import extract_fired_triggers
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 _FETCH_TIMEOUT_S = float(os.environ.get("HERMES_TA_FILTER_FETCH_TIMEOUT_S", "45"))
 
 
-def _assess_trend(candles: List[Candle]) -> str:
+def _assess_trend(candles: list[Candle]) -> str:
     """Bullish / bearish / flat based on EMA8/21 cross and slope."""
     if len(candles) < 30:
         return "flat"
@@ -48,7 +48,7 @@ def _assess_trend(candles: List[Candle]) -> str:
     return "flat"
 
 
-def _compute_atr4pct(candles: List[Candle]) -> Optional[float]:
+def _compute_atr4pct(candles: list[Candle]) -> Optional[float]:
     if len(candles) < 20:
         return None
     atr_arr = atr(candles, 14)
@@ -59,7 +59,7 @@ def _compute_atr4pct(candles: List[Candle]) -> Optional[float]:
     return (last / last_close) * 100
 
 
-def _compute_rsi(candles: List[Candle]) -> Optional[float]:
+def _compute_rsi(candles: list[Candle]) -> Optional[float]:
     if len(candles) < 20:
         return None
     arr = rsi(candles, 14)
@@ -67,7 +67,7 @@ def _compute_rsi(candles: List[Candle]) -> Optional[float]:
     return last if math.isfinite(last) else None
 
 
-def _compute_adx(candles: List[Candle]) -> Optional[float]:
+def _compute_adx(candles: list[Candle]) -> Optional[float]:
     if len(candles) < 30:
         return None
     arr = adx(candles, 14)
@@ -75,7 +75,7 @@ def _compute_adx(candles: List[Candle]) -> Optional[float]:
     return last if math.isfinite(last) else None
 
 
-def _check_volume_confirm(candles: List[Candle], mult: float = 1.2) -> bool:
+def _check_volume_confirm(candles: list[Candle], mult: float = 1.2) -> bool:
     if len(candles) < 21:
         return False
     last_vol = candle_val(candles[-1], "v")
@@ -86,7 +86,7 @@ def _check_volume_confirm(candles: List[Candle], mult: float = 1.2) -> bool:
     return avg_vol == 0 or last_vol >= avg_vol * mult
 
 
-def _extension_atr(candles: List[Candle]) -> Optional[float]:
+def _extension_atr(candles: list[Candle]) -> Optional[float]:
     """Distance of the last close from EMA21, measured in ATR(14) units.
 
     Positive = price above EMA21 (extended long / late to chase up),
@@ -105,7 +105,7 @@ def _extension_atr(candles: List[Candle]) -> Optional[float]:
     return (last_close - e21) / a
 
 
-def _obv_slope(candles: List[Candle], lookback: int = 10) -> Optional[float]:
+def _obv_slope(candles: list[Candle], lookback: int = 10) -> Optional[float]:
     """OBV change over the last `lookback` bars (signed).
 
     Positive = accumulation (volume on up-closes), negative = distribution.
@@ -118,7 +118,7 @@ def _obv_slope(candles: List[Candle], lookback: int = 10) -> Optional[float]:
     return series[-1] - series[-lookback - 1]
 
 
-def _check_ema_cross_recent(candles: List[Candle]) -> bool:
+def _check_ema_cross_recent(candles: list[Candle]) -> bool:
     if len(candles) < 25:
         return False
     closes = [candle_val(c, "c") for c in candles]
@@ -137,7 +137,7 @@ def _check_ema_cross_recent(candles: List[Candle]) -> bool:
     return False
 
 
-def analyze_perception(perception: Dict[str, Any]) -> Dict[str, Any]:
+def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
     """Run TA validation on a single perception, returning a TA-result dict."""
     coin = perception["coin"]
     try:

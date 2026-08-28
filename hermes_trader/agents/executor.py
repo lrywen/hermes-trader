@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Optional
 
 from hermes_trader.agents.config_store import read_agent_config, cfg_get, apply_coin_override
 from hermes_trader.agents.dsl_exit import (
@@ -75,7 +75,7 @@ _HL_ROUND_TRIP_FILLS = 2
 
 # Pending SL retry queue — positions whose server-side SL failed twice
 # and need aggressive retry at sub-60s intervals.
-_pending_sl_retries: Dict[str, Dict[str, Any]] = {}
+_pending_sl_retries: dict[str, dict[str, Any]] = {}
 
 # Idempotency guard for execute(): the memory.get_recent_trades check below
 # races with two concurrent invocations of the same analysis (e.g. scanner
@@ -105,7 +105,7 @@ _IN_FLIGHT_ANALYSES: set = set()
 _LIQ_BUFFER_USD = float(os.environ.get("HERMES_LIQ_BUFFER_USD", "10") or "10")
 
 
-def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> Dict[str, Any]:
+def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[str, Any]:
     """P0-4 pre-place gate: refuse to place any order on `coin` if an
     existing position in the same coin is already within
     ``HERMES_LIQ_BUFFER_USD`` of notional cushion from its liquidation
@@ -208,8 +208,8 @@ def _record_sizing_clamped(clamp: str) -> None:
         pass
 
 
-def _record_risk_gate_block(analysis: Dict[str, Any],
-                            gate_output: Dict[str, Any]) -> None:
+def _record_risk_gate_block(analysis: dict[str, Any],
+                            gate_output: dict[str, Any]) -> None:
     """P1-5: durably record a risk-gate block in events.jsonl.
 
     Gate blocks were previously visible only via ``logger.debug`` (silent in
@@ -310,7 +310,7 @@ _SL_MOVE_MIN_BPS = 15.0
 # P2-3: fallback default; the live value is config sl_buffer_bps.
 _SL_BUFFER_BPS = 10.0
 # Last modification attempt per coin: {coin: (timestamp, target_px)}.
-_sl_move_state: Dict[str, tuple] = {}
+_sl_move_state: dict[str, tuple] = {}
 
 # Static fallback 24h volumes, used ONLY when the live universe lookup fails.
 # WIRING FIX 2026-06-11: these constants used to be the ONLY volume source for
@@ -351,7 +351,7 @@ def _get_market_volume_24h(coin: str) -> float:
 _DEFAULT_CONVICTION_TIERS = [(0.80, 1.5), (0.65, 1.0), (0.0, 0.7)]
 
 
-def _parse_conviction_tiers(raw: Any) -> List[Tuple[float, float]]:
+def _parse_conviction_tiers(raw: Any) -> list[tuple[float, float]]:
     """Parse `conviction_tiers` config into descending (threshold, mult) pairs.
 
     Accepts a list of [min_confidence, size_multiplier] pairs. Falls back to the
@@ -370,7 +370,7 @@ def _parse_conviction_tiers(raw: Any) -> List[Tuple[float, float]]:
     return tiers
 
 
-def _conviction_multiplier(confidence: float, tiers: List[Tuple[float, float]]) -> float:
+def _conviction_multiplier(confidence: float, tiers: list[tuple[float, float]]) -> float:
     """First tier (descending) whose threshold `confidence` meets wins. Below
     every threshold → the lowest tier's multiplier."""
     for threshold, mult in tiers:
@@ -379,7 +379,7 @@ def _conviction_multiplier(confidence: float, tiers: List[Tuple[float, float]]) 
     return tiers[-1][1]
 
 
-def select_exit_params(dsl_config: Dict[str, Any], regime: str) -> Tuple[float, float, Any, float, float, str]:
+def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, float, Any, float, float, str]:
     """Regime-aware exit selection. The base dsl_config is the SCALP config
     (bank fast — +EV in chop/down per the controlled backtest: scalp +$1536/63%
     vs trend-ride -$757/47%). When regime is directional ('up'/'down') and
@@ -418,13 +418,13 @@ def select_exit_params(dsl_config: Dict[str, Any], regime: str) -> Tuple[float, 
 
 
 def compute_effective_stop_pct(
-    dsl_config: Dict[str, Any],
+    dsl_config: dict[str, Any],
     regime: str,
     leverage: float,
     atr_pct: float,
     avg_exit_slip_pct: float = 0.0,
     atr_hist_mean_pct: float = 0.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Replicate the DSL's three-layer effective-stop calculation at SIZING time.
 
     This is the sizing-side mirror of ``DSLExitTracker._evaluate``
@@ -513,7 +513,7 @@ def get_atr_hist_mean_pct(coin: str, interval: str = "4h", lookback_candles: int
         candles = fetch_hl_candles(coin, interval, lookback_candles)
         if not candles or len(candles) < period + 2:
             return 0.0
-        trs: List[float] = []
+        trs: list[float] = []
         prev = candles[0]
         for cur in candles[1:]:
             tr = max(
@@ -543,7 +543,7 @@ def get_atr_hist_mean_pct(coin: str, interval: str = "4h", lookback_candles: int
 # snapshot that research() already gathered (no extra fetch).
 
 
-def regime_strength_label(analysis: Dict[str, Any]) -> str:
+def regime_strength_label(analysis: dict[str, Any]) -> str:
     """Classify the coin's OWN 1h tape into STRONG_TREND / TREND / NEUTRAL /
     CHOP using the backtest's 5-component weighted score.
 
@@ -604,8 +604,8 @@ def regime_strength_label(analysis: Dict[str, Any]) -> str:
     return "CHOP"
 
 
-def plan_b_size_multiplier(analysis: Dict[str, Any],
-                           plan_b_cfg: Dict[str, Any]) -> Tuple[float, str]:
+def plan_b_size_multiplier(analysis: dict[str, Any],
+                           plan_b_cfg: dict[str, Any]) -> tuple[float, str]:
     """Plan B: in a mid-strength TREND (not STRONG_TREND), RSI 40-60 has no
     directional edge (backtest attribution: these bars bleed equally long/short).
     Halve size to cut risk while keeping signal coverage.
@@ -637,7 +637,7 @@ def plan_b_size_multiplier(analysis: Dict[str, Any],
 
 def momentum_reentry_allowed(last_exit_px: Optional[float], last_side: Optional[str],
                              current_mid: Optional[float], composite: Optional[float],
-                             cfg: Dict[str, Any]) -> Tuple[bool, str]:
+                             cfg: dict[str, Any]) -> tuple[bool, str]:
     """Should we BYPASS the loss-cooldown because a stopped name has RESUMED its
     uptrend? (The autopsy leak: SPCX was force-entered, noise-stopped, then the
     180m loss-cooldown locked us out of its +29% run.) The cooldown is anti-revenge
@@ -762,7 +762,7 @@ def _place_backup_sl(
 
 
 def _place_tp_scale_out(
-    config: Dict[str, Any], atr: float, size_in_coin: float,
+    config: dict[str, Any], atr: float, size_in_coin: float,
     entry_px: float, is_buy: bool, coin: str, trade_side: str
 ) -> None:
     """Place the take-profit scale-out resting order at the TP target.
@@ -874,8 +874,8 @@ def _place_tp_scale_out(
 
 
 def _evaluate_force_override(
-    analysis: Dict[str, Any], config: Dict[str, Any]
-) -> tuple[bool, Dict[str, Any]]:
+    analysis: dict[str, Any], config: dict[str, Any]
+) -> tuple[bool, dict[str, Any]]:
     """Single source of truth for the PASS → LONG structural-override decision.
 
     Both `maybe_execute` (the real upgrade + gate path) and `route_verdict`
@@ -950,7 +950,7 @@ def _evaluate_force_override(
     }
 
 
-def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Dict[str, Any]:
+def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
     `_rotation_retry` is set on the single self-retry after capital rotation
@@ -1298,7 +1298,7 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
         dex_name = coin_for_dex_check.split(":", 1)[0]
         from hermes_trader.client.hl_client import _http_post
 
-        def _read_dex_value() -> Tuple[bool, float]:
+        def _read_dex_value() -> tuple[bool, float]:
             try:
                 state_resp = _http_post("/info", {
                     "type": "clearinghouseState", "user": user, "dex": dex_name,
@@ -1352,7 +1352,7 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
     # and vice versa. Main-dex (crypto) trades behave exactly as before.
     _target_dex = analysis["coin"].split(":", 1)[0] if ":" in analysis["coin"] else ""
 
-    def _read_state() -> Tuple[Dict[str, Any], float, float]:
+    def _read_state() -> tuple[dict[str, Any], float, float]:
         st = fetch_account_state(user, include_hip3=True) or {}
         deq = st.get("dex_equity") or {}
         dav = st.get("dex_available") or {}
@@ -2336,7 +2336,7 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
     }
 
 
-def monitor_exits(mids: Dict[str, float]) -> List[Dict[str, Any]]:
+def monitor_exits(mids: dict[str, float]) -> list[dict[str, Any]]:
     """Check all DSL-tracked positions and return those that should be closed.
 
     `side` is the long/short of the actual position; `phase` is the DSL phase
@@ -2362,7 +2362,7 @@ def monitor_exits(mids: Dict[str, float]) -> List[Dict[str, Any]]:
     ]
 
 
-def sync_exchange_sl(mids: Dict[str, float]) -> None:
+def sync_exchange_sl(mids: dict[str, float]) -> None:
     """Move each position's exchange backup SL to trail the DSL floor in Phase 2.
 
     The DSL software floor (polled every ~15s) is the PRIMARY exit. The static
@@ -2492,11 +2492,11 @@ def sync_exchange_sl(mids: Dict[str, float]) -> None:
 
 
 def route_verdict(
-    analysis: Dict[str, Any],
+    analysis: dict[str, Any],
     *,
-    execute_fn: Optional[Callable[[Dict[str, Any]], Dict[str, Any]]] = None,
+    execute_fn: Optional[Callable[[dict[str, Any]], dict[str, Any]]] = None,
     close_fn: Optional[Callable[[str], Any]] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Route an analysis to the right action based on its verdict.
 
     Pure routing logic with the side-effecting functions injected, so EVERY
@@ -2541,7 +2541,7 @@ def route_verdict(
     return {"action": "unknown", "verdict": verdict, "result": None}
 
 
-def _runner_entry_block_reason(analysis: Dict[str, Any], config: Dict[str, Any]) -> str:
+def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any]) -> str:
     """Block entries that are not fresh runner setups.
 
     The live ledger's repeated loss mode is not "no runners exist"; it is broad
@@ -2775,7 +2775,7 @@ def _runner_entry_block_reason(analysis: Dict[str, Any], config: Dict[str, Any])
     return ""
 
 
-def close_position_market(coin: str) -> Dict[str, Any]:
+def close_position_market(coin: str) -> dict[str, Any]:
     """Market-close any open perp position for `coin`. Deregisters the DSL tracker on success.
 
     Returns include `entry_px`, `fill_px`, and `realized_pnl_pct` (leveraged,
@@ -2845,7 +2845,7 @@ def close_position_market(coin: str) -> Dict[str, Any]:
     # (the BIRD short<->long churn loop). reduce_only makes HL ignore the excess.
     res = place_hl_order(is_buy=not is_long, size=abs(szi), mid_price=mid_price, coin=coin,
                          reduce_only=True)
-    out: Dict[str, Any] = {**res, "coin": coin, "side": side,
+    out: dict[str, Any] = {**res, "coin": coin, "side": side,
                             "entry_px": entry_px, "leverage": leverage}
 
     # H5 / P0-5: partial-fill guard. A reduce-only close that fills less than

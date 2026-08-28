@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any
 
 
-TRIGGER_CONFIG: Dict[str, Any] = {
+TRIGGER_CONFIG: dict[str, Any] = {
     "weights": {
         # RE-WEIGHTED 2026-06-02 to MEASURED MARGINAL LIFT (fired vs not-fired ROE,
         # n=497 trades). Prior weights were inverted: the 1h slow-burn signals carried
@@ -71,6 +71,6 @@ TRIGGER_CONFIG: Dict[str, Any] = {
 }
 
 
-def get_config() -> Dict[str, Any]:
+def get_config() -> dict[str, Any]:
     """Return the default trigger configuration."""
     return TRIGGER_CONFIG

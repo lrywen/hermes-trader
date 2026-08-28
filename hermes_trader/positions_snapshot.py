@@ -19,7 +19,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ SNAPSHOT_FILE = os.environ.get(
 )
 
 
-def write_snapshot(asset_positions: List[Dict[str, Any]]) -> None:
+def write_snapshot(asset_positions: list[dict[str, Any]]) -> None:
     """Atomically persist the raw HL position list. Best-effort, never raises."""
     try:
         payload = {
@@ -45,7 +45,7 @@ def write_snapshot(asset_positions: List[Dict[str, Any]]) -> None:
         logger.warning(f"[snapshot] failed to persist positions: {e}")
 
 
-def read_snapshot(max_age_s: float = 120.0) -> Optional[Dict[str, Any]]:
+def read_snapshot(max_age_s: float = 120.0) -> Optional[dict[str, Any]]:
     """Return a state-like dict ({"asset_positions": [...]}) from the snapshot,
     or None if the file is missing, unreadable, or older than `max_age_s`.
 

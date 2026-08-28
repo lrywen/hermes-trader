@@ -13,7 +13,7 @@ import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional, Dict, Any
+from typing import Iterator, Optional, Any
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ def _lock_path(name: str, lock_dir: Optional[str] = None) -> Path:
     return base / f"hermes-{name}.lock"
 
 
-def _read_lock_metadata(path: Path) -> Optional[Dict[str, Any]]:
+def _read_lock_metadata(path: Path) -> Optional[dict[str, Any]]:
     try:
         with path.open("r") as f:
             return json.load(f)
@@ -53,7 +53,7 @@ def is_pid_alive(pid: Optional[int]) -> bool:
 _is_pid_alive = is_pid_alive
 
 
-def _write_metadata_inplace(fd: int, payload: Dict[str, Any]) -> None:
+def _write_metadata_inplace(fd: int, payload: dict[str, Any]) -> None:
     """Write metadata onto the already-locked fd. Keeps inode + flock stable."""
     encoded = json.dumps(payload).encode("utf-8")
     os.ftruncate(fd, 0)
@@ -129,7 +129,7 @@ def scanner_lock(name: str, timeout: float = 300.0) -> Iterator[None]:
         logger.debug(f"[lock] Released lock '{name}'")
 
 
-def check_lock_status(name: str, lock_dir: Optional[str] = None) -> Dict[str, Any]:
+def check_lock_status(name: str, lock_dir: Optional[str] = None) -> dict[str, Any]:
     """Check if a lock is currently held and by whom."""
     lock_path = _lock_path(name, lock_dir)
     prev = _read_lock_metadata(lock_path)

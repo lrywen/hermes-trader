@@ -19,7 +19,7 @@ import math
 import os
 import threading
 import time as _time
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 # Hyperliquid rejects any order below $10 notional. Target a small buffer above
 # it so the IOC price offset and mark-vs-limit rounding can't dip under.
@@ -89,7 +89,7 @@ API.__init__ = _patched_api_init
 _orig_api_post = API.post
 
 
-def _patched_api_post(self: Any, url_path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+def _patched_api_post(self: Any, url_path: str, payload: Optional[dict[str, Any]] = None) -> Any:
     payload = payload or {}
     last_err = None
     for attempt in range(_MAX_POST_RETRIES):
@@ -295,7 +295,7 @@ def _get_info() -> Info:
 # "Unknown coin: xyz:SMSN", and the HIP-3 backup stop-loss silently failed.
 # Cache the meta universe per dex so a transient 429 can't break coin
 # resolution and we stop hammering the API. TTL is long — meta rarely changes.
-_META_CACHE: Dict[str, Tuple[float, list]] = {}
+_META_CACHE: dict[str, tuple[float, list]] = {}
 _META_TTL_S = float(os.environ.get("HERMES_META_TTL_S", "3600"))
 # H11: the meta cache is process-local (lost on watchdog os.execv). On a cold
 # restart the first scan fires N concurrent get_coin_index calls across the
@@ -365,7 +365,7 @@ def prewarm_meta_cache() -> int:
     return warmed
 
 
-def get_coin_index(coin: str) -> Tuple[int, int, int]:
+def get_coin_index(coin: str) -> tuple[int, int, int]:
     """Resolve a coin name to (asset_index, sz_decimals, px_decimals) via the SDK meta endpoint.
 
     Searches the main perp universe first, then (for HIP-3 colon-namespaced
@@ -440,7 +440,7 @@ def get_hl_price(coin: str = "BTC") -> float:
     return float(mids.get(coin, "0"))
 
 
-def get_all_hl_mids(include_hip3: bool = False) -> Dict[str, float]:
+def get_all_hl_mids(include_hip3: bool = False) -> dict[str, float]:
     """Return {coin: mid_price} for every perp — one HTTP call for the whole universe.
 
     When `include_hip3=True`, also queries each registered HIP-3 perpDex
@@ -460,7 +460,7 @@ def get_all_hl_mids(include_hip3: bool = False) -> Dict[str, float]:
         logger.warning(
             "[get_all_hl_mids] FEED-FRESHNESS: main all_mids() returned EMPTY "
             "(degraded read) — DSL trackers will get no price this pass")
-    out: Dict[str, float] = {}
+    out: dict[str, float] = {}
     for k, v in raw.items():
         try:
             out[k] = float(v)
@@ -523,7 +523,7 @@ def _is_isolated_only(coin: str) -> bool:
     return False
 
 
-def set_leverage(coin: str, leverage: int) -> Dict[str, Any]:
+def set_leverage(coin: str, leverage: int) -> dict[str, Any]:
     """Set leverage for a coin, choosing cross vs isolated based on the market.
 
     For markets flagged `onlyIsolated: true` (most HIP-3 + ~3% of native HL),
@@ -610,7 +610,7 @@ def _oid_is_valid(oid: str) -> bool:
     return s.lstrip("+-").isdigit() and int(s) > 0
 
 
-def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, Any]:
+def _parse_order_result(result: Any, accept_resting: bool = False) -> dict[str, Any]:
     """Normalize a raw SDK order response into {ok, order_id?, avg_px?, total_sz?, error?}.
 
     For `filled` statuses we extract avgPx and totalSz too — downstream uses
@@ -673,7 +673,7 @@ def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, 
                 f"oid={oid!r}, full_status={st} — refusing to claim success"
             )
             return {"ok": False, "error": f"order_id_missing: filled.oid={oid!r}"}
-        out: Dict[str, Any] = {"ok": True, "order_id": oid}
+        out: dict[str, Any] = {"ok": True, "order_id": oid}
         try:
             if "avgPx" in f:
                 out["avg_px"] = float(f["avgPx"])
@@ -746,7 +746,7 @@ def entry_size_for_notional(coin: str, notional_usd: float, mid_price: float) ->
     return float(f"{size:.{sz_dec}f}")
 
 
-def get_orderbook_spread(coin: str) -> Dict[str, Any]:
+def get_orderbook_spread(coin: str) -> dict[str, Any]:
     """Fetch L2 order book and return bid/ask spread + depth info.
 
     Returns dict with:
@@ -824,7 +824,7 @@ def place_hl_order(
     coin: str = "BTC",
     reduce_only: bool = False,
     cloid: Optional[Cloid] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Place an IOC (immediate-or-cancel) limit order on Hyperliquid.
 
     reduce_only=True for CLOSES: the size floor below bumps small orders to HL's
@@ -938,7 +938,7 @@ def place_hl_trigger_order(
     trigger_px: float,
     kind: str,  # 'sl' or 'tp'
     coin: str = "BTC",
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Place a reduce-only trigger order (stop-loss or take-profit).
 
     Triggers a market order in the position-closing direction once the
@@ -1036,7 +1036,7 @@ def modify_sl_trigger(
     new_trigger_px: float,
     coin: str,
     oid: int,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Modify an existing reduce-only SL trigger order's trigger price via batchModify.
 
     Hyperliquid implements `modify_order` as an atomic cancel+replace: the old
@@ -1138,7 +1138,7 @@ def verify_order_exists(
     oid: Optional[str] = None,
     cloid: Optional[str] = None,
     user: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """P0-6: post-place reconciliation. After place_hl_order returns ok=True,
     cross-check that the exchange actually has the order (oid in openOrders
     for resting / filled in userFills for an immediate match). If neither
@@ -1215,7 +1215,7 @@ def verify_order_exists(
         }
 
 
-def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int] = None) -> Dict[str, Any]:
+def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int] = None) -> dict[str, Any]:
     """Cancel an order by order ID."""
     if not PRIVATE_KEY_HEX:
         return {"ok": False, "error": "PRIVATE_KEY not set"}
@@ -1253,7 +1253,7 @@ def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int]
 # short TTL safely eliminates redundant candle fetches within one execute()
 # call and across nearby calls. 0.0 results are also cached so a coin with
 # insufficient history doesn't trigger repeated network fetches.
-_ATR_CACHE: Dict[str, Tuple[float, float]] = {}
+_ATR_CACHE: dict[str, tuple[float, float]] = {}
 _ATR_CACHE_LOCK = threading.Lock()
 _ATR_TTL_S = float(os.environ.get("HERMES_ATR_TTL_S", "60"))
 
