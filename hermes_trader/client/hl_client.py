@@ -596,7 +596,48 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
         # for stable output. Internal callers wrap with set() or use `in`,
         # both of which work on a list.
         "queried_dexes": sorted(queried_dexes),
+        # P0-4: per-coin liquidation price snapshot used by the executor's
+        # pre-place gate. Each entry: {"liquidationPx": float, "szi": float,
+        # "side": "long"|"short"}. `szi` is the signed size in coin units
+        # (positive = long, negative = short). `liquidationPx` may be None
+        # or "0" for very small / fully-margined positions; we filter those
+        # out so the executor only sees positions that actually have a real
+        # liquidation price. Format chosen to match HL clearinghouseState's
+        # assetPositions[].position.liquidationPx field.
+        "liquidation_px_by_coin": {
+            p.get("position", {}).get("coin"): {
+                "liquidationPx": _parse_liquidation_px(
+                    p.get("position", {}).get("liquidationPx")
+                ),
+                "szi": float(p.get("position", {}).get("szi", "0") or 0),
+            }
+            for p in asset_positions
+            if _parse_liquidation_px(p.get("position", {}).get("liquidationPx")) is not None
+        },
     }
+
+
+def _parse_liquidation_px(raw) -> Optional[float]:
+    """P0-4: defensively parse HL's liquidationPx field.
+
+    HL returns it as a string ("0" for fully-margined/very small positions,
+    or the actual price for cross-margin positions). Returns None when the
+    value is missing, "0", empty, or unparseable — the executor must never
+    build a gate on a missing or zero liquidation price (that would either
+    be a no-op or a false-positive blow-up).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s == "0" or s.lower() in ("none", "null", "nan", ""):
+        return None
+    try:
+        v = float(s)
+    except (ValueError, TypeError):
+        return None
+    if v <= 0 or v != v:  # NaN check (v != v is the canonical NaN test)
+        return None
+    return v
 
 
 def fetch_aggregate_contributions_since(user: str, start_ms: int) -> float:

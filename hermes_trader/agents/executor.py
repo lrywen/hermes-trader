@@ -88,6 +88,98 @@ _EXEC_LOCK = threading.Lock()
 _IN_FLIGHT_ANALYSES: set = set()
 
 
+# ── P0-4: liquidation-price pre-place gate ────────────────────────────
+# A position whose existing liquidation price is already less than
+# HERMES_LIQ_BUFFER_USD (=10 by default) of notional cushion from the
+# current mid is one bad tick away from being auto-liquidated by the
+# exchange — adding any new exposure to the same coin (open / add / flip)
+# can only push the existing liq price CLOSER to the mark (additional
+# size raises the notional that has to lose before liquidating, but the
+# buffer in USD collapses because the same collateral backs a larger
+# position). Refuse to add exposure; operator must first manually close
+# or hedge the at-risk position. Reads account state via the cheap
+# clearinghouseState POST (no signing, no exchange fees).
+#
+# Bypass: set HERMES_LIQ_BUFFER_USD=0 to disable. Use only for testing —
+# live should always be ≥10.
+_LIQ_BUFFER_USD = float(os.environ.get("HERMES_LIQ_BUFFER_USD", "10") or "10")
+
+
+def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> Dict[str, Any]:
+    """P0-4 pre-place gate: refuse to place any order on `coin` if an
+    existing position in the same coin is already within
+    ``HERMES_LIQ_BUFFER_USD`` of notional cushion from its liquidation
+    price. Conservative — applies to opens, adds, and flips alike; the
+    rationale is that a position that close to liquidation is itself a
+    defect that should be reduced first, not enlarged.
+
+    Returns ``{"ok": True}`` when safe (or when the gate is disabled
+    via ``HERMES_LIQ_BUFFER_USD=0``), or ``{"ok": False, "error": "...",
+    "reason": "...", "liquidation_px": ..., "buffer_usd": ...}`` when
+    rejected. NEVER raises — a clearinghouse POST outage must not block
+    the main placement path; the gate is best-effort, fail-open with
+    a logged warning.
+    """
+    if _LIQ_BUFFER_USD <= 0:
+        return {"ok": True, "reason": "gate_disabled"}
+    if mid_price <= 0:
+        return {"ok": True, "reason": "no_mid_price"}
+    try:
+        st = fetch_account_state(user, include_hip3=False) or {}
+    except Exception as e:
+        logger.warning(
+            f"[executor] P0-4 liq-buffer gate: fetch_account_state failed "
+            f"({e!r}); fail-open — proceeding to place"
+        )
+        return {"ok": True, "reason": f"fetch_failed: {e!r}"}
+    by_coin = (st or {}).get("liquidation_px_by_coin") or {}
+    # Match on the same coin OR a HIP-3 prefixed variant (xyz:BTC → BTC).
+    pos = by_coin.get(coin)
+    if pos is None:
+        for k, v in by_coin.items():
+            if k == coin or k.endswith(":" + coin):
+                pos = v
+                break
+    if not pos:
+        return {"ok": True, "reason": "no_existing_position"}
+    liq_px = pos.get("liquidationPx")
+    szi = float(pos.get("szi", 0) or 0)
+    if liq_px is None or liq_px <= 0 or szi == 0:
+        return {"ok": True, "reason": "no_liquidation_px"}
+    # Buffer = |mark - liq_px| * |szi|  (USD value of the price cushion
+    # backed by the existing position). For a SHORT (szi < 0) the
+    # liquidation is on the upside; for a LONG (szi > 0) on the
+    # downside. |mid - liq_px| is the price gap either way.
+    buffer_usd = abs(float(mid_price) - float(liq_px)) * abs(szi)
+    if buffer_usd < _LIQ_BUFFER_USD:
+        msg = (
+            f"P0-4 liq-buffer gate: refused order on {coin}; existing "
+            f"position (szi={szi:+.6f}, liq_px={liq_px}) is only "
+            f"${buffer_usd:.2f} from liquidation at mid={mid_price}; "
+            f"threshold=${_LIQ_BUFFER_USD:.2f}"
+        )
+        logger.error(f"[executor] {msg}")
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"🚫 拒单 {coin}：现有持仓距强平仅 ${buffer_usd:.2f}，"
+                f"阈值 ${_LIQ_BUFFER_USD:.2f}；需先手动减仓",
+                category="risk",
+            )
+        except Exception:
+            pass
+        return {
+            "ok": False,
+            "error": f"too_close_to_liquidation: {coin} buffer_usd={buffer_usd:.2f} < {_LIQ_BUFFER_USD:.2f}",
+            "reason": msg,
+            "liquidation_px": liq_px,
+            "existing_szi": szi,
+            "buffer_usd": buffer_usd,
+            "threshold_usd": _LIQ_BUFFER_USD,
+        }
+    return {"ok": True, "buffer_usd": buffer_usd, "liquidation_px": liq_px, "existing_szi": szi}
+
+
 # ── Prometheus metric emission (best-effort, never raises) ────────────
 # Mirrors dsl_exit._record_exit: lazy import, fully guarded so a broken
 # metrics module can never break the trade hot path. Labels are bounded
@@ -1844,6 +1936,28 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
                 "gate_results": gate_output["results"],
             }
         _IN_FLIGHT_ANALYSES.add(_aid)
+
+    # P0-4: pre-place liquidation-buffer gate. Refuse to add exposure
+    # to a coin whose existing position is already within
+    # HERMES_LIQ_BUFFER_USD of notional cushion from its liquidation
+    # price. Runs BEFORE place_hl_order so the exchange never sees a
+    # dangerous order. Gate is best-effort / fail-open on /info outage.
+    try:
+        _user_addr = resolve_user_address()
+    except Exception:
+        _user_addr = None
+    _liq_gate = _check_liquidation_buffer(coin, mid_price, _user_addr or "")
+    if not _liq_gate.get("ok"):
+        # Same early-return shape as the order_failed branch — no
+        # exchange order, no orphan, in-flight marker cleared.
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(_aid)
+        return {
+            "executed": False, "mode": mode, "analysis_id": analysis["id"],
+            "reason": f"liq_buffer_blocked: {_liq_gate.get('error', 'unknown')}",
+            "liq_gate": _liq_gate,
+            "gate_results": gate_output["results"],
+        }
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
