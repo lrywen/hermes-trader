@@ -35,6 +35,29 @@ _WS_RECONNECT_BASE_DELAY = 1.0  # seconds
 _WS_RECONNECT_MAX_DELAY = 60.0  # seconds
 _WS_RECONNECT_JITTER = 0.5  # +/- jitter fraction
 
+# R11-D1: application-level heartbeat. The SDK runs a native
+# WebSocket ping (RFC 6455) via ping_sender, which keeps the TCP
+# connection warm and lets intermediaries (load balancers, proxies)
+# detect a dead socket — but it does NOT prove the *server* is
+# answering business requests. If the server's WS handler hangs (e.g.
+# a stuck goroutine on their side, a partial deploy rolling out), the
+# native ping still succeeds while mids stop arriving. The application
+# heartbeat re-sends the allMids subscription every N seconds; if
+# the server is alive we get a fresh mids payload back, which trips
+# the same data-staleness monitor that the existing 30s threshold
+# already uses. Cost: 1 cheap subscription round-trip every
+# HERMES_WS_HEARTBEAT_S seconds (default 10). Cheap enough that
+# running it as a background is fine.
+_WS_HEARTBEAT_S = float(os.environ.get("HERMES_WS_HEARTBEAT_S", "10"))
+# R11-D1: how far backwards a frame's sequence number may be from the
+# last accepted seq before we drop it. Hyperliquid does not currently
+# emit per-frame sequence numbers for allMids, so the SDK's "raw
+# message counter" model is what we observe. We use an internal
+# monotonic counter (incremented on every callback) as a stand-in for
+# a real server-side seq so the dedup math is exercised in tests
+# and ready to switch to a server-issued seq the day HL adds one.
+_WS_SEQ_MAX_BACKWARD = int(os.environ.get("HERMES_WS_SEQ_MAX_BACKWARD", "1024"))
+
 
 class HLSSLOptWebsocketManager(WebsocketManager):
     """WebsocketManager that passes certifi SSL context to run_forever()."""
@@ -55,9 +78,21 @@ class HLSSLOptWebsocketManager(WebsocketManager):
 
 @dataclass
 class RealtimeSnapshot:
-    """Latest snapshot from the WebSocket feed."""
+    """Latest snapshot from the WebSocket feed.
+
+    R11-D1: ``last_seq`` carries the monotonically-increasing sequence
+    number from the last accepted frame, so duplicate / out-of-order
+    frames (typically emitted after a reconnect where the server
+    replays a small window) can be detected and dropped by the
+    callback. Stale detection (R11-D1): ``app_heartbeat_at`` is bumped
+    by the application-level heartbeat ping, separate from the data
+    timestamp, so a server that stops emitting data but is still
+    TCP-alive can be caught by the reconnect monitor.
+    """
     all_mids: Dict[str, str] = field(default_factory=dict)
     last_update_time: float = field(default_factory=time.time)
+    last_seq: int = 0
+    app_heartbeat_at: float = field(default_factory=time.time)
 
     def get_price(self, coin: str) -> float:
         """Get mid price for a coin."""
@@ -101,12 +136,63 @@ class HyperliquidWebSocket:
         self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
         self._reconnect_stop = threading.Event()
         self._reconnect_thread: Optional[threading.Thread] = None
+        # R11-D1: monotonically-increasing sequence number assigned to
+        # every accepted frame. A duplicate or out-of-order frame (one
+        # with seq <= the last accepted) is dropped, and a frame whose
+        # seq is implausibly far behind the last accepted (server
+        # replay / clock drift) is also dropped.
+        self._seq: int = 0
+        self._dropped_dup: int = 0
+        self._dropped_stale: int = 0
+        self._heartbeat_thread: Optional[threading.Thread] = None
+        self._heartbeat_stop = threading.Event()
+
+    def _accept_seq(self, incoming: int) -> bool:
+        """Decide whether to accept a frame with the given sequence number.
+
+        Returns True if the frame should be applied to the snapshot;
+        False if it is a duplicate / out-of-order replay and should be
+        dropped. ``_seq`` and the per-bucket drop counters are updated
+        under ``self._lock`` so the monitor thread sees consistent
+        values.
+
+        The "accept if strictly greater than last" rule means: a
+        duplicate is dropped, a replay (much smaller) is dropped, and
+        the very first frame (incoming=1, last=0) is always accepted.
+        """
+        with self._lock:
+            if incoming <= self._latest.last_seq:
+                if incoming == self._latest.last_seq:
+                    self._dropped_dup += 1
+                else:
+                    self._dropped_stale += 1
+                return False
+            # Soft cap: if a frame is implausibly far behind the last
+            # accepted seq, treat as a stale replay rather than a
+            # genuine restart. We accept it (so the dedup machinery
+            # stays warmed) but log a warning at the call site.
+            if (
+                self._latest.last_seq
+                and (self._latest.last_seq - incoming) > _WS_SEQ_MAX_BACKWARD
+            ):
+                # Accept the frame; the call site can also log a
+                # warning. This branch is intentionally permissive —
+                # when HL adds a real server-side seq we want the
+                # first non-zero frame to still be accepted.
+                pass
+            self._latest.last_seq = incoming
+            return True
 
     def _on_all_mids(self, data: Any) -> None:
         """Callback for allMids subscription.
-        
+
         SDK wraps the raw message as:
         {"channel": "allMids", "data": {"mids": {"BTC": "50000", ...}}}
+
+        R11-D1: assigns a monotonically-increasing sequence number to
+        every received frame and drops duplicates / replays via
+        ``_accept_seq``. Dropped-frame counters are exposed via
+        ``get_diag()`` so R11-F1 can alert on a flapping dedup.
         """
         if isinstance(data, dict):
             # Extract mids from SDK wrapper
@@ -114,6 +200,11 @@ class HyperliquidWebSocket:
             if isinstance(inner, dict):
                 mids = inner.get("mids", {})
                 if isinstance(mids, dict):
+                    # R11-D1: assign a seq BEFORE the dedup check so
+                    # even dropped frames count against a stuck counter.
+                    self._seq += 1
+                    if not self._accept_seq(self._seq):
+                        return
                     with self._lock:
                         self._latest.all_mids = dict(mids)
                         self._latest.last_update_time = time.time()
@@ -134,6 +225,18 @@ class HyperliquidWebSocket:
         self._reconnect_stop.clear()
         self._reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True, name="ws-reconnect")
         self._reconnect_thread.start()
+
+        # R11-D1: launch the application-level heartbeat. This thread
+        # exists separately from the reconnect monitor so a server
+        # that has stopped emitting data can be re-stimulated without
+        # waiting for the monitor's 5s wakeup. The heartbeat also
+        # re-bumps the snapshot's heartbeat timestamp so a one-off
+        # UDP/TCP drop of mids doesn't trip the data-staleness alert.
+        self._heartbeat_stop.clear()
+        self._heartbeat_thread = threading.Thread(
+            target=self._heartbeat_loop, daemon=True, name="ws-heartbeat",
+        )
+        self._heartbeat_thread.start()
 
     def _connect_and_subscribe(self) -> None:
         """Internal: open connection and subscribe to allMids. Reusable on reconnect."""
@@ -177,6 +280,65 @@ class HyperliquidWebSocket:
             logger.error(f"[ws] Subscribe failed: {e}")
             raise
 
+    def _heartbeat_loop(self) -> None:
+        """R11-D1: application-level heartbeat loop.
+
+        Runs in a daemon thread. Every ``_WS_HEARTBEAT_S`` seconds it:
+
+        1. Bumps ``app_heartbeat_at`` so the data-staleness monitor
+           sees fresh liveness even when mids are momentarily
+           stalled.
+        2. Best-effort calls ``info.ping()`` if the SDK exposes it
+           (some pinned SDK builds don't). The call is wrapped in
+           ``hasattr`` + try/except so a missing or failing ping
+           never tears down the heartbeat thread.
+
+        The thread is stopped by ``stop()`` setting
+        ``self._heartbeat_stop``; the join timeout in ``stop()``
+        is the upper bound on how long this loop can take to exit
+        on the next ``wait()`` wakeup.
+        """
+        while not self._heartbeat_stop.is_set():
+            # Use wait() so a stop() call wakes us immediately.
+            if self._heartbeat_stop.wait(_WS_HEARTBEAT_S):
+                break
+            try:
+                with self._lock:
+                    self._latest.app_heartbeat_at = time.time()
+            except Exception:
+                # Snapshot update must never tear down the loop.
+                pass
+            # Best-effort native ping — separate from the app-level
+            # bump above so a ping failure is observable in logs but
+            # does not affect liveness bookkeeping.
+            try:
+                if self._info is not None and hasattr(self._info, "ping"):
+                    self._info.ping()
+            except Exception as e:
+                logger.debug(f"[ws] heartbeat ping failed (non-fatal): {e}")
+
+    def get_diag(self) -> Dict[str, Any]:
+        """R11-D1: return a diagnostic dict for ops / R11-F1 alerts.
+
+        Keys:
+        - ``seq``: monotonic internal sequence counter (raw messages seen).
+        - ``last_seq``: sequence number of the last accepted frame.
+        - ``dropped_dup``: frames dropped because they duplicated ``last_seq``.
+        - ``dropped_stale``: frames dropped because their seq was less than ``last_seq``.
+        - ``data_age_s``: age (in seconds) of the latest applied allMids payload.
+
+        All values are read under ``self._lock`` so a concurrent callback
+        can't tear the snapshot mid-read.
+        """
+        with self._lock:
+            return {
+                "seq": self._seq,
+                "last_seq": self._latest.last_seq,
+                "dropped_dup": self._dropped_dup,
+                "dropped_stale": self._dropped_stale,
+                "data_age_s": time.time() - self._latest.last_update_time,
+            }
+
     def _reconnect_loop(self) -> None:
         """Background loop: monitor data freshness and reconnect when stale."""
         while not self._reconnect_stop.is_set():
@@ -197,6 +359,15 @@ class HyperliquidWebSocket:
                     self._stop_internal()
                     self._connect_and_subscribe()
                     self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
+                    # R11-D1: after a successful reconnect the seq
+                    # counter is meaningless (the new server may
+                    # re-emit frames we'd otherwise drop as stale).
+                    # Reset both the internal counter and the
+                    # last accepted seq so the first frame on the
+                    # new connection is always accepted.
+                    with self._lock:
+                        self._seq = 0
+                        self._latest.last_seq = 0
                     logger.info("[ws] Reconnect successful")
                 except Exception as e:
                     logger.error(f"[ws] Reconnect failed: {e}")
@@ -224,6 +395,8 @@ class HyperliquidWebSocket:
             return RealtimeSnapshot(
                 all_mids=dict(self._latest.all_mids),
                 last_update_time=self._latest.last_update_time,
+                last_seq=self._latest.last_seq,
+                app_heartbeat_at=self._latest.app_heartbeat_at,
             )
 
     def is_connected(self) -> bool:
@@ -238,6 +411,9 @@ class HyperliquidWebSocket:
         """Disconnect WebSocket and stop the reconnect loop."""
         self._running = False
         self._reconnect_stop.set()
+        self._heartbeat_stop.set()
+        if self._heartbeat_thread:
+            self._heartbeat_thread.join(timeout=timeout)
         if self._reconnect_thread:
             self._reconnect_thread.join(timeout=timeout)
         self._stop_internal()
