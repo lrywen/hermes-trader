@@ -276,6 +276,17 @@ NOTIFY_FALLBACK_USED = Counter(
     ["category"],
 )
 
+# R11-C1: per-endpoint serialization gate (rate_limit.py). A high wait
+# means many concurrent workers are trying to enter the same endpoint
+# and being serialized by the in-process gate; alert on this before
+# the shared token bucket starts rejecting them.
+HL_RATE_GATE_WAIT = Histogram(
+    "hermes_hl_rate_gate_wait_seconds",
+    "Time spent waiting for the per-endpoint serialization gate (R11-C1).",
+    ["endpoint"],
+    buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
+)
+
 
 def _to_float(value: object) -> float:
     try:

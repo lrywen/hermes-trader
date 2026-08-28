@@ -286,4 +286,129 @@ def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
     return TokenBucket(cap, rate)
 
 
+# ── per-endpoint serialization gate (R11-C1) ─────────────────────────
+#
+# Shared / per-process token buckets meter global budget well, but they do
+# nothing about THUNDERING-HERD within one endpoint. A typical scan loop
+# fans out N concurrent ``candleSnapshot`` workers; each acquires weight
+# from the shared bucket (so the total is bounded) but they all stampede
+# the same endpoint at the same wall-clock instant. HL's per-endpoint
+# throttling then 429s them as a herd rather than as a fair share of the
+# IP budget.
+#
+# Solution: one in-process ``threading.Lock`` per endpoint name. A caller
+# must hold that endpoint's lock while it acquires the rate budget + does
+# the HTTP request + releases the budget. Different endpoints (e.g.
+# ``candleSnapshot`` vs ``allMids``) lock independently so they can still
+# run in parallel — only SAME-endpoint calls are serialized.
+#
+# Net effect: the burst pattern into any one endpoint becomes
+# FIFO-at-token-bucket-pace, which is exactly what HL's per-endpoint
+# limiter expects. Cross-endpoint parallelism (the common case: scan +
+# mids + portfolio in flight simultaneously) is preserved.
+#
+# The gate is opt-in via ``HERMES_HL_RATE_PER_ENDPOINT_GATE=1`` (default
+# ON) so a single-process host with no concurrency doesn't pay the lock
+# cost. ``HERMES_HL_RATE_PER_ENDPOINT_GATE=0`` disables it (e.g. for
+# the dashboard which already serializes per UI request).
+
+import contextlib  # noqa: E402
+
+
+@contextlib.contextmanager
+def per_endpoint_gate(endpoint: str):
+    """Acquire (and release) the in-process serialization lock for one
+    endpoint name. No-op when the gate is disabled via env or for the
+    sentinel ``"unknown"`` endpoint (avoids one big lock for every
+    un-typed probe).
+    """
+    if os.environ.get(
+        "HERMES_HL_RATE_PER_ENDPOINT_GATE", "1"
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        yield
+        return
+    if not endpoint or endpoint == "unknown":
+        yield
+        return
+    gate = _PER_ENDPOINT_GATES.get(endpoint)
+    if gate is None:
+        # Double-checked lock pattern: the dict assignment is atomic
+        # under CPython's GIL, but a rare race could let two threads
+        # build two Lock objects for the same endpoint. The first one
+        # stored wins; the second one is dropped — both are still
+        # valid Locks so correctness is preserved, just a tiny memory
+        # leak that's bounded by the number of distinct endpoint names
+        # observed.
+        gate = threading.Lock()
+        existing = _PER_ENDPOINT_GATES.setdefault(endpoint, gate)
+        if existing is not gate:
+            gate = existing
+    with gate:
+        yield
+
+
+_PER_ENDPOINT_GATES: dict = {}
+
+
+# Probe metrics so we can graph "this endpoint is contended" without
+# making a new metric per endpoint (label cardinality is bounded by the
+# known endpoint set, ~16 names).
+try:
+    from hermes_trader import metrics  # type: ignore
+
+    _GATE_WAIT_S = metrics.HL_RATE_GATE_WAIT  # Histogram {endpoint}
+except Exception:  # noqa: BLE001 — never break module import
+    metrics = None  # type: ignore
+    _GATE_WAIT_S = None
+
+
+@contextlib.contextmanager
+def timed_per_endpoint_gate(endpoint: str):
+    """Like per_endpoint_gate but records a wait-time histogram so we
+    can alert on an endpoint whose gate is consistently held long (R11-F1).
+    Falls back to per_endpoint_gate if the metric isn't available."""
+    import time as _t
+    if not endpoint or endpoint == "unknown":
+        with per_endpoint_gate(endpoint):
+            yield
+        return
+    if _GATE_WAIT_S is None:
+        with per_endpoint_gate(endpoint):
+            yield
+        return
+    if os.environ.get(
+        "HERMES_HL_RATE_PER_ENDPOINT_GATE", "1"
+    ).strip().lower() not in ("1", "true", "yes", "on"):
+        yield
+        return
+    # Lazily create the lock so the timed variant can record the wait
+    # on the FIRST entry to a new endpoint.
+    gate = _PER_ENDPOINT_GATES.get(endpoint)
+    if gate is None:
+        gate = threading.Lock()
+        existing = _PER_ENDPOINT_GATES.setdefault(endpoint, gate)
+        if existing is not gate:
+            gate = existing
+    t0 = _t.monotonic()
+    with gate:
+        wait = _t.monotonic() - t0
+        try:
+            _GATE_WAIT_S.labels(endpoint=endpoint).observe(wait)
+        except Exception:
+            pass
+        yield
+
+
+def _reset_per_endpoint_gates() -> None:
+    """Test helper: drop the per-endpoint gate table so a fresh
+    ``monkeypatch.setenv`` takes effect without a stale lock."""
+    _PER_ENDPOINT_GATES.clear()
+
+
+def gate_endpoint_names() -> list:
+    """Inspect the set of endpoints that have been observed since the
+    last reset. Used by tests to confirm a new endpoint creates a gate."""
+    return sorted(_PER_ENDPOINT_GATES.keys())
+
+
 HL_LIMITER = _build_limiter()

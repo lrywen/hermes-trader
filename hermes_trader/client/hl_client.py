@@ -27,7 +27,11 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import requests
 
-from hermes_trader.client.rate_limit import HL_LIMITER as _HL_LIMITER, endpoint_weight as _endpoint_weight
+from hermes_trader.client.rate_limit import (
+    HL_LIMITER as _HL_LIMITER,
+    endpoint_weight as _endpoint_weight,
+    timed_per_endpoint_gate as _per_endpoint_gate,
+)
 from hermes_trader.models.types import Candle
 
 if TYPE_CHECKING:
@@ -198,19 +202,51 @@ def _http_post(
     if max_wait is None:
         max_wait = float(os.environ.get("HERMES_HL_RATE_MAX_WAIT_S", "30"))
 
+    # R11-C1: serialize concurrent calls into the SAME endpoint so a
+    # burst of workers doesn't all stampede the endpoint's per-route
+    # limit and 429 as a herd. The gate is held across the full
+    # acquire + HTTP + release cycle. Different endpoints lock
+    # independently so cross-endpoint parallelism is preserved.
     _t0 = time.monotonic()
+    with _per_endpoint_gate(req_type):
+        _gate_wait_s = time.monotonic() - _t0
+        return _hl_request_inner(
+            payload=payload,
+            path=path,
+            weight=weight,
+            req_type=req_type,
+            opportunistic=opportunistic,
+            max_wait=max_wait,
+            timeout=timeout,
+            _gate_wait_s=_gate_wait_s,
+        )
+
+
+def _hl_request_inner(
+    *,
+    payload,
+    path: str,
+    weight: int,
+    req_type: str,
+    opportunistic: bool,
+    max_wait: float,
+    timeout: float,
+    _gate_wait_s: float,
+):
+    _rate_t0 = time.monotonic()
     if not _HL_LIMITER.acquire(weight, max_wait=max_wait):
-        _wait_s = time.monotonic() - _t0
+        _wait_s = time.monotonic() - _rate_t0
         msg = (
             f"[hl] rate budget exhausted for {req_type} "
-            f"(weight={weight}, waited {_wait_s:.2f}s/{max_wait:g}s) — skipping request"
+            f"(weight={weight}, gate={_gate_wait_s*1000:.1f}ms, "
+            f"waited {_wait_s:.2f}s/{max_wait:g}s) — skipping request"
         )
         if opportunistic:
             logger.debug(f"{msg} [opportunistic]")
         else:
             logger.warning(msg)
         return None
-    _rate_wait_s = time.monotonic() - _t0
+    _rate_wait_s = time.monotonic() - _rate_t0
 
     _http_t0 = time.monotonic()
     # Bounded 429-aware retry. We already hold rate-limit tokens for this
