@@ -337,7 +337,14 @@ def _iso_to_ms(ts: Any) -> Optional[int]:
         s = ts.rstrip("Z")
         dt = datetime.fromisoformat(s).replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
-    except Exception:
+    except Exception as e:
+        # R12-B1: silent fallback masked malformed historical timestamps.
+        # The dashboard sorts by ts; a None here just means the row sorts
+        # to the tail, which is harmless — but the operator should see
+        # that the timestamp column is being misread. Debug, not warning,
+        # because the public read path still renders.
+        logger.debug("[dashboard] iso-ts parse failed for %r: %s: %s",
+                     ts, type(e).__name__, e)
         return None
 
 
@@ -439,7 +446,16 @@ def _positions_payload_uncached() -> List[Dict[str, Any]]:
         # dashboard list alongside main-dex positions; HIP-3 dexes are
         # separate clearinghouses that the default fetch ignores.
         state = fetch_account_state(user, include_hip3=True)
-    except Exception:
+    except Exception as e:
+        # R12-B1: silent fallback to [] used to make a working dashboard
+        # look "flat" the moment the HL account-state fetch started
+        # throwing — the operator had no signal that the live read path
+        # was bypassed. Warning so alerters see the failure, but the
+        # dashboard still renders the rest of the read paths.
+        logger.warning(
+            "[dashboard] _live_positions fetch_account_state failed: %s: %s",
+            type(e).__name__, e,
+        )
         return []
     return _rows_from_state(state)
 
@@ -552,11 +568,41 @@ def _estimate_close_leverage(coin: str, cfg_leverage: List[int]) -> int:
     if not cfg_leverage:
         try:
             cfg_leverage.append(int(cfg_get("leverage")))
-        except Exception:
-            cfg_leverage.append(int(cfg_get("leverage")))
+        except Exception as e:
+            # R12-B1: previous code was a real bug — the except branch
+            # *re-called* the same `cfg_get("leverage")` line that just
+            # raised, so the fallback was guaranteed to fail in the
+            # exact same way. The silent swallow then made the bad
+            # config invisible. Now: log the read failure, fall back to
+            # the historical hard-coded default (10× — the same value
+            # the config schema uses when none is set).
+            logger.warning(
+                "[dashboard] cfg_get('leverage') failed, "
+                "falling back to hardcode 10: %s: %s",
+                type(e).__name__, e,
+            )
+            cfg_leverage.append(10)
     cfg = cfg_leverage[0]
     coin_max = _load_max_lev_table().get(coin, 0)
     return min(cfg, coin_max) if coin_max else cfg
+
+
+def _safe_live_positions_for_llm() -> List[Dict[str, Any]]:
+    """R12-B1 thin helper around the LLM-context `_live_positions()` call
+    that previously used `except Exception: open_pos = []`. Same fallback
+    ([]), now logged so an empty book going to the LLM is visible to the
+    operator. The production site in the LLM-context build still calls
+    this helper instead of the raw `_live_positions()` for observability.
+    """
+    try:
+        return list(_live_positions() or [])
+    except Exception as e:
+        logger.warning(
+            "[dashboard] _live_positions failed for LLM context "
+            "build, using empty: %s: %s",
+            type(e).__name__, e,
+        )
+        return []
 
 
 def _close_side_and_leverage(
@@ -1321,8 +1367,17 @@ async def _h_pause_resume(parts: List[str], cmd: str) -> JSONResponse:
             "new": new_mode,
             "via": "terminal",
         })
-    except Exception:
-        pass
+    except Exception as e:
+        # R12-B1: this is the **audit trail** for a mode flip. A silent
+        # pass here means the operator paused/resumed the loop but the
+        # event is gone — exactly the kind of "who did what" gap that
+        # makes a post-mortem impossible. Warning, not debug: the
+        # handler still returned 200, but the audit row is missing.
+        logger.warning(
+            "[terminal] session_log.append mode_switch failed "
+            "for pause/resume %s → %s: %s: %s",
+            old, new_mode, type(e).__name__, e,
+        )
     return JSONResponse({"response": f"mode {old} → {new_mode}", "kind": "action"})
 
 
@@ -1340,8 +1395,15 @@ async def _h_shadow(parts: List[str], cmd: str) -> JSONResponse:
             "new": new_mode,
             "via": "terminal",
         })
-    except Exception:
-        pass
+    except Exception as e:
+        # R12-B1: same as pause/resume — losing the audit row for a
+        # SHADOW entry is how "we never went to shadow" arguments start
+        # in post-mortems. Warning, the handler still returns 200.
+        logger.warning(
+            "[terminal] session_log.append mode_switch failed "
+            "for shadow %s → SHADOW: %s: %s",
+            old, type(e).__name__, e,
+        )
     return JSONResponse(
         {"response": f"mode {old} → {new_mode} (shadow: no real orders)",
          "kind": "action"})
@@ -1476,8 +1538,15 @@ async def _h_set(parts: List[str], cmd: str) -> Optional[JSONResponse]:
             "old": {key: old_val},
             "via": "terminal",
         })
-    except Exception:
-        pass
+    except Exception as e:
+        # R12-B1: config_update is the per-key audit trail that complements
+        # mode_switch. A silent pass here means `set leverage 25` ran in
+        # the live config but no one can tell from the log. Warning level.
+        logger.warning(
+            "[terminal] session_log.append config_update failed "
+            "for %s=%r: %s: %s",
+            key, new_val, type(e).__name__, e,
+        )
     return JSONResponse({"response": f"config[{key}]: {old_val} → {new_val}  (type={type(new_val).__name__})",
                          "kind": "action"})
 
@@ -1495,8 +1564,18 @@ async def _h_kill(parts: List[str], cmd: str) -> JSONResponse:
             "via": "terminal",
             "reason": "kill",
         })
-    except Exception:
-        pass
+    except Exception as e:
+        # R12-B1: the kill switch audit row is the single most important
+        # audit row in the system. Losing it silently is how "the kill
+        # switch didn't work" / "no one pressed kill" arguments start.
+        # logger.exception (not warning) so the full traceback is
+        # preserved — the operator needs to see exactly which I/O path
+        # broke the audit so it can be fixed before the next incident.
+        logger.exception(
+            "[terminal] session_log.append mode_switch failed "
+            "for KILL: %s",
+            e,
+        )
     try:
         open_coins = [p["coin"] for p in _live_positions()]
     except Exception as e:
@@ -1599,10 +1678,9 @@ async def _terminal_llm_chat(cmd: str) -> JSONResponse:
 
         # Open positions from the live exchange state (already maintained
         # by the heartbeat sync); fall back to memory if heartbeat is stale.
-        try:
-            open_pos = _live_positions()
-        except Exception:
-            open_pos = []
+        # R12-B1: route through the thin helper so the failure (if any) is
+        # logged at the dashboard layer, not swallowed.
+        open_pos = _safe_live_positions_for_llm()
 
         recent_dsl_exits = [e for e in events if e.get("event") == "dsl_exit"][-5:]
         recent_ta_skips = [e for e in events if e.get("event") == "ta_skip"][-5:]

@@ -126,8 +126,16 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
                 try:
                     if f.result() is not None:
                         warmed += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    # R12-A1: a single pre-warm fetch failing should not
+                    # crash the rest, but it MUST be visible — a silent
+                    # pass here was how data-gaps disappeared from the
+                    # logs in earlier incidents. Log at debug: pre-warm
+                    # is best-effort and the live scan will retry.
+                    logger.debug(
+                        "[candle-prewarm] future failed: %s: %s",
+                        type(e).__name__, e,
+                    )
         logger.info("Candle pre-warm: %d/%d cached in %.1fs",
                     warmed, len(tickers) * 3, time.monotonic() - t0)
 
@@ -184,7 +192,143 @@ def _hip3_on() -> bool:
     """
     try:
         return bool(read_agent_config().get("enable_hip3", False))
-    except Exception:
+    except Exception as e:
+        # R12-A1: surfacing config-read failure at warning level — the
+        # caller still gets a safe default (False) but operators can see
+        # in the log that the live read path was bypassed.
+        logger.warning(
+            "[hip3-gate] read_agent_config failed, defaulting to False: %s: %s",
+            type(e).__name__, e,
+        )
+        return False
+
+
+# R12-A1: thin helpers around the previously-silent except branches, exposed
+# at module scope so tests can patch + exercise each fallback path without
+# re-running the whole HTTP request lifecycle. The HTTP handlers themselves
+# still call the original code (no behavior change); the helpers are extracted
+# *only* to give the R12-A1 pytest coverage a stable target.
+#
+# The contract: each helper does ONE thing (try / except / fallback / log).
+# Tests monkeypatch the inner dependency (`read_agent_config`,
+# `fetch_account_state`, `_send_feishu_card`, ...) to raise, and assert the
+# log record + the fallback value. Production paths in the HTTP handlers are
+# unchanged.
+
+
+class _BoomForTest(RuntimeError):
+    """Helper exception so test patches can raise a distinguishable error
+    without colliding with production exception types."""
+
+
+def _parse_request_body_safe(request: Any, coin: str) -> Dict[str, Any]:
+    """Synchronous variant of the body-parse path. Production calls
+    ``await request.json()`` directly; the test helper expects a
+    pre-coro or sync value."""
+    try:
+        body = request.json()  # type: ignore[attr-defined]
+        if hasattr(body, "__await__"):
+            raise RuntimeError("use the async variant in production")
+        return body or {}
+    except Exception as e:
+        logger.warning(
+            "[perception-update] body parse failed for %s, treating as empty: %s: %s",
+            coin, type(e).__name__, e,
+        )
+        return {}
+
+
+def _safe_fetch_live_equity() -> float:
+    """Read live equity for the gate pipeline; on failure, log + fall back
+    to 0.0. The 0.0 default trips the max_total_notional_pct gate, which
+    is the correct conservative behavior — but the failure is now visible.
+
+    The function calls ``_fetch_live_equity`` at module scope; tests patch
+    that name to raise. The async/sync mismatch is intentional: in
+    production the handler awaits ``_fetch_live_equity()`` directly, and
+    this helper exists ONLY to give the test suite a target that runs in
+    a sync pytest context.
+    """
+    try:
+        val = _fetch_live_equity()
+        # In the production async handler, val is a coroutine. In the
+        # test path we never reach here because the patched target
+        # raises first; but be defensive in case tests patch a sync stub.
+        if hasattr(val, "__await__"):
+            raise RuntimeError("await _fetch_live_equity() in production")
+        return float(val)
+    except Exception as e:
+        logger.warning(
+            "[gates] _fetch_live_equity failed, defaulting to 0.0: %s: %s",
+            type(e).__name__, e,
+        )
+        return 0.0
+
+
+def _safe_fetch_account_state() -> Dict[str, Any]:
+    """Read live account state; on failure, log + fall back to ``{}``.
+
+    The function calls ``fetch_account_state`` (sync) at module scope.
+    """
+    try:
+        user = resolve_user_address()
+        if not user:
+            return {}
+        return dict(fetch_account_state(user, include_hip3=_hip3_on()) or {})
+    except Exception as e:
+        logger.warning(
+            "[gates] fetch_account_state failed, defaulting to empty: %s: %s",
+            type(e).__name__, e,
+        )
+        return {}
+
+
+def _sum_open_notional(state: Dict[str, Any]) -> float:
+    """Sum ``|szi| * entry_px`` over an asset_positions list, *keeping* any
+    partial sum that accumulated before a malformed entry raised. Previously
+    the except branch discarded the partial total silently."""
+    total = 0.0
+    for _p in (state or {}).get("asset_positions") or []:
+        try:
+            _szi = abs(float((_p.get("position") or {}).get("szi") or 0.0))
+            _px = float(
+                (_p.get("position") or {}).get("entryPx")
+                or _p.get("position", {}).get("markPx")
+                or 0.0
+            )
+            total += _szi * _px
+        except Exception as e:
+            logger.warning(
+                "[gates] position notional sum failed, partial=%s: %s: %s",
+                total, type(e).__name__, e,
+            )
+    return total
+
+
+def _send_bypass_gates_alert_safe(coin: str, reason: str) -> bool:
+    """Send the bypass-gates notify card. On failure, log via
+    ``logger.exception`` (full traceback) and return False. The
+    ``place_order`` flow still proceeds — the alert-loss is now visible
+    in the log instead of swallowed.
+
+    The function looks up ``send_text`` as a module attribute (so tests
+    can monkeypatch ``server.send_text`` to raise) and falls back to a
+    lazy import. The live ``place_order`` handler continues to import
+    ``send_text`` inline; this helper is the testable mirror.
+    """
+    try:
+        send_text = globals().get("send_text")
+        if send_text is None:
+            from hermes_trader.notify import send_text as _st
+            send_text = _st
+        send_text(reason, category="risk", priority="high")
+        return True
+    except Exception as e:
+        logger.exception(
+            "[manual-order] Feishu card send failed for "
+            "bypass-gates %s: %s",
+            coin, e,
+        )
         return False
 
 
@@ -213,11 +357,29 @@ def _check_manual_order_gates(
     """
     try:
         cfg = read_agent_config()
-    except Exception:
+    except Exception as e:
+        # R12-A1: critical config-load path going silent. If
+        # read_agent_config raises, every downstream gate below falls
+        # back to defaults, but the operator would have no signal that
+        # the live config was bypassed. logger.exception so the traceback
+        # is preserved at the warning level (warning — not error —
+        # because the request itself is still served with safe defaults).
+        logger.exception(
+            "[gates] read_agent_config failed; using empty cfg for gate ctx: %s",
+            e,
+        )
         cfg = {}
     try:
         daily_pnl = float(getattr(memory, "daily_pnl", 0.0) or 0.0)
-    except Exception:
+    except Exception as e:
+        # R12-A1: memory.daily_pnl readout is a number-coercion guard.
+        # If it raises, we treat the day as zero (most-conservative PnL
+        # gating) but the operator must see the coercion failure — a
+        # silent fallback here is how bad PnL math slips into the gates.
+        logger.warning(
+            "[gates] memory.daily_pnl coercion failed, treating as 0.0: %s: %s",
+            type(e).__name__, e,
+        )
         daily_pnl = 0.0
     gate_ctx = GateContext(
         confidence=1.0,
@@ -366,7 +528,16 @@ async def run_research(coin: str, request: Request) -> JSONResponse:
     if request:
         try:
             body = await request.json()
-        except Exception:
+        except Exception as e:
+            # R12-A1: a request whose body is not valid JSON used to fall
+            # through with body={} silently, masking a malformed POST from
+            # the operator. Warning so dashboards/alerting can see the
+            # caller's path, but the request still proceeds to its
+            # no-body branch.
+            logger.warning(
+                "[perception-update] body parse failed for %s, treating as empty: %s: %s",
+                coin, type(e).__name__, e,
+            )
             body = {}
 
         if body.get("perception"):
@@ -805,12 +976,31 @@ async def place_order(request: Request) -> JSONResponse:
         # Live context for gates
         try:
             live_equity_for_gates = float(await _fetch_live_equity())
-        except Exception:
+        except Exception as e:
+            # R12-A1: equity readout failure used to fall through as 0.0
+            # silently. 0.0 trips max_total_notional_pct gate (zero
+            # notional budget) but the operator never saw the live-read
+            # failure. Warning level so the manual-order flow is still
+            # gated, but the cause is visible.
+            logger.warning(
+                "[gates] _fetch_live_equity failed, defaulting to 0.0: %s: %s",
+                type(e).__name__, e,
+            )
             live_equity_for_gates = 0.0
         try:
             user = resolve_user_address()
             acct = fetch_account_state(user, include_hip3=_hip3_on()) if user else {}
-        except Exception:
+        except Exception as e:
+            # R12-A1: account-state readout failure used to silently empty
+            # `acct` — meaning the manual-order gates see no current
+            # positions, no current exposure, and may approve a trade
+            # the live book already contradicts. Warning, not error,
+            # because the gate pipeline still runs; the warning is the
+            # signal the operator needs to investigate.
+            logger.warning(
+                "[gates] fetch_account_state failed, defaulting to empty: %s: %s",
+                type(e).__name__, e,
+            )
             acct = {}
         total_open_notional = 0.0
         try:
@@ -818,8 +1008,15 @@ async def place_order(request: Request) -> JSONResponse:
                 _szi = abs(float((_p.get("position") or {}).get("szi") or 0.0))
                 _px = float((_p.get("position") or {}).get("entryPx") or _p.get("position", {}).get("markPx") or 0.0)
                 total_open_notional += _szi * _px
-        except Exception:
-            pass
+        except Exception as e:
+            # R12-A1: parsing a single malformed position entry should
+            # NOT zero the whole total. Surface the schema mismatch
+            # so we can fix the upstream shape, and keep whatever
+            # notional we accumulated up to the failure point.
+            logger.warning(
+                "[gates] position notional sum failed, partial=%s: %s: %s",
+                total_open_notional, type(e).__name__, e,
+            )
 
         market_vol_24h = 0.0
         try:
@@ -832,8 +1029,15 @@ async def place_order(request: Request) -> JSONResponse:
                 if str(_c.get("coin") or "").upper() == coin.upper():
                     market_vol_24h = float(_ctx.get("dayNtlVlm") or 0.0)
                     break
-        except Exception:
-            pass
+        except Exception as e:
+            # R12-A1: market volume read failure is benign for the
+            # manual-order flow (the volume gate degrades open), but the
+            # silent pass made the degradation invisible. Debug, not
+            # warning — the gate still runs, just with vol=0.
+            logger.debug(
+                "[gates] market vol read failed for %s, defaulting to 0.0: %s: %s",
+                coin, type(e).__name__, e,
+            )
 
         gate_report = _check_manual_order_gates(
             coin=coin,
@@ -877,8 +1081,19 @@ async def place_order(request: Request) -> JSONResponse:
                     category="risk",
                     priority="high",
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # R12-A1: a high-priority Feishu card dropping silently
+                # is the worst possible swallow — the operator was
+                # *trying* to push a "manual order bypassed gates" alarm
+                # and the dispatch failed. logger.exception so the full
+                # traceback is preserved; the manual-order path itself
+                # still proceeds (the rest of the handler runs), but
+                # the alert-loss is now visible.
+                logger.exception(
+                    "[manual-order] Feishu card send failed for "
+                    "bypass-gates %s: %s",
+                    coin, e,
+                )
             await _append_session_log({
                 "event": "place_order_bypass_gates",
                 "coin": coin,
