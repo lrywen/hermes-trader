@@ -323,4 +323,50 @@ def validate_config_updates(updates: Dict[str, Any], *, strict_keys: bool = True
                 "max_trade_notional_usd: must be >= 10 (HL minimum order "
                 "size); use 0 to disable the cap explicitly"
             )
+
+    # ── P0-3: FORBIDDEN_OVERRIDE — force-execute / bypass switches ────────
+    # Five config flags can disable a safety gate by themselves:
+    #   composite_force_execute   — bypasses the confidence floor when
+    #                                composite score is high
+    #   breakout_force_execute    — bypasses AI confirmation on breakout
+    #                                triggers (volume + price)
+    #   whale_force_execute       — bypasses AI confirmation on whale
+    #                                accumulation signals
+    #   whale_regime_bypass       — lets a whale signal clear the
+    #                                counter-regime gate
+    #   spread_gate_fail_open     — makes the spread/impact gate default
+    #                                to PASS when its data is unavailable
+    #                                (the only one of the five that turns
+    #                                a fail-CLOSED gate into fail-OPEN)
+    #
+    # Each of these is a "skip a check" lever. Enabling any of them
+    # without an explicit AI agreement is a single-keystroke path to
+    # losing money: the operator can flip a bool in the dashboard and
+    # the next trade is unprotected.
+    #
+    # The contract:
+    #   - When ANY of the five is set true, override_requires_ai must
+    #     ALSO be true in the SAME update. (splitting them across two
+    #     writes is allowed but the resulting state must have both
+    #     true; we check the merged state below by reading the current
+    #     config when available.)
+    #   - The runtime caller (executor / perception / spread gate)
+    #     must write a place_force_override_armed audit line whenever
+    #     it consults a force-execute switch in the armed state, so
+    #     post-trade review can see "this trade was force-executed
+    #     under override_requires_ai".
+    _FORCE_OVERRIDE_KEYS = (
+        "composite_force_execute", "breakout_force_execute",
+        "whale_force_execute", "whale_regime_bypass",
+        "spread_gate_fail_open",
+    )
+    for fkey in _FORCE_OVERRIDE_KEYS:
+        if updates.get(fkey) is True:
+            if not updates.get("override_requires_ai", False):
+                errors.append(
+                    f"{fkey}=true requires override_requires_ai=true in "
+                    f"the same update (FORBIDDEN_OVERRIDE — never arm a "
+                    f"force-execute switch without explicit AI agreement)"
+                )
+
     return errors
