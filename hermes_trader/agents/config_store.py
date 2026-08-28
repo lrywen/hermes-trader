@@ -119,6 +119,17 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
             "floor_pct": 1.0,
             "ceiling_pct": 4.0,
         },
+        # R12-C1: noise band tolerates a pull-back of atr_mult × entry ATR%
+        # below the floor before an exit fires (sub-first-tier only); was
+        # implicit via .get("noise_band", {}) in executor/dsl_exit.
+        "noise_band": {
+            "enabled": False,
+            "atr_mult": 1.0,
+        },
+        # R12-C1: floor-breach confirmation. Was implicit: executor built
+        # ExitPolicy with hardcoded defaults (1 / 0.0).
+        "consecutive_breaches_required": 1,
+        "breach_confirm_sec": 0.0,
         "phase2_tiers": [
             {"pct_above_entry": 8.0, "retrace_threshold": 0.35},
             {"pct_above_entry": 15.0, "retrace_threshold": 0.4},
@@ -146,6 +157,10 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
     "ta_sidestep_min_slow_burn_count": 99,
     "force_execute_slow_burn_count": 2,
     "conviction_sizing": False,
+    # R12-C1: legacy conviction sizing ladder (only consulted when
+    # conviction_sizing=true). [[min_confidence, size_multiplier], ...];
+    # was implicit via executor._DEFAULT_CONVICTION_TIERS.
+    "conviction_tiers": [[0.80, 1.5], [0.65, 1.0], [0.0, 0.7]],
     "whale_regime_bypass": False,
     "whale_force_execute": False,
     "whale_size_multiplier": 1.0,
@@ -155,6 +170,13 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
     "min_ai_close_hold_min": 25,
     "breakout_force_execute": False,
     "sl_atr_mult": 1.5,
+    # R12-C1: backup stop clamp width (%) and manual/TP bracket ATR mult.
+    # Was implicit via executor module constants (_DEFAULT_SL_CEILING_PCT=3.0,
+    # _DEFAULT_SL_FLOOR_PCT=1.2) and server.py tp default 1.0. sl_floor_pct
+    # has a per-coin override via atr_risk_sizing.coin_overrides.<coin>.
+    "sl_ceiling_pct": 3.0,
+    "sl_floor_pct": 1.2,
+    "tp_atr_mult": 1.0,
     "min_trend_score": 0.55,
     # Regime classifier thresholds (chop / against-funding conviction bars)
     "chop_min_conf": 0.75,
@@ -182,6 +204,17 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "min_short_composite": 25.0,
         "mover_min_confidence": 0.72,
         "mover_min_composite": 20.0,
+        # R12-C1: pullback-long bypass admits uptrend longs that have pulled
+        # back to a lower-risk zone. Off by default; was implicit via
+        # gate.get("pullback_long") hardcoded defaults in executor.
+        "pullback_long": {
+            "enabled": False,
+            "min_composite": 20.0,
+            "max_rsi": 70.0,
+            "max_extension_atr": 2.0,
+            "min_slow_burn": 1,
+            "shadow_mode": False,
+        },
     },
     "plan_b": {
         "enabled": True,
@@ -193,6 +226,10 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "risk_per_trade_pct": 0.02,
         "sizing_basis": "primary_stop",
+        # R12-C1: per-coin overrides for the ATR sizing / SL floor params
+        # (e.g. {"HYPE": {"sl_floor_pct": 1.5}}). Empty by default; was
+        # implicit via .get("coin_overrides", {}) in executor.
+        "coin_overrides": {},
     },
     "regime_classifier": {
         "fast_ema": 20,
@@ -204,6 +241,10 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
         "enabled": True,
         "min_agreement": 0.6,
         "min_agree_count": 3,
+        # R12-C1: when true, a bull/bear split defaults to a third-analyst
+        # tiebreak instead of fail-closed disagreement. Was implicit via
+        # debate_cfg.get("analyst3_default", False) in risk_gates.
+        "analyst3_default": False,
     },
     # Native in-process multi-perspective research debate. Off by default —
     # when enabled, research() runs bull/bear LLM calls in parallel plus an
@@ -324,6 +365,24 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
     # Per-coin parameter overrides; deep-merged on top of the base config by
     # with_coin_overrides() / executor. Empty by default.
     "coin_overrides": {},
+    # R12-C1: layered trading circuit breakers (executor post-close path).
+    # A single coin's realized spot loss >= single_coin_loss_pct halts new
+    # entries in that coin for single_coin_halt_min; cumulative daily PnL
+    # loss >= daily_loss_pct of start-of-day equity halts ALL entries for
+    # daily_halt_min. Thresholds were implicit cfg_get(..., default=) values
+    # in executor.py and invisible to operators / config audit. Set a halt
+    # duration to 0 to disable that layer.
+    "circuit_breaker": {
+        "single_coin_loss_pct": 3.0,
+        "single_coin_halt_min": 60.0,
+        "daily_loss_pct": 5.0,
+        "daily_halt_min": 120.0,
+    },
+    # R12-C1: optional lower confidence floor for regime-aligned entries
+    # (LONG in up-trend / SHORT in down-trend). None = feature off (the
+    # global min_ai_confidence applies uniformly). Was implicit via
+    # config.get("aligned_min_conf") in risk_gates.
+    "aligned_min_conf": None,
     # 配置文件注释字段（不参与交易逻辑）
     "_comment": "",
 }
@@ -738,7 +797,20 @@ def read_agent_config() -> Dict[str, Any]:
     # lenient" semantics: a key the operator added (e.g. for a dashboard
     # plugin) is not an error.
     _log_validation_warnings(raw, source="read_agent_config", strict_keys=False)
-    return _deep_merge(CANONICAL_DEFAULTS, raw)
+    merged = _deep_merge(CANONICAL_DEFAULTS, raw)
+    # R12-C1: a null in the on-disk file is a deep-merge *deletion marker*.
+    # For canonical keys whose default is itself None (feature-off sentinel,
+    # e.g. aligned_min_conf), a full merged view persisted by
+    # update_agent_config (then re-read) would silently drop the key from the
+    # merged/dumped view — the runtime behavior is unchanged (dict.get still
+    # yields None) but audit visibility is lost. Re-materialize such keys so
+    # they stay visible in dashboard dumps and `set`-able. Non-None keys are
+    # deliberately NOT backfilled here (their absence never follows from a
+    # canonical null).
+    for key, default in CANONICAL_DEFAULTS.items():
+        if default is None and key not in merged:
+            merged[key] = None
+    return merged
 
 
 def _read_raw_config() -> Optional[Dict[str, Any]]:

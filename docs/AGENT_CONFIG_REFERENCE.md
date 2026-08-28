@@ -158,7 +158,7 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 
 ---
 
-## 四、Risk 风控层（16 道闸门）
+## 四、Risk 风控层（15 道闸门）
 
 来源：`hermes_trader/agents/risk_gates.py`。`eval_all_gates` 顺序评估，任一不过即整单拦截（不做短路，全部收集用于遥测）。
 
@@ -179,7 +179,8 @@ executor 再被拒（`reason: pass_no_override`），白跑一趟研究。
 | 13 | `market_regime` | `counter_regime_min_conf` / `block_counter_trend_bypass` / `crowded_with_min_conf` | **0.8** / **true** / **0.8** | 市场制度闸（逆势需高置信/评分） |
 | 14 | `news` | AI `news_risk` | negative 停手 | 二元新闻熔断 |
 | 15 | `debate` | `debate_gate` | enabled, min_agreement 0.6 | 多智能体共识闸（5 路投票，需 ≥3 票且比例 ≥0.6） |
-| 16 | `hta_risk` | `hta_risk_gate` | enabled, fail_closed_shorts true | HTA 三方风险评审闸（熔断时空单 fail-closed，多单 fail-open） |
+
+> 注：第 16 号 `hta_risk`（外部 HTA :8766 三方风险评审流，`hta_risk_gate`）已退役——由原生多视角 debate（research.py）取代，`eval_all_gates` 不再注册该闸，`hta_risk_gate` 配置键无任何代码读取，保留也不会生效。
 
 ### 4.1 runner_entry_gate 入口闸（额外，`enabled: true`）
 

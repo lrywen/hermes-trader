@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from typing import Any, Dict, List, get_origin
+from typing import Any, Dict, List, Optional, get_origin
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -106,6 +106,12 @@ class _ConfigPatch(BaseModel):
     max_atr_pct: float = Field(default=CANONICAL_DEFAULTS["max_atr_pct"], ge=0.0, le=100.0)
     max_spread_pct: float = Field(default=CANONICAL_DEFAULTS["max_spread_pct"], ge=0.0, le=100.0)
     sl_atr_mult: float = Field(default=CANONICAL_DEFAULTS["sl_atr_mult"], ge=0.0, le=50.0)
+    # R12-C1: backup-SL clamp widths, manual-bracket TP mult, and the optional
+    # lower confidence floor for regime-aligned entries (None = feature off).
+    sl_ceiling_pct: float = Field(default=CANONICAL_DEFAULTS["sl_ceiling_pct"], ge=0.0, le=100.0)
+    sl_floor_pct: float = Field(default=CANONICAL_DEFAULTS["sl_floor_pct"], ge=0.0, le=100.0)
+    tp_atr_mult: float = Field(default=CANONICAL_DEFAULTS["tp_atr_mult"], ge=0.0, le=50.0)
+    aligned_min_conf: Optional[float] = Field(default=CANONICAL_DEFAULTS["aligned_min_conf"], ge=0.0, le=1.0)
     min_trend_score: float = Field(default=CANONICAL_DEFAULTS["min_trend_score"], ge=0.0, le=1.0)
     whale_size_multiplier: float = Field(default=CANONICAL_DEFAULTS["whale_size_multiplier"], ge=0.0)
 
@@ -114,6 +120,8 @@ class _ConfigPatch(BaseModel):
     coin_blocklist: list = Field(default_factory=lambda: _list_default("coin_blocklist"))
     hip3_dex_allowlist: list = Field(default_factory=lambda: _list_default("hip3_dex_allowlist"))
     hip3_dex_blocklist: list = Field(default_factory=lambda: _list_default("hip3_dex_blocklist"))
+    # R12-C1: conviction-scaled size tiers, [[min_confidence, size_mult], ...].
+    conviction_tiers: list = Field(default_factory=lambda: _list_default("conviction_tiers"))
 
     # ── nested objects (accepted as dicts, not deep-validated) ────────────
     dsl_exit: Dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_exit"))
@@ -134,6 +142,8 @@ class _ConfigPatch(BaseModel):
     memory_limits: Dict[str, Any] = Field(default_factory=lambda: _dict_default("memory_limits"))
     llm_circuit_breaker: Dict[str, Any] = Field(default_factory=lambda: _dict_default("llm_circuit_breaker"))
     coin_overrides: Dict[str, Any] = Field(default_factory=lambda: _dict_default("coin_overrides"))
+    # R12-C1: single-coin / daily drawdown halt thresholds.
+    circuit_breaker: Dict[str, Any] = Field(default_factory=lambda: _dict_default("circuit_breaker"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

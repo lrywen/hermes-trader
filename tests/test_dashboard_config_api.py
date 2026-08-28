@@ -348,15 +348,34 @@ def test_history_records_rollback(client):
 # ── nested object update ────────────────────────────────────────────────────
 
 def test_post_config_nested_object(client):
-    """debate_gate is a nested dict — it should be replaceable as a whole."""
-    new_gate = {"enabled": False, "min_agreement": 0.8, "min_agree_count": 4}
+    """debate_gate is a nested dict — explicit sub-keys replace; canonical-only
+    sub-keys are backfilled by the read-path deep merge (R12-C1)."""
+    new_gate = {
+        "enabled": False,
+        "min_agreement": 0.8,
+        "min_agree_count": 4,
+        "analyst3_default": True,
+    }
     r = client.post(
         "/api/dashboard/config",
         json={"updates": {"debate_gate": new_gate}},
         headers=_auth(),
     )
     assert r.status_code == 200, r.text
-    assert read_agent_config()["debate_gate"] == new_gate
+    gate = read_agent_config()["debate_gate"]
+    # All explicitly written keys land verbatim (whole-block replacement).
+    assert gate == new_gate
+    # A canonical-only sub-key omitted from the payload is backfilled by the
+    # read-path deep merge (R12-C1: analyst3_default is now a canonical key).
+    r2 = client.post(
+        "/api/dashboard/config",
+        json={"updates": {"debate_gate": {"enabled": False, "min_agreement": 0.9}}},
+        headers=_auth(),
+    )
+    assert r2.status_code == 200, r2.text
+    merged = read_agent_config()["debate_gate"]
+    assert merged["min_agreement"] == 0.9  # explicit override lands
+    assert merged["analyst3_default"] is False  # canonical default backfilled
 
 
 def test_post_config_list_value(client):
