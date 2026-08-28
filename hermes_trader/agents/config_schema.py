@@ -154,6 +154,10 @@ class _ConfigPatch(BaseModel):
     # R13-B2: exchange-SL mover tunables (executor.py). Two keys: per-coin
     # batchModify throttle and minimum bps-move to justify a cancel+replace.
     sl_move: dict[str, Any] = Field(default_factory=lambda: _dict_default("sl_move"))
+    # R13-B3: risk-gate scoring thresholds (risk_gates.py). Eight keys cover
+    # the market_regime_gate's counter-trend score bar plus the debate_gate
+    # analyst2 / analyst5 thresholds.
+    analyst_scoring: dict[str, Any] = Field(default_factory=lambda: _dict_default("analyst_scoring"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

@@ -471,7 +471,16 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     # When aligned with funding regime, use the normal counter_regime_min_conf
     # so we never *raise* the bar for regime-aligned trades.
     effective_min_conf = counter_regime_min_conf
-    effective_min_score = 50.0
+    # R13-B3: the normal counter-trend composite_score bar was a hardcoded
+    # 50.0 literal at this site; register it under
+    # analyst_scoring.counter_trend_min_score so an operator can retune
+    # the bar without redeploying. The canonical default = 50.0, so the
+    # runtime bar is unchanged. Hot-path cfg_get picks up env overrides
+    # (HERMES_CFG_ANALYST_SCORING__COUNTER_TREND_MIN_SCORE) and
+    # .agent-config.json edits on the next gate call.
+    effective_min_score = float(
+        cfg_get("analyst_scoring.counter_trend_min_score", config={})
+    )
     if against_funding:
         # P3 defense: an empty-string env override (HERMES_CFG_...='') makes
         # cfg_get return '', and float('') raises ValueError. `or default`
@@ -620,11 +629,25 @@ def debate_gate(
     # --- Analyst 2: Confidence vs Composite alignment ---
     # High confidence + high composite = strong consensus
     # Low confidence + high composite (or vice versa) = mixed signal
-    if ctx.confidence >= 0.7 and ctx.composite_score >= 40:
+    # R13-B3: the three threshold pairs were hardcoded literals
+    # (0.7/40, 0.5/60, 0.8/20). They're now in CANONICAL_DEFAULTS under
+    # analyst_scoring.* so an operator can retune them without
+    # redeploying. The canonical defaults match the old literals
+    # verbatim, so existing vote behaviour is unchanged. Hot-path
+    # cfg_get picks up env overrides
+    # (HERMES_CFG_ANALYST_SCORING__ANALYST2_*)
+    # and .agent-config.json edits on the next gate call.
+    a2_high_conf = float(cfg_get("analyst_scoring.analyst2_high_conf", config={}))
+    a2_high_score = float(cfg_get("analyst_scoring.analyst2_high_score", config={}))
+    a2_mid_conf = float(cfg_get("analyst_scoring.analyst2_mid_conf", config={}))
+    a2_mid_score = float(cfg_get("analyst_scoring.analyst2_mid_score", config={}))
+    a2_vhigh_conf = float(cfg_get("analyst_scoring.analyst2_very_high_conf", config={}))
+    a2_vhigh_score = float(cfg_get("analyst_scoring.analyst2_very_high_score", config={}))
+    if ctx.confidence >= a2_high_conf and ctx.composite_score >= a2_high_score:
         analyst2_agree = True
-    elif ctx.confidence >= 0.5 and ctx.composite_score >= 60:
+    elif ctx.confidence >= a2_mid_conf and ctx.composite_score >= a2_mid_score:
         analyst2_agree = True
-    elif ctx.confidence >= 0.8 and ctx.composite_score >= 20:
+    elif ctx.confidence >= a2_vhigh_conf and ctx.composite_score >= a2_vhigh_score:
         analyst2_agree = True
     else:
         analyst2_agree = False
@@ -642,7 +665,12 @@ def debate_gate(
 
     # --- Analyst 5: Whale signal boost ---
     # Whale signals are a strong independent validator
-    analyst5_agree = ctx.whale_signal_fired or ctx.confidence >= 0.75
+    # R13-B3: the 0.75 confidence floor was a hardcoded literal; it now
+    # resolves through cfg_get(analyst_scoring.analyst5_whale_or_conf).
+    # The canonical default is 0.75, so the existing vote behaviour is
+    # preserved; env / config edits take effect on the next gate call.
+    a5_conf_floor = float(cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}))
+    analyst5_agree = ctx.whale_signal_fired or ctx.confidence >= a5_conf_floor
 
     # --- Consensus ---
     analyst_votes = [analyst1_agree, analyst2_agree, analyst3_agree,

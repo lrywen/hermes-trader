@@ -431,6 +431,35 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "save_max_attempts": 3,
         "save_backoff_base_sec": 0.1,
     },
+    # R13-B3: risk-gate scoring thresholds (risk_gates.py). Eight keys cover
+    # the market_regime_gate's counter-trend score bar plus the debate_gate
+    # analyst2 / analyst5 thresholds — all of which used to be hardcoded
+    # module-level literals. They were therefore not env-overridable, not
+    # dashboard-dumpable, and not auditable via the canonical schema. The
+    # canonical default values match the existing literals verbatim so the
+    # runtime bar is unchanged; only the *path* changes (cfg_get with module
+    # default). Subagent audit had flagged the 50.0 / 60.0 "implicit
+    # mismatch" at L474/L484 as a drift candidate, but on close reading
+    # the two numbers are NOT inconsistent: 50.0 is the *normal*
+    # counter-trend bar (L474 default) and 60.0 is the *elevated*
+    # against-funding bar (L488 override). The L474 literal was the actual
+    # dead default — it now resolves through cfg_get to its canonical twin.
+    "analyst_scoring": {
+        # market_regime_gate / _counter_trend_decision: composite_score bar
+        # for the plain (non-against-funding) counter-trend case.
+        "counter_trend_min_score": 50.0,
+        # debate_gate analyst2 (confidence-vs-composite alignment): three
+        # conditional branches at risk_gates L623-628.
+        "analyst2_high_conf": 0.7,
+        "analyst2_high_score": 40,
+        "analyst2_mid_conf": 0.5,
+        "analyst2_mid_score": 60,
+        "analyst2_very_high_conf": 0.8,
+        "analyst2_very_high_score": 20,
+        # debate_gate analyst5 (whale boost): confidence floor that lets a
+        # non-whale trade still earn the vote at risk_gates L645.
+        "analyst5_whale_or_conf": 0.75,
+    },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the
     # global min_ai_confidence applies uniformly). Was implicit via

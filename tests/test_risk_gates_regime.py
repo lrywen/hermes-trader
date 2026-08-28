@@ -52,6 +52,12 @@ def _patch_regime(monkeypatch, regime: str, trend_score: float = 0.0) -> None:
             "chop_min_conf": 0.7,
             "chop_min_score": 50.0,
             "chop_burst_min_score": 20.0,
+            # R13-B3: market_regime_gate L474 effective_min_score now reads
+            # through cfg_get. The production cfg_get always falls back to
+            # CANONICAL_DEFAULTS["analyst_scoring"]["counter_trend_min_score"]
+            # (= 50.0) on miss; mirror that here so the regime tests still
+            # resolve the counter-trend score bar without hitting disk.
+            "analyst_scoring.counter_trend_min_score": 50.0,
         }.get(key, default)
 
     monkeypatch.setattr(risk_gates, "cfg_get", _fake_cfg)
