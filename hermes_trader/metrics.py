@@ -248,6 +248,33 @@ NOTIFY_DISPATCH_ERRORS = Counter(
     "were swallowed (previously logged at debug and invisible — a malformed "
     "record, e.g. None daily_pnl on a killswitch, silently dropped the alert).",
 )
+# ── R11-A1: send-side resilience (retry + circuit breaker + fallback) ────
+# Alert when NOTIFY_SEND_FAILURES is incrementing for 5m+ — a webhook is
+# degraded. NOTIFY_CIRCUIT_OPEN > 0 means a channel has been auto-quarantined.
+NOTIFY_SEND_RETRIES = Counter(
+    "hermes_notify_send_retries_total",
+    "Feishu send attempts that backed off and retried after a transient "
+    "(429 / 5xx / network) error. Labelled by channel URL.",
+    ["channel"],
+)
+NOTIFY_SEND_FAILURES = Counter(
+    "hermes_notify_send_failures_total",
+    "Feishu send attempts that exhausted retries against a channel "
+    "(and triggered the per-channel circuit breaker).",
+    ["channel"],
+)
+NOTIFY_CIRCUIT_OPEN = Gauge(
+    "hermes_notify_circuit_open",
+    "1 while the per-channel circuit breaker is open and sends are being "
+    "short-circuited, 0 when closed. Set on every send attempt.",
+    ["channel"],
+)
+NOTIFY_FALLBACK_USED = Counter(
+    "hermes_notify_fallback_used_total",
+    "Times a card was delivered via a non-primary channel because the "
+    "primary channel returned a non-2xx after exhausting retries.",
+    ["category"],
+)
 
 
 def _to_float(value: object) -> float:
