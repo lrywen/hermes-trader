@@ -29,18 +29,50 @@ def append(event: Dict[str, Any]) -> None:
             f.write(json.dumps(record) + "\n")
     except OSError:
         pass
+    # Fork outcome-relevant events (execute/exit/risk) into the authoritative
+    # events.jsonl so the post-trade event log has a signal→order→close trace.
+    # The high-volume heartbeat (scan/heartbeat/research/ta_skip) stays here
+    # only. This bridges the pre-2026-08-22 architecture split where order/
+    # close events never reached events.jsonl and memory rebuild found 0 orders.
+    try:
+        from hermes_trader import event_log
+        event_log.fork_from_session(record)
+    except Exception:
+        pass
+    # Best-effort Feishu notification dispatch. Imported lazily to avoid a
+    # circular import (notify_dispatch may import modules that log events at
+    # import time). Dispatched AFTER the disk write so a notification failure
+    # can never lose the durable record.
+    try:
+        from hermes_trader import notify_dispatch
+        notify_dispatch.dispatch(record)
+    except Exception:
+        pass
 
 
 def tail(n: int = 10) -> List[Dict[str, Any]]:
-    """Return the last `n` parseable events, oldest first."""
+    """Return the last `n` parseable events, oldest first.
+
+    Reads backward from the end of the file in chunks instead of loading the
+    whole log into memory (the log can grow to several MB over a session).
+    """
     try:
-        lines = [ln for ln in open(SESSION_LOG_FILE).read().splitlines() if ln.strip()]
-    except FileNotFoundError:
+        with open(SESSION_LOG_FILE, "rb") as f:
+            f.seek(0, 2)  # end
+            block = 8192
+            data = b""
+            while data.count(b"\n") <= n and f.tell() > 0:
+                step = min(block, f.tell())
+                f.seek(-step, 1)
+                data = f.read(step) + data
+                f.seek(-step, 1)
+        lines = [ln for ln in data.splitlines() if ln.strip()]
+    except (FileNotFoundError, OSError):
         return []
     out: List[Dict[str, Any]] = []
     for ln in lines[-n:]:
         try:
             out.append(json.loads(ln))
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             pass
     return out

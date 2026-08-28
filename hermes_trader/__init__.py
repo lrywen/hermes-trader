@@ -2,6 +2,8 @@
 
 import os
 import ssl
+from typing import Any
+
 import certifi
 
 __version__ = "0.3.0"
@@ -18,7 +20,7 @@ if not os.environ.get("NO_SSL_FIX"):
     if hasattr(ssl._ssl, "_get_default_verify_paths"):
         # Override SSL context defaults
         _orig_create_default_context = ssl.create_default_context
-        def _patched_create_default_context(*args, **kwargs):
+        def _patched_create_default_context(*args: Any, **kwargs: Any) -> ssl.SSLContext:
             ctx = _orig_create_default_context(*args, **kwargs)
             ctx.load_default_certs()
             return ctx

@@ -46,4 +46,4 @@ primary_region = "iad"  # change to a region near you
 
 [env]
   HERMES_PORT = "8000"
-  HERMES_SCAN_INTERVAL = "60"
+  HERMES_SCAN_INTERVAL = "15"

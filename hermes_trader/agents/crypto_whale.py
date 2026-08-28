@@ -25,13 +25,14 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import ssl
 import threading
 import time
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,9 @@ try:
     import certifi
     _SSL = ssl.create_default_context(cafile=certifi.where())
 except Exception:                     # pragma: no cover
-    _SSL = ssl._create_unverified_context()
+    # P1-15: never fall back to an unverified context (MITM risk). Use the
+    # system trust store with full verification; certifi is a pinned dep.
+    _SSL = ssl.create_default_context()
 
 _AGG = "https://api.binance.com/api/v3/aggTrades"
 
@@ -128,16 +131,45 @@ def compute_whale_flow(prints: List[Print], min_usd: float = 100_000.0,
 
 # ── thin cached fetch ────────────────────────────────────────────────────────
 _CACHE_TTL_S = 120.0
+_CACHE_MAX = int(os.environ.get("HERMES_CRYPTO_WHALE_CACHE_MAX", "1024"))
 _cache: Dict[str, tuple] = {}
 _lock = threading.Lock()
 
+# Single-flight coalescing for cold misses.
+_inflight: Dict[str, threading.Event] = {}
+_inflight_results: Dict[str, object] = {}
+_inflight_lock = threading.Lock()
 
-def _get_json(url: str, timeout: float = 10.0):
+# Binance is normally <1s, but a stalled edge can hold the default 10s for up
+# to 6 sequential pages = 60s. Bound each page to 2.5s so a degraded Binance
+# can't dominate the parallel-fetch window in research().
+_HTTP_TIMEOUT_S = float(os.environ.get("HERMES_WHALE_HTTP_TIMEOUT_S", "2.5"))
+
+
+def _cache_sweep(now: float, ttl: float, max_keep: int) -> None:
+    """Caller must hold _lock."""
+    expired = [k for k, (ts, _v) in _cache.items() if (now - ts) >= ttl]
+    for k in expired:
+        _cache.pop(k, None)
+    if len(_cache) > max_keep:
+        overflow = len(_cache) - max_keep
+        for k in sorted(_cache, key=lambda k: _cache[k][0])[:overflow]:
+            _cache.pop(k, None)
+
+
+def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[Dict[str, Any]]:
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+    _t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
-            return json.loads(r.read().decode("utf-8", "replace"))
-    except Exception:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+            _elapsed = time.monotonic() - _t0
+            if _elapsed > 1.5:
+                logger.info(f"[whale] GET {url[:80]}... in {_elapsed:.2f}s")
+            return data
+    except Exception as _e:
+        _elapsed = time.monotonic() - _t0
+        logger.warning(f"[whale] GET failed after {_elapsed:.2f}s: {type(_e).__name__}: {_e}")
         return None
 
 
@@ -184,10 +216,45 @@ def crypto_whale_signal(coin: str, min_usd: float = 100_000.0,
             return hit[1]
     if not allow_fetch:
         return hit[1] if hit else None
-    prints = fetch_aggtrades_window(sym, window_minutes=window_minutes, max_pages=max_pages)
-    rep = compute_whale_flow(prints, min_usd=min_usd, symbol=sym) if prints else None
-    if rep is not None:
-        rep = WhaleReport(**{**rep.__dict__, "window_minutes": window_minutes})
-    with _lock:
-        _cache[key] = (now, rep)
-    return rep
+
+    # Single-flight coalescing for cold cache misses.
+    waiter: Optional[threading.Event] = None
+    with _inflight_lock:
+        existing = _inflight.get(key)
+        if existing is not None:
+            waiter = existing
+        else:
+            evt = threading.Event()
+            _inflight[key] = evt
+    if waiter is not None:
+        _wt0 = time.monotonic()
+        waiter.wait(timeout=(_HTTP_TIMEOUT_S * max_pages) + 2.0)
+        with _inflight_lock:
+            result = _inflight_results.get(key)
+        logger.debug(f"[whale] crypto_whale_signal({coin}) coalesced in "
+                     f"{time.monotonic() - _wt0:.2f}s")
+        return result if isinstance(result, WhaleReport) else None
+
+    _fetch_t0 = time.monotonic()
+    try:
+        prints = fetch_aggtrades_window(sym, window_minutes=window_minutes, max_pages=max_pages)
+        rep = compute_whale_flow(prints, min_usd=min_usd, symbol=sym) if prints else None
+        if rep is not None:
+            rep = WhaleReport(**{**rep.__dict__, "window_minutes": window_minutes})
+        with _lock:
+            _cache[key] = (now, rep)
+            if len(_cache) > _CACHE_MAX:
+                _cache_sweep(now, ttl, _CACHE_MAX)
+        with _inflight_lock:
+            _inflight_results[key] = rep
+        _elapsed = time.monotonic() - _fetch_t0
+        if _elapsed > 1.5:
+            logger.info(f"[whale] crypto_whale_signal({coin}) in {_elapsed:.2f}s "
+                        f"({len(prints)} prints)")
+        return rep
+    finally:
+        with _inflight_lock:
+            _evt = _inflight.pop(key, None)
+            _inflight_results.pop(key, None)
+        if _evt is not None:
+            _evt.set()

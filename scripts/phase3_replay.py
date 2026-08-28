@@ -17,7 +17,7 @@ Usage: python3 scripts/phase3_replay.py GRASS 0.47055 3 7.27   # coin entry lev 
 import sys, time, json
 from hermes_trader.client.hl_client import fetch_hl_candles  # paced via the shared limiter
 from hermes_trader.agents.dsl_exit import DSLTracker, ExitPolicy, RetraceTier
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 
 INTERVAL = "1m"   # match the ~60s live loop cadence: one mark per tick, true time order
 BARS = 1500       # ~25h of 1m (covers a 24h run + lead-in)
@@ -63,10 +63,10 @@ def _policy(cfg, noise_band=False, noise_band_atr_mult=1.0):
     return ExitPolicy(
         noise_band_enabled=noise_band,
         noise_band_atr_mult=noise_band_atr_mult,
-        max_loss_pct=d.get("max_loss_pct", 1.0),
-        max_loss_roe_pct=d.get("max_loss_roe_pct", 8.0),
-        protect_pct=d.get("protect_pct", 1.5),
-        retrace_threshold=d.get("retrace_threshold", 0.30),
+        max_loss_pct=cfg_get("dsl_exit.max_loss_pct", config=d),
+        max_loss_roe_pct=cfg_get("dsl_exit.max_loss_roe_pct", config=d),
+        protect_pct=cfg_get("dsl_exit.protect_pct", config=d),
+        retrace_threshold=cfg_get("dsl_exit.retrace_threshold", config=d),
         hard_timeout_minutes=d.get("hard_timeout_minutes", 1800.0),
         breakeven_trigger_pct=d.get("breakeven_trigger_pct", 0.0),
         breakeven_lock_pct=d.get("breakeven_lock_pct", 0.0),

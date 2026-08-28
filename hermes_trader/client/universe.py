@@ -227,10 +227,28 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
     spot_meta, spot_ctx = _fetch_spot_meta(force_refresh)
 
     # HIP-3: walk every non-null perpDex and merge its markets in.
+    # Apply the same allow/blocklist mute as the scanner (perception.py) and
+    # account aggregation (hl_client.py): on testnet list_hip3_dexes() returns
+    # ~250 unfunded venues, and walking them all would serialize ~250
+    # metaAndAssetCtxs POSTs behind the rate limiter, stalling loop startup.
     hip3_meta: Dict[str, Any] = {}
     hip3_ctx: Dict[str, Any] = {}
     if include_hip3:
-        for dex in list_hip3_dexes(force_refresh):
+        dexes = list_hip3_dexes(force_refresh)
+        try:
+            from hermes_trader.agents.config_store import read_agent_config
+            _cfg = read_agent_config()
+        except Exception:
+            _cfg = {}
+        allow = {d for d in (_cfg.get("hip3_dex_allowlist") or []) if d}
+        block = {d for d in (_cfg.get("hip3_dex_blocklist") or []) if d}
+        if allow:
+            dexes = [d for d in dexes if d in allow]
+        if block:
+            dexes = [d for d in dexes if d not in block]
+        if not dexes:
+            logger.info("[universe] HIP-3 loading skipped — no dexes after allow/block filter")
+        for dex in dexes:
             m, c = _fetch_hip3_meta(dex, force_refresh)
             hip3_meta.update(m)
             hip3_ctx.update(c)
@@ -243,7 +261,7 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> Lis
         m = perp_meta.get(coin) or hip3_meta.get(coin) or spot_meta.get(coin, {})
         c = perp_ctx.get(coin) or hip3_ctx.get(coin) or spot_ctx.get(coin, {})
         
-        def _f(v, d=0):
+        def _f(v: Any, d: float = 0) -> float:
             return float(v) if v is not None else d
         
         asset = {
@@ -274,3 +292,32 @@ def get_market_by_coin(coin: str) -> Optional[Dict[str, Any]]:
         if m["coin"] == coin:
             return m
     return None
+
+
+def get_day_ntl_vlm(coin: str) -> float:
+    """24h notional volume for a single coin via O(1) cache lookup.
+
+    For native perps the disk-cached `asset_ctx_dict` is keyed by coin name, so
+    we can read the volume without materializing/sorting the whole universe
+    list (the executor calls this once per candidate in the hot path). HIP-3
+    markets are namespaced `<dex>:<symbol>` while their ctx dict is keyed by
+    bare symbol, so those fall back to the (already-cached) linear scan.
+    Returns 0.0 when the coin/volume is unavailable.
+    """
+    try:
+        if ":" not in coin:
+            _, perp_ctx = _fetch_perp_meta()
+            ctx = perp_ctx.get(coin)
+            if ctx:
+                vol = float(ctx.get("dayNtlVlm", 0) or 0)
+                if vol > 0:
+                    return vol
+        for m in get_universe(include_hip3=(":" in coin)):
+            if m.get("coin") == coin:
+                vol = float(m.get("dayNtlVlm", 0) or 0)
+                if vol > 0:
+                    return vol
+                break
+    except Exception:
+        pass
+    return 0.0

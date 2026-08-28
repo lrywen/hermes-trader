@@ -25,7 +25,7 @@ sys.path.insert(0, str(_REPO / "scripts"))
 
 import backtest_logged as btlog
 from _memory_io import load_memory
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.executor import _runner_entry_block_reason
 from hermes_trader.agents.sizing import atr_equal_risk_notional
 from hermes_trader.indicators.math import atr as calc_atr
@@ -408,16 +408,16 @@ def _current_option(cfg: dict[str, Any]) -> dict[str, Any]:
     dsl = cfg.get("dsl_exit") or {}
     return {
         "sizing": current_sizing,
-        "leverage": int(cfg.get("leverage", 8)),
+        "leverage": int(cfg_get("leverage", config=cfg)),
         "fraction": float(cfg.get("equity_fraction_per_trade", 0.12)),
         "risk_pct": float((cfg.get("atr_risk_sizing") or {}).get("risk_per_trade_pct", 0.01)),
-        "max_notional": float(cfg.get("max_trade_notional_usd", 120.0)),
-        "max_loss": float(dsl.get("max_loss_pct", 0.75)),
-        "roe_cap": float(dsl.get("max_loss_roe_pct", 6.0)),
-        "protect": float(dsl.get("protect_pct", 1.5)),
-        "retrace": float(dsl.get("retrace_threshold", 0.30)),
+        "max_notional": float(cfg_get("max_trade_notional_usd", config=cfg)),
+        "max_loss": float(cfg_get("dsl_exit.max_loss_pct", config=dsl)),
+        "roe_cap": float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl)),
+        "protect": float(cfg_get("dsl_exit.protect_pct", config=dsl)),
+        "retrace": float(cfg_get("dsl_exit.retrace_threshold", config=dsl)),
         "sl_atr_mult": float(cfg.get("sl_atr_mult", 1.5)),
-        "cooldown": int(cfg.get("cooldown_min", 60)),
+        "cooldown": int(cfg_get("cooldown_min", config=cfg)),
         "min_conf": float(cfg.get("min_ai_confidence", 0.70)),
         "counter_conf": float(cfg.get("counter_regime_min_conf", 0.80)),
         "min_composite": float(gate.get("min_composite", 30.0)),

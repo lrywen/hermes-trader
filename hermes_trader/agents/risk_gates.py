@@ -5,57 +5,85 @@ All gates are evaluated; results are collected for telemetry (no short-circuit).
 
 from __future__ import annotations
 
+import logging
+import threading
 import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
+
+from hermes_trader.agents.config_store import cfg_get
+from hermes_trader.shared_config import load_shared_config
+
+logger = logging.getLogger(__name__)
 
 GateResult = Dict[str, Any]  # {pass: bool, reason?: str}
 
 
+@dataclass
 class GateContext:
-    """Context passed to all risk gates."""
-    def __init__(
-        self,
-        confidence: float,
-        current_positions: List[Dict[str, Any]],
-        trade_notional_usd: float,
-        daily_pnl: float,
-        market_volume_24h_usd: float,
-        coin: str,
-        trade_side: str,  # 'long' or 'short'
-        has_binary_news_risk: bool,
-        equity: float,
-        total_open_notional: float,
-        composite_score: float = 0.0,
-        momentum_burst_fired: bool = False,
-        slow_burn_fired: bool = False,
-        whale_signal_fired: bool = False,
-        binary_news_match: str = "",
-        peak_daily_pnl: float = 0.0,
-    ):
-        self.confidence = confidence
-        self.current_positions = current_positions
-        self.trade_notional_usd = trade_notional_usd
-        self.daily_pnl = daily_pnl
-        self.peak_daily_pnl = peak_daily_pnl
-        self.market_volume_24h_usd = market_volume_24h_usd
-        self.coin = coin
-        self.trade_side = trade_side
-        self.has_binary_news_risk = has_binary_news_risk
-        self.equity = equity
-        self.total_open_notional = total_open_notional
-        self.composite_score = composite_score
-        self.momentum_burst_fired = momentum_burst_fired
+    """Context passed to all risk gates.
+
+    P2-4: now a dataclass. ``__post_init__`` coerces numerics/bools/strings
+    to their declared types (upstream values arrive straight from LLM JSON /
+    config / memory and may be ints, None, or strings), so individual gates
+    no longer each repeat ``float(...)`` / ``bool(...)`` / ``... or ""``.
+    Coercion is best-effort and fails safe: an unparseable numeric becomes
+    0.0 (which fails closed for the positive-floor gates), a non-list
+    positions value becomes ``[]``.
+    """
+    confidence: float
+    current_positions: List[Dict[str, Any]]
+    trade_notional_usd: float
+    daily_pnl: float
+    market_volume_24h_usd: float
+    coin: str
+    trade_side: str  # 'long' or 'short'
+    has_binary_news_risk: bool
+    equity: float
+    total_open_notional: float
+    composite_score: float = 0.0
+    momentum_burst_fired: bool = False
+    slow_burn_fired: bool = False
+    whale_signal_fired: bool = False
+    binary_news_match: str = ""
+    peak_daily_pnl: float = 0.0
+
+    def __post_init__(self) -> None:
+        def _num(v: Any) -> float:
+            # bool is a subclass of int — keep it numeric-compatible here;
+            # None / unparseable fail safe to 0.0.
+            try:
+                f = float(v)
+                return f if f == f else 0.0  # NaN guard
+            except (TypeError, ValueError):
+                return 0.0
+
+        self.confidence = _num(self.confidence)
+        self.trade_notional_usd = _num(self.trade_notional_usd)
+        self.daily_pnl = _num(self.daily_pnl)
+        self.peak_daily_pnl = _num(self.peak_daily_pnl)
+        self.market_volume_24h_usd = _num(self.market_volume_24h_usd)
+        self.equity = _num(self.equity)
+        self.total_open_notional = _num(self.total_open_notional)
+        self.composite_score = _num(self.composite_score)
+        self.momentum_burst_fired = bool(self.momentum_burst_fired)
         # True iff any 1h slow-burn trigger fired (volumeBuildup1h /
         # trendFlip1h / higherLows1h). Used as a counter-regime bypass: a
         # clean 1h accumulation pattern overrides the slow BTC proxy.
-        self.slow_burn_fired = slow_burn_fired
+        self.slow_burn_fired = bool(self.slow_burn_fired)
         # True iff whale_index oi_funding_anomaly flagged this coin
         # (negative funding + flat price + high OI = whale accumulation).
         # Same gate-bypass role as slow_burn_fired; orthogonal signal.
-        self.whale_signal_fired = whale_signal_fired
+        self.whale_signal_fired = bool(self.whale_signal_fired)
+        self.has_binary_news_risk = bool(self.has_binary_news_risk)
         # The headline + matched term that tripped the binary-news gate, for
         # log visibility ("which article blocked this?").
-        self.binary_news_match = binary_news_match
+        self.binary_news_match = str(self.binary_news_match or "")
+        self.coin = str(self.coin or "")
+        self.trade_side = str(self.trade_side or "long")
+        if not isinstance(self.current_positions, list):
+            self.current_positions = []
 
 
 def confidence_gate(ctx: GateContext, min_confidence: float) -> GateResult:
@@ -164,6 +192,46 @@ def cooldown_gate(ctx: GateContext, last_trade_time: Optional[int], cooldown_min
     return {"pass": False, "reason": f"cooldown active ({int(cooldown_min - elapsed)}min remaining)"}
 
 
+def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
+    """Block re-entry on a single coin while its per-trade loss breaker is armed.
+
+    Reads the memory state set by the close chokepoint (a realized spot loss
+    beyond circuit_breaker.single_coin_loss_pct halts that coin for
+    single_coin_halt_min). Sits ON TOP of the legacy loss cooldown — it uses
+    a larger threshold (3%) and a shorter, sharper window (60min) specifically
+    to stop immediate re-buying after a stop-out (PURR #6 / BOME class).
+    Memory is imported lazily to avoid a circular import at module load.
+    """
+    try:
+        from hermes_trader.agents.memory import memory
+        remaining = float(memory.coin_circuit_remaining_min(ctx.coin) or 0.0)
+        if remaining > 0:
+            return {"pass": False,
+                    "reason": f"coin circuit breaker active on {ctx.coin} ({int(remaining)}min remaining)"}
+    except Exception as e:  # noqa: BLE001 — a state-read failure must NOT block trading
+        logger.debug(f"[risk] coin-circuit gate state read failed for {ctx.coin}: {e}")
+    return {"pass": True}
+
+
+def global_halt_gate(ctx: GateContext) -> GateResult:
+    """Block ALL new entries while the daily cumulative-loss halt is armed.
+
+    Reads the memory state set by the close chokepoint (daily realized +
+    unrealized loss beyond circuit_breaker.daily_loss_pct of start-of-day
+    equity halts the whole book for daily_halt_min). This is an equity-based
+    hard stop complementing the USD-denominated daily_loss_kill_switch.
+    """
+    try:
+        from hermes_trader.agents.memory import memory
+        remaining = float(memory.global_halt_remaining_min() or 0.0)
+        if remaining > 0:
+            return {"pass": False,
+                    "reason": f"global daily-loss halt active ({int(remaining)}min remaining)"}
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[risk] global-halt gate state read failed: {e}")
+    return {"pass": True}
+
+
 def opposite_direction_guard(ctx: GateContext) -> GateResult:
     """Block ANY re-entry on a coin we already hold. A held position is managed
     solely by the DSL engine + the periodic AI close-check (CLOSE / HOLD); it is
@@ -171,12 +239,20 @@ def opposite_direction_guard(ctx: GateContext) -> GateResult:
     uncontrolled pyramid). The held-coin close-check sometimes returns a fresh
     LONG/SHORT on a strong held name; without this it would try to pyramid in
     (previously only the exchange margin check stopped it)."""
-    existing = next((p for p in ctx.current_positions if p["coin"] == ctx.coin), None)
+    # P1-3: .get() defensively — a malformed position record (missing coin/side)
+    # must not raise KeyError and abort the whole gate evaluation; fail open with
+    # a warning so the anomaly is visible.
+    existing = next((p for p in ctx.current_positions if p.get("coin") == ctx.coin), None)
     if not existing:
         return {"pass": True}
-    if existing["side"] != ctx.trade_side:
-        return {"pass": False, "reason": f"opposite position exists ({ctx.coin} {existing['side']}) — no auto-flip"}
-    return {"pass": False, "reason": f"already holding {ctx.coin} {existing['side']} — no pyramid/re-entry"}
+    held_side = existing.get("side")
+    if not held_side:
+        logger.warning(f"[risk] opposite_direction_guard: held position on {ctx.coin} "
+                       f"missing 'side' key — failing open (pass)")
+        return {"pass": True}
+    if held_side != ctx.trade_side:
+        return {"pass": False, "reason": f"opposite position exists ({ctx.coin} {held_side}) — no auto-flip"}
+    return {"pass": False, "reason": f"already holding {ctx.coin} {held_side} — no pyramid/re-entry"}
 
 
 # Major crypto coins for correlation cap
@@ -194,7 +270,7 @@ def correlation_cap(ctx: GateContext, max_crypto_correlated: int) -> GateResult:
         return {"pass": True}
     existing_crypto_long = sum(
         1 for p in ctx.current_positions
-        if p["coin"] in _CRYPTO_COINS and p["side"] == "long"
+        if p.get("coin") in _CRYPTO_COINS and p.get("side") == "long"
     )
     if existing_crypto_long < max_crypto_correlated:
         return {"pass": True}
@@ -212,12 +288,131 @@ def equity_risk_cap(ctx: GateContext, max_total_notional_pct: float) -> GateResu
     }
 
 
+def _funding_regime_for(coin: str) -> str:
+    """Funding regime for this coin's asset class, fail-open to NEUTRAL.
+
+    PER-CLASS LOOKUP: the gate uses the funding regime of THIS coin's
+    asset class (crypto / equity / commodity), not a global crypto-only
+    signal. Without this, a SHORT_CROWDED crypto regime would gate longs
+    on oil (xyz:CL) and semis (xyz:ARM) — those have their own funding
+    markets and shouldn't be evaluated by the crypto crowd.
+    """
+    try:
+        from hermes_trader.agents.hyperfeed import market_get_funding_regime
+        from hermes_trader.agents.market_regime import classify_asset
+        funding_data = market_get_funding_regime()
+        coin_class = classify_asset(coin)
+        by_class = funding_data.get("regimes_by_class") or {}
+        return by_class.get(coin_class) or funding_data.get("regime", "NEUTRAL")
+    except Exception as err:
+        # H4: a funding-data outage used to fail-open the crowding gate
+        # invisibly — crowded/contra trades slipped through with no trace.
+        # Log at WARNING (rate-limited by the natural scan cadence) so
+        # operators can see the gate is running blind, while still degrading
+        # to NEUTRAL to avoid hard-blocking all entries on a transient blip.
+        logger.warning(
+            f"[risk_gates] funding regime unavailable for {coin} "
+            f"(class lookup failed: {type(err).__name__}: {err}) — "
+            f"degrading gate to NEUTRAL (fail-open, visibility restored)"
+        )
+        return "NEUTRAL"
+
+
+def _chop_decision(ctx: GateContext, base: Dict[str, Any],
+                   counter_regime_min_conf: float,
+                   block_counter_trend_bypass: bool) -> GateResult:
+    """Gate call for a chop tape (ADX<20, EMA-neutral).
+
+    Unlike 'neutral' (which free-passes), chop RAISES the bar — both long
+    and short are technically counter-trend in a range, and fakeout
+    breakouts are the dominant loss mode here. Require real conviction
+    (conf/score) OR a momentum burst (a genuine impulse out of the range);
+    a lone slow_burn / whale ping does NOT clear it (those fire constantly
+    in chop).
+    """
+    chop_min_conf = max(counter_regime_min_conf,
+                        float(cfg_get("chop_min_conf")))
+    chop_min_score = float(cfg_get("chop_min_score"))
+    if ctx.confidence >= chop_min_conf or ctx.composite_score >= chop_min_score:
+        return {"pass": True, "via": "chop_conviction",
+                **{**base, "chop": True}}
+    # P1-4: a lone momentum burst in chop is a classic wick-fakeout; require
+    # a minimum composite score as confirmation (config: chop_burst_min_score,
+    # default 20) so the bypass only fires for a genuine impulse out of range.
+    chop_burst_min_score = float(cfg_get("chop_burst_min_score"))
+    if (ctx.momentum_burst_fired and not block_counter_trend_bypass
+            and ctx.composite_score >= chop_burst_min_score):
+        return {"pass": True, "via": "trigger:momentum_burst",
+                **{**base, "chop": True}}
+    return {"pass": False, "via": "chop_blocked",
+            **{**base, "chop": True, "counter_trend": True},
+            "reason": (f"chop regime (ADX<20) — {ctx.trade_side} needs "
+                       f"conf >= {chop_min_conf:.2f} or score >= {chop_min_score:.0f}"
+                       f" or momentum burst, have conf {ctx.confidence:.2f}, "
+                       f"score {ctx.composite_score:.0f}")}
+
+
+def _counter_trend_decision(ctx: GateContext, base: Dict[str, Any],
+                            regime: str, funding_regime: str,
+                            aligned: bool, weak_aligned: bool,
+                            effective_min_conf: float,
+                            effective_min_score: float,
+                            block_counter_trend_bypass: bool) -> GateResult:
+    """Counter-trend and/or against-funding bar.
+
+    The trade must clear the (possibly elevated) bar via conviction or
+    own-signal. `weak_aligned` trades are EMA-aligned but failed the
+    continuous score; they face the same bar as counter-trend (no free
+    pass on a weak cross).
+    """
+    base["counter_trend"] = (not aligned) or weak_aligned
+    if weak_aligned:
+        base["weak_trend_score"] = True
+    if ctx.confidence >= effective_min_conf:
+        return {"pass": True, "via": "confidence", **base}
+    if ctx.composite_score >= effective_min_score:
+        return {"pass": True, "via": "composite", **base}
+    # Binary-trigger bypass: a strong own-coin signal (momentum_burst /
+    # slow_burn / whale) normally overrides the slow macro-regime call.
+    # `block_counter_trend_bypass` (config, default False, reversible)
+    # DISABLES this bypass here — i.e. for trades that are already
+    # counter-trend and/or against the funding crowd. Data (journal
+    # P166-P177, ~-7% drawdown) showed low-conviction LONGS forced through
+    # via `trigger:slow_burn` against a DOWN tape (SP500/MU/ORCL longs) and
+    # bleeding. With the flag on, a counter-regime trade must clear REAL
+    # conviction (conf/score); a lone momentum trigger no longer pushes it
+    # through against the regime. Aligned and neutral-regime trades returned
+    # earlier and are UNAFFECTED, so this does NOT blanket-weaken the bypass
+    # — only where it fights a strong directional regime.
+    if (ctx.momentum_burst_fired or ctx.slow_burn_fired or ctx.whale_signal_fired) \
+            and not block_counter_trend_bypass:
+        trig = ("momentum_burst" if ctx.momentum_burst_fired
+                else "slow_burn" if ctx.slow_burn_fired else "whale")
+        return {"pass": True, "via": f"trigger:{trig}", **base}
+
+    blocked_via = "blocked_bypass" if block_counter_trend_bypass else "blocked"
+    return {
+        "pass": False,
+        "via": blocked_via,
+        **base,
+        "reason": (f"counter-regime {ctx.trade_side} vs {regime} trend "
+                   f"(funding={funding_regime}) — need conf >= {effective_min_conf:.2f} "
+                   f"or score >= {effective_min_score:.0f}"
+                   f"{'' if block_counter_trend_bypass else ' or own-coin signal'}, "
+                   f"have conf {ctx.confidence:.2f}, score {ctx.composite_score:.0f}"),
+    }
+
+
 def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
                        block_counter_trend_bypass: bool = False,
-                       crowded_with_min_conf: float = 0.0) -> GateResult:
+                       crowded_with_min_conf: float = 0.0,
+                       min_trend_score: float = 0.0) -> GateResult:
     """Block counter-regime trades unless conviction OR own-coin signal clears the bar.
 
-      - aligned with regime → pass
+      - aligned with regime → pass, BUT if min_trend_score>0 the 5-component
+        continuous strength score must also be >= min_trend_score (calibrated
+        0.55). This cuts the ~36% false-trend rate where EMA20/50 crosses on
+        weak/noise bars that the backtest score correctly rates NEUTRAL/CHOP.
       - regime neutral      → pass (subject to funding-regime override below)
       - counter-trend trade → pass if any of:
           * confidence >= counter_regime_min_conf
@@ -248,27 +443,14 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     "the regime proxy is stale" signals and we never want to hard-block on
     a clear individual setup, just enforce regime discipline by default.
     """
-    from hermes_trader.agents.market_regime import detect_regime
-    regime = detect_regime(ctx.coin)
+    from hermes_trader.agents.market_regime import detect_regime_with_score
+    regime, trend_score = detect_regime_with_score(ctx.coin)
 
-    # Pull funding regime (cached) — used as a symmetric overlay on the
-    # trend-regime gate. Both directions are treated identically: anything
-    # going against the crowded side faces the elevated bar.
-    #
-    # PER-CLASS LOOKUP: the gate uses the funding regime of THIS coin's
-    # asset class (crypto / equity / commodity), not a global crypto-only
-    # signal. Without this, a SHORT_CROWDED crypto regime would gate longs
-    # on oil (xyz:CL) and semis (xyz:ARM) — those have their own funding
-    # markets and shouldn't be evaluated by the crypto crowd.
-    try:
-        from hermes_trader.agents.hyperfeed import market_get_funding_regime
-        from hermes_trader.agents.market_regime import classify_asset
-        funding_data = market_get_funding_regime()
-        coin_class = classify_asset(ctx.coin)
-        by_class = funding_data.get("regimes_by_class") or {}
-        funding_regime = by_class.get(coin_class) or funding_data.get("regime", "NEUTRAL")
-    except Exception:
-        funding_regime = "NEUTRAL"
+    # Funding regime (cached) used as a symmetric overlay on the trend-regime
+    # gate. Both directions are treated identically: anything going against
+    # the crowded side faces the elevated bar. Extracted to _funding_regime_for
+    # (P2-1): per-class lookup, fail-open to NEUTRAL with WARNING visibility.
+    funding_regime = _funding_regime_for(ctx.coin)
 
     # Symmetric counter-funding-regime detection.
     against_funding = (
@@ -291,12 +473,24 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     effective_min_conf = counter_regime_min_conf
     effective_min_score = 50.0
     if against_funding:
-        effective_min_conf = max(counter_regime_min_conf, 0.85)
-        effective_min_score = 60.0
+        # P3 defense: an empty-string env override (HERMES_CFG_...='') makes
+        # cfg_get return '', and float('') raises ValueError. `or default`
+        # coerces ''/None to the elevated-bar defaults (0.85 conf / 60 score).
+        try:
+            _af_min_conf = float(cfg_get("against_funding_min_conf") or 0.85)
+        except (TypeError, ValueError):
+            _af_min_conf = 0.85
+        try:
+            _af_min_score = float(cfg_get("against_funding_min_score") or 60.0)
+        except (TypeError, ValueError):
+            _af_min_score = 60.0
+        effective_min_conf = max(counter_regime_min_conf, _af_min_conf)
+        effective_min_score = _af_min_score
 
     # Context attached to every result so the log reads "why" without
     # re-deriving regime state after the fact.
-    base = {"regime": regime, "funding": funding_regime,
+    base = {"regime": regime, "trend_score": round(trend_score, 3),
+            "funding": funding_regime,
             "against_funding": against_funding, "counter_trend": False}
 
     # Aligned with trend regime AND not against funding regime → easy pass,
@@ -305,7 +499,14 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     # squeeze, so a weak one is blocked here.
     aligned = (regime == "up" and ctx.trade_side == "long") or \
               (regime == "down" and ctx.trade_side == "short")
-    if aligned and not against_funding:
+    # Continuous strength overlay: the 4-state EMA20/50 cross fires on
+    # weak/noise bars (audit: 36% false-trend rate). Demote an "aligned" entry
+    # whose 5-component score is below min_trend_score to the counter-trend bar
+    # below, so a high-conviction own-coin signal (conf/score/momentum burst)
+    # can still clear it but a weak free-pass no longer does. min_trend_score=0
+    # disables the overlay (reverts to the original always-pass-aligned behavior).
+    weak_aligned = aligned and min_trend_score > 0 and trend_score < min_trend_score
+    if aligned and not against_funding and not weak_aligned:
         if with_crowd and crowded_with_min_conf > 0 and ctx.confidence < crowded_with_min_conf:
             return {"pass": False, "via": "crowded_squeeze",
                     **{**base, "with_crowd": True},
@@ -318,40 +519,21 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     if regime == "neutral" and not against_funding:
         return {"pass": True, "via": "neutral", **base}
 
-    # Past here the trade is counter-trend and/or against the funding crowd —
-    # it must clear the (possibly elevated) bar via conviction or own-signal.
-    base["counter_trend"] = not aligned
-    if ctx.confidence >= effective_min_conf:
-        return {"pass": True, "via": "confidence", **base}
-    if ctx.composite_score >= effective_min_score:
-        return {"pass": True, "via": "composite", **base}
-    # Binary-trigger bypass: a strong own-coin signal (momentum_burst / slow_burn
-    # / whale) normally overrides the slow macro-regime call. `block_counter_trend_bypass`
-    # (config, default False, reversible) DISABLES this bypass here — i.e. for trades
-    # that are already counter-trend and/or against the funding crowd. Data (journal
-    # P166-P177, ~-7% drawdown) showed low-conviction LONGS forced through via
-    # `trigger:slow_burn` against a DOWN tape (SP500/MU/ORCL longs) and bleeding. With
-    # the flag on, a counter-regime trade must clear REAL conviction (conf/score); a
-    # lone momentum trigger no longer pushes it through against the regime. Aligned and
-    # neutral-regime trades returned earlier (lines above) and are UNAFFECTED, so this
-    # does NOT blanket-weaken the bypass — only where it fights a strong directional regime.
-    if (ctx.momentum_burst_fired or ctx.slow_burn_fired or ctx.whale_signal_fired) \
-            and not block_counter_trend_bypass:
-        trig = ("momentum_burst" if ctx.momentum_burst_fired
-                else "slow_burn" if ctx.slow_burn_fired else "whale")
-        return {"pass": True, "via": f"trigger:{trig}", **base}
+    # Chop regime (ADX<20, EMA-neutral): a directionless whipsaw tape. Unlike
+    # 'neutral' (which free-passes), chop RAISES the bar — both long and short
+    # are technically counter-trend in a range, and fakeout breakouts are the
+    # dominant loss mode here. Require real conviction (conf/score) OR a
+    # momentum burst (a genuine impulse out of the range); a lone slow_burn /
+    # whale ping does NOT clear it (those fire constantly in chop).
+    if regime == "chop" and not against_funding:
+        return _chop_decision(ctx, base, counter_regime_min_conf,
+                              block_counter_trend_bypass)
 
-    blocked_via = "blocked_bypass" if block_counter_trend_bypass else "blocked"
-    return {
-        "pass": False,
-        "via": blocked_via,
-        **base,
-        "reason": (f"counter-regime {ctx.trade_side} vs {regime} trend "
-                   f"(funding={funding_regime}) — need conf >= {effective_min_conf:.2f} "
-                   f"or score >= {effective_min_score:.0f}"
-                   f"{'' if block_counter_trend_bypass else ' or own-coin signal'}, "
-                   f"have conf {ctx.confidence:.2f}, score {ctx.composite_score:.0f}"),
-    }
+    # Past here the trade is counter-trend and/or against the funding crowd —
+    # the (possibly elevated) conviction/own-signal bar lives in the helper.
+    return _counter_trend_decision(
+        ctx, base, regime, funding_regime, aligned, weak_aligned,
+        effective_min_conf, effective_min_score, block_counter_trend_bypass)
 
 
 def news_blackout_gate(ctx: GateContext) -> GateResult:
@@ -360,6 +542,140 @@ def news_blackout_gate(ctx: GateContext) -> GateResult:
     detail = f" — {ctx.binary_news_match}" if ctx.binary_news_match else ""
     return {"pass": False,
             "reason": f"binary news risk (Fed/earnings/hack in recent news){detail} — standing down"}
+
+
+_debate_defaults_warned = False
+
+
+def _warn_debate_defaults() -> None:
+    """One-time warning: debate_gate is running with no explicit config
+    section (fail-closed default-on, P0-A)."""
+    global _debate_defaults_warned
+    if not _debate_defaults_warned:
+        _debate_defaults_warned = True
+        logger.warning(
+            "[risk_gates] debate_gate enabled with IMPLICIT defaults "
+            "(no debate_gate section in config) — min_agreement=0.6, "
+            "min_agree_count=3, analyst3_default=False. Set "
+            "debate_gate.enabled=false explicitly to disable."
+        )
+
+
+def debate_gate(
+    ctx: GateContext,
+    config: Dict[str, Any],
+) -> GateResult:
+    """Multi-agent debate risk gate (B4).
+
+    Simulates a lightweight multi-analyst debate by checking the trade's
+    signal strength across multiple dimensions:
+      - confidence consensus: high confidence + composite score alignment
+      - trigger diversity: how many independent trigger types fired
+      - whale/regime corroboration: independent validators vote too
+
+    Fail-closed: when debate_gate is missing from config the gate ENABLES
+    itself with defaults (a missing config must not silently disable a risk
+    check). Set ``debate_gate.enabled: false`` explicitly to turn it off.
+    The gate is intentionally lightweight — a full multi-LLM debate is
+    delegated to the native in-process research debate; this is a fast
+    pre-filter that catches obvious lone-analyst overrides.
+
+    The gate evaluates five independent analysts:
+      1. Trigger diversity: at least one trigger type fired
+      2. Confidence/score consensus: confidence aligns with composite_score
+      3. Regime alignment: NOT re-detected here (the market_regime gate owns
+         that dimension) — this vote is configurable via
+         ``analyst3_default`` and DEFAULTS TO False (no rubber-stamp vote;
+         P0-D fix 2026-08-26). Set it true to restore the legacy behavior.
+      4. News risk: blocks when a binary-news risk is present
+      5. Whale boost: a whale signal or very high confidence
+
+    Scoring:
+      - Each analyst votes 0 or 1
+      - agree_count / 5 = agreement_ratio
+      - Block unless ratio >= min_agreement AND count >= min_agree_count
+    """
+    debate_cfg = config.get("debate_gate", {})
+    if not debate_cfg.get("enabled", True):
+        return {"pass": True, "via": "debate_disabled"}
+    if not debate_cfg:
+        # Config section entirely absent — the gate is running on implicit
+        # defaults. Log once so the fail-closed default is never silent.
+        _warn_debate_defaults()
+    analyst3_default = bool(debate_cfg.get("analyst3_default", False))
+
+    min_agreement = float(debate_cfg.get("min_agreement", 0.6))
+    min_agree_count = int(debate_cfg.get("min_agree_count", 3))
+
+    # --- Analyst 1: Trigger diversity ---
+    # Count how many independent trigger types are firing
+    trigger_types = [
+        ctx.momentum_burst_fired,
+        ctx.slow_burn_fired,
+        ctx.whale_signal_fired,
+    ]
+    active_triggers = sum(1 for t in trigger_types if t)
+    analyst1_agree = active_triggers >= 1  # At least one trigger type active
+
+    # --- Analyst 2: Confidence vs Composite alignment ---
+    # High confidence + high composite = strong consensus
+    # Low confidence + high composite (or vice versa) = mixed signal
+    if ctx.confidence >= 0.7 and ctx.composite_score >= 40:
+        analyst2_agree = True
+    elif ctx.confidence >= 0.5 and ctx.composite_score >= 60:
+        analyst2_agree = True
+    elif ctx.confidence >= 0.8 and ctx.composite_score >= 20:
+        analyst2_agree = True
+    else:
+        analyst2_agree = False
+
+    # --- Analyst 3: Regime alignment ---
+    # Regime is owned by the market_regime gate; this lightweight pre-filter
+    # must not re-detect it. Historically this vote was hard-coded True, which
+    # handed every trade a free vote out of five (P0-D). It now defaults to
+    # False — trades must earn consensus from the real signal votes — and can
+    # be flipped back via debate_gate.analyst3_default for legacy behavior.
+    analyst3_agree = analyst3_default
+
+    # --- Analyst 4: News risk check ---
+    analyst4_agree = not ctx.has_binary_news_risk
+
+    # --- Analyst 5: Whale signal boost ---
+    # Whale signals are a strong independent validator
+    analyst5_agree = ctx.whale_signal_fired or ctx.confidence >= 0.75
+
+    # --- Consensus ---
+    analyst_votes = [analyst1_agree, analyst2_agree, analyst3_agree,
+                     analyst4_agree, analyst5_agree]
+    agree_count = sum(1 for v in analyst_votes if v)
+    agreement_ratio = agree_count / len(analyst_votes)
+
+    if agreement_ratio >= min_agreement and agree_count >= min_agree_count:
+        return {
+            "pass": True,
+            "via": "debate_consensus",
+            "agree_count": agree_count,
+            "total_analysts": len(analyst_votes),
+            "agreement_ratio": agreement_ratio,
+        }
+
+    return {
+        "pass": False,
+        "reason": (
+            f"multi-agent debate blocked: {agree_count}/{len(analyst_votes)} analysts agree "
+            f"(ratio {agreement_ratio:.2f} < {min_agreement}, need ≥{min_agree_count}). "
+            f"Triggers={active_triggers}, conf={ctx.confidence:.2f}, "
+            f"score={ctx.composite_score:.0f}, news_risk={ctx.has_binary_news_risk}"
+        ),
+        "agree_count": agree_count,
+        "total_analysts": len(analyst_votes),
+        "agreement_ratio": agreement_ratio,
+    }
+
+
+# Load cross-component shared config (~/.hermes-trading/config.yaml).
+# Canonical implementation lives in hermes_trader.shared_config.
+_load_shared_config = load_shared_config
 
 
 def _cfg(config: Dict[str, Any], key: str, default: Any) -> Any:
@@ -375,64 +691,141 @@ def eval_all_gates(
     ctx: GateContext,
     config: Dict[str, Any],
     last_trade_time: Optional[int] = None,
+    *,
+    analysis: Optional[Dict[str, Any]] = None,
+    trace_id: str = "",
 ) -> Dict[str, Any]:
     """Evaluate all risk gates and collect results."""
     results = {}
+    # ── DEBUG: eval_all_gates entry — full trade proposal context ────────
+    logger.debug(
+        "[risk][gates] eval_begin coin=%s side=%s confidence=%.3f "
+        "notional_usd=%.2f equity=%.2f total_open=%.2f daily_pnl=%.2f "
+        "peak_pnl=%.2f volume_24h=%.0f positions=%d news_risk=%s "
+        "score=%.2f burst=%s slow=%s whale=%s trace_id=%s",
+        ctx.coin, ctx.trade_side, ctx.confidence,
+        ctx.trade_notional_usd or 0.0, ctx.equity or 0.0,
+        ctx.total_open_notional or 0.0, ctx.daily_pnl or 0.0,
+        ctx.peak_daily_pnl or 0.0, ctx.market_volume_24h_usd or 0.0,
+        len(ctx.current_positions or []), ctx.has_binary_news_risk,
+        ctx.composite_score or 0.0, ctx.momentum_burst_fired,
+        ctx.slow_burn_fired, ctx.whale_signal_fired, trace_id,
+    )
     # Regime-aware confidence floor: a WITH-TREND (aligned) trade — long in an up
     # regime, SHORT in a DOWN regime — gets a lower bar (`aligned_min_conf`) than
     # the default `min_ai_confidence`. The 0.78 default was calibrated on the
     # LONG-side 0.70-0.80 leak; applying it to aligned shorts made us sit out
     # selloffs (e.g. SOL SHORT 0.72 / -6.3% / $399M blocked). Demand full
     # conviction only to fight the trend (neutral/counter-trend keep the default).
-    min_conf = float(_cfg(config, "min_ai_confidence", 0.8))
+    min_conf = float(cfg_get("min_ai_confidence", config=config))
     aligned_min_conf = config.get("aligned_min_conf")
     if aligned_min_conf is not None:
         try:
-            from hermes_trader.agents.market_regime import detect_regime
-            _rg = detect_regime(ctx.coin)  # cached (TTL); market_regime_gate reuses it
+            from hermes_trader.agents.market_regime import detect_regime_with_score
+            _rg, _score = detect_regime_with_score(ctx.coin)  # cached; market_regime_gate reuses
             _aligned = (_rg == "up" and ctx.trade_side == "long") or \
                        (_rg == "down" and ctx.trade_side == "short")
-            if _aligned:
+            # A weak EMA cross (score < min_trend_score) is demoted: it doesn't
+            # get the lower aligned-min-confidence discount either.
+            _min_ts = float(cfg_get("min_trend_score", config=config) or 0.0)
+            if _aligned and not (_min_ts > 0 and _score < _min_ts):
                 min_conf = min(min_conf, float(aligned_min_conf))
         except Exception:
             pass
+    logger.debug(
+        "[risk][gates] confidence_floor coin=%s side=%s "
+        "min_conf=%.3f (aligned_min_conf=%s)",
+        ctx.coin, ctx.trade_side, min_conf, aligned_min_conf,
+    )
     results["confidence"] = confidence_gate(ctx, min_conf)
-    results["max_concurrent"] = max_concurrent_positions_gate(ctx, config.get("max_concurrent", 3))
-    results["notional_cap"] = per_trade_notional_cap_gate(ctx, config.get("max_trade_notional_usd", 300))
-    results["daily_loss"] = daily_loss_kill_switch(ctx, config.get("max_daily_loss_usd", -100))
+    results["max_concurrent"] = max_concurrent_positions_gate(
+        ctx, int(cfg_get("max_concurrent", config=config)))
+    results["notional_cap"] = per_trade_notional_cap_gate(
+        ctx, float(cfg_get("max_trade_notional_usd", config=config)))
+    results["daily_loss"] = daily_loss_kill_switch(
+        ctx, float(cfg_get("max_daily_loss_usd", config=config)))
     results["daily_giveback"] = daily_giveback_gate(
         ctx,
-        float(config.get("daily_giveback_halt_pct", 0.0) or 0.0),
-        float(config.get("daily_giveback_min_peak_usd", 20.0) or 0.0),
+        float(cfg_get("daily_giveback_halt_pct", config=config)),
+        float(cfg_get("daily_giveback_min_peak_usd", config=config)),
     )
     results["liquidity"] = market_liquidity_floor(
         ctx,
-        config.get("min_market_volume_usd", 5_000_000),
-        config.get("min_hip3_volume_usd", 500_000),
+        float(cfg_get("min_market_volume_usd", config=config)),
+        float(cfg_get("min_hip3_volume_usd", config=config)),
     )
     results["short_liquidity"] = short_liquidity_floor(
-        ctx, config.get("min_short_volume_usd", 0) or 0)
+        ctx, float(cfg_get("min_short_volume_usd", config=config)) or 0)
     results["coin_filter"] = coin_allowlist_gate(
         ctx,
-        config.get("coin_allowlist", []),
-        config.get("coin_blocklist", []),
+        cfg_get("coin_allowlist", config=config) or [],
+        cfg_get("coin_blocklist", config=config) or [],
     )
-    results["cooldown"] = cooldown_gate(ctx, last_trade_time, config.get("cooldown_min", 60))
+    results["cooldown"] = cooldown_gate(
+        ctx, last_trade_time, float(cfg_get("cooldown_min", config=config)))
+    # Tiered circuit breakers (sizing/risk-overhaul 2026-08-26): armed at the
+    # close chokepoint, enforced here so a halted coin/book cannot re-enter.
+    results["coin_circuit"] = coin_circuit_breaker_gate(ctx)
+    results["global_halt"] = global_halt_gate(ctx)
     results["opposite_guard"] = opposite_direction_guard(ctx)
-    results["correlation"] = correlation_cap(ctx, int(config.get("max_crypto_long_correlated", 2)))
-    results["equity_risk"] = equity_risk_cap(ctx, config.get("max_total_notional_pct", 1.0))  # Default 100% to allow trading with small accounts
+    results["correlation"] = correlation_cap(
+        ctx, int(cfg_get("max_crypto_long_correlated", config=config)))
+    results["equity_risk"] = equity_risk_cap(
+        ctx, float(cfg_get("max_total_notional_pct", config=config)))
     results["market_regime"] = market_regime_gate(
-        ctx, _cfg(config, "counter_regime_min_conf", 0.7),
-        bool(_cfg(config, "block_counter_trend_bypass", False)),
-        float(_cfg(config, "crowded_with_min_conf", 0.0) or 0.0),
+        ctx, float(cfg_get("counter_regime_min_conf", config=config)),
+        bool(cfg_get("block_counter_trend_bypass", config=config)),
+        float(cfg_get("crowded_with_min_conf", config=config) or 0.0),
+        float(cfg_get("min_trend_score", config=config) or 0.0),
     )
     results["news"] = news_blackout_gate(ctx)
+    results["debate"] = debate_gate(ctx, config)
 
     block_reasons = []
     blocked = False
+    # P3-1: count gate blocks (keys are the fixed gate names below; anything
+    # unexpected is normalised to "other" to keep the label bounded).
+    _GATE_KEYS = {
+        "confidence", "max_concurrent", "notional_cap", "daily_loss",
+        "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
+        "cooldown", "coin_circuit", "global_halt", "opposite_guard",
+        "correlation", "equity_risk", "market_regime", "news", "debate",
+    }
     for key, result in results.items():
         if not result.get("pass"):
             blocked = True
             block_reasons.append(result.get("reason", key))
+            try:
+                from hermes_trader import metrics
+                metrics.RISK_GATE_BLOCKS.labels(
+                    gate=key if key in _GATE_KEYS else "other").inc()
+            except Exception:  # noqa: BLE001
+                pass
+    # P3-1: market-regime verdict code (trigger:* variants collapse to
+    # "trigger"; anything outside the known via codes falls to "other").
+    try:
+        from hermes_trader import metrics
+        _via = str(results.get("market_regime", {}).get("via", "") or "")
+        if _via.startswith("trigger:"):
+            _via = "trigger"
+        _REGIME_VIAS = {
+            "aligned", "neutral", "chop_conviction", "chop_blocked",
+            "confidence", "composite", "crowded_squeeze", "blocked",
+            "blocked_bypass", "trigger",
+        }
+        metrics.RISK_GATE_REGIME_VERDICTS.labels(
+            via=_via if _via in _REGIME_VIAS else "other").inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+    # ── DEBUG: per-gate pass/fail summary + final verdict ────────────────
+    gate_summary = ",".join(
+        f"{k}={'1' if v.get('pass') else '0'}" for k, v in results.items()
+    )
+    logger.debug(
+        "[risk][gates] eval_end coin=%s side=%s blocked=%s gates=[%s] block_reasons=%r",
+        ctx.coin, ctx.trade_side, blocked,
+        gate_summary, block_reasons,
+    )
 
     return {"results": results, "blocked": blocked, "block_reasons": block_reasons}

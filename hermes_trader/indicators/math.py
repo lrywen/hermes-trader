@@ -142,3 +142,26 @@ def adx(candles: List[Candle], period: int = 14) -> List[float]:
         out[i] = (out[i - 1] * (period - 1) + dx[i]) / period
 
     return out
+
+
+def obv(candles: List[Candle]) -> List[float]:
+    """On-balance volume: cumulative volume signed by close direction.
+
+    Rises when volume accumulates on up-closes, falls on down-closes. The
+    slope/level confirms whether a price move is backed by real participation
+    (OBV confirms price) or is a weak/ divergent push.
+    """
+    out = [0.0] * len(candles)
+    running = 0.0
+    prev_close = None
+    for i, c in enumerate(candles):
+        close = candle_val(c, "c")
+        vol = candle_val(c, "v")
+        if prev_close is not None:
+            if close > prev_close:
+                running += vol
+            elif close < prev_close:
+                running -= vol
+        out[i] = running
+        prev_close = close
+    return out

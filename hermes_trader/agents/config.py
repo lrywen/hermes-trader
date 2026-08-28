@@ -35,6 +35,10 @@ TRIGGER_CONFIG: Dict[str, Any] = {
         "trendMomentumLookback": 72,  # 5m bars (~6h) for sustained up/down trend surfacing
         "trendMomentumPct": 5.0,      # min |%| move over ~6h to surface (5%: 3.0 over-surfaced — 22 triggers/scan, ~4.5x AI cost, flooded longs)
         "breakoutLookback": 48,
+        "breakoutMinRvol": 1.5,       # RVOL threshold: close break only fires when current vol >= this × prior avg
+        "breakoutRvolWindow": 20,     # prior-bar window for the RVOL average
+        "breakoutAtrScoreMult": 3.0,  # ATR-normalized score multiplier: min(10, distance/ATR * mult)
+        "breakoutConfirmBars": 2,     # consecutive closes beyond the edge required to fire (rejects 1-bar fakeouts)
         "bbLength": 20,
         "bbStdDev": 2,
         "adxPeriod": 14,
@@ -52,6 +56,17 @@ TRIGGER_CONFIG: Dict[str, Any] = {
         # 1h candles don't change mid-hour; cache 10min so we only refetch
         # every 10 scans, keeping the per-cycle weight budget intact.
         "cacheTtlMs1h": 600_000,
+        # Score CLOSED bars only: when the last 5m/1h bar is still forming,
+        # drop it and evaluate the last completed bar. Fixes the missed-surge
+        # bug where a strong close (e.g. BTC 12:40) was scored mid-formation at
+        # ~40% progress (composite 36 < gate 54), then slid to [-2] unevaluated
+        # when the next bar opened. Intra-bar signals now arrive at most one
+        # bar (~5min) late, but are deterministic.
+        "evaluateClosedBarsOnly": True,
+        # Within this many ms after a bar closes, bypass the candle cache to
+        # guarantee we read the just-completed bar instead of a pre-close
+        # snapshot still within cacheTtlMs.
+        "postCloseForceRefreshMs": 15_000,
     },
 }
 

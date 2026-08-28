@@ -8,14 +8,17 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 
 # Install deps first so `pip install` is cached across code changes.
+# 使用清华 PyPI 镜像（国内直连可达，无需代理）
 COPY pyproject.toml ./
 COPY hermes_trader/__init__.py hermes_trader/__init__.py
-RUN pip install -e .
+RUN pip install -e . --index-url https://pypi.tuna.tsinghua.edu.cn/simple
 
 # Copy the rest of the source.
 COPY hermes_trader/ hermes_trader/
 COPY scripts/ scripts/
 COPY conftest.py ./
+# Ops docs (e.g. DSL/SL manual) so they ship inside the image.
+COPY docs/ docs/
 
 # State lives on a Fly volume mounted at /data; defaults are overridden via env
 # in fly.toml so the loop + server + MCP all share one source of truth.

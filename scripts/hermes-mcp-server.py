@@ -29,6 +29,10 @@ if os.path.exists(_env_path):
                 key, _, val = line.partition('=')
                 os.environ.setdefault(key.strip(), val.strip())
 
+# Write-operation gate — all trade-affecting MCP tools require this.
+# Set to "1" only in the MCP server's env when write operations are needed.
+_HERMES_MCP_ALLOW_WRITE = os.environ.get("HERMES_MCP_ALLOW_WRITE", "0") == "1"
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -66,6 +70,17 @@ def _norm_coin(raw: str) -> str:
         dex, _, sym = raw.partition(":")
         return f"{dex}:{sym.upper()}"
     return raw.upper()
+
+
+def _check_write_gate() -> str | None:
+    """Return None if write gate is open, else an error JSON string."""
+    if not _HERMES_MCP_ALLOW_WRITE:
+        return json.dumps({
+            "status": "blocked",
+            "error": "Write operations are disabled by default. "
+                     "Set HERMES_MCP_ALLOW_WRITE=1 in the MCP server env to enable.",
+        })
+    return None
 
 # Tools whose underlying SDK call is not yet wired up. Each one is registered
 # with the MCP server so clients don't get a "tool not found" error, but
@@ -140,6 +155,37 @@ TOOLS = [
                 },
             },
             "required": ["coin"],
+        },
+    },
+    {
+        "name": "deep_research",
+        "description": "Multi-agent deep research on a ticker using HermesTradingAgents (LangGraph). Launches 4 analysts (market, social, news, fundamentals) + debate + risk review. Slower but more thorough than research.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "ticker": {
+                    "type": "string",
+                    "description": "Ticker symbol, e.g. BTC-USD, ETH-USD, SOL-USD, AAPL, NVDA",
+                },
+                "date": {
+                    "type": "string",
+                    "description": "Analysis date YYYY-MM-DD (default: today)",
+                },
+                "asset_type": {
+                    "type": "string",
+                    "enum": ["crypto", "stock"],
+                    "description": "Asset type (default: crypto)",
+                },
+                "max_debate_rounds": {
+                    "type": "number",
+                    "description": "Max debate rounds (default: 1, max: 3)",
+                },
+                "max_risk_discuss_rounds": {
+                    "type": "number",
+                    "description": "Max risk discussion rounds (default: 1, max: 3)",
+                },
+            },
+            "required": ["ticker"],
         },
     },
     {
@@ -923,6 +969,9 @@ def handle_state(params: Dict[str, Any]) -> str:
 
 
 def handle_config(params: Dict[str, Any]) -> str:
+    gate = _check_write_gate()
+    if gate:
+        return gate
     from hermes_trader.agents.config_store import read_agent_config, write_agent_config
 
     config = read_agent_config()
@@ -1015,6 +1064,14 @@ def handle_research(params: Dict[str, Any]) -> str:
 
 
 def handle_execute(params: Dict[str, Any]) -> str:
+    """Execute a trade — gated by HERMES_MCP_ALLOW_WRITE env var."""
+    if not _HERMES_MCP_ALLOW_WRITE:
+        return json.dumps({
+            "status": "blocked",
+            "error": "execute is disabled by default. "
+                     "Set HERMES_MCP_ALLOW_WRITE=1 in the MCP server env to enable.",
+        })
+
     from hermes_trader.agents.executor import maybe_execute
     from hermes_trader.agents.memory import memory
 
@@ -1051,6 +1108,71 @@ def handle_execute(params: Dict[str, Any]) -> str:
         return json.dumps({
             "status": "error",
             "coin": analysis.get("coin"),
+            "error": str(e),
+        })
+
+
+def handle_deep_research(params: Dict[str, Any]) -> str:
+    """Multi-agent deep research via HermesTradingAgents LangGraph.
+
+    Calls TradingAgentsGraph.propagate() to run 4 analysts + debate +
+    risk review, returning a structured decision.
+    """
+    from datetime import date
+
+    ticker = params.get("ticker", "")
+    if not ticker:
+        return json.dumps({"status": "error", "error": "ticker is required"})
+
+    analysis_date = params.get("date") or date.today().strftime("%Y-%m-%d")
+    asset_type = params.get("asset_type", "crypto")
+    max_debate_rounds = min(int(params.get("max_debate_rounds", 1)), 3)
+    max_risk_discuss_rounds = min(int(params.get("max_risk_discuss_rounds", 1)), 3)
+
+    # Ensure HermesTradingAgents is on sys.path
+    _hta_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "HermesTradingAgents")
+    _hta_path = os.path.abspath(_hta_path)
+    if os.path.isdir(_hta_path) and _hta_path not in sys.path:
+        sys.path.insert(0, _hta_path)
+
+    try:
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
+        from tradingagents.default_config import DEFAULT_CONFIG
+
+        config = DEFAULT_CONFIG.copy()
+        config["output_language"] = "English"
+        config["max_debate_rounds"] = max_debate_rounds
+        config["max_risk_discuss_rounds"] = max_risk_discuss_rounds
+        # Avoid checkpointing in a subprocess MCP context
+        config["checkpoint_enabled"] = False
+
+        graph = TradingAgentsGraph(debug=False, config=config)
+        final_state, decision = graph.propagate(ticker, analysis_date, asset_type=asset_type)
+
+        return json.dumps({
+            "status": "complete",
+            "ticker": ticker,
+            "date": analysis_date,
+            "asset_type": asset_type,
+            "decision": decision,
+            "debate_rounds": max_debate_rounds,
+            "risk_rounds": max_risk_discuss_rounds,
+            "note": "Full final_state available at graph.curr_state after propagate()",
+        }, indent=2, default=str)
+    except ImportError as e:
+        return json.dumps({
+            "status": "error",
+            "error": "HermesTradingAgents not installed",
+            "detail": (
+                "Run: cd /path/to/HermesTradingAgents && pip install -e .  "
+                "or set PIP_REQUIRE_VIRTUALENV=0 if using a system-level install."
+            ),
+            "import_error": str(e),
+        })
+    except Exception as e:
+        return json.dumps({
+            "status": "error",
+            "ticker": ticker,
             "error": str(e),
         })
 
@@ -1128,6 +1250,7 @@ def run() -> None:
     tool_handlers = {
         "scan": handle_scan,
         "research": handle_research,
+        "deep_research": handle_deep_research,
         "execute": handle_execute,
         "state": handle_state,
         "config": handle_config,
@@ -1265,6 +1388,9 @@ def handle_get_candles(params: Dict[str, Any]) -> str:
     return json.dumps([c.model_dump() for c in candles], indent=2, default=str)
 
 def handle_close_position(params: Dict[str, Any]) -> str:
+    gate = _check_write_gate()
+    if gate:
+        return gate
     """Handle close_position tool call."""
     from hermes_trader.client.exchange import get_hl_price, place_hl_order
     
@@ -1296,6 +1422,9 @@ def handle_close_position(params: Dict[str, Any]) -> str:
         return json.dumps({'closed': False, 'error': str(e)}, default=str)
 
 def handle_set_leverage(params: Dict[str, Any]) -> str:
+    gate = _check_write_gate()
+    if gate:
+        return gate
     """Handle set_leverage tool call."""
     from hermes_trader.client.exchange import set_leverage as set_leverage_fn
     coin = _norm_coin(params.get('coin', 'BTC'))
@@ -1315,6 +1444,9 @@ def handle_get_open_orders(params: Dict[str, Any]) -> str:
     return json.dumps(orders, indent=2, default=str)
 
 def handle_cancel_order(params: Dict[str, Any]) -> str:
+    gate = _check_write_gate()
+    if gate:
+        return gate
     """Handle cancel_order tool call."""
     from hermes_trader.client.exchange import _make_exchange
     asset = params.get('asset')

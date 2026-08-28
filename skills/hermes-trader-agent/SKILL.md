@@ -1,12 +1,12 @@
 ---
 name: hermes-trader-agent
-description: Use when operating, maintaining, or debugging hermes-trader — the standalone autonomous Hyperliquid trading system that Hermes Agent drives through its MCP server. Covers the scan/research/execute pipeline, the 11 risk gates, MCP tool wiring, and Hyperliquid order-placement gotchas.
-version: 1.0.0
+description: Use when operating, maintaining, or debugging hermes-trader — the standalone autonomous Hyperliquid trading system that Hermes Agent drives through its MCP server. Covers the scan/research/deep_research/execute pipeline, the 11 risk gates, MCP tool wiring, multi-agent deep analysis via LangGraph, and Hyperliquid order-placement gotchas.
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 metadata:
   hermes:
-    tags: [trading, hyperliquid, mcp, autonomous, quant]
+    tags: [trading, hyperliquid, mcp, autonomous, quant, multi-agent, langgraph]
     related_skills: [hyperliquid-agent-wallets]
     homepage: https://github.com/Julian-dev28/hermes-trader
 ---
@@ -22,7 +22,7 @@ operates it through the **MCP server** registered in `~/.hermes/config.yaml`
 trading engine itself has no Hermes-framework dependency; it is
 Hermes-*operated*, not Hermes-*built*.
 
-Repo: `/Users/julian_dev/Documents/code/hermes-trader`. The user develops on
+Repo: `/home/ldy/hermes-trader`. The user develops on
 branch `python` and fast-forward-merges to `daily-push-v2` (the deploy
 branch) after each batch of changes. **Never push directly to other branches
 without explicit confirmation.**
@@ -52,7 +52,9 @@ A pipeline designed to keep AI token cost proportional to real opportunity:
    EMA, RSI, ATR, ADX, volume) at zero AI cost. Only CONFIRMED perceptions
    (score ≥ 45) reach AI research; WEAK / REJECTED are dropped. A perception
    whose `momentumBurst` trigger fired bypasses the gate.
-4. **AI Research** — deep AI analysis via OpenRouter on triggered candidates.
+4. **AI Research** — deep AI analysis on triggered candidates. Two modes:
+   - **`research`** (default) — fast, single LLM call via OpenRouter on each candidate.
+   - **`deep_research`** (optional) — multi-agent LangGraph analysis orchestrating 4 specialist analysts (Market, Social, News, Fundamental) via DeepSeek, including debate rounds and risk committee review. Significantly deeper but slower (10–30s per ticker). Accessible via the MCP `deep_research` tool or the `hermes-trading-agents` MCP `trading_analyze` tool.
 5. **Execution** — ATR equal-risk sizing when `atr_risk_sizing.enabled=true`
    (current live path), with fraction-based sizing as the explicit fallback.
    Orders are clamped by per-trade notional and leverage caps, normalized to
@@ -123,25 +125,103 @@ mid-cycle (`hip3_disabled` / `crypto_disabled` reasons).
 
 ## MCP Integration
 
-The server (`scripts/hermes-mcp-server.py`, stdio, 100 tools) is registered in
+Two MCP servers are involved in the integration, both registered in
 `~/.hermes/config.yaml`:
+
+1. **`hermes-trader`** (`scripts/hermes-mcp-server.py`, stdio, 101 tools) —
+   the trading engine boundary. Tools: `scan`, `research`, `deep_research`,
+   `execute`, `state`, `config`.
+2. **`hermes-trading-agents`** (`/home/ldy/HermesTradingAgents/mcp/hermes_trading_tool.py`,
+   stdio) — the standalone multi-agent LangGraph analysis framework. Tools:
+   `trading_analyze` (full TradingAgentsGraph run on a ticker),
+   `market_scan` (fast univariate screen). This is the same engine that
+   `deep_research` invokes in-process, exposed as a standalone MCP server.
 
 ```yaml
 mcp_servers:
   hermes-trader:
     command: python3
     args:
-      - /Users/julian_dev/Documents/code/hermes-trader/scripts/hermes-mcp-server.py
-    cwd: /Users/julian_dev/Documents/code/hermes-trader   # recommended
+      - /home/ldy/hermes-trader/scripts/hermes-mcp-server.py
+    cwd: /home/ldy/hermes-trader   # recommended
     timeout: 60
     connect_timeout: 30
     env:
       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+  hermes-trading-agents:
+    command: /usr/bin/python3
+    args:
+      - /home/ldy/HermesTradingAgents/mcp/hermes_trading_tool.py
+    enabled: true
+    env:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      TRADINGAGENTS_LLM_PROVIDER: deepseek
+      TRADINGAGENTS_DEEP_THINK_LLM: deepseek-chat
+      TRADINGAGENTS_QUICK_THINK_LLM: deepseek-chat
+      TRADINGAGENTS_OUTPUT_LANGUAGE: English
+      TRADINGAGENTS_MAX_DEBATE_ROUNDS: "1"
+      TRADINGAGENTS_MAX_RISK_ROUNDS: "1"
+      TRADINGAGENTS_CHECKPOINT_ENABLED: "false"
 ```
 
-Primary tools: `scan`, `research`, `execute`, `state`, `config`. Adding tools and
-the audit invariant: see `references/mcp-server.md`. After editing the server,
-restart it: `pkill -f hermes-mcp-server.py` (the next call respawns it fresh).
+Adding tools and the audit invariant: see `references/mcp-server.md`. After
+editing the server, restart it: `pkill -f hermes-mcp-server.py` (the next call
+respawns it fresh).
+
+## Deep Research (Multi-Agent Analysis)
+
+Three analysis depths are available; pick by time/cost budget:
+
+| Mode | Latency | LLM | What it does |
+|------|---------|-----|--------------|
+| `research` | ~2–5s | OpenRouter (single call) | Standard hermes-trader AI analysis of a perception/candidate. |
+| `deep_research` | 10–30s | DeepSeek (multi-agent graph) | Full LangGraph run: 4 specialist analysts (Market, Social, News, Fundamental) → debate rounds → risk committee review → final decision. |
+| `trading_analyze` | 10–30s | DeepSeek (multi-agent graph) | Same TradingAgentsGraph engine as `deep_research`, exposed as the standalone `hermes-trading-agents` MCP server (useful when calling from Hermes Agent directly). |
+
+The `deep_research` MCP tool accepts:
+
+- `ticker` (required) — e.g. `BTC`, `ETH`, `SOL`.
+- `date` (optional, default today) — `YYYY-MM-DD`.
+- `asset_type` (optional, default `crypto`).
+- `max_debate_rounds` (optional, default 1, capped at 3).
+- `max_risk_discuss_rounds` (optional, default 1, capped at 3).
+
+**Selection guidance:** use `research` for routine candidate screening inside
+the trading loop (cost-proportional). Reserve `deep_research` / `trading_analyze`
+for high-conviction pre-trade checks, coverage gaps, or when the user asks for a
+fundamental/multi-agent opinion on a specific ticker — it is not free
+(4 analyst agents + debate + risk committee ≈ 10–30 LLM calls/run).
+
+**Dependencies:** requires the sibling repo `/home/ldy/HermesTradingAgents`
+(its `tradingagents.graph.trading_graph.TradingAgentsGraph` is imported
+in-process) and a valid `DEEPSEEK_API_KEY` (see below). `checkpoint_enabled`
+is forced off inside `deep_research` to avoid SQLite conflicts in the MCP
+subprocess.
+
+### Environment Requirements
+
+`deep_research`, `trading_analyze`, and `market_scan` all require DeepSeek API
+access via Volcano Engine. Configure the following in `~/.hermes/.env`:
+
+```bash
+# DeepSeek via Volcano Engine (火山引擎)
+DEEPSEEK_API_KEY=ark-...                       # your Volcano Engine API key
+DEEPSEEK_BASE_URL=https://ark.cn-beijing.volces.com/api/coding/v3
+```
+
+The Hermes Agent MCP server config (`~/.hermes/config.yaml`) already declares
+`DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}` and `DEEPSEEK_BASE_URL: ${DEEPSEEK_BASE_URL}`
+in the `hermes-trading-agents` env block, so `_interpolate_env_vars()` will
+resolve them at startup. Without these, the multi-agent graph will fail with an
+authentication error.
+
+**Model mapping:** `TRADINGAGENTS_DEEP_THINK_LLM` and
+`TRADINGAGENTS_QUICK_THINK_LLM` are both set to `deepseek-v4-flash`.
+
+**Note:** `deep_research` runs inside the `hermes-trader` MCP server process
+(`scripts/hermes-mcp-server.py`), which loads `.env.local` from the project
+root. If `hermes-trader` is not registered in `~/.hermes/config.yaml`, ensure
+`DEEPSEEK_API_KEY` and `DEEPSEEK_BASE_URL` are present in `.env.local`.
 
 ## State Files
 

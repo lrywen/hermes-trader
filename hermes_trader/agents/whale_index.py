@@ -1,8 +1,13 @@
 """Whale Index — smart-money signal heuristics over the Hyperliquid universe.
 
-Provides OI/funding-based concentration and accumulation signals.
-leaderboard_get_top / get_trader_state only return data for wallets added
-to WHALE_WALLETS.
+Provides OI/funding-based concentration and accumulation signals. The HL
+PUBLIC api has NO leaderboard endpoint (verified: vaults/leaderBoard/
+vaultDetails all return None), so production uses self-sourced, verifiable
+signals (OI surge + negative funding) rather than a static wallet registry.
+The older per-wallet leaderboard/get_trader_state helpers were removed
+because the WHALE_WALLETS registry was always empty — they only ever
+returned [] / None and gave a false impression of coverage. MCP callers use
+hyperfeed.leaderboard_get_top (private backend) instead.
 """
 
 from __future__ import annotations
@@ -11,9 +16,8 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from hermes_trader.client.hl_client import _http_post
 from hermes_trader.client.universe import get_universe
 
 logger = logging.getLogger(__name__)
@@ -28,66 +32,6 @@ _OI_HISTORY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     ".oi-history.json",
 )
-
-# Curated whale wallet registry. Add entries from app.hyperliquid.xyz/leaderboard
-# or hyperstats.org; format: "0x...": {"name": ..., "risk": "low"|"medium"|"high"}.
-WHALE_WALLETS: Dict[str, Dict[str, str]] = {}
-
-# ── Leaderboard from on-chain data ──────────────────────────────────────
-
-def _fetch_clearinghouse(user: str) -> Optional[Dict[str, Any]]:
-    """Fetch perp account state for a user address."""
-    return _http_post("/info", {"type": "clearinghouseState", "user": user})
-
-
-def _fetch_user_fills(user: str, limit: int = 100) -> List[Dict[str, Any]]:
-    """Fetch recent trades for a user."""
-    return _http_post(
-        "/info",
-        {"type": "userFills", "user": user, "limit": limit},
-    ) or []
-
-
-def leaderboard_get_top(
-    start: int = 0,
-    limit: int = 10,
-) -> List[Dict[str, Any]]:
-    """Return positions for the wallets registered in WHALE_WALLETS.
-
-    Args:
-        start: pagination offset
-        limit: number of entries (max 100)
-    """
-    results = []
-    for addr, meta in list(WHALE_WALLETS.items())[start:start + limit]:
-        try:
-            state = _fetch_clearinghouse(addr)
-            if not state:
-                continue
-            margin = state.get("marginSummary", {})
-            account_value = float(margin.get("accountValue", "0"))
-            positions = state.get("assetPositions", [])
-            
-            results.append({
-                "address": addr,
-                "name": meta.get("name", ""),
-                "account_value": account_value,
-                "positions": [
-                    {
-                        "coin": p["position"]["coin"],
-                        "szi": float(p["position"]["szi"]),
-                        "entryPx": float(p["position"]["entryPx"]),
-                        "leverage": {"value": p["position"]["leverage"].get("value", "0")},
-                    }
-                    for p in positions
-                    if p.get("position", {}).get("szi") != "0"
-                ],
-                "total_positions": len(positions),
-            })
-        except Exception as e:
-            logger.warning(f"[whale] Failed to fetch {addr}: {e}")
-    return results
-
 
 def smart_money_concentration(
     lookback_days: int = 7,
@@ -213,57 +157,6 @@ def oi_funding_anomaly(
             })
 
     return sorted(results, key=lambda x: x["confidence"], reverse=True)
-
-
-def get_trader_state(user: str) -> Optional[Dict[str, Any]]:
-    """Get comprehensive state for a specific trader address.
-    
-    Combines perp + spot state + recent trades into a single view.
-    """
-    perp = _fetch_clearinghouse(user)
-    fills = _fetch_user_fills(user, limit=20)
-    
-    if not perp:
-        return None
-    
-    margin = perp.get("marginSummary", {})
-    account_value = float(margin.get("accountValue", "0"))
-    total_ntl_pos = float(margin.get("totalNtlPos", "0"))
-    
-    positions = []
-    for p in perp.get("assetPositions", []):
-        if not p.get("position"):
-            continue
-        pos = p["position"]
-        szi = float(pos.get("szi", "0"))
-        if szi == 0:
-            continue
-        positions.append({
-            "coin": pos.get("coin", ""),
-            "side": "long" if szi > 0 else "short",
-            "size": abs(szi),
-            "entry_price": float(pos.get("entryPx", "0")),
-            "leverage": pos.get("leverage", {}).get("value", "0"),
-            "unrealized_pnl": float(pos.get("unrealizedPnl", "0")),
-        })
-    
-    return {
-        "address": user,
-        "account_value": account_value,
-        "total_notional_position": total_ntl_pos,
-        "positions": positions,
-        "recent_trades": [
-            {
-                "coin": f.get("coin", ""),
-                "side": f.get("side", ""),
-                "price": float(f.get("px", "0")),
-                "size": float(f.get("sz", "0")),
-                "fee": float(f.get("fee", "0")),
-                "time": f.get("time", 0),
-            }
-            for f in fills[:10]
-        ],
-    }
 
 
 # ── OI-surge whale detector (self-sourced, verifiable) ───────────────

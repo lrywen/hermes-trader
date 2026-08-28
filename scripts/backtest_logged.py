@@ -21,6 +21,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# P3-17: backtest process — never load a live mainnet private key.
+os.environ["HERMES_BACKTEST"] = "1"
+
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 _env = _REPO / ".env.local"
@@ -29,9 +32,11 @@ if _env.exists():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, _, v = line.partition("=")
+            if k.strip() == "HYPERLIQUID_PRIVATE_KEY":
+                continue
             os.environ.setdefault(k.strip(), v.strip())
 
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.sizing import atr_equal_risk_notional
 from hermes_trader.client.exchange import get_max_leverage
 from hermes_trader.indicators.math import atr as calc_atr
@@ -181,8 +186,8 @@ def live_sized_notional(
         basis = str(atr_cfg.get("sizing_basis", "atr_stop") or "atr_stop").lower()
         if basis in ("primary_stop", "dsl_stop"):
             stop_frac = min(
-                float(dsl_cfg.get("max_loss_pct", 2.0) or 2.0),
-                float(dsl_cfg.get("max_loss_roe_pct", 40.0) or 40.0) / max(1, coin_lev),
+                float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg) or 2.0),
+                float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg) or 40.0) / max(1, coin_lev),
             ) / 100.0
             if equity <= 0 or risk_pct <= 0 or stop_frac <= 0:
                 return 0.0, "primary_stop_invalid"
@@ -197,7 +202,7 @@ def live_sized_notional(
             risk_per_trade_pct=risk_pct,
             atr_abs=atr4h,
             entry_px=entry_px,
-            sl_atr_mult=float(cfg.get("sl_atr_mult", 1.5) or 1.5),
+            sl_atr_mult=float(cfg_get("sl_atr_mult", config=cfg) or 1.5),
             max_trade_notional_usd=cap,
             coin_max_leverage=coin_lev,
             config_max_leverage=leverage,
@@ -222,11 +227,11 @@ def passes_counter_regime(side: str, regime: str, conf: float, composite: float,
 
 def simulate_dsl_exit(entry_px: float, side: str, leverage: int,
                       forward_5m: List[Candle], dsl_cfg: Dict[str, Any]) -> Tuple[float, str, int, float]:
-    max_loss_pct = float(dsl_cfg.get("max_loss_pct", 2.0))
-    max_loss_roe_pct = float(dsl_cfg.get("max_loss_roe_pct", 40.0))
-    protect_pct = float(dsl_cfg.get("protect_pct", 0.5))
-    retrace = float(dsl_cfg.get("retrace_threshold", 0.30))
-    hard_timeout_min = float(dsl_cfg.get("hard_timeout_minutes", 180.0))
+    max_loss_pct = float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg))
+    max_loss_roe_pct = float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg))
+    protect_pct = float(cfg_get("dsl_exit.protect_pct", config=dsl_cfg))
+    retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl_cfg))
+    hard_timeout_min = float(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg))
     timeout_bars = int(hard_timeout_min // 5)
     lev = max(1, leverage)
     effective_max = min(max_loss_pct, max_loss_roe_pct / lev)
@@ -343,10 +348,10 @@ def main() -> int:
         dsl_cfg["protect_pct"] = args.protect
     if args.retrace:
         dsl_cfg["retrace_threshold"] = args.retrace
-    counter_regime_min_conf = float(cfg.get("counter_regime_min_conf", 0.65))
+    counter_regime_min_conf = float(cfg_get("counter_regime_min_conf", config=cfg))
     equity_fraction = float(args.equity_fraction or cfg.get("equity_fraction_per_trade", 0.04))
-    base_leverage = int(args.leverage or cfg.get("leverage", 10))
-    min_ai_conf = float(cfg.get("min_ai_confidence", 0.35))
+    base_leverage = int(args.leverage or cfg_get("leverage", config=cfg))
+    min_ai_conf = float(cfg_get("min_ai_confidence", config=cfg))
     dedup_min = int(args.dedup_min if args.dedup_min is not None
                     else cfg.get("cooldown_min", 30))
 
@@ -512,7 +517,7 @@ def main() -> int:
             continue
 
         # Fetch the entry bar + forward 5m bars (DSL window)
-        timeout_min = float(dsl_cfg.get("hard_timeout_minutes", 180.0))
+        timeout_min = float(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg))
         forward_end = ts + int(timeout_min * 60_000) + 600_000  # +10min padding
         forward = fetch_candles_at(coin, "5m", int(timeout_min // 5) + 10, forward_end)
         if forward is None:

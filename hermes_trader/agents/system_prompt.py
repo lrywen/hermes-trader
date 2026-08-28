@@ -137,6 +137,11 @@ def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
         track_record,
         "",
         "OUTPUT: 2–3 sentences of reasoning, then JSON on the last line. Nothing after.",
+        "",
+        "LANGUAGE: The reasoning field value MUST be written in Simplified Chinese (简体中文). "
+        "All JSON keys (verdict/confidence/side/entryPx/stopPx/tpPx/newsRisk/reasoning) and enum "
+        "values (LONG/SHORT/PASS/CLOSE, long/short, none/positive/negative) MUST remain in English. "
+        "Keep it concise, professional, and free of emoji.",
     ]
 
     return "\n".join(parts)

@@ -9,4 +9,4 @@ metadata:
 # containers already agree on where shared state lives.
 data:
   HERMES_PORT: "8000"
-  HERMES_SCAN_INTERVAL: "60"
+  HERMES_SCAN_INTERVAL: "15"

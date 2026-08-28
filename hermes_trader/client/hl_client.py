@@ -18,7 +18,9 @@ Rate limit management:
 from __future__ import annotations
 
 import logging
+import math
 import os
+import random
 import threading
 import time
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -34,7 +36,24 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-HL_API = "https://api.hyperliquid.xyz"
+
+class CandleFetchError(RuntimeError):
+    """Raised when a candle fetch fails due to a transient error (429/timeout).
+
+    Distinct from a genuine empty-history result (which returns ``[]``): a
+    ``CandleFetchError`` means the data is *unknown* and the caller should
+    treat the coin as un-scannable this cycle rather than reading it as
+    "no signal / insufficient history"."""
+
+# ── Environment-driven API endpoint ─────────────────────────────────
+# Default: Hyperliquid mainnet. Set HYPERLIQUID_TESTNET=true to switch all
+# HTTP/WS traffic to the testnet (api.hyperliquid-testnet.xyz).
+def _hl_api_base() -> str:
+    is_testnet = os.environ.get("HYPERLIQUID_TESTNET", "").strip().lower() in ("1", "true", "yes", "on")
+    return "https://api.hyperliquid-testnet.xyz" if is_testnet else "https://api.hyperliquid.xyz"
+
+
+HL_API = _hl_api_base()
 _MS_PER_CANDLE: Dict[str, int] = {
     "1m": 60_000,
     "5m": 300_000,
@@ -52,15 +71,19 @@ _info_lock = threading.Lock()
 
 
 def _fetch_meta_sync() -> tuple:
-    """Fetch meta and spot_meta via HTTP (fast, no WS needed)."""
-    try:
-        perp = requests.post(f"{HL_API}/info", json={"type": "meta"}, timeout=10)
-        perp.raise_for_status()
-        perp_meta = perp.json()
+    """Fetch meta and spot_meta via HTTP (fast, no WS needed).
 
-        spot = requests.post(f"{HL_API}/info", json={"type": "spotMeta"}, timeout=10)
-        spot.raise_for_status()
-        spot_meta = spot.json()
+    Goes through `_http_post` so these two weight-20 calls draw from the
+    shared rate bucket (a bare requests.post bypassed the limiter and could
+    fire during a 429 backoff window).
+    """
+    try:
+        perp_meta = _http_post("/info", {"type": "meta"}, timeout=10)
+        spot_meta = _http_post("/info", {"type": "spotMeta"}, timeout=10)
+        if not perp_meta:
+            perp_meta = {}
+        if not spot_meta:
+            spot_meta = {}
         return perp_meta, spot_meta
     except Exception as e:
         logger.error(f"[hl] Meta fetch failed: {e}")
@@ -85,7 +108,7 @@ def init_info() -> None:
             from hyperliquid.info import Info
             # skip_ws=True prevents blocking WS connect + meta fetch
             # We already have meta from HTTP above
-            _info_instance = Info(skip_ws=True, meta=perp_meta, spot_meta=spot_meta)
+            _info_instance = Info(skip_ws=True, base_url=HL_API, meta=perp_meta, spot_meta=spot_meta)
             logger.info("[hl] Info client initialized (HTTP-only)")
         except Exception as e:
             logger.warning(f"[hl] Failed to create Info: {e}")
@@ -123,28 +146,120 @@ def _get_session() -> "requests.Session":
     return _session
 
 
-def _http_post(path: str, payload: Dict[str, Any], timeout: int = 5) -> Any:
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """Parse an HTTP Retry-After header (seconds or HTTP-date) into seconds.
+
+    Returns None if absent/unparseable so the caller falls back to its own
+    backoff. Date values are clamped to a sane upper bound.
+    """
+    if not value:
+        return None
+    value = value.strip()
+    # Delta-seconds form.
+    try:
+        secs = float(value)
+        return max(0.0, secs)
+    except ValueError:
+        pass
+    # HTTP-date form.
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(value)
+        if dt is not None:
+            wait = (dt.timestamp() - time.time())
+            return max(0.0, wait)
+    except (TypeError, ValueError):
+        pass
+    return None
+
+
+def _http_post(
+    path: str,
+    payload: Dict[str, Any],
+    timeout: int = 5,
+    max_wait: Optional[float] = None,
+) -> Any:
     """Direct HTTP POST over the shared keep-alive connection pool.
 
     Acquires a rate-limit token first (HL: ~1200 weight/min). On budget
     exhaustion, returns None so the caller's existing retry/backoff handles it
     rather than firing into a 429.
+
+    `max_wait` caps how long we queue for budget. Trading-path callers leave it
+    None and get the full HERMES_HL_RATE_MAX_WAIT_S (30s) — their data is
+    required. Observability callers (e.g. surge postmortem candles) pass a small
+    value to declare themselves opportunistic: they yield the budget to the
+    trading path instead of parking on it for 30s, and a miss is logged at debug
+    since losing that data is expected and harmless.
     """
     weight = _endpoint_weight(payload.get("type"))
-    max_wait = float(os.environ.get("HERMES_HL_RATE_MAX_WAIT_S", "30"))
+    req_type = payload.get("type") or "unknown"
+    opportunistic = max_wait is not None
+    if max_wait is None:
+        max_wait = float(os.environ.get("HERMES_HL_RATE_MAX_WAIT_S", "30"))
+
+    _t0 = time.monotonic()
     if not _HL_LIMITER.acquire(weight, max_wait=max_wait):
-        logger.warning(
-            f"[hl] rate budget exhausted for {payload.get('type') or 'unknown'} "
-            f"(weight={weight}, waited {max_wait:g}s) — skipping request this retry"
+        _wait_s = time.monotonic() - _t0
+        msg = (
+            f"[hl] rate budget exhausted for {req_type} "
+            f"(weight={weight}, waited {_wait_s:.2f}s/{max_wait:g}s) — skipping request"
         )
+        if opportunistic:
+            logger.debug(f"{msg} [opportunistic]")
+        else:
+            logger.warning(msg)
         return None
-    try:
-        resp = _get_session().post(f"{HL_API}{path}", json=payload, timeout=timeout)
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        logger.error(f"[hl] HTTP POST {path} failed: {e}")
-        return None
+    _rate_wait_s = time.monotonic() - _t0
+
+    _http_t0 = time.monotonic()
+    # Bounded 429-aware retry. We already hold rate-limit tokens for this
+    # request; on a server-side 429 we drain the bucket by Retry-After
+    # (adaptive penalty so other callers queue instead of piling on) and
+    # retry once after the server's instructed wait. urllib3's Retry is NOT
+    # used for 429 because it can't honor Retry-After and would re-fire in
+    # lockstep across the worker pool.
+    max_429_retries = int(os.environ.get("HERMES_HL_429_RETRIES", "2"))
+    for attempt in range(max_429_retries + 1):
+        try:
+            resp = _get_session().post(f"{HL_API}{path}", json=payload, timeout=timeout)
+            if resp.status_code == 429:
+                retry_after = _parse_retry_after(resp.headers.get("Retry-After"))
+                # Penalty: drain the bucket enough to cover the cooldown the
+                # server asked for (refill rate * wait), plus one request
+                # weight. Capped so a bad header can't zero the bucket for long.
+                cooldown = min(retry_after, 15.0) if retry_after else 2.0
+                penalty = weight + _HL_LIMITER.refill_per_sec * cooldown
+                try:
+                    _HL_LIMITER.penalize(penalty)
+                except Exception:
+                    pass
+                if attempt < max_429_retries:
+                    logger.warning(
+                        f"[hl] {req_type} got 429 (attempt {attempt+1}) — "
+                        f"draining {penalty:.0f} budget, backing off {cooldown:.1f}s"
+                    )
+                    time.sleep(cooldown + random.uniform(0, 0.25))
+                    continue
+                logger.warning(
+                    f"[hl] {req_type} 429 persisted after {max_429_retries} retries — giving up"
+                )
+                return None
+            resp.raise_for_status()
+            _result = resp.json()
+            _http_s = time.monotonic() - _http_t0
+            if _rate_wait_s > 1.0 or _http_s > 3.0:
+                logger.info(
+                    f"[hl] {req_type} | rate_wait={_rate_wait_s:.2f}s http={_http_s:.2f}s "
+                    f"total={time.monotonic()-_t0:.2f}s weight={weight}"
+                )
+            return _result
+        except Exception as e:
+            _http_s = time.monotonic() - _http_t0
+            logger.error(
+                f"[hl] HTTP POST {path} ({req_type}) failed after {_http_s:.2f}s: {e}"
+            )
+            return None
 
 
 # ── Public API ────────────────────────────────────────────────────────
@@ -167,22 +282,117 @@ def resolve_user_address() -> str:
 # doubling the API pressure behind the recurring 429 storms that kill scans. A
 # small per-(coin,interval) TTL collapses those duplicates within a cycle. TTL is
 # well under a candle period so freshness is unaffected; env-tunable / 0 disables.
-_CANDLE_CACHE: Dict[str, tuple] = {}
+#
+# Uses the shared LRU+TTL ``_Cache`` abstraction (client/cache.py) instead of a
+# bespoke dict+sweep; this gives bounded size, atomic access and per-key
+# invalidation for free.
 _CANDLE_CACHE_TTL_S = float(os.environ.get("HERMES_CANDLE_CACHE_TTL_S", "90"))
+_CANDLE_CACHE_MAX = int(os.environ.get("HERMES_CANDLE_CACHE_MAX", "512"))
+_CANDLE_CACHE_DISABLED = _CANDLE_CACHE_TTL_S <= 0
+
+if _CANDLE_CACHE_DISABLED:
+    _CANDLE_CACHE = None
+else:
+    from hermes_trader.client.cache import _Cache as _SharedCache
+    _CANDLE_CACHE = _SharedCache(max_size=_CANDLE_CACHE_MAX, default_ttl=_CANDLE_CACHE_TTL_S)
+
+# Funding rate cache: funding updates hourly, so a 5-min TTL is safe and
+# eliminates a weight-20 POST on every research cycle.
+_FUNDING_CACHE_TTL_S = float(os.environ.get("HERMES_FUNDING_CACHE_TTL_S", "300"))
+if _FUNDING_CACHE_TTL_S <= 0:
+    _FUNDING_CACHE = None
+else:
+    from hermes_trader.client.cache import _Cache as _FundingCache
+    _FUNDING_CACHE = _FundingCache(max_size=256, default_ttl=_FUNDING_CACHE_TTL_S)
+
+# In-flight request coalescing: when N callers request the same cache_key
+# concurrently (e.g. 3 candle fetches across research + ta_filter), only one
+# HTTP call fires; the rest await the same result. Without this, a cold cache
+# after restart issues 3 duplicate candleSnapshot calls (weight 60) instead of
+# one (weight 20), tripling rate-budget pressure during exactly the window
+# when the bucket is already drained.
+_inflight: Dict[str, "threading.Event"] = {}
+_inflight_results: Dict[str, Any] = {}
+_inflight_lock = threading.Lock()
 
 
 def fetch_hl_candles(
     coin: str,
     interval: str = "5m",
     count: int = 100,
+    opportunistic: bool = False,
 ) -> List[Candle]:
-    """Fetch candles via HTTP (short-TTL cached per coin+interval+count)."""
-    cache_key = f"{coin}|{interval}|{count}"
-    if _CANDLE_CACHE_TTL_S > 0:
-        hit = _CANDLE_CACHE.get(cache_key)
-        if hit and (time.time() - hit[0]) < _CANDLE_CACHE_TTL_S:
-            return hit[1]
+    """Fetch candles via HTTP (short-TTL cached per coin+interval+count).
 
+    `opportunistic=True` marks the call as observability-only: it takes at most
+    a short slice of rate budget, skips the retry ladder, and never warns. Used
+    by the surge postmortem, whose candleSnapshot (weight 20) calls otherwise
+    compete with the trading path's own fetches.
+    """
+    cache_key = f"{coin}|{interval}|{count}"
+    if _CANDLE_CACHE is not None:
+        hit = _CANDLE_CACHE.get(cache_key)
+        if hit is not None:
+            logger.debug(f"[candles] {coin} {interval}: cache HIT ({len(hit)} bars)")
+            return hit
+
+    # Coalesce concurrent requests for the same key: if another thread is
+    # already fetching this exact candle range, wait for its result instead
+    # of issuing a duplicate weight-20 HTTP call.
+    _coalesce_event: Optional[threading.Event] = None
+    with _inflight_lock:
+        existing = _inflight.get(cache_key)
+        if existing is not None:
+            _coalesce_event = existing
+        elif not opportunistic:
+            _inflight[cache_key] = threading.Event()
+
+    if _coalesce_event is not None:
+        _wait_t0 = time.monotonic()
+        _coalesce_event.wait(timeout=30)
+        with _inflight_lock:
+            result = _inflight_results.get(cache_key)
+        if result is not None:
+            logger.debug(
+                f"[candles] {coin} {interval}: coalesced "
+                f"(waited {time.monotonic()-_wait_t0:.2f}s)"
+            )
+            return result
+        # If the leader failed/timed out, fall through and fetch ourselves.
+        logger.debug(f"[candles] {coin} {interval}: coalesce leader failed, fetching directly")
+
+    _fetch_t0 = time.monotonic()
+    try:
+        candles = _fetch_hl_candles_raw(coin, interval, count, cache_key, opportunistic)
+        # Publish successful result to coalesced waiters before signalling.
+        with _inflight_lock:
+            _inflight_results[cache_key] = candles
+    except Exception:
+        with _inflight_lock:
+            _inflight_results[cache_key] = None
+        raise
+    finally:
+        with _inflight_lock:
+            _evt = _inflight.pop(cache_key, None)
+        if _evt is not None:
+            _evt.set()
+
+    _elapsed = time.monotonic() - _fetch_t0
+    if _elapsed > 2.0:
+        logger.info(
+            f"[candles] {coin} {interval}: fetch {len(candles)} bars in {_elapsed:.2f}s"
+        )
+    return candles
+
+
+def _fetch_hl_candles_raw(
+    coin: str,
+    interval: str,
+    count: int,
+    cache_key: str,
+    opportunistic: bool,
+) -> List[Candle]:
+    """Internal: actual HTTP fetch + parse for fetch_hl_candles."""
     ms = _MS_PER_CANDLE.get(interval, 300_000)
     end_time = int(time.time() * 1000)
     start_time = end_time - ms * count
@@ -196,40 +406,63 @@ def fetch_hl_candles(
             "endTime": end_time,
         }
     }
-    # A non-list result means a transient failure (429 / timeout), NOT "no
-    # candles" — HL returns an empty LIST for a coin with no history. Those are
-    # indistinguishable downstream: research treated a 429-blanked fetch as
-    # "insufficient history" and emitted stop/tp = 0.0 (which the whale override
-    # could then force-execute stopless). So retry a transient failure a few
-    # times with backoff before giving up; a genuine empty list returns at once.
-    raw = _http_post("/info", payload)
-    attempts = 0
-    while not isinstance(raw, list) and attempts < 3:
-        attempts += 1
-        time.sleep(0.3 * attempts)
+    if opportunistic:
+        # One shot, tiny budget wait, no retries: the caller's report just omits
+        # the candle section rather than starving the trading path.
+        opp_wait = float(os.environ.get("HERMES_HL_RATE_OPPORTUNISTIC_WAIT_S", "2"))
+        raw = _http_post("/info", payload, max_wait=opp_wait)
+        if not isinstance(raw, list):
+            logger.debug(
+                f"[candles] {coin} {interval}: opportunistic fetch missed "
+                f"(rate budget or transient error) — returning EMPTY")
+            return []
+    else:
+        # A non-list result means a transient failure (429 / timeout), NOT "no
+        # candles" — HL returns an empty LIST for a coin with no history. Those
+        # must be distinguishable downstream: research must not treat a
+        # 429-blanked fetch as "insufficient history" (which previously emitted
+        # stop/tp = 0.0 and could be force-executed stopless by the whale
+        # override). Retry transient failures with backoff; if they persist,
+        # raise CandleFetchError so callers fail-closed instead of misreading
+        # "unknown" as "no signal".
         raw = _http_post("/info", payload)
-    if not isinstance(raw, list):
-        # Persisted across retries. Do NOT cache failures/empties — caching a bad
-        # read would blank the coin for the whole TTL. Let the next call retry.
-        # A non-list AFTER we already retried means a real transient-failure data
-        # gap (429/timeout), NOT "no history" — warn so it isn't silently read as
-        # "no signal" downstream. (attempts==0 path can't reach here: the first
-        # raw was already non-list, so attempts is always >=1 when we land here.)
-        logger.warning(
-            f"[candles] {coin} {interval}: fetch failed across {attempts} retries "
-            f"(transient 429/timeout) — returning EMPTY; this coin reads as "
-            f"'no signal' this scan (silent data gap)")
-        return []
+        attempts = 0
+        while not isinstance(raw, list) and attempts < 3:
+            attempts += 1
+            # H14: exponential-ish backoff with jitter so a coordinated burst
+            # of per-coin retries doesn't re-hit the rate limiter in lockstep.
+            time.sleep(0.3 * attempts + random.uniform(0, 0.25))
+            raw = _http_post("/info", payload)
+        if not isinstance(raw, list):
+            logger.warning(
+                f"[candles] {coin} {interval}: fetch failed across {attempts} retries "
+                f"(transient 429/timeout) — raising CandleFetchError (fail-closed)")
+            raise CandleFetchError(
+                f"candle fetch failed for {coin} {interval} after {attempts} retries"
+            )
 
-    candles = [
-        Candle(
-            t=c["t"], o=float(c["o"]), h=float(c["h"]),
-            l=float(c["l"]), c=float(c["c"]), v=float(c.get("v", "0")),
-        )
-        for c in raw
-    ]
-    if _CANDLE_CACHE_TTL_S > 0 and candles:
-        _CANDLE_CACHE[cache_key] = (time.time(), candles)
+    # Genuine empty history: HL returns []. Surface as [] (distinct from failure).
+    candles: List[Candle] = []
+    prev_t: Optional[int] = None
+    for c in raw:
+        try:
+            o = float(c["o"]); h = float(c["h"]); l = float(c["l"]); close = float(c["c"])
+            v = float(c.get("v", "0")); t = int(c["t"])
+        except (KeyError, TypeError, ValueError):
+            logger.warning(f"[candles] {coin} {interval}: dropping malformed candle {c!r}")
+            continue
+        # Reject NaN/Inf OHLC — one bad bar poisons every indicator downstream.
+        if not all(math.isfinite(x) for x in (o, h, l, close, v)):
+            logger.warning(f"[candles] {coin} {interval}: dropping non-finite candle t={t}")
+            continue
+        # Drop duplicate / out-of-order timestamps (monotonic ascending required).
+        if prev_t is not None and t <= prev_t:
+            continue
+        prev_t = t
+        candles.append(Candle(t=t, o=o, h=h, l=l, c=close, v=v))
+
+    if _CANDLE_CACHE is not None and candles:
+        _CANDLE_CACHE.set(cache_key, candles)
     return candles
 
 
@@ -245,8 +478,8 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
     `available` stays main-dex only because HIP-3 free margin only backs
     trades on its own dex; the executor sizes against this for main trades.
     """
-    perp = _http_post("/info", {"type": "clearinghouseState", "user": user})
-    spot = _http_post("/info", {"type": "spotClearinghouseState", "user": user})
+    perp = _http_post("/info", {"type": "clearinghouseState", "user": user}, timeout=15)
+    spot = _http_post("/info", {"type": "spotClearinghouseState", "user": user}, timeout=15)
 
     if not perp:
         perp = {}
@@ -283,12 +516,31 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
 
     if include_hip3:
         from hermes_trader.client.universe import list_hip3_dexes
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor
         try:
             dexes = list_hip3_dexes()
         except Exception as e:
             logger.warning(f"[hl] list_hip3_dexes failed during account aggregation: {e}")
             dexes = []
+
+        # HIP-3 dex mute (mirrors the scanner): only aggregate balances for the
+        # dexes we actually trade, so unfunded test/misc venues don't add 200+
+        # clearinghouse POSTs to every dashboard poll. `hip3_dex_allowlist`
+        # (e.g. ["xyz"]) = aggregate ONLY those dexes; `hip3_dex_blocklist` =
+        # aggregate all but those.
+        try:
+            from hermes_trader.agents.config_store import read_agent_config
+            _cfg = read_agent_config()
+        except Exception:
+            _cfg = {}
+        allow = {d for d in (_cfg.get("hip3_dex_allowlist") or []) if d}
+        block = {d for d in (_cfg.get("hip3_dex_blocklist") or []) if d}
+        if allow:
+            dexes = [d for d in dexes if d in allow]
+        if block:
+            dexes = [d for d in dexes if d not in block]
+        if not dexes:
+            logger.info("[hl] HIP-3 aggregation skipped — no dexes after allow/block filter")
 
         # Fan out the per-dex clearinghouse queries in parallel — serial loop
         # was 8 sequential POSTs × ~150ms each = 1.2s. Parallel finishes in
@@ -340,8 +592,52 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> Dict[str, Any]
         "asset_positions": asset_positions,
         "dex_equity": dex_equity,
         "dex_available": dex_available,
-        "queried_dexes": queried_dexes,
+        # JSON consumers (FastAPI JSONResponse) can't serialize a set; sort
+        # for stable output. Internal callers wrap with set() or use `in`,
+        # both of which work on a list.
+        "queried_dexes": sorted(queried_dexes),
+        # P0-4: per-coin liquidation price snapshot used by the executor's
+        # pre-place gate. Each entry: {"liquidationPx": float, "szi": float,
+        # "side": "long"|"short"}. `szi` is the signed size in coin units
+        # (positive = long, negative = short). `liquidationPx` may be None
+        # or "0" for very small / fully-margined positions; we filter those
+        # out so the executor only sees positions that actually have a real
+        # liquidation price. Format chosen to match HL clearinghouseState's
+        # assetPositions[].position.liquidationPx field.
+        "liquidation_px_by_coin": {
+            p.get("position", {}).get("coin"): {
+                "liquidationPx": _parse_liquidation_px(
+                    p.get("position", {}).get("liquidationPx")
+                ),
+                "szi": float(p.get("position", {}).get("szi", "0") or 0),
+            }
+            for p in asset_positions
+            if _parse_liquidation_px(p.get("position", {}).get("liquidationPx")) is not None
+        },
     }
+
+
+def _parse_liquidation_px(raw) -> Optional[float]:
+    """P0-4: defensively parse HL's liquidationPx field.
+
+    HL returns it as a string ("0" for fully-margined/very small positions,
+    or the actual price for cross-margin positions). Returns None when the
+    value is missing, "0", empty, or unparseable — the executor must never
+    build a gate on a missing or zero liquidation price (that would either
+    be a no-op or a false-positive blow-up).
+    """
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s or s == "0" or s.lower() in ("none", "null", "nan", ""):
+        return None
+    try:
+        v = float(s)
+    except (ValueError, TypeError):
+        return None
+    if v <= 0 or v != v:  # NaN check (v != v is the canonical NaN test)
+        return None
+    return v
 
 
 def fetch_aggregate_contributions_since(user: str, start_ms: int) -> float:
@@ -508,9 +804,26 @@ def stop_ws_mids() -> None:
 def fetch_funding_history(
     coin: str, start_time: int, end_time: Optional[int] = None,
 ) -> List[Dict[str, Any]]:
-    """Fetch funding rate history."""
+    """Fetch funding rate history.
+
+    Funding rates update hourly on HL, so the latest rate is cacheable for a
+    few minutes without staleness risk. Caching avoids a duplicate weight-20
+    POST per research cycle when ta_filter and research both request it.
+    """
     if end_time is None:
         end_time = int(time.time() * 1000)
+
+    # Short-TTL cache for the most recent funding rate (5 min = 1/12 of the
+    # hourly funding interval — more than fresh enough for prompt context).
+    _fkey = f"funding|{coin}"
+    if _FUNDING_CACHE is not None:
+        hit = _FUNDING_CACHE.get(_fkey)
+        if hit is not None:
+            return hit
+
     payload = {"type": "fundingHistory", "coin": coin, "startTime": start_time, "endTime": end_time}
     raw = _http_post("/info", payload)
-    return raw if isinstance(raw, list) else []
+    result = raw if isinstance(raw, list) else []
+    if result and _FUNDING_CACHE is not None:
+        _FUNDING_CACHE.set(_fkey, result)
+    return result

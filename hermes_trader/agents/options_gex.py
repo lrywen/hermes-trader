@@ -29,7 +29,7 @@ import ssl
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,9 @@ try:                                  # proper CA bundle (Mac python often lacks
     import certifi
     _SSL = ssl.create_default_context(cafile=certifi.where())
 except Exception:                     # pragma: no cover
-    _SSL = ssl._create_unverified_context()
+    # P1-15: never fall back to an unverified context (MITM risk). Use the
+    # system trust store with full verification; certifi is a pinned dep.
+    _SSL = ssl.create_default_context()
 
 _OCC = re.compile(r"^([A-Z\^_.]+)(\d{6})([CP])(\d{8})$")
 _CONTRACT_MULT = 100

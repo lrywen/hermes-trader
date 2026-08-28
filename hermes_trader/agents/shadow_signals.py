@@ -206,7 +206,7 @@ def run_shadow_async(coin: str, side: str, sub: Optional[Dict[str, Any]] = None)
     caller (the execute path), so it can't add latency or amplify the hot path."""
     sub = dict(sub or {})
 
-    def _worker():
+    def _worker() -> None:
         try:
             sig = gather_shadow_signals(coin, side, sub)
             if sig:

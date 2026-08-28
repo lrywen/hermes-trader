@@ -13,6 +13,8 @@ All market data streams through ONE websocket connection:
 from __future__ import annotations
 
 import logging
+import os
+import random
 import ssl
 import threading
 import time
@@ -23,13 +25,21 @@ import certifi
 from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
+from hermes_trader.client.hl_client import _http_post
+
 logger = logging.getLogger(__name__)
+
+# Reconnect constants
+_WS_MAX_STALE_SECONDS = int(os.environ.get("HERMES_WS_MAX_STALE_SECONDS", "30"))
+_WS_RECONNECT_BASE_DELAY = 1.0  # seconds
+_WS_RECONNECT_MAX_DELAY = 60.0  # seconds
+_WS_RECONNECT_JITTER = 0.5  # +/- jitter fraction
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
     """WebsocketManager that passes certifi SSL context to run_forever()."""
 
-    def __init__(self, base_url: str):
+    def __init__(self, base_url: str) -> None:
         super().__init__(base_url)
         # Prepare SSL options for run_forever
         self._sslopt = {
@@ -37,7 +47,7 @@ class HLSSLOptWebsocketManager(WebsocketManager):
             "ca_certs": certifi.where(),
         }
 
-    def run(self):
+    def run(self) -> None:
         """Override to inject SSL options into run_forever()."""
         self.ping_sender.start()
         self.ws.run_forever(sslopt=self._sslopt)
@@ -82,12 +92,15 @@ class HyperliquidWebSocket:
         ws.stop()
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._lock = threading.Lock()
         self._info: Optional[Info] = None
         self._ws_manager: Optional[HLSSLOptWebsocketManager] = None
         self._running = False
         self._latest = RealtimeSnapshot()
+        self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
+        self._reconnect_stop = threading.Event()
+        self._reconnect_thread: Optional[threading.Thread] = None
 
     def _on_all_mids(self, data: Any) -> None:
         """Callback for allMids subscription.
@@ -112,30 +125,29 @@ class HyperliquidWebSocket:
 
         logger.info("[ws] Connecting to Hyperliquid...")
 
-        # Step 1: Pre-fetch meta via HTTP (fast, no WS dependency)
-        import requests
-        try:
-            perp = requests.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "meta"},
-                timeout=10,
-            )
-            perp.raise_for_status()
-            perp_meta = perp.json()
+        self._connect_and_subscribe()
 
-            spot = requests.post(
-                "https://api.hyperliquid.xyz/info",
-                json={"type": "spotMeta"},
-                timeout=10,
-            )
-            spot.raise_for_status()
-            spot_meta = spot.json()
+        self._running = True
+
+        # Launch background reconnect monitor.
+        self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
+        self._reconnect_stop.clear()
+        self._reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True, name="ws-reconnect")
+        self._reconnect_thread.start()
+
+    def _connect_and_subscribe(self) -> None:
+        """Internal: open connection and subscribe to allMids. Reusable on reconnect."""
+        try:
+            # Route through the shared rate limiter so reconnect meta fetches
+            # (weight 20 each) don't bypass the bucket during a 429 window.
+            perp_meta = _http_post("/info", {"type": "meta"}, timeout=10)
+            spot_meta = _http_post("/info", {"type": "spotMeta"}, timeout=10)
+            if not perp_meta or not spot_meta:
+                raise RuntimeError("meta/spotMeta fetch returned no data (rate limited?)")
         except Exception as e:
             logger.error(f"[ws] Meta fetch failed: {e}")
             raise
 
-        # Step 2: Create Info with skip_ws=True + pre-fetched meta
-        # This is instant — no blocking WS connect or meta fetch
         try:
             self._info = Info(
                 skip_ws=True,
@@ -146,19 +158,15 @@ class HyperliquidWebSocket:
             logger.error(f"[ws] Failed to create Info: {e}")
             raise
 
-        # Step 3: Use custom WS manager with certifi SSL
         try:
             self._ws_manager = HLSSLOptWebsocketManager(self._info.base_url)
-            self._info.ws_manager = self._ws_manager  # <-- SDK checks this attribute
+            self._info.ws_manager = self._ws_manager
             self._ws_manager.start()
             logger.info("[ws] WebSocket manager started (with certifi SSL)")
         except Exception as e:
             logger.error(f"[ws] Failed to start WS manager: {e}")
             raise
 
-        self._running = True
-
-        # Step 4: Subscribe to allMids — ONE subscription gets ALL market prices
         try:
             sub_id = self._info.subscribe(
                 {"type": "allMids"},
@@ -168,6 +176,34 @@ class HyperliquidWebSocket:
         except Exception as e:
             logger.error(f"[ws] Subscribe failed: {e}")
             raise
+
+    def _reconnect_loop(self) -> None:
+        """Background loop: monitor data freshness and reconnect when stale."""
+        while not self._reconnect_stop.is_set():
+            self._reconnect_stop.wait(5.0)  # check every 5s
+            if self._reconnect_stop.is_set():
+                break
+            if self.get_data_age_seconds() > _WS_MAX_STALE_SECONDS:
+                logger.warning(
+                    f"[ws] Data stale for {self.get_data_age_seconds():.0f}s "
+                    f"(threshold={_WS_MAX_STALE_SECONDS}s) — reconnecting in "
+                    f"{self._reconnect_delay:.0f}s..."
+                )
+                # Exponential backoff with jitter
+                self._reconnect_stop.wait(self._reconnect_delay)
+                if self._reconnect_stop.is_set():
+                    break
+                try:
+                    self._stop_internal()
+                    self._connect_and_subscribe()
+                    self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
+                    logger.info("[ws] Reconnect successful")
+                except Exception as e:
+                    logger.error(f"[ws] Reconnect failed: {e}")
+                    self._reconnect_delay = min(
+                        self._reconnect_delay * 2 * random.uniform(1 - _WS_RECONNECT_JITTER, 1 + _WS_RECONNECT_JITTER),
+                        _WS_RECONNECT_MAX_DELAY,
+                    )
 
     def get_all_mids(self) -> Dict[str, str]:
         """Get latest all-mids snapshot.
@@ -199,13 +235,20 @@ class HyperliquidWebSocket:
             return time.time() - self._latest.last_update_time
 
     def stop(self, timeout: float = 3.0) -> None:
-        """Disconnect WebSocket with timeout to avoid hanging."""
+        """Disconnect WebSocket and stop the reconnect loop."""
         self._running = False
+        self._reconnect_stop.set()
+        if self._reconnect_thread:
+            self._reconnect_thread.join(timeout=timeout)
+        self._stop_internal()
+        logger.info("[ws] Disconnected")
+
+    def _stop_internal(self) -> None:
+        """Tear down the WS manager and Info without touching reconnect state."""
         if self._ws_manager:
             try:
                 self._ws_manager.stop_event.set()
                 self._ws_manager.ws.keep_running = False
-                # Force-close the underlying socket
                 if hasattr(self._ws_manager.ws, 'sock'):
                     sock = self._ws_manager.ws.sock
                     if sock and hasattr(sock, 'close'):
@@ -221,11 +264,10 @@ class HyperliquidWebSocket:
                 self._info.disconnect_websocket()
             except Exception:
                 pass
-        logger.info("[ws] Disconnected")
 
-    def __enter__(self):
+    def __enter__(self) -> "HyperliquidWebSocket":
         self.start()
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: Any) -> None:
         self.stop()

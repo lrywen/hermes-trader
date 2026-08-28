@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from typing import Dict, List, Optional
 
-from hermes_trader.indicators.math import adx, ema, sma, candle_val
+from hermes_trader.indicators.math import adx, atr, ema, sma, candle_val
 from hermes_trader.models.types import Candle, TriggerHit
 
 
@@ -81,14 +81,39 @@ def volume_spike(candles: List[Candle], sigma_threshold: float = 3) -> TriggerHi
     }
 
 
-def breakout(candles: List[Candle], lookback: int = 48) -> TriggerHit:
-    """Breakout detection against the prior range high/low over lookback bars."""
-    if len(candles) < lookback + 2:
+def breakout(
+    candles: List[Candle],
+    lookback: int = 48,
+    min_rvol: float = 1.5,
+    rvol_window: int = 20,
+    atr_period: int = 14,
+    atr_score_mult: float = 3.0,
+    confirm_bars: int = 2,
+) -> TriggerHit:
+    """Breakout detection against the prior range high/low over lookback bars.
+
+    A close beyond the prior range only counts as a fired breakout when
+    confirmed by relative volume (RVOL >= ``min_rvol`` vs the prior
+    ``rvol_window``-bar average) AND price has held beyond the edge for
+    ``confirm_bars`` consecutive closed bars. The latter rejects single-bar
+    stop-runs / fakeouts that immediately reverse back into the range — a
+    single wick close above the high no longer fires. (Set confirm_bars=1 to
+    restore the old single-close behavior.)
+
+    Score is ATR-normalized so BTC/ETH and low-price alts are on the same
+    scale: ``score = min(10, |close - edge| / ATR * atr_score_mult)``. A
+    close that breaks the edge but fails RVOL/confirmation still earns 50%
+    of that score (structural interest, weak confirmation) without firing.
+    """
+    confirm_bars = max(1, int(confirm_bars))
+    if len(candles) < lookback + confirm_bars + 1:
         return {"name": "breakout", "score": 0, "reason": "flat", "fired": False}
 
     current = candles[-1]
-    prior_start = len(candles) - lookback - 1
-    prior_end = len(candles) - 1
+    cur_close = candle_val(current, "c")
+    # Prior range is the `lookback` bars BEFORE the confirmation window.
+    prior_start = len(candles) - lookback - confirm_bars
+    prior_end = len(candles) - confirm_bars
 
     prior_high = float("-inf")
     prior_low = float("inf")
@@ -98,27 +123,123 @@ def breakout(candles: List[Candle], lookback: int = 48) -> TriggerHit:
         if candle_val(candles[i], "l") < prior_low:
             prior_low = candle_val(candles[i], "l")
 
-    if candle_val(current, "c") > prior_high:
-        pct_break = (candle_val(current, "c") - prior_high) / prior_high * 100
+    # Confirmation: every bar in the confirm window must close beyond the
+    # same edge (up or down). This is what rejects a one-bar fakeout.
+    confirm_closes = [candle_val(candles[i], "c")
+                      for i in range(len(candles) - confirm_bars, len(candles))]
+    held_above = all(c > prior_high for c in confirm_closes)
+    held_below = all(c < prior_low for c in confirm_closes)
+    first_break_idx = len(candles) - confirm_bars  # bar that first cleared edge
+
+    # RVOL: current volume relative to prior `rvol_window`-bar average.
+    # For multi-bar confirmation, measure volume on the bar that FIRST broke
+    # the edge (the start of the confirm window) — that is the volume bar
+    # that actually matters for confirming institutional participation.
+    rvol_ref_idx = min(len(candles) - 1, first_break_idx)
+    cur_vol = candle_val(candles[rvol_ref_idx], "v")
+    vol_start = max(0, rvol_ref_idx - rvol_window)
+    prior_vols = [candle_val(candles[i], "v") for i in range(vol_start, rvol_ref_idx)]
+    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0.0
+    if avg_vol <= 0:
+        rvol = 0.0
+    else:
+        rvol = cur_vol / avg_vol
+    rvol_ok = rvol >= min_rvol
+
+    # ATR for score normalization. Fall back to pct-break if ATR is not
+    # available yet (not enough history) so behavior degrades gracefully.
+    atr_series = atr(candles, atr_period)
+    cur_atr = atr_series[-1] if atr_series else float("nan")
+    atr_valid = isinstance(cur_atr, float) and not math.isnan(cur_atr) and cur_atr > 0
+
+    def _break_score(distance_price: float, reference_price: float) -> float:
+        if atr_valid:
+            return min(10.0, max(0.0, distance_price / cur_atr * atr_score_mult))
+        pct = distance_price / reference_price * 100
+        return min(10.0, max(0.0, pct))
+
+    if held_above:
+        distance = cur_close - prior_high
+        full_score = _break_score(distance, prior_high)
+        if rvol_ok:
+            held_note = f"held {confirm_bars} bars" if confirm_bars > 1 else ""
+            return {
+                "name": "breakout",
+                "score": full_score,
+                "reason": (
+                    f"breakout above {lookback}-bar high "
+                    f"(+{distance/ prior_high * 100:.2f}%, RVOL {rvol:.2f}x"
+                    f"{', ' + held_note if held_note else ''})"
+                ),
+                "fired": True,
+            }
+        # Close beyond the edge on weak volume — structural interest but no
+        # institutional confirmation. Keep partial score for composite input
+        # but do NOT fire (the gate won't see it as a trigger).
         return {
             "name": "breakout",
-            "score": min(10, max(0, pct_break)),
-            "reason": f"breakout above {lookback}-bar high",
-            "fired": True,
+            "score": full_score * 0.5,
+            "reason": (
+                f"breakout above {lookback}-bar high on weak volume "
+                f"(RVOL {rvol:.2f}x < {min_rvol}x) — unconfirmed"
+            ),
+            "fired": False,
         }
 
-    if candle_val(current, "c") < prior_low:
-        pct_break = (prior_low - candle_val(current, "c")) / prior_low * 100
+    if held_below:
+        distance = prior_low - cur_close
+        full_score = _break_score(distance, prior_low)
+        if rvol_ok:
+            held_note = f"held {confirm_bars} bars" if confirm_bars > 1 else ""
+            return {
+                "name": "breakout",
+                "score": full_score,
+                "reason": (
+                    f"breakout below {lookback}-bar low "
+                    f"(-{distance / prior_low * 100:.2f}%, RVOL {rvol:.2f}x"
+                    f"{', ' + held_note if held_note else ''})"
+                ),
+                "fired": True,
+            }
         return {
             "name": "breakout",
-            "score": min(10, max(0, pct_break)),
-            "reason": f"breakout below {lookback}-bar low",
-            "fired": True,
+            "score": full_score * 0.5,
+            "reason": (
+                f"breakout below {lookback}-bar low on weak volume "
+                f"(RVOL {rvol:.2f}x < {min_rvol}x) — unconfirmed"
+            ),
+            "fired": False,
         }
 
-    # Score proportional to distance from nearest range edge
-    dist_up = prior_high - candle_val(current, "c")
-    dist_down = candle_val(current, "c") - prior_low
+    # A single (or not-yet-confirmed) close beyond the edge, or inside range.
+    # Award partial structural score for a lone break bar so composite sees
+    # the developing setup, but don't fire until confirm_bars have held.
+    if cur_close > prior_high:
+        distance = cur_close - prior_high
+        return {
+            "name": "breakout",
+            "score": _break_score(distance, prior_high) * 0.5,
+            "reason": (
+                f"above {lookback}-bar high but not held {confirm_bars} bars "
+                f"— unconfirmed fakeout risk"
+            ),
+            "fired": False,
+        }
+    if cur_close < prior_low:
+        distance = prior_low - cur_close
+        return {
+            "name": "breakout",
+            "score": _break_score(distance, prior_low) * 0.5,
+            "reason": (
+                f"below {lookback}-bar low but not held {confirm_bars} bars "
+                f"— unconfirmed fakeout risk"
+            ),
+            "fired": False,
+        }
+
+    # Inside range: score proportional to distance from nearest edge.
+    dist_up = prior_high - cur_close
+    dist_down = cur_close - prior_low
     closest = min(dist_up, dist_down)
     range_size = prior_high - prior_low
     score = max(0, (1 - closest / range_size)) * 5 if range_size > 0 else 0
@@ -206,12 +327,25 @@ def trend_strength(candles: List[Candle], adx_period: int = 14) -> TriggerHit:
         return {"name": "trendStrength", "score": 0, "reason": "flat", "fired": False}
 
     fired = last_adx >= 25
-    score = min(10, max(0, last_adx / 4))
+    # ADX is non-linear across a trend's lifecycle:
+    #   25-30  = early trend (best entry window) -> full score
+    #   30-45  = mature trend                    -> standard score
+    #   >45    = extended/ late trend            -> HALF score (chase risk)
+    # The raw `last_adx / 4` map would keep rewarding higher ADX all the way
+    # to 50+, which systematically surfaced coins already at trend exhaustion.
+    if last_adx > 45:
+        base = min(10, max(0, last_adx / 4)) * 0.5
+    elif last_adx >= 25:
+        base = min(10, max(0, last_adx / 4))
+    else:
+        base = 0
 
     return {
         "name": "trendStrength",
-        "score": score if fired else 0,
-        "reason": f"ADX {last_adx:.1f} trending" if fired else "flat",
+        "score": base if fired else 0,
+        "reason": (f"ADX {last_adx:.1f} trending" +
+                   (" (late/extended)" if last_adx > 45 else ""))
+        if fired else "flat",
         "fired": fired,
     }
 

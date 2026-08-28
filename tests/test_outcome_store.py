@@ -10,7 +10,9 @@ from hermes_trader.agents.sizing import risk_of_ruin
 
 def _mem():
     m = AgentMemory()
-    m.flush = lambda: None  # never write to disk in tests
+    # P1-6: flush() gained (force=...) and record_close passes force=True;
+    # accept any signature so the stub never touches disk.
+    m.flush = lambda *a, **k: None  # never write to disk in tests
     return m
 
 

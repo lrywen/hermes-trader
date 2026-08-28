@@ -81,6 +81,11 @@ class _Cache:
             self.misses = 0
             self.evictions = 0
 
+    def delete(self, key: str) -> None:
+        """Invalidate a single key (used by force-refresh paths)."""
+        with self._lock:
+            self._store.pop(key, None)
+
 # Module-level cache for global (non-client) memoization
 _global_cache: Optional[_Cache] = None
 _global_cache_lock = threading.Lock()
@@ -112,7 +117,7 @@ def cached_api_call(key_func: Callable, ttl: float = 3.0, max_size: int = 512) -
 
     def decorator(fn: Callable) -> Callable:
         @wraps(fn)
-        def wrapper(*args, **kwargs):
+        def wrapper(*args: Any, **kwargs: Any) -> Any:
             key = key_func(*args, **kwargs)
             cached = cache.get(key)
             if cached is not None:

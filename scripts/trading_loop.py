@@ -48,18 +48,29 @@ logging.basicConfig(
 from hermes_trader.agents.perception import scan_once
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.research import research
-from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict
+from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl
 from hermes_trader.agents.dsl_exit import active_position_coins, rehydrate_from_exchange
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config
+from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.memory import memory
 from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache
 from hermes_trader.client.universe import get_universe
 from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.session_log import append as log_event
+from hermes_trader.surge_postmortem import SurgeDetector, SurgeConfig
 
 logger = logging.getLogger(__name__)
+
+# Surge postmortem watcher (module-level singleton): detects a coin whose
+# composite score explodes across cycles and auto-writes a full postmortem to
+# the container log + /data/postmortems/. Never raises into the loop.
+#
+# The surge NOTIFY threshold is intentionally INDEPENDENT of the scan/trade
+# gate (minCompositeScore, 54): we want to be alerted earlier (score>=40) even
+# though a trade isn't actionable until 54. Override via HERMES_SURGE_MIN_SCORE.
+_surge_min = float(os.environ.get("HERMES_SURGE_MIN_SCORE", "40"))
+_surge_detector = SurgeDetector(SurgeConfig(min_score=_surge_min))
 
 
 def _remaining_minutes(ms_remaining: float) -> int:
@@ -80,6 +91,39 @@ _last_progress_ts = time.time()
 _watchdog_timeout_s = int(os.environ.get('HERMES_WATCHDOG_TIMEOUT_S', '600'))
 
 
+def _pre_exec_flush(timeout_s: float = 3.0) -> None:
+    """Best-effort persistence of in-memory state before a watchdog re-exec.
+
+    The watchdog fires from its own thread while the MAIN thread is hung. If
+    the main thread holds the DSL-state or memory file lock, calling the
+    flush directly from here would block on flock() and defeat the self-heal.
+    Run each flush in a short-lived daemon thread with a bounded join so a
+    contended lock is abandoned rather than blocking the restart. A filled
+    order whose DSL tracker wasn't yet flushed is reconciled on startup by
+    rehydrate_from_exchange() anyway; this just narrows that window.
+    """
+    def _dsl() -> None:
+        try:
+            from hermes_trader.agents import dsl_exit
+            dsl_exit._save_state()
+        except Exception as e:
+            logger.debug(f"[watchdog] pre-exec dsl flush failed: {e}")
+
+    def _mem() -> None:
+        try:
+            memory.flush()
+        except Exception as e:
+            logger.debug(f"[watchdog] pre-exec memory flush failed: {e}")
+
+    for target in (_dsl, _mem):
+        t = threading.Thread(target=target, daemon=True)
+        t.start()
+        t.join(timeout_s)
+        if t.is_alive():
+            logger.warning("[watchdog] pre-exec flush timed out "
+                           f"(lock held by hung main thread) — proceeding to re-exec")
+
+
 def _watchdog() -> None:
     while True:
         time.sleep(60)
@@ -95,7 +139,28 @@ def _watchdog() -> None:
                            "error": f"hung {stalled:.0f}s — re-exec"})
             except Exception:
                 pass
+            # Persist what we can before the image is replaced. Server-side
+            # SL/TP brackets keep protecting positions through the restart;
+            # startup rehydrate rebuilds trackers from the exchange.
+            _pre_exec_flush()
             os.execv(sys.executable, [sys.executable] + sys.argv)
+
+
+def _beat(stage: str) -> None:
+    """Per-stage watchdog heartbeat.
+
+    The loop only bumped `_last_progress_ts` once per FULL cycle (after all
+    triggers had been researched + executed). A slow-but-progressing cycle
+    (cold-start meta prewarm + ~3 min scan + N serial HTA researches) could
+    legitimately exceed the 600s timeout and get killed mid-research, at
+    which point the restart re-did the same expensive work — a death spiral
+    observed 2026-08-18 (re-exec every ~10 min for hours). Bumping before
+    each major stage means a STUCK stage still fires the watchdog, but a
+    slow-moving one doesn't.
+    """
+    global _last_progress_ts
+    _last_progress_ts = time.time()
+    logger.debug(f"[watchdog] beat: {stage}")
 
 
 threading.Thread(target=_watchdog, name="hermes-watchdog", daemon=True).start()
@@ -170,9 +235,12 @@ if _startup_grace_s > 0:
     logger.info(f"[startup] grace delay {_startup_grace_s:.0f}s — letting HL rate budget refill before the first cold scan")
     time.sleep(_startup_grace_s)
 
-# Scan cadence: env-overridable, default 60s. Keep it above the candle cache
-# TTL (config.scan.cacheTtlMs) so every scan reads a fresh candle snapshot.
-scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '60'))
+# Scan cadence: env-overridable, default 15s.
+# Post-HYPE postmortem (2026-08-21): shortened from 60s to 15s to shrink the
+# DSL exit polling blind window during fast crashes. The 5m candle cache TTL
+# (50s) is keyed by candle timestamp so repeated reads within a TTL still see
+# the same closed candle; intra-candle price is fetched live via midpoint.
+scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '15'))
 min_score = config['scan']['minCompositeScore']
 
 logger.info(f"Scan interval: {scan_interval}s, Min score: {min_score}")
@@ -207,7 +275,11 @@ def _sync_account_state():
         # of dropping them as "stale".
         return 0.0, [], 0.0, 0.0, set(), {}
     try:
-        state = fetch_account_state(user, include_hip3=True)
+        # Respect the enable_hip3 config flag — when HIP-3 is disabled (e.g. the
+        # 10-USDC mainnet config), querying every perpDex's clearinghouse burns
+        # rate budget and time on every heartbeat for no benefit.
+        _hip3_on = bool(read_agent_config().get("enable_hip3", False))
+        state = fetch_account_state(user, include_hip3=_hip3_on)
     except Exception as e:
         # Fetch FAILED (e.g. API timeout storm). We did NOT successfully query any
         # dex, so report queried_dexes=set() — NOT {""}. Reporting the main dex as
@@ -273,6 +345,12 @@ def _sync_account_state():
 # AI close-check on coins we already hold so we don't research a "hold" every
 # scan. Resets on restart (a fresh close-check on startup is harmless/useful).
 _last_research_by_coin: dict = {}
+# Composite score at the time of that paid research, per coin. The re-research
+# throttle below uses it to exempt a coin whose setup materially strengthened
+# mid-throttle: measured 2026-08-19/20, 86/160 surfaced slots (54%) were dropped
+# by RESEARCH_THROTTLE alone, including movers that ran +20%+ after the skip.
+# Waiting out a fixed window on a score that jumped is the expensive failure.
+_last_research_score_by_coin: dict = {}
 
 
 while True:
@@ -319,6 +397,7 @@ while True:
         # without its own fetch_account_state call (which, sharing this IP,
         # was doubling HL load and tripping per-IP rate limits).
         write_snapshot(positions)
+        _beat("account_sync")
 
         # ── HARD daily-loss kill-switch ─────────────────────────────────────
         # The daily_loss GATE (risk_gates) only blocks NEW entries — it can't
@@ -331,7 +410,7 @@ while True:
         # preserves last-known-good daily_pnl), so a bad read can NEVER trigger a
         # flatten. Idempotent: after flattening, the next tick's positions are
         # empty so it won't re-fire.
-        _max_daily_loss = float(_cfg.get("max_daily_loss_usd", -100) or -100)
+        _max_daily_loss = float(cfg_get("max_daily_loss_usd", config=_cfg))
         if equity > 0 and positions and daily_pnl <= _max_daily_loss:
             logger.warning(
                 f"[killswitch] HARD daily-loss floor breached: PnL ${daily_pnl:.2f} "
@@ -353,10 +432,163 @@ while True:
         # Reconcile trackers with live exchange positions (handles restarts,
         # manual closes, externally-filled SLs), then market-close anything
         # whose dynamic floor was breached.
+        # Resolve user address here so rehydrate can look up actual fill times
+        # for synthesized trackers (the `user` local inside _sync_account_state
+        # is not visible in this scope).
+        user = resolve_user_address()
         try:
-            rehydrate_from_exchange(positions,
-                                    default_leverage=int(_cfg.get("leverage", 1) or 1),
-                                    queried_dexes=queried_dexes)
+            dropped = rehydrate_from_exchange(positions,
+                                    default_leverage=int(cfg_get("leverage", config=_cfg)),
+                                    queried_dexes=queried_dexes,
+                                    user=user)
+            # Backfill close/outcome records for positions that vanished outside
+            # the DSL market-close path (exchange-side SL/TP trigger, manual
+            # close, liquidation). Without this, rehydrate silently dropped the
+            # tracker and memory.closes never recorded the realized PnL — PURR
+            # 2026-08-22 hit its server-side SL and the trade existed in
+            # trades[] but had no matching closes[] row. Best-effort only: a
+            # bookkeeping failure must never block exit monitoring.
+            if dropped and user:
+                try:
+                    from hermes_trader.agents.dsl_exit import resolve_close_fill
+                    for _tr in dropped:
+                        try:
+                            _fill = resolve_close_fill(
+                                user, _tr.coin, _tr.side,
+                                since_ts=_tr.entry_time - 1.0)
+                            if not _fill:
+                                logger.warning(
+                                    f"[outcome-store] {_tr.coin} {_tr.side} "
+                                    f"tracker dropped externally but no "
+                                    f"reducing fill found — close NOT recorded")
+                                log_event({"event": "external_close_unattributed",
+                                           "coin": _tr.coin, "side": _tr.side,
+                                           "entry_px": _tr.entry_px})
+                                continue
+                            _exit_px = float(_fill.get("px") or 0.0)
+                            _sz = abs(float(_fill.get("sz") or 0.0))
+                            _fee = float(_fill.get("fee") or 0.0)
+                            _closed_pnl = float(_fill.get("closedPnl") or 0.0)
+                            _closed_at = int(_fill.get("time") or
+                                             int(time.time() * 1000))
+                            if _exit_px <= 0 or _sz <= 0:
+                                continue
+                            _lev = max(1, int(_tr.leverage or 1))
+                            _notional = _sz * _tr.entry_px
+                            if _tr.side == "long":
+                                _spot_pct = ((_exit_px - _tr.entry_px)
+                                             / _tr.entry_px * 100.0)
+                            else:
+                                _spot_pct = ((_tr.entry_px - _exit_px)
+                                             / _tr.entry_px * 100.0)
+                            # closedPnl from the exchange is net of the closing
+                            # fee but NOT the opening fee; subtract the entry
+                            # fee estimate so the stored net matches a normal
+                            # DSL close's realized_pnl_usd.
+                            _entry_fee = _notional * 0.00025
+                            _net_usd = round(_closed_pnl - _entry_fee, 4)
+                            _hold_min = round((_closed_at / 1000.0
+                                               - _tr.entry_time) / 60.0, 1)
+                            memory.record_close({
+                                "coin": _tr.coin, "side": _tr.side,
+                                "entry_px": _tr.entry_px, "exit_px": _exit_px,
+                                "size_coin": _sz,
+                                "notional_usd": round(_notional, 4),
+                                "spot_pct": round(_spot_pct, 4),
+                                "realized_pnl_pct": round(
+                                    _net_usd / _notional * 100.0 * _lev, 4)
+                                if _notional > 0 else 0.0,
+                                "realized_pnl_usd": _net_usd,
+                                "gross_pnl_usd": round(_closed_pnl + _fee, 4),
+                                "fee_usd": round(_fee + _entry_fee, 4),
+                                "leverage": _lev,
+                                "closed_at": _closed_at,
+                                "entry_time": int(_tr.entry_time * 1000),
+                                "hold_minutes": _hold_min,
+                                "signals_at_entry": {},
+                                "enforcement_at_entry": {},
+                                "forced_override": None,
+                                "entry_slip_bps": None,
+                                "exit_slip_bps": None,
+                                "regime_at_entry": _tr.entry_regime or "",
+                                "is_hip3": ":" in _tr.coin,
+                                "funding_cost_usd": None,
+                                "close_source": "exchange_trigger",
+                                "close_oid": _fill.get("oid"),
+                            })
+                            logger.info(
+                                f"[outcome-store] backfilled external close "
+                                f"{_tr.coin} {_tr.side} @ {_exit_px} "
+                                f"({_spot_pct:+.2f}% spot, pnl=${_net_usd}) "
+                                f"oid={_fill.get('oid')}")
+                            # Emit a dsl_exit session-log event so the web
+                            # dashboard's closed-trades panel (which only reads
+                            # session-log, not memory.closes/events.jsonl) can
+                            # see backfilled external closes. close_source is
+                            # preserved on the memory record; this event is the
+                            # dashboard-visible mirror.
+                            _fees_pct = (0.00025 * 2 * _lev)
+                            _gross_pct = _spot_pct * _lev
+                            log_event({
+                                "event": "dsl_exit",
+                                "coin": _tr.coin,
+                                "side": _tr.side,
+                                "leverage": _lev,
+                                "reason": "external_close_backfill",
+                                "exit_reason": "exchange_trigger",
+                                "entry_regime": _tr.entry_regime or "",
+                                "hold_min": _hold_min,
+                                "unrealized_pct": round(_spot_pct, 4),
+                                "leveraged_pct": round(_gross_pct, 4),
+                                "executed": True,
+                                "detail": f"backfill oid={_fill.get('oid')}",
+                                "fill_px": _exit_px,
+                                "entry_px": _tr.entry_px,
+                                "realized_spot_pct": round(_spot_pct, 4),
+                                "realized_pnl_pct": round(
+                                    _net_usd / _notional * 100.0 * _lev, 4)
+                                if _notional > 0 else 0.0,
+                                "fees_pct": _fees_pct,
+                                "close_source": "exchange_trigger",
+                            })
+                            log_event({"event": "external_close_recorded",
+                                       "coin": _tr.coin, "side": _tr.side,
+                                       "entry_px": _tr.entry_px,
+                                       "exit_px": _exit_px,
+                                       "spot_pct": round(_spot_pct, 4),
+                                       "realized_pnl_usd": _net_usd,
+                                       "leverage": _lev,
+                                       "oid": _fill.get("oid")})
+                            # Arm the loss cooldown on a losing external fill
+                            # so an exchange-side stop also enforces the
+                            # anti-revenge re-entry block (normally done by
+                            # close_position_market).
+                            if _net_usd < 0:
+                                try:
+                                    lc_min = float(
+                                        cfg_get("loss_cooldown_min",
+                                                config=read_agent_config()))
+                                    if lc_min > 0:
+                                        until = int(time.time() * 1000
+                                                    + lc_min * 60_000)
+                                        memory.set_loss_cooldown(_tr.coin, until)
+                                        logger.info(
+                                            f"[executor] loss cooldown armed "
+                                            f"on {_tr.coin}: {lc_min:.0f}min "
+                                            f"(external close ${_net_usd})")
+                                except Exception as _lc_e:
+                                    logger.warning(
+                                        f"[executor] loss-cooldown arm failed "
+                                        f"for {_tr.coin}: {_lc_e}")
+                        except Exception as _dc_e:
+                            logger.warning(
+                                f"[outcome-store] drop-backfill failed for "
+                                f"{_tr.coin}: {_dc_e}")
+                except Exception as _bf_e:
+                    logger.warning(
+                        f"[outcome-store] external-close backfill setup "
+                        f"failed (non-fatal): {_bf_e}")
+
             # include_hip3=True so xyz:MU / vntl:* etc. get fresh mids each
             # cycle — without them, monitor_exits has no price for HIP-3
             # trackers and their peak/floor never advance (dashboard shows
@@ -367,8 +599,25 @@ while True:
                 coin = ex["coin"]
                 lev = ex.get("leverage", 1)
                 lpct = ex.get("leveraged_pct", ex["unrealized_pct"] * lev)
+                _reg = ex.get("entry_regime") or "unknown"
+                _hold = ex.get("hold_min") or 0.0
+                _mfe = ex.get("mfe_pct") or 0.0
                 logger.info(f"[dsl] Closing {coin} {ex.get('side','?')} ({lev}x): "
                             f"{ex['reason']} (margin {lpct:+.2f}% · spot {ex['unrealized_pct']:+.2f}%)")
+                # Structured per-exit telemetry — machine-parseable for the
+                # trailing-stop conservatism audit (avg realized profit / hold
+                # time / MFE grouped by entry_regime). reason is canonicalized
+                # so floor_breach* -> trailing_stop for grouping.
+                _r = ex["reason"]
+                _canon = "trailing_stop" if _r.startswith("floor_breach") else (
+                    "max_loss" if _r.startswith("max_loss") else (
+                    "hard_timeout" if _r.startswith("hard_timeout") else (
+                    "stale_flat_timeout" if _r.startswith("stale_flat_timeout") else _r.split(" ")[0])))
+                logger.info(f"[dsl:exit_stats] coin={coin} side={ex.get('side','?')} "
+                            f"lev={lev} regime={_reg} reason={_canon} "
+                            f"hold_min={_hold:.1f} mfe_spot_pct={_mfe:+.2f} "
+                            f"exit_spot_pct={ex['unrealized_pct']:+.2f} "
+                            f"exit_margin_pct={lpct:+.2f}")
                 res = close_position_market(coin)
                 # The close response carries authoritative realized PnL when
                 # the order filled with a parseable avgPx — prefer it over the
@@ -380,6 +629,10 @@ while True:
                     "side": ex.get("side"),
                     "leverage": lev,
                     "reason": ex["reason"],
+                    "exit_reason": _canon,
+                    "entry_regime": _reg,
+                    "hold_min": round(_hold, 2),
+                    "mfe_spot_pct": round(_mfe, 4),
                     "unrealized_pct": round(ex["unrealized_pct"], 4),
                     "leveraged_pct": round(lpct, 4),
                     "executed": bool(res.get("ok")),
@@ -392,9 +645,30 @@ while True:
                     evt["realized_pnl_pct"] = res.get("realized_pnl_pct")
                     evt["fees_pct"] = res.get("fees_pct")
                 log_event(evt)
+
+            # ── Dynamic exchange-SL coordination ──────────────────────────
+            # After processing DSL exits, pull each Phase-2 position's static
+            # exchange backup SL up behind the ratcheted DSL floor (throttled,
+            # best-effort). This keeps the server-side safety net overlapping
+            # locked-in profit instead of sitting at the initial 3% ceiling.
+            try:
+                sync_exchange_sl(mids)
+            except Exception as _sl_e:
+                logger.error(f"[dsl] sync_exchange_sl failed (non-fatal): {_sl_e}")
+            # Retry placing backup SLs for positions whose initial placement
+            # failed twice. This used to be dead code (defined but never
+            # called) — a naked position had no server-side stop between DSL
+            # polls or across a crash. Wired here, right after sync, so every
+            # DSL monitor pass re-arms the exchange-side safety net.
+            try:
+                retry_pending_sl()
+            except Exception as _rsl_e:
+                logger.error(f"[dsl] retry_pending_sl failed (non-fatal): {_rsl_e}")
         except Exception as e:
             logger.error(f"[dsl] monitor pass failed: {e}")
             log_event({"event": "error", "scope": "dsl_monitor", "error": str(e)})
+
+        _beat("dsl_exit")
 
         if str(_cfg.get("mode", "OFF")).upper() == "OFF":
             logger.info("[mode] OFF — skipping scan/research/execution; exits still monitored")
@@ -403,10 +677,33 @@ while True:
             time.sleep(scan_interval)
             continue
 
+        # Hot-toggle `enable_hip3`: the universe is a startup snapshot (see the
+        # comment above line "HIP-3 toggle: read once at startup"), so flipping
+        # the flag mid-run previously required a restart to add/drop HIP-3
+        # tokenized markets. Detect the change each cycle and rebuild immediately.
+        # Read fresh here (do not rely on the perception-layer `include_hip3`,
+        # which only gates filtering of the already-prefetched list).
+        try:
+            _hip3_now = bool(read_agent_config().get("enable_hip3", False))
+        except Exception:
+            _hip3_now = _enable_hip3
+        if _hip3_now != _enable_hip3:
+            try:
+                universe = get_universe(force_refresh=True, include_hip3=_hip3_now)
+                _enable_hip3 = _hip3_now
+                _last_universe_refresh = time.time()
+                _n_hip3 = sum(1 for m in universe if m.get("dex"))
+                logger.info(
+                    f"[universe] enable_hip3 flipped to {_hip3_now} — rebuilt: "
+                    f"{len(universe)} markets ({_n_hip3} HIP-3)"
+                )
+            except Exception as e:
+                logger.warning(f"[universe] enable_hip3 flip rebuild failed, keeping prior snapshot: {e}")
+
         # Refresh the universe on a TTL so prevDayPx / dayNtlVlm / funding track
         # the live market instead of freezing at loop-start (stale fields make
         # the scanner rank yesterday's movers — see HERMES_UNIVERSE_REFRESH_S).
-        if universe_refresh_s > 0 and (time.time() - _last_universe_refresh) >= universe_refresh_s:
+        elif universe_refresh_s > 0 and (time.time() - _last_universe_refresh) >= universe_refresh_s:
             try:
                 universe = get_universe(force_refresh=True, include_hip3=_enable_hip3)
                 _last_universe_refresh = time.time()
@@ -415,7 +712,9 @@ while True:
                 logger.warning(f"[universe] periodic refresh failed, keeping prior snapshot: {e}")
 
         logger.info("Scanning markets...")
+        _beat("scan_start")
         results = scan_once(universe=universe, min_score=min_score, config=config)
+        _beat("scan_done")
         logger.info(f"Scan found {len(results)} triggers")
         # Per-cycle heartbeat — proof of life even when nothing triggers.
         # `coin_scores` carries the composite score for each trigger so the
@@ -427,12 +726,24 @@ while True:
                                     "triggers": [t['name'] for t in p.get('triggers', []) if t.get('fired')]}
                                    for p in results]})
 
+        # Surge detection: feed every trigger result (score >= gate) to the
+        # postmortem watcher. It compares against the previous cycle and fires
+        # a postmortem when a coin crosses the gate with a large score jump
+        # driven by a momentum trigger. Failures are swallowed internally.
+        for _p in results:
+            _surge_detector.observe(
+                _p.get("coin", "?"),
+                float(_p.get("composite_score", 0) or 0),
+                _p.get("triggers", []),
+                perception=_p,
+            )
+
         # Pre-research dedupe cache: coin → last research timestamp this run.
         # Prevents burning AI tokens on a setup that's still in cooldown from a
         # prior cycle. The execute-time `cooldown_gate` is still in place as the
         # authoritative backstop; this just stops the paid LLM call early.
         _cfg_cd = read_agent_config()
-        cooldown_min = float(_cfg_cd.get("cooldown_min", 60))
+        cooldown_min = float(_cfg_cd.get("cooldown_min", 30))
         cooldown_ms = cooldown_min * 60_000
         # How often a HELD coin is re-researched for a possible AI CLOSE. We
         # don't pay for a "hold" PASS every scan — the DSL engine handles fast
@@ -458,6 +769,9 @@ while True:
         _blocklist = set(_cfg_cd.get("coin_blocklist", []) or [])
         now_ms = int(time.time() * 1000)
 
+        # Per-cycle outcome tracker for the end-of-cycle summary log.
+        _cycle_outcomes = []  # list of (coin, action, executed, detail)
+
         for perception in results:
             coin = perception['coin']
             score = perception.get('composite_score', 0)
@@ -480,6 +794,7 @@ while True:
                                "signal": "HELD_THROTTLE",
                                "score": round(float(score), 1),
                                "trigger_score": round(float(score), 1)})
+                    _cycle_outcomes.append((coin, "skip", False, "held throttle"))
                     continue
                 # Infancy hold: skip the AI close-check while the position is
                 # younger than min_ai_close_hold_min (0=off). Measured churn
@@ -487,7 +802,7 @@ while True:
                 # own fresh entry 3x (TON 2x, ZEC 1x, each ~-1% ROE incl. fees) —
                 # flip-flopping on entry noise. DSL stop + backup SL still
                 # protect an infant position; only the AI's second-guess waits.
-                min_hold_min = float(_cfg_cd.get("min_ai_close_hold_min", 0) or 0)
+                min_hold_min = float(cfg_get("min_ai_close_hold_min", config=_cfg_cd))
                 if min_hold_min > 0:
                     from hermes_trader.agents import dsl_exit as _dsl
                     _tr = (_dsl._active_positions.get(f"{coin}_long")
@@ -497,6 +812,7 @@ while True:
                         if age_min < min_hold_min:
                             logger.info(f"{coin}: held {age_min:.0f}min < min_hold "
                                         f"{min_hold_min:.0f}min — infancy, skip close-check")
+                            _cycle_outcomes.append((coin, "skip", False, f"infancy hold {age_min:.0f}min"))
                             continue
             else:
                 # Blocklisted + not held → coin_filter will reject any entry, so
@@ -509,6 +825,7 @@ while True:
                                "signal": "BLOCKLISTED",
                                "score": round(float(score), 1),
                                "trigger_score": round(float(score), 1)})
+                    _cycle_outcomes.append((coin, "skip", False, "blocklisted"))
                     continue
                 # Not held but executed within cooldown_min → re-entry would be
                 # gate-blocked, so skip the paid AI call.
@@ -520,36 +837,75 @@ while True:
                                "signal": "COOLDOWN",
                                "score": round(float(score), 1),
                                "trigger_score": round(float(score), 1)})
+                    _cycle_outcomes.append((coin, "skip", False, f"cooldown {remaining_min}min"))
                     continue
                 # Re-research throttle: already researched recently (any verdict) →
                 # don't re-pay the LLM until research_cooldown_min lapses.
+                #
+                # Exemption: if the composite score jumped by at least
+                # research_rescore_delta since that research, the setup is
+                # materially different from the one we already judged, so the
+                # cached verdict is stale and worth re-paying for. Fires at most
+                # once per throttle window because we overwrite the stored score
+                # on every paid research.
                 last_research = _last_research_by_coin.get(coin, 0)
                 if (now_ms - last_research) < research_cooldown_ms:
-                    remaining_min = _remaining_minutes(research_cooldown_ms - (now_ms - last_research))
-                    logger.info(f"{coin}: re-research throttle ({remaining_min}min remaining) — skip")
-                    log_event({"event": "ta_skip", "coin": coin,
-                               "signal": "RESEARCH_THROTTLE",
-                               "score": round(float(score), 1),
-                               "trigger_score": round(float(score), 1)})
-                    continue
+                    _rescore_delta = float(_cfg_cd.get("research_rescore_delta", 0) or 0)
+                    _prev_score = _last_research_score_by_coin.get(coin)
+                    _jumped = (
+                        _rescore_delta > 0
+                        and _prev_score is not None
+                        and (float(score) - _prev_score) >= _rescore_delta
+                    )
+                    if _jumped:
+                        logger.info(
+                            f"{coin}: re-research throttle BYPASSED — composite "
+                            f"{_prev_score:.1f} -> {float(score):.1f} "
+                            f"(+{float(score) - _prev_score:.1f} >= {_rescore_delta:.1f})")
+                    else:
+                        remaining_min = _remaining_minutes(research_cooldown_ms - (now_ms - last_research))
+                        logger.info(f"{coin}: re-research throttle ({remaining_min}min remaining) — skip")
+                        log_event({"event": "ta_skip", "coin": coin,
+                                   "signal": "RESEARCH_THROTTLE",
+                                   "score": round(float(score), 1),
+                                   "trigger_score": round(float(score), 1)})
+                        _cycle_outcomes.append((coin, "skip", False, f"research throttle {remaining_min}min"))
+                        continue
 
             # TA filter — cheap statistical gate before the paid AI call.
+            # A momentum burst may bypass a WEAK TA score (the burst itself is
+            # the impulse) but NEVER a REJECTED one — REJECTED now includes the
+            # late-entry veto (RSI extreme / over-extension), so an over-extended
+            # burst must not reach the paid AI.
             ta = analyze_perception(perception)
-            if ta['signal'] != 'CONFIRMED' and not _burst_fired(perception):
+            _burst_bypass = _burst_fired(perception) and ta['signal'] != 'REJECTED'
+            if ta['signal'] != 'CONFIRMED' and not _burst_bypass:
                 logger.info(f"{coin}: TA {ta['signal']} (score {ta['score']:.0f}) — skip AI research")
                 log_event({"event": "ta_skip", "coin": coin,
                            "signal": ta['signal'],
                            "score": round(float(ta.get('score', 0)), 1),
+                           "reason": ta.get("reason"),
                            "trigger_score": round(float(score), 1)})
+                _cycle_outcomes.append((coin, "skip", False, f"TA {ta['signal']}"))
                 continue
             gate = 'CONFIRMED' if ta['signal'] == 'CONFIRMED' else f"{ta['signal']}+burst"
             logger.info(f"Researching {coin} (trigger {score:.1f}, TA {gate})...")
+            # Per-coin heartbeat: a 3-trigger cycle with slow HTA research can
+            # take several minutes (observed 77s on a single GOOGL call). A
+            # beat before each paid research prevents the watchdog from
+            # re-exec'ing mid-batch while coins are still making progress.
+            _beat(f"research_start:{coin}")
             # Record the paid-research time so the held-coin throttle above can
             # pace the next AI close-check on this position.
             _last_research_by_coin[coin] = now_ms
+            # Snapshot the score this verdict was formed on, so the throttle
+            # above can detect a material re-score during the window.
+            _last_research_score_by_coin[coin] = float(score)
 
             try:
-                analysis = research(coin, perception)
+                # Pass the cycle-level account state snapshot so research()
+                # doesn't re-fetch it (saves N × (2+M) HL POSTs per cycle).
+                analysis = research(coin, perception, account_snapshot=state)
                 logger.info(f"Verdict: {analysis['verdict']}, Confidence: {analysis['confidence']}")
                 # Store the full LLM reasoning verbatim — no character cap.
                 # The feed shows the complete rationale.
@@ -569,12 +925,28 @@ while True:
                 action = routed["action"]
                 result = routed["result"] or {}
                 if action == "execute":
-                    logger.info(f"Trade result: {result}")
                     executed = bool(result.get("executed"))
+                    if executed:
+                        _oid = result.get("order_id", "")
+                        _sz = result.get("size_usd", 0)
+                        logger.info(f"✅ {coin} ORDER PLACED — side={analysis['side']} "
+                                    f"size=${_sz:.0f} order_id={_oid}")
+                    else:
+                        _blocks = result.get("blocked_by") or []
+                        _reason = result.get("reason") or "; ".join(_blocks) or "unknown"
+                        logger.info(f"🚫 {coin} BLOCKED — {_reason}")
                     # Surface the regime decision so the log answers "why did a
                     # counter-regime trade fire?" — via is one of aligned /
                     # neutral / confidence / composite / trigger:<name> / blocked.
-                    mr = (result.get("gate_results") or {}).get("market_regime") or {}
+                    _all_gates = result.get("gate_results") or {}
+                    mr = _all_gates.get("market_regime") or {}
+                    # Persist a compact pass/fail summary of ALL 16 gates so the
+                    # event log can reconstruct which gates blocked a trade
+                    # (previously only market_regime's 4 fields were saved).
+                    _gates_summary = {
+                        gk: bool(gv.get("pass")) for gk, gv in _all_gates.items()
+                        if isinstance(gv, dict)
+                    }
                     log_event({"event": "execute", "coin": coin,
                                "side": analysis['side'],
                                "executed": executed,
@@ -589,7 +961,13 @@ while True:
                                "regime": mr.get("regime"),
                                "funding_regime": mr.get("funding"),
                                "regime_via": mr.get("via"),
-                               "counter_regime": mr.get("counter_trend") or mr.get("against_funding")})
+                               "counter_regime": mr.get("counter_trend") or mr.get("against_funding"),
+                               "gates": _gates_summary,
+                               "gate_results": _all_gates})
+                    _cycle_outcomes.append((coin, "execute", executed,
+                                           result.get("order_id") or
+                                           "; ".join(result.get("blocked_by") or []) or
+                                           result.get("reason") or ""))
                 elif action == "close":
                     logger.info(f"Closed {coin} per AI CLOSE verdict: {result}")
                     log_event({"event": "ai_close", "coin": coin,
@@ -598,9 +976,17 @@ while True:
                                or result.get("noop")
                                or result.get("error"),
                                "reasoning": (analysis.get("reasoning") or "")})
+                    _cycle_outcomes.append((coin, "close", bool(result.get("ok")),
+                                           result.get("order_id") or result.get("noop") or ""))
                 elif action == "unknown":
                     log_event({"event": "error", "coin": coin,
                                "error": f"unhandled verdict {routed['verdict']!r}"})
+                    _cycle_outcomes.append((coin, "unknown", False, routed.get("verdict", "")))
+                else:
+                    # PASS / HOLD / no-action verdict — coin was researched but
+                    # the AI chose not to act.
+                    _cycle_outcomes.append((coin, action or "pass", False,
+                                           f"verdict={analysis.get('verdict', '?')}"))
             except Exception as e:
                 # repr(e) not str(e): a bare exception (e.g. some httpx errors)
                 # stringifies to "" and produced blank "Error processing X:" lines.
@@ -608,8 +994,36 @@ while True:
                 logger.error(f"Error processing {coin}: {type(e).__name__}: {detail}")
                 log_event({"event": "error", "coin": coin,
                            "error": f"{type(e).__name__}: {detail}"})
+                _cycle_outcomes.append((coin, "error", False, f"{type(e).__name__}: {detail}"))
+            # Post-coin beat — covers both research+execute path and exception
+            # path, so one slow coin doesn't eat the whole cycle's budget.
+            _beat(f"research_done:{coin}")
 
         _last_progress_ts = time.time()  # watchdog: a full cycle completed
+        # End-of-cycle summary: one line per trigger coin so you can see at a
+        # glance which coins passed, which were blocked, and why.
+        if _cycle_outcomes:
+            logger.info("=" * 60)
+            logger.info(f"Cycle summary — {len(results)} trigger(s):")
+            for _c, _act, _ok, _detail in _cycle_outcomes:
+                if _act == "execute" and _ok:
+                    _tag = "✅ EXECUTED"
+                elif _act == "execute":
+                    _tag = "🚫 BLOCKED"
+                elif _act == "close" and _ok:
+                    _tag = "✅ CLOSED"
+                elif _act == "close":
+                    _tag = "⚠️  CLOSE-FAIL"
+                elif _act == "skip":
+                    _tag = "⏭️  SKIP"
+                elif _act == "error":
+                    _tag = "❌ ERROR"
+                else:
+                    _tag = f"⏸  {_act.upper()}"
+                logger.info(f"  {_tag:16s} {_c:14s} {_detail}")
+            logger.info("=" * 60)
+        else:
+            logger.info("Cycle summary — no triggers this scan")
         logger.info(f"Sleeping {scan_interval}s until next scan...")
         time.sleep(scan_interval)
 
@@ -620,5 +1034,5 @@ while True:
     except Exception as e:
         logger.error(f"Trading loop error: {e}")
         log_event({"event": "error", "error": str(e)})
-        logger.info("Sleeping 60s before retry...")
-        time.sleep(60)
+        logger.info(f"Sleeping {scan_interval}s before retry...")
+        time.sleep(scan_interval)

@@ -17,6 +17,8 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
+import time as _time
 from typing import Any, Dict, Optional, Tuple
 
 # Hyperliquid rejects any order below $10 notional. Target a small buffer above
@@ -24,12 +26,95 @@ from typing import Any, Dict, Optional, Tuple
 MIN_ORDER_USD = 10.5
 
 from eth_account import Account
+from hyperliquid.api import API
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils.signing import (
     OrderType,
     TriggerOrderType,
 )
+from hyperliquid.utils.types import Cloid
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+# ── SDK retry patching ────────────────────────────────────────────────────────
+# The testnet API (api.hyperliquid-testnet.xyz) intermittently drops SSL
+# connections (SSLEOFError) and returns 429 under burst load. The SDK's
+# API base class creates a bare requests.Session with zero retries and
+# calls self.session.post() directly. We fix this in two layers:
+#
+# 1. Patch API.__init__ to mount a urllib3 Retry adapter immediately after
+#    session creation — before Info.__init__ fires meta()/spotMeta().
+# 2. Wrap API.post to catch SSLEOFError / ConnectionError and retry with
+#    exponential backoff, since urllib3 Retry does NOT classify SSLEOFError
+#    as retryable by default.
+
+_MAX_POST_RETRIES = 5
+_POST_BACKOFF = 2.0  # seconds, doubles each attempt
+
+# Per-request timeout for the official SDK's HTTP calls. The SDK defaults to
+# timeout=None (infinite wait) — a silent TCP hang would block the trading
+# loop forever and only be unblocked by the 600s watchdog re-exec. Bound it.
+# 30s is generous for HL's typical <1s responses but bounds a hung socket
+# before the watchdog fires. Read/connect share the same value (requests
+# accepts a float for total timeout).
+_SDK_TIMEOUT = float(os.environ.get("HERMES_HL_SDK_TIMEOUT_S", "30"))
+
+
+def _mount_retry_adapter(session: Any) -> None:
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=2.0,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET", "POST"],
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+
+
+_orig_api_init = API.__init__
+
+
+def _patched_api_init(self: Any, base_url: Optional[str] = None, timeout: Optional[float] = None) -> None:
+    _orig_api_init(self, base_url, timeout)
+    _mount_retry_adapter(self.session)
+
+
+API.__init__ = _patched_api_init
+
+_orig_api_post = API.post
+
+
+def _patched_api_post(self: Any, url_path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
+    payload = payload or {}
+    last_err = None
+    for attempt in range(_MAX_POST_RETRIES):
+        try:
+            return _orig_api_post(self, url_path, payload)
+        except Exception as e:
+            last_err = e
+            err_name = type(e).__name__
+            is_retriable = any(
+                s in err_name
+                for s in ("SSLEOFError", "SSLError", "ConnectionError",
+                           "ConnectTimeout", "ReadTimeout", "ProxyError")
+            )
+            if not is_retriable or attempt == _MAX_POST_RETRIES - 1:
+                raise
+            delay = _POST_BACKOFF * (2 ** attempt)
+            logging.getLogger(__name__).warning(
+                "API.post %s failed (%s), retry %d/%d in %.1fs",
+                url_path, err_name, attempt + 1, _MAX_POST_RETRIES - 1, delay,
+            )
+            _time.sleep(delay)
+    raise last_err  # type: ignore[misc]
+
+
+API.post = _patched_api_post
 
 from hermes_trader.client.hl_client import (
     HL_API,
@@ -50,7 +135,21 @@ PRIVATE_KEY_HEX = os.environ.get("HYPERLIQUID_PRIVATE_KEY", "")
 IS_AGENT = bool(HL_MASTER and HL_WALLET and HL_MASTER.lower() != HL_WALLET.lower())
 HL_ACCOUNT = HL_MASTER if IS_AGENT else HL_WALLET
 
-HL_LEVERAGE = 5  # 5x cross margin
+# Default leverage used only as a fallback when .agent-config.json omits
+# `leverage` (the executor/sizing always prefer the live config value,
+# currently 12x in production). Env-overridable so a deploy can change the
+# fallback without a code edit; kept at 5x for backward compatibility.
+HL_LEVERAGE = int(os.environ.get("HERMES_DEFAULT_LEVERAGE", "5"))  # cross margin
+
+# Slippage cap for IOC marketable-limit orders. The 1% headroom past the L2
+# touch is meant to absorb in-flight price drift, NOT to accept a fill at any
+# price. If the computed IOC limit deviates from mid by more than this, the
+# book has moved too far (or L2 is stale/malformed) → reject rather than lift
+# a wide offer. Closes (reduce_only) get a relaxed cap because an emergency
+# flatten must be allowed to escape; set HERMES_MAX_SLIPPAGE_CLOSE_PCT=0 to
+# disable the escape hatch. Both values are in percent.
+_MAX_SLIPPAGE_PCT = float(os.environ.get("HERMES_MAX_SLIPPAGE_PCT", "1.5"))
+_MAX_SLIPPAGE_CLOSE_PCT = float(os.environ.get("HERMES_MAX_SLIPPAGE_CLOSE_PCT", "5.0"))
 
 
 _exchange_instance = None  # Singleton instance
@@ -78,11 +177,46 @@ def _resolve_perp_dexs() -> Optional[list]:
         return None
 
 
+def _is_backtest_process() -> bool:
+    """Detect whether the current process is a backtest run (P3-17).
+
+    Two independent signals, either of which is sufficient:
+      1. ``HERMES_BACKTEST=1`` env var, set explicitly by backtest launchers.
+      2. ``sys.argv[0]`` basename contains "backtest" (covers scripts/backtest*.py).
+
+    Testnet runs (``HYPERLIQUID_TESTNET`` set) are NOT treated as backtest.
+    """
+    if os.environ.get("HERMES_BACKTEST", "").strip().lower() in ("1", "true", "yes"):
+        return True
+    try:
+        import sys
+        argv0 = os.path.basename(sys.argv[0] or "").lower()
+        if "backtest" in argv0:
+            return True
+    except Exception:
+        pass
+    return False
+
+
 def _make_exchange() -> Exchange:
     """Create or reuse Exchange client singleton (avoids WebSocket connection limit)."""
     global _exchange_instance
     if _exchange_instance is not None:
         return _exchange_instance
+
+    # P3-17: backtest processes must NEVER construct a signing client against
+    # a live mainnet wallet. A backtest that imports this module must either
+    # run against testnet or (preferably) not place orders at all. Failing
+    # loudly here prevents a real private key from being loaded into a
+    # simulation process where it could be misused or leaked.
+    if PRIVATE_KEY_HEX and _is_backtest_process():
+        testnet = os.environ.get("HYPERLIQUID_TESTNET", "").strip().lower() in ("1", "true", "yes")
+        if not testnet:
+            raise RuntimeError(
+                "Refusing to load live HYPERLIQUID_PRIVATE_KEY in a backtest process "
+                "(detected via HERMES_BACKTEST=1 or argv 'backtest'). "
+                "Unset the private key, set HYPERLIQUID_TESTNET=1, or run outside backtest."
+            )
 
     if not PRIVATE_KEY_HEX:
         raise RuntimeError("HYPERLIQUID_PRIVATE_KEY not set")
@@ -102,12 +236,23 @@ def _make_exchange() -> Exchange:
     # perp_dexs= teaches the SDK the HIP-3 dex list at init so name_to_asset
     # can resolve `xyz:NVDA` etc. when enable_hip3 is on. With it None the
     # SDK behaves exactly as before.
-    _exchange_instance = Exchange(
-        wallet=acct,
-        base_url=HL_API,
-        account_address=account_address,
-        perp_dexs=_resolve_perp_dexs(),
-    )
+    last_err = None
+    for attempt in range(5):
+        try:
+            _exchange_instance = Exchange(
+                wallet=acct,
+                base_url=HL_API,
+                account_address=account_address,
+                perp_dexs=_resolve_perp_dexs(),
+                timeout=_SDK_TIMEOUT,
+            )
+            break
+        except Exception as e:
+            last_err = e
+            if attempt < 4:
+                _time.sleep(2.0 * (2 ** attempt))
+    if _exchange_instance is None:
+        raise last_err  # type: ignore[misc]
     return _exchange_instance
 
 
@@ -119,10 +264,27 @@ def _get_info() -> Info:
 
     skip_ws=True: the callers only use REST methods (meta, all_mids, l2,
     fills, ...), so no WebSocket connection is opened.
+
+    Retries construction up to 3 times because the SDK's Info() constructor
+    fires meta() + spotMeta() immediately, and on testnet the SSL handshake
+    intermittently fails with SSLEOFError.
     """
     global _info_instance
     if _info_instance is None:
-        _info_instance = Info(skip_ws=True, perp_dexs=_resolve_perp_dexs())
+        last_err = None
+        for attempt in range(5):
+            try:
+                _info_instance = Info(skip_ws=True, base_url=HL_API,
+                                     perp_dexs=_resolve_perp_dexs(),
+                                     timeout=_SDK_TIMEOUT)
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < 4:
+                    # Exponential backoff: 2s, 4s, 8s, 16s (handles 429 + SSL flakiness)
+                    _time.sleep(2.0 * (2 ** attempt))
+        if _info_instance is None:
+            raise last_err  # type: ignore[misc]
     return _info_instance
 
 
@@ -135,6 +297,13 @@ def _get_info() -> Info:
 # resolution and we stop hammering the API. TTL is long — meta rarely changes.
 _META_CACHE: Dict[str, Tuple[float, list]] = {}
 _META_TTL_S = float(os.environ.get("HERMES_META_TTL_S", "3600"))
+# H11: the meta cache is process-local (lost on watchdog os.execv). On a cold
+# restart the first scan fires N concurrent get_coin_index calls across the
+# ThreadPoolExecutor; without a lock they all miss simultaneously and stampede
+# info.meta(), provoking the restart-time 429 storm that breaks HIP-3 coin
+# resolution. Serialize cache fills so only ONE in-flight meta() per dex and
+# the rest wait for its result.
+_META_CACHE_LOCK = threading.Lock()
 
 
 def _cached_universe(dex: Optional[str] = None) -> list:
@@ -143,24 +312,31 @@ def _cached_universe(dex: Optional[str] = None) -> list:
     On a fetch failure we serve a stale cached copy if we have one, rather than
     raising — a transient API blip must not break coin resolution mid-execute.
     """
-    import time as _time
     key = dex or ""
     hit = _META_CACHE.get(key)
     now = _time.time()
     if hit and (now - hit[0]) < _META_TTL_S:
         return hit[1]
-    info = _get_info()
-    try:
-        meta = info.meta(dex=dex) if dex else info.meta()
-        universe = meta.get("universe", []) or []
-        if universe:
-            _META_CACHE[key] = (now, universe)
-        return universe
-    except Exception as e:
-        if hit:  # serve stale rather than fail the lookup
-            logger.warning(f"[_cached_universe] meta fetch failed for dex={dex!r}; serving stale: {e}")
+    # H11: serialize the cold fetch (see _META_CACHE_LOCK). Double-check the
+    # cache under the lock so concurrent threads coalesce onto the first
+    # thread's meta() result instead of stampeding the API.
+    with _META_CACHE_LOCK:
+        hit = _META_CACHE.get(key)
+        now = _time.time()
+        if hit and (now - hit[0]) < _META_TTL_S:
             return hit[1]
-        raise
+        info = _get_info()
+        try:
+            meta = info.meta(dex=dex) if dex else info.meta()
+            universe = meta.get("universe", []) or []
+            if universe:
+                _META_CACHE[key] = (now, universe)
+            return universe
+        except Exception as e:
+            if hit:  # serve stale rather than fail the lookup
+                logger.warning(f"[_cached_universe] meta fetch failed for dex={dex!r}; serving stale: {e}")
+                return hit[1]
+            raise
 
 
 def prewarm_meta_cache() -> int:
@@ -398,7 +574,6 @@ def _round_price_for_hl(price: float, sz_decimals: int, is_perp: bool = True,
     MAX_DECIMALS = 6 if is_perp else 8
     px_decimals_by_tick = max(0, MAX_DECIMALS - int(sz_decimals))
 
-    import math
     int_digits = max(0, int(math.floor(math.log10(price))) + 1)
     px_decimals_by_sigfig = max(0, 5 - int_digits)
     px_decimals = min(px_decimals_by_tick, px_decimals_by_sigfig)
@@ -417,6 +592,24 @@ def _round_price_for_hl(price: float, sz_decimals: int, is_perp: bool = True,
     return f"{rounded:.0f}"
 
 
+def _oid_is_valid(oid: str) -> bool:
+    """P0-6: An order oid from HL must be a non-empty, all-digit string of
+    positive length. A missing/empty/"0"/"None"/None oid on an otherwise-ok
+    response is a red flag: the SDK accepted the order but we have no handle
+    to reconcile or cancel it. Refuse to claim success so the caller can
+    fall through to a known-failure path instead of silently orphaning the
+    position on the exchange.
+    """
+    if oid is None:
+        return False
+    s = str(oid).strip()
+    if not s or s in ("0", "None", "null", "false"):
+        return False
+    # HL oids are positive integers; allow a leading sign just in case the
+    # SDK ever changes shape, but reject anything with non-numeric junk.
+    return s.lstrip("+-").isdigit() and int(s) > 0
+
+
 def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, Any]:
     """Normalize a raw SDK order response into {ok, order_id?, avg_px?, total_sz?, error?}.
 
@@ -424,28 +617,94 @@ def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, 
     these to compute realized PnL from the actual fill price rather than the
     pre-trade mid (the two differ by spread + slippage, which compounds at
     leverage).
+
+    NOTE: For trigger orders the exchange may accept the order at placement
+    (returning `resting`) then ASYNCHRONOUSLY reject it when the trigger fires
+    (e.g. "minTradeNtlRejected"). This parser only sees the placement-time
+    response; post-trigger rejections must be caught by polling historicalOrders.
+    An empty `statuses` array on an otherwise-ok response is treated as a
+    failure here — it indicates the SDK did not confirm the order.
     """
     if not (isinstance(result, dict) and result.get("status") == "ok"):
+        logger.error(f"[_parse_order_result] exchange returned non-ok: {result}")
         return {"ok": False, "error": str(result)}
     statuses = result.get("response", {}).get("data", {}).get("statuses", [])
-    if statuses:
-        st = statuses[0]
-        if accept_resting and st.get("resting"):
-            return {"ok": True, "order_id": str(st["resting"]["oid"])}
-        if st.get("filled"):
-            f = st["filled"]
-            out: Dict[str, Any] = {"ok": True, "order_id": str(f.get("oid", ""))}
-            try:
-                if "avgPx" in f:
-                    out["avg_px"] = float(f["avgPx"])
-                if "totalSz" in f:
-                    out["total_sz"] = float(f["totalSz"])
-            except (TypeError, ValueError):
-                pass
-            return out
-        if st.get("error"):
-            return {"ok": False, "error": st["error"]}
-    return {"ok": True}
+    if not statuses:
+        # Defensive: an ok envelope with no statuses means the SDK did not
+        # return an order confirmation. Previously this silently returned
+        # {"ok": True} which masked placement failures (e.g. BCH TP 2026-08-21
+        # was accepted as resting then rejected on trigger — a separate
+        # failure mode, but the empty-statuses path should never lie).
+        logger.error(
+            f"[_parse_order_result] ok envelope with EMPTY statuses — order "
+            f"NOT confirmed by exchange. full_response={result}"
+        )
+        return {"ok": False, "error": "no order status in exchange response"}
+    st = statuses[0]
+    # NOTE: `st.get("resting")` returns the inner dict (or None when missing).
+    # An empty `{}` resting payload is falsy under `if`-truthiness even though
+    # the key is present — that previously sent us down the UNRECOGNIZED
+    # branch on a legitimate "resting but missing oid" response. Use `in`
+    # so we always enter the resting path when the key is present, then let
+    # the _oid_is_valid() check below decide whether the oid is acceptable.
+    if accept_resting and "resting" in st and st["resting"] is not None:
+        try:
+            oid = str(st["resting"].get("oid", ""))
+        except (TypeError, AttributeError):
+            oid = ""
+        if not _oid_is_valid(oid):
+            logger.error(
+                f"[_parse_order_result] order RESTING but oid MISSING/INVALID: "
+                f"oid={oid!r}, full_status={st} — refusing to claim success "
+                f"(would orphan the position; we could not reconcile later)"
+            )
+            return {"ok": False, "error": f"order_id_missing: resting.oid={oid!r}"}
+        logger.info(
+            f"[_parse_order_result] order RESTING on exchange: oid={oid} "
+            f"(trigger order accepted, awaiting price)"
+        )
+        return {"ok": True, "order_id": oid}
+    if "filled" in st and st["filled"] is not None:
+        f = st["filled"]
+        oid = str(f.get("oid", ""))
+        if not _oid_is_valid(oid):
+            logger.error(
+                f"[_parse_order_result] order FILLED but oid MISSING/INVALID: "
+                f"oid={oid!r}, full_status={st} — refusing to claim success"
+            )
+            return {"ok": False, "error": f"order_id_missing: filled.oid={oid!r}"}
+        out: Dict[str, Any] = {"ok": True, "order_id": oid}
+        try:
+            if "avgPx" in f:
+                out["avg_px"] = float(f["avgPx"])
+            if "totalSz" in f:
+                out["total_sz"] = float(f["totalSz"])
+            # (H-7) The SDK's filled payload carries the fill time in ms —
+            # surface it so the DSL tracker can use the REAL entry time
+            # (hard_timeout / stale_flat timers key off it) instead of the
+            # signal time.
+            if "time" in f:
+                out["filled_at_ms"] = int(f["time"])
+        except (TypeError, ValueError):
+            pass
+        logger.info(
+            f"[_parse_order_result] order FILLED: oid={oid}, "
+            f"avg_px={out.get('avg_px')}, total_sz={out.get('total_sz')}"
+        )
+        return out
+    if "error" in st and st["error"] is not None:
+        err = st["error"]
+        logger.error(
+            f"[_parse_order_result] exchange REJECTED order: error={err}, "
+            f"full_status={st}"
+        )
+        return {"ok": False, "error": err}
+    # Unknown status shape — don't claim success.
+    logger.warning(
+        f"[_parse_order_result] UNRECOGNIZED status shape — cannot confirm "
+        f"order outcome: status={st}"
+    )
+    return {"ok": False, "error": f"unrecognized status: {st}"}
 
 
 def _min_order_size(price: float, sz_decimals: int) -> float:
@@ -487,6 +746,52 @@ def entry_size_for_notional(coin: str, notional_usd: float, mid_price: float) ->
     return float(f"{size:.{sz_dec}f}")
 
 
+def get_orderbook_spread(coin: str) -> Dict[str, Any]:
+    """Fetch L2 order book and return bid/ask spread + depth info.
+
+    Returns dict with:
+      - best_bid, best_ask: top-of-book prices
+      - spread_pct: (ask - bid) / mid * 100
+      - bid_depth_1pct, ask_depth_1pct: cumulative notional within 1% of mid
+      - ok: True if data was fetched successfully
+    """
+    try:
+        levels = _get_info().l2_snapshot(coin).get("levels", [])
+        bids_raw = levels[0] if len(levels) > 0 else []
+        asks_raw = levels[1] if len(levels) > 1 else []
+        if not bids_raw or not asks_raw:
+            return {"ok": False, "error": "empty_orderbook"}
+
+        best_bid = float(bids_raw[0]["px"])
+        best_ask = float(asks_raw[0]["px"])
+        mid = (best_bid + best_ask) / 2.0
+        spread_pct = (best_ask - best_bid) / mid * 100.0 if mid > 0 else 999.0
+
+        # Cumulative depth within 1% of mid
+        bid_depth = sum(
+            float(b["px"]) * float(b["sz"])
+            for b in bids_raw
+            if float(b["px"]) >= mid * 0.99
+        )
+        ask_depth = sum(
+            float(a["px"]) * float(a["sz"])
+            for a in asks_raw
+            if float(a["px"]) <= mid * 1.01
+        )
+
+        return {
+            "ok": True,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread_pct": round(spread_pct, 4),
+            "bid_depth_1pct_usd": round(bid_depth, 2),
+            "ask_depth_1pct_usd": round(ask_depth, 2),
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def _ioc_cross_price(coin: str, is_buy: bool, mid_price: float) -> float:
     """Limit price for an IOC order that reliably crosses the live book.
 
@@ -518,6 +823,7 @@ def place_hl_order(
     mid_price: float,
     coin: str = "BTC",
     reduce_only: bool = False,
+    cloid: Optional[Cloid] = None,
 ) -> Dict[str, Any]:
     """Place an IOC (immediate-or-cancel) limit order on Hyperliquid.
 
@@ -538,6 +844,33 @@ def place_hl_order(
         # Price the IOC to cross the live book (best bid/ask + 1% headroom).
         price = _ioc_cross_price(coin, is_buy, mid_price)
 
+        # H15: cap the accepted slippage vs mid. The 1% L2 headroom is drift
+        # absorption, not a license to lift any offer. A wide/stale book (e.g.
+        # during a flash crash or L2 outage) would otherwise produce an IOC
+        # limit far from mid and fill at a predatory price. Closes get a
+        # relaxed cap because an emergency flatten must still escape.
+        if mid_price > 0:
+            slip_pct = abs(price - mid_price) / mid_price * 100.0
+            cap = _MAX_SLIPPAGE_CLOSE_PCT if reduce_only else _MAX_SLIPPAGE_PCT
+            if cap > 0 and slip_pct > cap:
+                logger.error(
+                    f"[place_hl_order] REJECT {coin} {'BUY' if is_buy else 'SELL'} "
+                    f"reduce_only={reduce_only} — IOC price {price:.6g} deviates "
+                    f"{slip_pct:.2f}% from mid {mid_price:.6g} > cap {cap:.2f}%. "
+                    f"Not submitting (book moved too far / L2 stale)."
+                )
+                return {
+                    "ok": False,
+                    "error": (
+                        f"slippage {slip_pct:.2f}% > cap {cap:.2f}% "
+                        f"(reduce_only={reduce_only})"
+                    ),
+                    "error_code": "slippage_exceeded",
+                    "price": price,
+                    "mid": mid_price,
+                    "slippage_pct": round(slip_pct, 4),
+                }
+
         # Round price honoring HL's tick + 5-sigfig rules. is_buy tells the
         # rounder which direction preserves IOC-cross aggression.
         price_str = _round_price_for_hl(price, sz_dec, is_perp=True, is_buy=is_buy)
@@ -556,13 +889,18 @@ def place_hl_order(
         
         # SDK expects float for both size and price (signature: limit_px: float).
         # price_str was already rounded to HL's tick + sigfig rules, so float() is safe.
+        # cloid is an exchange-side idempotency key: a retried order with the same
+        # cloid is rejected by HL as a duplicate rather than filled twice.
+        order_kwargs = {"reduce_only": reduce_only}
+        if cloid is not None:
+            order_kwargs["cloid"] = cloid
         result = exchange.order(
             coin,
             is_buy,
             float(size_str),
             float(price_str),
             order_type,
-            reduce_only=reduce_only,
+            **order_kwargs,
         )
 
         parsed = _parse_order_result(result)
@@ -573,6 +911,21 @@ def place_hl_order(
                 f"[place_hl_order] {coin} {'BUY' if is_buy else 'SELL'} "
                 f"size={size_str} px={price_str} REJECTED: {parsed.get('error')}"
             )
+        else:
+            # P0-6: surface the cloid alongside order_id so the caller can
+            # reconcile against HL's openOrders / userFills later if the
+            # primary path (oid) ever goes stale. Cloid is the deterministic
+            # client-side idempotency key (UUID int → 16 bytes); oid is the
+            # exchange-assigned numeric id, which may be missing on partial
+            # response shapes.
+            if cloid is not None:
+                try:
+                    parsed["cloid"] = str(cloid.to_int() if hasattr(cloid, "to_int") else cloid)
+                except Exception:
+                    try:
+                        parsed["cloid"] = str(cloid)
+                    except Exception:
+                        pass
         return parsed
     except Exception as e:
         logger.error(f"Failed to place order for {coin}: {e}")
@@ -609,6 +962,29 @@ def place_hl_trigger_order(
         trigger_str = _round_price_for_hl(trigger_px, sz_dec, is_perp=True)
         trigger_f = float(trigger_str)
         size_str = f"{size:.{sz_dec}f}"
+        order_notional = float(size_str) * trigger_f
+
+        # H1: a resting trigger below the HL minimum is accepted at submit time
+        # but ASYNCHRONOUSLY REJECTED ("minTradeNtlRejected") the moment it
+        # fires — leaving the position with no stop/tp and no signal to us.
+        # Refuse to submit it; callers (executor TP/SL sizing) already upsize
+        # or skip, so this is defense-in-depth against any path that slips a
+        # sub-min order through. Set HERMES_ENFORCE_TRIGGER_MIN=0 to revert to
+        # the old log-and-submit behavior.
+        if order_notional < MIN_ORDER_USD and os.environ.get(
+            "HERMES_ENFORCE_TRIGGER_MIN", "1"
+        ) not in ("0", "false", "False"):
+            logger.error(
+                f"[place_hl_trigger_order] REJECT {coin} kind={kind} "
+                f"size={size_str} trigger={trigger_str} notional=${order_notional:.2f} "
+                f"< HL min ${MIN_ORDER_USD:.2f} — not submitting (would be "
+                f"asynchronously rejected on trigger, leaving position unprotected)"
+            )
+            return {
+                "ok": False,
+                "error": f"trigger_notional_below_min: ${order_notional:.2f} < ${MIN_ORDER_USD:.2f}",
+                "error_code": "trigger_notional_below_min",
+            }
 
         order_type = OrderType(
             trigger=TriggerOrderType(
@@ -619,8 +995,11 @@ def place_hl_trigger_order(
         )
 
         logger.info(
-            f"[place_hl_trigger_order] {coin} {kind} is_buy={is_buy} "
-            f"trigger={trigger_str} size={size_str}"
+            f"[place_hl_trigger_order] SUBMIT {coin} kind={kind} "
+            f"side={'buy' if is_buy else 'sell'} size={size_str} "
+            f"trigger={trigger_str} notional=${order_notional:.2f} "
+            f"reduce_only=true (hl_min=${MIN_ORDER_USD:.2f}, "
+            f"{'ABOVE min' if order_notional >= MIN_ORDER_USD else 'BELOW min — will be rejected on trigger!'})"
         )
 
         # isMarket=True fills at market on trigger; limit_px is a reference.
@@ -633,9 +1012,100 @@ def place_hl_trigger_order(
             reduce_only=True,
         )
 
-        return _parse_order_result(result, accept_resting=True)
+        parsed = _parse_order_result(result, accept_resting=True)
+        if parsed.get("ok"):
+            logger.info(
+                f"[place_hl_trigger_order] CONFIRMED {coin} kind={kind} "
+                f"oid={parsed.get('order_id')} size={size_str} trigger={trigger_str}"
+            )
+        else:
+            logger.error(
+                f"[place_hl_trigger_order] FAILED {coin} kind={kind} "
+                f"size={size_str} trigger={trigger_str} "
+                f"error={parsed.get('error')}"
+            )
+        return parsed
     except Exception as e:
-        logger.error(f"Failed to place trigger order for {coin}: {e}")
+        logger.error(f"[place_hl_trigger_order] EXCEPTION {coin} kind={kind}: {e}")
+        return {"ok": False, "error": str(e)}
+
+
+def modify_sl_trigger(
+    is_long_position: bool,
+    size: float,
+    new_trigger_px: float,
+    coin: str,
+    oid: int,
+) -> Dict[str, Any]:
+    """Modify an existing reduce-only SL trigger order's trigger price via batchModify.
+
+    Hyperliquid implements `modify_order` as an atomic cancel+replace: the old
+    `oid` is cancelled and a NEW oid is returned under `statuses[0].resting.oid`.
+    Callers MUST persist the new oid — the old one is immediately invalid.
+
+    Mainnet-verified constraints (2026-08, ETH perp):
+      * `limit_px` MUST equal the new triggerPx (the SDK rejects mismatches).
+      * The price MUST be rounded to the coin's tick size via _round_price_for_hl;
+        naive round() to 2 dp produces "Invalid TP/SL price" rejections.
+      * Response is `{"statuses":[{"resting":{"oid": <NEW_OID>}}]}` — same shape
+        as a fresh trigger placement, so _parse_order_result(accept_resting=True)
+        parses it directly.
+    """
+    if not PRIVATE_KEY_HEX:
+        return {"ok": False, "error": "HYPERLIQUID_PRIVATE_KEY not set"}
+    if size <= 0 or new_trigger_px <= 0 or not oid:
+        return {"ok": False, "error": "invalid size/price/oid"}
+
+    try:
+        _, sz_dec, _ = get_coin_index(coin)
+        exchange = _make_exchange()
+
+        # SL closes the position: opposite side, reduce-only.
+        is_buy = not is_long_position
+
+        trigger_str = _round_price_for_hl(new_trigger_px, sz_dec, is_perp=True)
+        trigger_f = float(trigger_str)
+        size_str = f"{size:.{sz_dec}f}"
+
+        order_type = OrderType(
+            trigger=TriggerOrderType(
+                triggerPx=trigger_f,
+                isMarket=True,
+                tpsl="sl",
+            )
+        )
+
+        logger.info(
+            f"[modify_sl_trigger] SUBMIT {coin} oid={oid} -> new_trigger={trigger_str} "
+            f"side={'buy' if is_buy else 'sell'} size={size_str} reduce_only=true"
+        )
+
+        # limit_px MUST equal triggerPx for trigger SL modifications.
+        result = exchange.modify_order(
+            oid=int(oid),
+            name=coin,
+            is_buy=is_buy,
+            sz=float(size_str),
+            limit_px=trigger_f,
+            order_type=order_type,
+            reduce_only=True,
+        )
+
+        # accept_resting=True: batchModify returns resting{oid:NEW_OID}.
+        parsed = _parse_order_result(result, accept_resting=True)
+        if parsed.get("ok"):
+            logger.info(
+                f"[modify_sl_trigger] CONFIRMED {coin} old_oid={oid} "
+                f"new_oid={parsed.get('order_id')} trigger={trigger_str}"
+            )
+        else:
+            logger.error(
+                f"[modify_sl_trigger] FAILED {coin} old_oid={oid} "
+                f"target_trigger={trigger_str} error={parsed.get('error')}"
+            )
+        return parsed
+    except Exception as e:
+        logger.error(f"[modify_sl_trigger] EXCEPTION {coin} oid={oid}: {e}")
         return {"ok": False, "error": str(e)}
 
 
@@ -661,6 +1131,88 @@ def cancel_open_orders_for_coin(coin: str) -> int:
     except Exception as e:
         logger.warning(f"[cancel_open_orders_for_coin] {coin} failed: {e}")
         return 0
+
+
+def verify_order_exists(
+    coin: str,
+    oid: Optional[str] = None,
+    cloid: Optional[str] = None,
+    user: Optional[str] = None,
+) -> Dict[str, Any]:
+    """P0-6: post-place reconciliation. After place_hl_order returns ok=True,
+    cross-check that the exchange actually has the order (oid in openOrders
+    for resting / filled in userFills for an immediate match). If neither
+    endpoint shows a hit, the response shape lied — most likely the order
+    was asynchronously rejected, or the SDK truncated the response.
+
+    Returns a dict shaped:
+        {"verified": bool, "in_open_orders": bool, "in_user_fills": bool,
+         "reason": str | None}
+
+    Never raises: a verify failure must not break the calling order flow.
+    Cloid is matched as a stringified int (HL surfaces cloid in openOrders
+    as `cloid` field, in userFills as a hex-ish token; we just compare as
+    strings so both shapes work).
+    """
+    if not oid and not cloid:
+        return {"verified": False, "reason": "no_oid_or_cloid"}
+    try:
+        user = user or resolve_user_address()
+        if not user:
+            return {"verified": False, "reason": "no_user_address"}
+        in_open = False
+        in_fills = False
+        # 1) openOrders: look for an order whose oid matches (or whose cloid
+        # matches, if provided). coin narrowing keeps the scan small.
+        try:
+            oo = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8) or []
+        except Exception as _oo_e:
+            oo = []
+            logger.debug(f"[verify_order_exists] openOrders fetch failed: {_oo_e!r}")
+        for o in oo:
+            if o.get("coin") != coin:
+                continue
+            if oid and str(o.get("oid")) == str(oid):
+                in_open = True
+                break
+            if cloid and str(o.get("cloid")) == str(cloid):
+                in_open = True
+                break
+        # 2) userFills: any fill on this coin for this oid/cloid counts as
+        # verified (immediate-or-cancel order has already settled).
+        try:
+            fills = _http_post("/info", {"type": "userFills", "user": user, "limit": 50}, timeout=8) or []
+        except Exception as _uf_e:
+            fills = []
+            logger.debug(f"[verify_order_exists] userFills fetch failed: {_uf_e!r}")
+        for f in fills:
+            if f.get("coin") != coin:
+                continue
+            if oid and str(f.get("oid")) == str(oid):
+                in_fills = True
+                break
+            if cloid and str(f.get("cloid")) == str(cloid):
+                in_fills = True
+                break
+        verified = in_open or in_fills
+        reason = None
+        if not verified:
+            reason = f"oid={oid!r} cloid={cloid!r} not in openOrders or userFills (in_open={in_open} in_fills={in_fills})"
+        return {
+            "verified": verified,
+            "in_open_orders": in_open,
+            "in_user_fills": in_fills,
+            "reason": reason,
+        }
+    except Exception as e:
+        # verify is best-effort; on hard failure report unverified so the
+        # caller alerts, but include the error for diagnosis.
+        return {
+            "verified": False,
+            "in_open_orders": False,
+            "in_user_fills": False,
+            "reason": f"verify_exception: {e!r}",
+        }
 
 
 def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int] = None) -> Dict[str, Any]:
@@ -697,30 +1249,55 @@ def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int]
 
 # ── ATR ────────────────────────────────────────────────────────────────────────
 
+# ATR is computed from 4h candles (24 candles/day); it changes slowly so a
+# short TTL safely eliminates redundant candle fetches within one execute()
+# call and across nearby calls. 0.0 results are also cached so a coin with
+# insufficient history doesn't trigger repeated network fetches.
+_ATR_CACHE: Dict[str, Tuple[float, float]] = {}
+_ATR_CACHE_LOCK = threading.Lock()
+_ATR_TTL_S = float(os.environ.get("HERMES_ATR_TTL_S", "60"))
+
+
 def get_hl_atr(
     interval: str = "4h",
     period: int = 14,
     coin: str = "BTC",
 ) -> float:
-    """Compute ATR(14) on a given HL interval (defaults to 4h)."""
+    """Compute ATR(period) on a given HL interval (defaults to 4h).
+
+    Results are cached for _ATR_TTL_S seconds keyed by (interval, period, coin).
+    ATR on 4h candles is stable over sub-minute windows, and the executor may
+    call this multiple times with identical arguments within one execution;
+    caching avoids redundant candle API round-trips.
+    """
+    cache_key = f"{interval}|{period}|{coin}"
+    now = _time.time()
+    with _ATR_CACHE_LOCK:
+        hit = _ATR_CACHE.get(cache_key)
+        if hit and (now - hit[0]) < _ATR_TTL_S:
+            return hit[1]
+
     candles = fetch_hl_candles(coin, interval, period + 10)
     if len(candles) < period + 1:
-        return 0.0
-    
-    tr = []
-    for i in range(1, len(candles)):
-        cur, pc = candles[i], candles[i - 1]
-        tr.append(max(
-            cur.h - cur.l,
-            abs(cur.h - pc.c),
-            abs(cur.l - pc.c),
-        ))
-    
-    if len(tr) < period:
-        return 0.0
-    
-    atr = sum(tr[:period]) / period
-    for i in range(period, len(tr)):
-        atr = (atr * (period - 1) + tr[i]) / period
+        result = 0.0
+    else:
+        tr = []
+        for i in range(1, len(candles)):
+            cur, pc = candles[i], candles[i - 1]
+            tr.append(max(
+                cur.h - cur.l,
+                abs(cur.h - pc.c),
+                abs(cur.l - pc.c),
+            ))
 
-    return atr
+        if len(tr) < period:
+            result = 0.0
+        else:
+            atr = sum(tr[:period]) / period
+            for i in range(period, len(tr)):
+                atr = (atr * (period - 1) + tr[i]) / period
+            result = atr
+
+    with _ATR_CACHE_LOCK:
+        _ATR_CACHE[cache_key] = (now, result)
+    return result

@@ -135,7 +135,7 @@ Replicates the Hyperfeed MCP plugin's data directly from HL API:
 | `hermes_trader/client/exchange.py` | Order placement, leverage setting, trigger orders (SL/TP) |
 | `hermes_trader/indicators/math.py` | TA indicators: EMA, SMA, ATR, RSI, ADX |
 | `hermes_trader/models/types.py` | Shared data type: `Candle` (OHLCV) |
-| `hermes_trader/server.py` | FastAPI server — 22 REST routes for frontend/dashboard |
+| `hermes_trader/server.py` | FastAPI server — 27 REST routes for frontend/dashboard |
 
 ---
 
@@ -234,12 +234,12 @@ both resolve (`max_trade_notional_usd` ≡ `maxTradeNotionalUsd`).
     "sizing_basis": "primary_stop"
   },
   "ta_sidestep_force_execute": true,
-  "ta_sidestep_min_slow_burn_count": 99,
+  "ta_sidestep_min_slow_burn_count": 2,
   "force_execute_composite": 30,
   "runner_entry_gate": {
     "enabled": true,
     "allow_shorts": false,
-    "bypass_sidestep_overrides": true,
+    "bypass_sidestep_overrides": false,
     "min_confidence": 0.7,
     "min_composite": 30.0,
     "min_hip3_composite": 50.0
@@ -303,9 +303,21 @@ defaults for missing keys; keep the tracked `.agent-config.json` explicit.
 - **`force_execute_composite` / `composite_force_execute` / `breakout_force_execute`
   / `whale_force_execute` / `ta_sidestep_force_execute`** — structural-override
   gates that can upgrade an AI PASS to a trade on strong TA/whale signals. Current
-  live keeps the broad composite override disabled, keeps sidestep modeling enabled
-  with `ta_sidestep_min_slow_burn_count=99`, and lets the runner gate bypass that
-  sidestep suppression for high-quality runner entries.
+  live keeps the broad composite override disabled and keeps the sidestep path
+  enabled with `ta_sidestep_min_slow_burn_count=2`. That count is a **hard floor**,
+  not one of several interchangeable alternatives:
+  `ta_sidestep_strong = force_execute AND slow_burn_count >= min AND (composite >= bar OR momentum_burst)`
+  — an accumulation base is required, and momentum confirmation is the either/or
+  part. It was an `OR` until 2026-08-21, which made the count dead config (live
+  2026-08-20: 5/5 overrides fired at `slow_burn_count=1` against `min=2` on a lone
+  `momentum_burst`). The router's `sidestep_hint` mirrors this expression and must
+  stay in lockstep — a looser hint only routes candidates the executor will refuse.
+- **`runner_entry_gate.min_confidence`** judges a structural override on
+  `ai_confidence_raw` (the model's pre-floor conviction), not on the value that the
+  override's `min_ai_confidence` floor rewrote. With `min_ai_confidence ==
+  min_confidence` the floored number cleared this bar by construction, so the
+  confidence gate was a no-op for every override. Plain candidates carry no such
+  field and fall back to `confidence` unchanged.
 
 Trigger internals (weights, sigma thresholds, candle interval) live separately in
 `hermes_trader/agents/config.py` — edit there to tune the scan itself.
@@ -354,7 +366,7 @@ scripts/restart.sh status
 # Follow logs
 tail -f logs/trading_loop.log
 ```
-The API is available at `http://localhost:8000`. Health check: `GET /` returns `{"service": "Hermes-Trader", "version": "0.3.0", "status": "running"}`.
+The API is available at `http://localhost:8000`. Health check: `GET /api/health` returns `{"service": "Hermes-Trader", "version": "0.3.0", "status": "running"}`.
 
 `scripts/restart.sh` manages the autonomous trading loop and the FastAPI server,
 including stop/verify/start and log files under `logs/`. The MCP stdio server is
@@ -374,7 +386,7 @@ The `--env prod --daemon` flags are informational only; they do not fork the
 process. Use `scripts/restart.sh` for normal operation.
 
 **Trading Loop Behavior:**
-- Scans top 60 markets every 60 seconds
+- Scans top 60 markets every 15 seconds
 - Each tick, reconciles DSL trackers with live exchange positions and runs an exit pass — market-closes anything whose dynamic floor, hard stop, or timeout has tripped
 - Runs the TA filter on each trigger — only CONFIRMED signals (or fired momentum bursts) reach AI research
 - Researches qualifying signals with the OpenRouter model configured in `.env.local`
@@ -420,7 +432,7 @@ sample is large enough.
 
 hermes-trader is a standalone Python application; **Hermes Agent operates it through this MCP server** — that is the whole integration boundary. The agent calls the tools below; the trading engine itself has no Hermes-framework dependency.
 
-The MCP server (`scripts/hermes-mcp-server.py`) exposes 100 tools over stdio transport. The 14 primary tools are listed below; the remainder are Hyperliquid data passthroughs (some are placeholders pending SDK wiring).
+The MCP server (`scripts/hermes-mcp-server.py`) exposes 101 tools over stdio transport. The 14 primary tools are listed below; the remainder are Hyperliquid data passthroughs (some are placeholders pending SDK wiring).
 
 | Tool | Description |
 |------|-------------|
@@ -554,7 +566,7 @@ Rewritten from TypeScript/Next.js to enable simpler deployment, MCP integration 
 | `candleSnapshot` (per coin) | 20 | Plus per-item weight |
 | **Total per scan cycle** | ~1,200 | Top 60 markets, one candle fetch each |
 
-With `HERMES_MAX_MARKETS=60` and a 50s candle-cache TTL, each 60s scan fetches fresh candles (~1,200 weight). The cache TTL is deliberately kept just below the scan interval so the scanner never reacts to a stale snapshot — raising it would re-introduce that lag.
+With `HERMES_MAX_MARKETS=60` and a 50s candle-cache TTL, each 15s scan fetches fresh candles (~1,200 weight). The cache TTL is deliberately kept well below the scan interval so the scanner never reacts to a stale snapshot — raising it would re-introduce that lag.
 
 The crypto/HIP-3 budget split (`HERMES_MAX_MARKETS_HIP3`, default 25) is a *partition* of the same 60-slot budget, not extra calls — total candle weight stays at ~1,200/scan regardless of how the split is tuned.
 
@@ -569,7 +581,7 @@ hermes-trader/
 ├── hermes_trader/                  # Pure Python agent
 │   ├── __init__.py
 │   ├── __main__.py                # Entry point
-│   ├── server.py                  # FastAPI server — 22 routes
+│   ├── server.py                  # FastAPI server — 27 routes
 │   ├── agents/                    # Core agent logic
 │   │   ├── config.py              # Agent configuration model
 │   │   ├── config_store.py        # Config persistence
@@ -598,7 +610,7 @@ hermes-trader/
 │   └── models/                    # Shared data types
 │       └── types.py               # Candle (OHLCV)
 ├── scripts/
-│   ├── hermes-mcp-server.py       # MCP server (stdio, 100 tools)
+│   ├── hermes-mcp-server.py       # MCP server (stdio, 101 tools)
 │   └── trading_loop.py            # Continuous trading loop
 ├── skills/hermes-trader-agent/    # Hermes Agent skill
 ├── tests/                         # pytest suite — offline / online / live e2e

@@ -24,7 +24,7 @@ from backtest import (  # reuse the validated primitives
     Candle, DSL, _evaluate, _trend_and_atr_pct, _heuristic_verdict, _ta_confirmed,
     ROUND_TRIP_FEE_BPS,
 )
-from hermes_trader.agents.config_store import read_agent_config as _live_cfg
+from hermes_trader.agents.config_store import read_agent_config as _live_cfg, cfg_get
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.agents.config import get_config
 from hermes_trader.client.universe import get_universe
@@ -139,10 +139,10 @@ def main():
     live = _live_cfg()
     live_dsl = live.get("dsl_exit", {}) or {}
     equity_fraction = float(args.equity_fraction or live.get("equity_fraction_per_trade", 0.12))
-    leverage_ceiling = int(args.leverage_ceiling or live.get("leverage", 8))
-    max_loss = float(args.max_loss if args.max_loss is not None else live_dsl.get("max_loss_pct", 0.75))
-    protect = float(args.protect if args.protect is not None else live_dsl.get("protect_pct", 1.5))
-    retrace = float(args.retrace if args.retrace is not None else live_dsl.get("retrace_threshold", 0.30))
+    leverage_ceiling = int(args.leverage_ceiling or cfg_get("leverage", config=live))
+    max_loss = float(args.max_loss if args.max_loss is not None else cfg_get("dsl_exit.max_loss_pct", config=live_dsl))
+    protect = float(args.protect if args.protect is not None else cfg_get("dsl_exit.protect_pct", config=live_dsl))
+    retrace = float(args.retrace if args.retrace is not None else cfg_get("dsl_exit.retrace_threshold", config=live_dsl))
     mr = live.get("momentum_reentry", {})
     reclaim_pct = float(mr.get("reclaim_pct", 1.0))
     min_comp = float(mr.get("min_composite", 30))

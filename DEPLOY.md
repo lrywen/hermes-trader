@@ -41,7 +41,17 @@ flyctl deploy
 ```
 
 After a successful deploy you'll get a URL like `https://hermes-trader-julian.fly.dev`.
-The dashboard is at `/`, the operator console is at `/operator?token=<HERMES_OPERATOR_TOKEN>`.
+The dashboard and operator console are now Vue SPA pages served at `/web/`
+(`/` redirects there). The operator console is at `/web/operator`; unlock it
+in-page with the `HERMES_OPERATOR_TOKEN` (sent via the `X-Operator-Token`
+header, never in the URL).
+
+> **Note:** this repo's Dockerfile does not build or `COPY` the SPA — the
+> `hermes-web/dist` bundle lives in the separate `hermes-web` repo. A bare
+> Fly image therefore serves only the JSON API (`/api/*`, `/metrics`); to
+> get the UI on Fly, add a build step that bakes `hermes-web/dist` into
+> `/app/web-dist`. The docker-compose deployment gets the SPA automatically
+> via bind-mount.
 
 ## Reading + rotating secrets
 

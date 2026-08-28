@@ -29,7 +29,7 @@ Scan HIP-3 tokenized-equity / commodity perps (`xyz:NVDA`, `km:USOIL`, etc.). Ad
 
 ## Sizing
 
-### `equity_fraction_per_trade` (float, 0–1, default `0.01`)
+### `equity_fraction_per_trade` (float, 0–1, default `0.2`)
 Fraction of perp equity committed as MARGIN per trade. With leverage, notional = `equity × fraction × leverage`.
 
 | Account size | Recommended fraction |
@@ -49,19 +49,19 @@ Max leverage to request per trade. Actual = `min(this, per-coin HL max)`. BTC: 4
 | $500–$2000 | 10–20x |
 | $2000+ | 5–10x |
 
-### `max_trade_notional_usd` (int, default `100000`)
+### `max_trade_notional_usd` (int, default `800`)
 Per-trade hard cap regardless of formula above. Keep well above intended deployment or trades get blocked.
 
 ### `max_concurrent` (int, default `10`)
-Max simultaneous open positions. With 60s scan + 180min hold, on a busy day you can fill 18-20 slots quickly. Trades over this cap are deferred.
+Max simultaneous open positions. With 15s scan + 180min hold, on a busy day you can fill 18-20 slots quickly. Trades over this cap are deferred.
 
-### `max_total_notional_pct` (float, default `1.0`)
-Combined open notional cap as multiple of equity. `40.0` = max 40× equity in total notional. Bounds total deployment even when individual trades are within `max_trade_notional_usd`.
+### `max_total_notional_pct` (float, default `10.0`)
+Combined open notional cap as a percentage of aggregate equity. `10.0` = max 10% of equity in total notional. Bounds total deployment even when individual trades are within `max_trade_notional_usd`.
 
 ### `min_available_margin_pct` (float, default `0.10`)
 Refuse new trade if `available / equity < this`. Default 10% leaves headroom for maintenance margin + slippage. Lower = more aggressive deployment, higher risk of HL "insufficient margin" rejections.
 
-### `conviction_sizing` (bool, default `true`)
+### `conviction_sizing` (bool, default `false`)
 Scale position size by AI confidence: a high-conviction setup bets a larger fraction of equity. Set `false` for flat sizing across all trades.
 
 ### `conviction_tiers` (list of `[min_confidence, multiplier]`, optional)
@@ -82,7 +82,7 @@ So at `equity_fraction_per_trade: 0.10`, a 0.90-confidence trade sizes at an eff
 
 ## Risk safety
 
-### `max_daily_loss_usd` (negative number, default `-100`)
+### `max_daily_loss_usd` (negative number, default `-30`)
 Daily-loss killswitch. When `daily_pnl <= this`, ALL new trades blocked until UTC midnight reset.
 
 | Account size | Recommended |
@@ -99,14 +99,14 @@ Too loose = catastrophic days possible. Too tight = locks you out on a normal va
 ### `daily_giveback_min_peak_usd` (float, default `20`)
 Arm threshold for the give-back breaker — it stays disarmed until the day's peak PnL reaches this, so a tiny `+$2` peak can't trip a halt. Scale to account size.
 
-### `cooldown_min` (int, default `60`)
+### `cooldown_min` (int, default `30`)
 Minimum minutes between trades on the same coin. Prevents over-trading a single market. 30-60 reasonable for active strategies; 120+ for slower. Also skips the paid AI research call for a non-held coin still inside this window (a re-entry would be gate-blocked anyway).
 
 ### `held_research_interval_min` (int, default `10`)
-How often a coin you ALREADY HOLD is re-researched for a possible AI `CLOSE`. Without this, a held position that keeps triggering pays for a "hold" PASS on every ~60s scan. The DSL exit engine still handles fast/loss exits in real time every scan regardless — this only paces the slower "thesis broke → close" judgment. Lower = more responsive AI closes but more token spend; higher = leans more on DSL for exits. Hot-reloaded.
+How often a coin you ALREADY HOLD is re-researched for a possible AI `CLOSE`. Without this, a held position that keeps triggering pays for a "hold" PASS on every ~15s scan. The DSL exit engine still handles fast/loss exits in real time every scan regardless — this only paces the slower "thesis broke → close" judgment. Lower = more responsive AI closes but more token spend; higher = leans more on DSL for exits. Hot-reloaded.
 
-### `min_ai_confidence` (float 0-1, default `0.35`)
-Floor for AI-verdict confidence to execute. Raise to filter out borderline trades; lower to accept more setups. Current default 0.30 with conviction_sizing reducing those bets to 0.7×.
+### `min_ai_confidence` (float 0-1, default `0.7`)
+Floor for AI-verdict confidence to execute. Raise to filter out borderline trades; lower to accept more setups. Current default 0.7 with conviction_sizing reducing those bets to 0.7×.
 
 ### `counter_regime_min_conf` (float 0-1, default `0.7`)
 For trades against the BTC/SP500 regime trend, AI confidence must clear this OR `composite_score ≥ 50` OR `momentumBurst` fired OR a slow-burn trigger fired. Loosened bypass paths added 2026-05-28. The `composite ≥ 50` path is NOT disabled by `block_counter_trend_bypass` (only the binary-trigger bypass is).
@@ -126,7 +126,7 @@ When `true`, the binary-trigger bypass (momentum_burst / slow_burn / whale) can 
 ### `whale_scan_bypass` (bool, default `false`)
 Let whale-accumulation signals (oi_funding_anomaly) surface a coin for research even when it scores below the composite scan gate (whale loads on FLAT price, which scores low on momentum triggers).
 
-### `max_crypto_long_correlated` (int, default `2`)
+### `max_crypto_long_correlated` (int, default `3`)
 Cap on simultaneous correlated crypto longs. Prevents stacking 5 alt longs that all dump together. HIP-3 equity/commodity longs don't count against this.
 
 ## Signal surfacing (gated)
@@ -139,7 +139,7 @@ These surface extra candidates for AI research beyond the weighted composite gat
 ### `candlestick_patterns` (nested, `enabled` default `false`)
 `{enabled, wick_body_ratio (2.0), context_lookback (6), context_pct (1.5)}`. Reversal candles at exhaustion — shooting-star/bearish-engulfing (→ SHORT) and hammer/bullish-engulfing (→ LONG), each requiring a preceding move so they fire at tops/bottoms, not every bar. Weight-0 surfacing signal; the research prompt also gets the last 12 raw 1h OHLC bars so the LLM reads price action directly.
 
-### `force_execute_composite` (float, default `40`)
+### `force_execute_composite` (float, default `30`)
 If AI says PASS but trigger composite hits this AND `force_execute_slow_burn_count` slow-burn triggers fire, the executor upgrades to LONG conf 0.70. The structure overrides the AI's hedge. Set to 999 to disable.
 
 ### `force_execute_slow_burn_count` (int, default `2`)
@@ -150,7 +150,7 @@ Three independent knobs, all default-on, to capitalize on smart-money accumulati
 
 - `whale_regime_bypass` (bool, default `true`) — a whale signal lets a trade bypass the counter-regime gate (even against trend).
 - `whale_force_execute` (bool, default `true`) — a whale signal alone upgrades an AI PASS to LONG conf 0.70 (the structural override).
-- `whale_size_multiplier` (float, default `1.3`) — whale-backed trades multiply their conviction sizing by this, clamped at 2× base. Set `1.0` to keep override/bypass but no size boost.
+- `whale_size_multiplier` (float, default `1.0`) — whale-backed trades multiply their conviction sizing by this, clamped at 2× base. Set `1.0` to keep override/bypass but no size boost.
 
 Set all three off (`false`/`false`/`1.0`) to treat whale signals as informational only (still shown in the AI prompt, no gate/sizing effect).
 
@@ -161,7 +161,7 @@ Set all three off (`false`/`false`/`1.0`) to treat whale signals as informationa
 ### `min_market_volume_usd` (int, default `5000000`)
 Crypto perps below this 24h volume are blocked. Default $5M screens illiquid microcaps.
 
-### `min_hip3_volume_usd` (int, default `500000`)
+### `min_hip3_volume_usd` (int, default `5000000`)
 HIP-3 perps below this 24h volume are blocked. Lower because HIP-3 markets carry less volume than crypto majors (xyz:CRCL at $4M is well-tradable).
 
 ### `min_short_volume_usd` (int, default `0` = off)
@@ -181,20 +181,29 @@ Coins always blocked regardless of allowlist. Use for known-bad markets.
 
 ## DSL exit (nested object)
 
-### `dsl_exit.max_loss_pct` (float, default `2.5`)
+### `dsl_exit.max_loss_pct` (float, default `0.4`)
 Max adverse SPOT% move before forced exit. Combined with the ROE cap below — whichever fires first.
 
-### `dsl_exit.max_loss_roe_pct` (float, default `50.0`)
-Max ROE% loss (margin %). At 40x leverage, 40% ROE = 1% spot. The min of (max_loss_pct, max_loss_roe_pct/leverage) is the effective stop. Tighter cap = smaller losses per trade but more stop-outs on noise.
+### `dsl_exit.max_loss_roe_pct` (float, default `5.0`)
+Max ROE% loss (margin %). At 40x leverage, 5% ROE = 0.125% spot. The min of (max_loss_pct, max_loss_roe_pct/leverage) is the effective stop. Tighter cap = smaller losses per trade but more stop-outs on noise.
 
-### `dsl_exit.protect_pct` (float, default `1.5`)
+### `dsl_exit.protect_pct` (float, default `1.25`)
 Spot% move required to engage phase-2 trailing. Lower = trailing locks profit earlier; higher = lets winners run further before tightening.
 
-### `dsl_exit.retrace_threshold` (float 0-1, default `0.30`)
-Phase-2 floor gives back this fraction of peak gains. `0.30` locks 70% of peak profit; `0.20` locks 80%; `0.50` lets price retrace half before exit.
+### `dsl_exit.retrace_threshold` (float 0-1, default `0.20`)
+Phase-2 floor gives back this fraction of peak gains. `0.20` locks 80% of peak profit; `0.30` locks 70%; `0.50` lets price retrace half before exit.
 
-### `dsl_exit.hard_timeout_minutes` (float, default `180`)
-Max time a position stays open before forced close. 90 = tight (frequent timeouts on slow movers); 180 = balanced; 360 = lets multi-hour setups breathe.
+### `dsl_exit.hard_timeout_minutes` (float, default `1800`)
+Max time a position stays open before forced close. 480 = one trading session; 1800 = multi-session hold; 3600+ = lets multi-day setups breathe.
+
+### `dsl_exit.stale_flat_timeout_minutes` (float, default `480`)
+Flatten a position that never reaches `protect_pct` within this window. `0` disables the stale-flat exit.
+
+### `dsl_exit.phase2_tiers` (list, default 2 tiers `[8%→35%, 15%→40%]`)
+Profit-scaled retrace ladder. Each tier is `{pct_above_entry, retrace_threshold}` — once price is `pct_above_entry` above entry, the phase-2 trail tightens to the corresponding `retrace_threshold`. Default two tiers: at +8% use 35% retrace, at +15% use 40% retrace (letting winners run further as they extend).
+
+### `dsl_exit.regime_aware` (nested, `enabled` default `true`)
+When `detect_regime()=='up'` (or trend regime), swap to looser trend-ride params (scalp chop / ride trends). Sub-keys: `trend_ride{protect_pct, retrace_threshold, phase2_tiers}` and `max_loss{trend{max_loss_pct, max_loss_roe_pct}, non_trend{…}}`. Default ON.
 
 ---
 
@@ -220,12 +229,13 @@ Run `scripts/config_preset.py show small_aggressive` to see the full values with
 All hot-read. README "Configuration" has the concise version.
 
 ### `dsl_exit` — trailing-stop engine
-- `max_loss_pct` (3.5) + `max_loss_roe_pct` (18) — hard stop, whichever binds first (ROE cap = `pct / leverage` in spot terms; at 10x, 18% ROE = 1.8% spot).
-- `protect_pct` (1.5) + `retrace_threshold` (0.30) — trail tightness. **Low = scalp (bank fast); high = trend-ride (let it run).** `phase2_tiers` = profit-scaled retrace ladder.
-- `stale_flat_timeout_minutes` — flatten a position that never reaches `protect_pct` within this window.
-- `regime_aware {enabled, trend_ride{…}}` — when `detect_regime()=='up'`, swap to looser trend-ride params (scalp chop / ride trends). Default OFF.
+- `max_loss_pct` (0.4) + `max_loss_roe_pct` (5.0) — hard stop, whichever binds first (ROE cap = `pct / leverage` in spot terms; at 10x, 5% ROE = 0.5% spot).
+- `protect_pct` (1.25) + `retrace_threshold` (0.20) — trail tightness. **Low = scalp (bank fast); high = trend-ride (let it run).** `phase2_tiers` = profit-scaled retrace ladder (default 2 tiers: +8%→35%, +15%→40%).
+- `stale_flat_timeout_minutes` (480) — flatten a position that never reaches `protect_pct` within this window.
+- `hard_timeout_minutes` (1800) — max time a position stays open before forced close.
+- `regime_aware {enabled, trend_ride{…}}` — when `detect_regime()=='up'`, swap to looser trend-ride params (scalp chop / ride trends). Default ON.
 
-### `atr_risk_sizing` `{enabled, risk_per_trade_pct}`
+### `atr_risk_sizing` `{enabled, risk_per_trade_pct (default 0.02)}`
 Equal-risk (Turtle-N): notional = `risk_per_trade_pct × equity / stop_width`. Overrides flat `equity_fraction` — volatile coins get smaller size, tight-stop coins bigger (capped by `max_trade_notional_usd`).
 
 ### `signal_enforcement` `{enabled, veto, boost, gex_veto, boost_bar_delta, whale_*}`
