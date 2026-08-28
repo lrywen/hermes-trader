@@ -133,6 +133,7 @@ class _ConfigPatch(BaseModel):
     plan_b: dict[str, Any] = Field(default_factory=lambda: _dict_default("plan_b"))
     atr_risk_sizing: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
     regime_classifier: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
+    regime_score: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_score"))
     debate_gate: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_gate"))
     debate_research: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_research"))
     signal_enforcement: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_enforcement"))

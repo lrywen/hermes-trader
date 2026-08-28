@@ -236,6 +236,44 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "slow_ema": 30,
         "slope_threshold": 0.002,
         "chop_adx_max": 20.0,
+        # R13-B5: fast-EMA slope lookback window (bars) for the trend
+        # classifier (market_regime._SLOPE_LOOKBACK) and the per-proxy regime
+        # cache freshness TTL (market_regime.REGIME_TTL_S, 5 min). Was
+        # module-literal / function-local — now visible + tunable.
+        "slope_lookback": 8,
+        "ttl_sec": 300,
+    },
+    # R13-B5: 5-component continuous trend-strength score (byte-aligned with
+    # scripts/backtest_ab_compare._regime_score). Consumed by
+    # market_regime.regime_strength_score() AND executor.regime_strength_label()
+    # (single source via market_regime.regime_score_params()); before R13-B5
+    # the weights/calibration were two byte-copied literal sets (one per file)
+    # invisible to cfg. Defaults are the exact calibrated literals.
+    "regime_score": {
+        # component weights (sum == 1.0)
+        "weight_adx": 0.25,
+        "weight_atr": 0.225,
+        "weight_ema_align": 0.175,
+        "weight_price_ext": 0.175,
+        "weight_obv": 0.175,
+        # calibration anchors: ADX 15 -> 0, 45 -> 1 (full span 30)
+        "adx_zero": 15.0,
+        "adx_full_span": 30.0,
+        # ATR% 0.2% -> 0, 1.0% -> 1 (full span 0.8)
+        "atr_pct_zero": 0.2,
+        "atr_pct_full_span": 0.8,
+        # |EMA8-EMA21| gap% reaching 0.5% -> 1.0
+        "ema_gap_full_pct": 0.5,
+        # distance from EMA21 reaching 2.0 ATR -> 1.0
+        "price_ext_full_atr": 2.0,
+        # OBV flat (no slope) partial credit (aligned=1.0, opposing=0.0)
+        "obv_flat_score": 0.3,
+        # score indicator periods (distinct from classifier EMA20/30)
+        "ema_fast": 8,
+        "ema_slow": 21,
+        "ind_period": 14,
+        "min_candles": 50,
+        "obv_slope_period": 10,
     },
     "debate_gate": {
         "enabled": True,

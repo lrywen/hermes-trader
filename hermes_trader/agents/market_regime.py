@@ -33,6 +33,7 @@ from typing import Literal, Optional
 
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.indicators.math import adx, atr as _atr_ind, ema, obv as _obv_ind
+from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +76,85 @@ def _obv_slope_sign(candles: list, period: int = 10) -> int:
     return 0
 
 
+# ── R13-B5: live-resolved 5-component strength-score params ───────────────
+# Literal fallback (== pre-R13-B5 behavior); the CANONICAL `regime_score`
+# block carries the same values and is the single source of truth at runtime.
+# REGIME_WEIGHTS remains the module-level weight dict (byte-aligned with the
+# backtest) and doubles as the weight fallback below.
+_REGIME_SCORE_DEFAULTS = {
+    "weights": dict(REGIME_WEIGHTS),
+    "adx_zero": 15.0,
+    "adx_full_span": 30.0,
+    "atr_pct_zero": 0.2,
+    "atr_pct_full_span": 0.8,
+    "ema_gap_full_pct": 0.5,
+    "price_ext_full_atr": 2.0,
+    "obv_flat_score": 0.3,
+    "ema_fast": 8,
+    "ema_slow": 21,
+    "ind_period": 14,
+    "min_candles": 50,
+    "obv_slope_period": 10,
+}
+
+
+def regime_score_params(*, config=None) -> dict:
+    """Resolve the 5-component strength-score weights + calibration anchors.
+
+    Returns the live `regime_score` canonical block (env ``HERMES_CFG_REGIME_SCORE__*``
+    overrides included) with the calibrated module literals as fallback. This is
+    the SINGLE source shared by market_regime.regime_strength_score() and
+    executor.regime_strength_label() so the two copies can never drift (before
+    R13-B5 the calibration literals were duplicated byte-for-byte in both files
+    and invisible to config). Per-leaf lookups mean each key is independently
+    env-overridable. Any read/coerce failure → module defaults (score path must
+    never break on a malformed config).
+    """
+    p = dict(_REGIME_SCORE_DEFAULTS)
+    p["weights"] = dict(_REGIME_SCORE_DEFAULTS["weights"])
+    try:
+        w = p["weights"]
+        w["adx"] = float(cfg_get("regime_score.weight_adx", config=config) or w["adx"])
+        w["atr"] = float(cfg_get("regime_score.weight_atr", config=config) or w["atr"])
+        w["ema_align"] = float(cfg_get("regime_score.weight_ema_align", config=config) or w["ema_align"])
+        w["price_ext"] = float(cfg_get("regime_score.weight_price_ext", config=config) or w["price_ext"])
+        w["obv"] = float(cfg_get("regime_score.weight_obv", config=config) or w["obv"])
+        for key in ("adx_zero", "atr_pct_zero", "obv_flat_score"):
+            p[key] = float(cfg_get(f"regime_score.{key}", config=config) or _REGIME_SCORE_DEFAULTS[key])
+        # spans must stay strictly positive (divisors) — guard malformed config
+        for key in ("adx_full_span", "atr_pct_full_span", "ema_gap_full_pct", "price_ext_full_atr"):
+            v = float(cfg_get(f"regime_score.{key}", config=config) or _REGIME_SCORE_DEFAULTS[key])
+            p[key] = v if v > 0 else _REGIME_SCORE_DEFAULTS[key]
+        for key in ("ema_fast", "ema_slow", "ind_period", "min_candles", "obv_slope_period"):
+            iv = int(cfg_get(f"regime_score.{key}", config=config) or _REGIME_SCORE_DEFAULTS[key])
+            p[key] = iv if iv > 0 else _REGIME_SCORE_DEFAULTS[key]
+    except Exception as e:  # never let config break the score
+        logger.debug(f"[regime] score params config read failed: {e}")
+        return {k: (dict(v) if k == "weights" else v)
+                for k, v in _REGIME_SCORE_DEFAULTS.items()}
+    return p
+
+
+def _regime_cache_ttl(*, config=None) -> int:
+    """Per-proxy regime cache freshness TTL (seconds). Live-resolves
+    regime_classifier.ttl_sec; module REGIME_TTL_S is the literal fallback."""
+    try:
+        v = int(cfg_get("regime_classifier.ttl_sec", config=config) or REGIME_TTL_S)
+        return v if v >= 0 else REGIME_TTL_S
+    except (TypeError, ValueError):
+        return REGIME_TTL_S
+
+
+def _slope_lookback(*, config=None) -> int:
+    """Fast-EMA slope lookback window (bars). Live-resolves
+    regime_classifier.slope_lookback; module _SLOPE_LOOKBACK is the fallback."""
+    try:
+        v = int(cfg_get("regime_classifier.slope_lookback", config=config) or _SLOPE_LOOKBACK)
+        return v if v > 0 else _SLOPE_LOOKBACK
+    except (TypeError, ValueError):
+        return _SLOPE_LOOKBACK
+
+
 def regime_strength_score(candles: list) -> float:
     """Continuous [0, 1] trend-strength score from 1h candles.
 
@@ -82,21 +162,23 @@ def regime_strength_score(candles: list) -> float:
     the EMA8/21 cross points. Components and weights are byte-for-byte the
     backtest reference (see _REGIME_WEIGHTS). Returns 0.0 on insufficient
     data; callers should treat low/0 as "not a confirmed trend"."""
-    if not candles or len(candles) < 50:
+    p = regime_score_params()
+    w = p["weights"]
+    if not candles or len(candles) < p["min_candles"]:
         return 0.0
     closes = [float(c.c) for c in candles]
     try:
-        e8_arr = ema(closes, 8)
-        e21_arr = ema(closes, 21)
+        e8_arr = ema(closes, p["ema_fast"])
+        e21_arr = ema(closes, p["ema_slow"])
         if len(e8_arr) < 1 or len(e21_arr) < 1:
             return 0.0
         e8 = e8_arr[-1]
         e21 = e21_arr[-1]
         close = closes[-1]
-        atr_arr = _atr_ind(candles, 14)
+        atr_arr = _atr_ind(candles, p["ind_period"])
         atr_v = next((v for v in reversed(atr_arr)
                       if v == v and v != float("inf")), None)
-        adx_arr = adx(candles, 14)
+        adx_arr = adx(candles, p["ind_period"])
         adx_v = next((v for v in reversed(adx_arr)
                       if v == v and v != float("inf")), None)
     except Exception as e:
@@ -106,31 +188,31 @@ def regime_strength_score(candles: list) -> float:
         return 0.0
 
     bullish = e8 > e21
-    # ADX 15 -> 0, 45 -> 1
-    adx_c = max(0.0, min(1.0, (adx_v - 15.0) / 30.0))
-    # ATR% 0.2% -> 0, 1.0% -> 1
+    # ADX adx_zero -> 0, (adx_zero + span) -> 1
+    adx_c = max(0.0, min(1.0, (adx_v - p["adx_zero"]) / p["adx_full_span"]))
+    # ATR% atr_pct_zero% -> 0, (zero + span)% -> 1
     atr_pct = atr_v / close * 100
-    atr_c = max(0.0, min(1.0, (atr_pct - 0.2) / 0.8)) if atr_v else 0.0
-    # |EMA8-EMA21| gap%: 0% -> 0, 0.5% -> 1
+    atr_c = (max(0.0, min(1.0, (atr_pct - p["atr_pct_zero"]) / p["atr_pct_full_span"]))
+             if atr_v else 0.0)
+    # |EMA_fast-EMA_slow| gap%: 0% -> 0, ema_gap_full_pct% -> 1
     ema_c = 0.0
     if e21 > 0:
         gap_pct = abs(e8 - e21) / e21 * 100
-        ema_c = max(0.0, min(1.0, gap_pct / 0.5))
-    # Price vs EMA21 in ATR units: 0 -> 0, 2.0 ATR -> 1
+        ema_c = max(0.0, min(1.0, gap_pct / p["ema_gap_full_pct"]))
+    # Price vs EMA_slow in ATR units: 0 -> 0, price_ext_full_atr ATR -> 1
     ext_c = 0.0
     if atr_v > 0 and e21:
         ext = abs((close - e21) / atr_v)
-        ext_c = max(0.0, min(1.0, ext / 2.0))
-    # OBV: aligned = 1.0, flat = 0.3, opposing = 0.0
-    obv_dir = _obv_slope_sign(candles)
+        ext_c = max(0.0, min(1.0, ext / p["price_ext_full_atr"]))
+    # OBV: aligned = 1.0, flat = obv_flat_score, opposing = 0.0
+    obv_dir = _obv_slope_sign(candles, p["obv_slope_period"])
     if (bullish and obv_dir > 0) or (not bullish and obv_dir < 0):
         obv_c = 1.0
     elif obv_dir == 0:
-        obv_c = 0.3
+        obv_c = p["obv_flat_score"]
     else:
         obv_c = 0.0
 
-    w = REGIME_WEIGHTS
     score = (w["adx"] * adx_c + w["atr"] * atr_c + w["ema_align"] * ema_c
              + w["price_ext"] * ext_c + w["obv"] * obv_c)
     return max(0.0, min(1.0, score))
@@ -319,10 +401,11 @@ def trend_from_closes(closes: list[float],
         return "neutral"
     fast = ema(closes, fast_p)
     slow = ema(closes, slow_p)
-    if len(fast) < _SLOPE_LOOKBACK + 1 or len(slow) < 1:
+    lookback = _slope_lookback()
+    if len(fast) < lookback + 1 or len(slow) < 1:
         return "neutral"
     f_now, s_now = fast[-1], slow[-1]
-    f_prev = fast[-(_SLOPE_LOOKBACK + 1)]
+    f_prev = fast[-(lookback + 1)]
     if f_prev == 0:
         return "neutral"
     slope = (f_now - f_prev) / abs(f_prev)
@@ -403,13 +486,14 @@ def detect_regime_with_score(coin: str, *, force: bool = False) -> tuple[Regime,
     score (0..1) for the same proxy candles. The risk gate uses score>=0.55 as
     a strictness overlay on "aligned" entries to cut the 36% false-trend rate
     measured by scripts/audit_neutral_chop.py. Cached for REGIME_TTL_S."""
+    ttl_s = _regime_cache_ttl()
     klass = classify_asset(coin)
     if klass == "commodity":
         proxy = coin if ":" in coin else coin.upper()
     elif klass == "equity":
         now = time.time()
         cached_own = _regime_cache.get(coin)
-        if not force and cached_own and (now - cached_own[1]) < REGIME_TTL_S:
+        if not force and cached_own and (now - cached_own[1]) < ttl_s:
             if cached_own[0] not in ("neutral", "chop"):
                 sc = _score_cache.get(coin, (0.0, 0.0))[0]
                 return cached_own[0], sc
@@ -426,7 +510,7 @@ def detect_regime_with_score(coin: str, *, force: bool = False) -> tuple[Regime,
 
     now = time.time()
     cached = _regime_cache.get(proxy)
-    if not force and cached and (now - cached[1]) < REGIME_TTL_S:
+    if not force and cached and (now - cached[1]) < ttl_s:
         sc = _score_cache.get(proxy, (0.0, 0.0))[0]
         return cached[0], sc
     regime, score = _detect_for_proxy_with_score(proxy)

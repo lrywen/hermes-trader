@@ -27,7 +27,7 @@ from hermes_trader.agents.dsl_exit import (
     register_position,
     set_bracket,
 )
-from hermes_trader.agents.market_regime import REGIME_WEIGHTS
+from hermes_trader.agents.market_regime import regime_score_params
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.risk_gates import GateContext, eval_all_gates
 from hermes_trader.client.exchange import (
@@ -669,30 +669,36 @@ def regime_strength_label(analysis: dict[str, Any]) -> str:
         return ""
     bullish = e8 > e21
 
-    # ADX 15 -> 0, 45 -> 1.
-    adx_c = max(0.0, min(1.0, (adx_v - 15.0) / 30.0))
-    # ATR% 0.2% -> 0, 1.0% -> 1.
+    # R13-B5: weights + calibration come from the single shared source in
+    # market_regime (regime_score_params → `regime_score` canonical block) so
+    # this Plan-B copy can never drift from regime_strength_score(). Defaults
+    # are byte-identical to the previously inline literals.
+    p = regime_score_params()
+    w = p["weights"]
+    # ADX adx_zero -> 0, (zero + span) -> 1.
+    adx_c = max(0.0, min(1.0, (adx_v - p["adx_zero"]) / p["adx_full_span"]))
+    # ATR% atr_pct_zero% -> 0, (zero + span)% -> 1.
     atr_pct = atr_v / close * 100 if close else 0.0
-    atr_c = max(0.0, min(1.0, (atr_pct - 0.2) / 0.8)) if atr_v else 0.0
-    # |EMA8-EMA21| gap%: 0% -> 0, 0.5% -> 1.
+    atr_c = (max(0.0, min(1.0, (atr_pct - p["atr_pct_zero"]) / p["atr_pct_full_span"]))
+             if atr_v else 0.0)
+    # |EMA_fast-EMA_slow| gap%: 0% -> 0, ema_gap_full_pct% -> 1.
     ema_c = 0.0
     if e21 > 0:
         gap_pct = abs(e8 - e21) / e21 * 100
-        ema_c = max(0.0, min(1.0, gap_pct / 0.5))
-    # Price vs EMA21 in ATR units: 0 -> 0, 2.0 ATR -> 1.
+        ema_c = max(0.0, min(1.0, gap_pct / p["ema_gap_full_pct"]))
+    # Price vs EMA_slow in ATR units: 0 -> 0, price_ext_full_atr ATR -> 1.
     ext_c = 0.0
     if atr_v > 0 and e21:
         ext = abs((close - e21) / atr_v)
-        ext_c = max(0.0, min(1.0, ext / 2.0))
-    # OBV: aligned with EMA direction = 1.0, flat = 0.3, opposing = 0.0.
+        ext_c = max(0.0, min(1.0, ext / p["price_ext_full_atr"]))
+    # OBV: aligned with EMA direction = 1.0, flat = obv_flat_score, opposing = 0.0.
     if (bullish and obv_dir > 0) or (not bullish and obv_dir < 0):
         obv_c = 1.0
     elif obv_dir == 0:
-        obv_c = 0.3
+        obv_c = p["obv_flat_score"]
     else:
         obv_c = 0.0
 
-    w = REGIME_WEIGHTS
     score = max(0.0, min(1.0, (
         w["adx"] * adx_c + w["atr"] * atr_c + w["ema_align"] * ema_c
         + w["price_ext"] * ext_c + w["obv"] * obv_c
