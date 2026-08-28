@@ -566,7 +566,7 @@ Rewritten from TypeScript/Next.js to enable simpler deployment, MCP integration 
 | `candleSnapshot` (per coin) | 20 | Plus per-item weight |
 | **Total per scan cycle** | ~1,200 | Top 60 markets, one candle fetch each |
 
-With `HERMES_MAX_MARKETS=60` and a 50s candle-cache TTL, each 60s scan fetches fresh candles (~1,200 weight). The cache TTL is deliberately kept just below the scan interval so the scanner never reacts to a stale snapshot — raising it would re-introduce that lag.
+With `HERMES_MAX_MARKETS=60` and a 50s candle-cache TTL, each 15s scan fetches fresh candles (~1,200 weight). The cache TTL is deliberately kept well below the scan interval so the scanner never reacts to a stale snapshot — raising it would re-introduce that lag.
 
 The crypto/HIP-3 budget split (`HERMES_MAX_MARKETS_HIP3`, default 25) is a *partition* of the same 60-slot budget, not extra calls — total candle weight stays at ~1,200/scan regardless of how the split is tuned.
 
