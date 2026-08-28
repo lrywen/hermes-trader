@@ -408,8 +408,11 @@ def _scan_single_market(
             try:
                 from hermes_trader.agents.market_regime import classify_candles
                 trend_chop = classify_candles(candles_1h) == "chop"
-            except Exception:
-                trend_chop = False
+            except Exception as _e:
+                # R12-D1: regime-classifier hiccup must not silence a real
+                # trend signal. Surface as DEBUG so the fallback is visible
+                # without spamming the operator on every choppy market.
+                logger.debug(f"[regime] classify_candles failed for {market['coin']}: {_e}")
         if trend_fired and trend_chop:
             logger.debug(f"[regime] {market['coin']} trend-momentum surfacing suppressed (chop)")
         trend_bypass = trend_fired and not trend_chop
@@ -443,17 +446,22 @@ def _scan_single_market(
                             for h in hits
                         ],
                     })
-                except Exception:
-                    pass
-            # Verbose near-miss log line (gated by the momentum switch).
-            if _mc.get("enabled") and _mc.get("log_near_miss") and score >= min_score * 0.5:
-                try:
-                    logger.info(
-                        f"[near-miss] {market['coin']} composite {score:.1f} "
-                        f"(gate {min_score}) fired={[h['name'] for h in hits if h.get('fired')]}"
+                except Exception as _e:
+                    # R12-D1: near_miss observability row — losing it silently
+                    # would hide the score trajectory of coins that almost made
+                    # it. Surface as WARNING (rare path, this won't spam).
+                    logger.warning(
+                        f"[near-miss] session_log.append failed for {market['coin']}: {_e}"
                     )
-                except Exception:
-                    pass
+            # Verbose near-miss log line (gated by the momentum switch).
+            # R12-D1: the previous `try/except Exception: pass` was a defensive
+            # shell around a logger.info call that cannot throw; removed to
+            # avoid the silent-except anti-pattern.
+            if _mc.get("enabled") and _mc.get("log_near_miss") and score >= min_score * 0.5:
+                logger.info(
+                    f"[near-miss] {market['coin']} composite {score:.1f} "
+                    f"(gate {min_score}) fired={[h['name'] for h in hits if h.get('fired')]}"
+                )
             return (True, None)
 
         whale = (whale_signals or {}).get(market["coin"])
@@ -468,6 +476,12 @@ def _scan_single_market(
             "whale_signal": whale,  # None unless coin is in oi_funding_anomaly hits
         })
     except Exception as e:
+        # R12-D1: per-market eval failure used to vanish behind a False return.
+        # Caller (scan_once) drops the result, so the operator needs the cause
+        # in the logs to reconstruct which coins were silently skipped. DEBUG
+        # level — scan_once already counts and logs the first 5 at WARNING+,
+        # and per-coin eval is high-volume.
+        logger.debug(f"[scan] per-market eval failed for {market.get('coin','?')}: {e}")
         return (False, str(e))
 
 
@@ -515,7 +529,12 @@ def scan_once(
         include_hip3 = bool(_cfg.get("enable_hip3", False))
         whale_scan_bypass = bool(_cfg.get("whale_scan_bypass", False))
         trend_surface_enabled = bool(_cfg.get("trend_surface_enabled", False))
-    except Exception:
+    except Exception as e:
+        # R12-D1: agent-config read failure used to silently fall back to
+        # crypto-only / no-bypass — a real degraded-config state that the
+        # operator must see. WARNING once per scan; this gates whale and
+        # trend surfacing for the whole cycle.
+        logger.warning(f"[scan] read_agent_config failed, falling back to defaults: {e}")
         _cfg = {}
         include_crypto = True
         include_hip3 = False
@@ -541,8 +560,11 @@ def scan_once(
         if isinstance(val, str):
             try:
                 mids[sym] = float(val)
-            except ValueError:
-                pass
+            except ValueError as _e:
+                # R12-D1: previously a silent `pass`. A non-numeric mid
+                # string is a data-feed anomaly — log at DEBUG (high
+                # volume per scan) and skip the entry.
+                logger.debug(f"[scan] mid {sym!r} not float-coercible: {_e}")
         elif isinstance(val, (int, float)):
             mids[sym] = val
 
