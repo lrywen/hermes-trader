@@ -378,6 +378,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "daily_loss_pct": 5.0,
         "daily_halt_min": 120.0,
     },
+    # R13-A1: perception scan-tick block (TRIGGER_CONFIG["scan"], perception.py
+    # L216-269). Previously implicit: the keys lived only in the module-level
+    # TRIGGER_CONFIG dict and perception read them via `config["scan"][key]`
+    # without ever consulting read_agent_config() / cfg_get. The MCP server
+    # therefore had to hard-code its own defaults (180s / 20) which silently
+    # drifted from production (5m / 54). Registering the block here makes the
+    # values configurable, env-overridable, dashboard-dumpable, and — most
+    # importantly — gives the MCP server a single source of truth to read
+    # from. Defaults mirror TRIGGER_CONFIG verbatim; behaviour is unchanged.
+    "scan": {
+        "minCompositeScore": 54,
+        "candleInterval": "5m",
+        "candleCount": 100,
+        "cacheTtlMs": 50_000,
+        "cacheTtlMs1h": 600_000,
+        "evaluateClosedBarsOnly": True,
+        "postCloseForceRefreshMs": 15_000,
+    },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the
     # global min_ai_confidence applies uniformly). Was implicit via

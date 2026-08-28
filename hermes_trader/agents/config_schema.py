@@ -144,6 +144,9 @@ class _ConfigPatch(BaseModel):
     coin_overrides: dict[str, Any] = Field(default_factory=lambda: _dict_default("coin_overrides"))
     # R12-C1: single-coin / daily drawdown halt thresholds.
     circuit_breaker: dict[str, Any] = Field(default_factory=lambda: _dict_default("circuit_breaker"))
+    # R13-A1: perception scan-tick block. Nested because perception reads it
+    # as `config["scan"]` (and TRIGGER_CONFIG["scan"] is itself a dict).
+    scan: dict[str, Any] = Field(default_factory=lambda: _dict_default("scan"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

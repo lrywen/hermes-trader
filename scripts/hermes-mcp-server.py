@@ -951,6 +951,34 @@ def handle_scan(params: Dict[str, Any]) -> str:
     })
 
 
+def _scan_interval_seconds(scan_cfg: Dict[str, Any]) -> int:
+    """R13-A1: convert the canonical ``candleInterval`` string to seconds.
+
+    The legacy MCP field ``scan_interval_sec`` is the number of seconds
+    between perception ticks; the canonical config key is the interval
+    string (``"5m"``, ``"15m"``, ``"1h"``). Mapping it here keeps the LLM-
+    facing surface stable while the canonical key stays human-friendly.
+
+    Returns 300 (5m) on any unrecognised value — matches the canonical
+    default registered in CANONICAL_DEFAULTS["scan"].
+    """
+    interval = (scan_cfg or {}).get("candleInterval", "5m")
+    if not isinstance(interval, str) or not interval:
+        return 300
+    unit = interval[-1]
+    try:
+        n = int(interval[:-1])
+    except ValueError:
+        return 300
+    if unit == "m":
+        return n * 60
+    if unit == "h":
+        return n * 3600
+    if unit == "s":
+        return n
+    return 300
+
+
 def handle_state(params: Dict[str, Any]) -> str:
     user = resolve_user_address()
     # include_hip3=True so the LLM sees aggregated equity and every HIP-3
@@ -963,8 +991,14 @@ def handle_state(params: Dict[str, Any]) -> str:
         "equity": account.get("equity", 0),
         "total_notional": account.get("total_ntl", 0),
         "positions": account.get("asset_positions", []),
-        "scan_interval_sec": config.get("scan", {}).get("interval", 180),
-        "min_composite_score": config.get("scan", {}).get("minCompositeScore", 20),
+        # R13-A1: read from the canonical scan block registered in
+        # CANONICAL_DEFAULTS instead of hard-coded fallbacks. Previously the
+        # MCP server silently reported 180s / 20 while perception actually
+        # ticked at 5m / 54, masking the real config from LLM operators.
+        # The candleInterval→seconds mapping keeps the legacy snake_case
+        # surface ("scan_interval_sec") while reading the canonical key.
+        "scan_interval_sec": _scan_interval_seconds(config.get("scan", {})),
+        "min_composite_score": config.get("scan", {}).get("minCompositeScore", 54),
     })
 
 
