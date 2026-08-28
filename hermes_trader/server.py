@@ -45,7 +45,7 @@ from fastapi.responses import JSONResponse, StreamingResponse         # noqa: E4
 from hermes_trader.metrics import render_metrics                      # noqa: E402
 
 from hermes_trader import __version__, dashboard, session_log         # noqa: E402
-from hermes_trader.dashboard import _require_operator                 # noqa: E402
+from hermes_trader.dashboard import _require_operator, require_operator_write  # noqa: E402
 from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
 from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
 from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
@@ -258,7 +258,7 @@ async def get_agent_state() -> JSONResponse:
     return JSONResponse(content=state)
 
 
-@app.post("/api/agent/scan", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/scan", dependencies=[Depends(require_operator_write)])
 async def run_scan(request: Request) -> JSONResponse:
     """POST /api/agent/scan — sweep markets for trigger signals."""
     global _last_scan_at
@@ -348,7 +348,7 @@ async def _research_cached(coin: str, perception: Dict[str, Any]) -> Dict[str, A
             _research_inflight.pop(coin, None)
 
 
-@app.post("/api/agent/research/{coin}", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/research/{coin}", dependencies=[Depends(require_operator_write)])
 async def run_research(coin: str, request: Request) -> JSONResponse:
     """POST /api/agent/research/{coin} — full AI analysis for one coin.
 
@@ -385,7 +385,7 @@ async def run_research(coin: str, request: Request) -> JSONResponse:
     return JSONResponse(content=analysis)
 
 
-@app.post("/api/agent/research/{coin}/stream", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/research/{coin}/stream", dependencies=[Depends(require_operator_write)])
 async def run_research_stream(coin: str, request: Request) -> StreamingResponse:
     """SSE streaming research endpoint.
 
@@ -415,7 +415,7 @@ async def run_research_stream(coin: str, request: Request) -> StreamingResponse:
     )
 
 
-@app.post("/api/risk/review/stream", dependencies=[Depends(_require_operator)])
+@app.post("/api/risk/review/stream", dependencies=[Depends(require_operator_write)])
 async def risk_review_stream(request: Request) -> StreamingResponse:
     """SSE streaming endpoint for risk review.
 
@@ -442,7 +442,7 @@ async def risk_review_stream(request: Request) -> StreamingResponse:
     )
 
 
-@app.post("/api/agent/execute", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/execute", dependencies=[Depends(require_operator_write)])
 async def run_execute(request: Request) -> JSONResponse:
     """POST /api/agent/execute — run risk gates and execute an analysis."""
     memory.load()
@@ -493,7 +493,7 @@ async def agent_start() -> JSONResponse:
     return JSONResponse(content={"running": running, "pid": pid if running else None})
 
 
-@app.post("/api/agent/start", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/start", dependencies=[Depends(require_operator_write)])
 async def agent_start_post() -> JSONResponse:
     """POST /api/agent/start — report scanner status.
 
@@ -512,7 +512,7 @@ async def agent_start_post() -> JSONResponse:
     return JSONResponse(content={"status": "stub", "message": "Python agent runs independently"})
 
 
-@app.post("/api/agent/stop", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/stop", dependencies=[Depends(require_operator_write)])
 async def agent_stop() -> JSONResponse:
     """POST /api/agent/stop — terminate the scanner process."""
     if not os.path.exists(PID_FILE):
@@ -539,7 +539,7 @@ async def get_config() -> JSONResponse:
     return JSONResponse(content=read_agent_config())
 
 
-@app.post("/api/agent/config", dependencies=[Depends(_require_operator)])
+@app.post("/api/agent/config", dependencies=[Depends(require_operator_write)])
 async def update_config(request: Request) -> JSONResponse:
     """POST /api/agent/config — merge new values into the agent config.
 
@@ -704,7 +704,7 @@ async def get_orderbook(coin: str = Query("BTC")) -> JSONResponse:
         raise HTTPException(500, str(e))
 
 
-@app.post("/api/hl/place-order", dependencies=[Depends(_require_operator)])
+@app.post("/api/hl/place-order", dependencies=[Depends(require_operator_write)])
 async def place_order(request: Request) -> JSONResponse:
     """POST /api/hl/place-order — manual order with ATR-based SL/TP brackets.
 
@@ -943,7 +943,7 @@ async def place_order(request: Request) -> JSONResponse:
         raise HTTPException(500, str(e))
 
 
-@app.post("/api/hl/close-position", dependencies=[Depends(_require_operator)])
+@app.post("/api/hl/close-position", dependencies=[Depends(require_operator_write)])
 async def close_position(request: Request) -> JSONResponse:
     """POST /api/hl/close-position — close an open position for a coin.
 
@@ -989,7 +989,7 @@ async def close_position(request: Request) -> JSONResponse:
         raise HTTPException(500, str(e))
 
 
-@app.post("/api/hl/cancel-order", dependencies=[Depends(_require_operator)])
+@app.post("/api/hl/cancel-order", dependencies=[Depends(require_operator_write)])
 async def cancel_order(request: Request) -> JSONResponse:
     """POST /api/hl/cancel-order — cancel an order by OID."""
     try:

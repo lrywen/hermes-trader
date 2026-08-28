@@ -1163,6 +1163,21 @@ def _require_operator(request: Request, write: bool = False) -> None:
         _check_operator_write_rate(ip)
 
 
+def require_operator_write(request: Request) -> None:
+    """P0-7: the canonical dependency for STATE-CHANGING operator endpoints.
+
+    Thin wrapper that pins ``write=True`` on ``_require_operator`` so the
+    per-IP F11 write rate-limit always fires — no developer can forget to
+    pass ``write=True`` in a route decorator. Read-only routes continue to
+    use ``_require_operator`` directly (with the default ``write=False``).
+
+    Always authenticate with a valid ``HERMES_OPERATOR_TOKEN``; 401 on bad
+    / missing token, 429 on auth-failure lockout, 429 on write rate-limit
+    exhaustion, 503 on operator surface disabled.
+    """
+    _require_operator(request, write=True)
+
+
 def _log_operator_action(action: str, *, via: str, result: Optional[Dict[str, Any]] = None,
                          **extra: Any) -> None:
     """F22: persist a human-driven operator action to the session log.
