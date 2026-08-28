@@ -1,0 +1,300 @@
+# R11-F1 — PrometheusRule alerts for hermes-trader.
+#
+# This file ships alerts for every metric that should never quietly
+# break the trading loop. Each alert is designed to page at 5-10m of
+# sustained failure — short enough to catch a degraded mode before
+# the open-position risk compounds, long enough to ignore a single
+# blip from a pod restart or a one-off network hiccup.
+#
+# Apply order:
+#
+#   kubectl apply -f k8s/namespace.yaml
+#   kubectl apply -f k8s/configmap.yaml
+#   kubectl apply -f k8s/service.yaml
+#   kubectl apply -f k8s/statefulset.yaml
+#   helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
+#       -n monitoring --create-namespace
+#   kubectl apply -f k8s/servicemonitor.yaml
+#   kubectl apply -f k8s/prometheusrule.yaml
+#
+# After apply, the alerts appear in Prometheus's /alerts page. To
+# see them in Grafana, add a Prometheus data source pointed at
+# kube-prometheus-stack-prometheus:9090 in the monitoring namespace,
+# then open the Alerting tab.
+#
+# All metric names below are owned by ``hermes_trader.metrics``. The
+# tests in ``tests/test_prometheus_alerts.py`` verify the YAML is
+# valid, that every expr references a metric that is actually
+# registered, and that the alert names are unique.
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: hermes-trader
+  namespace: hermes
+  labels:
+    app: hermes-trader
+    release: kube-prometheus-stack
+    # prometheus-operator picks this up via labelSelector on the
+    # Prometheus CR; the standard stack selects
+    # `release: kube-prometheus-stack`. Match that.
+spec:
+  groups:
+    # ── Group 1: durable-write / circuit-breaker health ────────────────
+    - name: hermes.durable_writes
+      interval: 30s
+      rules:
+        - alert: HermesDSLStateSaveErrors
+          # ``hermes_dsl_state_save_errors_total`` is bumped every time
+          # the ratchet file fails to write. A non-zero rate for
+          # 5 minutes means the DSL state machine is silently losing
+          # its position. Page immediately.
+          expr: increase(hermes_dsl_state_save_errors_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: dsl_state
+          annotations:
+            summary: "DSL state save has failed in the last 5m"
+            description: |
+              ``hermes_dsl_state_save_errors_total`` is non-zero for the
+              last 5 minutes. The DSL ratchet file is not flushing to
+              disk. If the process restarts now, in-flight ratchet
+              state will be lost and the bot will resume from a stale
+              snapshot. Check disk pressure on the hermes-trader PVC
+              and dmesg for I/O errors.
+            runbook: "kubectl -n hermes exec hermes-trader-0 -c loop -- ls -la /data/.dsl-state.json"
+
+        - alert: HermesMemoryFlushErrors
+          # ``hermes_memory_flush_errors_total`` (R11-B1) counts failed
+          # atomic flushes. A 5m rate > 0 means ``memory.json`` is
+          # not being persisted; the in-process state is still
+          # correct but the next crash loses trades, calibration
+          # decisions, and the circuit-breaker state.
+          expr: increase(hermes_memory_flush_errors_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: agent_memory
+          annotations:
+            summary: "Agent memory flush has failed in the last 5m"
+            description: |
+              ``hermes_memory_flush_errors_total`` is non-zero for the
+              last 5 minutes. ``memory.json`` atomic write is broken
+              (fsync/rename/lock). On pod restart we lose the full
+              agent memory including circuit-breaker state and the
+              calibration window. Check ``kubectl -n hermes logs
+              hermes-trader-0 -c loop | grep -i memory`` and
+              ``df -h /data`` on the PVC.
+
+    # ── Group 2: circuit breakers (LLM + trade-side) ──────────────────
+    - name: hermes.circuit_breakers
+      interval: 30s
+      rules:
+        - alert: HermesLLMCircuitOpen
+          # ``hermes_llm_circuit_state`` is a Gauge that the loop
+          # sets to 1.0 when the LLM provider breaker is open. The
+          # label is the reason string (e.g. "consecutive_failures",
+          # "rate_limited") so the alert message tells the operator
+          # *why* we're degraded without needing to dig.
+          expr: hermes_llm_circuit_state == 1
+          for: 2m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: llm_provider
+          annotations:
+            summary: "LLM circuit breaker is open (degraded to skeleton mode)"
+            description: |
+              ``hermes_llm_circuit_state{{reason="{{ $labels.reason }}"}}``
+              has been 1 for 2m+. The agent is running on its
+              skeleton fallback (no LLM debate) and the calibration
+              stage has degraded. The {{ $labels.reason }} label
+              identifies which breaker condition tripped. Check the
+              upstream LLM provider's status page; if it's a Hermes
+              bug, capture the loop logs and roll the pod.
+
+        - alert: HermesTradeCircuitTripped
+          # ``hermes_trade_circuit_state{scope="global"} == 1`` means
+          # the global kill switch is on — the bot is not opening
+          # new positions. This is correct behavior post-incident
+          # (we WANT the circuit to trip on bad days) but it should
+          # never go silent.
+          expr: hermes_trade_circuit_state{scope="global"} == 1
+          for: 0m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "Global trade circuit is open — bot is not opening new positions"
+            description: |
+              ``hermes_trade_circuit_state{scope="global"} == 1`` for
+              0m. New positions are blocked by the global kill
+              switch. This is expected during a known drawdown but
+              should never go unreviewed — confirm the trip reason
+              with ``grep circuit ~/.hermes-trader/memory.json`` (or
+              the equivalent in the pod) before leaving it on.
+
+    # ── Group 3: dispatch / rate-gate (R11-A1 + R11-C1) ───────────────
+    - name: hermes.dispatch
+      interval: 30s
+      rules:
+        - alert: HermesNotifyDispatchErrors
+          # ``hermes_notify_dispatch_errors_total`` is the
+          # post-retry-failure count from R11-A1. A 10m rate > 0
+          # means notifications are not reaching the operator (the
+          # final fallback path failed). This is a 2x page:
+          #   - primary: ops signal is broken, you are flying blind
+          #   - secondary: a real trade incident will go un-noticed
+          # Hence the 10m ``for`` — we want to ignore a single
+          # transient webhook failure.
+          expr: increase(hermes_notify_dispatch_errors_total[10m]) > 0
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: notify_dispatch
+          annotations:
+            summary: "Notify dispatch has errors in the last 10m"
+            description: |
+              ``hermes_notify_dispatch_errors_total`` is non-zero for
+              the last 10 minutes. After R11-A1, the dispatcher
+              retries 3x with backoff and falls back to a backup
+              webhook, then to a no-op sink. A non-zero rate here
+              means the entire dispatch chain is exhausted. Confirm
+              Feishu webhook reachability and the
+              ``HERMES_OPERATOR_TOKEN`` secret.
+
+        - alert: HermesHLRateGateSaturated
+          # ``hermes_hl_rate_gate_wait_seconds`` p95 > 5s for 10m
+          # means the per-endpoint gate (R11-C1) is consistently
+          # blocking outbound HL calls for > 5 seconds. Either:
+          #   - the loop is hot-looping and we are sending too many
+          #     calls per second (a downstream 429 storm), OR
+          #   - the gate's capacity configuration has drifted below
+          #     the actual call rate.
+          # Either way, it's a "scanner is going to time out on its
+          # own cycles" warning — page so we tighten the gate
+          # before the next full minute forces it.
+          expr: histogram_quantile(0.95, sum by (le, endpoint) (rate(hermes_hl_rate_gate_wait_seconds_bucket[5m]))) > 5
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: hl_rate_gate
+          annotations:
+            summary: "HL rate-gate p95 wait > 5s on endpoint {{ $labels.endpoint }}"
+            description: |
+              ``hermes_hl_rate_gate_wait_seconds`` p95 on
+              ``{{ $labels.endpoint }}`` has been > 5s for 10
+              minutes. The scanner is being throttled by the
+              per-endpoint gate. Check the loop's outbound call
+              rate in the last 10m (``grep -c 'hl_request' loop.log``)
+              and consider tightening the per-endpoint capacity
+              config, or scaling the loop to a single replica to
+              avoid double-spending the budget.
+
+    # ── Group 4: WS / data freshness (R11-D1) ─────────────────────────
+    - name: hermes.ws_freshness
+      interval: 15s
+      rules:
+        - alert: HermesWSDataStale
+          # ``hermes_ws_data_age_seconds`` is set from
+          # ``ws_client.get_diag()["data_age_s"]`` on every /metrics
+          # scrape. The data-staleness monitor inside ws_client also
+          # fires a local reconnect at 30s, but the global
+          # Prometheus view is what the on-call engineer sees. 60s
+          # is one full missed local retry cycle, which is the
+          # point at which we treat the feed as effectively down.
+          expr: hermes_ws_data_age_seconds > 60
+          for: 2m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: websocket
+          annotations:
+            summary: "allMids feed is stale (data_age > 60s for 2m)"
+            description: |
+              ``hermes_ws_data_age_seconds`` > 60 for the last 2
+              minutes. The allMids feed has not produced a fresh
+              payload in over a minute. The local reconnect loop
+              has either failed or is in exponential backoff. The
+              scanner will be making decisions on stale prices —
+              consider pausing the loop with the
+              ``hermes.pause`` action until the feed recovers.
+
+        - alert: HermesWSAppHeartbeatStale
+          # ``hermes_ws_app_heartbeat_age_seconds`` is the age of the
+          # *application-level* heartbeat (R11-D1). The native SDK
+           # ping keeps the TCP socket warm but does NOT prove the
+           # server is answering business requests; this metric
+           # captures the second layer. > 45s means the heartbeat
+           # thread is stuck or the WS is half-open.
+          expr: hermes_ws_app_heartbeat_age_seconds > 45
+          for: 5m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: websocket
+          annotations:
+            summary: "WS app-level heartbeat is stale (heartbeat_age > 45s for 5m)"
+            description: |
+              ``hermes_ws_app_heartbeat_age_seconds`` > 45 for 5
+              minutes. The R11-D1 heartbeat thread has not
+              successfully bumped ``app_heartbeat_at`` recently.
+              This is the "TCP is up but the application is half-
+              dead" condition — a network probe would not catch
+              it. Restart the pod to clear.
+
+        - alert: HermesWSDropSpike
+          # ``rate(hermes_ws_dropped_dup_total[5m])`` > 1/s
+          # sustained for 10m means the server is replaying frames
+          # at a non-trivial rate. This is usually a sign of a
+          # reconnect storm on the HL side: each reconnect
+          # triggers a re-subscribe which the loop drops because
+          # the sequence numbers don't match. We don't page on
+          # every dup (a single reconnect emits a small burst)
+          # but a sustained 1/s rate means the loop is in a bad
+          # state.
+          expr: rate(hermes_ws_dropped_dup_total[5m]) > 1
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: websocket
+          annotations:
+            summary: "WS dropping > 1 dup/s for 10m — possible reconnect storm"
+            description: |
+              ``hermes_ws_dropped_dup_total`` is rising at > 1/s for
+              the last 10 minutes. The R11-D1 dedup layer is
+              dropping frames because the WS is replaying them,
+              which usually means a reconnect storm on the upstream
+              or our own reconnect loop is misbehaving. Capture
+              the loop logs around the last WS reconnect and
+              consider scaling the heartbeat interval.
+
+        - alert: HermesWSStaleFrameSpike
+          # ``rate(hermes_ws_dropped_stale_total[5m])`` > 0.1/s
+          # sustained 10m means the WS is feeding us out-of-order
+          # frames at a meaningful rate. Less common than dup (a
+          # healthy network shouldn't reorder), so a non-trivial
+          # rate here is a "the loop is making decisions on
+          # older-than-current data" warning.
+          expr: rate(hermes_ws_dropped_stale_total[5m]) > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: websocket
+          annotations:
+            summary: "WS dropping stale frames > 0.1/s for 10m"
+            description: |
+              ``hermes_ws_dropped_stale_total`` is rising at > 0.1/s
+              for the last 10 minutes. The R11-D1 dedup layer is
+              dropping out-of-order frames. The last_seq-vs-seq
+              gap is widening — the loop's view of the order book
+              is drifting. Investigate the WS transport (TCP MSS,
+              any recent deploy that changed the SDK).

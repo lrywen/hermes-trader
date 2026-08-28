@@ -71,6 +71,8 @@ helm install kube-prometheus-stack prometheus-community/kube-prometheus-stack \
 
 # Wire Prometheus to scrape /metrics (needs the operator CRDs from the step above)
 kubectl apply -f k8s/servicemonitor.yaml
+# Wire the alert rules (R11-F1) — same operator CRDs required.
+kubectl apply -f k8s/prometheusrule.yaml
 ```
 
 > The ServiceMonitor's `release: kube-prometheus-stack` label must match the
@@ -108,6 +110,40 @@ kubectl -n monitoring port-forward svc/kube-prometheus-stack-prometheus 9090:909
 
 Plus the standard `process_*` / `python_gc_*` collectors (CPU, RSS, GC) — these
 populate on Linux, i.e. inside the container.
+
+## Alerts (R11-F1)
+
+`k8s/prometheusrule.yaml` defines 10 alert rules across 4 groups. Each
+metric the alert references is owned by `hermes_trader.metrics` —
+`tests/test_prometheus_alerts.py` enforces the YAML↔metrics contract
+(every metric named in an alert `expr` is actually registered, and
+every alert has a unique name with `for` + `severity`).
+
+| Alert | Group | Triggers when | Severity |
+|---|---|---|---|
+| `HermesDSLStateSaveErrors` | durable_writes | `hermes_dsl_state_save_errors_total` rising 5m | critical |
+| `HermesMemoryFlushErrors` | durable_writes | `hermes_memory_flush_errors_total` rising 5m | critical |
+| `HermesLLMCircuitOpen` | circuit_breakers | `hermes_llm_circuit_state == 1` for 2m | warning |
+| `HermesTradeCircuitTripped` | circuit_breakers | `hermes_trade_circuit_state{scope="global"} == 1` | warning |
+| `HermesNotifyDispatchErrors` | dispatch | `hermes_notify_dispatch_errors_total` rising 10m | warning |
+| `HermesHLRateGateSaturated` | dispatch | per-endpoint gate p95 wait > 5s for 10m | warning |
+| `HermesWSDataStale` | ws_freshness | `hermes_ws_data_age_seconds > 60` for 2m | critical |
+| `HermesWSAppHeartbeatStale` | ws_freshness | `hermes_ws_app_heartbeat_age_seconds > 45` for 5m | warning |
+| `HermesWSDropSpike` | ws_freshness | `hermes_ws_dropped_dup_total` rate > 1/s for 10m | warning |
+| `HermesWSStaleFrameSpike` | ws_freshness | `hermes_ws_dropped_stale_total` rate > 0.1/s for 10m | warning |
+
+(Each row in the table below corresponds to one alert; the rule
+is loaded by `kubectl apply -f k8s/prometheusrule.yaml` and lives
+under the `hermes-trader` PrometheusRule in the `hermes`
+namespace.)
+
+After `kubectl apply -f k8s/prometheusrule.yaml`, the rules appear
+under Prometheus → Alerts. For Slack/PagerDuty wiring, edit the
+`AlertmanagerConfig` CR; this skill does not include the
+Alertmanager wiring so the alerts currently page nobody — the
+point is to have a single source of truth for "this metric going
+wrong means the bot is broken" and to surface the symptoms in
+Grafana alongside the dashboards.
 
 ## Teardown (back to $0)
 

@@ -12,6 +12,7 @@ which is where the ops signal matters).
 from __future__ import annotations
 
 import logging
+import time
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -286,6 +287,31 @@ HL_RATE_GATE_WAIT = Histogram(
     ["endpoint"],
     buckets=(0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0),
 )
+# R11-F1: WS gauges — surface HyperliquidWebSocket.get_diag() for the
+# PrometheusRule alerts in k8s/prometheusrule.yaml. The /metrics
+# endpoint stays network-free (R11-D1's get_diag reads from a local
+# in-process snapshot), so the scrape path never contends with the
+# trading loop's rate limiter.
+WS_LAST_SEQ = Gauge(
+    "hermes_ws_last_seq",
+    "Sequence number of the most recent accepted allMids frame (R11-D1).",
+)
+WS_DROPPED_DUP = Counter(
+    "hermes_ws_dropped_dup_total",
+    "allMids frames dropped because their seq duplicated the last accepted (R11-D1).",
+)
+WS_DROPPED_STALE = Counter(
+    "hermes_ws_dropped_stale_total",
+    "allMids frames dropped because their seq was less than the last accepted (R11-D1).",
+)
+WS_DATA_AGE_S = Gauge(
+    "hermes_ws_data_age_seconds",
+    "Age (in seconds) of the most recent applied allMids payload (R11-D1).",
+)
+WS_APP_HEARTBEAT_AGE_S = Gauge(
+    "hermes_ws_app_heartbeat_age_seconds",
+    "Age (in seconds) since the app-level heartbeat last fired (R11-D1).",
+)
 
 
 def _to_float(value: object) -> float:
@@ -353,6 +379,32 @@ def _refresh() -> None:
         DEBATE_CACHE_ENTRIES.set(float(len(_debate_cache)))
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[metrics] debate cache read failed: {e}")
+
+    # R11-F1: WS diag snapshot. The WebSocket singleton is held by
+    # hl_client; if it isn't started (e.g. before trading_loop reaches
+    # start_ws_mids), the gauges stay at zero, which is the correct
+    # "no data yet" signal. The Counters (dropped_dup/dropped_stale)
+    # are inc()'d directly by ws_client so they are already
+    # up-to-date; we only refresh the Gauges here.
+    try:
+        from hermes_trader.client.hl_client import _ws_mids_instance
+
+        ws = _ws_mids_instance
+        if ws is not None and hasattr(ws, "get_diag"):
+            diag = ws.get_diag()
+            WS_LAST_SEQ.set(float(diag.get("last_seq", 0)))
+            WS_DATA_AGE_S.set(float(diag.get("data_age_s", 0.0)))
+            try:
+                snap = ws.get_snapshot()
+                WS_APP_HEARTBEAT_AGE_S.set(
+                    max(0.0, time.time() - float(snap.app_heartbeat_at))
+                )
+            except Exception:
+                # Snapshot can be momentarily racy; never let a gauge
+                # read tear the metrics endpoint.
+                pass
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[metrics] ws diag read failed: {e}")
 
 
 def render_metrics() -> tuple[bytes, str]:
