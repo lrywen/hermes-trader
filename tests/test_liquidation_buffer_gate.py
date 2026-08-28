@@ -154,10 +154,18 @@ def _patch_buffer(monkeypatch, *, threshold, by_coin):
     namespace — monkeypatching ``hl_client.fetch_account_state`` alone
     does NOT reach ``executor._check_liquidation_buffer``. Patch BOTH
     attributes (mirroring the P0-6 verify_order_exists test helper).
+
+    R13-B4: the gate threshold is now live-resolved via
+    ``_resolve_liq_buffer_usd()`` (hot-path helper that consults legacy
+    env → canonical config → module fallback), so monkeypatch the helper
+    directly instead of the module constant. We also keep the
+    ``_LIQ_BUFFER_USD`` monkeypatch for backward compatibility with any
+    direct-import readers.
     """
     from hermes_trader.agents import executor
     from hermes_trader.client import hl_client
     monkeypatch.setattr(executor, "_LIQ_BUFFER_USD", threshold)
+    monkeypatch.setattr(executor, "_resolve_liq_buffer_usd", lambda: threshold)
     def fake_fetch(user, include_hip3=False):
         return {"liquidation_px_by_coin": by_coin}
     monkeypatch.setattr(hl_client, "fetch_account_state", fake_fetch)

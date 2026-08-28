@@ -460,6 +460,33 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # non-whale trade still earn the vote at risk_gates L645.
         "analyst5_whale_or_conf": 0.75,
     },
+    # R13-B4: executor execution-path constants (executor.py). Three gaps:
+    #   * tp_atr_mult DRIFT FIX — the key was already registered (above) and
+    #     server.py / research.py read it, but the executor's actual TP
+    #     placement (_place_tp_scale_out and the maybe_execute final_tp) used
+    #     the module constant TP_ATR_MULT=1.0 and NEVER read cfg, so an
+    #     operator tuning it to 1.2/1.5 made AI advice / backtest / live
+    #     order disagree. The hot path now resolves it via cfg_get.
+    #   * sl_ceiling_hard_max_pct — the HYPE-43%-incident hard clamp on the
+    #     backup-SL width was a function-local literal 15.0 (executor
+    #     L2296), not configurable / observable / env-overridable.
+    #   * liq_buffer_usd + execution block — the P0-4 liquidation pre-place
+    #     gate threshold (env-only HERMES_LIQ_BUFFER_USD=10) and the HL
+    #     taker-fee bookkeeping constants (HERMES_TAKER_FEE_PCT=0.025
+    #     env-only; round_trip_fills=2 a pure hardcode) were invisible to
+    #     the canonical schema / dashboard / config audit.
+    # Legacy env vars (HERMES_LIQ_BUFFER_USD / HERMES_TAKER_FEE_PCT) keep
+    # precedence for backward compat; canonical defaults match the existing
+    # literals verbatim so behaviour is unchanged when nothing is set.
+    "sl_ceiling_hard_max_pct": 15.0,
+    "liq_buffer_usd": 10.0,
+    "execution": {
+        # Hyperliquid perp taker fee in PERCENT (HL = 2.5bps = 0.025%), used
+        # to model round-trip entry+exit cost in realized-PnL bookkeeping.
+        "taker_fee_pct": 0.025,
+        # Number of taker fills modeled per round trip (entry + exit = 2).
+        "round_trip_fills": 2,
+    },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the
     # global min_ai_confidence applies uniformly). Was implicit via

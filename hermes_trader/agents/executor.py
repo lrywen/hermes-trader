@@ -50,6 +50,90 @@ from hermes_trader.client.hl_client import fetch_account_state, resolve_user_add
 
 logger = logging.getLogger(__name__)
 
+
+# ── R13-B4: hot-path live-resolve helpers for executor execution constants ──
+# Same pattern as the R13-B2 sl_move helpers (L307-314 below): re-resolve
+# via cfg_get on every call so a live .agent-config.json / env edit takes
+# effect on the next tick without restart, with the module constant as the
+# import-time fallback. Centralized here to avoid five near-identical copies
+# at the call sites and to make the "0 is a valid value" semantics (liq
+# buffer gate disabled) consistent — the previous `or cfg_get(...)` pattern
+# would have collapsed a 0.0 into the fallback.
+def _resolve_live_float(
+    key: str,
+    fallback: float,
+    *,
+    config: Optional[dict[str, Any]] = None,
+) -> float:
+    """Return the live config value for *key* or *fallback* on missing/None.
+
+    Unlike ``cfg_get(key, default, config=...)`` this treats a missing
+    key AND a None / non-numeric value both as "fall back" — the canonical
+    default 0.0 (legitimately used to disable the liq-buffer gate) is
+    preserved as a real 0.0, never silently swapped for the fallback.
+    """
+    val = cfg_get(key, config=config)
+    if val is None:
+        return fallback
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _resolve_live_int(
+    key: str,
+    fallback: int,
+    *,
+    config: Optional[dict[str, Any]] = None,
+) -> int:
+    """Same semantics as ``_resolve_live_float`` but for ints (round_trip_fills)."""
+    val = cfg_get(key, config=config)
+    if val is None:
+        return fallback
+    try:
+        return int(val)
+    except (TypeError, ValueError):
+        return fallback
+
+
+def _resolve_liq_buffer_usd() -> float:
+    """Resolve the P0-4 liquidation-buffer gate threshold in USD.
+
+    Legacy env ``HERMES_LIQ_BUFFER_USD`` keeps operator override precedence
+    (matches the historic contract); canonical key ``liq_buffer_usd``
+    registers the value with the config schema / dashboard / audit tools.
+    0.0 means "gate disabled" — must round-trip, not collapse to 10.0.
+    """
+    env_raw = os.environ.get("HERMES_LIQ_BUFFER_USD")
+    if env_raw is not None and env_raw != "":
+        try:
+            return float(env_raw)
+        except (TypeError, ValueError):
+            pass
+    return _resolve_live_float("liq_buffer_usd", _LIQ_BUFFER_USD)
+
+
+def _resolve_hl_taker_fee_pct() -> float:
+    """Resolve the HL perp taker fee (PERCENT) used in close/flatten bookkeeping.
+
+    Legacy env ``HERMES_TAKER_FEE_PCT`` keeps operator override precedence;
+    canonical key ``execution.taker_fee_pct`` provides the new route.
+    """
+    env_raw = os.environ.get("HERMES_TAKER_FEE_PCT")
+    if env_raw is not None and env_raw != "":
+        try:
+            return float(env_raw)
+        except (TypeError, ValueError):
+            pass
+    return _resolve_live_float("execution.taker_fee_pct", _HL_TAKER_FEE_PCT)
+
+
+def _resolve_hl_round_trip_fills() -> int:
+    """Resolve the number of taker fills modeled per round trip (entry+exit)."""
+    return _resolve_live_int("execution.round_trip_fills", _HL_ROUND_TRIP_FILLS)
+
+
 # Backup server-side stop multiplier. RETUNED 2026-06-02 (microscope audit): was
 # 3.5 -> ~5.5% spot on median names, far too wide to catch anything. The data showed
 # 54% of max_loss exits GAP PAST the 1.2% DSL cap (median realized -1.56%, worst -3.6%)
@@ -101,8 +185,13 @@ _IN_FLIGHT_ANALYSES: set = set()
 # clearinghouseState POST (no signing, no exchange fees).
 #
 # Bypass: set HERMES_LIQ_BUFFER_USD=0 to disable. Use only for testing —
-# live should always be ≥10.
-_LIQ_BUFFER_USD = float(os.environ.get("HERMES_LIQ_BUFFER_USD", "10") or "10")
+# live should always be ≥10. R13-B4: the canonical key `liq_buffer_usd`
+# (resolved by _resolve_liq_buffer_usd in _check_liquidation_buffer) is
+# now the new config path; the legacy env still wins (operator override).
+# _LIQ_BUFFER_USD below is the import-time fallback (10.0 verbatim) so the
+# historical module-level literal stays intact for any direct-import
+# callers.
+_LIQ_BUFFER_USD = 10.0
 
 
 def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[str, Any]:
@@ -120,7 +209,11 @@ def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[st
     the main placement path; the gate is best-effort, fail-open with
     a logged warning.
     """
-    if _LIQ_BUFFER_USD <= 0:
+    # R13-B4: live-resolve on every call so a config / env edit takes
+    # effect on the next order (no restart). 0.0 round-trips as "gate
+    # disabled" (legacy behavior).
+    live_buffer_usd = _resolve_liq_buffer_usd()
+    if live_buffer_usd <= 0:
         return {"ok": True, "reason": "gate_disabled"}
     if mid_price <= 0:
         return {"ok": True, "reason": "no_mid_price"}
@@ -151,31 +244,31 @@ def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[st
     # liquidation is on the upside; for a LONG (szi > 0) on the
     # downside. |mid - liq_px| is the price gap either way.
     buffer_usd = abs(float(mid_price) - float(liq_px)) * abs(szi)
-    if buffer_usd < _LIQ_BUFFER_USD:
+    if buffer_usd < live_buffer_usd:
         msg = (
             f"P0-4 liq-buffer gate: refused order on {coin}; existing "
             f"position (szi={szi:+.6f}, liq_px={liq_px}) is only "
             f"${buffer_usd:.2f} from liquidation at mid={mid_price}; "
-            f"threshold=${_LIQ_BUFFER_USD:.2f}"
+            f"threshold=${live_buffer_usd:.2f}"
         )
         logger.error(f"[executor] {msg}")
         try:
             from hermes_trader import notify
             notify.send_text(
                 f"🚫 拒单 {coin}：现有持仓距强平仅 ${buffer_usd:.2f}，"
-                f"阈值 ${_LIQ_BUFFER_USD:.2f}；需先手动减仓",
+                f"阈值 ${live_buffer_usd:.2f}；需先手动减仓",
                 category="risk",
             )
         except Exception:
             pass
         return {
             "ok": False,
-            "error": f"too_close_to_liquidation: {coin} buffer_usd={buffer_usd:.2f} < {_LIQ_BUFFER_USD:.2f}",
+            "error": f"too_close_to_liquidation: {coin} buffer_usd={buffer_usd:.2f} < {live_buffer_usd:.2f}",
             "reason": msg,
             "liquidation_px": liq_px,
             "existing_szi": szi,
             "buffer_usd": buffer_usd,
-            "threshold_usd": _LIQ_BUFFER_USD,
+            "threshold_usd": live_buffer_usd,
         }
     return {"ok": True, "buffer_usd": buffer_usd, "liquidation_px": liq_px, "existing_szi": szi}
 
@@ -784,7 +877,20 @@ def _place_tp_scale_out(
     tp_scale_fraction = float(config.get("tp_scale_fraction", 0.5))
     if not (atr > 0 and size_in_coin > 0 and 0 < tp_scale_fraction <= 1.0):
         return
-    tp_px_trig = _signed_price(entry_px, atr * TP_ATR_MULT, is_buy)
+    # R13-B4: tp_atr_mult DRIFT FIX — the canonical key was already
+    # registered (and server.py / research.py read it) but the live
+    # placement used the module constant TP_ATR_MULT=1.0 and never read
+    # cfg, so an operator tuning it to 1.2/1.5 made AI advice / backtest
+    # / live order disagree. Fall back to the module constant when the
+    # config value is missing / non-finite.
+    live_tp_atr_mult = _resolve_live_float("tp_atr_mult", TP_ATR_MULT, config=config)
+    if not (math.isfinite(live_tp_atr_mult) and live_tp_atr_mult > 0):
+        logger.warning(
+            f"[executor:tp] invalid tp_atr_mult={live_tp_atr_mult} — "
+            f"falling back to {TP_ATR_MULT}"
+        )
+        live_tp_atr_mult = TP_ATR_MULT
+    tp_px_trig = _signed_price(entry_px, atr * live_tp_atr_mult, is_buy)
     tp_size = size_in_coin * tp_scale_fraction
     tp_intended_notional = tp_size * tp_px_trig
     full_notional = size_in_coin * entry_px
@@ -819,7 +925,7 @@ def _place_tp_scale_out(
         f"full_size={size_in_coin} (${full_notional:.2f}), "
         f"intended_frac={tp_scale_fraction:.0%}, intended_size={tp_size} "
         f"(${tp_intended_notional:.2f}), tp_px={tp_px_trig:.6g} "
-        f"(atr={atr:.6g}, {TP_ATR_MULT}x ATR), "
+        f"(atr={atr:.6g}, {live_tp_atr_mult}x ATR), "
         f"hl_min_size={tp_min_size} (${tp_min_notional:.2f})"
     )
 
@@ -2293,11 +2399,24 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         sl_floor_pct = _DEFAULT_SL_FLOOR_PCT
     # Hard upper bound: a backup stop wider than 15% from entry leaves the same
     # unprotected gap class as the HYPE incident regardless of config.
+    # R13-B4: now driven by canonical key `sl_ceiling_hard_max_pct`
+    # (default 15.0); module constant 15.0 retained as the import-time
+    # fallback so any direct-import caller still resolves to the same
+    # number.
     _SL_CEILING_HARD_MAX_PCT = 15.0
-    if sl_ceiling_pct > _SL_CEILING_HARD_MAX_PCT:
+    _live_hard_max_pct = _resolve_live_float(
+        "sl_ceiling_hard_max_pct", _SL_CEILING_HARD_MAX_PCT, config=config
+    )
+    if not (math.isfinite(_live_hard_max_pct) and _live_hard_max_pct > 0):
+        logger.warning(
+            f"[executor] invalid sl_ceiling_hard_max_pct={_live_hard_max_pct} — "
+            f"falling back to {_SL_CEILING_HARD_MAX_PCT}"
+        )
+        _live_hard_max_pct = _SL_CEILING_HARD_MAX_PCT
+    if sl_ceiling_pct > _live_hard_max_pct:
         logger.warning(f"[executor] sl_ceiling_pct={sl_ceiling_pct}% exceeds hard max "
-                       f"{_SL_CEILING_HARD_MAX_PCT}% — clamping")
-        sl_ceiling_pct = _SL_CEILING_HARD_MAX_PCT
+                       f"{_live_hard_max_pct}% — clamping")
+        sl_ceiling_pct = _live_hard_max_pct
     # Floor must never exceed ceiling (would invert the clamp and place a stop
     # on the wrong side); pin it to ceiling if misconfigured.
     if sl_floor_pct > sl_ceiling_pct:
@@ -2322,10 +2441,23 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         final_sl = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
     else:
         final_sl = stop_px
+    # R13-B4: tp_atr_mult DRIFT FIX — same fix as _place_tp_scale_out above;
+    # the canonical key was registered but the main placement path used
+    # the module constant TP_ATR_MULT=1.0 and never read cfg, so an
+    # operator tuning it (1.2 / 1.5) made AI advice / backtest / live
+    # order disagree. Fall back to the module constant when the config
+    # value is missing / non-finite.
+    live_tp_atr_mult = _resolve_live_float("tp_atr_mult", TP_ATR_MULT, config=config)
+    if not (math.isfinite(live_tp_atr_mult) and live_tp_atr_mult > 0):
+        logger.warning(
+            f"[executor] invalid tp_atr_mult={live_tp_atr_mult} — "
+            f"falling back to {TP_ATR_MULT}"
+        )
+        live_tp_atr_mult = TP_ATR_MULT
     if is_buy:
-        final_tp = _signed_price(entry_px, atr * TP_ATR_MULT, True)
+        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, True)
     elif atr > 0:
-        final_tp = _signed_price(entry_px, atr * TP_ATR_MULT, False)
+        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, False)
     else:
         final_tp = tp_px
 
@@ -2964,7 +3096,16 @@ def close_position_market(coin: str) -> dict[str, Any]:
                     f"— settling bookkeeping with fallback px={fill_px:.6g} "
                     f"(PnL/breaker thresholds approximate)")
         # round-trip taker fills (entry + exit) at the HL taker rate × leverage
-        fees_pct = _HL_TAKER_FEE_PCT * _HL_ROUND_TRIP_FILLS * leverage
+        # R13-B4: hot-path live-resolve fee constants on every close
+        # (legacy env still wins via _resolve_hl_taker_fee_pct /
+        # _resolve_hl_round_trip_fills) so the realized-PnL model
+        # tracks any live config / env edit on the next close, not on
+        # next process restart. Defaults are the historical literals
+        # (0.025 PERCENT * 2 fills * leverage) — zero behavior change
+        # when the operator hasn't set anything.
+        live_fee_pct = _resolve_hl_taker_fee_pct()
+        live_round_trip_fills = _resolve_hl_round_trip_fills()
+        fees_pct = live_fee_pct * live_round_trip_fills * leverage
         out["fees_pct"] = round(fees_pct, 4)
         if fill_px and entry_px > 0:
             # Spot move from the perspective of the position: long earns when

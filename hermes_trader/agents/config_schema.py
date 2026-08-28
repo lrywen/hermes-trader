@@ -111,6 +111,10 @@ class _ConfigPatch(BaseModel):
     sl_ceiling_pct: float = Field(default=CANONICAL_DEFAULTS["sl_ceiling_pct"], ge=0.0, le=100.0)
     sl_floor_pct: float = Field(default=CANONICAL_DEFAULTS["sl_floor_pct"], ge=0.0, le=100.0)
     tp_atr_mult: float = Field(default=CANONICAL_DEFAULTS["tp_atr_mult"], ge=0.0, le=50.0)
+    # R13-B4: HYPE-incident hard clamp on backup-SL width (%), and the P0-4
+    # liquidation-buffer gate threshold in USD (0 disables the gate).
+    sl_ceiling_hard_max_pct: float = Field(default=CANONICAL_DEFAULTS["sl_ceiling_hard_max_pct"], ge=0.0, le=100.0)
+    liq_buffer_usd: float = Field(default=CANONICAL_DEFAULTS["liq_buffer_usd"], ge=0.0)
     aligned_min_conf: Optional[float] = Field(default=CANONICAL_DEFAULTS["aligned_min_conf"], ge=0.0, le=1.0)
     min_trend_score: float = Field(default=CANONICAL_DEFAULTS["min_trend_score"], ge=0.0, le=1.0)
     whale_size_multiplier: float = Field(default=CANONICAL_DEFAULTS["whale_size_multiplier"], ge=0.0)
@@ -158,6 +162,11 @@ class _ConfigPatch(BaseModel):
     # the market_regime_gate's counter-trend score bar plus the debate_gate
     # analyst2 / analyst5 thresholds.
     analyst_scoring: dict[str, Any] = Field(default_factory=lambda: _dict_default("analyst_scoring"))
+    # R13-B4: executor execution-path cost / fee bookkeeping knobs
+    # (executor.py). Two keys — HL perp taker fee in PERCENT and the
+    # number of taker fills modeled per round trip. Defaults mirror the
+    # existing module literals (0.025 / 2) verbatim.
+    execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("execution"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
