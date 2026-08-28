@@ -3736,3 +3736,88 @@ def test_chop_regime_gate_raises_conviction_bar(monkeypatch):
                      slow_burn_fired=True)
     r = market_regime_gate(slow_only)
     assert r["pass"] is False and r["via"] == "chop_blocked"
+
+
+# ── trend-surfacing regime gate: trend market works, chop stays silent ───────
+
+def _trend_surface_market_and_cfg():
+    """A coin in a steady 5m downtrend (~9% over the 72-bar momentum window)
+    that fires ONLY downtrendMomentum (weight 0) — the composite stays well
+    below the gate, so surfacing depends entirely on the trend bypass."""
+    from hermes_trader.agents.config import get_config
+    cfg = get_config()
+    market = {"coin": "TRX", "type": "perp", "dex": None}
+    return market, cfg, cfg["scan"]["minCompositeScore"]
+
+
+def _patch_fetch(monkeypatch, candles_5m, candles_1h):
+    from hermes_trader.agents import perception
+    monkeypatch.setattr(
+        perception, "_fetch_candles_sync",
+        lambda coin, interval, count, ttl, **kwargs:
+        candles_5m if interval == "5m" else candles_1h)
+
+
+def test_trend_surface_suppressed_in_chop_regime(monkeypatch):
+    """downtrendMomentum fires but the coin's own 1h regime is chop (EMA-neutral
+    + ADX<20): trend surfacing must be SILENCED (not surfaced)."""
+    from hermes_trader.agents import perception
+    from hermes_trader.agents.market_regime import classify_candles
+    down_5m = _trend_candles(120, start=100.0, step=-0.12)
+    chop_1h = _flat_candles(48, price=100.0)
+    assert classify_candles(chop_1h) == "chop"  # fixture sanity
+    _patch_fetch(monkeypatch, down_5m, chop_1h)
+    market, cfg, gate = _trend_surface_market_and_cfg()
+
+    ok, res = perception._scan_single_market(market, 100.0, cfg, gate, None,
+                                             False, trend_surface_enabled=True)
+    assert ok and res is None, f"chop regime must silence trend surfacing, got {res}"
+
+
+def test_trend_surface_fires_in_trend_regime(monkeypatch):
+    """Same 5m downtrend, but the 1h regime is a directional trend: the coin is
+    surfaced even though its composite score is below the gate (the whole point
+    of the trend bypass — unblocking shorts)."""
+    from hermes_trader.agents import perception
+    from hermes_trader.agents.market_regime import classify_candles
+    down_5m = _trend_candles(120, start=100.0, step=-0.12)
+    trend_1h = _trend_candles(48, start=100.0, step=-0.5)
+    assert classify_candles(trend_1h) == "down"  # fixture sanity
+    _patch_fetch(monkeypatch, down_5m, trend_1h)
+    market, cfg, gate = _trend_surface_market_and_cfg()
+
+    ok, res = perception._scan_single_market(market, 100.0, cfg, gate, None,
+                                             False, trend_surface_enabled=True)
+    assert ok and isinstance(res, dict), f"trend regime must surface, got {res}"
+    assert res["coin"] == "TRX"
+    assert res["composite_score"] < gate  # genuinely sub-gate → bypass did the work
+    assert any(h["name"] == "downtrendMomentum" and h["fired"]
+               for h in res["triggers"])
+
+
+def test_trend_surface_fail_open_without_1h_candles(monkeypatch):
+    """If the 1h candle fetch fails/returns nothing, the regime can't be
+    computed — surfacing must fail OPEN (surface) so a data hiccup never
+    silences a real trend."""
+    from hermes_trader.agents import perception
+    down_5m = _trend_candles(120, start=100.0, step=-0.12)
+    _patch_fetch(monkeypatch, down_5m, None)
+    market, cfg, gate = _trend_surface_market_and_cfg()
+
+    ok, res = perception._scan_single_market(market, 100.0, cfg, gate, None,
+                                             False, trend_surface_enabled=True)
+    assert ok and isinstance(res, dict), f"missing 1h must fail open (surface), got {res}"
+
+
+def test_trend_surface_disabled_drops_subgate_trend(monkeypatch):
+    """Master switch OFF: even a clean directional trend must not surface a
+    sub-gate coin (trend_surface_enabled is the hot kill-switch)."""
+    from hermes_trader.agents import perception
+    down_5m = _trend_candles(120, start=100.0, step=-0.12)
+    trend_1h = _trend_candles(48, start=100.0, step=-0.5)
+    _patch_fetch(monkeypatch, down_5m, trend_1h)
+    market, cfg, gate = _trend_surface_market_and_cfg()
+
+    ok, res = perception._scan_single_market(market, 100.0, cfg, gate, None,
+                                             False, trend_surface_enabled=False)
+    assert ok and res is None, f"switch OFF must not surface, got {res}"

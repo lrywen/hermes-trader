@@ -393,8 +393,26 @@ def _scan_single_market(
         # for bullish multi-trigger setups; a lone trend signal can't clear it).
         # This is what unblocks shorting downtrends. Gated by trend_surface_enabled
         # (default ON) so it's reversible without a code change.
-        trend_bypass = trend_surface_enabled and any(
+        trend_fired = trend_surface_enabled and any(
             h["name"] in ("uptrendMomentum", "downtrendMomentum") and h["fired"] for h in hits)
+        # Regime gate: the momentum triggers measure only the window's NET % move
+        # (no monotonicity/ADX quality), so in a choppy/sideways market a round-trip
+        # that nets +/-3% would surface noise. Suppress trend surfacing when the
+        # coin's own 1h regime is "chop" (ADX<20 AND EMA20/30 show no direction).
+        # up/down/neutral still surface — neutral implies ADX>=20, i.e. it is not a
+        # sideways whipsaw. Reuses the already-fetched candles_1h (zero extra
+        # requests); any failure falls back to surfacing so a regime-compute hiccup
+        # never silences a real signal.
+        trend_chop = False
+        if trend_fired and candles_1h:
+            try:
+                from hermes_trader.agents.market_regime import classify_candles
+                trend_chop = classify_candles(candles_1h) == "chop"
+            except Exception:
+                trend_chop = False
+        if trend_fired and trend_chop:
+            logger.debug(f"[regime] {market['coin']} trend-momentum surfacing suppressed (chop)")
+        trend_bypass = trend_fired and not trend_chop
         # Candlestick reversal bypass: a fired shooting-star/hammer/engulfing surfaces
         # the coin for AI research even below the composite gate (the gate is tuned for
         # momentum, not reversals). Gated by candlestick_patterns.enabled.
