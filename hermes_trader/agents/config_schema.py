@@ -151,6 +151,9 @@ class _ConfigPatch(BaseModel):
     # the write throttle / force-reload TTL / policy cache TTL / save retry
     # / backoff base — all on the trade hot path.
     dsl_state_io: dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_state_io"))
+    # R13-B2: exchange-SL mover tunables (executor.py). Two keys: per-coin
+    # batchModify throttle and minimum bps-move to justify a cancel+replace.
+    sl_move: dict[str, Any] = Field(default_factory=lambda: _dict_default("sl_move"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

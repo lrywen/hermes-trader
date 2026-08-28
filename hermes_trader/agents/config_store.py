@@ -349,6 +349,23 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # in hours (research display / against-funding context).
     "sl_buffer_bps": 10.0,
     "funding_lookback_hours": 24,
+    # R13-B2: dynamic exchange-SL mover (executor.py L304-311) tunables.
+    # Two knobs control how aggressively the trailing SL follows the DSL
+    # floor in Phase 2:
+    #   * min_interval_sec — per-coin throttle on batchModify (avoid
+    #     spamming HL cancel+replace every tick / respect rate limit)
+    #   * min_bps — minimum relative-to-entry move (in bps) that
+    #     justifies a cancel+replace (filters micro-ratchets)
+    # Were hardcoded module-level constants (_SL_MOVE_MIN_INTERVAL_SEC=30.0,
+    # _SL_MOVE_MIN_BPS=15.0) at executor.py L304/307; perception / R12
+    # audit flagged them as unobservable + not env-overridable + not
+    # dashboard-dumpable. sl_buffer_bps above is already plumbed via
+    # cfg_get at executor L2389; this block brings the other two knobs
+    # into parity. Defaults match the existing literals verbatim.
+    "sl_move": {
+        "min_interval_sec": 30.0,
+        "min_bps": 15.0,
+    },
     # R9/P2-3: news gate freshness window (days) and the short-TTL Brave
     # headline cache (seconds). Were hardcoded module constants in research.py.
     "news_freshness_days": 2,

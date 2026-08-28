@@ -301,13 +301,22 @@ def _record_pullback_shadow(*, coin: str, side: str, score: float,
 # to trail just behind the floor so a server-side stop can still cap gap-
 # throughs without firing BEFORE the (15s-polled) DSL. Throttled per coin to
 # avoid spamming batchModify on every tick and to respect HL rate limits.
-_SL_MOVE_MIN_INTERVAL_SEC = 30.0
+# R13-B2: resolve from canonical sl_move block; module symbols remain as the
+# import-time fallback so existing callers (verify_dsl_sl_sync.py) still see
+# the right number. Hot-path checks below re-resolve via cfg_get so a live
+# .agent-config.json edit takes effect on the next tick without restart.
+_SL_MOVE_MIN_INTERVAL_SEC = float(
+    cfg_get("sl_move.min_interval_sec", config={}) or 30.0
+)
 # Floor must move at least this many bps (relative to entry) before we issue a
 # modify — filters micro-ratchets that aren't worth a cancel+replace.
-_SL_MOVE_MIN_BPS = 15.0
+_SL_MOVE_MIN_BPS = float(
+    cfg_get("sl_move.min_bps", config={}) or 15.0
+)
 # Backup SL sits this many bps BEHIND the DSL floor (long: below floor; short:
 # above floor) so DSL is the primary trigger and the exchange order is the net.
-# P2-3: fallback default; the live value is config sl_buffer_bps.
+# P2-3: fallback default; the live value is config sl_buffer_bps (and the
+# hot-path below re-resolves via cfg_get on every call).
 _SL_BUFFER_BPS = 10.0
 # Last modification attempt per coin: {coin: (timestamp, target_px)}.
 _sl_move_state: dict[str, tuple] = {}
@@ -2444,15 +2453,20 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
             if not tighter:
                 continue
             # Min-move filter (relative to entry): skip sub-threshold ratchets.
+            # R13-B2: read live cfg value so a runtime config edit takes
+            # effect without restart; fall back to module constant.
             move_bps = abs(target - cur) / tracker.entry_px * 10_000.0
-            if move_bps < _SL_MOVE_MIN_BPS:
+            live_min_bps = cfg_get("sl_move.min_bps", _SL_MOVE_MIN_BPS)
+            if move_bps < live_min_bps:
                 continue
 
         # ── Per-coin throttle ───────────────────────────────────────────
+        # R13-B2: same live-resolve pattern.
+        live_min_interval = cfg_get("sl_move.min_interval_sec", _SL_MOVE_MIN_INTERVAL_SEC)
         st = _sl_move_state.get(coin)
         if st is not None:
             last_ts, last_target = st
-            if now - last_ts < _SL_MOVE_MIN_INTERVAL_SEC:
+            if now - last_ts < live_min_interval:
                 continue
             if last_target is not None and abs(last_target - target) < 1e-12:
                 continue
