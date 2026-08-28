@@ -332,6 +332,247 @@ CANONICAL_DEFAULTS: Dict[str, Any] = {
 DEFAULT_CONFIG: Dict[str, Any] = CANONICAL_DEFAULTS
 
 
+# ---------------------------------------------------------------------------
+# R11-E1: full-config schema validation hook for the store write/read paths.
+#
+# F27 introduced `validate_config_updates` for *partial* patches arriving over
+# the web API / CLI / `set` terminal command. That gate keeps a typed Pydantic
+# whitelist in lock-step with `CANONICAL_DEFAULTS`, but it deliberately only
+# inspects the keys the caller touched — leaving four dangerous back-doors:
+#
+#   1. `read_agent_config()` reading a hand-edited / corrupted JSON file
+#      (the field was renamed, the value was quoted as a string, etc.) —
+#      the bad value silently ships to every `cfg_get` consumer.
+#   2. `write_agent_config(cfg)` called directly (e.g. from a script that
+#      rebuilds the config from a different source) — bypasses the patch
+#      gate entirely.
+#   3. `restore_backup()` / `restore_snapshot()` writing a previously bad
+#      config back to disk — the .bak and snapshots can store a corrupt
+#      config because no gate sits between the snapshot blob and
+#      `_write_raw_locked`.
+#   4. `update_agent_config()` — the post-merge cfg can be valid per-patch
+#      but invalid in aggregate (e.g. leverage del+leverage le independently
+#      OK, but `composite_force_execute=true` set without
+#      `override_requires_ai=true` slips through patch-level checks if the
+#      patch set the second key as `None` for "leave alone" semantics).
+#
+# The functions below are the store-level safety net. They re-validate the
+# *entire* candidate cfg against the canonical schema and:
+#   * type / kind mismatches   -> hard error (will be raised by write paths),
+#   * range violations          -> hard error,
+#   * mode / FORBIDDEN_OVERRIDE -> hard error,
+#   * unknown top-level keys    -> only flagged when `strict_keys=True`
+#     (the legacy /api/agent/config endpoint kept lenient semantics so
+#     dashboard plugins can stash their own keys; everything else uses
+#     strict mode).
+#
+# A corrupt write is *never* a recoverable condition for a trading bot:
+# better to raise and let the operator investigate than to lose a
+# kill-switch silently.
+# ---------------------------------------------------------------------------
+
+# Per-key expected kind, derived from CANONICAL_DEFAULTS so it tracks the
+# single source of truth.  Nested dict / list kinds use the *type* of the
+# canonical default (int / float / bool / str / list / dict).  Mode is
+# explicitly a 3-value enum and lives in its own per-key check below.
+_TYPE_KIND_BY_KEY: Dict[str, Any] = {
+    key: type(default) for key, default in CANONICAL_DEFAULTS.items()
+}
+
+# Keys whose canonical default is `bool` and that must accept bool
+# exclusively. Centralised so the "bool is not an int" matrix is enforced
+# uniformly by both the patch-level gate and the full-cfg gate.
+_STRICT_BOOL_KEYS = frozenset(
+    k for k, v in CANONICAL_DEFAULTS.items() if isinstance(v, bool)
+)
+
+
+def _validate_cfg_value(key: str, value: Any) -> Optional[str]:
+    """Return an error string if *value* fails the canonical kind check for
+    *key*, otherwise None. Centralised kind/range check shared by the
+    patch-level and full-cfg gates (no enum / unknown-key logic here — those
+    are caller concerns).
+
+    A *value* of ``None`` is treated as the deep-merge protocol's
+    "deletion marker" and is not kind-checked — the key is popped before
+    persistence, so the value never lands on disk as ``null``.  This
+    matches the F27 patch gate's behaviour: ``None`` keys are stripped
+    from the validation payload in :func:`_flatten_patch_for_validation`.
+    """
+    if value is None:
+        # ``None`` is the deep-merge deletion marker — not a kind error.
+        return None
+    expected = _TYPE_KIND_BY_KEY.get(key)
+    if expected is None:
+        # Unknown key — caller decides (strict mode rejects; lenient mode
+        # accepts).
+        return None
+    if expected is bool:
+        if not isinstance(value, bool):
+            return f"{key}: expected bool, got {type(value).__name__}"
+        return None
+    if expected is int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            return f"{key}: expected int, got {type(value).__name__}"
+        return None
+    if expected is float:
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return f"{key}: expected number, got {type(value).__name__}"
+        return None
+    if expected is str:
+        if not isinstance(value, str):
+            return f"{key}: expected string, got {type(value).__name__}"
+        return None
+    if expected is list:
+        if not isinstance(value, list):
+            return f"{key}: expected list, got {type(value).__name__}"
+        return None
+    if expected is dict:
+        if not isinstance(value, dict):
+            return f"{key}: expected object, got {type(value).__name__}"
+        return None
+    # Fallback — unknown canonical kind (e.g. tuple). Be permissive.
+    return None
+
+
+def _validate_critical(cfg: Dict[str, Any]) -> List[str]:
+    """R11-E1: run the FORBIDDEN_OVERRIDE contract against the merged view
+    of *cfg*.
+
+    Unlike :func:`validate_config_updates` (F27) which is a *patch* gate
+    and inspects only the keys the caller touched, this helper sees the
+    full state. The FORBIDDEN_OVERRIDE branch is the one safety check
+    that *requires* a whole-view perspective: ``composite_force_execute``
+    or any of the four other force-override keys can be enabled across
+    two separate writes (e.g. one patch arms the lever, a second patch
+    forgets to set ``override_requires_ai=true``), and the patch-level
+    gate cannot catch the resulting armed state.
+
+    We deliberately do **not** delegate to ``validate_config_updates``
+    here for the mode-enum / safety-floor checks — those are designed
+    for *partial* patches and would false-reject legitimate historical
+    values on a whole view (the ``mode`` field was a free-form string
+    before the P0-2 enum landed; older ``.bak`` files still carry the
+    old value). Those checks belong in the patch gate only.
+    """
+    from hermes_trader.agents.config_schema import validate_forbidden_overrides
+    return validate_forbidden_overrides(cfg)
+
+
+def validate_config_dict(cfg: Dict[str, Any], *, strict_keys: bool = True) -> List[str]:
+    """Validate a *whole* config dict (post-merge) against the canonical
+    schema. Returns a list of human-readable error strings (empty on pass).
+
+    Unlike :func:`hermes_trader.agents.config_schema.validate_config_updates`
+    (which only inspects the keys the caller touched), this gate checks:
+
+    * every key in *cfg* has a kind compatible with its canonical default,
+    * the merged result does not contain `composite_force_execute=true`
+      (or any of the four other force-override keys) without
+      `override_requires_ai=true` — a state the per-patch gate cannot catch
+      if the two keys arrive in different writes,
+    * the F27 range / mode-enum / safety-floor matrix is satisfied for
+      the merged view.
+
+    ``strict_keys=True`` additionally rejects unknown top-level keys
+    (used by callers that want to keep the on-disk schema tight).
+    ``strict_keys=False`` keeps historical legacy-endpoint semantics:
+    unknown keys round-trip as-is and are not surfaced here. The two
+    modes differ from ``validate_config_updates`` only in the unknowns
+    (the type/range/override logic is identical, so a passing patch
+    always yields a passing whole).
+    """
+    if not isinstance(cfg, dict):
+        return [f"config: expected object, got {type(cfg).__name__}"]
+
+    errors: List[str] = []
+
+    # 1. Unknown-key gate.
+    for key in cfg.keys():
+        if key not in CANONICAL_DEFAULTS:
+            if strict_keys:
+                errors.append(f"unknown key: {key}")
+            # Lenient: leave it for the deep-merge path to persist.
+
+    # 2. Per-key kind check across the entire cfg.
+    for key, value in cfg.items():
+        # ``_comment`` is the operator's free-form note; no kind enforcement.
+        if key == "_comment":
+            continue
+        if key not in CANONICAL_DEFAULTS:
+            # Unknown keys are not type-checked in lenient mode (they
+            # round-trip as-is); in strict mode they were already rejected
+            # in step 1.
+            continue
+        if value is None:
+            # Deep-merge deletion marker — _validate_cfg_value skips
+            # these, skip them here too for clarity.
+            continue
+        err = _validate_cfg_value(key, value)
+        if err is not None:
+            errors.append(err)
+
+    # 3. Delegate the F27 range / mode-enum / FORBIDDEN_OVERRIDE matrix
+    # to the critical-only gate (sees the merged view, not the patch).
+    # dedupe against the kind-check errors above (F27 also reports
+    # "leverage: expected int" for the same key) so the operator sees
+    # one error per problem, not two.
+    critical_errors = _validate_critical(cfg)
+    seen = set(errors)
+    for ce in critical_errors:
+        if ce not in seen:
+            errors.append(ce)
+            seen.add(ce)
+
+    return errors
+
+
+def _validate_or_raise(
+    cfg: Dict[str, Any], *, source: str, strict_keys: bool = True
+) -> None:
+    """Run :func:`validate_config_dict` on *cfg*; raise ``RuntimeError`` with
+    a joined error list if any errors are found.
+
+    *source* is a short label (e.g. ``"write_agent_config"``,
+    ``"restore_snapshot"``) included in the exception message so the
+    operator can see which path rejected the cfg.
+    """
+    errors = validate_config_dict(cfg, strict_keys=strict_keys)
+    if not errors:
+        return
+    msg = (
+        f"[config] refusing to {source} — schema validation failed "
+        f"({len(errors)} error(s)): " + "; ".join(errors)
+    )
+    logger.error(msg)
+    raise RuntimeError(msg)
+
+
+def _log_validation_warnings(
+    cfg: Dict[str, Any], *, source: str, strict_keys: bool = True
+) -> List[str]:
+    """Run :func:`validate_config_dict` on *cfg* and log any errors as
+    warnings.  Never raises.  Returns the list of errors (empty on pass) so
+    the caller can decide whether to surface them in a metric / audit line.
+
+    Used by :func:`read_agent_config`: a hand-edited / partially-corrupt
+    config on disk must not crash the bot (CANONICAL_DEFAULTS is always the
+    safety net for any key that fails), but the operator needs to see the
+    problem in the logs so it can be fixed.  The deep-merge on
+    CANONICAL_DEFAULTS will replace any malformed top-level value with the
+    canonical default — except for keys that aren't in CANONICAL_DEFAULTS
+    (those round-trip as-is and may be the operator's deliberate custom
+    keys).
+    """
+    errors = validate_config_dict(cfg, strict_keys=strict_keys)
+    if errors:
+        logger.warning(
+            f"[config] {source} loaded config with {len(errors)} schema "
+            f"warning(s): " + "; ".join(errors)
+        )
+    return errors
+
+
 def _deep_merge(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
     """Recursively merge *overlay* into a copy of *base*.
 
@@ -486,6 +727,17 @@ def read_agent_config() -> Dict[str, Any]:
     raw = _read_raw_config()
     if raw is None:
         return dict(CANONICAL_DEFAULTS)
+    # R11-E1: log any schema violations found in the on-disk file but do
+    # NOT raise.  A hand-edited / partially-corrupt config must not crash
+    # the bot — the deep-merge on CANONICAL_DEFAULTS will overwrite any
+    # malformed top-level value with the canonical default (for keys
+    # _in_ CANONICAL_DEFAULTS) and the per-coin path will use those
+    # defaults transparently.  Unknown / not-in-canonical keys round-trip
+    # as-is so the operator's deliberate custom keys are preserved.
+    # strict_keys=False to preserve the historical "raw disk file is
+    # lenient" semantics: a key the operator added (e.g. for a dashboard
+    # plugin) is not an error.
+    _log_validation_warnings(raw, source="read_agent_config", strict_keys=False)
     return _deep_merge(CANONICAL_DEFAULTS, raw)
 
 
@@ -576,6 +828,16 @@ def write_agent_config(cfg: Dict[str, Any], *, backup: bool = True) -> None:
     try:
         lock_fd = os.open(_CONFIG_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # R11-E1: validate BEFORE touching the disk. The flock is held so
+        # this is the only place validation can run for a direct
+        # write_agent_config() call. Raises RuntimeError on critical
+        # schema violation (wrong type / out-of-range / mode typo /
+        # FORBIDDEN_OVERRIDE armed) — the .bak and .tmp files are
+        # untouched. Unknown keys are still accepted (strict_keys=False)
+        # to preserve the historical "raw disk file is lenient"
+        # semantics — a dashboard plugin that stashed its own keys
+        # before R11-E1 must keep working.
+        _validate_or_raise(cfg, source="write_agent_config", strict_keys=False)
         _write_raw_locked(cfg, backup=backup)
     except OSError as e:
         logger.error(f"[config] FAILED to write {CONFIG_PATH}: {e}")
@@ -685,6 +947,15 @@ def update_agent_config(*, backup: bool = True) -> Iterator[Dict[str, Any]]:
             )
         cfg = _deep_merge(CANONICAL_DEFAULTS, raw)
         yield cfg
+        # R11-E1: the body mutated cfg; validate the *post-merge* state
+        # before persisting.  This catches aggregated violations the
+        # patch-level gate cannot — most importantly FORBIDDEN_OVERRIDE
+        # where one write set `composite_force_execute=true` and a
+        # later write toggled `override_requires_ai` away, producing
+        # an armed state that per-patch validation never saw as
+        # simultaneous.  Unknown keys are accepted (strict_keys=False)
+        # to preserve the historical round-trip contract.
+        _validate_or_raise(cfg, source="update_agent_config", strict_keys=False)
         _write_raw_locked(cfg, backup=backup)
     finally:
         if lock_fd is not None:
@@ -717,11 +988,25 @@ def backup_config() -> Optional[Dict[str, Any]]:
 
 
 def restore_backup() -> bool:
-    """Restore the config from the last backup. Returns True on success."""
+    """Restore the config from the last backup. Returns True on success.
+
+    R11-E1: delegates to :func:`write_agent_config`, so the schema gate
+    runs automatically. A bad .bak (e.g. hand-edited and never validated)
+    raises ``RuntimeError`` instead of being silently restored.
+    """
     old = backup_config()
     if old is None:
         return False
-    write_agent_config(old, backup=False)
+    try:
+        write_agent_config(old, backup=False)
+    except RuntimeError as e:
+        # The .bak is corrupt — surface a clear log line distinct from
+        # the generic write rejection so the operator can tell which
+        # recovery path failed.
+        logger.error(
+            f"[config] refusing to restore from backup {_BACKUP_PATH}: {e}"
+        )
+        return False
     logger.warning(f"[config] restored from backup {_BACKUP_PATH}")
     return True
 
@@ -812,6 +1097,11 @@ def restore_snapshot(ts: int) -> bool:
     are bound to the open file description, so a second fd in this same
     process (opened by write_agent_config) blocking on LOCK_EX would
     self-deadlock. write_agent_config takes the lock itself.
+
+    R11-E1: delegates to :func:`write_agent_config`, so the schema gate
+    runs automatically. A snapshot that was created from a bad cfg (e.g.
+    taken before the R11-E1 gate existed) raises ``RuntimeError`` instead
+    of being silently restored.
     """
     path = _snap_path(ts)
     try:
@@ -821,7 +1111,13 @@ def restore_snapshot(ts: int) -> bool:
             old = json.load(f)
         # Do not overwrite the rolling .bak with the snapshot itself; a
         # restore is a recovery action, not a normal edit.
-        write_agent_config(old, backup=False)
+        try:
+            write_agent_config(old, backup=False)
+        except RuntimeError as e:
+            logger.error(
+                f"[config] refusing to restore from snapshot {path}: {e}"
+            )
+            return False
         logger.warning(f"[config] restored from snapshot {path}")
         return True
     except (OSError, json.JSONDecodeError) as e:

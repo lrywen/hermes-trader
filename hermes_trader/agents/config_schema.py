@@ -370,3 +370,40 @@ def validate_config_updates(updates: Dict[str, Any], *, strict_keys: bool = True
                 )
 
     return errors
+
+
+_FORCE_OVERRIDE_KEYS_FOR_GATE = (
+    "composite_force_execute", "breakout_force_execute",
+    "whale_force_execute", "whale_regime_bypass",
+    "spread_gate_fail_open",
+)
+
+
+def validate_forbidden_overrides(cfg: Dict[str, Any]) -> List[str]:
+    """R11-E1: run only the FORBIDDEN_OVERRIDE contract on a whole-config view.
+
+    ``validate_config_updates`` is a *patch* gate — it only inspects what the
+    caller is writing, not what is already on disk. The four hot-load write
+    paths in ``config_store`` (read-back of a hand-edited JSON, direct
+    ``write_agent_config`` calls, ``restore_backup`` / ``restore_snapshot``)
+    need a whole-view safety net, but applying the patch gate's full suite
+    (mode enum, safety floors) to the merged state would false-reject
+    legitimate historical values ("mode" once accepted any string before
+    the P0-2 enum was added) and orphan the operator's .bak.
+
+    This helper runs the *one* check that is safe and necessary on a whole
+    view: the FORBIDDEN_OVERRIDE contract — any force-execute switch armed
+    without ``override_requires_ai=true`` is refused. That contract is
+    independent of historical values because the force-execute keys only
+    exist as booleans (a legacy "ON" string in a JSON file is a *type*
+    failure, caught by ``_validate_cfg_value`` upstream of this call).
+    """
+    errors: List[str] = []
+    for fkey in _FORCE_OVERRIDE_KEYS_FOR_GATE:
+        if cfg.get(fkey) is True and cfg.get("override_requires_ai") is not True:
+            errors.append(
+                f"{fkey}=true requires override_requires_ai=true in "
+                f"the same config (FORBIDDEN_OVERRIDE — never arm a "
+                f"force-execute switch without explicit AI agreement)"
+            )
+    return errors
