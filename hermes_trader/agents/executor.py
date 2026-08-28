@@ -1864,6 +1864,43 @@ def maybe_execute(analysis: Dict[str, Any], _rotation_retry: bool = False) -> Di
     # persistent trade record then guards against re-execution; on the
     # failure path the exchange Cloid guards retries and rehydrate recovers
     # the orphan.
+    # P0-6: best-effort post-place reconciliation. We just got ok=True from
+    # place_hl_order, but a real orphan (exchange has the position, our
+    # tracker doesn't) shows up when the response shape lied about the fill
+    # (e.g. an oid the exchange actually rejected asynchronously, or a
+    # truncated response that hid an outright rejection). Cross-check
+    # openOrders + userFills; if neither confirms the order, alert
+    # category=risk and stamp the result with unverified=True so a
+    # background reconciler can pick it up. This MUST NOT block the main
+    # path — the order was submitted, we already have a tracker; verify is
+    # a smoke test, not a gate.
+    _unverified = False
+    try:
+        _oid = str(order_res.get("order_id") or "")
+        _cloid_str = str(order_res.get("cloid") or "")
+        if not _cloid_str and _cloid is not None:
+            _cloid_str = str(_cloid)
+        if _oid or _cloid_str:
+            from hermes_trader.client.exchange import verify_order_exists
+            _vre = verify_order_exists(coin=coin, oid=_oid or None, cloid=_cloid_str or None)
+            if not _vre.get("verified", True):
+                _unverified = True
+                try:
+                    from hermes_trader import notify
+                    notify.send_text(
+                        f"⚠️ 下单响应未在交易所核对: {coin} oid={_oid} cloid={_cloid_str}；"
+                        f"可能孤儿仓位，需人工查 openOrders/userFills",
+                        category="risk")
+                except Exception:
+                    pass
+                logger.error(
+                    f"[executor] execute_plan {coin} order NOT verified on "
+                    f"exchange (oid={_oid} cloid={_cloid_str}): {_vre.get('reason')}"
+                )
+    except Exception as _verify_e:
+        # verify failure must never block placement
+        logger.warning(f"[executor] verify_order_exists best-effort failed: {_verify_e!r}")
+
     try:
         arrival_mid = float(mid_price or 0)
         try:

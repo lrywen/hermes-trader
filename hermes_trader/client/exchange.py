@@ -592,6 +592,24 @@ def _round_price_for_hl(price: float, sz_decimals: int, is_perp: bool = True,
     return f"{rounded:.0f}"
 
 
+def _oid_is_valid(oid: str) -> bool:
+    """P0-6: An order oid from HL must be a non-empty, all-digit string of
+    positive length. A missing/empty/"0"/"None"/None oid on an otherwise-ok
+    response is a red flag: the SDK accepted the order but we have no handle
+    to reconcile or cancel it. Refuse to claim success so the caller can
+    fall through to a known-failure path instead of silently orphaning the
+    position on the exchange.
+    """
+    if oid is None:
+        return False
+    s = str(oid).strip()
+    if not s or s in ("0", "None", "null", "false"):
+        return False
+    # HL oids are positive integers; allow a leading sign just in case the
+    # SDK ever changes shape, but reject anything with non-numeric junk.
+    return s.lstrip("+-").isdigit() and int(s) > 0
+
+
 def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, Any]:
     """Normalize a raw SDK order response into {ok, order_id?, avg_px?, total_sz?, error?}.
 
@@ -623,16 +641,38 @@ def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, 
         )
         return {"ok": False, "error": "no order status in exchange response"}
     st = statuses[0]
-    if accept_resting and st.get("resting"):
-        oid = str(st["resting"]["oid"])
+    # NOTE: `st.get("resting")` returns the inner dict (or None when missing).
+    # An empty `{}` resting payload is falsy under `if`-truthiness even though
+    # the key is present — that previously sent us down the UNRECOGNIZED
+    # branch on a legitimate "resting but missing oid" response. Use `in`
+    # so we always enter the resting path when the key is present, then let
+    # the _oid_is_valid() check below decide whether the oid is acceptable.
+    if accept_resting and "resting" in st and st["resting"] is not None:
+        try:
+            oid = str(st["resting"].get("oid", ""))
+        except (TypeError, AttributeError):
+            oid = ""
+        if not _oid_is_valid(oid):
+            logger.error(
+                f"[_parse_order_result] order RESTING but oid MISSING/INVALID: "
+                f"oid={oid!r}, full_status={st} — refusing to claim success "
+                f"(would orphan the position; we could not reconcile later)"
+            )
+            return {"ok": False, "error": f"order_id_missing: resting.oid={oid!r}"}
         logger.info(
             f"[_parse_order_result] order RESTING on exchange: oid={oid} "
             f"(trigger order accepted, awaiting price)"
         )
         return {"ok": True, "order_id": oid}
-    if st.get("filled"):
+    if "filled" in st and st["filled"] is not None:
         f = st["filled"]
         oid = str(f.get("oid", ""))
+        if not _oid_is_valid(oid):
+            logger.error(
+                f"[_parse_order_result] order FILLED but oid MISSING/INVALID: "
+                f"oid={oid!r}, full_status={st} — refusing to claim success"
+            )
+            return {"ok": False, "error": f"order_id_missing: filled.oid={oid!r}"}
         out: Dict[str, Any] = {"ok": True, "order_id": oid}
         try:
             if "avgPx" in f:
@@ -652,7 +692,7 @@ def _parse_order_result(result: Any, accept_resting: bool = False) -> Dict[str, 
             f"avg_px={out.get('avg_px')}, total_sz={out.get('total_sz')}"
         )
         return out
-    if st.get("error"):
+    if "error" in st and st["error"] is not None:
         err = st["error"]
         logger.error(
             f"[_parse_order_result] exchange REJECTED order: error={err}, "
@@ -871,6 +911,21 @@ def place_hl_order(
                 f"[place_hl_order] {coin} {'BUY' if is_buy else 'SELL'} "
                 f"size={size_str} px={price_str} REJECTED: {parsed.get('error')}"
             )
+        else:
+            # P0-6: surface the cloid alongside order_id so the caller can
+            # reconcile against HL's openOrders / userFills later if the
+            # primary path (oid) ever goes stale. Cloid is the deterministic
+            # client-side idempotency key (UUID int → 16 bytes); oid is the
+            # exchange-assigned numeric id, which may be missing on partial
+            # response shapes.
+            if cloid is not None:
+                try:
+                    parsed["cloid"] = str(cloid.to_int() if hasattr(cloid, "to_int") else cloid)
+                except Exception:
+                    try:
+                        parsed["cloid"] = str(cloid)
+                    except Exception:
+                        pass
         return parsed
     except Exception as e:
         logger.error(f"Failed to place order for {coin}: {e}")
@@ -1076,6 +1131,88 @@ def cancel_open_orders_for_coin(coin: str) -> int:
     except Exception as e:
         logger.warning(f"[cancel_open_orders_for_coin] {coin} failed: {e}")
         return 0
+
+
+def verify_order_exists(
+    coin: str,
+    oid: Optional[str] = None,
+    cloid: Optional[str] = None,
+    user: Optional[str] = None,
+) -> Dict[str, Any]:
+    """P0-6: post-place reconciliation. After place_hl_order returns ok=True,
+    cross-check that the exchange actually has the order (oid in openOrders
+    for resting / filled in userFills for an immediate match). If neither
+    endpoint shows a hit, the response shape lied — most likely the order
+    was asynchronously rejected, or the SDK truncated the response.
+
+    Returns a dict shaped:
+        {"verified": bool, "in_open_orders": bool, "in_user_fills": bool,
+         "reason": str | None}
+
+    Never raises: a verify failure must not break the calling order flow.
+    Cloid is matched as a stringified int (HL surfaces cloid in openOrders
+    as `cloid` field, in userFills as a hex-ish token; we just compare as
+    strings so both shapes work).
+    """
+    if not oid and not cloid:
+        return {"verified": False, "reason": "no_oid_or_cloid"}
+    try:
+        user = user or resolve_user_address()
+        if not user:
+            return {"verified": False, "reason": "no_user_address"}
+        in_open = False
+        in_fills = False
+        # 1) openOrders: look for an order whose oid matches (or whose cloid
+        # matches, if provided). coin narrowing keeps the scan small.
+        try:
+            oo = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8) or []
+        except Exception as _oo_e:
+            oo = []
+            logger.debug(f"[verify_order_exists] openOrders fetch failed: {_oo_e!r}")
+        for o in oo:
+            if o.get("coin") != coin:
+                continue
+            if oid and str(o.get("oid")) == str(oid):
+                in_open = True
+                break
+            if cloid and str(o.get("cloid")) == str(cloid):
+                in_open = True
+                break
+        # 2) userFills: any fill on this coin for this oid/cloid counts as
+        # verified (immediate-or-cancel order has already settled).
+        try:
+            fills = _http_post("/info", {"type": "userFills", "user": user, "limit": 50}, timeout=8) or []
+        except Exception as _uf_e:
+            fills = []
+            logger.debug(f"[verify_order_exists] userFills fetch failed: {_uf_e!r}")
+        for f in fills:
+            if f.get("coin") != coin:
+                continue
+            if oid and str(f.get("oid")) == str(oid):
+                in_fills = True
+                break
+            if cloid and str(f.get("cloid")) == str(cloid):
+                in_fills = True
+                break
+        verified = in_open or in_fills
+        reason = None
+        if not verified:
+            reason = f"oid={oid!r} cloid={cloid!r} not in openOrders or userFills (in_open={in_open} in_fills={in_fills})"
+        return {
+            "verified": verified,
+            "in_open_orders": in_open,
+            "in_user_fills": in_fills,
+            "reason": reason,
+        }
+    except Exception as e:
+        # verify is best-effort; on hard failure report unverified so the
+        # caller alerts, but include the error for diagnosis.
+        return {
+            "verified": False,
+            "in_open_orders": False,
+            "in_user_fills": False,
+            "reason": f"verify_exception: {e!r}",
+        }
 
 
 def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int] = None) -> Dict[str, Any]:
