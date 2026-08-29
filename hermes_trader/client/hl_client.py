@@ -296,7 +296,7 @@ def _hl_request_inner(
             if _rate_wait_s > 1.0 or _http_s > 3.0:
                 logger.info(
                     f"[hl] {req_type} | rate_wait={_rate_wait_s:.2f}s http={_http_s:.2f}s "
-                    f"total={time.monotonic()-_t0:.2f}s weight={weight}"
+                    f"total={time.monotonic()-_http_t0:.2f}s weight={weight}"
                 )
             return _result
         except Exception as e:

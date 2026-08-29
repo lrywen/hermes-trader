@@ -1001,8 +1001,13 @@ def ta_late_entry_gate(
         return _done("pass", {
             "pass": True,
             "via": "ta_late_entry_pass",
+            "data_ok": True,
             "rsi4h": verdict.get("rsi4h"),
             "adx4h": verdict.get("adx4h"),
+            "extension": verdict.get("extension"),
+            "rsi15m": verdict.get("rsi15m"),
+            "relaxed_by_trend": verdict.get("relaxed_by_trend"),
+            "mtf_passed": verdict.get("mtf_passed"),
         })
 
     reason = f"late-entry gate: {verdict.get('reason', '')}".rstrip()
@@ -1023,7 +1028,13 @@ def ta_late_entry_gate(
             "pass": True,  # shadow never blocks
             "via": "ta_late_entry_shadow",
             "would_block": True,
+            "data_ok": True,
             "reason": reason,
+            "rsi4h": verdict.get("rsi4h"),
+            "adx4h": verdict.get("adx4h"),
+            "extension": verdict.get("extension"),
+            "rsi15m": verdict.get("rsi15m"),
+            "mtf_passed": verdict.get("mtf_passed"),
         })
 
     # enforce: hard block.
