@@ -2485,6 +2485,15 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
     monkeypatch.setattr(executor, "register_position", lambda *a, **k: None)
     monkeypatch.setattr(executor.memory, "track_daily_pnl", lambda *a, **k: None)
     monkeypatch.setattr(executor.memory, "get_daily_pnl", lambda: 0.0)
+    # B-F7: the drawdown gate imports the memory singleton directly (not via
+    # executor.memory), so stub the peak it reads too — the no-op track above
+    # means no peak is ever recorded in this fixture's world.
+    monkeypatch.setattr(executor.memory, "peak_equity", lambda: 0.0)
+    # B-F2/B-F6: same direct-import pattern for the streak / per-coin daily
+    # loss readers — no closes happen in the fixture, so all read zero/empty.
+    monkeypatch.setattr(executor.memory, "consecutive_losses", lambda coin: 0)
+    monkeypatch.setattr(executor.memory,
+                        "coin_daily_realized_pnl_pct", lambda coin, sod: 0.0)
     monkeypatch.setattr(executor.memory, "get_recent_trades", lambda n=10: [])
     monkeypatch.setattr(executor.memory, "record_trade", lambda t: None)
     monkeypatch.setenv("HYPERLIQUID_PRIVATE_KEY", "0xabc")

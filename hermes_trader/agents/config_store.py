@@ -605,6 +605,20 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "single_coin_halt_min": 60.0,
         "daily_loss_pct": 5.0,
         "daily_halt_min": 120.0,
+        # B-F2 (deep audit 2026-08-28): consecutive losing closes on one coin
+        # before new entries on that coin are blocked. The streak was recorded
+        # in memory (record_loss_outcome) but no gate ever read it. <=0 disables.
+        "consecutive_loss_limit": 3,
+        # B-F6: per-coin CUMULATIVE daily realized loss, as % of start-of-day
+        # equity. Backs the per_coin_daily_loss_gate; complements the per-trade
+        # single_coin_loss_pct (one large spot loss) with the many-small-loss
+        # accumulation case. <=0 disables.
+        "coin_daily_loss_pct": 5.0,
+        # B-F7: account-wide max drawdown from the all-time equity high-water
+        # mark, as a %. Blocks ALL new entries beyond it (a kill-switch the
+        # daily-loss gate cannot cover: a slow multi-day grind down trips no
+        # single day's limit but still blows the account). <=0 disables.
+        "max_drawdown_pct": 15.0,
     },
     # R13-A1: perception scan-tick block (TRIGGER_CONFIG["scan"], perception.py
     # L216-269). Previously implicit: the keys lived only in the module-level

@@ -223,6 +223,12 @@ class AgentMemory:
         self._equity: float = 0
         self._daily_pnl: float = 0
         self._peak_daily_pnl: float = 0  # high-water mark of daily_pnl (intraday, resets at UTC roll)
+        # B-F7 (deep audit 2026-08-28): all-time high-water mark of equity,
+        # backing the account max-drawdown gate. Unlike _peak_daily_pnl this
+        # does NOT reset at UTC roll — a drawdown is measured from the highest
+        # equity the account has ever reached. Updated on every accepted equity
+        # tick in track_daily_pnl (after the implausible-read filter).
+        self._peak_equity: float = 0
         self._start_of_day_equity: float = 0
         self._day_start_ts: int = 0
         self._open_positions: list[dict[str, Any]] = []
@@ -353,6 +359,12 @@ class AgentMemory:
                 self._daily_pnl = data.get("dailyPnl", 0)
                 self._start_of_day_equity = data.get("startOfDayEquity", 0)
                 self._day_start_ts = data.get("dayStartTs", 0)
+                # B-F7: all-time equity high-water mark (absent in old files →
+                # 0.0, re-seeds itself on the first accepted equity tick).
+                try:
+                    self._peak_equity = float(data.get("peakEquity", 0) or 0)
+                except (TypeError, ValueError):
+                    self._peak_equity = 0.0
                 self._open_positions = data.get("openPositions", [])
 
                 # Tiered circuit-breaker state (best-effort restore; a stale/
@@ -552,6 +564,7 @@ class AgentMemory:
                 "dailyPnl": self._daily_pnl,
                 "startOfDayEquity": self._start_of_day_equity,
                 "dayStartTs": self._day_start_ts,
+                "peakEquity": self._peak_equity,  # B-F7 all-time equity HWM
                 "openPositions": list(self._open_positions),
                 "coinCircuit": dict(self._coin_circuit),
                 "globalHaltUntilMs": int(self._global_halt_until_ms or 0),
@@ -802,6 +815,11 @@ class AgentMemory:
                 self._daily_pnl = current_equity - self._start_of_day_equity - net_contributions
             # Track the day's peak PnL so a give-back breaker can lock in green days.
             self._peak_daily_pnl = max(self._peak_daily_pnl, self._daily_pnl)
+            # B-F7: all-time equity high-water mark for the drawdown gate. The
+            # implausible-read filter above already ran, so the values reaching
+            # here are accepted (sustained) readings — a one-tick partial-dex
+            # blip can neither inflate the peak nor fake a crash below it.
+            self._peak_equity = max(self._peak_equity, current_equity)
             self._equity = current_equity
             # P1-6: every accepted equity tick mutates dailyPnl/peak/equity;
             # coalesced onto the trading loop's periodic (throttled) flush.
@@ -810,6 +828,16 @@ class AgentMemory:
     def peak_daily_pnl(self) -> float:
         """Intraday high-water mark of daily PnL (resets at UTC midnight)."""
         return self._peak_daily_pnl
+
+    def peak_equity(self) -> float:
+        """All-time high-water mark of equity (B-F7 drawdown gate baseline).
+
+        Updated only on accepted equity ticks; 0.0 until the first tick, in
+        which case the drawdown gate treats the book as having no reference
+        peak and passes (fail-open on missing reference, fail-closed once a
+        real peak exists)."""
+        with self._lock:
+            return float(self._peak_equity)
 
     # ── Loss cooldown (anti-revenge re-entry) ───────────────────────────────
     # Backed by the persisted `_cooldowns` dict (coin -> expires_ms), which was

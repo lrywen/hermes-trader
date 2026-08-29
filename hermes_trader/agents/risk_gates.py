@@ -232,6 +232,93 @@ def global_halt_gate(ctx: GateContext) -> GateResult:
     return {"pass": True}
 
 
+def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
+    """B-F2 (deep audit 2026-08-28): block re-entry on a coin after `limit`
+    CONSECUTIVE losing closes.
+
+    The close chokepoint already records the streak
+    (memory.record_loss_outcome → _consecutive_losses[coin]); it resets on any
+    winning close and at UTC day roll. Before this gate the counter was
+    recorded but NOTHING read it, so the "consecutive-loss halt" of the 16
+    defined risk controls was dead. A state-read failure fails OPEN (the
+    existing cooldown/circuit breakers still apply); the streak itself is a
+    pure non-negative int. Disabled when limit <= 0.
+    """
+    if limit <= 0:
+        return {"pass": True}
+    try:
+        from hermes_trader.agents.memory import memory
+        streak = int(memory.consecutive_losses(ctx.coin) or 0)
+        if streak >= limit:
+            return {"pass": False,
+                    "reason": f"consecutive-loss halt: {ctx.coin} has {streak} "
+                              f"losing closes in a row (>= {limit}) — no entries "
+                              f"until a winning close or UTC roll"}
+    except Exception as e:  # noqa: BLE001 — same fail-open-on-read-error convention as the breakers
+        logger.debug(f"[risk] consecutive-loss gate state read failed for {ctx.coin}: {e}")
+    return {"pass": True}
+
+
+def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResult:
+    """B-F6: block a coin whose CUMULATIVE realized loss today has reached
+    `max_loss_pct` (%, of start-of-day equity).
+
+    memory.coin_daily_realized_pnl_pct() sums today's closed-Trade PnL for the
+    coin (a NEGATIVE number when net down). This catches the many-small-losses
+    accumulation that the per-trade single_coin_loss_pct breaker misses (no
+    single stop hits 3%, but ten -0.4% stops on the same name add up).
+    Disabled when max_loss_pct <= 0 or there is no usable baseline equity yet.
+    Read failure fails open (coin_circuit remains the independent backstop).
+    """
+    if max_loss_pct <= 0:
+        return {"pass": True}
+    try:
+        from hermes_trader.agents.memory import memory
+        sod_equity = float(memory.get_start_of_day_equity() or 0.0)
+        if sod_equity <= 0:
+            return {"pass": True}  # no baseline yet (pre-first-tick) → nothing to measure
+        pnl_pct = float(memory.coin_daily_realized_pnl_pct(ctx.coin, sod_equity) or 0.0)
+        if pnl_pct <= -max_loss_pct:
+            return {"pass": False,
+                    "reason": f"per-coin daily loss halt: {ctx.coin} realized "
+                              f"{pnl_pct:.2f}% today (<= -{max_loss_pct:.1f}% of "
+                              f"SOD equity) — no more entries on this coin today"}
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[risk] per-coin daily-loss gate state read failed for {ctx.coin}: {e}")
+    return {"pass": True}
+
+
+def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
+    """B-F7: block ALL new entries when account equity has fallen more than
+    `max_drawdown_pct` (%) from its all-time high-water mark.
+
+    The USD daily-loss kill-switch (daily_loss_kill_switch) and the daily
+    circuit halt only see the CURRENT day: a slow multi-day grind — losing
+    $10/day for two weeks from a $200 peak — trips no single-day limit while
+    the account bleeds out. This gate measures peak-to-current equity instead.
+    The peak is tracked in memory.track_daily_pnl (post implausible-read
+    filter) and persisted (peakEquity). Disabled when max_drawdown_pct <= 0 or
+    no reference peak exists yet (fail open on missing reference; once a peak
+    is recorded the gate fails closed). Read failure fails open.
+    """
+    if max_drawdown_pct <= 0:
+        return {"pass": True}
+    try:
+        from hermes_trader.agents.memory import memory
+        peak = float(memory.peak_equity() or 0.0)
+        if peak <= 0 or ctx.equity <= 0:
+            return {"pass": True}  # no reference peak / no live equity yet
+        dd_pct = (peak - ctx.equity) / peak * 100.0
+        if dd_pct >= max_drawdown_pct:
+            return {"pass": False,
+                    "reason": f"account drawdown halt: equity ${ctx.equity:.0f} is "
+                              f"{dd_pct:.1f}% below peak ${peak:.0f} "
+                              f"(>= {max_drawdown_pct:.1f}%) — no new entries"}
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[risk] drawdown gate state read failed: {e}")
+    return {"pass": True}
+
+
 def opposite_direction_guard(ctx: GateContext) -> GateResult:
     """Block ANY re-entry on a coin we already hold. A held position is managed
     solely by the DSL engine + the periodic AI close-check (CLOSE / HOLD); it is
@@ -803,6 +890,14 @@ def eval_all_gates(
     # close chokepoint, enforced here so a halted coin/book cannot re-enter.
     results["coin_circuit"] = coin_circuit_breaker_gate(ctx)
     results["global_halt"] = global_halt_gate(ctx)
+    # B-F2/B-F6/B-F7 (deep audit 2026-08-28): the book-keeping existed but no
+    # gate read it. Threshold <= 0 disables each gate.
+    results["consecutive_loss"] = consecutive_loss_gate(
+        ctx, int(cfg_get("circuit_breaker.consecutive_loss_limit", config=config) or 0))
+    results["coin_daily_loss"] = per_coin_daily_loss_gate(
+        ctx, float(cfg_get("circuit_breaker.coin_daily_loss_pct", config=config) or 0.0))
+    results["drawdown"] = drawdown_gate(
+        ctx, float(cfg_get("circuit_breaker.max_drawdown_pct", config=config) or 0.0))
     results["opposite_guard"] = opposite_direction_guard(ctx)
     results["correlation"] = correlation_cap(
         ctx, int(cfg_get("max_crypto_long_correlated", config=config)))
@@ -824,7 +919,8 @@ def eval_all_gates(
     _GATE_KEYS = {
         "confidence", "max_concurrent", "notional_cap", "daily_loss",
         "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
-        "cooldown", "coin_circuit", "global_halt", "opposite_guard",
+        "cooldown", "coin_circuit", "global_halt", "consecutive_loss",
+        "coin_daily_loss", "drawdown", "opposite_guard",
         "correlation", "equity_risk", "market_regime", "news", "debate",
     }
     for key, result in results.items():
