@@ -180,6 +180,12 @@ class _ConfigPatch(BaseModel):
     crypto_whale: dict[str, Any] = Field(default_factory=lambda: _dict_default("crypto_whale"))
     news_catalyst: dict[str, Any] = Field(default_factory=lambda: _dict_default("news_catalyst"))
     whale_index: dict[str, Any] = Field(default_factory=lambda: _dict_default("whale_index"))
+    # R13-B8: trigger composite-score weights and thresholds (TRIGGER_CONFIG,
+    # consumed by perception.scan_once). Nested because perception reads them
+    # as config["weights"] / config["thresholds"]; snake_case canonical leaves
+    # are mapped to the camelCase runtime keys by config.py helpers.
+    trigger_weights: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_weights"))
+    trigger_thresholds: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_thresholds"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

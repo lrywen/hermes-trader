@@ -394,7 +394,7 @@ def _sustained_move_pct(candles: list[Candle], lookback: int) -> Optional[float]
     return (end - start) / start * 100
 
 
-def uptrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
+def uptrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 5.0) -> TriggerHit:
     """Sustained UPward move over `lookback` bars (default ~6h on 5m).
 
     Surfaces a coin in a steady uptrend that the fast spike triggers (which need
@@ -416,7 +416,7 @@ def uptrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: f
     }
 
 
-def downtrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 3.0) -> TriggerHit:
+def downtrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: float = 5.0) -> TriggerHit:
     """Sustained DOWNward move over `lookback` bars (default ~6h on 5m).
 
     The bearish mirror of uptrend_momentum — surfaces a coin in a steady

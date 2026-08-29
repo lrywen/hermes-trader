@@ -518,6 +518,58 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "evaluateClosedBarsOnly": True,
         "postCloseForceRefreshMs": 15_000,
     },
+    # R13-B8: trigger composite-score weights (TRIGGER_CONFIG["weights"],
+    # perception.py L316/323 -> triggers.composite_score). The 12 weights
+    # previously lived only in the module-level TRIGGER_CONFIG dict and had no
+    # env / dashboard / set-channel — an operator could not tune or even read
+    # them at runtime. Leaf names are snake_case (canonical convention);
+    # config.py.trigger_weights_params() maps them to the camelCase runtime
+    # keys that composite_score indexes by trigger name. Six weights are
+    # intentionally 0.0 (net-negative / surfacing-only triggers), hence the
+    # >= 0 guard. Defaults mirror TRIGGER_CONFIG verbatim; behaviour unchanged.
+    "trigger_weights": {
+        "trend_strength": 0.55,
+        "pct_move_spike": 0.40,
+        "breakout": 0.30,
+        "volume_spike": 0.25,
+        "momentum_burst": 0.20,
+        "volume_buildup_1h": 0.15,
+        "higher_lows_1h": 0.0,
+        "trend_flip_1h": 0.0,
+        "range_compression": 0.0,
+        "uptrend_momentum": 0.0,
+        "downtrend_momentum": 0.0,
+        "daily_mover": 0.0,
+    },
+    # R13-B8: trigger thresholds (TRIGGER_CONFIG["thresholds"], perception.py
+    # L272-300). Same registration gap as trigger_weights. Includes the D6
+    # fix: trend_momentum_pct is 5.0 here and in TRIGGER_CONFIG — the
+    # perception dict.get fallback (L298/300) and the
+    # uptrend_momentum/downtrend_momentum signature defaults (triggers.py
+    # L397/419) used to silently say 3.0 (the value that over-surfaced 22
+    # triggers/scan at ~4.5x AI cost); they are dead fallbacks (runtime is
+    # always 5.0 via get_config) but a missing thresholds key would silently
+    # resurrect 3.0, so all four now agree. Leaf names snake_case; mapped to
+    # camelCase runtime keys by trigger_thresholds_params(). Six keys are
+    # floats (> 0 guard), ten are ints (>= 1 guard). Defaults verbatim.
+    "trigger_thresholds": {
+        "sigma_threshold": 2.0,
+        "trend_momentum_lookback": 72,
+        "trend_momentum_pct": 5.0,
+        "breakout_lookback": 48,
+        "breakout_min_rvol": 1.5,
+        "breakout_rvol_window": 20,
+        "breakout_atr_score_mult": 3.0,
+        "breakout_confirm_bars": 2,
+        "bb_length": 20,
+        "bb_std_dev": 2,
+        "adx_period": 14,
+        "momentum_lookback": 2,
+        "momentum_pct": 4.0,
+        "vol_buildup_ratio": 2.5,
+        "trend_flip_bars": 3,
+        "higher_lows_required": 4,
+    },
     # R13-B1: DSL state-file I/O tunables (dsl_exit.py L65/77/86/1061/1063).
     # The five knobs (process-wide save throttle, dashboard force-reload TTL,
     # ExitPolicy cache TTL, save retry attempts, save backoff base) were

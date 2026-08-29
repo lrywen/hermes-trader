@@ -16,7 +16,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
-from hermes_trader.agents.config import get_config
+from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
 from hermes_trader.client.cache import _Cache
 from hermes_trader.client.hl_client import fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
@@ -295,9 +295,9 @@ def _scan_single_market(
             # reached the AI). Acts as a bypass below; the AI + aligned-conf bar +
             # short floor + counter-regime gate adjudicate direction/execution.
             trigger_mod.uptrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
-                                         thresholds.get("trendMomentumPct", 3.0)),
+                                         thresholds.get("trendMomentumPct", 5.0)),
             trigger_mod.downtrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
-                                           thresholds.get("trendMomentumPct", 3.0)),
+                                           thresholds.get("trendMomentumPct", 5.0)),
         ]
 
         # Squeeze-breakout coupling: a breakout that resolves out of a Bollinger
@@ -546,6 +546,15 @@ def scan_once(
     # features such as momentum_continuation / candlestick_patterns actually
     # follow the live config instead of being dead knobs.
     scan_cfg = {**cfg, **_cfg}
+
+    # R13-B8: resolve weights/thresholds from the canonical trigger_weights /
+    # trigger_thresholds blocks (env + agent-config + CANONICAL_DEFAULTS) and
+    # override the TRIGGER_CONFIG copies so per-leaf env overrides take effect
+    # on the scan hot path. Helpers fall back to the TRIGGER_CONFIG literals
+    # on any failure and return the camelCase runtime keys _scan_single_market
+    # / composite_score expect — runtime values are unchanged by default.
+    scan_cfg["weights"] = trigger_weights_params(config=_cfg)
+    scan_cfg["thresholds"] = trigger_thresholds_params(config=_cfg)
 
     if not include_crypto and not include_hip3:
         logger.warning("[scan] both enable_crypto and enable_hip3 are False — nothing to scan")

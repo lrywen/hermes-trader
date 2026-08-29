@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from hermes_trader.agents.config_store import cfg_get
+
+logger = logging.getLogger(__name__)
 
 
 TRIGGER_CONFIG: dict[str, Any] = {
@@ -74,3 +79,106 @@ TRIGGER_CONFIG: dict[str, Any] = {
 def get_config() -> dict[str, Any]:
     """Return the default trigger configuration."""
     return TRIGGER_CONFIG
+
+
+# ── R13-B8: canonical hot-path resolution for weights / thresholds ──────────
+# These literals mirror TRIGGER_CONFIG verbatim and stay as the fallback
+# symbols (backtest scripts import get_config() directly). The CANONICAL
+# `trigger_weights` / `trigger_thresholds` blocks are the single source of
+# truth at runtime; leaf names there are snake_case, while consumers
+# (triggers.composite_score indexes by trigger name; _scan_single_market
+# reads thresholds["camelKey"]) expect the historical camelCase keys, so the
+# helpers below map canonical leaves back to the runtime key names.
+
+# snake_case canonical leaf -> camelCase runtime key (weights).
+_TRIGGER_WEIGHTS_KEYMAP: dict[str, str] = {
+    "trend_strength": "trendStrength",
+    "pct_move_spike": "pctMoveSpike",
+    "breakout": "breakout",
+    "volume_spike": "volumeSpike",
+    "momentum_burst": "momentumBurst",
+    "volume_buildup_1h": "volumeBuildup1h",
+    "higher_lows_1h": "higherLows1h",
+    "trend_flip_1h": "trendFlip1h",
+    "range_compression": "rangeCompression",
+    "uptrend_momentum": "uptrendMomentum",
+    "downtrend_momentum": "downtrendMomentum",
+    "daily_mover": "dailyMover",
+}
+
+# snake_case canonical leaf -> (camelCase runtime key, is_int) (thresholds).
+_TRIGGER_THRESHOLDS_KEYMAP: dict[str, tuple[str, bool]] = {
+    "sigma_threshold": ("sigmaThreshold", False),
+    "trend_momentum_lookback": ("trendMomentumLookback", True),
+    "trend_momentum_pct": ("trendMomentumPct", False),
+    "breakout_lookback": ("breakoutLookback", True),
+    "breakout_min_rvol": ("breakoutMinRvol", False),
+    "breakout_rvol_window": ("breakoutRvolWindow", True),
+    "breakout_atr_score_mult": ("breakoutAtrScoreMult", False),
+    "breakout_confirm_bars": ("breakoutConfirmBars", True),
+    "bb_length": ("bbLength", True),
+    "bb_std_dev": ("bbStdDev", True),
+    "adx_period": ("adxPeriod", True),
+    "momentum_lookback": ("momentumLookback", True),
+    "momentum_pct": ("momentumPct", False),
+    "vol_buildup_ratio": ("volBuildupRatio", False),
+    "trend_flip_bars": ("trendFlipBars", True),
+    "higher_lows_required": ("higherLowsRequired", True),
+}
+
+
+def trigger_weights_params(*, config: dict[str, Any] | None = None) -> dict[str, float]:
+    """Resolve the trigger composite-score weights (camelCase runtime keys).
+
+    Returns the live ``trigger_weights`` canonical block (env
+    ``HERMES_CFG_TRIGGER_WEIGHTS__*`` overrides included) with the
+    TRIGGER_CONFIG literals as fallback. Guards: every weight must be a
+    finite number >= 0 — six weights are intentionally 0.0 (net-negative /
+    surfacing-only triggers), so negatives are rejected but zero is legal.
+    Any read/coerce failure returns a fresh copy of the literals; the scan
+    hot path must never break on a bad config.
+    """
+    p = {camel: TRIGGER_CONFIG["weights"][camel] for camel in _TRIGGER_WEIGHTS_KEYMAP.values()}
+    try:
+        for leaf, camel in _TRIGGER_WEIGHTS_KEYMAP.items():
+            v = cfg_get(f"trigger_weights.{leaf}", config=config)
+            if v is None:
+                continue
+            fv = float(v)
+            if fv >= 0.0:
+                p[camel] = fv
+    except Exception as e:  # never let config break the scan path
+        logger.debug(f"[config] trigger weights read failed: {e}")
+        return {camel: TRIGGER_CONFIG["weights"][camel] for camel in _TRIGGER_WEIGHTS_KEYMAP.values()}
+    return p
+
+
+def trigger_thresholds_params(*, config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Resolve the trigger thresholds (camelCase runtime keys).
+
+    Returns the live ``trigger_thresholds`` canonical block (env
+    ``HERMES_CFG_TRIGGER_THRESHOLDS__*`` overrides included) with the
+    TRIGGER_CONFIG literals as fallback. Guards: float thresholds must be
+    > 0, int thresholds must be >= 1 — malformed leaves keep the literal.
+    Any read/coerce failure returns a fresh copy of the literals.
+    """
+    p = {spec[0]: TRIGGER_CONFIG["thresholds"][spec[0]]
+         for spec in _TRIGGER_THRESHOLDS_KEYMAP.values()}
+    try:
+        for leaf, (camel, is_int) in _TRIGGER_THRESHOLDS_KEYMAP.items():
+            v = cfg_get(f"trigger_thresholds.{leaf}", config=config)
+            if v is None:
+                continue
+            if is_int:
+                iv = int(v)
+                if iv >= 1:
+                    p[camel] = iv
+            else:
+                fv = float(v)
+                if fv > 0.0:
+                    p[camel] = fv
+    except Exception as e:  # never let config break the scan path
+        logger.debug(f"[config] trigger thresholds read failed: {e}")
+        return {spec[0]: TRIGGER_CONFIG["thresholds"][spec[0]]
+                for spec in _TRIGGER_THRESHOLDS_KEYMAP.values()}
+    return p
