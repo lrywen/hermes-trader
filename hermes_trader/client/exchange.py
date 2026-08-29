@@ -134,6 +134,7 @@ API.post = _patched_api_post
 from hermes_trader.client.hl_client import (
     HL_API,
     _http_post,
+    assess_candle_quality,
     fetch_hl_candles,
     resolve_user_address,
 )
@@ -1527,7 +1528,20 @@ def get_hl_atr(
             return hit[1]
 
     candles = fetch_hl_candles(coin, interval, period + 10)
-    if len(candles) < period + 1:
+    # C-M2 (deep audit 2026-08-28): fail CLOSED on distorted data. A gappy /
+    # stale / truncated candle series silently shrinks ATR → oversized position
+    # and a stop tighter than the real bar range; the executor treats atr<=0 as
+    # ``no_atr_no_stop`` and refuses the trade. A short but otherwise healthy
+    # series still reads as insufficient-history (the len check below).
+    quality = assess_candle_quality(candles, interval, period + 10)
+    if candles and not quality["ok"]:
+        logger.warning(
+            f"[atr] {coin} {interval}: candle quality gate failed "
+            f"({', '.join(quality['issues'])}; gaps={quality['gaps']}, "
+            f"age_ms={quality['age_ms']}) → ATR=0.0 (fail-closed, no stop sizing)"
+        )
+        result = 0.0
+    elif len(candles) < period + 1:
         result = 0.0
     else:
         tr = []

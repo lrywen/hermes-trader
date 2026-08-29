@@ -731,10 +731,19 @@ def get_atr_hist_mean_pct(coin: str, interval: str = "4h", lookback_candles: int
     same units DSL uses for entry_atr_pct.
     """
     try:
-        from hermes_trader.client.hl_client import fetch_hl_candles
+        from hermes_trader.client.hl_client import assess_candle_quality, fetch_hl_candles
         period = 14
         candles = fetch_hl_candles(coin, interval, lookback_candles)
         if not candles or len(candles) < period + 2:
+            return 0.0
+        # C-M2: a gappy/stale/truncated history distorts the mean baseline
+        # (spike breaker would mis-fire). No baseline → breaker stays neutral.
+        _q = assess_candle_quality(candles, interval, lookback_candles)
+        if not _q["ok"]:
+            logger.warning(
+                f"[sizing] atr_hist_mean quality gate failed for {coin} "
+                f"({', '.join(_q['issues'])}; gaps={_q['gaps']}) → no baseline"
+            )
             return 0.0
         trs: list[float] = []
         prev = candles[0]

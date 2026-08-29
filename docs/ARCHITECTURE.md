@@ -39,6 +39,41 @@ the human-visible surface; the MCP server owns the Hermes Agent integration.
 
 ---
 
+## Exchange scope: Hyperliquid only, by design
+
+The entire execution, account, and market-data path targets **Hyperliquid
+exclusively** (`api.hyperliquid.xyz`, or the testnet via
+`HYPERLIQUID_TESTNET=true`). There is deliberately **no `ExchangeAdapter`
+abstraction** and no second-venue integration — this is a scoping decision,
+not a gap:
+
+- **All order placement / signing / leverage / account state goes through the
+  official `hyperliquid-python-sdk`** in `hermes_trader/client/exchange.py`
+  (`place_hl_order`, trigger orders, `set_leverage`, `get_max_leverage`,
+  `fetch_account_state`) and `hermes_trader/client/hl_client.py` (HTTP/Info).
+- **Hyperliquid-specific rules are hard-coded to HL and are NOT portable**:
+  the price-tick formula in `_round_price_for_hl()`
+  (`tick = 10^-(MAX_DECIMALS − szDecimals)`, MAX_DECIMALS 6 perp / 8 spot, plus
+  the 5-significant-digit rule), `szDecimals`/`pxDecimals` from HL meta,
+  the **~$10 minimum notional** (`MIN_ORDER_USD = 10.5`) rounded per
+  `10^-szDecimals`, IOC limit TIF, and the EIP-712 signing flow. Adding
+  Binance/OKX/Bybit would mean re-implementing venue precision, min-size,
+  margin/leverage semantics, order types, and fill reconciliation — there is no
+  shared adapter to plug into.
+- **HIP-3 dexes (xyz, vntl, km, …) are NOT a second exchange.** They are
+  separate perpDexes/clearinghouses *inside the Hyperliquid L1* — same SDK,
+  same signing key, same API, same rate bucket — aggregated via the `dex`
+  request parameter. See the HIP-3 chapter below.
+- **The only non-HL market-data touchpoint is read-only**: `crypto_whale.py`
+  pulls Binance public `aggTrades` for whale order-flow *signals*. It never
+  places orders, holds no keys, and does not affect venue assumptions.
+
+If multi-venue support is ever wanted, the honest path is a new adapter layer
+plus per-venue precision/min-notional/leverage tables — the current codebase
+should not be read as "HL today, pluggable tomorrow."
+
+---
+
 ## Where the name "Hermes" comes from
 
 The agent layer is [Hermes Agent](https://github.com/NousResearch/hermes-agent)

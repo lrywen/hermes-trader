@@ -26,6 +26,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -1152,14 +1153,119 @@ _SSE_REPLAY_LINES = int(os.environ.get("HERMES_SSE_REPLAY_LINES", "500"))
 _SSE_HEARTBEAT_S = float(os.environ.get("HERMES_SSE_HEARTBEAT_S", "15"))
 
 
-async def _tail_log_sse() -> AsyncIterator[str]:
-    """Stream new session-log lines as SSE events. Replays the recent past first."""
+# D-FCFG-3: session-log events that are safe for an UNAUTHENTICATED feed
+# client. Everything else (orders, positions, exits, config dumps/snapshots,
+# operator actions, LLM terminal traffic, killswitches) is operator-only —
+# the audit flagged the anonymous feed as pushing real-time equity, open
+# positions, closes and strategy state to anyone who can reach the port.
+# Equity numbers and positions are ALSO visible via the deliberately-public
+# summary/positions/equity-curve polling endpoints, but the feed additionally
+# leaks strategy intent (AI verdicts/scores), order quantities/prices, config
+# bodies and operator terminal traffic, which those endpoints do not. The
+# whitelist is allowlist-by-default: a newly added event type stays
+# operator-only until explicitly classified here.
+_PUBLIC_FEED_EVENTS: frozenset[str] = frozenset({
+    "loop_heartbeat",  # status light + config.mode surface only (redacted below)
+    "scan",            # trigger counts only
+    "error",           # generic operational errors
+    "near_miss",       # coin + reason, no order data
+    "loop_start",      # loop lifecycle marker
+    "loop_stop",       # loop lifecycle marker
+})
+
+
+def _public_feed_filter(event: dict[str, Any]) -> dict[str, Any] | None:
+    """Project one session-log event onto the unauthenticated feed.
+
+    Returns a redacted/field-stripped shallow copy for event types in
+    :data:`_PUBLIC_FEED_EVENTS`, or ``None`` when the event must not reach an
+    anonymous client at all. Heartbeats carry equity/available/daily PnL which
+    the public summary endpoint already exposes, so those scalar status
+    fields survive; the full ``config`` snapshot is stripped down to the
+    non-sensitive operating posture (mode + on/off toggles)."""
+    etype = event.get("event")
+    if etype not in _PUBLIC_FEED_EVENTS:
+        return None
+    if etype == "loop_heartbeat":
+        hb_cfg = event.get("config") or {}
+        out = {k: v for k, v in event.items() if k != "config"}
+        out["config"] = {
+            "mode": hb_cfg.get("mode"),
+            "crypto": hb_cfg.get("crypto"),
+            "hip3": hb_cfg.get("hip3"),
+        }
+        return _redact(out)
+    # scan/error/near_miss/loop_*: keep top-level scalars, drop any nested
+    # payload blobs wholesale (defense in depth — never trust a future field).
+    out = {
+        k: v for k, v in event.items()
+        if k in ("ts", "event", "coin", "verdict", "reason", "msg",
+                 "message", "triggers", "perceptions", "detail", "via")
+        and not isinstance(v, (dict, list))
+    }
+    return _redact(out)
+
+
+# D-FCFG-3: non-sensitive top-level config keys safe to return on the
+# unauthenticated GET /api/dashboard/config. Only operating posture (mode +
+# feature toggles) and coarse, non-revealing limits. Nested blocks
+# (dsl_exit / atr_risk_sizing / signal_enforcement — exit ladder, sizing
+# internals, gate tuning), secret-bearing fields and allow/block lists stay
+# operator-only. Whitelist by name: a newly added canonical key is NOT public
+# until listed here. The authenticated UI uses /api/dashboard/operator/config
+# for the full (redacted) document.
+_PUBLIC_CONFIG_KEYS: frozenset[str] = frozenset({
+    "mode",
+    "enable_crypto",
+    "enable_hip3",
+    "auto_flatten_on_global_halt",
+    "auto_flatten_on_coin_circuit",
+    "leverage",
+    "max_concurrent",
+    "max_crypto_long_correlated",
+    "equity_fraction_per_trade",
+    "max_trade_notional_usd",
+    "max_total_notional_pct",
+    "cooldown_min",
+    "research_cooldown_min",
+    "min_ai_confidence",
+    "counter_regime_min_conf",
+    "min_market_volume_usd",
+    "min_hip3_volume_usd",
+    "min_short_volume_usd",
+})
+
+
+def _public_config_project(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Project the full agent config onto the anonymous whitelist."""
+    return {k: cfg[k] for k in _PUBLIC_CONFIG_KEYS if k in cfg}
+
+
+async def _tail_log_sse(public_only: bool = False) -> AsyncIterator[str]:
+    """Stream new session-log lines as SSE events. Replays the recent past first.
+
+    D-FCFG-3: ``public_only=True`` projects every event through
+    :func:`_public_feed_filter` so an unauthenticated connection only ever
+    receives whitelisted, redacted events (operator-gated clients get the
+    full feed via a short-lived feed ticket)."""
+    def _emit(e: Any) -> str | None:
+        if public_only:
+            if not isinstance(e, dict):
+                return None
+            proj = _public_feed_filter(e)
+            if proj is None:
+                return None
+            return f"data: {json.dumps(proj)}\n\n"
+        return f"data: {json.dumps(e)}\n\n"
+
     # Replay buffer so a fresh connection sees the recent past, not just future events.
     # session_log.tail() reads backward from end of file in chunks; offload to a
     # thread so it doesn't block the event loop for other routes / SSE clients.
     replay = await asyncio.to_thread(session_log.tail, _SSE_REPLAY_LINES)
     for e in replay:
-        yield f"data: {json.dumps(e)}\n\n"
+        chunk = _emit(e)
+        if chunk is not None:
+            yield chunk
 
     def _stat_size() -> int:
         return _LOG_PATH.stat().st_size if _LOG_PATH.exists() else 0
@@ -1215,7 +1321,15 @@ async def _tail_log_sse() -> AsyncIterator[str]:
             last_size = 0  # rotated
         if new_lines:
             for line in new_lines:
-                yield f"data: {line}\n\n"
+                # D-FCFG-3: live lines go through the same _emit projection as
+                # the replay buffer (public_only → whitelist filter); lines are
+                # pre-validated JSON by _read_new_lines.
+                try:
+                    chunk = _emit(json.loads(line))
+                except json.JSONDecodeError:
+                    chunk = None
+                if chunk is not None:
+                    yield chunk
             last_size = new_size
         elif new_size != last_size:
             last_size = new_size
@@ -1377,6 +1491,81 @@ def require_operator_write(request: Request) -> None:
     exhaustion, 503 on operator surface disabled.
     """
     _require_operator(request, write=True)
+
+
+# D-FCFG-3: short-lived SSE feed tickets. The browser EventSource API cannot
+# set request headers, so the operator token (Authorization/X-Operator-Token)
+# cannot ride the stream connection directly. Instead an authenticated UI
+# first POSTs to the operator feed-ticket endpoint with its token, then opens
+# ``/api/feed/stream?ticket=<t>``. Tickets are 256-bit random secrets, kept in
+# process memory, and valid only for the short connect window below — a leaked
+# ticket grants READ-ONLY feed access (no writes, no token surface) and expires
+# on its own. The ticket rides the query string as ``?ticket=`` (deliberately
+# NOT ``?token=``, which the P1-12 deprecation middleware rejects).
+_FEED_TICKET_TTL_S = float(os.environ.get("HERMES_FEED_TICKET_TTL_S", "60"))
+_feed_tickets: dict[str, float] = {}  # ticket -> expiry epoch seconds
+_feed_ticket_lock = threading.Lock()
+
+
+def _issue_feed_ticket() -> tuple[str, int]:
+    """Mint a feed ticket for an already-authenticated operator.
+
+    Returns ``(ticket, expires_in_s)``. Caller MUST have verified the operator
+    token first — this function performs no auth itself."""
+    ticket = secrets.token_urlsafe(32)
+    expires = time.time() + _FEED_TICKET_TTL_S
+    with _feed_ticket_lock:
+        _feed_tickets[ticket] = expires
+        # Opportunistic sweep so dead tickets don't accumulate forever.
+        if len(_feed_tickets) > 1024:
+            for t in [t for t, exp in _feed_tickets.items() if exp <= expires]:
+                _feed_tickets.pop(t, None)
+    return ticket, int(_FEED_TICKET_TTL_S)
+
+
+def _feed_ticket_valid(ticket: str | None) -> bool:
+    """True iff ``ticket`` is a known, unexpired feed ticket."""
+    if not ticket:
+        return False
+    with _feed_ticket_lock:
+        exp = _feed_tickets.get(ticket)
+        return exp is not None and exp > time.time()
+
+
+def _request_has_operator_creds(request: Request) -> bool:
+    """True if the request carries any operator-token credential header.
+
+    Lets the public endpoints distinguish "anonymous visitor" (serve the
+    whitelist, do NOT run the auth gate — that would count a failed login and
+    could trip the brute-force lockout) from "client that presented a token"
+    (run the full gate so 401/429/503 behave normally)."""
+    return bool(
+        _extract_bearer(request)
+        or request.headers.get("X-Operator-Token")
+    )
+
+
+def feed_client_is_operator(request: Request) -> bool:
+    """D-FCFG-3: authorize a feed/history client that may not be able to send
+    auth headers (EventSource).
+
+    Returns True when the request carries either a live ``?ticket=`` feed
+    ticket or a valid operator token in a header. Anonymous access to these
+    endpoints remains allowed (callers fall back to ``public_only=True``), so
+    a missing/invalid token here MUST NOT call :func:`_require_operator` —
+    that would count every public dashboard viewer as a failed operator login
+    and trip the brute-force lockout (5 fails / 5 min) for ordinary users.
+    """
+    if _feed_ticket_valid(request.query_params.get("ticket")):
+        return True
+    expected = os.environ.get("HERMES_OPERATOR_TOKEN", "")
+    if not expected:
+        return False
+    provided = (
+        _extract_bearer(request)
+        or request.headers.get("X-Operator-Token", "")
+    )
+    return bool(provided) and hmac.compare_digest(provided, expected)
 
 
 def _log_operator_action(action: str, *, via: str, result: Optional[dict[str, Any]] = None,

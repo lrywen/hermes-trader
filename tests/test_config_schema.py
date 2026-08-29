@@ -5,9 +5,9 @@ Covers:
     (a drift sentinel — the model is the single source of truth);
   * validate_config_updates reproduces the strict type/range matrix
     (bool is not a number, strings are not coerced, bounds enforced);
-  * strict vs lenient unknown-key handling (web/CLI vs legacy endpoint);
-  * the legacy POST /api/agent/config endpoint still persists unknown keys
-    but now 422s on type/range errors;
+  * strict vs lenient unknown-key handling (write paths vs store callers);
+  * POST /api/agent/config now shares the strict contract (D-FCFG-4):
+    unknown keys 422 instead of being persisted;
   * coerce_config_value parses bool/null/JSON list/JSON object for the CLI.
 """
 
@@ -108,15 +108,12 @@ def test_comment_key_accepted_as_is():
     assert validate_config_updates({"_comment": "free-form note"}, strict_keys=True) == []
 
 
-# ── legacy POST /api/agent/config contract ─────────────────────────────────
+# ── POST /api/agent/config write contract (D-FCFG-4: strict) ───────────────
 
 @pytest.fixture()
 def server_client(monkeypatch):
     monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
     from hermes_trader import server
-    cfg = read_agent_config()
-    cfg["legacy_schema_seed"] = 1
-    write_agent_config(cfg, backup=False)
     return TestClient(server.app)
 
 
@@ -124,17 +121,22 @@ def _auth():
     return {"Authorization": f"Bearer {_OP_TOKEN}"}
 
 
-def test_legacy_endpoint_persists_unknown_keys(server_client):
+def test_agent_config_endpoint_rejects_unknown_keys(server_client):
+    """D-FCFG-4 (deep audit 2026-08-28): POST /api/agent/config now applies
+    the SAME strict_keys gate as POST /api/dashboard/config. Unknown keys
+    are 422'd and never persisted (the lenient deep-merge used to let any
+    operator stash arbitrary keys in .agent-config.json)."""
     r = server_client.post(
         "/api/agent/config",
         json={"legacy_schema_custom_key": True},
         headers=_auth(),
     )
-    assert r.status_code == 200, r.text
-    assert read_agent_config().get("legacy_schema_custom_key") is True
+    assert r.status_code == 422
+    assert "unknown key" in r.text
+    assert read_agent_config().get("legacy_schema_custom_key") is None
 
 
-def test_legacy_endpoint_rejects_bad_types(server_client):
+def test_agent_config_endpoint_rejects_bad_types(server_client):
     r = server_client.post(
         "/api/agent/config",
         json={"leverage": "not-an-int"},
@@ -145,17 +147,21 @@ def test_legacy_endpoint_rejects_bad_types(server_client):
     assert read_agent_config().get("leverage") != "not-an-int"
 
 
-def test_legacy_endpoint_none_deletes_key(server_client):
+def test_agent_config_endpoint_none_deletes_key(server_client):
     cfg = read_agent_config()
-    cfg["legacy_schema_none_key"] = 42
+    cfg["cooldown_min"] = 42
     write_agent_config(cfg, backup=False)
     r = server_client.post(
         "/api/agent/config",
-        json={"legacy_schema_none_key": None},
+        json={"cooldown_min": None},
         headers=_auth(),
     )
     assert r.status_code == 200, r.text
-    assert "legacy_schema_none_key" not in read_agent_config()
+    # None is a deep-merge deletion marker: the key is dropped from the raw
+    # file and read_agent_config falls back to the canonical default (30).
+    from hermes_trader.agents.config_store import _read_raw_config, CANONICAL_DEFAULTS
+    assert "cooldown_min" not in _read_raw_config()
+    assert read_agent_config()["cooldown_min"] == CANONICAL_DEFAULTS["cooldown_min"]
 
 
 # ── CLI / terminal coercion ────────────────────────────────────────────────
@@ -180,3 +186,129 @@ def test_cli_style_json_list_update_passes_validation(monkeypatch):
     val = coerce_config_value('["BTC"]')
     assert val == ["BTC"]
     assert validate_config_updates({"coin_allowlist": val}, strict_keys=True) == []
+
+
+# ── D-FCFG-2 (deep audit 2026-08-28): nested risk-block deep validation ────
+
+@pytest.mark.parametrize("block,patch,needle", [
+    # Out-of-range leaf: a negative max-loss widens the stop instead of
+    # tightening it (the audit's dsl_exit.max_loss_pct=-999 example).
+    ("dsl_exit", {"max_loss_pct": -999.0}, "dsl_exit.max_loss_pct"),
+    ("dsl_exit", {"atr_stop": {"atr_mult": "1.5x"}},
+     "dsl_exit.atr_stop.atr_mult"),
+    ("dsl_exit", {"atr_stop": {"floor_pct": 999.0}},
+     "dsl_exit.atr_stop.floor_pct"),
+    # Unknown nested key: typo / smuggled switch inside a risk block.
+    ("dsl_exit", {"atr_stop": {"atrr_mult": 1.5}},
+     "dsl_exit.atr_stop.atrr_mult: unknown key"),
+    ("dsl_exit", {"regime_aware": {"trend_ride": {"max_loss_pct": 0.5}}},
+     "regime_aware.trend_ride.max_loss_pct: unknown key"),
+    # phase2_tiers: must be a list of validated objects.
+    ("dsl_exit", {"phase2_tiers": {"pct_above_entry": 8.0}},
+     "dsl_exit.phase2_tiers: expected list"),
+    ("dsl_exit", {"phase2_tiers": [{"pct_above_entry": -5.0,
+                                    "retrace_threshold": 0.4}]},
+     "dsl_exit.phase2_tiers[0].pct_above_entry"),
+    ("dsl_exit", {"phase2_tiers": [{"pct_above_entry": 8.0,
+                                    "retrace": 0.4}]},
+     "dsl_exit.phase2_tiers[0].retrace: unknown key"),
+    # Deeply nested regime leaves.
+    ("dsl_exit", {"regime_aware": {"max_loss": {
+        "trend": {"max_loss_pct": -1.0}}}},
+     "regime_aware.max_loss.trend.max_loss_pct"),
+    ("dsl_exit", {"regime_aware": {"max_loss": {
+        "non_trend": {"max_loss_roe_pct": "5%"}}}},
+     "regime_aware.max_loss.non_trend.max_loss_roe_pct"),
+    # Block itself must be an object.
+    ("dsl_exit", "not-a-dict", "dsl_exit: expected object"),
+    ("dsl_exit", [{"max_loss_pct": 0.4}], "dsl_exit: expected object"),
+    # atr_risk_sizing
+    ("atr_risk_sizing", {"risk_per_trade_pct": -0.02},
+     "atr_risk_sizing.risk_per_trade_pct"),
+    ("atr_risk_sizing", {"sizing_basis": "moon_stop"},
+     "atr_risk_sizing.sizing_basis"),
+    ("atr_risk_sizing", {"sizing_v2_cap_pct": 5.0},
+     "atr_risk_sizing.sizing_v2_cap_pct"),
+    ("atr_risk_sizing", {"enabled": "yes"},
+     "atr_risk_sizing.enabled"),
+    ("atr_risk_sizing", {"coin_overrides": {"HYPE": {"sl_floor_pct": -1.5}}},
+     "atr_risk_sizing.coin_overrides.HYPE.sl_floor_pct"),
+    ("atr_risk_sizing", {"coin_overrides": {"HYPE": 1.5}},
+     "atr_risk_sizing.coin_overrides.HYPE: expected object"),
+    ("atr_risk_sizing", {"coin_overrides": [1, 2]},
+     "atr_risk_sizing.coin_overrides: expected object"),
+    ("atr_risk_sizing", {"sneaky_key": True},
+     "atr_risk_sizing.sneaky_key: unknown key"),
+    # signal_enforcement
+    ("signal_enforcement", {"boost_bar_delta": 1.5},
+     "signal_enforcement.boost_bar_delta"),
+    ("signal_enforcement", {"boost_bar_delta": -1},
+     "signal_enforcement.boost_bar_delta"),
+    ("signal_enforcement", {"whale_window_min": "15m"},
+     "signal_enforcement.whale_window_min"),
+    ("signal_enforcement", {"whale_veto_min_usd": -250000},
+     "signal_enforcement.whale_veto_min_usd"),
+    ("signal_enforcement", {"veto": "true"},
+     "signal_enforcement.veto"),
+    ("signal_enforcement", {"unknown_gate": True},
+     "signal_enforcement.unknown_gate: unknown key"),
+])
+def test_nested_risk_block_deep_validation_rejects(block, patch, needle):
+    """D-FCFG-2: malformed / out-of-range / unknown leaves inside the three
+    safety-critical nested blocks are rejected at the patch gate, with a
+    dotted path pointing at the offending leaf."""
+    errors = validate_config_updates({block: patch}, strict_keys=True)
+    assert errors, f"expected rejection for {block}={patch!r}"
+    assert any(needle in e for e in errors), (needle, errors)
+
+
+@pytest.mark.parametrize("block,partial", [
+    # Partial patches: a single known leaf is enough (the deep merge fills
+    # the rest from canonical defaults).
+    ("dsl_exit", {"max_loss_pct": 0.5}),
+    ("dsl_exit", {"atr_stop": {"enabled": True, "atr_mult": 2.0}}),
+    ("dsl_exit", {"noise_band": {"enabled": True, "atr_mult": 0.8}}),
+    ("dsl_exit", {"phase2_tiers": [{"pct_above_entry": 10.0,
+                                    "retrace_threshold": 0.5}]}),
+    ("dsl_exit", {"regime_aware": {"enabled": False}}),
+    ("atr_risk_sizing", {"enabled": False}),
+    ("atr_risk_sizing", {"sizing_basis": "dsl_stop"}),
+    ("atr_risk_sizing", {"sizing_v2_enabled": True, "sizing_v2_cap_pct": 0.1}),
+    # coin_overrides: unknown extension leaves (documented plugin channel,
+    # e.g. atr_stop_floor_pct in RISK_OVERHAUL_2026-08-26) are ignored,
+    # while the known leaf is still type/range checked.
+    ("atr_risk_sizing", {"coin_overrides": {
+        "HYPE": {"sl_floor_pct": 1.5, "atr_stop_floor_pct": 1.5}}}),
+    ("atr_risk_sizing", {"coin_overrides": {"PURR": {"future_leaf": "x"}}}),
+    ("signal_enforcement", {"veto": False}),
+    ("signal_enforcement", {"boost_bar_delta": 6}),
+    ("signal_enforcement", {"whale_veto_min_usd": 500_000}),
+])
+def test_nested_risk_block_valid_partial_accepted(block, partial):
+    """D-FCFG-2: well-formed partial patches (and documented extension
+    leaves) pass — the deep gate must not reject legitimate writes."""
+    assert validate_config_updates(
+        {block: partial}, strict_keys=True
+    ) == [], validate_config_updates({block: partial}, strict_keys=True)
+
+
+def test_nested_risk_block_canonical_defaults_pass():
+    """The shipped canonical defaults for all three blocks satisfy the spec."""
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS as _CD
+    for block in ("dsl_exit", "atr_risk_sizing", "signal_enforcement"):
+        assert validate_config_updates(
+            {block: _CD[block]}, strict_keys=True
+        ) == [], block
+
+
+def test_agent_config_endpoint_rejects_malformed_nested_block(server_client):
+    """D-FCFG-2 end-to-end: a malformed nested leaf is 422'd and never
+    reaches .agent-config.json."""
+    r = server_client.post(
+        "/api/agent/config",
+        json={"dsl_exit": {"max_loss_pct": -999.0}},
+        headers=_auth(),
+    )
+    assert r.status_code == 422
+    assert "dsl_exit.max_loss_pct" in r.text
+    assert read_agent_config()["dsl_exit"]["max_loss_pct"] != -999.0

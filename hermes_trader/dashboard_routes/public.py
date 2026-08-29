@@ -25,9 +25,15 @@ from hermes_trader.dashboard import (
     _equity_curve_payload,
     _http_cache_params,
     _positions_payload,
+    _public_config_project,
+    _public_feed_filter,
+    _redact,
+    _request_has_operator_creds,
+    _require_operator,
     _summary_payload,
     _tail_log_sse,
     _ttl_cached,
+    feed_client_is_operator,
 )
 
 logger = logging.getLogger("hermes-dashboard")
@@ -130,11 +136,23 @@ def register_public_routes(app: FastAPI) -> None:
         return RedirectResponse(url="/web/", status_code=302)
 
     @app.get("/api/dashboard/config")
-    async def dashboard_config() -> JSONResponse:
-        """Read-only JSON dump of `.agent-config.json` for the /config page.
-        Hot-reloads alongside the trading loop (no caching)."""
+    async def dashboard_config(request: Request) -> JSONResponse:
+        """Agent config for the /config page. Hot-reloads (no caching).
+
+        D-FCFG-3: two tiers. A request presenting a valid operator token gets
+        the full config with secrets scrubbed by ``_redact`` (the authenticated
+        UI gets the same full document it edits). An anonymous request gets
+        ONLY the non-sensitive whitelist (mode, feature toggles, coarse
+        limits) — exit ladders, sizing internals, gate tuning, allow/block
+        lists and any secret-bearing field are operator-only. A client that
+        SENDS a credential header gets the real gate (401/429/503); a request
+        with no credentials is treated as anonymous without counting a failed
+        login."""
         cfg = await asyncio.to_thread(read_agent_config)
-        return JSONResponse(cfg)
+        if _request_has_operator_creds(request):
+            _require_operator(request)  # raises 401/429/503 on bad creds
+            return JSONResponse(_redact(cfg))
+        return JSONResponse(_public_config_project(cfg))
 
     @app.get("/api/dashboard/summary")
     async def dashboard_summary() -> JSONResponse:
@@ -177,9 +195,17 @@ def register_public_routes(app: FastAPI) -> None:
         return JSONResponse(payload)
 
     @app.get("/api/feed/stream")
-    async def feed_stream() -> StreamingResponse:
+    async def feed_stream(request: Request) -> StreamingResponse:
+        # D-FCFG-3: EventSource cannot set headers, so the authenticated UI
+        # exchanges its operator token for a short-lived feed ticket
+        # (POST /api/dashboard/operator/feed-ticket) and opens
+        # /api/feed/stream?ticket=<t>; a bearer/x-operator-token header is
+        # also accepted for non-browser clients. Authenticated clients get the
+        # full feed; anonymous clients only get the whitelisted, redacted
+        # public projection (see _public_feed_filter).
+        full = feed_client_is_operator(request)
         return StreamingResponse(
-            _tail_log_sse(),
+            _tail_log_sse(public_only=not full),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -189,14 +215,23 @@ def register_public_routes(app: FastAPI) -> None:
         )
 
     @app.get("/api/feed/history")
-    async def feed_history(limit: int = 500) -> JSONResponse:
+    async def feed_history(request: Request, limit: int = 500) -> JSONResponse:
         """Return recent session-log events (oldest first), capped at 5000.
 
         The portal channel page calls this on mount so reloads/visits restore
         the full recent history instead of only the 500-line SSE replay buffer.
+
+        D-FCFG-3: same tiering as the stream — operator token (header) or a
+        valid ``?ticket=`` returns every event; anonymous callers only receive
+        events that pass _public_feed_filter (whitelist + redaction).
         """
         n = max(1, min(limit, 5000))
         events = await asyncio.to_thread(session_log.tail, n)
+        if not feed_client_is_operator(request):
+            events = [
+                proj for e in events
+                if (proj := _public_feed_filter(e)) is not None
+            ]
         return JSONResponse({"events": events})
 
     # ── SPA catch-all: serve index.html for any non-API GET route ───────

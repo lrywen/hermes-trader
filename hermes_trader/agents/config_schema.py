@@ -305,12 +305,186 @@ def _type_ok(kind: Any, val: Any) -> bool:
     return isinstance(val, kind)
 
 
+# ── D-FCFG-2 (deep audit 2026-08-28): deep validation for safety-critical ──
+# nested blocks. Until now these blocks were accepted as bare dicts, so an
+# operator could persist a malformed / out-of-range leaf (e.g.
+# dsl_exit.max_loss_pct=-999 — a negative stop widens the loss limit 1000x;
+# atr_stop.atr_mult="1.5x" — a crash-type that the .get() consumers treat as
+# a fatal stop-construction input). The three blocks below gate trade RISK:
+# DSL exit geometry, ATR risk sizing, and signal enforcement. Each leaf is
+# spec'd with (kind, lo, hi); nested objects and list-of-objects recurse.
+# A leaf spec is a tuple (kind, lo, hi); a dict spec maps sub-keys to specs
+# (unknown sub-keys are rejected); list specs are ("list", item_spec) where
+# item_spec is itself a dict spec validated for every element.
+
+_NUM = (int, float)
+
+
+def _num_leaf(lo: float, hi: float) -> tuple:
+    return ("num", lo, hi)
+
+
+# Percent leaves: percentages are expressed in the same units as the
+# canonical defaults (max_loss_pct=0.4 means 0.4%, etc.). Bounds are
+# deliberately generous sanity rails, not the runtime operating range.
+_DSL_EXIT_SPEC: dict[str, Any] = {
+    "max_loss_pct": _num_leaf(0.0, 25.0),
+    "max_loss_roe_pct": _num_leaf(0.0, 200.0),
+    "protect_pct": _num_leaf(0.0, 50.0),
+    "retrace_threshold": _num_leaf(0.0, 1.0),
+    "hard_timeout_minutes": _num_leaf(0.0, 100_000.0),
+    "breakeven_trigger_pct": _num_leaf(0.0, 50.0),
+    "breakeven_lock_pct": _num_leaf(0.0, 50.0),
+    "stale_flat_timeout_minutes": _num_leaf(0.0, 100_000.0),
+    "atr_stop": {
+        "enabled": ("bool",),
+        "atr_mult": _num_leaf(0.0, 20.0),
+        "floor_pct": _num_leaf(0.0, 50.0),
+        "ceiling_pct": _num_leaf(0.0, 100.0),
+    },
+    "noise_band": {
+        "enabled": ("bool",),
+        "atr_mult": _num_leaf(0.0, 20.0),
+    },
+    "consecutive_breaches_required": ("int", 1, 100),
+    "breach_confirm_sec": _num_leaf(0.0, 600.0),
+    "phase2_tiers": ("list", {
+        "pct_above_entry": _num_leaf(0.0, 100.0),
+        "retrace_threshold": _num_leaf(0.0, 1.0),
+    }),
+    "regime_aware": {
+        "enabled": ("bool",),
+        "trend_ride": {
+            "protect_pct": _num_leaf(0.0, 50.0),
+            "retrace_threshold": _num_leaf(0.0, 1.0),
+            "phase2_tiers": ("list", {
+                "pct_above_entry": _num_leaf(0.0, 100.0),
+                "retrace_threshold": _num_leaf(0.0, 1.0),
+            }),
+        },
+        "max_loss": {
+            "trend": {
+                "max_loss_pct": _num_leaf(0.0, 25.0),
+                "max_loss_roe_pct": _num_leaf(0.0, 200.0),
+            },
+            "non_trend": {
+                "max_loss_pct": _num_leaf(0.0, 25.0),
+                "max_loss_roe_pct": _num_leaf(0.0, 200.0),
+            },
+        },
+    },
+}
+
+_ATR_RISK_SIZING_SPEC: dict[str, Any] = {
+    "enabled": ("bool",),
+    "risk_per_trade_pct": _num_leaf(0.0, 1.0),
+    "sizing_basis": ("enum", ("primary_stop", "dsl_stop", "atr_stop")),
+    # Sizing v2 gray-release knobs (read with .get from the same block).
+    "sizing_v2_enabled": ("bool",),
+    "sizing_v2_cap_pct": _num_leaf(0.0, 1.0),
+    # coin_overrides.<COIN> is a free-form per-coin map; only the leaves the
+    # executor actually reads are spec-checked (sl_floor_pct), unknown
+    # override leaves are accepted (plugin/extension channel).
+    "coin_overrides": ("dict_of", {
+        "sl_floor_pct": _num_leaf(0.0, 50.0),
+    }),
+}
+
+_SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
+    "enabled": ("bool",),
+    "veto": ("bool",),
+    "boost": ("bool",),
+    "gex_veto": ("bool",),
+    "boost_bar_delta": ("int", 0, 1000),
+    "whale_window_min": ("int", 0, 100_000),
+    "whale_veto_min_usd": _num_leaf(0.0, 1_000_000_000.0),
+    "whale_boost_min_usd": _num_leaf(0.0, 1_000_000_000.0),
+}
+
+_NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
+    "dsl_exit": _DSL_EXIT_SPEC,
+    "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
+    "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
+}
+
+
+def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> None:
+    """Recursively validate one nested-block value against a leaf/dict/list
+    spec. Error paths are dotted (``dsl_exit.atr_stop.atr_mult``).
+
+    A bare ``dict`` spec (sub-key → spec mapping) is the same as the
+    ``("dict", {...})`` tuple form — nested object specs are written bare,
+    container specs need the explicit tag."""
+    if isinstance(spec, dict):
+        spec = ("dict", spec)
+    kind = spec[0]
+    if kind == "dict":
+        if not isinstance(val, dict):
+            errors.append(f"{path}: expected object, got {type(val).__name__}")
+            return
+        for k, v in val.items():
+            if k not in spec[1]:
+                errors.append(f"{path}.{k}: unknown key")
+            else:
+                _validate_nested_spec(f"{path}.{k}", v, spec[1][k], errors)
+    elif kind == "list":
+        if not isinstance(val, list):
+            errors.append(f"{path}: expected list, got {type(val).__name__}")
+            return
+        for i, item in enumerate(val):
+            _validate_nested_spec(f"{path}[{i}]", item, ("dict", spec[1]), errors)
+    elif kind == "dict_of":
+        # Free-form map (e.g. coin_overrides keyed by coin); map keys are
+        # arbitrary strings. Only the leaves the runtime actually reads are
+        # spec-checked; unknown override leaves are silently ignored — they
+        # are the documented forward-compat / plugin extension channel
+        # (RISK_OVERHAUL_2026-08-26 ships e.g. atr_stop_floor_pct there).
+        if not isinstance(val, dict):
+            errors.append(f"{path}: expected object, got {type(val).__name__}")
+            return
+        leaf_specs = spec[1]
+        for mk, mv in val.items():
+            if not isinstance(mk, str):
+                errors.append(f"{path}: keys must be strings, got {type(mk).__name__}")
+                continue
+            if not isinstance(mv, dict):
+                errors.append(
+                    f"{path}.{mk}: expected object, got {type(mv).__name__}"
+                )
+                continue
+            for lk, lv in mv.items():
+                if lk in leaf_specs:
+                    _validate_nested_spec(
+                        f"{path}.{mk}.{lk}", lv, leaf_specs[lk], errors
+                    )
+    elif kind == "bool":
+        if not isinstance(val, bool):
+            errors.append(f"{path}: expected bool, got {type(val).__name__}")
+    elif kind == "int":
+        if not isinstance(val, int) or isinstance(val, bool):
+            errors.append(f"{path}: expected int, got {type(val).__name__}")
+        elif val < spec[1] or val > spec[2]:
+            errors.append(f"{path}: must be between {spec[1]} and {spec[2]}")
+    elif kind == "num":
+        if isinstance(val, bool) or not isinstance(val, _NUM):
+            errors.append(f"{path}: expected number, got {type(val).__name__}")
+        elif val < spec[1] or val > spec[2]:
+            errors.append(
+                f"{path}: must be between {spec[1]} and {spec[2]} (got {val})"
+            )
+    elif kind == "enum":
+        if not isinstance(val, str) or val not in spec[1]:
+            errors.append(f"{path}: must be one of {list(spec[1])}, got {val!r}")
+
+
 def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True) -> list[str]:
     """Validate a partial config update. Returns a list of error strings.
 
-    ``strict_keys=True`` (web API, terminal ``set``, CLI): unknown keys are
-    rejected. ``strict_keys=False`` (legacy ``POST /api/agent/config``):
-    unknown keys are left for the deep-merge path to persist.
+    ``strict_keys=True`` (both web write paths — POST /api/dashboard/config
+    and POST /api/agent/config — plus terminal ``set`` and the CLI): unknown
+    keys are rejected. ``strict_keys=False`` is retained for schema-level
+    callers that deliberately preserve caller-policy keys; as of D-FCFG-4
+    (deep audit 2026-08-28) no HTTP write path uses it.
     """
     errors: list[str] = []
     fields = _ConfigPatch.model_fields
@@ -483,6 +657,17 @@ def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True
                     f"the same update (FORBIDDEN_OVERRIDE — never arm a "
                     f"force-execute switch without explicit AI agreement)"
                 )
+
+    # ── D-FCFG-2: deep validation of safety-critical nested blocks ────────
+    # The three blocks gate trade risk (DSL exit geometry, ATR sizing,
+    # signal enforcement). Top-level typing only proved they were dicts;
+    # a malformed leaf (e.g. dsl_exit.max_loss_pct=-999, atr_mult="1.5x")
+    # used to persist and reach the executor. Recurse per the leaf specs.
+    for _block, _spec in _NESTED_BLOCK_SPECS.items():
+        if _block in updates:
+            _validate_nested_spec(
+                _block, updates[_block], ("dict", _spec), errors
+            )
 
     return errors
 

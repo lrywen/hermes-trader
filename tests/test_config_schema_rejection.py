@@ -333,11 +333,11 @@ def test_write_agent_config_rejects_bad_type(tmp_path, monkeypatch):
 
 def test_write_agent_config_accepts_unknown_key_for_backcompat(tmp_path, monkeypatch):
     """Unknown keys must still round-trip through write_agent_config —
-    the historical `POST /api/agent/config` endpoint accepts custom
-    keys (dashboard plugins stash their own), and the on-disk write
-    path must not break that. R11-E1 narrows the gate to *critical*
-    problems (type / range / mode / FORBIDDEN_OVERRIDE); unknown
-    keys are still a caller-policy concern.
+    hand-edited configs and restores may carry keys the schema does not
+    know, and the on-disk write path must not drop them. R11-E1 narrows
+    the store gate to *critical* problems (type / range / mode /
+    FORBIDDEN_OVERRIDE); unknown keys remain a caller-policy concern
+    (both HTTP write paths reject them at the patch gate — D-FCFG-4).
     """
     cfg_file = tmp_path / ".agent-config.json"
     cfg_file.write_text(json.dumps(dict(CANONICAL_DEFAULTS)))
@@ -530,21 +530,19 @@ def test_restore_snapshot_happy_path(tmp_path, monkeypatch):
 
 def test_legacy_endpoint_unknown_key_still_persists_via_lenient_path(tmp_path, monkeypatch):
     """The R11-E1 store gate is lenient for unknown keys (preserves
-    historical on-disk semantics: dashboard plugins stash their own
-    keys via the legacy ``/api/agent/config`` endpoint, and the
-    on-disk round-trip must not break that). Critical safety bypass
-    (FORBIDDEN_OVERRIDE) and kind mismatches are still rejected —
-    only *unknown keys* are lenient. This matches the F27 split:
-    web patch API / store write / store read all accept unknown keys
-    on round-trip; only the kind + FORBIDDEN_OVERRIDE gates fire."""
+    historical on-disk semantics: hand-edited files / restores / plugin
+    state round-trip). Critical safety bypass (FORBIDDEN_OVERRIDE) and
+    kind mismatches are still rejected — only *unknown keys* are lenient.
+    This matches the F27 split: the HTTP patch gates now BOTH reject
+    unknown keys (D-FCFG-4, deep audit 2026-08-28) while the store read /
+    write paths keep lenient unknown-key round-trip."""
     cfg_file = tmp_path / ".agent-config.json"
     cfg_file.write_text(json.dumps(dict(CANONICAL_DEFAULTS)))
     monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
     monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
 
     # Direct write with an unknown key is accepted (lenient — preserves
-    # the legacy /api/agent/config endpoint's stash-your-own-key
-    # behaviour).
+    # the on-disk stash-your-own-key round-trip).
     bad = dict(CANONICAL_DEFAULTS)
     bad["unknown_plugin_key"] = 1
     write_agent_config(bad, backup=False)

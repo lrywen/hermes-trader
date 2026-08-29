@@ -3,6 +3,7 @@
 from hermes_trader.client.hl_client import (
     HL_API,
     _MS_PER_CANDLE,
+    assess_candle_quality,
     fetch_account_state,
     fetch_all_mids,
     fetch_hl_candles,
@@ -21,6 +22,7 @@ __all__ = [
     # HL API
     "HL_API",
     "_MS_PER_CANDLE",
+    "assess_candle_quality",
     "fetch_account_state",
     "fetch_all_mids",
     "fetch_hl_candles",

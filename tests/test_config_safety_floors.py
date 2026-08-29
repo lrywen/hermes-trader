@@ -13,8 +13,8 @@ Coverage:
   * max_total_notional_pct sane-floor: 0<x<0.5 rejected; 0 and >=0.5 ok
   * max_trade_notional_usd sane-floor: 0<x<10 rejected; 0 and >=10 ok
   * non-mode / non-threshold keys are unaffected (regression guard)
-  * legacy POST /api/dashboard/config path also rejects (strict_keys=False
-    still runs the safety checks; only unknown-key rejection is gated)
+  * safety floors also fire under strict_keys=False (store-gate mode);
+    as of D-FCFG-4 both HTTP write paths use strict_keys=True
 """
 
 from __future__ import annotations
@@ -155,10 +155,10 @@ def test_multiple_errors_accumulate():
 
 
 def test_legacy_endpoint_still_runs_safety_checks():
-    """The legacy ``POST /api/agent/config`` path uses
-    ``strict_keys=False`` (unknown keys allowed) but must STILL enforce
-    the new safety floors. Only the unknown-key check is gated by
-    ``strict_keys``; the enum / sane-floor checks must always run."""
+    """The schema gate's enum / sane-floor checks are independent of the
+    ``strict_keys`` unknown-key flag: they run in lenient mode too (the
+    on-disk store gate still validates with strict_keys=False). D-FCFG-4
+    moved both HTTP write paths to strict; lenient remains for store use."""
     errs = validate_config_updates(
         {"mode": "ENABLED", "_my_custom_key": 1},
         strict_keys=False,
@@ -166,7 +166,7 @@ def test_legacy_endpoint_still_runs_safety_checks():
     assert any("mode" in e for e in errs), (
         "safety check should run even when strict_keys=False"
     )
-    # unknown key is NOT rejected on the legacy path
+    # unknown key is NOT flagged in lenient mode (store round-trip policy)
     assert not any("unknown key" in e for e in errs)
 
 

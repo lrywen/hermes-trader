@@ -924,9 +924,9 @@ DEFAULT_CONFIG: dict[str, Any] = CANONICAL_DEFAULTS
 #   * range violations          -> hard error,
 #   * mode / FORBIDDEN_OVERRIDE -> hard error,
 #   * unknown top-level keys    -> only flagged when `strict_keys=True`
-#     (the legacy /api/agent/config endpoint kept lenient semantics so
-#     dashboard plugins can stash their own keys; everything else uses
-#     strict mode).
+#     (on-disk read/write/restore keep lenient semantics so hand-edited
+#     files and plugin state round-trip; BOTH HTTP write paths enforce
+#     strict mode at the patch gate — D-FCFG-4, deep audit 2026-08-28).
 #
 # A corrupt write is *never* a recoverable condition for a trading bot:
 # better to raise and let the operator investigate than to lose a
@@ -1410,8 +1410,9 @@ def write_agent_config(cfg: dict[str, Any], *, backup: bool = True) -> None:
         # FORBIDDEN_OVERRIDE armed) — the .bak and .tmp files are
         # untouched. Unknown keys are still accepted (strict_keys=False)
         # to preserve the historical "raw disk file is lenient"
-        # semantics — a dashboard plugin that stashed its own keys
-        # before R11-E1 must keep working.
+        # semantics — hand-edited files / restores may carry keys the
+        # schema does not know (the HTTP patch gates reject them —
+        # D-FCFG-4).
         _validate_or_raise(cfg, source="write_agent_config", strict_keys=False)
         _write_raw_locked(cfg, backup=backup)
     except OSError as e:

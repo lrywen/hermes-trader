@@ -21,6 +21,7 @@ from hermes_trader.agents.config_store import read_agent_config
 from hermes_trader.dashboard import (
     _TERMINAL_HANDLERS,
     _config_apply,
+    _issue_feed_ticket,
     _log_operator_action,
     _require_operator,
     _terminal_llm_chat,
@@ -36,6 +37,17 @@ def register_operator_routes(app: FastAPI) -> None:
     async def operator_config(request: Request) -> JSONResponse:
         _require_operator(request)
         return JSONResponse(read_agent_config())
+
+    @app.post("/api/dashboard/operator/feed-ticket")
+    async def operator_feed_ticket(request: Request) -> JSONResponse:
+        # D-FCFG-3: mint a short-lived read-only SSE ticket. The browser
+        # EventSource API cannot set Authorization headers, so the UI exchanges
+        # its operator token (in a header here) for a ticket it can pass as
+        # ?ticket= on the feed stream. Read gate (no write rate-limit) — a
+        # ticket grants nothing but feed read access and expires in ~60s.
+        _require_operator(request)
+        ticket, expires_in_s = _issue_feed_ticket()
+        return JSONResponse({"ticket": ticket, "expires_in_s": expires_in_s})
 
     @app.get("/api/dashboard/operator/trackers")
     async def operator_trackers(request: Request) -> JSONResponse:

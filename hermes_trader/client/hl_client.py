@@ -511,9 +511,82 @@ def _fetch_hl_candles_raw(
         prev_t = t
         candles.append(Candle(t=t, o=o, h=h, l=l, c=close, v=v))
 
+    # C-M2 (deep audit 2026-08-28): quality gate. HL's candleSnapshot has
+    # silently returned truncated / gappy / stale series during 429 storms —
+    # an ATR computed over those bars is distorted (too small → oversized
+    # position + stop too tight) and nothing downstream noticed. Annotate the
+    # series; the sizing path (get_hl_atr) treats a non-ok gate as 0.0 so the
+    # executor's existing ``atr <= 0 → no_atr_no_stop`` rule fails CLOSED.
+    if candles:
+        quality = assess_candle_quality(candles, interval, count)
+        if not quality["ok"]:
+            logger.warning(
+                f"[candles] {coin} {interval}: quality gate failed "
+                f"({', '.join(quality['issues'])}; bars={len(candles)}, "
+                f"gaps={quality['gaps']}, age_ms={quality['age_ms']}) — "
+                f"ATR/sizing consumers must fail-closed")
+
     if _CANDLE_CACHE is not None and candles:
         _CANDLE_CACHE.set(cache_key, candles)
     return candles
+
+
+def assess_candle_quality(
+    candles: "list[Candle]",
+    interval: str,
+    expected_count: int,
+    now_ms: Optional[float] = None,
+) -> dict[str, Any]:
+    """C-M2: sanity-check a candle series for continuity / freshness / coverage.
+
+    Returns ``{"ok": bool, "issues": [str, ...], "gaps": int, "age_ms": int}``.
+
+    Checks (all against HL's fixed-alignment grid, bar open time = ``t``):
+    - gaps: adjacent closed bars whose open-time delta != exactly one interval
+      (a missing bar anywhere silently compresses indicator history);
+    - stale: the newest closed bar is more than ``2 * interval`` old (feed
+      outage — a "fresh" series cannot lag by two+ bars);
+    - low_coverage: fewer closed bars than ``80%`` of ``expected_count``
+      (truncated snapshot produces unreliable, over-fit indicators);
+    - thin: fewer than 2 closed bars (nothing to compute on).
+    """
+    issues: list[str] = []
+    gaps = 0
+    age_ms = -1
+    ms = _MS_PER_CANDLE.get(interval, 300_000)
+    cur_ms = now_ms if now_ms is not None else time.time() * 1000.0
+
+    # Series is ascending by construction (out-of-order ts are dropped at
+    # parse). The still-forming last bar has no successor to gap-check against
+    # and its open time is always current, so excluding it leaves exactly the
+    # closed bars — this also covers the cache-tail continuity comparison:
+    # a refetched series whose closed bars don't chain at the cache boundary
+    # shows up here as an internal delta != ms.
+    closed = candles
+    if candles and cur_ms < float(candles[-1].t) + ms:
+        closed = candles[:-1]
+
+    if len(closed) < 2:
+        issues.append("thin")
+        return {"ok": False, "issues": issues or ["thin"], "gaps": gaps,
+                "age_ms": age_ms}
+
+    for i in range(1, len(closed)):
+        delta = int(closed[i].t) - int(closed[i - 1].t)
+        if delta != ms:
+            gaps += 1
+    if gaps:
+        issues.append("gaps")
+
+    age_ms = int(cur_ms - float(closed[-1].t))
+    if age_ms > 2 * ms:
+        issues.append("stale")
+
+    expected_closed = max(1, expected_count - 1)
+    if len(closed) < int(expected_closed * 0.8):
+        issues.append("low_coverage")
+
+    return {"ok": not issues, "issues": issues, "gaps": gaps, "age_ms": age_ms}
 
 
 def fetch_account_state(user: str, include_hip3: bool = False) -> dict[str, Any]:

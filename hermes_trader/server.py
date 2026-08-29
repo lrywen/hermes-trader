@@ -732,11 +732,14 @@ async def update_config(request: Request) -> JSONResponse:
         raise HTTPException(400, "invalid JSON")
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
-    # F27: type/range gate before the merge. Unknown keys stay lenient
-    # (legacy callers persist custom keys); None means "delete key" in the
-    # deep merge and is excluded from validation.
+    # F27 / D-FCFG-4 (deep audit 2026-08-28): type/range/unknown-key gate
+    # before the merge. This endpoint and POST /api/dashboard/config now
+    # share the SAME strict write contract — unknown keys are 422, not
+    # silently persisted (the on-disk store gate stays lenient for
+    # hand-edited files / restores). None means "delete key" in the deep
+    # merge and is excluded from validation.
     errors = validate_config_updates(
-        {k: v for k, v in body.items() if v is not None}, strict_keys=False
+        {k: v for k, v in body.items() if v is not None}, strict_keys=True
     )
     if errors:
         raise HTTPException(422, json.dumps({"errors": errors}))
