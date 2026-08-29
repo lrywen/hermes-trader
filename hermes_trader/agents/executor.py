@@ -170,6 +170,14 @@ _pending_sl_retries: dict[str, dict[str, Any]] = {}
 # Cloid is the third layer (defends against network retries reaching HL).
 _EXEC_LOCK = threading.Lock()
 _IN_FLIGHT_ANALYSES: set = set()
+# A-F4 (deep audit 2026-08-28): coin-dimension in-flight set. The analysis set
+# above keys on analysis_id, but the scanner mints a fresh analysis_id every
+# cycle, so two DIFFERENT analyses for the SAME coin (e.g. a 1m scan and a 15m
+# scan landing in the same window) are invisible to each other — both pass the
+# aid check, both see current_positions empty (the market order hasn't filled
+# yet), and both place orders → double-open on one coin. The coin set makes the
+# second caller block until the first finishes placing/recording its order.
+_IN_FLIGHT_COINS: set = set()
 
 # H6/C-M3: streak of order placements whose response was LOST (408/timeout)
 # AND whose fill could not be confirmed either way (reconcile lookup itself
@@ -2238,6 +2246,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 "analysis_id": _aid, "reason": "already_executed",
                 "gate_results": gate_output["results"],
             }
+        # A-F4: coin-dimension claim. A different analysis targeting the same
+        # coin is already mid-order — block it; its own trade record (or the
+        # pre-place position re-check below) will decide what happens next.
+        if coin in _IN_FLIGHT_COINS:
+            logger.warning(
+                f"[executor] A-F4 coin order already in-flight for {coin} "
+                f"(analysis {_aid}); blocking concurrent same-coin entry.")
+            return {
+                "executed": False, "mode": mode,
+                "analysis_id": _aid, "reason": "coin_order_in_flight",
+                "gate_results": gate_output["results"],
+            }
         already = next(
             (t for t in memory.get_recent_trades(100)
              if t.get("analysis_id") == _aid and t.get("size_usd", 0) > 0),
@@ -2251,6 +2271,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 "gate_results": gate_output["results"],
             }
         _IN_FLIGHT_ANALYSES.add(_aid)
+        _IN_FLIGHT_COINS.add(coin)
 
     # P0-4: pre-place liquidation-buffer gate. Refuse to add exposure
     # to a coin whose existing position is already within
@@ -2267,12 +2288,46 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # exchange order, no orphan, in-flight marker cleared.
         with _EXEC_LOCK:
             _IN_FLIGHT_ANALYSES.discard(_aid)
+            _IN_FLIGHT_COINS.discard(coin)
         return {
             "executed": False, "mode": mode, "analysis_id": analysis["id"],
             "reason": f"liq_buffer_blocked: {_liq_gate.get('error', 'unknown')}",
             "liq_gate": _liq_gate,
             "gate_results": gate_output["results"],
         }
+
+    # A-F4: pre-place position re-check. All gates ran against the account
+    # snapshot fetched at the top of the pipeline; between that read and this
+    # point another caller (different analysis_id — invisible to the aid set;
+    # blocked here only while IT holds the coin in-flight marker) may have
+    # already opened the same coin and filled before we placed. The market
+    # order hasn't been sent yet, so a fresh live read settles it: if the
+    # coin now shows a real position, refuse to place rather than double-open.
+    # Best-effort / fail-open: a read failure logs and proceeds (the exchange
+    # Cloid + DSL one-position-per-coin registry remain the backstops).
+    try:
+        _pre_state = fetch_account_state(user)
+        _pre_pos = next(
+            (ap for ap in (_pre_state.get("asset_positions") or [])
+             if ap.get("position", {}).get("coin") == coin
+             and abs(float(ap.get("position", {}).get("szi") or 0.0)) > 0),
+            None,
+        )
+        if _pre_pos is not None:
+            logger.warning(
+                f"[executor] A-F4 pre-place re-check: {coin} already has a live "
+                f"position (szi={_pre_pos.get('position', {}).get('szi')}) "
+                f"— refusing to double-open (analysis {_aid}).")
+            with _EXEC_LOCK:
+                _IN_FLIGHT_ANALYSES.discard(_aid)
+                _IN_FLIGHT_COINS.discard(coin)
+            return {
+                "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                "reason": "position_already_open_pre_place",
+                "gate_results": gate_output["results"],
+            }
+    except Exception as _pre_e:
+        logger.warning(f"[executor] A-F4 pre-place re-check failed (fail-open): {_pre_e!r}")
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
@@ -2334,6 +2389,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                             f"after response loss ({_rc.get('reason')}); safe to retry.")
                 with _EXEC_LOCK:
                     _IN_FLIGHT_ANALYSES.discard(_aid)
+                    _IN_FLIGHT_COINS.discard(coin)
                 return {
                     "executed": False, "mode": mode, "analysis_id": analysis["id"],
                     "reason": f"order_failed_response_unknown_not_filled: {order_res.get('error', 'unknown')}",
@@ -2395,6 +2451,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                         logger.error(f"[executor] C-M3 halt arm failed: {_h_e}")
                 with _EXEC_LOCK:
                     _IN_FLIGHT_ANALYSES.discard(_aid)
+                    _IN_FLIGHT_COINS.discard(coin)
                 return {
                     "executed": False, "mode": mode, "analysis_id": analysis["id"],
                     "reason": f"order_response_unknown_unresolved: {order_res.get('error', 'unknown')}",
@@ -2406,6 +2463,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             _reset_resp_unknown_streak()
             with _EXEC_LOCK:
                 _IN_FLIGHT_ANALYSES.discard(_aid)
+                _IN_FLIGHT_COINS.discard(coin)
             return {
                 "executed": False, "mode": mode, "analysis_id": analysis["id"],
                 "reason": f"order_failed: {order_res.get('error', 'unknown')}",
@@ -2506,6 +2564,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
             stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
             consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
+            # A-F5: persist-confirmed (4s default) floor breach; config key
+            # dsl_exit.breach_confirm_sec drives both this and policy_from_config.
+            breach_confirm_sec=float(dsl_config.get("breach_confirm_sec", cfg_get("dsl_exit.breach_confirm_sec", default=4.0)) or 0.0),
             noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
             noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
             phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
@@ -2683,6 +2744,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     finally:
         with _EXEC_LOCK:
             _IN_FLIGHT_ANALYSES.discard(_aid)
+            _IN_FLIGHT_COINS.discard(coin)
 
     # Backup exchange stop-loss bracket — fires server-side (instantly, between our
     # DSL checks) to cap the gap-throughs the DSL loop misses. DSL is still the

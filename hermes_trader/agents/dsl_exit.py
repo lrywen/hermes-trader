@@ -472,7 +472,15 @@ class ExitPolicy:
     # is 9s — the same config meant wildly different things. The clock is
     # stable across feed rates. 0 disables the time gate (immediate exit,
     # or tick-count gate if consecutive_breaches_required > 1).
-    breach_confirm_sec: float = 0.0
+    # A-F5 (deep audit 2026-08-28): default was 0.0 — a single instantaneous
+    # mid tick through the floor (a wick that the WS allMids feed briefly
+    # marked) market-closed a winning position. The loop polls every ~15s,
+    # so a sub-second wick was invisible to a "consecutive tick" gate but
+    # one mid tick was enough to fire an exit. Default is now 4s (audit
+    # recommendation 3–5s): a breach must persist across two poll cycles,
+    # and exit confirmation additionally requires the INDEX price (oracle,
+    # which a single-book wick cannot move) to be through the floor.
+    breach_confirm_sec: float = 4.0
     # ── Patch A: don't exit inside the noise band (sub-first-tier) ──────────
     # Phase-3 finding: on strong movers we trailing-exited at +0.6–1.2% (the 0.30
     # give-back applied to a barely-green position) while the trend kept running,
@@ -632,8 +640,18 @@ class DSLTracker:
             return floor
         return max(floor, prev_floor) if self.is_long() else min(floor, prev_floor)
 
-    def check(self, mark_px: float) -> ExitVerdict:
-        """Evaluate DSL floor against current mark price. Call on every tick."""
+    def check(self, mark_px: float, index_px: Optional[float] = None) -> ExitVerdict:
+        """Evaluate DSL floor against current mark price. Call on every tick.
+
+        A-F5 (deep audit 2026-08-28): ``index_px`` is the exchange oracle /
+        index price for the same coin. Floor-breach EXIT verdicts require the
+        index price to also be through the floor; the raw mid (allMids) can be
+        pushed through a floor by a single-book wick, but the oracle index is a
+        multi-source blend that a wick cannot move. When ``index_px`` is None
+        or unusable the confirmation degrades to the breach_confirm_sec time
+        gate alone (fail-open to mid; the exchange-side backup SL remains the
+        hard backstop). Peak/floor tracking still follows the mid.
+        """
         # Flush a deferred floor move from a prior tick if the throttle
         # interval has elapsed; _request_save re-checks the window and keeps
         # the dirty flag set otherwise, so a burst of ticks only writes once
@@ -828,7 +846,26 @@ class DSLTracker:
             count_gate_ok = (
                 self.consecutive_breaches >= pol.consecutive_breaches_required
             )
-            if time_gate_ok and count_gate_ok:
+            # A-F5: wick confirmation against the INDEX price. The mid is a
+            # single order-book snapshot; a transient wick can push it through
+            # the floor for one poll even though the index (oracle blend) never
+            # traded there. If a usable index price is supplied, require it to
+            # also be through the floor to exit; a healthy index ABOVE the floor
+            # while mid pokes below is the classic wick → hold and keep waiting
+            # (the time gate keeps running). No usable index → degrade to the
+            # time/count gates on mid (fail-open; exchange backup SL is the net).
+            index_ok = True
+            index_note = ""
+            try:
+                _idx = float(index_px) if index_px is not None else 0.0
+            except (TypeError, ValueError):
+                _idx = 0.0
+            if _idx > 0.0 and math.isfinite(_idx):
+                index_ok = sgn * (_idx - floor) <= 0 or math.isclose(
+                    sgn * (_idx - floor), 0.0, abs_tol=1e-12
+                )
+                index_note = ", idx-confirmed" if index_ok else f", mid-only wick? idx={_idx:.6g} above floor"
+            if time_gate_ok and count_gate_ok and index_ok:
                 _record_exit("floor_breach")
                 _request_save(force=True)
                 held_for = (
@@ -839,11 +876,20 @@ class DSLTracker:
                     exit=True,
                     reason=(
                         f"floor_breach ({self.consecutive_breaches}x consec"
-                        f"{held_for}, floor={floor:.2f})"
+                        f"{held_for}, floor={floor:.2f}{index_note})"
                     ),
                     floor_price=floor, peak_price=self.peak_px,
                     phase=self._phase_label(),
                     unrealized_pct=upct,
+                )
+            if not index_ok:
+                # Mid breached but index didn't — log the suppressed wick so
+                # the behavior is observable, but do NOT reset the time gate:
+                # if the breach is real the next tick's index will confirm.
+                logger.info(
+                    f"[dsl:wick] {self.coin} {self.side} mid={mark_px:.6g} "
+                    f"breached floor={floor:.6g} but index={_idx:.6g} did not — "
+                    f"holding (A-F5 wick suppression, {breach_elapsed:.1f}s elapsed)."
                 )
         else:
             self.consecutive_breaches = 0
@@ -1012,7 +1058,8 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
         hard_timeout_minutes=pol_raw.get("hard_timeout_minutes", ExitPolicy.hard_timeout_minutes),
         phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,
         consecutive_breaches_required=pol_raw.get("consecutive_breaches_required", 1),
-        breach_confirm_sec=float(pol_raw.get("breach_confirm_sec", 0.0) or 0.0),
+        # A-F5: fallback default moved to 4.0s (see ExitPolicy.breach_confirm_sec).
+        breach_confirm_sec=float(pol_raw.get("breach_confirm_sec", 4.0) or 0.0),
         breakeven_trigger_pct=pol_raw.get("breakeven_trigger_pct", ExitPolicy.breakeven_trigger_pct),
         breakeven_lock_pct=pol_raw.get("breakeven_lock_pct", ExitPolicy.breakeven_lock_pct),
         atr_stop_enabled=pol_raw.get("atr_stop_enabled", ExitPolicy.atr_stop_enabled),
@@ -1448,7 +1495,8 @@ def _build_policy_from_config() -> ExitPolicy:
             atr_stop_ceiling_pct=float(atr_cfg.get("ceiling_pct", ExitPolicy.atr_stop_ceiling_pct)),
             stale_flat_timeout_minutes=float(dsl.get("stale_flat_timeout_minutes", 0.0) or 0.0),
             consecutive_breaches_required=int(dsl.get("consecutive_breaches_required", 1) or 1),
-            breach_confirm_sec=float(dsl.get("breach_confirm_sec", 0.0) or 0.0),
+            # A-F5: default 4.0s breach confirmation (was 0.0 = single-tick exit).
+            breach_confirm_sec=float(dsl.get("breach_confirm_sec", 4.0) or 0.0),
             noise_band_enabled=bool(noise_cfg.get("enabled", False)),
             noise_band_atr_mult=float(noise_cfg.get("atr_mult", ExitPolicy.noise_band_atr_mult)),
             phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,
@@ -1614,6 +1662,13 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
 _MISSING_MID_WARN_INTERVAL_S = 60.0
 _last_missing_mid_warn: dict[str, float] = {}
 
+# A-F5 (deep audit 2026-08-28): short-TTL cache for oracle/index prices used
+# in floor-breach wick confirmation. Keyed by dex name ("" = main perp dex).
+# One metaAndAssetCtxs call per dex per exit pass is enough — the oracle moves
+# slowly and only needs to confirm a breach, not to set the floor.
+_IDX_CACHE_TTL_S = 5.0
+_IDX_CACHE: dict[str, tuple[float, dict[str, float]]] = {}
+
 
 def _valid_mid(v: Any) -> bool:
     """True when `v` is a usable, positive, finite mark price."""
@@ -1636,18 +1691,88 @@ def held_coins_missing_mids(mids: dict[str, Any]) -> list[str]:
                    if not _valid_mid(mids.get(t.coin))})
 
 
-def check_all_positions(mids: dict[str, float]) -> list[ExitVerdict]:
+def get_index_prices(coins: set[str]) -> dict[str, float]:
+    """Fresh oracle/index prices ({coin: px}) for the given coins.
+
+    A-F5 (deep audit 2026-08-28): floor-breach exits must be confirmed against
+    the INDEX price, not just the instantaneous mid (a wick moves the mid but
+    not the oracle blend). Uses metaAndAssetCtxs (weight 20, same call the
+    universe loader uses) with a SHORT-TTL in-memory cache so one exit pass
+    costs at most one HTTP request per active dex. Any failure returns a
+    partial/empty dict — callers degrade to mid-only.
+    """
+    out: dict[str, float] = {}
+    if not coins:
+        return out
+    now = time.monotonic()
+    # Split native vs HIP-3 (HIP-3 coins look like "<dex>:<SYMBOL>").
+    dexes: set[str] = {""}
+    for c in coins:
+        if ":" in c:
+            dexes.add(c.split(":", 1)[0])
+    try:
+        from hermes_trader.client.hl_client import _http_post
+    except Exception:
+        return out
+    for dex in dexes:
+        cache_key = dex or ""
+        hit = _IDX_CACHE.get(cache_key)
+        if hit is not None and (now - hit[0]) < _IDX_CACHE_TTL_S:
+            ctx_map = hit[1]
+        else:
+            try:
+                payload: dict[str, Any] = {"type": "metaAndAssetCtxs"}
+                if dex:
+                    payload["dex"] = dex
+                data = _http_post("/info", payload, timeout=8)
+                if not (data and isinstance(data, list) and len(data) >= 2):
+                    continue
+                meta, ctx = data[0], data[1]
+                ctx_map = {}
+                for i, u in enumerate(meta.get("universe", []) or []):
+                    name = u.get("name")
+                    if name and i < len(ctx):
+                        try:
+                            ctx_map[name] = float(ctx[i].get("oraclePx") or 0.0)
+                        except (TypeError, ValueError):
+                            continue
+                _IDX_CACHE[cache_key] = (now, ctx_map)
+            except Exception as e:
+                logger.warning(f"[dsl] A-F5 index fetch failed for dex={dex or 'main'}: {e}")
+                continue
+        for c in coins:
+            if dex and not c.startswith(f"{dex}:"):
+                continue
+            if not dex and ":" in c:
+                continue
+            bare = c.split(":", 1)[1] if dex else c
+            px = ctx_map.get(bare) or 0.0
+            if px > 0:
+                out[c] = px
+    return out
+
+
+def check_all_positions(mids: dict[str, float], index_prices: Optional[dict[str, float]] = None) -> list[ExitVerdict]:
     """Check all active positions against current mids. Call each scan tick.
 
     Returns list of ExitVerdict for positions that should be closed.
 
-    C-M1: a tracker with no usable mark price is skipped (no price → no
-    defensible market close; the exchange-side backup SL is the backstop),
-    but the blind tick is logged at ERROR level, throttled per coin, instead
-    of being silently swallowed.
+    A-F5: ``index_prices`` maps coin -> oracle/index price for wick cross-check
+    of floor breaches; fetched via :func:`get_index_prices` by the loop when
+    not supplied. C-M1: a tracker with no usable mark price is skipped (no
+    price → no defensible market close; the exchange-side backup SL is the
+    backstop), but the blind tick is logged at ERROR level, throttled per
+    coin, instead of being silently swallowed.
     """
     exits = []
     now = time.monotonic()
+    _idx = index_prices
+    if _idx is None:
+        try:
+            _idx = get_index_prices({t.coin for t in _active_positions.values()})
+        except Exception as _e:
+            logger.warning(f"[dsl] A-F5 index-price fetch failed (degrading to mid-only): {_e}")
+            _idx = {}
     for tracker in list(_active_positions.values()):
         mark_px = mids.get(tracker.coin)
         # Handle both str and float values from different sources
@@ -1666,7 +1791,7 @@ def check_all_positions(mids: dict[str, float]) -> list[ExitVerdict]:
                     f"exchange backup SL is the only stop. Feed failure must "
                     f"pause new entries (FEED-FRESHNESS).")
             continue
-        verdict = tracker.check(mark_px)
+        verdict = tracker.check(mark_px, index_px=(_idx or {}).get(tracker.coin))
         if verdict.exit:
             exits.append(verdict)
     return exits

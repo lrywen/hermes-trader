@@ -87,6 +87,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "max_concurrent": 10,
     "max_total_notional_pct": 10.0,
     "max_daily_loss_usd": -30,
+    # B-M11 (deep audit 2026-08-28): the global-halt and per-coin circuit
+    # breakers only block NEW entries — positions already open keep bleeding
+    # to their DSL stops during the halt window. These opt-in switches make
+    # them HARD: when armed, the trading loop market-closes every open
+    # position (global halt) / the halted coin's position (coin circuit) the
+    # moment the breaker trips. Default OFF: flattening on a halt is a
+    # deliberate operator choice (it locks in the loss and forfeits any
+    # recovery), and the daily-loss USD kill-switch above already flattens
+    # unconditionally.
+    "auto_flatten_on_global_halt": False,
+    "auto_flatten_on_coin_circuit": False,
     "daily_giveback_halt_pct": 0.35,
     "daily_giveback_min_peak_usd": 25.0,
     "crowded_with_min_conf": 0.8,
@@ -128,8 +139,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         },
         # R12-C1: floor-breach confirmation. Was implicit: executor built
         # ExitPolicy with hardcoded defaults (1 / 0.0).
+        # A-F5 (deep audit 2026-08-28): breach_confirm_sec default 0.0 → 4.0
+        # (audit: 3–5s). A single instantaneous mid tick through the floor no
+        # longer closes; the breach must persist 4s AND the oracle index price
+        # must confirm it (dsl_exit.get_index_prices).
         "consecutive_breaches_required": 1,
-        "breach_confirm_sec": 0.0,
+        "breach_confirm_sec": 4.0,
         "phase2_tiers": [
             {"pct_above_entry": 8.0, "retrace_threshold": 0.35},
             {"pct_above_entry": 15.0, "retrace_threshold": 0.4},

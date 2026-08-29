@@ -513,7 +513,48 @@ def get_all_hl_mids(include_hip3: bool = False) -> dict[str, float]:
                     f"no price (peak/floor frozen until next good read)")
         except Exception as e:
             logger.warning(f"[get_all_hl_mids] HIP-3 dex enumeration failed: {e}")
+    # A-F14 (deep audit 2026-08-28): stamp the last SUCCESSFUL MAIN-BOOK mid
+    # fetch. The trading loop reads the age via mid_feed_age_seconds() and
+    # pauses entries/DSL-exits when it exceeds the freshness budget — during
+    # a network outage the SDK's REST allMids either raises (raw=None → out={})
+    # or, on a stuck connection, the call can succeed with a frame the local
+    # TCP stack accepted late. Either way, deciding entries/exits on a price
+    # older than the budget means trading blind; the exchange-side backup SLs
+    # are the backstop while decisions are paused. Only a non-empty MAIN
+    # snapshot counts (HIP-3 mids come from separate per-dex POSTs and must
+    # not refresh the main-book liveness signal).
+    if raw:
+        global _MID_FEED_LAST_OK_MONO
+        with _MID_FEED_LOCK:
+            _MID_FEED_LAST_OK_MONO = _time.monotonic()
     return out
+
+
+# A-F14: timestamp of the last non-empty main-book mids fetch. 0.0 = no
+# successful fetch yet (cold start) — callers treat that as "unknown" and
+# fall back to the C-M1 empty-snapshot behavior rather than halting.
+_MID_FEED_LAST_OK_MONO: float = 0.0
+_MID_FEED_LOCK = threading.Lock()
+
+# Freshness budget for a mid snapshot used in entry/exit decisions. The loop
+# polls every ~15s; a snapshot older than ~2x that plus network slack is
+# evidence of a stuck/dead feed. Matches the ws_client staleness threshold
+# (ws_max_stale_s = 30) so WS-driven and REST-driven loops halt together.
+MID_FEED_MAX_STALE_S = 30.0
+
+
+def mid_feed_age_seconds() -> Optional[float]:
+    """Age of the last successful main-book mids fetch; None before the first.
+
+    A-F14 (deep audit 2026-08-28): decision-point freshness check. None means
+    "no data point yet" (cold start) — NOT stale; the C-M1 empty-snapshot gate
+    handles a feed that never produced data.
+    """
+    with _MID_FEED_LOCK:
+        ts = _MID_FEED_LAST_OK_MONO
+    if ts <= 0.0:
+        return None
+    return max(0.0, _time.monotonic() - ts)
 
 
 # ── Order placement ────────────────────────────────────────────────────────────

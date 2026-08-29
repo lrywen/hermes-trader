@@ -53,7 +53,7 @@ from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_miss
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.memory import memory
-from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache
+from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache, mid_feed_age_seconds, MID_FEED_MAX_STALE_S
 from hermes_trader.client.universe import get_universe
 from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address
 from hermes_trader.positions_snapshot import write_snapshot
@@ -261,6 +261,106 @@ def _burst_fired(perception):
                for t in perception.get("triggers", []))
 
 
+# B-M11 (deep audit 2026-08-28): optional HARD flatten on breakers.
+# Extracted as a pure helper so the breaker→flatten mapping is unit-testable
+# without driving the whole loop.
+def bm11_breaker_flatten(equity, positions, cfg, mem,
+                         flattener=close_position_market,
+                         event_log=log_event):
+    """Flatten open positions when a breaker is armed AND its opt-in switch on.
+
+    Mirrors the daily-loss kill-switch guards: ``equity > 0`` (a degraded read
+    returns equity=0 and can never trigger a flatten) and non-empty positions.
+    Both switches DEFAULT OFF (config_store) — flattening on a halt is a
+    deliberate operator choice.
+
+      * auto_flatten_on_global_halt: global halt armed → close EVERY coin.
+      * auto_flatten_on_coin_circuit: coin circuit armed → close that coin
+        (skipped if the global pass already closed it this tick).
+
+    State reads never raise; a failing read is treated as "not armed".
+    Returns the set of coins actually flattened.
+    """
+    flattened: set = set()
+    if not (equity > 0 and positions):
+        return flattened
+    pos_coins = [(_p.get("position") or {}).get("coin") for _p in positions]
+    pos_coins = [c for c in pos_coins if c]
+    if not pos_coins:
+        return flattened
+    if bool(cfg_get("auto_flatten_on_global_halt", config=cfg)):
+        try:
+            _grem = float(mem.global_halt_remaining_min() or 0.0)
+        except Exception as _ge:
+            logger.error(f"[killswitch] B-M11 global-halt state read failed: {_ge}")
+            _grem = 0.0
+        if _grem > 0:
+            logger.warning(
+                f"[killswitch] B-M11 global halt armed ({int(_grem)}min) and "
+                f"auto_flatten_on_global_halt=ON — flattening {len(pos_coins)} "
+                f"open position(s)")
+            for _coin in pos_coins:
+                try:
+                    _res = flattener(_coin)
+                    logger.warning(f"[killswitch] halt-flatten {_coin}: ok={_res.get('ok')}")
+                    flattened.add(_coin)
+                except Exception as _e:
+                    logger.error(f"[killswitch] halt-flatten failed for {_coin}: {_e}")
+            event_log({"event": "global_halt_auto_flatten",
+                       "remaining_min": round(_grem, 1),
+                       "flattened": len(flattened)})
+    if bool(cfg_get("auto_flatten_on_coin_circuit", config=cfg)):
+        for _coin in pos_coins:
+            if _coin in flattened:
+                continue
+            try:
+                _crem = float(mem.coin_circuit_remaining_min(_coin) or 0.0)
+            except Exception as _ce:
+                logger.error(f"[killswitch] B-M11 coin-circuit state read failed for {_coin}: {_ce}")
+                continue
+            if _crem <= 0:
+                continue
+            logger.warning(
+                f"[killswitch] B-M11 coin circuit armed on {_coin} ({int(_crem)}min) "
+                f"and auto_flatten_on_coin_circuit=ON — flattening")
+            try:
+                _res = flattener(_coin)
+                logger.warning(f"[killswitch] circuit-flatten {_coin}: ok={_res.get('ok')}")
+                flattened.add(_coin)
+            except Exception as _e:
+                logger.error(f"[killswitch] circuit-flatten failed for {_coin}: {_e}")
+            event_log({"event": "coin_circuit_auto_flatten", "coin": _coin,
+                       "remaining_min": round(_crem, 1)})
+    return flattened
+
+
+def af14_feed_decision(mids, stale_age, missing_mids,
+                       max_stale_s=MID_FEED_MAX_STALE_S):
+    """Pure A-F14/C-M1 feed-health decision for one loop tick.
+
+    Returns (halt_reason, skip_exits):
+      * halt_reason None = feed healthy (entries may run); otherwise entries
+        are paused with the returned reason.
+      * skip_exits True only for the A-F14 STALE case — DSL market-close
+        decisions are skipped as well as entries (closing on a stale mid is
+        exactly the wick exit A-F5 hardened against; exchange-side backup SLs
+        remain live server-side). Empty/blind snapshots still run
+        monitor_exits (entries paused only): an empty snapshot has no tracker
+        whose floor could fire, and exchange SLs backstop the rest.
+    """
+    if not mids:
+        return ("empty mids snapshot (all_mids feed failed)", False)
+    if stale_age is not None and stale_age > max_stale_s:
+        return (f"mids feed stale ({stale_age:.0f}s > {max_stale_s:.0f}s budget)",
+                True)
+    if missing_mids:
+        _blind = sorted(missing_mids)
+        reason = (f"no usable mid for held coin(s): {', '.join(_blind[:5])}"
+                  + (f" +{len(_blind) - 5} more" if len(_blind) > 5 else ""))
+        return (reason, False)
+    return (None, False)
+
+
 def _sync_account_state():
     """Pull live aggregated equity + positions from HL, persist to memory.
 
@@ -427,6 +527,19 @@ while True:
                     logger.error(f"[killswitch] failed to flatten {_coin}: {_e}")
             log_event({"event": "hard_killswitch", "daily_pnl": round(daily_pnl, 2),
                        "limit": _max_daily_loss, "flattened": len(positions)})
+
+        # ── B-M11: optional HARD flatten on circuit breakers ───────────────
+        # global_halt_gate / coin_circuit_breaker_gate only block NEW entries
+        # (risk_gates) — a position already open when the breaker trips keeps
+        # running to its DSL stop through the whole halt window. With these
+        # opt-in switches armed (default OFF — config_store defaults), the
+        # breaker becomes a hard flatten: global halt closes EVERY open
+        # position; a coin circuit closes that coin's position. The flatten
+        # is idempotent (close_position_market re-fetches live state and
+        # no-ops an already-flat coin; after closing, the coin vanishes from
+        # the next tick's `positions`), and the same equity>0 guard as the
+        # daily-loss kill-switch applies so a degraded read can't trigger it.
+        bm11_breaker_flatten(equity, positions, _cfg, memory)
 
         # ── DSL exit pass ───────────────────────────────────────────────────
         # Reconcile trackers with live exchange positions (handles restarts,
@@ -605,15 +718,33 @@ while True:
             # (their DSL exits cannot evaluate either — check_all_positions
             # screams per coin). In both states new entries this cycle would be
             # sized off stale/missing prices, so they are paused.
-            if not mids:
-                _feed_halt_reason = "empty mids snapshot (all_mids feed failed)"
+            #
+            # A-F14 (deep audit 2026-08-28): also fail closed on a STALE feed.
+            # A non-empty snapshot can still be an OLD snapshot — during a
+            # network partition the SDK can hand back data buffered before the
+            # drop, or a poll cycle can be delayed long enough that the mids no
+            # longer reflect the market. mid_feed_age_seconds() stamps every
+            # successful MAIN-book fetch; beyond MID_FEED_MAX_STALE_S (30s,
+            # matching ws_client's ws_max_stale_s) the feed is treated as dead
+            # for BOTH directions: new entries stay paused (below) and DSL
+            # market-close exits are SKIPPED this cycle — closing on a stale
+            # mid fires exactly the wick exits A-F5 hardened against, and on a
+            # stale price in the WRONG direction there is no defensible exit
+            # either. The exchange-side backup SL orders remain live
+            # server-side and cover real disaster while decisions are paused.
+            _stale_age = mid_feed_age_seconds()
+            _blind = held_coins_missing_mids(mids) if mids else []
+            _feed_halt_reason, _stale_skip_exits = af14_feed_decision(
+                mids, _stale_age, _blind)
+            if _stale_skip_exits:
+                # A-F14: stale feed → skip DSL exit DECISIONS as well as entries.
+                logger.error(
+                    f"[FEED-FRESHNESS] {_feed_halt_reason} — pausing entries AND "
+                    f"DSL market-close exits this cycle (exchange-side backup SLs "
+                    f"remain live server-side).")
+                exits = []
             else:
-                _blind = held_coins_missing_mids(mids)
-                if _blind:
-                    _feed_halt_reason = (f"no usable mid for held coin(s): "
-                                         f"{', '.join(_blind[:5])}"
-                                         + (f" +{len(_blind)-5} more" if len(_blind) > 5 else ""))
-            exits = monitor_exits(mids)
+                exits = monitor_exits(mids)
             for ex in exits:
                 coin = ex["coin"]
                 lev = ex.get("leverage", 1)

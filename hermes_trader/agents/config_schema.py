@@ -60,6 +60,10 @@ class _ConfigPatch(BaseModel):
     ta_sidestep_force_execute: bool = Field(default=CANONICAL_DEFAULTS["ta_sidestep_force_execute"])
     whale_force_execute: bool = Field(default=CANONICAL_DEFAULTS["whale_force_execute"])
     trend_surface_enabled: bool = Field(default=CANONICAL_DEFAULTS["trend_surface_enabled"])
+    # B-M11 (deep audit 2026-08-28): opt-in auto-flatten when the global halt
+    # or per-coin circuit breaker trips (default off; open-blocking only).
+    auto_flatten_on_global_halt: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_global_halt"])
+    auto_flatten_on_coin_circuit: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_coin_circuit"])
 
     # ── scalars: ints ─────────────────────────────────────────────────────
     leverage: int = Field(default=CANONICAL_DEFAULTS["leverage"], ge=1, le=50)
