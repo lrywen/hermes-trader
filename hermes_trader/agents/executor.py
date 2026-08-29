@@ -194,6 +194,39 @@ def _reset_resp_unknown_streak() -> None:
         _resp_unknown_streak = 0
 
 
+# C-M6 (deep audit 2026-08-28): close_position_market is reachable from the
+# trading loop, the dashboard kill-switch, and manual API calls at the same
+# time. Without serialization two concurrent closes both fetch the same live
+# szi, both place a reduce-only order, and both run the settlement block
+# (deregister / record_close / loss-streak / breakers) — the second caller
+# double-counts the realized PnL and inflates the consecutive-loss streak
+# (B-F2 gate). A per-coin lock serializes the fetch→close→settle critical
+# section for each coin (different coins stay parallel).
+_CLOSE_LOCKS: dict[str, threading.Lock] = {}
+_CLOSE_LOCKS_GUARD = threading.Lock()
+
+
+def _get_close_lock(coin: str) -> threading.Lock:
+    with _CLOSE_LOCKS_GUARD:
+        lk = _CLOSE_LOCKS.get(coin)
+        if lk is None:
+            lk = threading.Lock()
+            _CLOSE_LOCKS[coin] = lk
+        return lk
+
+
+# C-M6 dedupe: wall-clock (ms) of the last FULL settlement per coin. The
+# lock already prevents same-process concurrent double-settlement; this
+# timestamp additionally suppresses a rapid repeat close (watchdog restart /
+# double kill click) whose second call slips in after the first released the
+# lock but within the dedupe window — such a call finds the position already
+# flat via fetch_account_state anyway, but belt-and-braces keeps the outcome
+# store / loss streak / breaker arming idempotent.
+# value: (settled_at_ms, side, (entry_px, abs_szi))
+_CLOSE_SETTLED_AT: dict[str, tuple] = {}
+_CLOSE_DEDUPE_WINDOW_MS = 30_000
+
+
 # ── P0-4: liquidation-price pre-place gate ────────────────────────────
 # A position whose existing liquidation price is already less than
 # HERMES_LIQ_BUFFER_USD (=10 by default) of notional cushion from the
@@ -3080,6 +3113,18 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
 
 
 def close_position_market(coin: str) -> dict[str, Any]:
+    """Market-close any open perp position for `coin`.
+
+    C-M6 (deep audit 2026-08-28): the whole fetch→close→settle sequence runs
+    under a per-coin lock so concurrent callers (trading loop + dashboard
+    kill-switch + manual API) can't double-close / double-settle the same
+    position. Different coins still close in parallel.
+    """
+    with _get_close_lock(coin):
+        return _close_position_market_locked(coin)
+
+
+def _close_position_market_locked(coin: str) -> dict[str, Any]:
     """Market-close any open perp position for `coin`. Deregisters the DSL tracker on success.
 
     Returns include `entry_px`, `fill_px`, and `realized_pnl_pct` (leveraged,
@@ -3221,6 +3266,28 @@ def close_position_market(coin: str) -> dict[str, Any]:
             return out
 
     if res.get("ok"):
+        # C-M6: settlement dedupe. The per-coin lock above already prevents
+        # same-process concurrent double settlement; this additionally guards
+        # the case where a second close for the SAME position slips in right
+        # after the lock was released (watchdog restart / double kill click /
+        # loop+dashboard overlap). Matching on (entry_px, size) means a
+        # genuinely NEW position re-entered within the window is still settled.
+        _now_ms = int(time.time() * 1000)
+        _settle_sig = (round(float(entry_px or 0.0), 8), round(abs(float(szi or 0.0)), 8))
+        _prev = _CLOSE_SETTLED_AT.get(coin)
+        if (
+            isinstance(_prev, tuple)
+            and len(_prev) == 3
+            and _now_ms - int(_prev[0]) < _CLOSE_DEDUPE_WINDOW_MS
+            and _prev[2] == _settle_sig
+        ):
+            logger.warning(
+                f"[executor] close {coin}: DUPLICATE settlement suppressed "
+                f"(same {side} position settled {(_now_ms - int(_prev[0])) / 1000:.1f}s ago) "
+                f"— skipping record_close / loss streak / breakers"
+            )
+            out["settlement_deduped"] = True
+            return out
         deregister_position(coin, side)
         # Cancel the now-stranded reduce-only SL/TP trigger bracket so stale
         # orders don't pile up and reject a future reduce-only order on this coin.
@@ -3491,6 +3558,11 @@ def close_position_market(coin: str) -> dict[str, Any]:
                             pass
         except Exception as _tb_e:
             logger.warning(f"[executor] tiered-breaker arm failed for {coin}: {_tb_e}")
+        # C-M6: full settlement finished — record the dedupe signature so a
+        # rapid repeat close for the SAME position skips record_close / loss
+        # streak / breaker arming. A genuinely new position (different entry
+        # or size) has a different signature and still settles.
+        _CLOSE_SETTLED_AT[coin] = (_now_ms, side, _settle_sig)
     return out
 
 
