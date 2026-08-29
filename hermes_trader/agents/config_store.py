@@ -275,6 +275,20 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_candles": 50,
         "obv_slope_period": 10,
     },
+    # R13-B6: funding-crowding regime classifier (hyperfeed.py). Consumed by
+    # hyperfeed._compute_funding_regime() / market_get_funding_regime() and
+    # read on the risk-gate hot path (risk_gates._funding_regime_for). The
+    # 5-min cache TTL was the twin of regime_classifier.ttl_sec (R13-B5) —
+    # one was wired, the other still a module literal. Defaults are the exact
+    # hyperfeed literals: ±0.0001 funding crowding bar, OI floors 1e7 (crypto)
+    # / 1e6 (HIP-3 equity+commodity), per-class long-vs-short count margin 5.
+    "funding_regime": {
+        "ttl_sec": 300,
+        "crowded_funding_threshold": 0.0001,
+        "oi_floor_crypto": 10000000.0,
+        "oi_floor_other": 1000000.0,
+        "class_dominance_margin": 5,
+    },
     "debate_gate": {
         "enabled": True,
         "min_agreement": 0.6,

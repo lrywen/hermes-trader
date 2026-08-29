@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from hermes_trader.client.hl_client import _http_post, fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
+from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +24,53 @@ TRUSTED_WALLETS: set[str] = set()
 # and avoids hitting get_universe() on every risk-gate evaluation.
 _FUNDING_REGIME_TTL_S = 300
 _funding_regime_cache: Optional[tuple[dict[str, Any], float]] = None
+
+# Literal fallback (== pre-R13-B6 behavior); the CANONICAL `funding_regime`
+# block carries the same values and is the single source of truth at runtime.
+# _FUNDING_REGIME_TTL_S stays as a module symbol (external reference + TTL
+# fallback). Tunables: ±funding crowding bar, per-class OI floors (crypto vs
+# HIP-3 equity/commodity, which are an order of magnitude smaller), and the
+# per-class long-vs-short count dominance margin used by _decide().
+_FUNDING_REGIME_DEFAULTS: dict[str, float] = {
+    "ttl_sec": float(_FUNDING_REGIME_TTL_S),
+    "crowded_funding_threshold": 0.0001,
+    "oi_floor_crypto": 1e7,
+    "oi_floor_other": 1e6,
+    "class_dominance_margin": 5.0,
+}
+
+
+def funding_regime_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, float]:
+    """Resolve the funding-crowding regime classifier knobs.
+
+    Returns the live `funding_regime` canonical block (env
+    ``HERMES_CFG_FUNDING_REGIME__*`` overrides included) with the module
+    literals as fallback. Per-leaf lookups keep each key independently
+    env-overridable. Guards: the funding threshold and both OI floors must be
+    strictly positive, the dominance margin non-negative, the TTL non-negative
+    — anything malformed falls back to the literal. Any read/coerce failure
+    returns a fresh copy of the literals (risk-gate hot path must never break
+    on a bad config).
+    """
+    p = dict(_FUNDING_REGIME_DEFAULTS)
+    try:
+        v = cfg_get("funding_regime.ttl_sec", config=config)
+        if v is not None:
+            iv = int(v)
+            p["ttl_sec"] = float(iv) if iv >= 0 else p["ttl_sec"]
+        for key in ("crowded_funding_threshold", "oi_floor_crypto", "oi_floor_other"):
+            v = cfg_get(f"funding_regime.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv > 0 else p[key]
+        v = cfg_get("funding_regime.class_dominance_margin", config=config)
+        if v is not None:
+            iv = int(v)
+            p["class_dominance_margin"] = float(iv) if iv >= 0 else p["class_dominance_margin"]
+    except Exception as e:  # never let config break the risk-gate path
+        logger.debug(f"[hyperfeed] funding regime params config read failed: {e}")
+        return dict(_FUNDING_REGIME_DEFAULTS)
+    return p
 
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
@@ -368,7 +416,8 @@ def market_get_funding_regime() -> dict[str, Any]:
     """
     global _funding_regime_cache
     now = time.time()
-    if _funding_regime_cache and (now - _funding_regime_cache[1]) < _FUNDING_REGIME_TTL_S:
+    ttl_s = int(funding_regime_params()["ttl_sec"])
+    if _funding_regime_cache and (now - _funding_regime_cache[1]) < ttl_s:
         return _funding_regime_cache[0]
     result = _compute_funding_regime()
     _funding_regime_cache = (result, now)
@@ -381,6 +430,11 @@ def _compute_funding_regime() -> dict[str, Any]:
     # (xyz:CL), semis (xyz:ARM), gold (xyz:GOLD), etc. would silently be
     # excluded — and the gate would default them to a stale crypto regime.
     from hermes_trader.agents.market_regime import classify_asset
+    params = funding_regime_params()
+    funding_bar = params["crowded_funding_threshold"]
+    oi_floor_crypto = params["oi_floor_crypto"]
+    oi_floor_other = params["oi_floor_other"]
+    dominance_margin = int(params["class_dominance_margin"])
     universe = get_universe(include_hip3=True)
     assets = []
     # Per-class counters: {"crypto": {"long": N, "short": M}, ...}
@@ -399,12 +453,12 @@ def _compute_funding_regime() -> dict[str, Any]:
         # OI threshold scales by class — HIP-3 markets are an order of
         # magnitude smaller than BTC/ETH, so the 1e7 crypto floor would
         # blank every equity/commodity perp's regime signal.
-        oi_floor = 1e7 if klass == "crypto" else 1e6
+        oi_floor = oi_floor_crypto if klass == "crypto" else oi_floor_other
 
-        if funding > 0.0001 and oi > oi_floor:
+        if funding > funding_bar and oi > oi_floor:
             regime = "LONG_CROWDED"
             counts[klass]["long"] += 1
-        elif funding < -0.0001 and oi > oi_floor:
+        elif funding < -funding_bar and oi > oi_floor:
             regime = "SHORT_CROWDED"
             counts[klass]["short"] += 1
         else:
@@ -421,9 +475,9 @@ def _compute_funding_regime() -> dict[str, Any]:
 
     # Compute per-class regime: dominant side beats the other by margin.
     def _decide(c: dict[str, int]) -> str:
-        if c["long"] > c["short"] + 5:
+        if c["long"] > c["short"] + dominance_margin:
             return "LONG_CROWDED"
-        if c["short"] > c["long"] + 5:
+        if c["short"] > c["long"] + dominance_margin:
             return "SHORT_CROWDED"
         return "NEUTRAL"
 

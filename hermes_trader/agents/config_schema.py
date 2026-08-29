@@ -134,6 +134,10 @@ class _ConfigPatch(BaseModel):
     atr_risk_sizing: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
     regime_classifier: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
     regime_score: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_score"))
+    # R13-B6: funding-crowding regime classifier knobs (hyperfeed.py). Five
+    # keys: cache TTL, ±funding crowding threshold, per-class OI floors, and
+    # the long-vs-short count dominance margin.
+    funding_regime: dict[str, Any] = Field(default_factory=lambda: _dict_default("funding_regime"))
     debate_gate: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_gate"))
     debate_research: dict[str, Any] = Field(default_factory=lambda: _dict_default("debate_research"))
     signal_enforcement: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_enforcement"))
