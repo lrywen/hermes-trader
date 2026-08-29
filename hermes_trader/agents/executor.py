@@ -1946,6 +1946,34 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             binary_news_match = news_text[:140]
 
     trade_side = analysis.get("side", "long") or "long"
+
+    # H4 (deep audit 2026-08-29): estimate the planned WORST-CASE stop distance
+    # (spot %) so liquidation_buffer_gate can enforce liq_distance > stop +
+    # sl_buffer. Mirrors the backup-SL clamp (_place_backup_sl uses
+    # min(max(atr/entry*mult, floor), ceiling) + a slip widen capped at 0.5x
+    # ceiling); a cached ATR/mid read here is reused below, and a failed read
+    # simply leaves stop_distance_pct=0 (gate passes open — nothing to check).
+    _h4_stop_distance_pct = 0.0
+    # Legacy sizing leaves mid_price=0 until after gates; fetch it now (cached
+    # by the post-gate get_hl_price call) so the liq check has an entry price.
+    if mid_price <= 0:
+        try:
+            mid_price = get_hl_price(coin)
+        except Exception:
+            mid_price = 0.0
+    try:
+        _h4_mid = mid_price
+        _h4_atr = atr if atr > 0 else get_hl_atr("4h", 14, coin)
+        if _h4_mid > 0 and _h4_atr > 0:
+            _h4_mult = float(config.get("sl_atr_mult", _DEFAULT_SL_ATR_MULT) or _DEFAULT_SL_ATR_MULT)
+            _h4_floor = float(config.get("sl_floor_pct", _DEFAULT_SL_FLOOR_PCT) or _DEFAULT_SL_FLOOR_PCT)
+            _h4_ceiling = float(config.get("sl_ceiling_pct", _DEFAULT_SL_CEILING_PCT) or _DEFAULT_SL_CEILING_PCT)
+            if _h4_mult > 0 and _h4_ceiling > 0:
+                _h4_width = min(max((_h4_atr / _h4_mid) * _h4_mult * 100.0, _h4_floor), _h4_ceiling)
+                _h4_stop_distance_pct = min(_h4_width + _h4_ceiling * 0.5, _h4_ceiling * 1.5)
+    except Exception as _h4_e:  # noqa: BLE001 — pre-trade estimate is best-effort
+        logger.debug(f"[executor] H4 stop-distance estimate failed for {coin}: {_h4_e}")
+
     ctx = GateContext(
         confidence=analysis["confidence"],
         current_positions=positions,
@@ -1965,6 +1993,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # counter-regime gate. Missing config fails closed.
         whale_signal_fired=bool(analysis.get("whale_signal")) and bool(config.get("whale_regime_bypass", False)),
         peak_daily_pnl=memory.peak_daily_pnl(),
+        # H4: pre-trade liquidation-price check inputs.
+        entry_px=mid_price if mid_price > 0 else 0.0,
+        leverage=float(leverage),
+        stop_distance_pct=_h4_stop_distance_pct,
     )
     # H3: an armed whale_regime_bypass is about to be consulted with a live
     # whale signal (it changes the counter-regime gate input) — audit it.

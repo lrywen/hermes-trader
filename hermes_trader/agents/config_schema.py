@@ -94,6 +94,9 @@ class _ConfigPatch(BaseModel):
     min_short_volume_usd: float = Field(default=CANONICAL_DEFAULTS["min_short_volume_usd"], ge=0.0)
     research_rescore_delta: float = Field(default=CANONICAL_DEFAULTS["research_rescore_delta"], ge=0.0, le=100.0)
     sl_buffer_bps: float = Field(default=CANONICAL_DEFAULTS["sl_buffer_bps"], ge=0.0, le=1000.0)
+    # H4 (deep audit 2026-08-29): assumed maintenance-margin rate (%) for the
+    # pre-trade liquidation-price gate. 0 disables the gate.
+    liquidation_maint_margin_pct: float = Field(default=CANONICAL_DEFAULTS["liquidation_maint_margin_pct"], ge=0.0, le=20.0)
     tp_scale_fraction: float = Field(default=CANONICAL_DEFAULTS["tp_scale_fraction"], ge=0.0, le=1.0)
     against_funding_min_conf: float = Field(default=CANONICAL_DEFAULTS["against_funding_min_conf"], ge=0.0, le=1.0)
     against_funding_min_score: float = Field(default=CANONICAL_DEFAULTS["against_funding_min_score"], ge=0.0, le=100.0)

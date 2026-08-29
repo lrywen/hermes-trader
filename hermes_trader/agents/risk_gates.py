@@ -48,6 +48,16 @@ class GateContext:
     whale_signal_fired: bool = False
     binary_news_match: str = ""
     peak_daily_pnl: float = 0.0
+    # H4 (deep audit 2026-08-29): liquidation-price pre-check inputs. Zero
+    # values mean "not applicable" (manual-order path / caller without the
+    # data) and liquidation_buffer_gate passes open. entry_px is the planned
+    # fill price, leverage the cross-margin leverage about to be set, and
+    # stop_distance_pct the planned worst-case stop distance in SPOT percent
+    # (backup-SL width incl. slippage widen), so the gate can enforce
+    # liq_distance > stop + sl_buffer.
+    entry_px: float = 0.0
+    leverage: float = 0.0
+    stop_distance_pct: float = 0.0
 
     def __post_init__(self) -> None:
         def _num(v: Any) -> float:
@@ -67,6 +77,11 @@ class GateContext:
         self.equity = _num(self.equity)
         self.total_open_notional = _num(self.total_open_notional)
         self.composite_score = _num(self.composite_score)
+        # H4: pre-trade liquidation-check inputs (0.0 = not supplied → gate
+        # passes open).
+        self.entry_px = _num(self.entry_px)
+        self.leverage = _num(self.leverage)
+        self.stop_distance_pct = _num(self.stop_distance_pct)
         self.momentum_burst_fired = bool(self.momentum_burst_fired)
         # True iff any 1h slow-burn trigger fired (volumeBuildup1h /
         # trendFlip1h / higherLows1h). Used as a counter-regime bypass: a
@@ -316,6 +331,54 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
                               f"(>= {max_drawdown_pct:.1f}%) — no new entries"}
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[risk] drawdown gate state read failed: {e}")
+    return {"pass": True}
+
+
+def liquidation_buffer_gate(
+    ctx: GateContext,
+    maint_margin_rate_pct: float,
+    extra_buffer_pct: float,
+) -> GateResult:
+    """H4 (deep audit 2026-08-29): refuse an entry whose estimated liquidation
+    price sits INSIDE the planned stop-loss bracket.
+
+    On a thin-margin account (10U equity) a single order at 10x with a 3%
+    backup stop is structurally guaranteed to be liquidated before the stop
+    can fire (liq ~10% away, stop at 3%+slippage). This gate estimates the
+    liquidation move from (entry_px, leverage, maintenance-margin rate) and
+    enforces the audit contract::
+
+        liq_distance_pct > stop_distance_pct + extra_buffer_pct
+
+    The isolated-margin estimate ``(1/lev - mmr)`` is deliberately
+    CONSERVATIVE for cross margin (real cross liq is further away because
+    account-wide collateral backs the position), so it only rejects orders
+    that would be fatal even in isolation. Disabled when maint_margin_rate_pct
+    <= 0 or when the caller did not provide entry/leverage/stop data
+    (zero-field contexts — e.g. the manual-order path — pass open).
+    """
+    if maint_margin_rate_pct <= 0:
+        return {"pass": True}
+    entry = float(ctx.entry_px or 0.0)
+    lev = float(ctx.leverage or 0.0)
+    stop_pct = float(ctx.stop_distance_pct or 0.0)
+    if entry <= 0 or lev <= 0 or stop_pct <= 0:
+        return {"pass": True}  # no pre-trade data supplied → nothing to check
+    liq_distance_pct = (1.0 / lev) * 100.0 - float(maint_margin_rate_pct)
+    if liq_distance_pct <= 0:
+        return {"pass": False,
+                "reason": f"liquidation_buffer: leverage {lev:g}x leaves no "
+                          f"liq cushion at all (maint margin "
+                          f"{maint_margin_rate_pct:.2f}%) — entry refused"}
+    required_pct = stop_pct + float(extra_buffer_pct or 0.0)
+    if liq_distance_pct <= required_pct:
+        return {"pass": False,
+                "reason": f"liquidation_buffer: {ctx.coin} {ctx.trade_side} at "
+                          f"{lev:g}x would be liquidated ~{liq_distance_pct:.2f}% "
+                          f"from entry, inside the planned stop bracket "
+                          f"({stop_pct:.2f}% + {float(extra_buffer_pct or 0.0):.2f}% "
+                          f"buffer = {required_pct:.2f}%) — entry refused (reduce "
+                          f"leverage so 1/lev - maint > stop + buffer)"}
     return {"pass": True}
 
 
@@ -898,6 +961,15 @@ def eval_all_gates(
         ctx, float(cfg_get("circuit_breaker.coin_daily_loss_pct", config=config) or 0.0))
     results["drawdown"] = drawdown_gate(
         ctx, float(cfg_get("circuit_breaker.max_drawdown_pct", config=config) or 0.0))
+    # H4 (deep audit 2026-08-29): refuse entries whose estimated liquidation
+    # price falls inside the planned stop bracket (10U thin-margin blast
+    # protection). maint_margin_rate_pct <= 0 disables; the extra buffer is
+    # the canonical sl_buffer_bps (basis points → percent).
+    results["liquidation_buffer"] = liquidation_buffer_gate(
+        ctx,
+        float(cfg_get("liquidation_maint_margin_pct", config=config) or 0.0),
+        float(cfg_get("sl_buffer_bps", config=config) or 0.0) / 100.0,
+    )
     results["opposite_guard"] = opposite_direction_guard(ctx)
     results["correlation"] = correlation_cap(
         ctx, int(cfg_get("max_crypto_long_correlated", config=config)))
@@ -920,7 +992,8 @@ def eval_all_gates(
         "confidence", "max_concurrent", "notional_cap", "daily_loss",
         "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
         "cooldown", "coin_circuit", "global_halt", "consecutive_loss",
-        "coin_daily_loss", "drawdown", "opposite_guard",
+        "coin_daily_loss", "drawdown", "liquidation_buffer",
+        "opposite_guard",
         "correlation", "equity_risk", "market_regime", "news", "debate",
     }
     for key, result in results.items():

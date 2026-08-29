@@ -559,6 +559,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # SL ratchet coordination); and the funding-rate history lookback window
     # in hours (research display / against-funding context).
     "sl_buffer_bps": 10.0,
+    # H4 (deep audit 2026-08-29): assumed maintenance-margin rate (PERCENT)
+    # for the pre-trade liquidation-price estimate. The gate requires
+    # liq_distance_pct (= 100/leverage - this rate) > stop_distance_pct +
+    # sl_buffer. HL's actual maintenance margin is tier-dependent; 1.0% is a
+    # conservative flat assumption for small perps. Set to 0 to disable.
+    "liquidation_maint_margin_pct": 1.0,
     "funding_lookback_hours": 24,
     # R13-B2: dynamic exchange-SL mover (executor.py L304-311) tunables.
     # Two knobs control how aggressively the trailing SL follows the DSL
