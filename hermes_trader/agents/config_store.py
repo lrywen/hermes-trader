@@ -650,6 +650,46 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "resp_unknown_halt_n": 3,
         "resp_unknown_halt_min": 60.0,
     },
+    # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard gate.
+    # The same late_entry_check() pure function (agents/ta_filter.py) runs in
+    # three places with ONE source of truth for thresholds:
+    #   1. analyze_perception() — pre-filter before the paid LLM debate
+    #   2. ta_late_entry_gate() — hard pre-trade gate in eval_all_gates()
+    #   3. scripts/backtest.py — backtest entry path (rule parity)
+    # mode controls the pre-trade GATE only (the pre-filter veto is always
+    # active): "off" = gate absent; "shadow" = verdict recorded + metrics but
+    # never blocks (gray-release, run 3-7 days); "enforce" = blocks orders.
+    # Thresholds: 4h RSI / extension-in-ATR veto is OR semantics; when 4h ADX
+    # >= adx_trend_threshold and the EMA trend aligns with the trade side the
+    # relaxed limits apply (trend exception); on a 4h veto with 15m RSI not
+    # yet extreme the trade passes (multi-timeframe continuation override).
+    # Per-trader tuning is via env HERMES_CFG_TA_LATE_ENTRY__<KEY>; no global
+    # hard-coded numbers outside this block.
+    "ta_late_entry": {
+        "mode": "shadow",
+        # --- 4h hard veto thresholds (normal regime) ---
+        "rsi_ob": 75,
+        "rsi_os": 25,
+        "ext_ob": 2.5,
+        "ext_os": -2.5,
+        # --- trend exception: relax limits in a strong aligned trend ---
+        "trend_relax_enabled": True,
+        "adx_trend_threshold": 35,
+        "rsi_ob_relaxed": 82,
+        "rsi_os_relaxed": 18,
+        "ext_ob_relaxed": 3.5,
+        "ext_os_relaxed": -3.5,
+        # --- multi-timeframe: 15m RSI continuation override ---
+        "mtf_enabled": True,
+        "rsi15m_ob": 72,
+        "rsi15m_os": 28,
+        # --- data requirements / fetch sizing ---
+        "min_bars_4h": 30,
+        "min_bars_15m": 20,
+        "fetch_bars": 100,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
     # R13-A1: perception scan-tick block (TRIGGER_CONFIG["scan"], perception.py
     # L216-269). Previously implicit: the keys lived only in the module-level
     # TRIGGER_CONFIG dict and perception read them via `config["scan"][key]`

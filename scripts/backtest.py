@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import bisect
 import math
 import os
 import sys
@@ -49,11 +50,36 @@ sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.ta_filter import late_entry_check
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
 from hermes_trader.indicators import math as ind
 from hermes_trader.indicators import triggers as trig
 from hermes_trader.models.types import Candle
+
+# Interval → candle duration in ms (mirrors hl_client._MS_PER_CANDLE).
+_MS_PER: Dict[str, int] = {
+    "5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000,
+    "4h": 4 * 3_600_000, "1d": 24 * 3_600_000,
+}
+
+
+def _closed_slice(series: Optional[List[Candle]], ts_ms: List[int],
+                  decision_ms: int, tf_ms: int) -> Optional[List[Candle]]:
+    """Return the prefix of a higher-timeframe series that is FULLY CLOSED at
+    the decision instant (bar open time + duration <= decision time).
+
+    Entry decisions in this engine are made on bar i's close and filled at
+    bar i+1's open; ``decision_ms`` = bar i open + one sim-bar duration. A
+    higher-TF bar is usable only if it has closed by then — anything still in
+    progress would leak future price action (look-ahead). Matches the live
+    gate, which at order time sees only completed candles.
+    """
+    if not series:
+        return None
+    cutoff = decision_ms - tf_ms  # latest higher-TF bar OPEN time fully closed
+    j = bisect.bisect_right(ts_ms, cutoff)
+    return series[:j] if j > 0 else None
 
 # Hyperliquid perp taker fee model used by the live executor: 2.5 bps per side.
 ROUND_TRIP_FEE_BPS = 5.0
@@ -206,11 +232,32 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
               retrace_threshold: float = 0.30,
               atr_mult: float = 0.0, atr_floor: float = 1.0,
               atr_ceiling: float = 4.0,
-              stop_widths: Optional[list] = None) -> List[Trade]:
+              stop_widths: Optional[list] = None,
+              candles_4h: Optional[List[Candle]] = None,
+              candles_15m: Optional[List[Candle]] = None,
+              late_entry_params: Optional[Dict[str, Any]] = None,
+              late_vetoes: Optional[List[dict]] = None) -> List[Trade]:
     trades: List[Trade] = []
     open_t: Optional[Trade] = None
     open_dsl: Optional[DSL] = None
     fee_pct = ROUND_TRIP_FEE_BPS / 10000.0
+
+    # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live
+    # ta_late_entry_gate re-runs late_entry_check() on FRESH 4h (+15m) candles
+    # immediately before order placement. The backtest calls the SAME pure
+    # function on only the higher-TF bars that have CLOSED by the decision
+    # instant (bar i close → fill at i+1 open), so the veto is 100% identical
+    # in rules and free of look-ahead. Backtests evaluate the FINAL rule set,
+    # so the check is enforced regardless of the live gate's gray-release
+    # mode (mode is a deployment control, not a strategy difference).
+    le_params = dict(late_entry_params or {})
+    le_enabled = bool(le_params) and candles_4h is not None
+    if le_enabled:
+        le_params.pop("mode", None)
+        le_params.pop("shadow_log_path", None)
+    sim_ms = _MS_PER.get(cfg.get("_interval", "1h"), _MS_PER["1h"])
+    t4 = [c.t for c in candles_4h] if candles_4h else []
+    t15 = [c.t for c in candles_15m] if candles_15m else []
 
     for i in range(warmup, len(candles) - 1):
         window = candles[: i + 1]
@@ -244,6 +291,24 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
             continue
 
         side = "long" if verdict == "LONG" else "short"
+
+        # Live late-entry hard gate, same pure function + same closed-bar
+        # information set as the order-time recompute.
+        if le_enabled:
+            decision_ms = bar.t + sim_ms
+            w4 = _closed_slice(candles_4h, t4, decision_ms, _MS_PER["4h"])
+            w15 = _closed_slice(candles_15m, t15, decision_ms, _MS_PER["15m"])
+            le = late_entry_check(w4, w15, side, le_params)
+            if le.get("block"):
+                if late_vetoes is not None:
+                    late_vetoes.append({
+                        "coin": coin, "side": side, "bar": i,
+                        "reason": le.get("reason", ""),
+                        "rsi4h": le.get("rsi4h"), "adx4h": le.get("adx4h"),
+                        "extension": le.get("extension"),
+                    })
+                continue
+
         lev = min(lev_ceiling, max_lev)
         notional = equity * equity_fraction * lev
         margin = equity * equity_fraction
@@ -302,6 +367,9 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int) -> None:
     print(f"  - No funding cost, no slippage beyond a {ROUND_TRIP_FEE_BPS:.1f}-bps round-trip fee.")
     print("  - One open position per coin at a time; max_concurrent cap NOT enforced across coins.")
     print("  - Equity held constant (no compounding); cooldown_min not applied.")
+    print("  - ta_late_entry hard gate is 100% aligned with live: same late_entry_check() "
+          "pure function, ENFORCED (backtests evaluate the final rule set), and only "
+          "4h/15m bars CLOSED by the decision instant are used — no look-ahead.")
     print("  - Past performance does NOT imply future results.")
 
 
@@ -327,6 +395,9 @@ def main() -> int:
                     help="ATR stop floor spot pct (default: .agent-config.json)")
     ap.add_argument("--atr-ceiling", type=float, default=None,
                     help="ATR stop ceiling spot pct (default: .agent-config.json)")
+    ap.add_argument("--no-late-entry", action="store_true",
+                    help="disable the live ta_late_entry hard gate (default: enforced, "
+                         "100% parity with the live order-time gate)")
     args = ap.parse_args()
 
     live = read_agent_config()
@@ -343,11 +414,16 @@ def main() -> int:
         atr_mult = float(live_atr.get("atr_mult", 0.0)) if bool(live_atr.get("enabled", False)) else 0.0
     atr_floor = float(args.atr_floor if args.atr_floor is not None else live_atr.get("floor_pct", 1.0))
     atr_ceiling = float(args.atr_ceiling if args.atr_ceiling is not None else live_atr.get("ceiling_pct", 4.0))
+    # Live late-entry gate parameters (same ta_late_entry config block the
+    # order-time gate reads). The backtest ENFORCES the veto regardless of the
+    # live mode (shadow/enforce is a deployment control, not a rule difference).
+    late_entry_params: Dict[str, Any] = {} if args.no_late_entry else dict(live.get("ta_late_entry") or {})
 
     bars_per_day = {"5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}[args.interval]
     total_bars = args.days * bars_per_day + 100  # +warmup
 
     cfg = get_config()
+    cfg["_interval"] = args.interval
     universe = get_universe()
     perps = [m for m in universe if m["type"] == "perp" and not m["coin"].startswith("@")]
     coins = sorted(perps, key=lambda m: m.get("dayNtlVlm", 0), reverse=True)[: args.coins]
@@ -361,6 +437,16 @@ def main() -> int:
 
     all_trades: List[Trade] = []
     stop_widths: List[float] = []
+    late_vetoes: List[dict] = []
+    sim_ms = _MS_PER[args.interval]
+    # Bars to pull for the higher-TF gate series: enough to cover the whole sim
+    # window plus indicator warmup (min_bars_4h=30 / min_bars_15m=20).
+    need_4h = math.ceil(total_bars * sim_ms / _MS_PER["4h"]) + 40
+    need_15m = math.ceil(total_bars * sim_ms / _MS_PER["15m"]) + 30
+    if late_entry_params:
+        print(f"ta_late_entry: ENFORCED in backtest (live mode={late_entry_params.get('mode', 'shadow')}; "
+              f"rsi_ob={late_entry_params.get('rsi_ob')}, adx_trend={late_entry_params.get('adx_trend_threshold')}, "
+              f"mtf={late_entry_params.get('mtf_enabled')}; --no-late-entry to disable)\n")
     for m in coins:
         coin = m["coin"]; max_lev = int(m.get("maxLeverage", 5))
         try:
@@ -368,6 +454,17 @@ def main() -> int:
             if len(candles) < 110:
                 print(f"  {coin:8} skip ({len(candles)} bars — insufficient)")
                 continue
+            candles_4h: Optional[List[Candle]] = None
+            candles_15m: Optional[List[Candle]] = None
+            if late_entry_params:
+                try:
+                    # Reuse the base series when it IS the higher TF; fetch failures
+                    # degrade this coin to no-gate, mirroring the live fail-open.
+                    candles_4h = candles if args.interval == "4h" else fetch_hl_candles(coin, "4h", need_4h)
+                    candles_15m = candles if args.interval == "15m" else fetch_hl_candles(coin, "15m", need_15m)
+                except Exception as e:
+                    print(f"  {coin:8} late-entry gate unavailable ({e}) — running without it")
+                    candles_4h = candles_15m = None
             trades = _simulate(
                 coin, candles, max_lev,
                 equity=args.equity, equity_fraction=equity_fraction,
@@ -376,6 +473,8 @@ def main() -> int:
                 retrace_threshold=retrace,
                 atr_mult=atr_mult, atr_floor=atr_floor,
                 atr_ceiling=atr_ceiling, stop_widths=stop_widths,
+                candles_4h=candles_4h, candles_15m=candles_15m,
+                late_entry_params=late_entry_params, late_vetoes=late_vetoes,
             )
             pnl = sum(t.pnl_usd for t in trades)
             w = sum(1 for t in trades if t.pnl_usd > 0)
@@ -383,6 +482,13 @@ def main() -> int:
             all_trades.extend(trades)
         except Exception as e:
             print(f"  {coin:8} error: {e}")
+
+    if late_entry_params and late_vetoes:
+        print(f"\nta_late_entry vetoes: {len(late_vetoes)} entries blocked")
+        for v in late_vetoes[:8]:
+            print(f"  {v['coin']:8} {v['side']:5} bar {v['bar']:5}  {v['reason']}")
+        if len(late_vetoes) > 8:
+            print(f"  ... and {len(late_vetoes) - 8} more")
 
     _print_summary(all_trades, args.equity, args.days)
     if stop_widths:

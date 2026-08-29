@@ -3513,6 +3513,298 @@ def test_ta_filter_passes_healthy_long(monkeypatch):
     assert res["signal"] != "REJECTED" or "late long" not in (res.get("reason") or "")
 
 
+# ── late_entry_check pure function: trend-relax + MTF override (deep audit) ─
+
+def test_late_entry_pure_basic_veto_and_pass():
+    """Parabolic 4h uptrend blocks longs; healthy trend does not."""
+    from hermes_trader.agents.ta_filter import late_entry_check
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    v = late_entry_check(bull, None, "long", {"mtf_enabled": False})
+    assert v["data_ok"] is True and v["block"] is True
+    assert "late long" in v["reason"]
+    # Shorts against the same up-move are not "late short" extended.
+    vs = late_entry_check(bull, None, "short", {"mtf_enabled": False})
+    assert vs["block"] is False
+    # Healthy trend (RSI ~60): no veto.
+    ok = late_entry_check(_healthy_trend_candles(100), None, "long", {"mtf_enabled": False})
+    assert ok["block"] is False and ok["data_ok"] is True
+
+
+def test_late_entry_pure_insufficient_data_fails_open():
+    """< min_bars_4h → data_ok False (callers must fail OPEN)."""
+    from hermes_trader.agents.ta_filter import late_entry_check
+    v = late_entry_check(_trend_candles(10), None, "long", None)
+    assert v["data_ok"] is False and v["block"] is False
+    v2 = late_entry_check(None, None, "short", None)
+    assert v2["data_ok"] is False
+
+
+def test_late_entry_pure_trend_relax_still_blocks_parabolic():
+    """Strong aligned trend widens the limits, but a parabolic stretch beyond
+    even the relaxed RSI 82 / +3.5xATR bounds is still vetoed."""
+    from hermes_trader.agents.ta_filter import late_entry_check
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    v = late_entry_check(bull, None, "long", {"mtf_enabled": False})
+    assert v["block"] is True
+    assert v["relaxed_by_trend"] is True
+    assert v["trend_direction"] == "bullish"
+    assert "relaxed limits still exceeded" in v["reason"]
+
+
+def test_late_entry_pure_mtf_override_passes_continuation():
+    """4h stretched but 15m RSI not yet extreme → continuation allowed."""
+    from hermes_trader.agents.ta_filter import late_entry_check
+    bull4h = _trend_candles(100, start=100.0, step=0.6)
+    healthy15m = _healthy_trend_candles(60)
+    v = late_entry_check(bull4h, healthy15m, "long", None)
+    assert v["block"] is False
+    assert v["mtf_passed"] is True
+    # 15m also parabolic → override denied, block stands.
+    hot15m = _trend_candles(60, start=100.0, step=0.6)
+    v2 = late_entry_check(bull4h, hot15m, "long", None)
+    assert v2["block"] is True and v2["mtf_passed"] is False
+    # mtf_enabled=False behaves like no 15m series.
+    v3 = late_entry_check(bull4h, healthy15m, "long", {"mtf_enabled": False})
+    assert v3["block"] is True and v3["mtf_passed"] is None
+    # 15m series too short → sub-check N/A, block stands on 4h alone.
+    v4 = late_entry_check(bull4h, healthy15m[:10], "long", None)
+    assert v4["block"] is True and v4["mtf_passed"] is None
+
+
+def test_late_entry_pure_short_side_mirrors():
+    """Parabolic downtrend blocks shorts only via the short-side limits."""
+    from hermes_trader.agents.ta_filter import late_entry_check
+    bear = [_mk_candle(i, 100 - i * 0.6, 101 - i * 0.6, 99 - i * 0.6,
+                       100 - i * 0.6, 1000) for i in range(100)]
+    v = late_entry_check(bear, None, "short", {"mtf_enabled": False})
+    assert v["block"] is True and v["relaxed_by_trend"] is True
+    assert v["trend_direction"] == "bearish"
+    # Long into a crash is not overbought.
+    assert late_entry_check(bear, None, "long", {"mtf_enabled": False})["block"] is False
+
+
+# ── ta_late_entry_gate: order-time hard gate (deep audit 高危项) ────────────
+
+def _le_config(mode="shadow", **over):
+    cfg = {"mode": mode, "min_bars_4h": 30, "trend_relax_enabled": True,
+           "adx_trend_threshold": 35, "rsi_ob": 75, "rsi_os": 25,
+           "ext_ob": 2.5, "ext_os": -2.5, "rsi_ob_relaxed": 82,
+           "rsi_os_relaxed": 18, "ext_ob_relaxed": 3.5, "ext_os_relaxed": -3.5,
+           "mtf_enabled": True, "min_bars_15m": 20, "rsi15m_ob": 72,
+           "rsi15m_os": 28, "fetch_bars": 100, "shadow_log_path": ""}
+    cfg.update(over)
+    return {"ta_late_entry": cfg}
+
+
+def _patch_candles(monkeypatch, c4h, c15m):
+    """Patch fetch at BOTH bindings: risk_gates imports hl_client's symbol
+    lazily, and ta_filter holds a from-import binding."""
+    import hermes_trader.client.hl_client as hl
+    import hermes_trader.agents.ta_filter as tf
+    fake = lambda coin, interval, count, *a, **k: (  # noqa: E731
+        c4h if interval == "4h" else c15m)
+    monkeypatch.setattr(hl, "fetch_hl_candles", fake)
+    monkeypatch.setattr(tf, "fetch_hl_candles", fake)
+
+
+def test_ta_late_entry_gate_disabled_without_config_block():
+    """No ta_late_entry block → zero-fetch disabled path (plain-dict configs)."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    r = ta_late_entry_gate(_ctx(), {})
+    assert r["pass"] is True and r["via"] == "ta_late_entry_disabled"
+    r2 = ta_late_entry_gate(_ctx(), {"ta_late_entry": "nope"})
+    assert r2["via"] == "ta_late_entry_disabled"
+
+
+def test_ta_late_entry_gate_mode_off():
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    r = ta_late_entry_gate(_ctx(), _le_config(mode="off"))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_off"
+
+
+def test_ta_late_entry_gate_shadow_records_but_never_blocks(monkeypatch, tmp_path):
+    """Shadow mode: would_block verdict, order still passes, JSONL appended."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    hot15 = _trend_candles(60, start=100.0, step=0.6)
+    _patch_candles(monkeypatch, bull, hot15)
+    log = tmp_path / "le_shadow.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="shadow", shadow_log_path=str(log)))
+    assert r["pass"] is True
+    assert r["via"] == "ta_late_entry_shadow" and r["would_block"] is True
+    assert "late-entry gate" in r["reason"]
+    lines = log.read_text().splitlines()
+    assert len(lines) == 1 and '"blocked": true' in lines[0]
+    assert '"coin": "TEST"' in lines[0]
+
+
+def test_ta_late_entry_gate_enforce_blocks(monkeypatch):
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    _patch_candles(monkeypatch, bull, bull)
+    r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
+    assert r["pass"] is False and r["via"] == "ta_late_entry_block"
+
+
+def test_ta_late_entry_gate_enforce_passes_healthy(monkeypatch):
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    healthy = _healthy_trend_candles(100)
+    _patch_candles(monkeypatch, healthy, healthy)
+    r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+
+
+def test_ta_late_entry_gate_mtf_override_passes_in_enforce(monkeypatch):
+    """4h parabolic but 15m healthy → MTF continuation override passes even
+    under enforce (suggestion ④: don't kill with-trend continuation)."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    bull4h = _trend_candles(100, start=100.0, step=0.6)
+    healthy15m = _healthy_trend_candles(60)
+    _patch_candles(monkeypatch, bull4h, healthy15m)
+    r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+
+
+def test_ta_late_entry_gate_fail_open_on_fetch_error(monkeypatch):
+    """Any fetch/compute failure must PASS the order (never stall execution)."""
+    import hermes_trader.client.hl_client as hl
+    import hermes_trader.agents.ta_filter as tf
+
+    def boom(*a, **k):
+        raise RuntimeError("hl down")
+    monkeypatch.setattr(hl, "fetch_hl_candles", boom)
+    monkeypatch.setattr(tf, "fetch_hl_candles", boom)
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_data_missing"
+
+
+def test_ta_late_entry_gate_fail_open_on_insufficient_data(monkeypatch):
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    short = _trend_candles(8)
+    _patch_candles(monkeypatch, short, short)
+    r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_data_missing"
+
+
+def test_ta_late_entry_registered_in_eval_all_gates(monkeypatch):
+    """The gate is wired into eval_all_gates: an enforce-mode veto blocks the
+    whole chain, and a config without the block takes the no-fetch path."""
+    from hermes_trader.agents import risk_gates
+    # enforce + parabolic 4h/15m → chain must be blocked by ta_late_entry.
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    _patch_candles(monkeypatch, bull, bull)
+    cfg = _le_config(mode="enforce")
+    cfg.update({"debate_gate": {"enabled": False}})
+    out = risk_gates.eval_all_gates(_ctx(trade_side="long"), cfg)
+    assert "ta_late_entry" in out["results"]
+    assert out["results"]["ta_late_entry"]["pass"] is False
+    assert out["blocked"] is True
+    assert any("late-entry" in r for r in out["block_reasons"])
+    # A plain dict WITHOUT the block still evaluates (disabled path, no fetch).
+    out2 = risk_gates.eval_all_gates(_ctx(), {"debate_gate": {"enabled": False}})
+    assert out2["results"]["ta_late_entry"]["via"] == "ta_late_entry_disabled"
+    assert out2["blocked"] is False
+
+
+# ── ta_late_entry config block: canonical defaults + schema validation ──────
+
+def test_ta_late_entry_canonical_config_present():
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
+    block = CANONICAL_DEFAULTS["ta_late_entry"]
+    assert block["mode"] == "shadow"  # gray release by default
+    assert block["rsi_ob"] == 75 and block["rsi_os"] == 25
+    assert block["adx_trend_threshold"] == 35
+    assert block["mtf_enabled"] is True and block["trend_relax_enabled"] is True
+
+
+def test_ta_late_entry_schema_rejects_bad_values():
+    from hermes_trader.agents.config_schema import validate_config_updates
+    errs = validate_config_updates({"ta_late_entry": {"mode": "bogus", "rsi_ob": 999}})
+    assert any("mode" in e for e in errs)
+    assert any("rsi_ob" in e for e in errs)
+    ok = validate_config_updates({"ta_late_entry": {"mode": "enforce", "rsi_ob": 70}})
+    assert ok == []
+
+
+# ── backtest parity: same pure function, closed-bar information set ─────────
+
+def test_backtest_closed_slice_uses_only_closed_higher_tf_bars():
+    """Higher-TF bars are visible only once CLOSED at the decision instant —
+    an in-progress 4h bar would leak the future (look-ahead)."""
+    import importlib.util
+    import sys as _sys
+    if "bt_under_test" not in _sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "bt_under_test", str(pathlib.Path(__file__).resolve().parents[1] / "scripts" / "backtest.py"))
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["bt_under_test"] = mod
+        spec.loader.exec_module(mod)
+    bt = _sys.modules["bt_under_test"]
+    H = 3600_000
+    ts = [i * 4 * H for i in range(5)]
+    series = [f"c{i}" for i in range(5)]
+    # decision at 12h: bars opening 0h/4h/8h (closing 4h/8h/12h) are closed.
+    assert bt._closed_slice(series, ts, 12 * H, 4 * H) == ["c0", "c1", "c2"]
+    # 1ms before: the 8h bar (closes exactly 12h) is still in progress.
+    assert bt._closed_slice(series, ts, 12 * H - 1, 4 * H) == ["c0", "c1"]
+    # Nothing closed yet → None (caller treats as data missing, not as signal).
+    assert bt._closed_slice(series, ts, 3 * H, 4 * H) is None
+    assert bt._closed_slice([], [], 12 * H, 4 * H) is None
+
+
+def test_backtest_simulate_enforces_late_entry_veto():
+    """_simulate blocks late entries via the SAME pure function and records
+    vetoes; without higher-TF data the run is unaffected."""
+    import importlib.util
+    import sys as _sys
+    if "bt_under_test" not in _sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "bt_under_test", str(pathlib.Path(__file__).resolve().parents[1] / "scripts" / "backtest.py"))
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["bt_under_test"] = mod
+        spec.loader.exec_module(mod)
+    bt = _sys.modules["bt_under_test"]
+    H = 3600_000
+    # 1h base series on the SAME ms time axis as the 4h/15m series (bar open
+    # t = i*1h); long flat stretch then a parabolic final ramp that makes
+    # every trigger fire while 4h is deeply overbought.
+    base = [_mk_candle(i * H, c.o, c.h, c.l, c.c, c.v)
+            for i, c in enumerate(_flat_candles(320))]
+    for i in range(260, 320):
+        base[i] = _mk_candle(i * H, 100 + (i - 260) * 0.8, 100 + (i - 259) * 0.8,
+                             100 + (i - 260) * 0.8 - 0.2,
+                             100 + (i - 260) * 0.8, 5000)
+    bull4h = _trend_candles(120, start=100.0, step=0.6)
+    bull4h = [_mk_candle(c.t * 4 * H, c.o, c.h, c.l, c.c, c.v) for c in bull4h]
+    hot15 = [_mk_candle(c.t * 15 * 60_000, c.o, c.h, c.l, c.c, c.v)
+             for c in _trend_candles(400, start=100.0, step=0.6)]
+    cfg = {"_interval": "1h",
+           "thresholds": {"sigmaThreshold": 2.0, "bbLength": 20, "bbStdDev": 2.0,
+                          "adxPeriod": 14, "breakoutLookback": 20,
+                          "breakoutMinRvol": 1.5, "breakoutRvolWindow": 20,
+                          "breakoutAtrScoreMult": 3.0,
+                          "momentumLookback": 10, "momentumPct": 2.0},
+           "weights": {}}
+    vetoes: list = []
+    params = {"mode": "shadow", "rsi_ob": 75, "rsi_os": 25, "ext_ob": 2.5,
+              "ext_os": -2.5, "rsi_ob_relaxed": 82, "rsi_os_relaxed": 18,
+              "ext_ob_relaxed": 3.5, "ext_os_relaxed": -3.5,
+              "adx_trend_threshold": 35, "mtf_enabled": True}
+    trades_gated = bt._simulate(
+        "TEST", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5,
+        cfg=cfg, candles_4h=bull4h, candles_15m=hot15,
+        late_entry_params=dict(params), late_vetoes=vetoes)
+    trades_plain = bt._simulate(
+        "TEST", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5, cfg=cfg)
+    # Gate vetoed at least as many entries as it removed from the trade list.
+    assert len(vetoes) > 0
+    assert len(trades_gated) <= len(trades_plain)
+    assert all(v["reason"].startswith("late ") for v in vetoes)
+    assert all(v["coin"] == "TEST" and v["side"] == "long" for v in vetoes)
+
+
 # ── executor runner-gate RSI / extension veto (P0) ──────────────────────────
 
 def _runner_gate_config(**over):

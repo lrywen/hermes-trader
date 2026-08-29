@@ -6,6 +6,7 @@ All gates are evaluated; results are collected for telemetry (no short-circuit).
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from dataclasses import dataclass
@@ -859,6 +860,190 @@ def debate_gate(
     }
 
 
+# ── ta_late_entry_gate (deep audit 高危项, 2026-08-30) ───────────────────
+# The old late-entry veto lived only in analyze_perception() — a pre-filter
+# for the PAID LLM debate that manual / MCP / API / CLI orders bypassed, and
+# whose minutes-stale TA was never re-checked at order time. This gate runs
+# the SAME late_entry_check() pure function as the pre-filter and the
+# backtest engine (one source of truth, zero rule drift), re-fetching 4h
+# (+15m) candles immediately before order placement.
+#
+# Activation: a ``ta_late_entry`` config block must be present (production
+# configs always have it via CANONICAL_DEFAULTS; plain-dict test configs
+# without the block take the zero-fetch disabled path). mode:
+#   off     → gate disabled
+#   shadow → verdict + metrics + JSONL recorded, order NEVER blocked
+#             (gray-release; run 3–7 days, reconcile would_block vs the
+#              subsequent move before flipping)
+#   enforce → late entries are blocked (hard gate)
+# Fail-OPEN: any fetch / data / compute failure (or too little 4h data)
+# passes the order — a risk gate must not stall the exchange path — and is
+# surfaced via the data_missing verdict label.
+def _record_late_entry_shadow(rec: dict[str, Any], path: str) -> None:
+    """Best-effort append a late-entry shadow verdict to the audit JSONL."""
+    import json
+    import os
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:  # noqa: BLE001
+        logger.warning(f"[risk][gates] late-entry shadow write failed: {e}")
+
+
+def ta_late_entry_gate(
+    ctx: GateContext,
+    config: dict[str, Any],
+) -> GateResult:
+    t0 = time.perf_counter()
+
+    def _done(outcome: str, result: GateResult) -> GateResult:
+        dt = time.perf_counter() - t0
+        try:
+            from hermes_trader import metrics
+            metrics.RISK_GATE_DURATION.labels(gate="ta_late_entry", outcome=outcome).observe(dt)
+        except Exception:  # noqa: BLE001
+            pass
+        if dt > 0.025:
+            logger.warning(
+                "[risk][gates] ta_late_entry slow: %.1fms outcome=%s coin=%s",
+                dt * 1000.0, outcome, ctx.coin,
+            )
+        return result
+
+    le_cfg = config.get("ta_late_entry")
+    # No block at all → gate inactive (keeps plain-dict test configs off the
+    # network entirely).
+    if not isinstance(le_cfg, dict):
+        return {"pass": True, "via": "ta_late_entry_disabled"}
+    mode = str(le_cfg.get("mode", "shadow") or "shadow").lower()
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
+    if mode == "off":
+        return _done("disabled", {"pass": True, "via": "ta_late_entry_off"})
+
+    try:
+        from concurrent.futures import ThreadPoolExecutor
+        from hermes_trader.agents.ta_filter import late_entry_check
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        n = int(le_cfg.get("fetch_bars", 100) or 100)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            f4 = pool.submit(fetch_hl_candles, ctx.coin, "4h", n)
+            f15 = pool.submit(fetch_hl_candles, ctx.coin, "15m", n)
+            candles_4h = f4.result()
+            candles_15m = f15.result()
+        verdict = late_entry_check(candles_4h, candles_15m, side, le_cfg)
+    except Exception as e:  # noqa: BLE001 — fail OPEN, never stall orders
+        logger.warning(
+            "[risk][gates] ta_late_entry fetch/compute failed for %s: %s",
+            ctx.coin, e,
+        )
+        try:
+            from hermes_trader import metrics
+            metrics.TA_LATE_ENTRY_VERDICTS.labels(
+                mode=mode, side=side, verdict="data_missing").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return _done("data_missing", {
+            "pass": True,
+            "via": "ta_late_entry_data_missing",
+            "reason": f"late-entry gate unavailable ({type(e).__name__})",
+        })
+
+    if not verdict.get("data_ok"):
+        try:
+            from hermes_trader import metrics
+            metrics.TA_LATE_ENTRY_VERDICTS.labels(
+                mode=mode, side=side, verdict="data_missing").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return _done("data_missing", {
+            "pass": True,
+            "via": "ta_late_entry_data_missing",
+            "reason": verdict.get("reason") or "insufficient 4h data",
+        })
+
+    blocked = bool(verdict.get("block"))
+    rec = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "coin": ctx.coin,
+        "side": side,
+        "mode": mode,
+        "blocked": blocked,
+        "reason": verdict.get("reason", ""),
+        "rsi4h": verdict.get("rsi4h"),
+        "adx4h": verdict.get("adx4h"),
+        "extension": verdict.get("extension"),
+        "rsi15m": verdict.get("rsi15m"),
+        "relaxed_by_trend": verdict.get("relaxed_by_trend"),
+        "mtf_passed": verdict.get("mtf_passed"),
+        "trend_direction": verdict.get("trend_direction"),
+        "entry_px": ctx.entry_px or None,
+        "confidence": ctx.confidence,
+        "outcome": None,  # filled by post-run reconciliation
+        "exit_px": None,
+        "pnl_usd": None,
+    }
+    path = str(le_cfg.get("shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_TA_LATE_ENTRY_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/ta_late_entry_shadow.jsonl"),
+    )
+    _record_late_entry_shadow(rec, path)
+
+    if not blocked:
+        try:
+            from hermes_trader import metrics
+            metrics.TA_LATE_ENTRY_VERDICTS.labels(
+                mode=mode, side=side, verdict="pass").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return _done("pass", {
+            "pass": True,
+            "via": "ta_late_entry_pass",
+            "rsi4h": verdict.get("rsi4h"),
+            "adx4h": verdict.get("adx4h"),
+        })
+
+    reason = f"late-entry gate: {verdict.get('reason', '')}".rstrip()
+    if mode == "shadow":
+        # Gray release: record the would-block verdict but do NOT stop the
+        # order. Warning level so it survives into container logs.
+        logger.warning(
+            "[risk][gates] ta_late_entry SHADOW would-block coin=%s side=%s: %s",
+            ctx.coin, side, reason,
+        )
+        try:
+            from hermes_trader import metrics
+            metrics.TA_LATE_ENTRY_VERDICTS.labels(
+                mode=mode, side=side, verdict="would_block").inc()
+        except Exception:  # noqa: BLE001
+            pass
+        return _done("shadow_block", {
+            "pass": True,  # shadow never blocks
+            "via": "ta_late_entry_shadow",
+            "would_block": True,
+            "reason": reason,
+        })
+
+    # enforce: hard block.
+    logger.info(
+        "[risk][gates] ta_late_entry BLOCK coin=%s side=%s: %s",
+        ctx.coin, side, reason,
+    )
+    try:
+        from hermes_trader import metrics
+        metrics.TA_LATE_ENTRY_VERDICTS.labels(
+            mode=mode, side=side, verdict="block").inc()
+    except Exception:  # noqa: BLE001
+        pass
+    return _done("enforce_block", {
+        "pass": False,
+        "via": "ta_late_entry_block",
+        "reason": reason,
+    })
+
+
 # Load cross-component shared config (~/.hermes-trading/config.yaml).
 # Canonical implementation lives in hermes_trader.shared_config.
 _load_shared_config = load_shared_config
@@ -983,6 +1168,11 @@ def eval_all_gates(
     )
     results["news"] = news_blackout_gate(ctx)
     results["debate"] = debate_gate(ctx, config)
+    # ta_late_entry (deep audit 高危项, 2026-08-30): hard late-entry veto
+    # re-checked at order time with FRESH candles (the pre-filter TA is
+    # minutes stale). Runs the same late_entry_check() pure function as the
+    # ta_filter pre-filter and the backtest; mode off/shadow/enforce.
+    results["ta_late_entry"] = ta_late_entry_gate(ctx, config)
 
     block_reasons = []
     blocked = False
@@ -995,6 +1185,7 @@ def eval_all_gates(
         "coin_daily_loss", "drawdown", "liquidation_buffer",
         "opposite_guard",
         "correlation", "equity_risk", "market_regime", "news", "debate",
+        "ta_late_entry",
     }
     for key, result in results.items():
         if not result.get("pass"):

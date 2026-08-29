@@ -245,6 +245,10 @@ class _ConfigPatch(BaseModel):
     # Legacy HERMES_HL_RATE_* / HERMES_HL_429_RETRIES env vars remain the
     # top-priority channel.
     hl_rate_limit: dict[str, Any] = Field(default_factory=lambda: _dict_default("hl_rate_limit"))
+    # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard-gate
+    # thresholds shared by the ta_filter pre-filter, the ta_late_entry_gate
+    # pre-trade gate and the backtest engine (one source of truth).
+    ta_late_entry: dict[str, Any] = Field(default_factory=lambda: _dict_default("ta_late_entry"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
@@ -405,6 +409,32 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "dsl_exit": _DSL_EXIT_SPEC,
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
+    "ta_late_entry": {
+        # off = gate absent; shadow = record/metrics only (gray release);
+        # enforce = late entries are actually blocked.
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        # 4h hard veto: RSI extremes OR price extension in ATR units.
+        "rsi_ob": _num_leaf(50.0, 100.0),
+        "rsi_os": _num_leaf(0.0, 50.0),
+        "ext_ob": _num_leaf(0.0, 20.0),
+        "ext_os": _num_leaf(-20.0, 0.0),
+        # Trend exception: relax the veto limits in a strong aligned trend.
+        "trend_relax_enabled": ("bool",),
+        "adx_trend_threshold": _num_leaf(0.0, 100.0),
+        "rsi_ob_relaxed": _num_leaf(50.0, 100.0),
+        "rsi_os_relaxed": _num_leaf(0.0, 50.0),
+        "ext_ob_relaxed": _num_leaf(0.0, 20.0),
+        "ext_os_relaxed": _num_leaf(-20.0, 0.0),
+        # Multi-timeframe: 15m RSI continuation override.
+        "mtf_enabled": ("bool",),
+        "rsi15m_ob": _num_leaf(50.0, 100.0),
+        "rsi15m_os": _num_leaf(0.0, 50.0),
+        # Data requirements / fetch sizing.
+        "min_bars_4h": ("int", 10, 500),
+        "min_bars_15m": ("int", 5, 500),
+        "fetch_bars": ("int", 30, 1000),
+        "shadow_log_path": ("str",),
+    },
 }
 
 
@@ -475,6 +505,9 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
     elif kind == "enum":
         if not isinstance(val, str) or val not in spec[1]:
             errors.append(f"{path}: must be one of {list(spec[1])}, got {val!r}")
+    elif kind == "str":
+        if not isinstance(val, str):
+            errors.append(f"{path}: expected string, got {type(val).__name__}")
 
 
 def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True) -> list[str]:

@@ -190,7 +190,7 @@ RISK_GATE_BLOCKS = Counter(
     "(confidence/max_concurrent/notional_cap/daily_loss/daily_giveback/"
     "liquidity/short_liquidity/coin_filter/cooldown/coin_circuit/"
     "global_halt/opposite_guard/correlation/equity_risk/market_regime/"
-    "news/debate/other).",
+    "news/debate/ta_late_entry/other).",
     ["gate"],
 )
 RISK_GATE_REGIME_VERDICTS = Counter(
@@ -199,6 +199,30 @@ RISK_GATE_REGIME_VERDICTS = Counter(
     "(aligned/neutral/chop_conviction/chop_blocked/confidence/composite/"
     "crowded_squeeze/blocked/blocked_bypass/trigger/other).",
     ["via"],
+)
+# ta_late_entry_gate (deep audit 高危项, 2026-08-30): the gate re-fetches 4h
+# (+15m) candles and recomputes RSI/ADX/ATR immediately before order
+# placement. Alert when the p95 of the whole evaluation approaches 10ms
+# (slippage budget). Bounded labels: gate is fixed; outcome ∈
+# ok/shadow_block/enforce_block/pass/data_missing/error/disabled.
+RISK_GATE_DURATION = Histogram(
+    "hermes_risk_gate_duration_seconds",
+    "Wall duration of one risk-gate evaluation, labelled by gate and "
+    "bounded outcome. Buckets centre on the 10ms late-entry recompute "
+    "budget (0.005–0.05s).",
+    ["gate", "outcome"],
+    buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
+)
+# Shadow/enforce verdicts of the late-entry gate. In shadow mode (the
+# gray-release default) would_block=1 verdicts are recorded but never stop
+# the order; compare against post-entry price action for 3-7 days before
+# flipping mode=enforce. Bounded labels: mode (off/shadow/enforce), side
+# (long/short), verdict (pass/would_block/block/data_missing).
+TA_LATE_ENTRY_VERDICTS = Counter(
+    "hermes_ta_late_entry_verdicts_total",
+    "ta_late_entry_gate verdicts, labelled by mode, side and bounded "
+    "verdict (pass/would_block/block/data_missing).",
+    ["mode", "side", "verdict"],
 )
 
 # ── Trade-side tiered circuit breakers (executor.py / memory.py) ───────
