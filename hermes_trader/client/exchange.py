@@ -75,7 +75,14 @@ def _mount_retry_adapter(session: Any) -> None:
         connect=5,
         read=5,
         backoff_factor=2.0,
-        status_forcelist=[429, 500, 502, 503, 504],
+        # C-M3 (deep audit 2026-08-28): 408 (Request Timeout) is response-
+        # unknown — the request MAY have reached HL and filled before the
+        # response was lost. Retrying POST on 408 is safe for order placement
+        # because the Cloid idempotency key makes a duplicate submission a
+        # rejected dup rather than a double fill; a GET retry is trivially
+        # safe. Without 408 in this list a dropped response surfaced as a
+        # hard error and the "maybe filled" case was never reconciled (H6).
+        status_forcelist=[408, 429, 500, 502, 503, 504],
         allowed_methods=["GET", "POST"],
         raise_on_status=False,
     )
@@ -834,6 +841,44 @@ def _ioc_cross_price(coin: str, is_buy: bool, mid_price: float) -> float:
     return mid_price * (1.01 if is_buy else 0.99)
 
 
+# C-M3/H6: exception classes whose occurrence AFTER an order request means the
+# response was lost in transit — the order MAY have reached HL and filled. A
+# 408 is HL (or a proxy) timing out the response write; ReadTimeout is our
+# socket giving up after the server accepted the request; connection/SSL
+# failures can drop the response after the request was processed. Callers
+# MUST reconcile such cases against userFills by Cloid before treating the
+# order as unfilled (H6).
+_RESPONSE_UNKNOWN_NAMES = (
+    "HTTPError",          # requests HTTP 408/5xx with a lost body
+    "ReadTimeout",
+    "Timeout",            # requests base Timeout (covers read/connect pools)
+    "ConnectTimeout",
+    "ConnectionError",
+    "SSLError",
+    "SSLEOFError",
+    "ProxyError",
+    "ChunkedEncodingError",
+)
+
+
+def _is_response_unknown_error(e: BaseException) -> bool:
+    """True if exception ``e`` marks an order whose FILL STATE is unknown.
+
+    Conservative by design: only transport/timeout/408 class failures count.
+    A 408 is matched by name ("HTTPError") plus a "408" in the message so a
+    400/401/403 (definite local rejection) is NOT misclassified.
+    """
+    name = type(e).__name__
+    if not any(s in name for s in _RESPONSE_UNKNOWN_NAMES):
+        return False
+    if name == "HTTPError":
+        msg = str(e)
+        # Only 408 (and, defensively, 5xx gateways that drop the response)
+        # are ambiguous. A 400/401/403 means HL definitively rejected.
+        return ("408" in msg) or ("502" in msg) or ("503" in msg) or ("504" in msg)
+    return True
+
+
 def place_hl_order(
     is_buy: bool,
     size: float,
@@ -945,6 +990,17 @@ def place_hl_order(
                         pass
         return parsed
     except Exception as e:
+        # C-M3/H6: classify the failure. A transport/timeout/408-class error
+        # means the order may have reached HL and FILLED even though we got no
+        # response — tag it response_unknown so the executor reconciles via
+        # userFills before giving up (an untagged failure is a definite local
+        # / envelope rejection: no order exists on the exchange).
+        if _is_response_unknown_error(e):
+            logger.error(
+                f"[place_hl_order] {coin} response UNKNOWN after submit "
+                f"(order may be filled): {type(e).__name__}: {e}")
+            return {"ok": False, "error": str(e),
+                    "error_code": "response_unknown"}
         logger.error(f"Failed to place order for {coin}: {e}")
         return {"ok": False, "error": str(e)}
 
@@ -1044,6 +1100,12 @@ def place_hl_trigger_order(
         return parsed
     except Exception as e:
         logger.error(f"[place_hl_trigger_order] EXCEPTION {coin} kind={kind}: {e}")
+        # C-M3: a reduce-only trigger lost to 408/timeout means the SL/TP may
+        # not be armed — tag response_unknown so callers (DSL backup-SL re-arm
+        # cycle) can retry rather than assume the bracket is in place.
+        if _is_response_unknown_error(e):
+            return {"ok": False, "error": str(e),
+                    "error_code": "response_unknown"}
         return {"ok": False, "error": str(e)}
 
 
@@ -1230,6 +1292,133 @@ def verify_order_exists(
             "in_user_fills": False,
             "reason": f"verify_exception: {e!r}",
         }
+
+
+def reconcile_order_fill(
+    coin: str,
+    cloid: Optional[Any] = None,
+    oid: Optional[str] = None,
+    is_buy: Optional[bool] = None,
+    expect_size: Optional[float] = None,
+    retries: int = 3,
+    retry_delay_s: float = 1.0,
+    user: Optional[str] = None,
+) -> dict[str, Any]:
+    """H6: decide whether an order whose RESPONSE WAS LOST actually filled.
+
+    Called after place_hl_order returned error_code="response_unknown"
+    (408/timeout/SSL drop — the order request may have reached HL and been
+    matched even though we never got the envelope). Polls userFills (newest
+    first) matching the Cloid/oid and aggregates the REAL fill economics so
+    the caller can register the position at the true avgPx/sz instead of the
+    requested price.
+
+    Returns a dict (never raises):
+      • status="filled":    {"status","avg_px","total_sz","filled_at_ms",
+                             "oid","cloid","n_fills"}
+      • status="not_filled": {"status","reason"} — no matching fill after
+                             retries (the order truly did not execute)
+      • status="unknown":   {"status","reason"} — the LOOKUP itself failed
+                             (network/parse), so fill state stays ambiguous;
+                             the caller must fall back to rehydrate + halt.
+
+    `is_buy`/`expect_size` narrow the match defensively when known (a fill on
+    the wrong side or with wildly wrong size would indicate a stale Cloid).
+    """
+    cloid_str = str(cloid) if cloid is not None else None
+    if not cloid_str and not oid:
+        return {"status": "unknown", "reason": "no_cloid_or_oid_to_reconcile"}
+    try:
+        user = user or resolve_user_address()
+        if not user:
+            return {"status": "unknown", "reason": "no_user_address"}
+    except Exception as e:
+        return {"status": "unknown", "reason": f"user_resolve_exception: {e!r}"}
+
+    want_side = "B" if is_buy else ("A" if is_buy is False else None)
+    last_reason = "no_matching_fill"
+    for attempt in range(max(1, retries)):
+        try:
+            fills = _http_post(
+                "/info", {"type": "userFills", "user": user, "limit": 50},
+                timeout=8,
+            )
+        except Exception as e:
+            last_reason = f"userFills_fetch_exception: {e!r}"
+            fills = None
+        matched: list[dict[str, Any]] = []
+        if isinstance(fills, list):
+            for f in fills:
+                if not isinstance(f, dict) or f.get("coin") != coin:
+                    continue
+                hit = False
+                if cloid_str and str(f.get("cloid") or "") == cloid_str:
+                    hit = True
+                if oid and str(f.get("oid") or "") == str(oid):
+                    hit = True
+                if not hit:
+                    continue
+                if want_side is not None and f.get("side") not in (want_side, None):
+                    # Same Cloid/oid but opposite side — treat as no match
+                    # (stale/foreign fill); safer to fall through than adopt
+                    # the wrong economics.
+                    continue
+                matched.append(f)
+        if matched:
+            # userFills is newest-first; the OPENING order's fills are the
+            # most recent matches. Aggregate weighted avg price + total size.
+            tot_sz = 0.0
+            tot_notional = 0.0
+            latest_ms = 0
+            fill_oid = None
+            n = 0
+            for f in matched:
+                try:
+                    sz = float(f.get("sz") or 0.0)
+                    px = float(f.get("px") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if sz <= 0 or px <= 0:
+                    continue
+                tot_sz += sz
+                tot_notional += sz * px
+                try:
+                    tms = int(f.get("time") or 0)
+                except (TypeError, ValueError):
+                    tms = 0
+                if tms > latest_ms:
+                    latest_ms = tms
+                if fill_oid is None and f.get("oid") is not None:
+                    fill_oid = f.get("oid")
+                n += 1
+            if n and tot_sz > 0:
+                avg_px = tot_notional / tot_sz
+                # Defensive size check: a fill wildly larger than requested
+                # (>0.5% over, beyond rounding to HL's size tick) signals a
+                # Cloid/oid collision — stay ambiguous rather than register
+                # a phantom size.
+                if expect_size is not None and expect_size > 0 and tot_sz > expect_size * 1.005:
+                    return {"status": "unknown",
+                            "reason": (f"fill_sz {tot_sz} >> requested {expect_size}; "
+                                       f"possible id mismatch")}
+                return {
+                    "status": "filled",
+                    "avg_px": avg_px,
+                    "total_sz": tot_sz,
+                    "filled_at_ms": latest_ms or None,
+                    "oid": str(fill_oid) if fill_oid is not None else (str(oid) if oid else None),
+                    "cloid": cloid_str,
+                    "n_fills": n,
+                }
+        # No fill yet — an IOC settles in <1s but a lagging fill index can
+        # take a couple of seconds; wait and re-poll.
+        if attempt < max(1, retries) - 1:
+            _time.sleep(max(0.0, retry_delay_s))
+    # Polls completed without a fetch error and no fill → the order did not
+    # execute (HL rejects rather than queues a non-matching IOC).
+    if last_reason == "no_matching_fill":
+        return {"status": "not_filled", "reason": last_reason}
+    return {"status": "unknown", "reason": last_reason}
 
 
 def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int] = None) -> dict[str, Any]:

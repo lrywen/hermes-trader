@@ -171,6 +171,28 @@ _pending_sl_retries: dict[str, dict[str, Any]] = {}
 _EXEC_LOCK = threading.Lock()
 _IN_FLIGHT_ANALYSES: set = set()
 
+# H6/C-M3: streak of order placements whose response was LOST (408/timeout)
+# AND whose fill could not be confirmed either way (reconcile lookup itself
+# failed). A confirmed fill and a confirmed non-fill both RESET the streak —
+# the exchange was reachable and answered. Only "deaf exchange" outcomes
+# count; at the configured threshold the executor arms the global halt so a
+# connectivity outage can't keep spraying order requests into the void.
+_RESP_UNKNOWN_LOCK = threading.Lock()
+_resp_unknown_streak: int = 0
+
+
+def _bump_resp_unknown_streak() -> int:
+    global _resp_unknown_streak
+    with _RESP_UNKNOWN_LOCK:
+        _resp_unknown_streak += 1
+        return _resp_unknown_streak
+
+
+def _reset_resp_unknown_streak() -> None:
+    global _resp_unknown_streak
+    with _RESP_UNKNOWN_LOCK:
+        _resp_unknown_streak = 0
+
 
 # ── P0-4: liquidation-price pre-place gate ────────────────────────────
 # A position whose existing liquidation price is already less than
@@ -2084,15 +2106,140 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
     if not order_res.get("ok"):
-        # Order was not accepted/filled — no exchange position exists, so it is
-        # safe to clear the in-flight marker and allow a later retry.
-        with _EXEC_LOCK:
-            _IN_FLIGHT_ANALYSES.discard(_aid)
-        return {
-            "executed": False, "mode": mode, "analysis_id": analysis["id"],
-            "reason": f"order_failed: {order_res.get('error', 'unknown')}",
-            "gate_results": gate_output["results"],
-        }
+        # H6: a DEFINITE failure (HL envelope rejection, slippage cap, local
+        # validation) means no order exists on the exchange → clear the marker
+        # and allow a later retry. But error_code="response_unknown" (408 /
+        # read timeout / SSL drop after submit) is ambiguous: the order MAY
+        # have reached HL and FILLED before the response was lost, and the
+        # cloid idempotency key means HL would reject a blind retry as a dup
+        # only if it HAS the order — giving us no signal. Reconcile against
+        # userFills by Cloid before deciding.
+        if order_res.get("error_code") == "response_unknown" and _cloid is not None:
+            try:
+                from hermes_trader.client.exchange import reconcile_order_fill
+                _rc = reconcile_order_fill(
+                    coin=coin, cloid=_cloid,
+                    is_buy=is_buy, expect_size=float(size_in_coin or 0.0) or None,
+                )
+            except Exception as _rc_e:
+                _rc = {"status": "unknown", "reason": f"reconcile_exception: {_rc_e!r}"}
+                logger.warning(f"[executor] H6 reconcile raised for {coin}: {_rc_e!r}")
+
+            if _rc.get("status") == "filled":
+                # The order DID fill despite the lost response. Backfill the
+                # result with the REAL fill economics and FALL THROUGH into
+                # the normal success path below so register_position /
+                # record_trade / backup-SL all run exactly once with true
+                # avgPx/total_sz — no duplicated registration logic.
+                _reset_resp_unknown_streak()
+                logger.warning(
+                    f"[executor] H6 RECONCILED {coin} fill after response loss: "
+                    f"avg_px={_rc.get('avg_px')} total_sz={_rc.get('total_sz')} "
+                    f"n={_rc.get('n_fills')} oid={_rc.get('oid')} — registering "
+                    f"from userFills (no orphan)."
+                )
+                try:
+                    from hermes_trader import notify
+                    notify.send_text(
+                        f"⚠️ H6 下单响应丢失但已成交，已补登: {coin} "
+                        f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
+                        f"oid={_rc.get('oid')}", category="risk")
+                except Exception:
+                    pass
+                order_res = {
+                    "ok": True,
+                    "order_id": _rc.get("oid"),
+                    "cloid": str(_cloid),
+                    "avg_px": float(_rc.get("avg_px") or 0.0),
+                    "total_sz": float(_rc.get("total_sz") or 0.0),
+                    "filled_at_ms": _rc.get("filled_at_ms"),
+                    "reconciled_after_response_unknown": True,
+                }
+            elif _rc.get("status") == "not_filled":
+                # Exchange answered cleanly and has no fill → the order truly
+                # did not execute. Safe to clear + retry later.
+                _reset_resp_unknown_streak()
+                logger.info(f"[executor] H6 reconcile {coin}: confirmed NOT filled "
+                            f"after response loss ({_rc.get('reason')}); safe to retry.")
+                with _EXEC_LOCK:
+                    _IN_FLIGHT_ANALYSES.discard(_aid)
+                return {
+                    "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                    "reason": f"order_failed_response_unknown_not_filled: {order_res.get('error', 'unknown')}",
+                    "gate_results": gate_output["results"],
+                }
+            else:
+                # The LOOKUP itself failed — we cannot tell filled from
+                # unfilled. Shrink the orphan window immediately via rehydrate
+                # (a real fill gets a synthetic tracker on this same tick),
+                # count the deaf-exchange streak, and halt auto entries at the
+                # configured threshold so we don't keep spraying orders.
+                _streak = _bump_resp_unknown_streak()
+                logger.error(
+                    f"[executor] H6 reconcile UNRESOLVED for {coin} "
+                    f"(streak={_streak}): {_rc.get('reason')} — fill state "
+                    f"unknown; running immediate rehydrate."
+                )
+                try:
+                    from hermes_trader.agents.dsl_exit import rehydrate_from_exchange
+                    _rstate = fetch_account_state(user)
+                    _rpositions = _rstate.get("asset_positions", []) or []
+                    rehydrate_from_exchange(
+                        _rpositions,
+                        default_leverage=int(config.get("leverage", 1) or 1),
+                        queried_dexes={""},
+                        user=user,
+                    )
+                except Exception as _rh_e:
+                    logger.error(f"[executor] H6 immediate rehydrate failed: {_rh_e}")
+                try:
+                    _halt_n = int(cfg_get(
+                        "circuit_breaker.resp_unknown_halt_n",
+                        config=config, default=3) or 0)
+                except Exception:
+                    _halt_n = 3
+                if _halt_n > 0 and _streak >= _halt_n:
+                    try:
+                        _halt_min = float(cfg_get(
+                            "circuit_breaker.resp_unknown_halt_min",
+                            config=config, default=60.0) or 60.0)
+                    except Exception:
+                        _halt_min = 60.0
+                    try:
+                        _until = int(time.time() * 1000 + _halt_min * 60_000)
+                        memory.set_global_halt(_until)
+                        logger.critical(
+                            f"[executor] C-M3: {_streak} consecutive response-unknown "
+                            f"order outcomes → GLOBAL HALT {_halt_min:.0f}min "
+                            f"(exchange unreachable / not answering).")
+                        try:
+                            from hermes_trader import notify
+                            notify.send_text(
+                                f"🛑 C-M3 连续 {_streak} 次下单响应未知且无法核对，"
+                                f"暂停自动开仓 {_halt_min:.0f} 分钟（交易所连接异常）",
+                                category="risk")
+                        except Exception:
+                            pass
+                    except Exception as _h_e:
+                        logger.error(f"[executor] C-M3 halt arm failed: {_h_e}")
+                with _EXEC_LOCK:
+                    _IN_FLIGHT_ANALYSES.discard(_aid)
+                return {
+                    "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                    "reason": f"order_response_unknown_unresolved: {order_res.get('error', 'unknown')}",
+                    "reconcile": _rc,
+                    "gate_results": gate_output["results"],
+                }
+        else:
+            # Definite rejection / envelope error — no order on the exchange.
+            _reset_resp_unknown_streak()
+            with _EXEC_LOCK:
+                _IN_FLIGHT_ANALYSES.discard(_aid)
+            return {
+                "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                "reason": f"order_failed: {order_res.get('error', 'unknown')}",
+                "gate_results": gate_output["results"],
+            }
 
     # Phase-1: local state persistence — wrap in try/except to prevent
     # orphaned positions (exchange has position but local state doesn't).

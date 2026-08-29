@@ -619,6 +619,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # daily-loss gate cannot cover: a slow multi-day grind down trips no
         # single day's limit but still blows the account). <=0 disables.
         "max_drawdown_pct": 15.0,
+        # H6/C-M3 (deep audit 2026-08-28): after an order placement whose
+        # response was LOST (408/read-timeout/SSL drop), the executor polls
+        # userFills to decide filled vs not-filled. When the exchange itself
+        # is unreachable the outcome stays unknown (a possible orphan); N
+        # consecutive unresolvable outcomes trigger a global auto-entry halt
+        # for halt_min minutes so we stop spraying orders at a deaf exchange.
+        # halt_n <= 0 disables the halt (rehydrate still runs each time).
+        "resp_unknown_halt_n": 3,
+        "resp_unknown_halt_min": 60.0,
     },
     # R13-A1: perception scan-tick block (TRIGGER_CONFIG["scan"], perception.py
     # L216-269). Previously implicit: the keys lived only in the module-level

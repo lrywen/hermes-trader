@@ -143,7 +143,10 @@ def _get_session() -> "requests.Session":
                     pool_maxsize=32,
                     max_retries=requests.adapters.Retry(
                         total=2, backoff_factor=0.3,
-                        status_forcelist=[502, 503, 504],
+                        # C-M3: 408 is response-unknown; GET/POST info calls
+                        # are read-side (and order POST carries Cloid), so a
+                        # retry cannot double-submit. See exchange.py H6 notes.
+                        status_forcelist=[408, 502, 503, 504],
                         allowed_methods=["POST"],
                     ),
                 )
