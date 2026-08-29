@@ -203,6 +203,19 @@ class _ConfigPatch(BaseModel):
     # future timeout and the per-source fetch timeout family. Legacy
     # HERMES_RESEARCH_* env vars remain the top-priority channel.
     research_fetch: dict[str, Any] = Field(default_factory=lambda: _dict_default("research_fetch"))
+    # R13-B11: memory equity quality-gate knobs (memory.py). Seven keys: the
+    # track_daily_pnl partial-dex degraded-read filter (implausible fraction,
+    # crash fraction, filter window, re-confirm streak), the exit-slip
+    # lookback window / min samples, and the flush throttle. Legacy
+    # HERMES_EQUITY_CRASH_DOWN_PCT / HERMES_MEMORY_FLUSH_THROTTLE_S env vars
+    # remain the top-priority channel.
+    memory_quality: dict[str, Any] = Field(default_factory=lambda: _dict_default("memory_quality"))
+    # R13-B11: dashboard equity read-side quality-gate knobs (dashboard.py).
+    # Four keys: equity-curve dip flag ratio / trailing window, summary
+    # heartbeat staleness threshold, closed-trades dedup window. Legacy
+    # HERMES_EQUITY_DIP_RATIO / HERMES_EQUITY_DIP_WINDOW /
+    # HERMES_CLOSED_TRADES_DEDUP_MS env vars remain the top-priority channel.
+    dashboard_equity: dict[str, Any] = Field(default_factory=lambda: _dict_default("dashboard_equity"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

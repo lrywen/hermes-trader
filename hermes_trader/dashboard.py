@@ -376,9 +376,12 @@ def _summary_payload() -> dict[str, Any]:
 
     # Heuristic status: "scanning" if a heartbeat hit in the last 3min;
     # "stale" if older; "offline" if no heartbeat ever.
+    # R13-B11: staleness threshold resolves through
+    # dashboard_equity.stale_tick_age_s (180s literal as fallback).
+    stale_after_s = int(_dashboard_equity_params()["stale_tick_age_s"])
     if not heartbeat:
         status = "offline"
-    elif last_tick_age_s is None or last_tick_age_s > 180:
+    elif last_tick_age_s is None or last_tick_age_s > stale_after_s:
         status = "stale"
     else:
         status = "scanning"
@@ -937,7 +940,9 @@ def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
             rows.append(_row_from_outcome_close(rec, _estimate_leverage))
 
     # ── De-duplicate cross-source reports of the same fill (see helper) ──
-    dedup_window_ms = int(os.environ.get("HERMES_CLOSED_TRADES_DEDUP_MS", "5000"))
+    # R13-B11: window resolves through dashboard_equity.dedup_window_ms (legacy
+    # HERMES_CLOSED_TRADES_DEDUP_MS env still wins; 5000ms literal as fallback).
+    dedup_window_ms = int(_dashboard_equity_params()["dedup_window_ms"])
     return _deduplicate_close_rows(rows, dedup_window_ms)[:limit]
 
 
@@ -949,6 +954,87 @@ def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
 # it rather than silently dropping it, so a real drawdown stays visible.
 _EQUITY_DIP_RATIO = float(os.environ.get("HERMES_EQUITY_DIP_RATIO", "0.7"))
 _EQUITY_DIP_WINDOW = int(os.environ.get("HERMES_EQUITY_DIP_WINDOW", "15"))
+
+# R13-B11: dashboard equity read-side quality-gate tunables. The dip ratio /
+# window literals stay as live module globals (tests monkeypatch.setattr
+# _EQUITY_DIP_RATIO, so the fallback layer is read from globals() at call
+# time rather than baked into a defaults table); the heartbeat staleness
+# threshold and the closed-trades dedup window were bare literals (180 /
+# 5000). Every value is also reachable via the dashboard_equity canonical
+# block, with the legacy HERMES_* env vars kept as the top-priority channel.
+# leaf -> (legacy env var or None, kind "i"/"f", minimum guard).
+_DASHBOARD_EQUITY_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "dip_ratio": ("HERMES_EQUITY_DIP_RATIO", "f", 0.0),
+    "dip_window": ("HERMES_EQUITY_DIP_WINDOW", "i", 1),
+    "stale_tick_age_s": (None, "i", 0),
+    "dedup_window_ms": ("HERMES_CLOSED_TRADES_DEDUP_MS", "i", 0),
+}
+
+
+def _dashboard_equity_defaults() -> dict[str, Any]:
+    """Live literal fallback layer for the dashboard equity gate.
+
+    dip_ratio / dip_window read the module globals fresh on every call so a
+    monkeypatch.setattr (test_cleanup dip tests) keeps taking effect; the
+    other two literals are constants. Returns an independent dict copy."""
+    return {
+        "dip_ratio": globals().get("_EQUITY_DIP_RATIO", 0.7),
+        "dip_window": globals().get("_EQUITY_DIP_WINDOW", 15),
+        "stale_tick_age_s": 180,
+        "dedup_window_ms": 5000,
+    }
+
+
+# dip_ratio / dip_window have a live module global (test_cleanup monkeypatches
+# it via setattr): the canonical default must NOT mask the live global, so an
+# unconfigured cfg_get result is treated as "fall back to the live literal"
+# while an explicit HERMES_CFG_ env / config-dict value still wins.
+_DASHBOARD_EQUITY_LIVE_GLOBAL_LEAVES = frozenset(("dip_ratio", "dip_window"))
+
+
+def _dashboard_equity_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the four dashboard equity quality-gate knobs (independent copy).
+
+    R13-B11: per leaf, a non-empty legacy env var wins
+    (HERMES_EQUITY_DIP_RATIO / HERMES_EQUITY_DIP_WINDOW /
+    HERMES_CLOSED_TRADES_DEDUP_MS), then cfg_get covers
+    HERMES_CFG_DASHBOARD_EQUITY__<LEAF> env and the agent-config dict, then
+    the live literal (read from module globals for dip_ratio/dip_window so a
+    monkeypatch.setattr keeps working). Ints/floats are coerced and must clear
+    the minimum guard. Any failure returns a fresh literal copy so a dashboard
+    render never raises.
+    """
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
+    defaults = _dashboard_equity_defaults()
+    try:
+        p = dict(defaults)
+        for leaf, (legacy_env, kind, min_v) in _DASHBOARD_EQUITY_SPEC.items():
+            raw: Any = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                got = cfg_get(f"dashboard_equity.{leaf}", config=config)
+                # An unconfigured leaf resolves to the registered canonical
+                # literal; for live-global leaves that literal must defer to
+                # the module global (already in p), so skip it. An explicit
+                # HERMES_CFG_ env / config-dict value differs -> it wins.
+                if leaf in _DASHBOARD_EQUITY_LIVE_GLOBAL_LEAVES:
+                    canon = CANONICAL_DEFAULTS["dashboard_equity"][leaf]
+                    try:
+                        if got is None or float(got) == float(canon):
+                            continue
+                    except (TypeError, ValueError):
+                        continue
+                raw = got
+            if raw is None:
+                continue
+            v: Any = int(raw) if kind == "i" else float(raw)
+            if v >= min_v:
+                p[leaf] = v
+        return p
+    except Exception as e:
+        logger.debug(f"[dashboard] dashboard_equity params read failed, using literals: {e}")
+        return dict(defaults)
 
 
 def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
@@ -962,6 +1048,13 @@ def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
     global) median preserves genuine gradual growth across the window.
     """
     from statistics import median
+
+    # R13-B11: dip ratio / trailing window resolve through the
+    # dashboard_equity block; the helper reads _EQUITY_DIP_RATIO /
+    # _EQUITY_DIP_WINDOW live as fallbacks so monkeypatch.setattr still works.
+    _q = _dashboard_equity_params()
+    dip_ratio = _q["dip_ratio"]
+    dip_window = _q["dip_window"]
 
     cutoff = int(time.time() * 1000) - range_s * 1000
     raw: list[tuple] = []
@@ -979,12 +1072,12 @@ def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
     window: list[float] = []  # last N accepted equities (trailing reference)
     for ts, eq in raw:
         ref = median(window) if window else eq
-        degraded = bool(window) and eq < _EQUITY_DIP_RATIO * ref
+        degraded = bool(window) and eq < dip_ratio * ref
         series.append({"ts": ts, "equity": round(eq, 2),
                        "flag": "degraded" if degraded else "ok"})
         if not degraded:
             window.append(eq)
-            if len(window) > _EQUITY_DIP_WINDOW:
+            if len(window) > dip_window:
                 window.pop(0)
     return series
 

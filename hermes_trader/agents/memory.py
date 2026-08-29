@@ -139,6 +139,64 @@ def _memory_limits() -> dict[str, int]:
     }
 
 
+# R13-B11: equity data-quality gate tunables. The literals below mirror the
+# values previously hardcoded in track_daily_pnl (_IMPLAUSIBLE_PCT = 0.25, the
+# `< 180` window, `streak < 2`), the avg_exit_slip_bps signature defaults
+# (days=30.0, min_samples=3) and the FLUSH_THROTTLE_S module constant (0.2);
+# they stay as the final fallback layer. CRASH_DOWN_PCT_DEFAULT /
+# FLUSH_THROTTLE_S also carry their legacy env-var defaults (kept as the
+# top-priority channel by _memory_quality_params for operator/test compat).
+_MEMORY_QUALITY_DEFAULTS: dict[str, Any] = {
+    "implausible_pct": 0.25,
+    "crash_down_pct": 0.40,
+    "filter_window_sec": 180,
+    "reconfirm_streak": 2,
+    "slip_window_days": 30.0,
+    "slip_min_samples": 3,
+    "flush_throttle_s": 0.2,
+}
+# leaf -> (legacy env var or None, kind "i"/"f", minimum guard).
+_MEMORY_QUALITY_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "implausible_pct": (None, "f", 0.0),
+    "crash_down_pct": ("HERMES_EQUITY_CRASH_DOWN_PCT", "f", 0.0),
+    "filter_window_sec": (None, "i", 0),
+    "reconfirm_streak": (None, "i", 1),
+    "slip_window_days": (None, "f", 0.0),
+    "slip_min_samples": (None, "i", 1),
+    "flush_throttle_s": ("HERMES_MEMORY_FLUSH_THROTTLE_S", "f", 0.0),
+}
+
+
+def _memory_quality_params() -> dict[str, Any]:
+    """Resolve the seven memory equity quality-gate knobs (independent copy).
+
+    R13-B11: per leaf, a non-empty legacy env var wins
+    (HERMES_EQUITY_CRASH_DOWN_PCT / HERMES_MEMORY_FLUSH_THROTTLE_S — operator
+    /test compat), then cfg_get covers HERMES_CFG_MEMORY_QUALITY__<LEAF> env
+    and the agent-config dict, then the inline literal. Ints/floats are
+    coerced and must clear the minimum guard. Any failure returns a fresh
+    literal copy so the equity hot path never raises.
+    """
+    from hermes_trader.agents.config_store import cfg_get
+    p = dict(_MEMORY_QUALITY_DEFAULTS)
+    try:
+        for leaf, (legacy_env, kind, min_v) in _MEMORY_QUALITY_SPEC.items():
+            raw: Any = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                raw = cfg_get(f"memory_quality.{leaf}")
+            if raw is None:
+                continue
+            v: Any = int(raw) if kind == "i" else float(raw)
+            if v >= min_v:
+                p[leaf] = v
+    except Exception as e:
+        logger.debug(f"[memory] memory_quality params read failed, using literals: {e}")
+        return dict(_MEMORY_QUALITY_DEFAULTS)
+    return p
+
+
 class AgentMemory:
     """Singleton — persistent in-memory state + disk persistence."""
 
@@ -461,7 +519,10 @@ class AgentMemory:
         if not force:
             if not self._dirty:
                 return
-            if (time.monotonic() - self._last_flush_ts) < FLUSH_THROTTLE_S:
+            # R13-B11: throttle now resolves through memory_quality.flush_throttle_s
+            # (legacy HERMES_MEMORY_FLUSH_THROTTLE_S env still wins); FLUSH_THROTTLE_S
+            # remains as the helper's literal fallback symbol.
+            if (time.monotonic() - self._last_flush_ts) < _memory_quality_params()["flush_throttle_s"]:
                 return
         # P3-1: time the actual write path only — gated skips are not flushes.
         _t0 = time.monotonic()
@@ -677,10 +738,16 @@ class AgentMemory:
         #      implausible reading to RE-CONFIRM once before accepting. A
         #      one-tick partial-dex blip stays rejected; a sustained move
         #      (even a slower crash) is accepted on the very next tick.
-        _IMPLAUSIBLE_PCT = 0.25
-        _CRASH_DOWN_PCT = float(os.environ.get("HERMES_EQUITY_CRASH_DOWN_PCT", "0.40"))
+        # R13-B11: the four filter knobs resolve through the memory_quality
+        # block (legacy HERMES_EQUITY_CRASH_DOWN_PCT env still wins); the
+        # literals live in _MEMORY_QUALITY_DEFAULTS as the final fallback.
+        _q = _memory_quality_params()
+        _IMPLAUSIBLE_PCT = _q["implausible_pct"]
+        _CRASH_DOWN_PCT = _q["crash_down_pct"]
+        _FILTER_WINDOW_S = _q["filter_window_sec"]
+        _RECONFIRM_STREAK = _q["reconfirm_streak"]
         if (prev_eq > 0 and current_equity > 0
-                and (now_s - prev_ts) < 180):
+                and (now_s - prev_ts) < _FILTER_WINDOW_S):
             move_frac = (current_equity - prev_eq) / prev_eq
             if move_frac <= -_CRASH_DOWN_PCT:
                 logger.critical(
@@ -692,7 +759,7 @@ class AgentMemory:
             elif abs(move_frac) > _IMPLAUSIBLE_PCT:
                 streak = getattr(self, "_eq_implausible_streak", 0) + 1
                 self._eq_implausible_streak = streak
-                if streak < 2:
+                if streak < _RECONFIRM_STREAK:
                     logger.error(
                         f"[memory] IMPLAUSIBLE equity swing ${prev_eq:.2f} -> "
                         f"${current_equity:.2f} ({move_frac*100:+.1f}%) in "
@@ -991,13 +1058,22 @@ class AgentMemory:
         self._day_realized_usd = day_totals
         self._day_stats_start_ts = day_start
 
-    def avg_exit_slip_bps(self, coin: str, days: float = 30.0,
-                          min_samples: int = 3) -> float:
+    def avg_exit_slip_bps(self, coin: str, days: Optional[float] = None,
+                          min_samples: Optional[int] = None) -> float:
         """Mean adverse exit slippage in bps over the last `days` for `coin`.
         Returns 0.0 when there are fewer than `min_samples` qualifying closes
         (insufficient history → do not widen on noise). P1-6: scans only the
         coin's bounded adverse-slip deque (≤ the configured closes limit,
-        already coin/adverse-filtered) instead of the full _closes list."""
+        already coin/adverse-filtered) instead of the full _closes list.
+
+        R13-B11: when not passed explicitly, the lookback window and minimum
+        sample bar resolve from the memory_quality block
+        (slip_window_days=30.0 / slip_min_samples=3 literals as fallback)."""
+        _q = _memory_quality_params()
+        if days is None:
+            days = _q["slip_window_days"]
+        if min_samples is None:
+            min_samples = _q["slip_min_samples"]
         cutoff = time.time() - days * 86400.0
         with self._lock:
             self._ensure_close_stats_nolock()

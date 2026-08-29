@@ -449,6 +449,52 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "trades": 0,
         },
     },
+    # R13-B11: memory equity quality-gate knobs (memory.py). Seven leaves:
+    # the track_daily_pnl partial-dex degraded-read filter (implausible move
+    # fraction, immediate-accept crash fraction, the same-tick filter window,
+    # and the re-confirm streak), the avg_exit_slip_bps lookback window in
+    # days and its minimum-sample bar, and the non-forced flush throttle in
+    # seconds. They were previously a bare `_IMPLAUSIBLE_PCT = 0.25` literal
+    # and `< 180` / `streak < 2` literals in track_daily_pnl, the
+    # `days=30.0` / `min_samples=3` signature defaults of avg_exit_slip_bps,
+    # and module-load os.environ.get reads
+    # (HERMES_EQUITY_CRASH_DOWN_PCT / HERMES_MEMORY_FLUSH_THROTTLE_S) — never
+    # in CANONICAL_DEFAULTS. memory._memory_quality_params() keeps the two
+    # legacy env vars as the top-priority override, then falls through to
+    # this block via cfg_get (HERMES_CFG_MEMORY_QUALITY__* env +
+    # agent-config); the literals remain as the final fallback. Defaults
+    # mirror the memory.py literals verbatim; behaviour unchanged.
+    "memory_quality": {
+        "implausible_pct": 0.25,
+        "crash_down_pct": 0.40,
+        "filter_window_sec": 180,
+        "reconfirm_streak": 2,
+        "slip_window_days": 30.0,
+        "slip_min_samples": 3,
+        "flush_throttle_s": 0.2,
+    },
+    # R13-B11: dashboard equity read-side quality-gate knobs (dashboard.py).
+    # Four leaves: the equity-curve dip flag ratio and trailing reference
+    # window (_equity_curve_payload partial-dex degraded-point flagging), the
+    # summary heartbeat staleness threshold in seconds (_summary_payload
+    # "scanning"/"stale" status), and the closed-trades cross-source
+    # de-duplication window in ms (_closed_trades_payload). They were
+    # previously module-load os.environ.get reads
+    # (HERMES_EQUITY_DIP_RATIO / HERMES_EQUITY_DIP_WINDOW /
+    # HERMES_CLOSED_TRADES_DEDUP_MS) and a bare `> 180` literal — never in
+    # CANONICAL_DEFAULTS. dashboard._dashboard_equity_params() keeps every
+    # legacy env var as the top-priority override, then falls through to this
+    # block via cfg_get (HERMES_CFG_DASHBOARD_EQUITY__* env + agent-config);
+    # the module-level _EQUITY_DIP_RATIO / _EQUITY_DIP_WINDOW attributes stay
+    # (tests monkeypatch.setattr them) and are read live as the literal
+    # fallback layer. Defaults mirror the dashboard.py literals verbatim;
+    # behaviour unchanged.
+    "dashboard_equity": {
+        "dip_ratio": 0.7,
+        "dip_window": 15,
+        "stale_tick_age_s": 180,
+        "dedup_window_ms": 5000,
+    },
     # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
     # SL ratchet coordination); and the funding-rate history lookback window
     # in hours (research display / against-funding context).
