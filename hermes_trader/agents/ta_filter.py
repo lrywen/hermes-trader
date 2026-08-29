@@ -227,16 +227,9 @@ def late_entry_check(
         rsi_hit = rsi4h is not None and rsi4h < rsi_limit
         ext_hit = extension is not None and extension < ext_limit
 
-    if not (rsi_hit or ext_hit):
-        return result
-
-    why = []
-    if rsi_hit:
-        why.append(f"RSI {rsi4h:.0f}{'>' if is_long else '<'}{rsi_limit:.0f}")
-    if ext_hit:
-        why.append(f"extension {'+' if extension > 0 else ''}{extension:.1f}xATR")
-
-    # ── Rule 3: multi-timeframe override (15m impulse still has room) ─────
+    # ── Rule 3 prep: compute 15m RSI whenever data is available. Done before
+    # the not-stretched early return so the shadow log / gate always record the
+    # small-frame reading (cheap RSI; needed for shadow-period analysis).
     rsi15m: Optional[float] = None
     mtf_passed: Optional[bool] = None
     mtf_enabled = bool(_p("mtf_enabled", True))
@@ -253,6 +246,15 @@ def late_entry_check(
                 else rsi15m > float(_p("rsi15m_os", 28))
             )
             result["mtf_passed"] = mtf_passed
+
+    if not (rsi_hit or ext_hit):
+        return result
+
+    why = []
+    if rsi_hit:
+        why.append(f"RSI {rsi4h:.0f}{'>' if is_long else '<'}{rsi_limit:.0f}")
+    if ext_hit:
+        why.append(f"extension {'+' if extension > 0 else ''}{extension:.1f}xATR")
 
     if mtf_passed is True:
         result["reason"] = (
