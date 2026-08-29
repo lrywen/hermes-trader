@@ -230,7 +230,14 @@ def _ttl_cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
         else:
             loader = False
     if not loader:
-        ev.wait(timeout=_TTL_LOAD_WAIT_S)
+        # R13-B12: resolve the waiter timeout lazily — this branch only runs
+        # on a concurrent singleflight miss (rare), so the cached-hit hot path
+        # never touches config; failures fall back to the literal constant.
+        try:
+            wait_s = float(_http_cache_params().get("ttl_load_wait_s", _TTL_LOAD_WAIT_S))
+        except Exception:
+            wait_s = _TTL_LOAD_WAIT_S
+        ev.wait(timeout=wait_s)
         with _TTL_CACHE_LOCK:
             hit = _TTL_CACHE.get(key)
             if hit and time.time() - hit[0] < ttl:
@@ -245,7 +252,7 @@ def _ttl_cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
             else:
                 loader = False
         if not loader:
-            ev2.wait(timeout=_TTL_LOAD_WAIT_S)
+            ev2.wait(timeout=wait_s)
             with _TTL_CACHE_LOCK:
                 hit = _TTL_CACHE.get(key)
                 if hit:
@@ -1035,6 +1042,61 @@ def _dashboard_equity_params(*, config: Optional[dict[str, Any]] = None) -> dict
     except Exception as e:
         logger.debug(f"[dashboard] dashboard_equity params read failed, using literals: {e}")
         return dict(defaults)
+
+
+# R13-B12: HTTP-edge cache TTLs. The public JSON poll endpoints
+# (summary / equity-curve / closed-trades) and the per-coin research verdict
+# cache used to read their TTLs from legacy HERMES_* env vars at import time
+# with bare-literal defaults (2.0 / 30.0 / 10.0 / 30.0); the TTL-cache
+# singleflight waiter timeout (_TTL_LOAD_WAIT_S = 60.0) was a bare literal
+# with no env channel. Every leaf is now reachable via the http_cache
+# canonical block, with the legacy env vars kept as the top-priority channel.
+# leaf -> (legacy env var or None, kind "i"/"f", minimum guard).
+_HTTP_CACHE_DEFAULTS: dict[str, float] = {
+    "summary_ttl_s": 2.0,
+    "equity_curve_ttl_s": 30.0,
+    "closed_trades_ttl_s": 10.0,
+    "research_cache_ttl_s": 30.0,
+    "ttl_load_wait_s": 60.0,
+}
+_HTTP_CACHE_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "summary_ttl_s": ("HERMES_SUMMARY_TTL_S", "f", 0.0),
+    "equity_curve_ttl_s": ("HERMES_EQUITY_CURVE_TTL_S", "f", 0.0),
+    "closed_trades_ttl_s": ("HERMES_CLOSED_TRADES_TTL_S", "f", 0.0),
+    "research_cache_ttl_s": ("HERMES_RESEARCH_HTTP_CACHE_S", "f", 0.0),
+    "ttl_load_wait_s": (None, "f", 0.0),
+}
+
+
+def _http_cache_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the five HTTP-edge cache TTL knobs (independent copy).
+
+    R13-B12: per leaf, a non-empty legacy env var wins
+    (HERMES_SUMMARY_TTL_S / HERMES_EQUITY_CURVE_TTL_S /
+    HERMES_CLOSED_TRADES_TTL_S / HERMES_RESEARCH_HTTP_CACHE_S), then cfg_get
+    covers HERMES_CFG_HTTP_CACHE__<LEAF> env and the agent-config dict, then
+    the literal default. TTLs are floats and may be 0 (a TTL of 0 disables
+    the cache write, preserving the prior semantic); values must clear the
+    >= 0 guard. Any failure returns a fresh literal copy so a request render
+    never raises.
+    """
+    try:
+        p = dict(_HTTP_CACHE_DEFAULTS)
+        for leaf, (legacy_env, kind, min_v) in _HTTP_CACHE_SPEC.items():
+            raw: Any = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                raw = cfg_get(f"http_cache.{leaf}", config=config)
+            if raw is None:
+                continue
+            v: Any = int(raw) if kind == "i" else float(raw)
+            if v >= min_v:
+                p[leaf] = v
+        return p
+    except Exception as e:
+        logger.debug(f"[dashboard] http_cache params read failed, using literals: {e}")
+        return dict(_HTTP_CACHE_DEFAULTS)
 
 
 def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:

@@ -1075,6 +1075,10 @@ _SAVE_BACKOFF_BASE_SEC = float(
     os.environ.get("HERMES_DSL_SAVE_BACKOFF_BASE_SEC")
     or cfg_get("dsl_state_io.save_backoff_base_sec", config={})
 )
+# R13-B12: exponential backoff growth factor between save retries (was the
+# bare literal 3 in `3 ** attempt`). No legacy env channel — reachable via
+# HERMES_CFG_DSL_STATE_IO__SAVE_BACKOFF_FACTOR / the agent-config dict.
+_SAVE_BACKOFF_FACTOR = int(cfg_get("dsl_state_io.save_backoff_factor", 3, config={}))
 
 
 def _save_state() -> None:
@@ -1117,7 +1121,7 @@ def _save_state() -> None:
                         f"[dsl] state save attempt {attempt + 1}/"
                         f"{_SAVE_MAX_ATTEMPTS} failed: {e}; retrying"
                     )
-                    time.sleep(_SAVE_BACKOFF_BASE_SEC * (3 ** attempt))
+                    time.sleep(_SAVE_BACKOFF_BASE_SEC * (_SAVE_BACKOFF_FACTOR ** attempt))
                 else:
                     logger.error(
                         f"[dsl] state save failed after "

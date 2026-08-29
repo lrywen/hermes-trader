@@ -216,6 +216,13 @@ class _ConfigPatch(BaseModel):
     # HERMES_EQUITY_DIP_RATIO / HERMES_EQUITY_DIP_WINDOW /
     # HERMES_CLOSED_TRADES_DEDUP_MS env vars remain the top-priority channel.
     dashboard_equity: dict[str, Any] = Field(default_factory=lambda: _dict_default("dashboard_equity"))
+    # R13-B12: HTTP-edge cache TTLs (dashboard.py / public.py / server.py).
+    # Five keys: summary / equity-curve / closed-trades public poll endpoint
+    # TTLs, per-coin research verdict cache TTL, and TTL-cache singleflight
+    # waiter timeout. Legacy HERMES_SUMMARY_TTL_S / HERMES_EQUITY_CURVE_TTL_S
+    # / HERMES_CLOSED_TRADES_TTL_S / HERMES_RESEARCH_HTTP_CACHE_S env vars
+    # remain the top-priority channel.
+    http_cache: dict[str, Any] = Field(default_factory=lambda: _dict_default("http_cache"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

@@ -23,6 +23,7 @@ from hermes_trader.dashboard import (
     _SECURITY_HEADERS,
     _closed_trades_payload,
     _equity_curve_payload,
+    _http_cache_params,
     _positions_payload,
     _summary_payload,
     _tail_log_sse,
@@ -38,8 +39,11 @@ _WEB_DIST = "/app/web-dist"
 # are fine to cache for their poll interval.
 _NO_CACHE_HEADERS = {"Cache-Control": "no-store, no-cache, must-revalidate", "Pragma": "no-cache"}
 
-# F26: poll-interval cache TTLs for the JSON endpoints (env-overridable;
-# defaults match the prior hard-coded values).
+# F26: poll-interval cache TTLs for the JSON endpoints. R13-B12: the live
+# values now resolve per-request through _http_cache_params() (legacy
+# HERMES_* env → http_cache canonical block → these literal fallbacks); the
+# module constants stay as import-time fallback symbols and are asserted on
+# by test_dashboard_config_api, so do not remove them.
 _SUMMARY_TTL_S = float(os.environ.get("HERMES_SUMMARY_TTL_S", "2.0"))
 _EQUITY_CURVE_TTL_S = float(os.environ.get("HERMES_EQUITY_CURVE_TTL_S", "30.0"))
 _CLOSED_TRADES_TTL_S = float(os.environ.get("HERMES_CLOSED_TRADES_TTL_S", "10.0"))
@@ -137,7 +141,13 @@ def register_public_routes(app: FastAPI) -> None:
         # Payload reads + parses the full session log on every cache miss
         # (~150ms). Run it in a worker thread so a long read doesn't block
         # the asyncio event loop and starve other routes / SSE clients.
-        payload = await asyncio.to_thread(_ttl_cached, "summary", _SUMMARY_TTL_S, _summary_payload)
+        payload = await asyncio.to_thread(
+            lambda: _ttl_cached(
+                "summary",
+                _http_cache_params()["summary_ttl_s"],
+                _summary_payload,
+            )
+        )
         return JSONResponse(payload)
 
     @app.get("/api/dashboard/positions")
@@ -150,18 +160,20 @@ def register_public_routes(app: FastAPI) -> None:
 
     @app.get("/api/dashboard/equity-curve")
     async def dashboard_equity_curve(range_s: int = Query(86400, ge=60, le=2_592_000)) -> JSONResponse:
-        payload = await asyncio.to_thread(
-            _ttl_cached, f"equity-curve:{range_s}", _EQUITY_CURVE_TTL_S,
-            lambda: _equity_curve_payload(range_s),
-        )
+        def _serve():
+            ttl = _http_cache_params()["equity_curve_ttl_s"]
+            return _ttl_cached(f"equity-curve:{range_s}", ttl, lambda: _equity_curve_payload(range_s))
+
+        payload = await asyncio.to_thread(_serve)
         return JSONResponse(payload)
 
     @app.get("/api/dashboard/closed-trades")
     async def dashboard_closed_trades(limit: int = Query(20, ge=1, le=200)) -> JSONResponse:
-        payload = await asyncio.to_thread(
-            _ttl_cached, f"closed-trades:{limit}", _CLOSED_TRADES_TTL_S,
-            lambda: _closed_trades_payload(limit),
-        )
+        def _serve():
+            ttl = _http_cache_params()["closed_trades_ttl_s"]
+            return _ttl_cached(f"closed-trades:{limit}", ttl, lambda: _closed_trades_payload(limit))
+
+        payload = await asyncio.to_thread(_serve)
         return JSONResponse(payload)
 
     @app.get("/api/feed/stream")

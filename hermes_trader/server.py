@@ -488,17 +488,25 @@ async def _research_cached(coin: str, perception: dict[str, Any]) -> dict[str, A
         return dict(await fut)
 
     t0 = time.time()
+    # R13-B12: resolve the cache TTL on the miss path only (a HIT returns
+    # above without touching config). Legacy HERMES_RESEARCH_HTTP_CACHE_S
+    # still wins inside the helper; the import-time constant is the fallback
+    # symbol and keeps the module attribute stable.
+    try:
+        ttl_s = float(dashboard._http_cache_params().get("research_cache_ttl_s", _RESEARCH_CACHE_TTL_S))
+    except Exception:
+        ttl_s = _RESEARCH_CACHE_TTL_S
     try:
         analysis = await loop.run_in_executor(None, lambda: research(coin=coin, perception=perception))
         async with _research_cache_lock:
-            if _RESEARCH_CACHE_TTL_S > 0:
-                _research_cache[coin] = (time.time() + _RESEARCH_CACHE_TTL_S, dict(analysis))
+            if ttl_s > 0:
+                _research_cache[coin] = (time.time() + ttl_s, dict(analysis))
         if not fut.done():
             fut.set_result(dict(analysis))
         logger.info(
             f"[research-cache] MISS→COMPUTE coin={coin} elapsed_ms="
             f"{int((time.time() - t0) * 1000)} verdict={analysis.get('verdict')} "
-            f"ttl_s={_RESEARCH_CACHE_TTL_S}"
+            f"ttl_s={ttl_s}"
         )
         return analysis
     except Exception as e:

@@ -495,6 +495,19 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "stale_tick_age_s": 180,
         "dedup_window_ms": 5000,
     },
+    # R13-B12: HTTP-edge cache TTLs (dashboard.py / public.py / server.py).
+    # Five keys cover the three public JSON poll endpoints, the per-coin
+    # research verdict cache, and the TTL-cache singleflight waiter timeout.
+    # Legacy HERMES_SUMMARY_TTL_S / HERMES_EQUITY_CURVE_TTL_S /
+    # HERMES_CLOSED_TRADES_TTL_S / HERMES_RESEARCH_HTTP_CACHE_S env vars
+    # remain the top-priority channel; ttl_load_wait_s was a bare literal.
+    "http_cache": {
+        "summary_ttl_s": 2.0,
+        "equity_curve_ttl_s": 30.0,
+        "closed_trades_ttl_s": 10.0,
+        "research_cache_ttl_s": 30.0,
+        "ttl_load_wait_s": 60.0,
+    },
     # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
     # SL ratchet coordination); and the funding-rate history lookback window
     # in hours (research display / against-funding context).
@@ -719,6 +732,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "policy_cache_ttl_s": 5.0,
         "save_max_attempts": 3,
         "save_backoff_base_sec": 0.1,
+        "save_backoff_factor": 3,
     },
     # R13-B3: risk-gate scoring thresholds (risk_gates.py). Eight keys cover
     # the market_regime_gate's counter-trend score bar plus the debate_gate
