@@ -1135,7 +1135,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     if bool(_shadow_cfg.get("enabled", False)):
         try:
             from hermes_trader.agents.shadow_signals import run_shadow_async
-            run_shadow_async(analysis["coin"], analysis.get("side", "long"), _shadow_cfg)
+            run_shadow_async(analysis["coin"], analysis.get("side", "long"), _shadow_cfg,
+                             config=config)
         except Exception as _sh_e:
             logger.debug(f"[shadow-signals] dispatch failed (non-fatal): {_sh_e}")
 
@@ -2284,7 +2285,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         try:
             from hermes_trader.agents.shadow_signals import gather_shadow_signals
             _entry_sig = gather_shadow_signals(coin, trade_side,
-                                               config.get("shadow_signals") or {}, allow_fetch=False)
+                                               config.get("shadow_signals") or {}, allow_fetch=False,
+                                               config=config)
             # Execution-quality capture: arrival mid vs actual fill = real entry
             # slippage (the # the backtests don't model). Signed as adverse cost bps
             # (long paying above mid / short selling below = positive cost).
@@ -2842,7 +2844,10 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         ):
             try:
                 from hermes_trader.agents.options_gex import gex_override_caution
-                near = float(gex_cfg.get("caution_near_wall_pct", 1.0))
+                # R13-B7 (D1): canonical gex_signal.caution_near_wall_pct (10.0)
+                # via cfg_get — the old literal fallback 1.0 was dead (merged
+                # config always carries 10.0) but silently dropped env overrides.
+                near = float(cfg_get("gex_signal.caution_near_wall_pct", 10.0, config=config))
                 suppress, why = gex_override_caution(
                     coin, "long", near_wall_pct=near, allow_fetch=False
                 )

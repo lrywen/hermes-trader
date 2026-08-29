@@ -366,6 +366,59 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "news": True,
         "whale_window_min": 15,
     },
+    # R13-B7: free-signal-suite tunables. Each block mirrors the literals that
+    # were hardcoded in the corresponding module; the modules keep their module
+    # constants as fallback symbols but resolve every leaf through cfg_get so
+    # env (HERMES_CFG_<BLOCK>__<KEY>) and dashboard overrides actually reach
+    # the hot path (direct dict reads silently ignored env — the gex caution
+    # drift fixed here: canonical said 10.0 while three fallbacks said 1.0).
+    "options_gex": {
+        "ttl_sec": 900,              # CBOE delayed feed; 15-min structural cache
+        "http_timeout_s": 12.0,      # per-request CBOE fetch bound
+    },
+    "short_volume": {
+        "ttl_sec": 3600,             # FINRA file is daily; an hour is plenty
+        "http_timeout_s": 12.0,      # per-day FINRA fetch bound
+        "crowded_ratio": 0.60,       # >= → squeeze fuel
+        "light_ratio": 0.35,         # <= → little short pressure
+        "trend_delta": 0.03,         # series first-vs-last move for rising/falling
+        "lookback_days": 5,          # trading days walked back per scan
+    },
+    "crypto_whale": {
+        "ttl_sec": 120,              # Binance aggTrades rolling window cache
+        "http_timeout_s": 2.5,       # per-page bound (6 sequential pages max)
+        "cache_max": 1024,           # per-process cache entry cap
+        "window_minutes": 15,        # rolling aggTrades window
+        "min_usd": 100000,           # print >= this counts as a whale print
+        "bias_threshold": 0.20,      # |net|/whale $ >= this for a directional bias
+        "max_pages": 6,              # pagination cap on the window walk
+    },
+    "news_catalyst": {
+        "ttl_sec": 300,              # GDELT/RSS cache; news moves fast
+        "http_timeout_s": 3.0,       # per-request bound (2 parallel GDELT calls)
+        "surge_breaking_x": 2.5,     # latest coverage bin >= 2.5x baseline = breaking
+        "surge_elevated_x": 1.5,     # >= 1.5x baseline = elevated coverage
+        "timespan": "1h",            # GDELT query timespan
+        "max_records": 30,           # ArtList maxrecords / headline cap
+        "rss_limit": 25,             # rss_headlines headline cap
+        "fetch_max_workers": 2,      # parallel GDELT ArtList+TimelineVol pool
+    },
+    "whale_index": {
+        "min_volume_usd": 1000000,       # smart_money_concentration 24h-vol floor
+        "funding_confidence_scale": 0.0001,  # |funding|/this = concentration confidence
+        "oi_vol_ratio_min": 10,          # OI/($M vol) above this = high-OI flag
+        "oi_vol_confidence_norm": 50,    # ratio/this = high-OI confidence
+        "min_oi_usd": 5000000,           # OI notional floor for anomaly/surge
+        "max_funding_threshold": -0.00001,  # funding must be below this
+        "funding_norm": 0.00008,         # |funding| mapping to ~full confidence
+        "flat_price_pct": 10,            # |24h price move| below this = flat
+        "min_oi_growth_pct": 8.0,        # OI surge since last snapshot
+        "max_price_move_pct": 4.0,       # price-still-flat gate for surge
+        "surge_norm_pct": 25.0,          # OI growth mapping to ~full confidence
+        "min_confidence": 0.05,          # whale_accumulation_map confidence floor
+        "mcp_min_confidence": 0.1,       # get_whale_signals (MCP) confidence floor
+        "mcp_top_n": 10,                 # get_whale_signals result cap
+    },
     # 动量回补（趋势回归重新入场）
     "momentum_reentry": {
         "enabled": False,

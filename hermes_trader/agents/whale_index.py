@@ -16,11 +16,65 @@ import json
 import logging
 import os
 import time
-from typing import Any
+from typing import Any, Optional
 
+from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.universe import get_universe
 
 logger = logging.getLogger(__name__)
+
+# ── Config wiring (R13-B7) ──────────────────────────────────────────────────
+# Literal fallbacks (== pre-R13-B7 behavior); the CANONICAL `whale_index` block
+# carries the same values and is the single source of truth at runtime (env
+# HERMES_CFG_WHALE_INDEX__* overrides included).
+_WHALE_INDEX_DEFAULTS: dict[str, Any] = {
+    "min_volume_usd": 1_000_000.0,
+    "funding_confidence_scale": 0.0001,
+    "oi_vol_ratio_min": 10,
+    "oi_vol_confidence_norm": 50,
+    "min_oi_usd": 5_000_000.0,
+    "max_funding_threshold": -0.00001,
+    "funding_norm": 0.00008,
+    "flat_price_pct": 10,
+    "min_oi_growth_pct": 8.0,
+    "max_price_move_pct": 4.0,
+    "surge_norm_pct": 25.0,
+    "min_confidence": 0.05,
+    "mcp_min_confidence": 0.1,
+    "mcp_top_n": 10,
+}
+
+
+def whale_index_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the whale-index heuristic knobs (canonical ``whale_index`` block)
+    with the module literals as fallback. Per-leaf lookups keep every key
+    independently env-overridable; magnitudes/thresholds must be positive (the
+    negative-funding threshold is kept as-is), int knobs must be positive ints.
+    Any read/coerce failure returns a fresh copy of the literals — the signal
+    path must never break on a bad config."""
+    p = dict(_WHALE_INDEX_DEFAULTS)
+    try:
+        positive_float = ("min_volume_usd", "funding_confidence_scale", "min_oi_usd",
+                          "funding_norm", "min_oi_growth_pct", "max_price_move_pct",
+                          "surge_norm_pct", "min_confidence", "mcp_min_confidence")
+        for key in positive_float:
+            v = cfg_get(f"whale_index.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv > 0 else p[key]
+        v = cfg_get("whale_index.max_funding_threshold", config=config)
+        if v is not None:
+            p["max_funding_threshold"] = float(v)
+        for key in ("oi_vol_ratio_min", "oi_vol_confidence_norm", "flat_price_pct",
+                    "mcp_top_n"):
+            v = cfg_get(f"whale_index.{key}", config=config)
+            if v is not None:
+                iv = int(v)
+                p[key] = iv if iv > 0 else p[key]
+    except Exception as e:  # never let config break the signal path
+        logger.debug(f"[whale] whale_index params config read failed: {e}")
+        return dict(_WHALE_INDEX_DEFAULTS)
+    return p
 
 # Persisted OI snapshots for the self-sourced OI-surge whale detector. The HL
 # PUBLIC api has NO leaderboard endpoint (verified: vaults/leaderBoard/vaultDetails
@@ -34,21 +88,27 @@ _OI_HISTORY_FILE = os.path.join(
 )
 
 def smart_money_concentration(
-    lookback_days: int = 7,
-    min_volume_usd: float = 1e6,
+    lookback_days: Optional[int] = None,
+    min_volume_usd: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Identify assets with growing smart money concentration.
-    
+
     Analyzes OI + volume distribution to find assets where large traders
     are accumulating positions. Flags:
     - OI growth outpaces volume growth
     - Top whales increasing positions in same asset
     - OI concentration in top 10 wallets
-    
+
     Args:
         lookback_days: how far back to scan for concentration changes
         min_volume_usd: minimum 24h volume threshold
     """
+    p = whale_index_params()
+    if min_volume_usd is None:
+        min_volume_usd = p["min_volume_usd"]
+    funding_confidence_scale = p["funding_confidence_scale"]
+    oi_vol_ratio_min = p["oi_vol_ratio_min"]
+    oi_vol_confidence_norm = p["oi_vol_confidence_norm"]
     universe = get_universe()
     results = []
     
@@ -68,7 +128,7 @@ def smart_money_concentration(
                 "coin": m["coin"],
                 "type": m["type"],
                 "signal": "accumulation",
-                "confidence": min(1.0, abs(funding) / 0.0001),  # scale funding magnitude
+                "confidence": min(1.0, abs(funding) / funding_confidence_scale),  # scale funding magnitude
                 "oi": day_oi,
                 "volume_24h": day_vol,
                 "funding_rate": funding,
@@ -77,12 +137,12 @@ def smart_money_concentration(
         
         # High OI relative to volume = whale accumulation
         oi_vol_ratio = day_oi / (day_vol / 1e6) if day_vol > 0 else 0
-        if oi_vol_ratio > 10:  # OI > 10x of daily volume in millions
+        if oi_vol_ratio > oi_vol_ratio_min:
             results.append({
                 "coin": m["coin"],
                 "type": m["type"],
                 "signal": "high_oi_concentration",
-                "confidence": min(1.0, oi_vol_ratio / 50),  # scale ratio
+                "confidence": min(1.0, oi_vol_ratio / oi_vol_confidence_norm),  # scale ratio
                 "oi": day_oi,
                 "volume_24h": day_vol,
                 "oi_volume_ratio": oi_vol_ratio,
@@ -93,9 +153,9 @@ def smart_money_concentration(
 
 
 def oi_funding_anomaly(
-    min_oi_usd: float = 5e6,
-    max_funding_threshold: float = -0.00001,
-    funding_norm: float = 0.00008,
+    min_oi_usd: Optional[float] = None,
+    max_funding_threshold: Optional[float] = None,
+    funding_norm: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Detect assets where OI is high but price is flat while funding is
     negative — classic smart money accumulation pattern.
@@ -119,6 +179,14 @@ def oi_funding_anomaly(
         max_funding_threshold: funding rate must be below this (more negative = stronger)
         funding_norm: funding magnitude that maps to ~full confidence
     """
+    p = whale_index_params()
+    if min_oi_usd is None:
+        min_oi_usd = p["min_oi_usd"]
+    if max_funding_threshold is None:
+        max_funding_threshold = p["max_funding_threshold"]
+    if funding_norm is None:
+        funding_norm = p["funding_norm"]
+    flat_price_pct = p["flat_price_pct"]
     universe = get_universe(include_hip3=True)
     results = []
 
@@ -140,14 +208,14 @@ def oi_funding_anomaly(
         price_change_24h = (mid_px - prev_px) / prev_px * 100 if prev_px > 0 else 0
 
         # Signal: OI high + funding negative + price relatively flat (quiet accumulation)
-        if abs(price_change_24h) < 10:
+        if abs(price_change_24h) < flat_price_pct:
             results.append({
                 "coin": m["coin"],
                 "type": m["type"],
                 "signal": "smart_money_accumulation",
                 "confidence": (
                     min(1.0, abs(funding) / funding_norm)   # funding magnitude (calibrated)
-                    * (1 - abs(price_change_24h) / 10)      # flatter price = stronger
+                    * (1 - abs(price_change_24h) / flat_price_pct)      # flatter price = stronger
                 ),
                 "oi": oi,
                 "funding_rate": funding,
@@ -162,10 +230,10 @@ def oi_funding_anomaly(
 # ── OI-surge whale detector (self-sourced, verifiable) ───────────────
 
 def oi_surge_accumulation(
-    min_oi_usd: float = 5e6,
-    min_oi_growth_pct: float = 8.0,
-    max_price_move_pct: float = 4.0,
-    surge_norm_pct: float = 25.0,
+    min_oi_usd: Optional[float] = None,
+    min_oi_growth_pct: Optional[float] = None,
+    max_price_move_pct: Optional[float] = None,
+    surge_norm_pct: Optional[float] = None,
 ) -> list[dict[str, Any]]:
     """Flag coins whose OPEN INTEREST surged since the last scan while price stayed
     flat — positions being built quietly = smart-money accumulation, about to move.
@@ -178,6 +246,15 @@ def oi_surge_accumulation(
     snapshot, and |price move since last snapshot| <= max_price_move_pct (the
     "loading while flat" tell — if price already ran, the move's not ahead of us).
     """
+    p = whale_index_params()
+    if min_oi_usd is None:
+        min_oi_usd = p["min_oi_usd"]
+    if min_oi_growth_pct is None:
+        min_oi_growth_pct = p["min_oi_growth_pct"]
+    if max_price_move_pct is None:
+        max_price_move_pct = p["max_price_move_pct"]
+    if surge_norm_pct is None:
+        surge_norm_pct = p["surge_norm_pct"]
     universe = get_universe()
     now = time.time()
     # load prior snapshot
@@ -242,7 +319,7 @@ def oi_surge_accumulation(
 # These functions can be registered as MCP tools for autonomous agents
 # to query whale data as part of their scanning pipeline.
 
-def whale_accumulation_map(min_confidence: float = 0.05) -> dict[str, dict[str, Any]]:
+def whale_accumulation_map(min_confidence: Optional[float] = None) -> dict[str, dict[str, Any]]:
     """Return {coin: signal_dict} for coins flagged as smart-money accumulation.
 
     MERGES two self-sourced, verifiable signals (no external leaderboard needed):
@@ -253,6 +330,8 @@ def whale_accumulation_map(min_confidence: float = 0.05) -> dict[str, dict[str, 
     A coin flagged by EITHER (or both, taking the higher confidence) is returned.
     These feed perception.whale_signal -> executor force-execute + 1.3x size + regime bypass.
     """
+    if min_confidence is None:
+        min_confidence = whale_index_params()["min_confidence"]
     merged: dict[str, dict[str, Any]] = {}
     for s in oi_funding_anomaly() + oi_surge_accumulation():
         if s.get("confidence", 0) < min_confidence:
@@ -264,8 +343,8 @@ def whale_accumulation_map(min_confidence: float = 0.05) -> dict[str, dict[str, 
 
 
 def get_whale_signals(
-    min_confidence: float = 0.1,
-    top_n: int = 10,
+    min_confidence: Optional[float] = None,
+    top_n: Optional[int] = None,
 ) -> list[dict[str, Any]]:
     """Aggregate concentration + anomaly signals for MCP-tool callers.
 
@@ -273,6 +352,11 @@ def get_whale_signals(
     uses `whale_accumulation_map()` instead — the high-OI-concentration
     branch this combines in is too noisy for direction calls.
     """
+    p = whale_index_params()
+    if min_confidence is None:
+        min_confidence = p["mcp_min_confidence"]
+    if top_n is None:
+        top_n = int(p["mcp_top_n"])
     concentration = smart_money_concentration()
     anomalies = oi_funding_anomaly()
     

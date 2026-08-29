@@ -32,7 +32,9 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from statistics import median
-from typing import Optional
+from typing import Any, Optional
+
+from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -99,16 +101,66 @@ def parse_gdelt_artlist(payload: dict) -> list[Article]:
     return out
 
 
-def detect_surge(volume_points: list[float], min_baseline: float = 1e-9) -> tuple:
+# ── Config wiring (R13-B7) ───────────────────────────────────────────────────
+# Literal fallback (== pre-R13-B7 behavior); the CANONICAL `news_catalyst`
+# block carries the same values and is the single source of truth at runtime.
+# _CACHE_TTL_S stays as a module symbol (external reference + TTL fallback).
+# The legacy HERMES_NEWS_HTTP_TIMEOUT_S env read was removed (no deployment
+# referenced it); its default lives on as canonical http_timeout_s and remains
+# env-overridable via HERMES_CFG_NEWS_CATALYST__HTTP_TIMEOUT_S.
+_NEWS_CATALYST_DEFAULTS: dict[str, Any] = {
+    "ttl_sec": 300.0,
+    "http_timeout_s": 3.0,
+    "surge_breaking_x": 2.5,
+    "surge_elevated_x": 1.5,
+    "timespan": "1h",
+    "max_records": 30,
+    "rss_limit": 25,
+    "fetch_max_workers": 2,
+}
+
+
+def news_catalyst_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the GDELT/RSS catalyst knobs (live `news_catalyst` canonical
+    block, env ``HERMES_CFG_NEWS_CATALYST__*`` overrides included) with the
+    module literals as fallback. Per-leaf lookups keep each key independently
+    env-overridable; TTL/timeout/surge multiples must be positive, the int
+    knobs positive ints. Any read/coerce failure returns a fresh copy of the
+    literals (signal path must never break on a bad config)."""
+    p = dict(_NEWS_CATALYST_DEFAULTS)
+    try:
+        for key in ("ttl_sec", "http_timeout_s", "surge_breaking_x", "surge_elevated_x"):
+            v = cfg_get(f"news_catalyst.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv > 0 else p[key]
+        v = cfg_get("news_catalyst.timespan", config=config)
+        if v is not None and isinstance(v, str) and v.strip():
+            p["timespan"] = v
+        for key in ("max_records", "rss_limit", "fetch_max_workers"):
+            v = cfg_get(f"news_catalyst.{key}", config=config)
+            if v is not None:
+                iv = int(v)
+                p[key] = iv if iv > 0 else p[key]
+    except Exception as e:  # never let config break the signal path
+        logger.debug(f"[news] news_catalyst params config read failed: {e}")
+        return dict(_NEWS_CATALYST_DEFAULTS)
+    return p
+
+
+def detect_surge(volume_points: list[float], min_baseline: float = 1e-9,
+                 breaking_x: Optional[float] = None) -> tuple:
     """Given a coverage-volume timeline (oldest->newest), is the latest bin a
     SURGE vs the baseline (median of the earlier bins)? Returns (breaking, x)."""
+    if breaking_x is None:
+        breaking_x = news_catalyst_params()["surge_breaking_x"]
     if len(volume_points) < 3:
         return (False, 1.0)
     latest = volume_points[-1]
     base = median(volume_points[:-1]) or min_baseline
     x = latest / base if base > 0 else 0.0
-    # "breaking" = latest coverage at least 2.5x its recent baseline AND nonzero
-    return (x >= 2.5 and latest > 0, round(x, 2))
+    # "breaking" = latest coverage at least breaking_x times its baseline AND nonzero
+    return (x >= breaking_x and latest > 0, round(x, 2))
 
 
 def parse_gdelt_timeline(payload: dict) -> list[float]:
@@ -175,10 +227,14 @@ _inflight_lock = threading.Lock()
 # Bounded per-request timeout. GDELT's free tier frequently stalls near the
 # client timeout; two parallel calls × a long timeout inflated research().
 # 3s caps a stalled GDELT while still giving the API a fair shot on a good link.
-_HTTP_TIMEOUT_S = float(__import__("os").environ.get("HERMES_NEWS_HTTP_TIMEOUT_S", "3"))
+# Literal fallback symbol; the live value comes from news_catalyst_params()
+# (canonical news_catalyst.http_timeout_s, env-overridable).
+_HTTP_TIMEOUT_S = 3.0
 
 
-def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[dict]:
+def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict]:
+    if timeout is None:
+        timeout = news_catalyst_params()["http_timeout_s"]
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
@@ -194,7 +250,9 @@ def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[dict]:
         return None
 
 
-def _get_text(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[str]:
+def _get_text(url: str, timeout: Optional[float] = None) -> Optional[str]:
+    if timeout is None:
+        timeout = news_catalyst_params()["http_timeout_s"]
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
@@ -210,13 +268,24 @@ def _get_text(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[str]:
         return None
 
 
-def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
-                  ttl: float = _CACHE_TTL_S,
+def catalyst_scan(query: str, timespan: Optional[str] = None,
+                  max_records: Optional[int] = None,
+                  ttl: Optional[float] = None,
                   allow_fetch: bool = True) -> Optional[CatalystReport]:
     """Free catalyst scan for a topic/ticker via GDELT: latest headlines + a
     coverage-surge ('breaking') read. Cached per (query, timespan).
 
     allow_fetch=False = CACHE-ONLY (return last cached value or None, no network)."""
+    p = news_catalyst_params()
+    if timespan is None:
+        timespan = p["timespan"]
+    if max_records is None:
+        max_records = int(p["max_records"])
+    if ttl is None:
+        ttl = p["ttl_sec"]
+    http_timeout_s = p["http_timeout_s"]
+    fetch_max_workers = int(p["fetch_max_workers"])
+    surge_elevated_x = p["surge_elevated_x"]
     key = f"gdelt::{query}::{timespan}"
     now = time.time()
     with _lock:
@@ -239,7 +308,7 @@ def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
 
     if waiter is not None:
         _wt0 = time.monotonic()
-        waiter.wait(timeout=_HTTP_TIMEOUT_S + 1.0)
+        waiter.wait(timeout=http_timeout_s + 1.0)
         with _inflight_lock:
             result = _inflight_results.get(key)
         logger.debug(f"[news] catalyst_scan({query}) coalesced in "
@@ -254,11 +323,11 @@ def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
         vol_url = f"{_GDELT}?query={q}&mode=TimelineVol&format=json&timespan={timespan}"
         # The two GDELT calls are independent — parallelize them so a slow
         # ArtList doesn't serialise behind a slow TimelineVol (was 2 × 12s = 24s).
-        with ThreadPoolExecutor(max_workers=2) as _pool:
-            f_art = _pool.submit(_get_json, art_url)
-            f_vol = _pool.submit(_get_json, vol_url)
-            art = f_art.result(timeout=_HTTP_TIMEOUT_S + 1.0)
-            vol = f_vol.result(timeout=_HTTP_TIMEOUT_S + 1.0)
+        with ThreadPoolExecutor(max_workers=fetch_max_workers) as _pool:
+            f_art = _pool.submit(_get_json, art_url, http_timeout_s)
+            f_vol = _pool.submit(_get_json, vol_url, http_timeout_s)
+            art = f_art.result(timeout=http_timeout_s + 1.0)
+            vol = f_vol.result(timeout=http_timeout_s + 1.0)
 
         if art is None and vol is None:
             with _lock:
@@ -273,7 +342,7 @@ def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
             query=query, n_recent=len(headlines), breaking=breaking, surge_x=surge_x,
             headlines=headlines[:max_records],
             note=("⚡ BREAKING — coverage surging" if breaking
-                  else "elevated coverage" if surge_x >= 1.5 else ""),
+                  else "elevated coverage" if surge_x >= surge_elevated_x else ""),
         )
         with _lock:
             _cache[key] = (now, rep)
@@ -295,8 +364,13 @@ def catalyst_scan(query: str, timespan: str = "1h", max_records: int = 30,
 
 
 def rss_headlines(keywords: Optional[list[str]] = None, feeds: Optional[list[str]] = None,
-                  limit: int = 25, ttl: float = _CACHE_TTL_S) -> list[Article]:
+                  limit: Optional[int] = None, ttl: Optional[float] = None) -> list[Article]:
     """Lowest-latency major-wire headlines, optionally keyword-filtered. Cached."""
+    p = news_catalyst_params()
+    if limit is None:
+        limit = int(p["rss_limit"])
+    if ttl is None:
+        ttl = p["ttl_sec"]
     feeds = feeds or _RSS_FEEDS
     key = "rss::" + ",".join(sorted(feeds)) + "::" + ",".join(sorted(keywords or []))
     now = time.time()

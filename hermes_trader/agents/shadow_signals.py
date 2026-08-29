@@ -23,6 +23,8 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from hermes_trader.agents.config_store import cfg_get
+
 logger = logging.getLogger(__name__)
 
 
@@ -35,12 +37,18 @@ def _base_symbol(coin: str) -> str:
 
 
 def gather_shadow_signals(coin: str, side: str, sub: Optional[dict[str, Any]] = None,
-                          allow_fetch: bool = True) -> dict[str, Any]:
+                          allow_fetch: bool = True, *,
+                          config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """Compute every applicable free signal for `coin`. Each is individually
     try/excepted so one outage never blanks the rest. Returns a compact dict.
 
     allow_fetch=False = CACHE-ONLY (no network) — used to snapshot the signals AT
-    ENTRY on the hot path for the forward backtest, without amplifying the path."""
+    ENTRY on the hot path for the forward backtest, without amplifying the path.
+
+    R13-B7: knobs resolve through cfg_get (canonical blocks, env
+    ``HERMES_CFG_*`` honored). The legacy ``sub``-dict literals stay as the
+    cfg_get caller default fallback so an absent config behaves exactly as before.
+    `config` is the merged agent config (per-coin overrides preserved)."""
     sub = sub or {}
     out: dict[str, Any] = {}
     is_hip3 = ":" in (coin or "")
@@ -68,8 +76,11 @@ def gather_shadow_signals(coin: str, side: str, sub: Optional[dict[str, Any]] = 
         if sub.get("crypto_whale", True):
             try:
                 from hermes_trader.agents.crypto_whale import crypto_whale_signal
-                r = crypto_whale_signal(coin, window_minutes=float(sub.get("whale_window_min", 15)),
-                                        allow_fetch=allow_fetch)
+                r = crypto_whale_signal(
+                    coin,
+                    window_minutes=float(cfg_get("shadow_signals.whale_window_min", 15.0,
+                                                config=config)),
+                    allow_fetch=allow_fetch)
                 if r:
                     out["whale"] = {"bias": r.bias, "net_usd": r.net_usd,
                                     "whale_n": r.whale_n, "window_min": r.window_minutes}
@@ -78,9 +89,11 @@ def gather_shadow_signals(coin: str, side: str, sub: Optional[dict[str, Any]] = 
 
     if sub.get("news", True):
         try:
-            from hermes_trader.agents.news_catalyst import catalyst_scan
-            r = catalyst_scan(_base_symbol(coin), timespan="1h", allow_fetch=allow_fetch)
-            if r and (r.breaking or r.surge_x >= 1.5):
+            from hermes_trader.agents.news_catalyst import catalyst_scan, news_catalyst_params
+            _np = news_catalyst_params(config=config)
+            r = catalyst_scan(_base_symbol(coin), timespan=_np["timespan"],
+                              allow_fetch=allow_fetch)
+            if r and (r.breaking or r.surge_x >= _np["surge_elevated_x"]):
                 top = r.headlines[0].title[:80] if r.headlines else ""
                 out["news"] = {"breaking": r.breaking, "surge_x": r.surge_x,
                                "n": r.n_recent, "top": top}
@@ -144,7 +157,12 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
         if is_hip3 and bool(en.get("gex_veto", True)):
             try:
                 from hermes_trader.agents.options_gex import gex_override_caution
-                near = float((cfg.get("gex_signal") or {}).get("caution_near_wall_pct", 1.0))
+                # R13-B7 (D1): resolve through cfg_get so the canonical
+                # gex_signal.caution_near_wall_pct (10.0) — and env overrides —
+                # actually apply; the old dict-literal fallback of 1.0 was a
+                # dead-but-wrong default (runtime value was already 10.0 via the
+                # merged config; only env override was silently lost).
+                near = float(cfg_get("gex_signal.caution_near_wall_pct", 10.0, config=cfg))
                 sup, why = gex_override_caution(coin, "long", near_wall_pct=near, allow_fetch=False)
                 if sup:
                     veto, veto_reason = True, why
@@ -153,9 +171,13 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
         if (not is_hip3) and not veto:
             try:
                 from hermes_trader.agents.crypto_whale import crypto_whale_signal
-                w = crypto_whale_signal(coin, window_minutes=float(en.get("whale_window_min", 15)),
-                                        allow_fetch=False)
-                min_net = float(en.get("whale_veto_min_usd", 250_000))
+                w = crypto_whale_signal(
+                    coin,
+                    window_minutes=float(cfg_get("signal_enforcement.whale_window_min", 15.0,
+                                                config=cfg)),
+                    allow_fetch=False)
+                min_net = float(cfg_get("signal_enforcement.whale_veto_min_usd", 250_000.0,
+                                        config=cfg))
                 if w and w.bias == "whale_selling" and abs(w.net_usd) >= min_net:
                     veto = True
                     veto_reason = (f"whales dumping: net ${w.net_usd:+,.0f} aggressive "
@@ -170,8 +192,9 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
     if do_boost:
         # breaking news on this name
         try:
-            from hermes_trader.agents.news_catalyst import catalyst_scan
-            r = catalyst_scan(_base_symbol(coin), timespan="1h", allow_fetch=False)
+            from hermes_trader.agents.news_catalyst import catalyst_scan, news_catalyst_params
+            _np = news_catalyst_params(config=cfg)
+            r = catalyst_scan(_base_symbol(coin), timespan=_np["timespan"], allow_fetch=False)
             if r and r.breaking:
                 boost = True
                 boost_reasons.append(f"breaking news (surge {r.surge_x}x)")
@@ -189,9 +212,13 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
         else:
             try:
                 from hermes_trader.agents.crypto_whale import crypto_whale_signal
-                w = crypto_whale_signal(coin, window_minutes=float(en.get("whale_window_min", 15)),
-                                        allow_fetch=False)
-                min_net = float(en.get("whale_boost_min_usd", 250_000))
+                w = crypto_whale_signal(
+                    coin,
+                    window_minutes=float(cfg_get("signal_enforcement.whale_window_min", 15.0,
+                                                config=cfg)),
+                    allow_fetch=False)
+                min_net = float(cfg_get("signal_enforcement.whale_boost_min_usd", 250_000.0,
+                                        config=cfg))
                 if w and w.bias == "whale_buying" and w.net_usd >= min_net:
                     boost = True
                     boost_reasons.append(f"whales buying net ${w.net_usd:+,.0f}")
@@ -201,14 +228,15 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
     return Enforcement(boost=boost, boost_reason="; ".join(boost_reasons))
 
 
-def run_shadow_async(coin: str, side: str, sub: Optional[dict[str, Any]] = None) -> None:
+def run_shadow_async(coin: str, side: str, sub: Optional[dict[str, Any]] = None, *,
+                     config: Optional[dict[str, Any]] = None) -> None:
     """Fire-and-forget shadow gather+log on a daemon thread. NEVER blocks the
     caller (the execute path), so it can't add latency or amplify the hot path."""
     sub = dict(sub or {})
 
     def _worker() -> None:
         try:
-            sig = gather_shadow_signals(coin, side, sub)
+            sig = gather_shadow_signals(coin, side, sub, config=config)
             if sig:
                 logger.info(f"[shadow-signals] {coin} ({side}): {shadow_summary(sig)}")
         except Exception as e:                              # pragma: no cover

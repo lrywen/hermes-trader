@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import ssl
 import threading
 import time
@@ -33,6 +32,8 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
+
+from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
 
@@ -100,9 +101,60 @@ def parse_aggtrades(payload: list) -> list[Print]:
     return out
 
 
+# ── Config wiring (R13-B7) ───────────────────────────────────────────────────
+# Literal fallback (== pre-R13-B7 behavior); the CANONICAL `crypto_whale` block
+# carries the same values and is the single source of truth at runtime.
+# _CACHE_TTL_S stays as a module symbol (external reference + TTL fallback).
+# The legacy HERMES_WHALE_HTTP_TIMEOUT_S / HERMES_CRYPTO_WHALE_CACHE_MAX env
+# reads were removed (no deployment referenced them); their defaults live on
+# as canonical leaves and remain env-overridable via HERMES_CFG_CRYPTO_WHALE__*.
+_CRYPTO_WHALE_DEFAULTS: dict[str, Any] = {
+    "ttl_sec": 120.0,
+    "http_timeout_s": 2.5,
+    "cache_max": 1024,
+    "window_minutes": 15.0,
+    "min_usd": 100_000.0,
+    "bias_threshold": 0.20,
+    "max_pages": 6,
+}
+
+
+def crypto_whale_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the Binance aggTrades whale-flow knobs (live `crypto_whale`
+    canonical block, env ``HERMES_CFG_CRYPTO_WHALE__*`` overrides included) with
+    the module literals as fallback. Per-leaf lookups keep each key
+    independently env-overridable; TTL/timeout/threshold/window/min_usd must be
+    non-negative and the bias threshold in (0, 1), cache_max/max_pages positive
+    ints. Any read/coerce failure returns a fresh copy of the literals (signal
+    path must never break on a bad config)."""
+    p = dict(_CRYPTO_WHALE_DEFAULTS)
+    try:
+        for key in ("ttl_sec", "http_timeout_s", "window_minutes", "min_usd"):
+            v = cfg_get(f"crypto_whale.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv >= 0 else p[key]
+        v = cfg_get("crypto_whale.bias_threshold", config=config)
+        if v is not None:
+            fv = float(v)
+            p["bias_threshold"] = fv if 0.0 < fv < 1.0 else p["bias_threshold"]
+        for key in ("cache_max", "max_pages"):
+            v = cfg_get(f"crypto_whale.{key}", config=config)
+            if v is not None:
+                iv = int(v)
+                p[key] = iv if iv > 0 else p[key]
+    except Exception as e:  # never let config break the signal path
+        logger.debug(f"[whale] crypto_whale params config read failed: {e}")
+        return dict(_CRYPTO_WHALE_DEFAULTS)
+    return p
+
+
 def compute_whale_flow(prints: list[Print], min_usd: float = 100_000.0,
-                       symbol: str = "") -> WhaleReport:
+                       symbol: str = "",
+                       bias_threshold: Optional[float] = None) -> WhaleReport:
     """Net aggressive whale flow from large prints (>= min_usd)."""
+    if bias_threshold is None:
+        bias_threshold = crypto_whale_params()["bias_threshold"]
     buy = sell = 0.0
     whales = 0
     for p in prints:
@@ -115,8 +167,8 @@ def compute_whale_flow(prints: list[Print], min_usd: float = 100_000.0,
             sell += p.usd
     net = buy - sell
     total = buy + sell
-    # bias needs a meaningful imbalance (>20% of whale $ on one side)
-    if total > 0 and abs(net) / total >= 0.20:
+    # bias needs a meaningful imbalance (>threshold share of whale $ on one side)
+    if total > 0 and abs(net) / total >= bias_threshold:
         bias = "whale_buying" if net > 0 else "whale_selling"
     else:
         bias = "balanced"
@@ -131,7 +183,7 @@ def compute_whale_flow(prints: list[Print], min_usd: float = 100_000.0,
 
 # ── thin cached fetch ────────────────────────────────────────────────────────
 _CACHE_TTL_S = 120.0
-_CACHE_MAX = int(os.environ.get("HERMES_CRYPTO_WHALE_CACHE_MAX", "1024"))
+_CACHE_MAX = 1024
 _cache: dict[str, tuple] = {}
 _lock = threading.Lock()
 
@@ -142,8 +194,9 @@ _inflight_lock = threading.Lock()
 
 # Binance is normally <1s, but a stalled edge can hold the default 10s for up
 # to 6 sequential pages = 60s. Bound each page to 2.5s so a degraded Binance
-# can't dominate the parallel-fetch window in research().
-_HTTP_TIMEOUT_S = float(os.environ.get("HERMES_WHALE_HTTP_TIMEOUT_S", "2.5"))
+# can't dominate the parallel-fetch window in research(). The live value comes
+# from crypto_whale_params(); _HTTP_TIMEOUT_S remains as a module fallback.
+_HTTP_TIMEOUT_S = 2.5
 
 
 def _cache_sweep(now: float, ttl: float, max_keep: int) -> None:
@@ -157,7 +210,9 @@ def _cache_sweep(now: float, ttl: float, max_keep: int) -> None:
             _cache.pop(k, None)
 
 
-def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[dict[str, Any]]:
+def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
+    if timeout is None:
+        timeout = crypto_whale_params()["http_timeout_s"]
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
@@ -173,11 +228,17 @@ def _get_json(url: str, timeout: float = _HTTP_TIMEOUT_S) -> Optional[dict[str, 
         return None
 
 
-def fetch_aggtrades_window(symbol: str, window_minutes: float = 15.0,
-                           max_pages: int = 6, page_limit: int = 1000) -> list[Print]:
+def fetch_aggtrades_window(symbol: str, window_minutes: Optional[float] = None,
+                           max_pages: Optional[int] = None,
+                           page_limit: int = 1000) -> list[Print]:
     """Pull ALL aggTrades over the last `window_minutes` by forward-paginating from
     startTime (fromId), so the read covers real minutes — not the ~seconds that a
     single latest-1000 batch spans on a liquid pair. Bounded by max_pages."""
+    p = crypto_whale_params()
+    if window_minutes is None:
+        window_minutes = p["window_minutes"]
+    if max_pages is None:
+        max_pages = int(p["max_pages"])
     sym = urllib.parse.quote(symbol)
     start_ms = int((time.time() - window_minutes * 60) * 1000)
     payload = _get_json(f"{_AGG}?symbol={sym}&startTime={start_ms}&limit={page_limit}")
@@ -197,14 +258,26 @@ def fetch_aggtrades_window(symbol: str, window_minutes: float = 15.0,
     return prints
 
 
-def crypto_whale_signal(coin: str, min_usd: float = 100_000.0,
-                        window_minutes: float = 15.0, max_pages: int = 6,
-                        ttl: float = _CACHE_TTL_S,
+def crypto_whale_signal(coin: str, min_usd: Optional[float] = None,
+                        window_minutes: Optional[float] = None,
+                        max_pages: Optional[int] = None,
+                        ttl: Optional[float] = None,
                         allow_fetch: bool = True) -> Optional[WhaleReport]:
     """Free whale-flow report for a crypto coin via Binance public aggTrades over a
     rolling time WINDOW. Returns None for xyz: equities or on fetch failure.
 
     allow_fetch=False = CACHE-ONLY (return last cached value or None, no network)."""
+    p = crypto_whale_params()
+    if ttl is None:
+        ttl = p["ttl_sec"]
+    if min_usd is None:
+        min_usd = p["min_usd"]
+    if window_minutes is None:
+        window_minutes = p["window_minutes"]
+    if max_pages is None:
+        max_pages = int(p["max_pages"])
+    cache_max = int(p["cache_max"])
+    http_timeout_s = p["http_timeout_s"]
     sym = binance_symbol(coin)
     if not sym:
         return None
@@ -228,7 +301,7 @@ def crypto_whale_signal(coin: str, min_usd: float = 100_000.0,
             _inflight[key] = evt
     if waiter is not None:
         _wt0 = time.monotonic()
-        waiter.wait(timeout=(_HTTP_TIMEOUT_S * max_pages) + 2.0)
+        waiter.wait(timeout=(http_timeout_s * max_pages) + 2.0)
         with _inflight_lock:
             result = _inflight_results.get(key)
         logger.debug(f"[whale] crypto_whale_signal({coin}) coalesced in "
@@ -243,8 +316,8 @@ def crypto_whale_signal(coin: str, min_usd: float = 100_000.0,
             rep = WhaleReport(**{**rep.__dict__, "window_minutes": window_minutes})
         with _lock:
             _cache[key] = (now, rep)
-            if len(_cache) > _CACHE_MAX:
-                _cache_sweep(now, ttl, _CACHE_MAX)
+            if len(_cache) > cache_max:
+                _cache_sweep(now, ttl, cache_max)
         with _inflight_lock:
             _inflight_results[key] = rep
         _elapsed = time.monotonic() - _fetch_t0

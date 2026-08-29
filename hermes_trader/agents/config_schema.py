@@ -172,6 +172,14 @@ class _ConfigPatch(BaseModel):
     # number of taker fills modeled per round trip. Defaults mirror the
     # existing module literals (0.025 / 2) verbatim.
     execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("execution"))
+    # R13-B7: free-signal-suite blocks — CBOE GEX cache/timeout, FINRA
+    # short-volume thresholds, Binance whale-flow window/thresholds, GDELT
+    # news-catalyst surge/timeout, and the HL whale-index OI/funding knobs.
+    options_gex: dict[str, Any] = Field(default_factory=lambda: _dict_default("options_gex"))
+    short_volume: dict[str, Any] = Field(default_factory=lambda: _dict_default("short_volume"))
+    crypto_whale: dict[str, Any] = Field(default_factory=lambda: _dict_default("crypto_whale"))
+    news_catalyst: dict[str, Any] = Field(default_factory=lambda: _dict_default("news_catalyst"))
+    whale_index: dict[str, Any] = Field(default_factory=lambda: _dict_default("whale_index"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

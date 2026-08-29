@@ -30,8 +30,9 @@ import time
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Any, Optional
 
+from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.agents.options_gex import underlying_for  # xyz: -> underlying
 
 logger = logging.getLogger(__name__)
@@ -97,23 +98,74 @@ def parse_finra_shvol(text: str, want_symbol: Optional[str] = None) -> list[Shor
     return rows
 
 
-def classify_short_regime(ratio: float) -> str:
+# ── Config wiring (R13-B7) ───────────────────────────────────────────────────
+# Literal fallback (== pre-R13-B7 behavior); the CANONICAL `short_volume` block
+# carries the same values and is the single source of truth at runtime.
+# _CACHE_TTL_S stays as a module symbol (external reference + TTL fallback).
+_SHORT_VOLUME_DEFAULTS: dict[str, Any] = {
+    "ttl_sec": 3600.0,
+    "http_timeout_s": 12.0,
+    "crowded_ratio": 0.60,
+    "light_ratio": 0.35,
+    "trend_delta": 0.03,
+    "lookback_days": 5,
+}
+
+
+def short_volume_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the FINRA short-volume knobs (live `short_volume` canonical
+    block, env ``HERMES_CFG_SHORT_VOLUME__*`` overrides included) with the module
+    literals as fallback. Per-leaf lookups keep each key independently
+    env-overridable; ratios/trend deltas must be in (0, 1), TTL/timeout
+    non-negative, lookback days a positive int. Any read/coerce failure returns
+    a fresh copy of the literals (signal path must never break on bad config)."""
+    p = dict(_SHORT_VOLUME_DEFAULTS)
+    try:
+        for key in ("ttl_sec", "http_timeout_s"):
+            v = cfg_get(f"short_volume.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv >= 0 else p[key]
+        for key in ("crowded_ratio", "light_ratio", "trend_delta"):
+            v = cfg_get(f"short_volume.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if 0.0 < fv < 1.0 else p[key]
+        v = cfg_get("short_volume.lookback_days", config=config)
+        if v is not None:
+            iv = int(v)
+            p["lookback_days"] = iv if iv > 0 else p["lookback_days"]
+    except Exception as e:  # never let config break the signal path
+        logger.debug(f"[shortvol] short_volume params config read failed: {e}")
+        return dict(_SHORT_VOLUME_DEFAULTS)
+    return p
+
+
+def classify_short_regime(ratio: float, crowded_ratio: Optional[float] = None,
+                          light_ratio: Optional[float] = None) -> str:
     # FINRA consolidated short volume routinely runs ~40-50% market-wide, so the
     # squeeze-relevant band is the UPPER tail.
-    if ratio >= 0.60:
+    p = short_volume_params()
+    if crowded_ratio is None:
+        crowded_ratio = p["crowded_ratio"]
+    if light_ratio is None:
+        light_ratio = p["light_ratio"]
+    if ratio >= crowded_ratio:
         return "crowded_short_squeeze_fuel"
-    if ratio <= 0.35:
+    if ratio <= light_ratio:
         return "light_short"
     return "neutral"
 
 
-def _trend(series: list[float]) -> str:
+def _trend(series: list[float], trend_delta: Optional[float] = None) -> str:
     if len(series) < 2:
         return "n/a"
+    if trend_delta is None:
+        trend_delta = short_volume_params()["trend_delta"]
     d = series[-1] - series[0]
-    if d > 0.03:
+    if d > trend_delta:
         return "rising"
-    if d < -0.03:
+    if d < -trend_delta:
         return "falling"
     return "flat"
 
@@ -140,7 +192,9 @@ _cache: dict[str, tuple] = {}  # symbol -> (epoch, ShortVolReport|None)
 _lock = threading.Lock()
 
 
-def _fetch_day(date: str, timeout: float = 12.0) -> Optional[str]:
+def _fetch_day(date: str, timeout: Optional[float] = None) -> Optional[str]:
+    if timeout is None:
+        timeout = short_volume_params()["http_timeout_s"]
     url = _BASE.format(date=date)
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -150,14 +204,19 @@ def _fetch_day(date: str, timeout: float = 12.0) -> Optional[str]:
         return None
 
 
-def short_volume_signal(coin_or_ticker: str, lookback_days: int = 5,
-                        ttl: float = _CACHE_TTL_S,
+def short_volume_signal(coin_or_ticker: str, lookback_days: Optional[int] = None,
+                        ttl: Optional[float] = None,
                         allow_fetch: bool = True) -> Optional[ShortVolReport]:
     """Free short-volume report for an equity/index or xyz: perp. Walks back from
     today over `lookback_days` trading days, skipping weekends/holidays (missing
     files just 404 and are skipped). Cached per symbol.
 
     allow_fetch=False = CACHE-ONLY (return last cached value or None, no network)."""
+    p = short_volume_params()
+    if ttl is None:
+        ttl = p["ttl_sec"]
+    if lookback_days is None:
+        lookback_days = int(p["lookback_days"])
     symbol = underlying_for(coin_or_ticker)
     # FINRA files key on the plain ticker, not CBOE's "_SPX" index form.
     symbol = symbol.lstrip("_")

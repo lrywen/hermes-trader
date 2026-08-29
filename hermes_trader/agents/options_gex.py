@@ -32,6 +32,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from hermes_trader.agents.config_store import cfg_get
+
 logger = logging.getLogger(__name__)
 
 try:                                  # proper CA bundle (Mac python often lacks one)
@@ -181,7 +183,39 @@ def compute_max_pain(rows: list[OptRow], nearest_expiry_only: bool = True) -> Op
     return best_k
 
 
-def fetch_cboe(ticker: str, timeout: float = 12.0) -> Optional[dict[str, Any]]:
+# ── Config wiring (R13-B7) ───────────────────────────────────────────────────
+# Literal fallback (== pre-R13-B7 behavior); the CANONICAL `options_gex` block
+# carries the same values and is the single source of truth at runtime.
+# _GEX_TTL_S stays as a module symbol (external reference + TTL fallback).
+_OPTIONS_GEX_DEFAULTS: dict[str, float] = {
+    "ttl_sec": 900.0,
+    "http_timeout_s": 12.0,
+}
+
+
+def options_gex_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, float]:
+    """Resolve the CBOE GEX fetch/cache knobs (live `options_gex` canonical
+    block, env ``HERMES_CFG_OPTIONS_GEX__*`` overrides included) with the module
+    literals as fallback. Per-leaf lookups keep each key independently
+    env-overridable; TTL and timeout must be non-negative. Any read/coerce
+    failure returns a fresh copy of the literals (signal path must never break
+    on a bad config)."""
+    p = dict(_OPTIONS_GEX_DEFAULTS)
+    try:
+        for key in ("ttl_sec", "http_timeout_s"):
+            v = cfg_get(f"options_gex.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv >= 0 else p[key]
+    except Exception as e:  # never let config break the signal path
+        logger.debug(f"[gex] options_gex params config read failed: {e}")
+        return dict(_OPTIONS_GEX_DEFAULTS)
+    return p
+
+
+def fetch_cboe(ticker: str, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
+    if timeout is None:
+        timeout = options_gex_params()["http_timeout_s"]
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
@@ -220,13 +254,15 @@ _gex_cache: dict[str, tuple] = {}      # ticker -> (epoch, GexReport|None)
 _gex_lock = threading.Lock()
 
 
-def gex_signal_cached(coin_or_ticker: str, ttl: float = _GEX_TTL_S,
+def gex_signal_cached(coin_or_ticker: str, ttl: Optional[float] = None,
                       allow_fetch: bool = True) -> Optional[GexReport]:
     """gex_signal() with a process-wide TTL cache. Caches misses too (as None)
     so a CBOE outage can't hammer the hot path. Thread-safe.
 
     allow_fetch=False = CACHE-ONLY: return the last cached value (or None) WITHOUT
     any network call — for the execute hot path, which must never fetch."""
+    if ttl is None:
+        ttl = options_gex_params()["ttl_sec"]
     ticker = underlying_for(coin_or_ticker)
     now = time.time()
     with _gex_lock:
@@ -245,8 +281,10 @@ def gex_signal_cached(coin_or_ticker: str, ttl: float = _GEX_TTL_S,
     return rep
 
 
-def gex_override_caution(coin: str, side: str, near_wall_pct: float = 1.0,
-                         ttl: float = _GEX_TTL_S, allow_fetch: bool = True) -> tuple:
+def gex_override_caution(coin: str, side: str,
+                         near_wall_pct: Optional[float] = None,
+                         ttl: Optional[float] = None,
+                         allow_fetch: bool = True) -> tuple:
     """Should a FORCED structural-override LONG on this xyz name be suppressed?
 
     Returns (suppress: bool, reason: str). Conservative + always-safe:
@@ -258,7 +296,17 @@ def gex_override_caution(coin: str, side: str, near_wall_pct: float = 1.0,
         `near_wall_pct`% below the call wall (overhead dealer resistance). That
         is a mean-revert pin, not a ripper — exactly the setup that turns a
         forced override into a dud. AI-conviction LONGs never reach this.
+
+    R13-B7: `near_wall_pct` defaults to the canonical `gex_signal.
+    caution_near_wall_pct` (10.0). The old signature default of 1.0 was dead
+    code (read_agent_config deep-merges CANONICAL_DEFAULTS, so the live value
+    was always 10.0) but direct-dict reads let env overrides vanish — callers
+    now pass nothing and resolve through cfg_get.
     """
+    if near_wall_pct is None:
+        near_wall_pct = float(cfg_get("gex_signal.caution_near_wall_pct", 10.0))
+    if ttl is None:
+        ttl = options_gex_params()["ttl_sec"]
     if ":" not in (coin or "") or (side or "").lower() != "long":
         return (False, "")
     rep = gex_signal_cached(coin, ttl=ttl, allow_fetch=allow_fetch)
