@@ -62,7 +62,7 @@ def test_canonical_defaults_pass_validation_lenient():
 
 def test_validate_forbidden_overrides_unit():
     """Direct unit test of the F27-extension helper used by the whole-cfg
-    store gate. Catches the case where any of the 5 force-execute
+    store gate. Catches the case where any of the 6 force-execute
     switches is armed without override_requires_ai being explicitly
     True in the merged state."""
     from hermes_trader.agents.config_schema import validate_forbidden_overrides
@@ -77,10 +77,10 @@ def test_validate_forbidden_overrides_unit():
     bad["override_requires_ai"] = False
     errs = validate_forbidden_overrides(bad)
     assert any("FORBIDDEN_OVERRIDE" in e for e in errs)
-    # 3. all 5 force keys covered
+    # 3. all 6 force keys covered
     for k in ("composite_force_execute", "breakout_force_execute",
-              "whale_force_execute", "whale_regime_bypass",
-              "spread_gate_fail_open"):
+              "whale_force_execute", "ta_sidestep_force_execute",
+              "whale_regime_bypass", "spread_gate_fail_open"):
         cfg = dict(CANONICAL_DEFAULTS)
         cfg[k] = True
         cfg["override_requires_ai"] = False

@@ -429,18 +429,22 @@ def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True
             )
 
     # ── P0-3: FORBIDDEN_OVERRIDE — force-execute / bypass switches ────────
-    # Five config flags can disable a safety gate by themselves:
+    # Six config flags can disable a safety gate by themselves:
     #   composite_force_execute   — bypasses the confidence floor when
     #                                composite score is high
     #   breakout_force_execute    — bypasses AI confirmation on breakout
     #                                triggers (volume + price)
     #   whale_force_execute       — bypasses AI confirmation on whale
     #                                accumulation signals
+    #   ta_sidestep_force_execute — bypasses AI confirmation on the TA
+    #                                sidestep path (enough slow-burn
+    #                                triggers plus a composite/momentum
+    #                                breakout)
     #   whale_regime_bypass       — lets a whale signal clear the
     #                                counter-regime gate
     #   spread_gate_fail_open     — makes the spread/impact gate default
     #                                to PASS when its data is unavailable
-    #                                (the only one of the five that turns
+    #                                (the only one of the six that turns
     #                                a fail-CLOSED gate into fail-OPEN)
     #
     # Each of these is a "skip a check" lever. Enabling any of them
@@ -449,20 +453,20 @@ def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True
     # the next trade is unprotected.
     #
     # The contract:
-    #   - When ANY of the five is set true, override_requires_ai must
+    #   - When ANY of the six is set true, override_requires_ai must
     #     ALSO be true in the SAME update. (splitting them across two
     #     writes is allowed but the resulting state must have both
     #     true; we check the merged state below by reading the current
     #     config when available.)
     #   - The runtime caller (executor / perception / spread gate)
-    #     must write a place_force_override_armed audit line whenever
-    #     it consults a force-execute switch in the armed state, so
+    #     must write a force_override_armed audit line whenever it
+    #     consults a force-execute switch in the armed state, so
     #     post-trade review can see "this trade was force-executed
     #     under override_requires_ai".
     _FORCE_OVERRIDE_KEYS = (
         "composite_force_execute", "breakout_force_execute",
-        "whale_force_execute", "whale_regime_bypass",
-        "spread_gate_fail_open",
+        "whale_force_execute", "ta_sidestep_force_execute",
+        "whale_regime_bypass", "spread_gate_fail_open",
     )
     for fkey in _FORCE_OVERRIDE_KEYS:
         if updates.get(fkey) is True:
@@ -478,8 +482,8 @@ def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True
 
 _FORCE_OVERRIDE_KEYS_FOR_GATE = (
     "composite_force_execute", "breakout_force_execute",
-    "whale_force_execute", "whale_regime_bypass",
-    "spread_gate_fail_open",
+    "whale_force_execute", "ta_sidestep_force_execute",
+    "whale_regime_bypass", "spread_gate_fail_open",
 )
 
 

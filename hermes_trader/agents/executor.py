@@ -400,6 +400,64 @@ def _record_risk_gate_block(analysis: dict[str, Any],
                      "(coin=%s)", type(e).__name__, e, analysis.get("coin"))
 
 
+# H3 (deep audit 2026-08-28): the six FORBIDDEN_OVERRIDE switches (see
+# config_schema P0-3) arm "skip a safety check" paths. The schema refuses to
+# arm any of them without override_requires_ai=true, but arming alone is
+# silent at runtime — nothing in events.jsonl said "this gate was bypassed
+# under a force override". Whenever the armed state is actually CONSULTED in
+# a way that changes the decision (a PASS upgraded to LONG, the spread gate
+# failing open, a whale signal clearing the counter-regime gate), this writes
+# a durable force_override_armed line so post-trade review can reconstruct
+# which switch fired. Best-effort: never blocks trading.
+_FORCE_OVERRIDE_CONFIG_KEYS = (
+    "composite_force_execute",
+    "breakout_force_execute",
+    "whale_force_execute",
+    "ta_sidestep_force_execute",
+    "whale_regime_bypass",
+    "spread_gate_fail_open",
+)
+
+
+def _record_force_override_armed(*, coin: str, trigger: str,
+                                 config: dict[str, Any],
+                                 details: Optional[dict[str, Any]] = None,
+                                 trace_id: str = "") -> None:
+    """Durably record that an armed FORBIDDEN_OVERRIDE switch was consulted.
+
+    Writes one ``force_override_armed`` event to events.jsonl carrying the
+    trigger path, the armed switches (the P0-3 keys that are true in this
+    config snapshot), the override_requires_ai state, and optional trigger
+    detail (e.g. which structural-override sub-test fired)."""
+    try:
+        from hermes_trader import event_log
+        armed = {
+            k: bool(config.get(k, False))
+            for k in _FORCE_OVERRIDE_CONFIG_KEYS
+            if bool(config.get(k, False))
+        }
+        ok = event_log.append(
+            "force_override_armed",
+            payload={
+                "coin": coin,
+                "trigger": trigger,
+                "armed_switches": armed,
+                "override_requires_ai": bool(
+                    config.get("override_requires_ai", True)),
+                "details": details or {},
+            },
+            trace_id=trace_id,
+        )
+        if not ok:
+            logger.error("[executor] force_override_armed event NOT durably "
+                         "written for coin=%s trigger=%s — audit feed may "
+                         "be down", coin, trigger)
+    except Exception as e:
+        logger.error("[executor] force_override_armed record raised %s: %s "
+                     "(coin=%s trigger=%s)",
+                     type(e).__name__, e, coin, trigger)
+
+
 # ── Pullback-long shadow audit (Suggestion A 48h grayscale) ────────────────
 # When runner_entry_gate.pullback_long.shadow_mode is enabled, every signal
 # that WOULD be admitted by the pullback-long bypass is appended here as a
@@ -1354,6 +1412,30 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             f"ai raw_conf={_ai_conf_raw:.3f} ai_down={int(_ai_down)} "
             f"nlp={int(_nlp_parsed)} reasoning={_reasoning!r}"
         )
+        # H3: the PASS→LONG upgrade is a force-execute switch changing the
+        # trading decision. Durable audit line naming the trigger + every
+        # armed switch + the override_requires_ai state (the schema only
+        # lets these switches arm with override_requires_ai=true; this
+        # records the runtime state at fire time).
+        _record_force_override_armed(
+            coin=analysis["coin"],
+            trigger=f"structural_override:{trigger}",
+            config=config,
+            details={
+                "subtests": {
+                    "whale": bool(whale_fired),
+                    "slow_burn": bool(slow_burn_strong),
+                    "breakout": bool(breakout_strong),
+                    "composite_strong": bool(composite_strong),
+                    "ta_sidestep": bool(ta_sidestep_strong),
+                },
+                "composite": _composite,
+                "composite_bar": override_composite,
+                "slow_burn_count": _slow_count,
+                "ai_confidence_raw": _ai_conf_raw,
+            },
+            trace_id=str(analysis.get("trace_id") or ""),
+        )
         # Fetch order book spread/depth for forced-trade diagnostics
         _ob = get_orderbook_spread(analysis["coin"])
         if _ob.get("ok"):
@@ -1884,6 +1966,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         whale_signal_fired=bool(analysis.get("whale_signal")) and bool(config.get("whale_regime_bypass", False)),
         peak_daily_pnl=memory.peak_daily_pnl(),
     )
+    # H3: an armed whale_regime_bypass is about to be consulted with a live
+    # whale signal (it changes the counter-regime gate input) — audit it.
+    if bool(config.get("whale_regime_bypass", False)) and analysis.get("whale_signal"):
+        _record_force_override_armed(
+            coin=analysis["coin"],
+            trigger="whale_regime_bypass",
+            config=config,
+            details={"whale_signal": True},
+            trace_id=str(analysis.get("trace_id") or ""),
+        )
 
     gate_output = eval_all_gates(
         ctx,
@@ -2074,6 +2166,20 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             logger.warning(
                 f"[executor] Pre-trade {coin}: orderbook unavailable "
                 f"({_ob.get('error', 'unknown')}) — FAIL_OPEN overridden, proceeding"
+            )
+            # H3: spread_gate_fail_open (or the HERMES_SPREAD_GATE_FAIL_OPEN
+            # env escape) turned a fail-CLOSED gate into fail-OPEN and the
+            # trade is proceeding on an unreadable book — audit it.
+            _record_force_override_armed(
+                coin=coin,
+                trigger="spread_gate_fail_open",
+                config=config,
+                details={
+                    "orderbook_error": _ob.get("error", "unknown"),
+                    "via_env": os.environ.get(
+                        "HERMES_SPREAD_GATE_FAIL_OPEN", "0") == "1",
+                },
+                trace_id=str(analysis.get("trace_id") or ""),
             )
         else:
             logger.error(

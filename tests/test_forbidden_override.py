@@ -1,22 +1,25 @@
-"""P0-3: FORBIDDEN_OVERRIDE — five force-execute / bypass switches must
+"""P0-3: FORBIDDEN_OVERRIDE — six force-execute / bypass switches must
 never be armed without an explicit AI agreement in the same config write.
 
-Each of the five flags can disable a safety gate by itself:
+Each of the six flags can disable a safety gate by itself:
   * composite_force_execute   — bypasses the confidence floor on high
                                composite score
   * breakout_force_execute    — bypasses AI confirmation on breakout
   * whale_force_execute       — bypasses AI confirmation on whale signal
+  * ta_sidestep_force_execute — bypasses AI confirmation on the TA
+                               sidestep path
   * whale_regime_bypass       — lets a whale signal clear the
                                counter-regime gate
   * spread_gate_fail_open     — turns the spread/impact gate from
                                fail-CLOSED into fail-OPEN (the most
-                               dangerous of the five — a single bool
+                               dangerous of the six — a single bool
                                flip lets an unprotected trade through
                                when the data feed is down)
 
 The contract: arming any of them requires ``override_requires_ai=true``
-in the SAME update. The schema enforces this; the runtime caller is
-expected to log a ``force_override_armed`` audit line on each consult.
+in the SAME update. The schema enforces this; the runtime caller
+(executor) writes a ``force_override_armed`` audit line whenever an
+armed switch is actually consulted in a decision-changing path.
 """
 
 from __future__ import annotations
@@ -30,6 +33,7 @@ _FORCE_OVERRIDE_KEYS = (
     "composite_force_execute",
     "breakout_force_execute",
     "whale_force_execute",
+    "ta_sidestep_force_execute",
     "whale_regime_bypass",
     "spread_gate_fail_open",
 )
@@ -40,7 +44,7 @@ _FORCE_OVERRIDE_KEYS = (
 
 @pytest.mark.parametrize("fkey", _FORCE_OVERRIDE_KEYS)
 def test_force_switch_alone_is_rejected(fkey):
-    """Arming any of the five without ``override_requires_ai=true`` is the
+    """Arming any of the six without ``override_requires_ai=true`` is the
     exact attack the schema guard exists to prevent. Must be rejected
     with a single, named error."""
     errs = validate_config_updates({fkey: True})
@@ -64,7 +68,7 @@ def test_force_switch_with_override_requires_ai_is_accepted(fkey):
     )
 
 
-def test_all_five_can_be_armed_in_one_update():
+def test_all_six_can_be_armed_in_one_update():
     errs = validate_config_updates({
         **{k: True for k in _FORCE_OVERRIDE_KEYS},
         "override_requires_ai": True,
