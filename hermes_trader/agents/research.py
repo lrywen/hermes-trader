@@ -53,8 +53,12 @@ _POOL_WORKERS = int(os.environ.get("HERMES_RESEARCH_POOL_WORKERS", "16"))
 def _get_pool() -> ThreadPoolExecutor:
     global _POOL
     if _POOL is None:
+        # R13-B10: pool width resolves through research_fetch_params (legacy
+        # HERMES_RESEARCH_POOL_WORKERS env → canonical research_fetch block →
+        # the _POOL_WORKERS import-time literal). Read once at construction.
+        workers = int(research_fetch_params()["pool_workers"])
         _POOL = ThreadPoolExecutor(
-            max_workers=_POOL_WORKERS,
+            max_workers=workers,
             thread_name_prefix="research",
         )
     return _POOL
@@ -75,10 +79,16 @@ def _http() -> httpx.Client:
     if _HTTP is None or _HTTP.is_closed:
         with _HTTP_LOCK:
             if _HTTP is None or _HTTP.is_closed:
+                # R13-B10: connection-pool limits resolve through
+                # research_fetch_params (canonical research_fetch block → the
+                # former 8/16 literals). Read once at client construction.
+                fp = research_fetch_params()
                 _HTTP = httpx.Client(
                     http2=True,
-                    limits=httpx.Limits(max_keepalive_connections=8,
-                                        max_connections=16),
+                    limits=httpx.Limits(
+                        max_keepalive_connections=int(fp["max_keepalive_connections"]),
+                        max_connections=int(fp["max_connections"]),
+                    ),
                 )
     return _HTTP
 
@@ -111,6 +121,123 @@ except Exception:  # pragma: no cover - shared dir optional
 _load_shared_config = load_shared_config
 
 logger = logging.getLogger(__name__)
+
+
+# ── R13-B10: canonical research LLM / fetch knobs ───────────────────────
+# The LLM-call parameters (gateway model/base URL, temperature, token
+# budgets, read/connect timeouts, 429 retry budget with exponential backoff,
+# length-continuation turns) and the concurrency/prefetch knobs (shared pool
+# width, httpx connection-pool limits, signals-block future timeout, the
+# per-source prefetch ceilings) used to live as inline literals or
+# os.environ.get(HERMES_*/OPENROUTER_*, <literal>) reads scattered across
+# _call_openrouter / _get_pool / _http / _signals_block / _parallel_prefetch.
+# They never appeared in CANONICAL_DEFAULTS, so the dashboard dump /
+# validate_config_updates could neither observe nor tune them. Both blocks
+# are now registered canonically (research_llm / research_fetch); these
+# helpers resolve every leaf as: legacy env var (highest priority, operator
+# / test compat) → cfg_get("research_llm|research_fetch.<leaf>") which covers
+# HERMES_CFG_* env and the agent-config dict → the inline literal. The
+# helpers never raise on the hot path — any coercion failure or out-of-range
+# value falls back to the literal copy.
+_RESEARCH_LLM_DEFAULTS: dict[str, Any] = {
+    "model": "deepseek-v4-flash",
+    "base_url": "https://openrouter.ai/api/v1",
+    "temperature": 0.1,
+    "max_tokens": 500,
+    "debate_max_tokens": 350,
+    "timeout_sec": 60.0,
+    "connect_timeout_sec": 5.0,
+    "retries": 2,
+    "backoff_base_sec": 1.0,
+    "backoff_cap_sec": 15.0,
+    "continuations": 2,
+}
+# leaf -> (legacy env var or None, kind "i"/"f"/"s", minimum guard).
+_RESEARCH_LLM_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "model": ("OPENROUTER_MODEL", "s", 0.0),
+    "base_url": ("OPENROUTER_BASE_URL", "s", 0.0),
+    "temperature": (None, "f", 0.0),
+    "max_tokens": (None, "i", 1),
+    "debate_max_tokens": (None, "i", 1),
+    "timeout_sec": (None, "f", 0.1),
+    "connect_timeout_sec": (None, "f", 0.1),
+    "retries": (None, "i", 0),
+    "backoff_base_sec": (None, "f", 0.0),
+    "backoff_cap_sec": (None, "f", 0.0),
+    "continuations": (None, "i", 0),
+}
+
+_RESEARCH_FETCH_DEFAULTS: dict[str, Any] = {
+    "pool_workers": _POOL_WORKERS,
+    "max_connections": 16,
+    "max_keepalive_connections": 8,
+    "signals_timeout_sec": 40.0,
+    "fetch_timeout_default_sec": 45.0,
+    "fetch_timeout_candles_sec": 15.0,
+    "fetch_timeout_funding_sec": 8.0,
+    "fetch_timeout_news_sec": 10.0,
+    "fetch_timeout_signals_sec": 12.0,
+}
+_RESEARCH_FETCH_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "pool_workers": ("HERMES_RESEARCH_POOL_WORKERS", "i", 1),
+    "max_connections": (None, "i", 1),
+    "max_keepalive_connections": (None, "i", 0),
+    "signals_timeout_sec": ("HERMES_RESEARCH_SIGNALS_TIMEOUT_S", "f", 0.1),
+    "fetch_timeout_default_sec": ("HERMES_RESEARCH_FETCH_TIMEOUT_S", "f", 0.1),
+    "fetch_timeout_candles_sec": ("HERMES_RESEARCH_FETCH_TIMEOUT_CANDLES", "f", 0.1),
+    "fetch_timeout_funding_sec": ("HERMES_RESEARCH_FETCH_TIMEOUT_FUNDING", "f", 0.1),
+    "fetch_timeout_news_sec": ("HERMES_RESEARCH_FETCH_TIMEOUT_NEWS", "f", 0.1),
+    "fetch_timeout_signals_sec": ("HERMES_RESEARCH_FETCH_TIMEOUT_SIGNALS", "f", 0.1),
+}
+
+
+def _research_params(block: str, defaults: dict[str, Any],
+                     spec: dict[str, tuple[Optional[str], str, float]],
+                     *, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve one canonical research block (shared by llm/fetch).
+
+    Per leaf: a non-empty legacy env var wins (operator/test compat), then
+    cfg_get covers HERMES_CFG_<BLOCK>__<LEAF> env and the agent-config dict,
+    then the inline literal. Strings pass through; ints/floats are coerced
+    and must clear the minimum guard. Any failure returns a fresh literal
+    copy so the research hot path never raises.
+    """
+    p = dict(defaults)
+    try:
+        for leaf, (legacy_env, kind, min_v) in spec.items():
+            raw: Any = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                raw = cfg_get(f"{block}.{leaf}", config=config)
+            if raw is None:
+                continue
+            if kind == "s":
+                v: Any = str(raw)
+                if v == "":
+                    continue
+            elif kind == "i":
+                v = int(raw)
+            else:
+                v = float(raw)
+            if kind == "s" or v >= min_v:
+                p[leaf] = v
+    except Exception as e:
+        logger.debug(f"[research] {block} params read failed, using literals: {e}")
+        return dict(defaults)
+    return p
+
+
+def research_llm_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the eleven research LLM-call knobs (independent dict copy)."""
+    return _research_params("research_llm", _RESEARCH_LLM_DEFAULTS,
+                            _RESEARCH_LLM_SPEC, config=config)
+
+
+def research_fetch_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the nine research concurrency/prefetch knobs (independent copy)."""
+    return _research_params("research_fetch", _RESEARCH_FETCH_DEFAULTS,
+                            _RESEARCH_FETCH_SPEC, config=config)
 
 
 # P3-2: research-path LLM circuit breaker. Without it, a dead OpenRouter
@@ -367,7 +494,9 @@ def _signals_block(coin: str) -> str:
         # P1-1: submit to the shared pool (no nested-pool burst). Each source
         # has its own internal timeout; give the futures a bound too so a hung
         # source can't wedge this block forever.
-        _sig_timeout = float(os.environ.get("HERMES_RESEARCH_SIGNALS_TIMEOUT_S", "40"))
+        # R13-B10: legacy HERMES_RESEARCH_SIGNALS_TIMEOUT_S env still wins;
+        # canonical research_fetch.signals_timeout_sec resolves underneath.
+        _sig_timeout = float(research_fetch_params()["signals_timeout_sec"])
         pool = _get_pool()
         f_gex = pool.submit(_fetch_gex)
         f_sv = pool.submit(_fetch_short_vol)
@@ -620,25 +749,42 @@ def _call_openrouter(
     user_message: str,
     *,
     response_format: Optional[dict] = None,
-    timeout: float = 60.0,
-    max_tokens: int = 500,
+    timeout: Optional[float] = None,
+    max_tokens: Optional[int] = None,
     path: str = "call_ai",
 ) -> str:
     """Call the LLM API via OpenAI-compatible endpoint (synchronous httpx).
 
     Supports OpenRouter, Volcengine Ark, or any OpenAI-compatible gateway via:
-      OPENROUTER_API_KEY  — API key
+      OPENROUTER_API_KEY  — API key (stays a bare secret env var; NOT canonical)
       OPENROUTER_MODEL    — model name (default: deepseek-v4-flash)
       OPENROUTER_BASE_URL — base URL without /chat/completions
                             (default: https://openrouter.ai/api/v1)
+
+    R13-B10: every other knob (model/base URL fallbacks, temperature, token
+    budgets, timeouts, retries/backoff, continuations) resolves through
+    research_llm_params() — legacy OPENROUTER_* env wins, then the canonical
+    research_llm block, then the inline literals. Caller-passed ``timeout`` /
+    ``max_tokens`` (e.g. the debate path's shorter values) still override.
 
     ``path`` is a bounded P3-1 metrics label identifying the caller
     (call_ai/debate_direct); it never carries a coin or free text.
     """
     _t_started = time.time()
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
-    model = os.environ.get("OPENROUTER_MODEL", "deepseek-v4-flash")
-    base_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+    lp = research_llm_params()
+    model = str(lp["model"])
+    base_url = str(lp["base_url"])
+    if timeout is None:
+        timeout = float(lp["timeout_sec"])
+    if max_tokens is None:
+        max_tokens = int(lp["max_tokens"])
+    temperature = float(lp["temperature"])
+    connect_timeout = float(lp["connect_timeout_sec"])
+    max_429_retries = int(lp["retries"])
+    backoff_base_s = float(lp["backoff_base_sec"])
+    backoff_cap_s = float(lp["backoff_cap_sec"])
+    max_length_continuations = int(lp["continuations"])
 
     if not openrouter_key:
         logger.warning("[research] OPENROUTER_API_KEY not set — returning empty response")
@@ -671,7 +817,7 @@ def _call_openrouter(
         ],
         "stream": False,
         "max_tokens": max_tokens,
-        "temperature": 0.1,
+        "temperature": temperature,
     }
     if response_format:
         # Only attached when the caller opts in (debate synthesis). Models that
@@ -681,12 +827,9 @@ def _call_openrouter(
     # P2-5: rate-limit retry budget. 429s (and the occasional 5xx) are retried
     # with exponential backoff, honouring the provider Retry-After header when
     # it is present; cap the sleep so a hostile header can't wedge the loop.
-    _MAX_429_RETRIES = 2
-    _BACKOFF_BASE_S = 1.0
-    _BACKOFF_CAP_S = 15.0
-    # P2-5: when finish_reason == "length" the JSON was cut mid-object; up to
-    # this many continuation turns are appended to complete it.
-    _MAX_LENGTH_CONTINUATIONS = 2
+    # R13-B10: the budget / backoff / continuation values above now resolve
+    # through research_llm_params() (canonical research_llm block) instead of
+    # local literals; the closure names below are kept for readability.
 
     def _post(msgs: list[dict[str, str]], max_toks: int) -> httpx.Response:
         body = dict(payload)
@@ -699,7 +842,7 @@ def _call_openrouter(
             url,
             json=body,
             headers=headers,
-            timeout=httpx.Timeout(timeout, connect=5.0),
+            timeout=httpx.Timeout(timeout, connect=connect_timeout),
         )
 
     def _retry_after_s(resp: httpx.Response, attempt: int) -> float:
@@ -707,26 +850,26 @@ def _call_openrouter(
         try:
             ra = (resp.headers.get("retry-after") or "").strip()
             if ra:
-                return max(0.0, min(_BACKOFF_CAP_S, float(ra)))
+                return max(0.0, min(backoff_cap_s, float(ra)))
         except (TypeError, ValueError):
             pass
-        return min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+        return min(backoff_cap_s, backoff_base_s * (2 ** attempt))
 
     def _send(msgs: list[dict[str, str]], max_toks: int) -> httpx.Response:
         """POST with 429/5xx backoff. Returns the final response (any status)."""
         resp = None
-        for attempt in range(_MAX_429_RETRIES + 1):
+        for attempt in range(max_429_retries + 1):
             try:
                 resp = _post(msgs, max_toks)
             except Exception as e:
                 # Network/timeout error: back off and retry like a 429 while
                 # the budget lasts, else surface as a failure response.
-                if attempt >= _MAX_429_RETRIES:
+                if attempt >= max_429_retries:
                     raise
-                wait = min(_BACKOFF_CAP_S, _BACKOFF_BASE_S * (2 ** attempt))
+                wait = min(backoff_cap_s, backoff_base_s * (2 ** attempt))
                 logger.warning(
                     f"[research] LLM call EXCEPTION ({type(e).__name__}) — "
-                    f"retry {attempt + 1}/{_MAX_429_RETRIES} in {wait:.1f}s"
+                    f"retry {attempt + 1}/{max_429_retries} in {wait:.1f}s"
                 )
                 try:
                     from hermes_trader import metrics
@@ -736,11 +879,11 @@ def _call_openrouter(
                     pass
                 time.sleep(wait)
                 continue
-            if resp.status_code in (429, 502, 503) and attempt < _MAX_429_RETRIES:
+            if resp.status_code in (429, 502, 503) and attempt < max_429_retries:
                 wait = _retry_after_s(resp, attempt)
                 logger.warning(
                     f"[research] HTTP {resp.status_code} rate-limit/unavailable — "
-                    f"retry {attempt + 1}/{_MAX_429_RETRIES} in {wait:.1f}s"
+                    f"retry {attempt + 1}/{max_429_retries} in {wait:.1f}s"
                 )
                 try:
                     from hermes_trader import metrics
@@ -791,10 +934,10 @@ def _call_openrouter(
         # object cut mid-stream is reassembled into something parse_structured
         # can recover. Chat turn order: assistant chunk, then "continue".
         if finish_reason == "length" and content.strip():
-            for cont_i in range(_MAX_LENGTH_CONTINUATIONS):
+            for cont_i in range(max_length_continuations):
                 logger.warning(
                     f"[research] finish_reason=length — continuation "
-                    f"{cont_i + 1}/{_MAX_LENGTH_CONTINUATIONS} "
+                    f"{cont_i + 1}/{max_length_continuations} "
                     f"(partial_chars={len(content)})"
                 )
                 try:
@@ -1322,6 +1465,10 @@ def _debate_direct(
     :func:`parse_structured` to extract JSON from prose/code-fences.
     """
     dcfg = _debate_cfg()
+    # R13-B10: the debate path's tighter token budget resolves through
+    # research_llm_params (canonical research_llm.debate_max_tokens → the
+    # former 350 literal).
+    debate_tokens = int(research_llm_params()["debate_max_tokens"])
     rf = ResearchVerdict.openrouter_response_format() if structured else None
     per_call_timeout = timeout if timeout is not None else _debate_per_call_timeout()
     role = _debate_role(system_prompt)
@@ -1336,7 +1483,7 @@ def _debate_direct(
             user_message,
             response_format=rf,
             timeout=per_call_timeout,
-            max_tokens=350,
+            max_tokens=debate_tokens,
             path="debate_direct",
         )
     except Exception as e:
@@ -1652,19 +1799,27 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> dict[str, Any]:
     # hl_client retries and deserve more headroom. Each future's own HTTP
     # timeout still applies underneath; these bounds only cap a HUNG future.
     # HERMES_RESEARCH_FETCH_TIMEOUT_S remains honored as a fallback ceiling for
-    # any source without an explicit override.
-    _default_timeout = float(os.environ.get("HERMES_RESEARCH_FETCH_TIMEOUT_S", "45"))
+    # any source without an explicit override. R13-B10: the ceilings resolve
+    # through research_fetch_params — each legacy HERMES_RESEARCH_FETCH_* env
+    # var still wins (test/operator compat), then the canonical
+    # research_fetch block, then these literals.
+    fp = research_fetch_params()
+    _default_timeout = float(fp["fetch_timeout_default_sec"])
+    _src_leaf = {
+        "candles": "fetch_timeout_candles_sec",
+        "funding": "fetch_timeout_funding_sec",
+        "news": "fetch_timeout_news_sec",
+        "signals": "fetch_timeout_signals_sec",
+    }
 
-    def _src_timeout(name: str, default: float) -> float:
-        return float(os.environ.get(
-            f"HERMES_RESEARCH_FETCH_TIMEOUT_{name.upper()}",
-            str(default if default > 0 else _default_timeout),
-        ))
+    def _src_timeout(name: str) -> float:
+        v = float(fp[_src_leaf[name]])
+        return v if v > 0 else _default_timeout
 
-    t_candles = _src_timeout("candles", 15.0)
-    t_funding = _src_timeout("funding", 8.0)
-    t_news = _src_timeout("news", 10.0)
-    t_signals = _src_timeout("signals", 12.0)
+    t_candles = _src_timeout("candles")
+    t_funding = _src_timeout("funding")
+    t_news = _src_timeout("news")
+    t_signals = _src_timeout("signals")
     _fetch_t0 = time.monotonic()
     logger.info(
         f"[research] {coin}: parallel data-fetch START "

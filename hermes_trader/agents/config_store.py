@@ -599,6 +599,63 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "movers_min_pct": 1.0,
         "future_timeout_sec": 60,
     },
+    # R13-B10: research-path LLM call knobs (research.py _call_openrouter /
+    # _debate_direct). Eleven leaves covering the gateway model/base URL, the
+    # sampling temperature, the normal-path vs debate-path response token
+    # budgets, the read/connect httpx timeouts, the 429/5xx retry budget with
+    # its exponential backoff base/cap, and the finish_reason=length
+    # continuation turn budget. They were previously either local literals
+    # inside _call_openrouter (temperature / timeouts / retries / backoff /
+    # continuations) or read only via OPENROUTER_* env vars, and never appeared
+    # in CANONICAL_DEFAULTS — invisible to dashboard dump /
+    # validate_config_updates and un-tunable via the canonical config channel.
+    # research.research_llm_params() keeps OPENROUTER_MODEL /
+    # OPENROUTER_BASE_URL as the top-priority override (operator gateway
+    # routing), then falls through to this block via cfg_get
+    # (HERMES_CFG_RESEARCH_LLM__* env + agent-config). OPENROUTER_API_KEY stays
+    # a bare secret env var and is deliberately NOT registered here. Defaults
+    # mirror the research.py literals verbatim; behaviour unchanged.
+    "research_llm": {
+        "model": "deepseek-v4-flash",
+        "base_url": "https://openrouter.ai/api/v1",
+        "temperature": 0.1,
+        "max_tokens": 500,
+        "debate_max_tokens": 350,
+        "timeout_sec": 60.0,
+        "connect_timeout_sec": 5.0,
+        "retries": 2,
+        "backoff_base_sec": 1.0,
+        "backoff_cap_sec": 15.0,
+        "continuations": 2,
+    },
+    # R13-B10: research-path concurrency / prefetch knobs (research.py
+    # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
+    # covering the shared ThreadPoolExecutor width, the reused httpx client's
+    # keepalive/total connection-pool limits, the inner signals-block future
+    # timeout, the per-source prefetch fallback ceiling, and the four
+    # per-source fetch ceilings (candles / funding / news / signals). They
+    # were previously read only via os.environ.get(HERMES_RESEARCH_*,
+    # <literal>) or hardcoded as httpx.Limits(...) literals, and never
+    # appeared in CANONICAL_DEFAULTS. research.research_fetch_params() keeps
+    # every legacy HERMES_RESEARCH_* env var (including the
+    # HERMES_RESEARCH_FETCH_TIMEOUT_<SOURCE> family) as the top-priority
+    # override, then falls through to this block via cfg_get
+    # (HERMES_CFG_RESEARCH_FETCH__* env + agent-config). Pool width and
+    # connection limits are read lazily at pool/client construction, so
+    # config changes take effect on the next process (the singletons are
+    # built once). Defaults mirror the research.py literals verbatim;
+    # behaviour unchanged.
+    "research_fetch": {
+        "pool_workers": 16,
+        "max_connections": 16,
+        "max_keepalive_connections": 8,
+        "signals_timeout_sec": 40.0,
+        "fetch_timeout_default_sec": 45.0,
+        "fetch_timeout_candles_sec": 15.0,
+        "fetch_timeout_funding_sec": 8.0,
+        "fetch_timeout_news_sec": 10.0,
+        "fetch_timeout_signals_sec": 12.0,
+    },
     # R13-B1: DSL state-file I/O tunables (dsl_exit.py L65/77/86/1061/1063).
     # The five knobs (process-wide save throttle, dashboard force-reload TTL,
     # ExitPolicy cache TTL, save retry attempts, save backoff base) were

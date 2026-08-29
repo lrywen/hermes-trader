@@ -191,6 +191,18 @@ class _ConfigPatch(BaseModel):
     # sweep, batch rate-limit pacing, thread-pool width, movers % cut-off and
     # future timeout. Legacy HERMES_* env vars remain the top-priority channel.
     scan_budget: dict[str, Any] = Field(default_factory=lambda: _dict_default("scan_budget"))
+    # R13-B10: research-path LLM call knobs (research.py _call_openrouter /
+    # _debate_direct). Eleven keys: gateway model/base URL, temperature,
+    # normal/debate token budgets, read/connect timeouts, retry budget with
+    # backoff base/cap, and continuation turns. OPENROUTER_MODEL /
+    # OPENROUTER_BASE_URL env vars remain the top-priority channel.
+    research_llm: dict[str, Any] = Field(default_factory=lambda: _dict_default("research_llm"))
+    # R13-B10: research-path concurrency / prefetch knobs (research.py
+    # _get_pool / _http / _signals_block / _parallel_prefetch). Nine keys:
+    # shared pool width, httpx keepalive/total connection limits, signals
+    # future timeout and the per-source fetch timeout family. Legacy
+    # HERMES_RESEARCH_* env vars remain the top-priority channel.
+    research_fetch: dict[str, Any] = Field(default_factory=lambda: _dict_default("research_fetch"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
