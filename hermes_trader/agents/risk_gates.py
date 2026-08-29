@@ -240,16 +240,24 @@ def opposite_direction_guard(ctx: GateContext) -> GateResult:
     LONG/SHORT on a strong held name; without this it would try to pyramid in
     (previously only the exchange margin check stopped it)."""
     # P1-3: .get() defensively — a malformed position record (missing coin/side)
-    # must not raise KeyError and abort the whole gate evaluation; fail open with
-    # a warning so the anomaly is visible.
+    # must not raise KeyError and abort the whole gate evaluation.
+    # B-M4 (deep audit 2026-08-28): a held record missing 'side' is a corrupted
+    # / tampered position state — we cannot tell whether the intended trade is a
+    # flip or a pyramid, so BOTH are dangerous. Fail CLOSED (block) instead of
+    # failing open; production position records always carry 'side' (built from
+    # asset_positions szi sign in executor, backfilled by active_position_coins),
+    # so this only trips on real corruption.
     existing = next((p for p in ctx.current_positions if p.get("coin") == ctx.coin), None)
     if not existing:
         return {"pass": True}
     held_side = existing.get("side")
     if not held_side:
-        logger.warning(f"[risk] opposite_direction_guard: held position on {ctx.coin} "
-                       f"missing 'side' key — failing open (pass)")
-        return {"pass": True}
+        logger.error(f"[risk] opposite_direction_guard: held position on {ctx.coin} "
+                     f"has malformed record (missing 'side' key) — fail-CLOSED: "
+                     f"entry blocked to prevent auto-flip/pyramid on unknown state")
+        return {"pass": False,
+                "reason": f"malformed_position: held {ctx.coin} record missing 'side' "
+                          f"— fail-closed (no auto-flip/pyramid on unknown state)"}
     if held_side != ctx.trade_side:
         return {"pass": False, "reason": f"opposite position exists ({ctx.coin} {held_side}) — no auto-flip"}
     return {"pass": False, "reason": f"already holding {ctx.coin} {held_side} — no pyramid/re-entry"}

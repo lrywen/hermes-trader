@@ -1606,12 +1606,48 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
     return dropped
 
 
+# C-M1 (deep audit 2026-08-28): per-coin throttle for the missing-mid alarm.
+# A held position without a usable mark price means the DSL engine CANNOT
+# evaluate its exit this tick — previously this was a silent `continue`
+# (fail-open: the position was unmonitored with no trace). The exchange-side
+# backup SL remains the hard backstop, but the blind tick must be loud.
+_MISSING_MID_WARN_INTERVAL_S = 60.0
+_last_missing_mid_warn: dict[str, float] = {}
+
+
+def _valid_mid(v: Any) -> bool:
+    """True when `v` is a usable, positive, finite mark price."""
+    try:
+        f = float(v)
+    except (ValueError, TypeError):
+        return False
+    return f > 0.0 and math.isfinite(f)
+
+
+def held_coins_missing_mids(mids: dict[str, Any]) -> list[str]:
+    """Coins with an active DSL tracker whose mark price is absent/unusable.
+
+    Used by the trading loop as a feed-health gate: when the price feed is
+    dead (empty snapshot) or blind to any held coin, NEW-ENTRY decisions are
+    paused for the cycle (exit monitoring still runs; exchange SLs backstop
+    positions that cannot be DSL-evaluated). Returns a sorted list.
+    """
+    return sorted({t.coin for t in _active_positions.values()
+                   if not _valid_mid(mids.get(t.coin))})
+
+
 def check_all_positions(mids: dict[str, float]) -> list[ExitVerdict]:
     """Check all active positions against current mids. Call each scan tick.
 
     Returns list of ExitVerdict for positions that should be closed.
+
+    C-M1: a tracker with no usable mark price is skipped (no price → no
+    defensible market close; the exchange-side backup SL is the backstop),
+    but the blind tick is logged at ERROR level, throttled per coin, instead
+    of being silently swallowed.
     """
     exits = []
+    now = time.monotonic()
     for tracker in list(_active_positions.values()):
         mark_px = mids.get(tracker.coin)
         # Handle both str and float values from different sources
@@ -1619,9 +1655,18 @@ def check_all_positions(mids: dict[str, float]) -> list[ExitVerdict]:
             try:
                 mark_px = float(mark_px)
             except (ValueError, TypeError):
-                continue
-            if mark_px > 0:
-                verdict = tracker.check(mark_px)
-                if verdict.exit:
-                    exits.append(verdict)
+                mark_px = None
+        if mark_px is None or not (mark_px > 0.0 and math.isfinite(mark_px)):
+            last = _last_missing_mid_warn.get(tracker.coin, 0.0)
+            if now - last >= _MISSING_MID_WARN_INTERVAL_S:
+                _last_missing_mid_warn[tracker.coin] = now
+                logger.error(
+                    f"[dsl] NO USABLE MID for held {tracker.coin} {tracker.side} "
+                    f"(raw={mark_px!r}) — DSL exit NOT evaluated this tick; "
+                    f"exchange backup SL is the only stop. Feed failure must "
+                    f"pause new entries (FEED-FRESHNESS).")
+            continue
+        verdict = tracker.check(mark_px)
+        if verdict.exit:
+            exits.append(verdict)
     return exits

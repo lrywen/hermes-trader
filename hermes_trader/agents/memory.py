@@ -822,7 +822,10 @@ class AgentMemory:
         with self._lock:
             self._cooldowns[coin] = int(until_ms)
             self._dirty = True
-        self.flush()
+        # B-M12 (deep audit 2026-08-28): risk-blocking state must hit disk
+        # immediately — a crash inside the flush-throttle window would lose the
+        # cooldown and let the anti-revenge block vanish on restart.
+        self.flush(force=True)
 
     def loss_cooldown_remaining_min(self, coin: str) -> float:
         """Minutes left on `coin`'s loss cooldown (0 when expired/absent)."""
@@ -849,7 +852,9 @@ class AgentMemory:
         with self._lock:
             self._coin_circuit[coin] = int(until_ms)
             self._dirty = True
-        self.flush()
+        # B-M12: force flush — a per-coin breaker must survive a crash within
+        # the throttle window, otherwise the coin can be re-opened on restart.
+        self.flush(force=True)
 
     def coin_circuit_remaining_min(self, coin: str) -> float:
         with self._lock:
@@ -867,7 +872,9 @@ class AgentMemory:
         with self._lock:
             self._global_halt_until_ms = int(until_ms)
             self._dirty = True
-        self.flush()
+        # B-M12: force flush — the global halt blocks ALL entries; losing it to
+        # a throttled-write crash would resume trading through a daily-loss halt.
+        self.flush(force=True)
 
     def global_halt_remaining_min(self) -> float:
         with self._lock:

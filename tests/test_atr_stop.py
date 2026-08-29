@@ -280,7 +280,8 @@ def test_loss_cooldown_blocks_reentry(monkeypatch):
     )
     # Never flush test cooldowns into the LIVE .agent-memory.json (this test
     # once armed a real 60min TON cooldown in production state).
-    monkeypatch.setattr(ex.memory, "flush", lambda: None)
+    # B-M12: set_loss_cooldown now force-flushes, so the stub must accept kwargs.
+    monkeypatch.setattr(ex.memory, "flush", lambda *a, **k: None)
     ex.memory.set_loss_cooldown("TON", int(_t.time() * 1000 + 60 * 60_000))
     try:
         res = ex.maybe_execute({

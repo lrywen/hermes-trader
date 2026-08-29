@@ -49,7 +49,7 @@ from hermes_trader.agents.perception import scan_once
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.research import research
 from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl
-from hermes_trader.agents.dsl_exit import active_position_coins, rehydrate_from_exchange
+from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.memory import memory
@@ -436,6 +436,11 @@ while True:
         # for synthesized trackers (the `user` local inside _sync_account_state
         # is not visible in this scope).
         user = resolve_user_address()
+        # C-M1 (deep audit 2026-08-28): feed-health gate for NEW entries.
+        # Set inside the DSL pass below when the price snapshot is unusable;
+        # consumed after the OFF-mode check to skip scan/research/execution.
+        # Exit monitoring always runs regardless (exchange SLs backstop).
+        _feed_halt_reason = None
         try:
             dropped = rehydrate_from_exchange(positions,
                                     default_leverage=int(cfg_get("leverage", config=_cfg)),
@@ -594,6 +599,20 @@ while True:
             # trackers and their peak/floor never advance (dashboard shows
             # "no DSL" indefinitely and DSL stop never fires on HIP-3).
             mids = get_all_hl_mids(include_hip3=True)
+            # C-M1: fail CLOSED on feed failure. A completely empty snapshot
+            # means all_mids() failed/returned nothing; held coins missing from
+            # a non-empty snapshot mean the feed is blind to positions we hold
+            # (their DSL exits cannot evaluate either — check_all_positions
+            # screams per coin). In both states new entries this cycle would be
+            # sized off stale/missing prices, so they are paused.
+            if not mids:
+                _feed_halt_reason = "empty mids snapshot (all_mids feed failed)"
+            else:
+                _blind = held_coins_missing_mids(mids)
+                if _blind:
+                    _feed_halt_reason = (f"no usable mid for held coin(s): "
+                                         f"{', '.join(_blind[:5])}"
+                                         + (f" +{len(_blind)-5} more" if len(_blind) > 5 else ""))
             exits = monitor_exits(mids)
             for ex in exits:
                 coin = ex["coin"]
@@ -672,6 +691,18 @@ while True:
 
         if str(_cfg.get("mode", "OFF")).upper() == "OFF":
             logger.info("[mode] OFF — skipping scan/research/execution; exits still monitored")
+            _last_progress_ts = time.time()
+            logger.info(f"Sleeping {scan_interval}s until next scan...")
+            time.sleep(scan_interval)
+            continue
+
+        # C-M1: price feed is dead or blind to a held coin — skip ALL new-entry
+        # decisions this cycle (scan/research/execution). Positions are still
+        # exit-monitored above and backstopped by exchange-side SLs; trading on
+        # missing/stale prices is the fail-open path the audit flagged.
+        if _feed_halt_reason:
+            logger.error(f"[feed] FEED-FRESHNESS halt — skipping entries this cycle: {_feed_halt_reason}")
+            log_event({"event": "feed_halt", "reason": _feed_halt_reason})
             _last_progress_ts = time.time()
             logger.info(f"Sleeping {scan_interval}s until next scan...")
             time.sleep(scan_interval)
