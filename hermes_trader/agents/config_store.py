@@ -570,6 +570,35 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "trend_flip_bars": 3,
         "higher_lows_required": 4,
     },
+    # R13-B9: perception scan_budget knobs (perception.py scan_once). Twelve
+    # leaves covering the candle-cache size, the per-scan market budget split
+    # (total / HIP-3 reservation / movers slots / USD volume floors), the
+    # rotating universe sweep, batch rate-limit pacing, thread-pool width, the
+    # movers |24h%| cut-off, and the per-future timeout. They were previously
+    # read only via os.environ.get(HERMES_*, <literal>) at scan time and never
+    # appeared in CANONICAL_DEFAULTS — invisible to dashboard dump /
+    # validate_config_updates and un-tunable via the canonical config channel.
+    # perception.scan_budget_params() keeps every legacy HERMES_* env var as
+    # the top-priority override (MCP server writes HERMES_MAX_MARKETS; existing
+    # test/operator knobs keep working), then falls through to this block via
+    # cfg_get (HERMES_CFG_SCAN_BUDGET__* env + agent-config). Zero is a legal
+    # "reserved disabled" value for budget slots / sweep / sleep; cache size,
+    # batch size, the movers % cut-off and the timeout must be >= 1 / > 0.
+    # Defaults mirror the perception literals verbatim; behaviour unchanged.
+    "scan_budget": {
+        "cache_max": 512,
+        "max_markets": 60,
+        "max_markets_hip3": 25,
+        "max_markets_movers": 10,
+        "movers_vol_floor_usd": 300_000.0,
+        "hip3_movers_floor_usd": 50_000.0,
+        "universe_sweep": 0,
+        "batch_size": 20,
+        "batch_sleep_sec": 0.3,
+        "parallel_workers": 32,
+        "movers_min_pct": 1.0,
+        "future_timeout_sec": 60,
+    },
     # R13-B1: DSL state-file I/O tunables (dsl_exit.py L65/77/86/1061/1063).
     # The five knobs (process-wide save throttle, dashboard force-reload TTL,
     # ExitPolicy cache TTL, save retry attempts, save backoff base) were

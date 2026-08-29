@@ -186,6 +186,11 @@ class _ConfigPatch(BaseModel):
     # are mapped to the camelCase runtime keys by config.py helpers.
     trigger_weights: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_weights"))
     trigger_thresholds: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_thresholds"))
+    # R13-B9: perception scan budget / pacing knobs (perception.py scan_once).
+    # Twelve keys: cache size, market budget split, USD floors, universe
+    # sweep, batch rate-limit pacing, thread-pool width, movers % cut-off and
+    # future timeout. Legacy HERMES_* env vars remain the top-priority channel.
+    scan_budget: dict[str, Any] = Field(default_factory=lambda: _dict_default("scan_budget"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

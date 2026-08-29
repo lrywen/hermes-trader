@@ -17,6 +17,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
 from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
+from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.cache import _Cache
 from hermes_trader.client.hl_client import fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
@@ -492,6 +493,80 @@ def _scan_single_market(
 _sweep_offset = 0
 
 
+# R13-B9: scan budget / pacing knobs. These twelve literals were previously
+# read inline via os.environ.get(HERMES_*, <literal>) inside scan_once and had
+# no canonical registration (invisible to dashboard dump / validate_config).
+# Each leaf maps to the legacy HERMES_* env var that operators / the MCP server
+# (scripts/hermes-mcp-server.py writes HERMES_MAX_MARKETS) / existing tests set;
+# that legacy channel stays the TOP-priority override for backward compat, then
+# cfg_get reads the canonical scan_budget block (HERMES_CFG_SCAN_BUDGET__* env +
+# agent-config). Defaults mirror the old literals verbatim — zero behaviour
+# change. spec: (legacy env or None, kind "i"/"f", min value); a value failing
+# coercion or the guard falls back to the literal. Zero is a legal
+# "reserved/disabled" value for budget slots / sweep / sleep, hence 0 for those.
+_SCAN_BUDGET_DEFAULTS: dict[str, Any] = {
+    "cache_max": 512,
+    "max_markets": 60,
+    "max_markets_hip3": 25,
+    "max_markets_movers": 10,
+    "movers_vol_floor_usd": 300_000.0,
+    "hip3_movers_floor_usd": 50_000.0,
+    "universe_sweep": 0,
+    "batch_size": 20,
+    "batch_sleep_sec": 0.3,
+    "parallel_workers": 32,
+    "movers_min_pct": 1.0,
+    "future_timeout_sec": 60,
+}
+_SCAN_BUDGET_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "cache_max": ("HERMES_PERCEPTION_CACHE_MAX", "i", 1),
+    "max_markets": ("HERMES_MAX_MARKETS", "i", 0),
+    "max_markets_hip3": ("HERMES_MAX_MARKETS_HIP3", "i", 0),
+    "max_markets_movers": ("HERMES_MAX_MARKETS_MOVERS", "i", 0),
+    "movers_vol_floor_usd": ("HERMES_MOVERS_VOL_FLOOR_USD", "f", 0),
+    "hip3_movers_floor_usd": ("HERMES_HIP3_MOVERS_FLOOR_USD", "f", 0),
+    "universe_sweep": ("HERMES_UNIVERSE_SWEEP", "i", 0),
+    "batch_size": ("HERMES_BATCH_SIZE", "i", 1),
+    "batch_sleep_sec": ("HERMES_BATCH_SLEEP", "f", 0),
+    "parallel_workers": (None, "i", 1),
+    "movers_min_pct": (None, "f", 0.0001),
+    "future_timeout_sec": (None, "i", 1),
+}
+
+
+def scan_budget_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Resolve the twelve scan budget/pacing knobs for one scan_once call.
+
+    Returns an independent dict of snake_case leaves. Resolution per leaf:
+    legacy HERMES_* env var (highest priority, operator / MCP compat) →
+    cfg_get("scan_budget.<leaf>") which covers HERMES_CFG_SCAN_BUDGET__* env,
+    the agent-config dict and CANONICAL_DEFAULTS → the inline literal. Any
+    coercion failure or out-of-range value falls back to the literal so the
+    scan hot path never raises.
+    """
+    p = dict(_SCAN_BUDGET_DEFAULTS)
+    try:
+        for leaf, (legacy_env, kind, min_v) in _SCAN_BUDGET_SPEC.items():
+            raw = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                raw = cfg_get(f"scan_budget.{leaf}", config=config)
+            if raw is None:
+                continue
+            if kind == "i":
+                v: Any = int(raw)
+            else:
+                v = float(raw)
+            if v >= min_v:
+                p[leaf] = v
+    except Exception as e:
+        # Bad env / config must not kill the scan — return the literal budget.
+        logger.debug(f"[scan] budget params read failed, using literals: {e}")
+        return dict(_SCAN_BUDGET_DEFAULTS)
+    return p
+
+
 def scan_once(
     universe: Optional[list[dict[str, Any]]] = None,
     min_score: float = 20,
@@ -518,7 +593,9 @@ def scan_once(
     _reset_data_gaps()
     cfg = config or get_config()
     min_score = cfg["scan"]["minCompositeScore"] if min_score == 20 else min_score
-    workers = parallel_workers or cfg["scan"].get("parallelWorkers", 32)
+    # Defensive default only; the R13-B9 canonical scan_budget.parallel_workers
+    # resolves the real value (32) below once the agent-config read completes.
+    workers = parallel_workers or 32
 
     # Asset-class toggles read fresh per scan so operator flips take effect
     # without restart. `enable_hip3` adds per-dex POSTs (cost) so it's opt-in.
@@ -546,6 +623,18 @@ def scan_once(
     # features such as momentum_continuation / candlestick_patterns actually
     # follow the live config instead of being dead knobs.
     scan_cfg = {**cfg, **_cfg}
+
+    # R13-B9: resolve the twelve scan budget / pacing knobs from the canonical
+    # scan_budget block (legacy HERMES_* env still wins for backward compat —
+    # the MCP server drives HERMES_MAX_MARKETS and operator/test knobs remain
+    # live). Helper falls back to the inline literals on any failure.
+    budget = scan_budget_params(config=_cfg)
+    # Thread-pool width: explicit call arg > canonical scan_budget (default 32).
+    workers = parallel_workers or int(budget["parallel_workers"])
+    # The candle cache is created at module import with the legacy env value;
+    # live-sync its cap so canonical/agent-config overrides take effect without
+    # rebuilding the cache (reads _max_size on every set).
+    _candle_cache._max_size = int(budget["cache_max"])
 
     # R13-B8: resolve weights/thresholds from the canonical trigger_weights /
     # trigger_thresholds blocks (env + agent-config + CANONICAL_DEFAULTS) and
@@ -641,15 +730,17 @@ def scan_once(
         # top-by-volume slice. Single-class runs hand the entire budget to
         # that class. Total candle fetches stay at `max_markets` to keep
         # the scanner inside HL's 1200 weight/minute rate budget.
-        max_markets = int(os.environ.get("HERMES_MAX_MARKETS", "60"))
-        max_markets_hip3 = int(os.environ.get("HERMES_MAX_MARKETS_HIP3", "25"))
-        max_markets_movers = int(os.environ.get("HERMES_MAX_MARKETS_MOVERS", "10"))
-        movers_vol_floor = float(os.environ.get("HERMES_MOVERS_VOL_FLOOR_USD", "300000"))
+        # R13-B9: resolved once above via scan_budget_params() (legacy HERMES_*
+        # env still wins, then canonical scan_budget.*, then these literals).
+        max_markets = int(budget["max_markets"])
+        max_markets_hip3 = int(budget["max_markets_hip3"])
+        max_markets_movers = int(budget["max_markets_movers"])
+        movers_vol_floor = float(budget["movers_vol_floor_usd"])
         # Half the HIP-3 budget goes to top-by-volume (clean liquid markets),
         # half to top-by-|24h%| above a tiny floor (catches xyz:DKNG-style
         # low-volume HIP-3 pumpers that would never make a vol cut). The HIP-3
         # universe is bounded so this doesn't expose us to crypto-microcap noise.
-        hip3_movers_floor = float(os.environ.get("HERMES_HIP3_MOVERS_FLOOR_USD", "50000"))
+        hip3_movers_floor = float(budget["hip3_movers_floor_usd"])
         crypto_sweep_floor = float(_cfg.get("min_market_volume_usd", movers_vol_floor) or movers_vol_floor)
         hip3_sweep_floor = float(_cfg.get("min_hip3_volume_usd", hip3_movers_floor) or hip3_movers_floor)
 
@@ -684,7 +775,7 @@ def scan_once(
                           if m["coin"] not in chosen
                           and m.get("dayNtlVlm", 0) >= mv_floor]
             by_pct = sorted(candidates, key=_abs_pct_24h, reverse=True)
-            movers_pick = [m for m in by_pct if _abs_pct_24h(m) >= 1.0][:movers_budget]
+            movers_pick = [m for m in by_pct if _abs_pct_24h(m) >= budget["movers_min_pct"]][:movers_budget]
             return vol_pick, movers_pick
 
         if include_crypto and include_hip3:
@@ -728,9 +819,10 @@ def scan_once(
         # Each scan adds the next `sweep_n` eligible markets, advancing a persistent
         # offset that wraps around — so every market is seen within
         # ceil(len(eligible)/sweep_n) cycles, while top-vol+movers are ALWAYS scanned
-        # (never miss a live ripper). Pacing (HERMES_BATCH_SLEEP) keeps us under HL's
-        # ~1200 weight/min budget. HERMES_UNIVERSE_SWEEP=0 disables (default).
-        sweep_n = int(os.environ.get("HERMES_UNIVERSE_SWEEP", "0"))
+        # (never miss a live ripper). Pacing (batch_sleep_sec) keeps us under HL's
+        # ~1200 weight/min budget. universe_sweep=0 disables (default).
+        # R13-B9: resolved via scan_budget_params() above.
+        sweep_n = int(budget["universe_sweep"])
         if sweep_n > 0 and eligible:
             global _sweep_offset
             sweep_pool = [
@@ -763,8 +855,9 @@ def scan_once(
     # Batch markets into groups of `batch_size` and sleep between batches
     # to stay under the HL rate limit. Within each batch, fan out with
     # `workers` threads.
-    batch_size = int(os.environ.get("HERMES_BATCH_SIZE", "20"))
-    batch_sleep = float(os.environ.get("HERMES_BATCH_SLEEP", "0.3"))
+    # R13-B9: batch pacing resolved via scan_budget_params() above.
+    batch_size = int(budget["batch_size"])
+    batch_sleep = float(budget["batch_sleep_sec"])
 
     # Build per-market scan callables
     callables = []
@@ -814,7 +907,7 @@ def scan_once(
             for i, future in enumerate(futures):
                 idx = batch_start + i
                 try:
-                    success, result = future.result(timeout=60)
+                    success, result = future.result(timeout=int(budget["future_timeout_sec"]))
                     if success and isinstance(result, dict):
                         results.append(result)
                     elif not success:
