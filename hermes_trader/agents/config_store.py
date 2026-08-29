@@ -508,6 +508,53 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "research_cache_ttl_s": 30.0,
         "ttl_load_wait_s": 60.0,
     },
+    # R13-B13: Hyperliquid client-layer knobs (client/exchange.py /
+    # hl_client.py / ws_client.py). Twelve leaves cover the SDK HTTP timeout,
+    # the cross-margin fallback leverage, the IOC slippage caps, the meta /
+    # ATR / candle / funding cache TTLs+sizes, and the WebSocket staleness /
+    # heartbeat / sequence tolerances. Legacy HERMES_HL_SDK_TIMEOUT_S /
+    # HERMES_DEFAULT_LEVERAGE / HERMES_MAX_SLIPPAGE_PCT /
+    # HERMES_MAX_SLIPPAGE_CLOSE_PCT / HERMES_META_TTL_S / HERMES_ATR_TTL_S /
+    # HERMES_CANDLE_CACHE_TTL_S / HERMES_CANDLE_CACHE_MAX /
+    # HERMES_FUNDING_CACHE_TTL_S / HERMES_WS_MAX_STALE_SECONDS /
+    # HERMES_WS_HEARTBEAT_S / HERMES_WS_SEQ_MAX_BACKWARD env vars remain the
+    # top-priority channel. default_leverage (5) is the cross-margin fallback
+    # only — NOT the top-level trading `leverage` (10); the two never merged.
+    "hl_client_io": {
+        "sdk_timeout_s": 30.0,
+        "default_leverage": 5,
+        "max_slippage_pct": 1.5,
+        "max_slippage_close_pct": 5.0,
+        "meta_ttl_s": 3600.0,
+        "atr_ttl_s": 60.0,
+        "candle_cache_ttl_s": 90.0,
+        "candle_cache_max": 512,
+        "funding_cache_ttl_s": 300.0,
+        "ws_max_stale_s": 30,
+        "ws_heartbeat_s": 10.0,
+        "ws_seq_max_backward": 1024,
+    },
+    # R13-B13: Hyperliquid rate-limiter knobs (client/rate_limit.py +
+    # hl_client.py call sites). Seven leaves cover token-bucket refill /
+    # capacity, the trading-path max budget wait, the 429 retry count, the
+    # opportunistic (observability) budget wait, and the two gate switches
+    # (cross-process shared bucket; in-process per-endpoint serialization).
+    # Legacy HERMES_HL_RATE_REFILL_PER_SEC / HERMES_HL_RATE_CAPACITY /
+    # HERMES_HL_RATE_MAX_WAIT_S / HERMES_HL_429_RETRIES /
+    # HERMES_HL_RATE_OPPORTUNISTIC_WAIT_S / HERMES_HL_RATE_SHARED /
+    # HERMES_HL_RATE_PER_ENDPOINT_GATE env vars remain the top-priority
+    # channel (the gate switch keeps its historical call-time env read so a
+    # post-import toggle still takes effect). The shared-bucket state FILE
+    # path stays an env-only deployment knob.
+    "hl_rate_limit": {
+        "rate_refill_per_sec": 20.0,
+        "rate_capacity": 600,
+        "rate_max_wait_s": 30.0,
+        "rate_429_retries": 2,
+        "rate_opportunistic_wait_s": 2.0,
+        "rate_shared": True,
+        "rate_per_endpoint_gate": True,
+    },
     # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
     # SL ratchet coordination); and the funding-rate history lookback window
     # in hours (research display / against-funding context).

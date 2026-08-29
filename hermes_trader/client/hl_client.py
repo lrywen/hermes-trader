@@ -29,6 +29,8 @@ import requests
 
 from hermes_trader.client.rate_limit import (
     HL_LIMITER as _HL_LIMITER,
+    _HL_CLIENT_IO,
+    _HL_RATE_LIMIT,
     endpoint_weight as _endpoint_weight,
     timed_per_endpoint_gate as _per_endpoint_gate,
 )
@@ -200,7 +202,9 @@ def _http_post(
     req_type = payload.get("type") or "unknown"
     opportunistic = max_wait is not None
     if max_wait is None:
-        max_wait = float(os.environ.get("HERMES_HL_RATE_MAX_WAIT_S", "30"))
+        # R13-B13: canonical hl_rate_limit.rate_max_wait_s (import-time snapshot;
+        # the legacy HERMES_HL_RATE_MAX_WAIT_S env channel still wins at boot).
+        max_wait = float(_HL_RATE_LIMIT["rate_max_wait_s"])
 
     # R11-C1: serialize concurrent calls into the SAME endpoint so a
     # burst of workers doesn't all stampede the endpoint's per-route
@@ -255,7 +259,9 @@ def _hl_request_inner(
     # retry once after the server's instructed wait. urllib3's Retry is NOT
     # used for 429 because it can't honor Retry-After and would re-fire in
     # lockstep across the worker pool.
-    max_429_retries = int(os.environ.get("HERMES_HL_429_RETRIES", "2"))
+    # R13-B13: canonical hl_rate_limit.rate_429_retries (import-time snapshot;
+    # legacy HERMES_HL_429_RETRIES env channel still wins at boot).
+    max_429_retries = int(_HL_RATE_LIMIT["rate_429_retries"])
     for attempt in range(max_429_retries + 1):
         try:
             resp = _get_session().post(f"{HL_API}{path}", json=payload, timeout=timeout)
@@ -322,8 +328,11 @@ def resolve_user_address() -> str:
 # Uses the shared LRU+TTL ``_Cache`` abstraction (client/cache.py) instead of a
 # bespoke dict+sweep; this gives bounded size, atomic access and per-key
 # invalidation for free.
-_CANDLE_CACHE_TTL_S = float(os.environ.get("HERMES_CANDLE_CACHE_TTL_S", "90"))
-_CANDLE_CACHE_MAX = int(os.environ.get("HERMES_CANDLE_CACHE_MAX", "512"))
+# R13-B13: TTL/size resolve from canonical hl_client_io (import-time
+# snapshot; legacy HERMES_CANDLE_CACHE_TTL_S / HERMES_CANDLE_CACHE_MAX env
+# channels still win at boot). TTL <= 0 disables the cache as before.
+_CANDLE_CACHE_TTL_S = float(_HL_CLIENT_IO["candle_cache_ttl_s"])
+_CANDLE_CACHE_MAX = int(_HL_CLIENT_IO["candle_cache_max"])
 _CANDLE_CACHE_DISABLED = _CANDLE_CACHE_TTL_S <= 0
 
 if _CANDLE_CACHE_DISABLED:
@@ -334,7 +343,9 @@ else:
 
 # Funding rate cache: funding updates hourly, so a 5-min TTL is safe and
 # eliminates a weight-20 POST on every research cycle.
-_FUNDING_CACHE_TTL_S = float(os.environ.get("HERMES_FUNDING_CACHE_TTL_S", "300"))
+# R13-B13: canonical hl_client_io.funding_cache_ttl_s (import-time
+# snapshot; legacy HERMES_FUNDING_CACHE_TTL_S env channel still wins).
+_FUNDING_CACHE_TTL_S = float(_HL_CLIENT_IO["funding_cache_ttl_s"])
 if _FUNDING_CACHE_TTL_S <= 0:
     _FUNDING_CACHE = None
 else:
@@ -445,7 +456,7 @@ def _fetch_hl_candles_raw(
     if opportunistic:
         # One shot, tiny budget wait, no retries: the caller's report just omits
         # the candle section rather than starving the trading path.
-        opp_wait = float(os.environ.get("HERMES_HL_RATE_OPPORTUNISTIC_WAIT_S", "2"))
+        opp_wait = float(_HL_RATE_LIMIT["rate_opportunistic_wait_s"])
         raw = _http_post("/info", payload, max_wait=opp_wait)
         if not isinstance(raw, list):
             logger.debug(

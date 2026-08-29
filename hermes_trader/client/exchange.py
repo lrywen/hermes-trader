@@ -37,6 +37,12 @@ from hyperliquid.utils.types import Cloid
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
+# R13-B13: client I/O knobs resolve from canonical block hl_client_io.
+# Imported here (above the SDK-retry patch that consumes _SDK_TIMEOUT) —
+# rate_limit is a leaf module (stdlib + lazy config_store import only),
+# so this cannot introduce a cycle with the SDK/hl_client imports below.
+from hermes_trader.client.rate_limit import _HL_CLIENT_IO
+
 # ── SDK retry patching ────────────────────────────────────────────────────────
 # The testnet API (api.hyperliquid-testnet.xyz) intermittently drops SSL
 # connections (SSLEOFError) and returns 429 under burst load. The SDK's
@@ -58,7 +64,9 @@ _POST_BACKOFF = 2.0  # seconds, doubles each attempt
 # 30s is generous for HL's typical <1s responses but bounds a hung socket
 # before the watchdog fires. Read/connect share the same value (requests
 # accepts a float for total timeout).
-_SDK_TIMEOUT = float(os.environ.get("HERMES_HL_SDK_TIMEOUT_S", "30"))
+# R13-B13: canonical hl_client_io.sdk_timeout_s (import-time snapshot;
+# legacy HERMES_HL_SDK_TIMEOUT_S env channel still wins at boot).
+_SDK_TIMEOUT = float(_HL_CLIENT_IO["sdk_timeout_s"])
 
 
 def _mount_retry_adapter(session: Any) -> None:
@@ -139,7 +147,11 @@ HL_ACCOUNT = HL_MASTER if IS_AGENT else HL_WALLET
 # `leverage` (the executor/sizing always prefer the live config value,
 # currently 12x in production). Env-overridable so a deploy can change the
 # fallback without a code edit; kept at 5x for backward compatibility.
-HL_LEVERAGE = int(os.environ.get("HERMES_DEFAULT_LEVERAGE", "5"))  # cross margin
+# R13-B13: canonical hl_client_io.default_leverage (import-time snapshot;
+# legacy HERMES_DEFAULT_LEVERAGE env channel still wins at boot). This is
+# the cross-margin FALLBACK leverage and is a DISTINCT knob from the
+# top-level config `leverage` (trading config, default 10) — never merge.
+HL_LEVERAGE = int(_HL_CLIENT_IO["default_leverage"])  # cross margin
 
 # Slippage cap for IOC marketable-limit orders. The 1% headroom past the L2
 # touch is meant to absorb in-flight price drift, NOT to accept a fill at any
@@ -148,8 +160,11 @@ HL_LEVERAGE = int(os.environ.get("HERMES_DEFAULT_LEVERAGE", "5"))  # cross margi
 # a wide offer. Closes (reduce_only) get a relaxed cap because an emergency
 # flatten must be allowed to escape; set HERMES_MAX_SLIPPAGE_CLOSE_PCT=0 to
 # disable the escape hatch. Both values are in percent.
-_MAX_SLIPPAGE_PCT = float(os.environ.get("HERMES_MAX_SLIPPAGE_PCT", "1.5"))
-_MAX_SLIPPAGE_CLOSE_PCT = float(os.environ.get("HERMES_MAX_SLIPPAGE_CLOSE_PCT", "5.0"))
+# R13-B13: canonical hl_client_io slippage caps (import-time snapshot;
+# legacy HERMES_MAX_SLIPPAGE_PCT / HERMES_MAX_SLIPPAGE_CLOSE_PCT env
+# channels still win at boot).
+_MAX_SLIPPAGE_PCT = float(_HL_CLIENT_IO["max_slippage_pct"])
+_MAX_SLIPPAGE_CLOSE_PCT = float(_HL_CLIENT_IO["max_slippage_close_pct"])
 
 
 _exchange_instance = None  # Singleton instance
@@ -296,7 +311,9 @@ def _get_info() -> Info:
 # Cache the meta universe per dex so a transient 429 can't break coin
 # resolution and we stop hammering the API. TTL is long — meta rarely changes.
 _META_CACHE: dict[str, tuple[float, list]] = {}
-_META_TTL_S = float(os.environ.get("HERMES_META_TTL_S", "3600"))
+# R13-B13: canonical hl_client_io.meta_ttl_s (import-time snapshot;
+# legacy HERMES_META_TTL_S env channel still wins at boot).
+_META_TTL_S = float(_HL_CLIENT_IO["meta_ttl_s"])
 # H11: the meta cache is process-local (lost on watchdog os.execv). On a cold
 # restart the first scan fires N concurrent get_coin_index calls across the
 # ThreadPoolExecutor; without a lock they all miss simultaneously and stampede
@@ -1255,7 +1272,9 @@ def cancel_orders(oid: int, coin: Optional[str] = None, asset_idx: Optional[int]
 # insufficient history doesn't trigger repeated network fetches.
 _ATR_CACHE: dict[str, tuple[float, float]] = {}
 _ATR_CACHE_LOCK = threading.Lock()
-_ATR_TTL_S = float(os.environ.get("HERMES_ATR_TTL_S", "60"))
+# R13-B13: canonical hl_client_io.atr_ttl_s (import-time snapshot;
+# legacy HERMES_ATR_TTL_S env channel still wins at boot).
+_ATR_TTL_S = float(_HL_CLIENT_IO["atr_ttl_s"])
 
 
 def get_hl_atr(

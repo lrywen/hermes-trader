@@ -223,6 +223,21 @@ class _ConfigPatch(BaseModel):
     # / HERMES_CLOSED_TRADES_TTL_S / HERMES_RESEARCH_HTTP_CACHE_S env vars
     # remain the top-priority channel.
     http_cache: dict[str, Any] = Field(default_factory=lambda: _dict_default("http_cache"))
+    # R13-B13: Hyperliquid client-layer knobs (exchange.py / hl_client.py /
+    # ws_client.py) — SDK timeout, fallback leverage, slippage caps, cache
+    # TTLs/sizes, WS staleness/heartbeat/seq tolerances. Legacy
+    # HERMES_HL_SDK_TIMEOUT_S / HERMES_DEFAULT_LEVERAGE /
+    # HERMES_MAX_SLIPPAGE_PCT / HERMES_MAX_SLIPPAGE_CLOSE_PCT /
+    # HERMES_META_TTL_S / HERMES_ATR_TTL_S / HERMES_CANDLE_CACHE_* /
+    # HERMES_FUNDING_CACHE_TTL_S / HERMES_WS_* env vars remain the
+    # top-priority channel.
+    hl_client_io: dict[str, Any] = Field(default_factory=lambda: _dict_default("hl_client_io"))
+    # R13-B13: Hyperliquid rate-limiter knobs (client/rate_limit.py). Seven
+    # leaves: bucket refill/capacity, trading-path max wait, 429 retries,
+    # opportunistic wait, and the shared-bucket / per-endpoint-gate switches.
+    # Legacy HERMES_HL_RATE_* / HERMES_HL_429_RETRIES env vars remain the
+    # top-priority channel.
+    hl_rate_limit: dict[str, Any] = Field(default_factory=lambda: _dict_default("hl_rate_limit"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is

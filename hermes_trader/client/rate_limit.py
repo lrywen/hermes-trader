@@ -23,10 +23,13 @@ as an automatic fallback if the shared state can't be opened.
 """
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
-from typing import Union
+from typing import Any, Optional, Union
+
+logger = logging.getLogger(__name__)
 
 # Per-endpoint weights from HL docs. Default 20 (the expensive bucket) for
 # anything unknown so we never under-count and trip a 429.
@@ -52,16 +55,148 @@ def endpoint_weight(req_type: str | None) -> int:
     return _ENDPOINT_WEIGHT.get(req_type or "", 20)
 
 
+# ── R13-B13: canonical config wiring ──────────────────────────────────
+#
+# The client layer's numeric knobs used to be scattered ``os.environ.get``
+# literals across rate_limit.py / hl_client.py / exchange.py / ws_client.py:
+# not visible in the dashboard config dump, not validated by
+# validate_config_updates, and not overridable via .agent-config.json. They
+# now register in CANONICAL_DEFAULTS (blocks ``hl_client_io`` /
+# ``hl_rate_limit``) and resolve through two helpers hosted here (rate_limit
+# is the bottom leaf of the client import graph; config_store has zero
+# hermes_trader imports, so the lazy cfg_get import below cannot cycle).
+#
+# Resolution per leaf: legacy env var (if set to a non-empty string — the
+# historical env channel, HIGHEST priority) → cfg_get("block.leaf")
+# (HERMES_CFG_* canonical env + agent-config + CANONICAL_DEFAULTS) → the
+# literal table. Every value is coerced to its kind ("i"nt / "f"loat /
+# "b"ool) and range-guarded; any failure returns an independent copy of the
+# literal defaults so the trading hot path never crashes on a bad config.
+_HL_CLIENT_IO_DEFAULTS: dict[str, Any] = {
+    "sdk_timeout_s": 30.0,
+    "default_leverage": 5,
+    "max_slippage_pct": 1.5,
+    "max_slippage_close_pct": 5.0,
+    "meta_ttl_s": 3600.0,
+    "atr_ttl_s": 60.0,
+    "candle_cache_ttl_s": 90.0,
+    "candle_cache_max": 512,
+    "funding_cache_ttl_s": 300.0,
+    "ws_max_stale_s": 30,
+    "ws_heartbeat_s": 10.0,
+    "ws_seq_max_backward": 1024,
+}
+
+# leaf -> (legacy env or None, kind "i"/"f"/"b", min guard value).
+_HL_CLIENT_IO_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "sdk_timeout_s": ("HERMES_HL_SDK_TIMEOUT_S", "f", 0.0),
+    "default_leverage": ("HERMES_DEFAULT_LEVERAGE", "i", 1.0),
+    "max_slippage_pct": ("HERMES_MAX_SLIPPAGE_PCT", "f", 0.0),
+    "max_slippage_close_pct": ("HERMES_MAX_SLIPPAGE_CLOSE_PCT", "f", 0.0),
+    "meta_ttl_s": ("HERMES_META_TTL_S", "f", 0.0),
+    "atr_ttl_s": ("HERMES_ATR_TTL_S", "f", 0.0),
+    "candle_cache_ttl_s": ("HERMES_CANDLE_CACHE_TTL_S", "f", 0.0),
+    "candle_cache_max": ("HERMES_CANDLE_CACHE_MAX", "i", 1.0),
+    "funding_cache_ttl_s": ("HERMES_FUNDING_CACHE_TTL_S", "f", 0.0),
+    "ws_max_stale_s": ("HERMES_WS_MAX_STALE_SECONDS", "i", 1.0),
+    "ws_heartbeat_s": ("HERMES_WS_HEARTBEAT_S", "f", 0.0),
+    "ws_seq_max_backward": ("HERMES_WS_SEQ_MAX_BACKWARD", "i", 1.0),
+}
+
+_HL_RATE_LIMIT_DEFAULTS: dict[str, Any] = {
+    "rate_refill_per_sec": 20.0,
+    "rate_capacity": 600,
+    "rate_max_wait_s": 30.0,
+    "rate_429_retries": 2,
+    "rate_opportunistic_wait_s": 2.0,
+    "rate_shared": True,
+    "rate_per_endpoint_gate": True,
+}
+
+_HL_RATE_LIMIT_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "rate_refill_per_sec": ("HERMES_HL_RATE_REFILL_PER_SEC", "f", 0.0),
+    "rate_capacity": ("HERMES_HL_RATE_CAPACITY", "i", 1.0),
+    "rate_max_wait_s": ("HERMES_HL_RATE_MAX_WAIT_S", "f", 0.0),
+    "rate_429_retries": ("HERMES_HL_429_RETRIES", "i", 0.0),
+    "rate_opportunistic_wait_s": ("HERMES_HL_RATE_OPPORTUNISTIC_WAIT_S", "f", 0.0),
+    "rate_shared": ("HERMES_HL_RATE_SHARED", "b", 0.0),
+    "rate_per_endpoint_gate": ("HERMES_HL_RATE_PER_ENDPOINT_GATE", "b", 0.0),
+}
+
+_TRUE_TOKENS = ("1", "true", "yes", "on")
+
+
+def _resolve_hl_block(
+    block: str,
+    defaults: dict[str, Any],
+    spec: dict[str, tuple[Optional[str], str, float]],
+    *,
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve one canonical block: legacy env (top priority) → cfg_get →
+    literals. Never raises — on any error a fresh copy of the literals is
+    returned so the trading hot path degrades to the old behaviour."""
+    try:
+        # Lazy import: keeps rate_limit importable even if the config layer
+        # is unavailable (and doubly breaks any potential import cycle).
+        from hermes_trader.agents.config_store import cfg_get
+
+        p = dict(defaults)
+        for leaf, (legacy_env, kind, min_v) in spec.items():
+            raw: Any = None
+            if legacy_env is not None:
+                raw = os.environ.get(legacy_env)
+            if raw is None or raw == "":
+                raw = cfg_get(f"{block}.{leaf}", config=config)
+            if raw is None:
+                continue
+            if kind == "b":
+                v = str(raw).strip().lower() in _TRUE_TOKENS
+            elif kind == "i":
+                v = int(raw)
+            else:
+                v = float(raw)
+            if kind == "b" or v >= min_v:
+                p[leaf] = v
+        return p
+    except Exception as e:  # noqa: BLE001 — config must never break HTTP
+        logger.debug("[hl] %s params read failed, using literals: %s", block, e)
+        return dict(defaults)
+
+
+def _hl_client_io_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """R13-B13: resolved ``hl_client_io`` block (client I/O knobs)."""
+    return _resolve_hl_block(
+        "hl_client_io", _HL_CLIENT_IO_DEFAULTS, _HL_CLIENT_IO_SPEC, config=config
+    )
+
+
+def _hl_rate_limit_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """R13-B13: resolved ``hl_rate_limit`` block (rate-limiter knobs)."""
+    return _resolve_hl_block(
+        "hl_rate_limit", _HL_RATE_LIMIT_DEFAULTS, _HL_RATE_LIMIT_SPEC, config=config
+    )
+
+
+# Import-time resolution: the historical env channel was read at import
+# time (or on the hot path) for every one of these knobs, and no production
+# path toggles them at runtime; resolving once here keeps the request hot
+# path config-free while preserving the "env must be set before boot"
+# deployment semantics. Module symbols keep their old names as fallbacks.
+_HL_CLIENT_IO = _hl_client_io_params(config={})
+_HL_RATE_LIMIT = _hl_rate_limit_params(config={})
+
+
 def _refill_rate() -> float:
-    # 1200 weight/min = 20 weight/s. Env-overridable.
-    return float(os.environ.get("HERMES_HL_RATE_REFILL_PER_SEC", "20"))
+    # 1200 weight/min = 20 weight/s. Import-time resolved (R13-B13).
+    return float(_HL_RATE_LIMIT["rate_refill_per_sec"])
 
 
 def _capacity() -> int:
     # Burst capacity. A full cold scan fans out candleSnapshot (weight 20)
     # calls; 600 weight absorbs the immediate burst and smooths the rest via
     # refill. Must stay well under the per-minute budget.
-    return int(os.environ.get("HERMES_HL_RATE_CAPACITY", "600"))
+    return int(_HL_RATE_LIMIT["rate_capacity"])
 
 
 class TokenBucket:
@@ -270,9 +405,9 @@ class SharedTokenBucket:
 def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
     cap = _capacity()
     rate = _refill_rate()
-    shared = os.environ.get("HERMES_HL_RATE_SHARED", "1").strip().lower() in (
-        "1", "true", "yes", "on",
-    )
+    # R13-B13: shared-bucket switch resolved at import time (like the
+    # bucket sizing); the state FILE path stays an env-only deployment knob.
+    shared = bool(_HL_RATE_LIMIT["rate_shared"])
     if shared:
         path = os.environ.get(
             "HERMES_HL_RATE_STATE_FILE", "/dev/shm/hermes_hl_rate.state"
@@ -315,6 +450,18 @@ def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
 import contextlib  # noqa: E402
 
 
+def _per_endpoint_gate_enabled() -> bool:
+    """R13-B13: the gate switch keeps its historical CALL-TIME env read —
+    tests/ops toggle ``HERMES_HL_RATE_PER_ENDPOINT_GATE`` after import and
+    expect the change to take effect immediately. A non-empty env value
+    wins (legacy channel, highest priority); unset/empty falls back to the
+    import-time canonical snapshot (``hl_rate_limit.rate_per_endpoint_gate``)."""
+    raw = os.environ.get("HERMES_HL_RATE_PER_ENDPOINT_GATE")
+    if raw is None or raw.strip() == "":
+        return bool(_HL_RATE_LIMIT["rate_per_endpoint_gate"])
+    return raw.strip().lower() in _TRUE_TOKENS
+
+
 @contextlib.contextmanager
 def per_endpoint_gate(endpoint: str):
     """Acquire (and release) the in-process serialization lock for one
@@ -322,9 +469,7 @@ def per_endpoint_gate(endpoint: str):
     sentinel ``"unknown"`` endpoint (avoids one big lock for every
     un-typed probe).
     """
-    if os.environ.get(
-        "HERMES_HL_RATE_PER_ENDPOINT_GATE", "1"
-    ).strip().lower() not in ("1", "true", "yes", "on"):
+    if not _per_endpoint_gate_enabled():
         yield
         return
     if not endpoint or endpoint == "unknown":
@@ -376,9 +521,7 @@ def timed_per_endpoint_gate(endpoint: str):
         with per_endpoint_gate(endpoint):
             yield
         return
-    if os.environ.get(
-        "HERMES_HL_RATE_PER_ENDPOINT_GATE", "1"
-    ).strip().lower() not in ("1", "true", "yes", "on"):
+    if not _per_endpoint_gate_enabled():
         yield
         return
     # Lazily create the lock so the timed variant can record the wait

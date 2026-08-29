@@ -26,11 +26,16 @@ from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
 from hermes_trader.client.hl_client import _http_post
+# R13-B13: WS tuning knobs live in canonical block hl_client_io; rate_limit
+# is a leaf (stdlib + lazy config_store only), so this import cannot cycle.
+from hermes_trader.client.rate_limit import _HL_CLIENT_IO
 
 logger = logging.getLogger(__name__)
 
 # Reconnect constants
-_WS_MAX_STALE_SECONDS = int(os.environ.get("HERMES_WS_MAX_STALE_SECONDS", "30"))
+# R13-B13: import-time snapshot from canonical hl_client_io.ws_max_stale_s
+# (legacy HERMES_WS_MAX_STALE_SECONDS env channel still wins at boot).
+_WS_MAX_STALE_SECONDS = int(_HL_CLIENT_IO["ws_max_stale_s"])
 _WS_RECONNECT_BASE_DELAY = 1.0  # seconds
 _WS_RECONNECT_MAX_DELAY = 60.0  # seconds
 _WS_RECONNECT_JITTER = 0.5  # +/- jitter fraction
@@ -48,7 +53,9 @@ _WS_RECONNECT_JITTER = 0.5  # +/- jitter fraction
 # already uses. Cost: 1 cheap subscription round-trip every
 # HERMES_WS_HEARTBEAT_S seconds (default 10). Cheap enough that
 # running it as a background is fine.
-_WS_HEARTBEAT_S = float(os.environ.get("HERMES_WS_HEARTBEAT_S", "10"))
+# R13-B13: canonical hl_client_io.ws_heartbeat_s (import-time snapshot;
+# legacy HERMES_WS_HEARTBEAT_S env channel still wins at boot).
+_WS_HEARTBEAT_S = float(_HL_CLIENT_IO["ws_heartbeat_s"])
 # R11-D1: how far backwards a frame's sequence number may be from the
 # last accepted seq before we drop it. Hyperliquid does not currently
 # emit per-frame sequence numbers for allMids, so the SDK's "raw
@@ -56,7 +63,9 @@ _WS_HEARTBEAT_S = float(os.environ.get("HERMES_WS_HEARTBEAT_S", "10"))
 # monotonic counter (incremented on every callback) as a stand-in for
 # a real server-side seq so the dedup math is exercised in tests
 # and ready to switch to a server-issued seq the day HL adds one.
-_WS_SEQ_MAX_BACKWARD = int(os.environ.get("HERMES_WS_SEQ_MAX_BACKWARD", "1024"))
+# R13-B13: canonical hl_client_io.ws_seq_max_backward (import-time snapshot;
+# legacy HERMES_WS_SEQ_MAX_BACKWARD env channel still wins at boot).
+_WS_SEQ_MAX_BACKWARD = int(_HL_CLIENT_IO["ws_seq_max_backward"])
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
