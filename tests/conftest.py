@@ -19,3 +19,10 @@ os.environ["HERMES_DSL_STATE_FILE"] = os.path.join(_tmp, ".dsl-state.json")
 # live volume's events.jsonl / session-log.jsonl.
 os.environ["HERMES_EVENTS_FILE"] = os.path.join(_tmp, "events.jsonl")
 os.environ["SESSION_LOG_PATH"] = os.path.join(_tmp, "session-log.jsonl")
+# Redirect the ta_late_entry shadow JSONL: gate/prefilter tests that omit
+# shadow_log_path would otherwise append to the developer's real
+# ~/.hermes-trading/ta_late_entry_shadow.jsonl (late_entry_shadow_path falls
+# back to this env var). Tests that need to assert on contents pass an
+# explicit shadow_log_path or monkeypatch.setenv to their own tmp_path.
+os.environ["HERMES_TA_LATE_ENTRY_SHADOW_FILE"] = os.path.join(
+    _tmp, "ta_late_entry_shadow.jsonl")
