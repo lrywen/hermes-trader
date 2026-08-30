@@ -361,6 +361,80 @@ def af14_feed_decision(mids, stale_age, missing_mids,
     return (None, False)
 
 
+# C1 (ARCHITECTURE.md "equity-spike bug"): event types in events.jsonl that
+# prove a REAL money-losing close happened recently. Every one of them is in
+# event_log._FORKABLE_EVENTS, so query_events actually sees them. If a crash-
+# sized equity drop is NOT explained by any of these within the lookback, it is
+# a phantom degraded read, not a real loss.
+_PHANTOM_CRASH_EXIT_EVENTS = frozenset({
+    "close",                    # memory.record_close → event_log.append("close")
+    "dsl_exit",                 # DSL market close (executed or backfilled mirror)
+    "ai_close",                 # AI-decided close
+    "external_close_recorded",  # exchange-side stop fill detected after the fact
+    "hard_killswitch",          # this loop's own HARD flatten from a prior tick
+})
+
+
+def phantom_crash_unconfirmed(equity, prev_eq, prev_ts, *,
+                              crash_pct=None, recency_s=180.0,
+                              lookback_s=60.0, query_fn=None,
+                              time_module=time, now=None):
+    """True when a crash-sized single-tick equity drop has NO real-close event.
+
+    The heartbeat already guards equity<=0 (empty API response) and partial-DEX
+    reads (a held dex missing from the aggregate). The residual hole is a
+    NON-zero phantom: the aggregate returns a *real-looking* value that is far
+    too low (a degraded dex silently under-reports instead of dropping out).
+    Left untouched it poisons daily PnL and FALSE-TRIPS the HARD kill-switch,
+    flattening the whole book on fiction (the documented >50%-tick phantom).
+
+    Returns True only when ALL hold:
+      * a previous accepted reading exists and is recent (< ``recency_s``) and
+        this tick is a crash-sized drop (``>= crash_pct``) against it;
+      * no real-close event (``_PHANTOM_CRASH_EXIT_EVENTS``) was logged in the
+        last ``lookback_s`` — a genuine liquidation/close that explains the drop.
+
+    On True the caller preserves last-known-good (degraded return). A genuine
+    crash is delayed at most one tick: the closes it triggers land in the log,
+    and the still-crushed next tick then sees them and is accepted (fail-CLOSED
+    for entries/exits in between — we would not want to trade on it anyway).
+    Fail-OPEN on any evidence/threshold ambiguity: when ``query_fn`` is absent
+    or the previous reading is missing/stale/older, returns False (accept).
+    """
+    if not (equity > 0 and prev_eq > 0):
+        return False
+    if crash_pct is None or crash_pct <= 0:
+        return False
+    _now = now if now is not None else time_module.time()
+    if prev_ts <= 0 or (_now - prev_ts) > recency_s:
+        return False
+    move_frac = (equity - prev_eq) / prev_eq
+    if move_frac > -crash_pct:
+        return False
+    # Crash-sized drop. Only call the log query on this (rare) path.
+    if query_fn is None:
+        return False
+    from datetime import datetime, timezone, timedelta
+    start_iso = (datetime.fromtimestamp(_now, tz=timezone.utc)
+                 - timedelta(seconds=lookback_s)
+                 ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    try:
+        recent = query_fn(start=start_iso) or []
+    except Exception as e:
+        # Event storage must never block the safety path; a read failure means
+        # we cannot PROVE the drop is fake → accept it (fail-open on real risk).
+        logger.warning(f"[heartbeat] phantom-crash event query failed ({e}); "
+                       f"treating equity reading as real")
+        return False
+    explained = any(
+        (e.get("event") in _PHANTOM_CRASH_EXIT_EVENTS)
+        # forked records nest fields under "payload"; accept both shapes.
+        or (e.get("payload", {}) or {}).get("event") in _PHANTOM_CRASH_EXIT_EVENTS
+        for e in recent
+    )
+    return not explained
+
+
 def _sync_account_state():
     """Pull live aggregated equity + positions from HL, persist to memory.
 
@@ -424,6 +498,40 @@ def _sync_account_state():
             f"missing from queried {set(queried_dexes)} (equity read ${equity:.2f} is "
             f"incomplete) — skipping memory update, preserving last-known-good")
         return 0.0, [], 0.0, 0.0, set(), {}
+
+    # PHANTOM-CRASH sanity check (C1): equity>0 and every held dex answered, yet
+    # the aggregate can still return a real-looking but far-too-low value (a
+    # degraded dex under-reports instead of dropping out). A crash-sized drop vs
+    # the last ACCEPTED reading that NO recent real-close event explains is a
+    # phantom — accepting it would poison daily PnL and false-trip the HARD kill.
+    # Preserve last-known-good exactly like the guards above. Threshold reuses
+    # memory's crash_down_pct (same single-tick crash definition); on a genuine
+    # crash the closes land in events.jsonl and the next tick is accepted.
+    prev_eq, prev_ts = memory.last_equity_reading()
+    try:
+        from hermes_trader.agents.memory import _memory_quality_params
+        _crash_pct = float(_memory_quality_params().get("crash_down_pct", 0.0) or 0.0)
+    except Exception as _qp_e:
+        logger.warning(f"[heartbeat] crash-threshold read failed ({_qp_e}); "
+                       f"skipping phantom-crash check this tick")
+        _crash_pct = 0.0
+    if _crash_pct > 0:
+        try:
+            from hermes_trader.event_log import query_events
+        except Exception as _imp_e:
+            logger.warning(f"[heartbeat] event_log unavailable ({_imp_e}); "
+                           f"skipping phantom-crash check this tick")
+            query_events = None
+        if phantom_crash_unconfirmed(
+                equity, prev_eq, prev_ts, crash_pct=_crash_pct,
+                query_fn=query_events):
+            logger.warning(
+                f"[heartbeat] phantom-crash reading ${prev_eq:.2f} -> ${equity:.2f} "
+                f"({(equity - prev_eq) / prev_eq * 100:.1f}%) with NO real-close "
+                f"event in the last 60s — degraded/phantom read; skipping memory "
+                f"update, preserving last-known-good (a sustained move re-asserts "
+                f"next tick)")
+            return 0.0, [], 0.0, 0.0, set(), {}
 
     # Subtract net USDC contributions so transfers/deposits don't show
     # up as trading PnL in the equity-diff calculation.

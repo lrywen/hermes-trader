@@ -839,6 +839,16 @@ class AgentMemory:
         with self._lock:
             return float(self._peak_equity)
 
+    def last_equity_reading(self) -> tuple[float, float]:
+        """Most recent ACCEPTED equity reading and its epoch-seconds timestamp.
+
+        Returns ``(0.0, 0.0)`` before the first tick. The heartbeat uses this as
+        the previous-tick baseline for its phantom-crash sanity check (a reading
+        is only comparable against the last value the quality gate accepted)."""
+        with self._lock:
+            return float(getattr(self, "_last_eq_reading", 0.0) or 0.0), \
+                float(getattr(self, "_last_eq_reading_ts", 0.0) or 0.0)
+
     # ── Loss cooldown (anti-revenge re-entry) ───────────────────────────────
     # Backed by the persisted `_cooldowns` dict (coin -> expires_ms), which was
     # serialized but never written/read until 2026-06-11 — wired up after TON

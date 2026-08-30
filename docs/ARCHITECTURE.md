@@ -965,13 +965,32 @@ to all positions opened by the standard executor path.
 for the rest of the UTC day when realized PnL drops below it. Cap-only —
 existing positions still get DSL-managed.
 
-**Known weakness (pending fix):** the heartbeat computes daily PnL from
-HL's `accountValue`, which occasionally returns `0` on a transient API
-hiccup before recovering. A zero reading mid-day looks like a catastrophic
-loss and trips the killswitch on phantom data. The mitigation is to
-sanity-check the heartbeat: if equity drops >50% in a single 15s tick AND
-no `dsl_exit` event explains it, treat the reading as transient and don't
-update daily PnL until the next clean tick. **TODO** in the loop.
+**Phantom-equity guards (C1, implemented):** the heartbeat computes daily
+PnL from HL's `accountValue`, which on a transient API hiccup can return
+`0`, drop a whole dex from the aggregate, or silently under-report — any of
+which looks like a catastrophic loss and would trip the killswitch on
+phantom data. `_sync_account_state` rejects degraded reads in layers,
+preserving last-known-good (it skips the `track_daily_pnl` update and
+returns an empty queried-dex set, so a degraded tick can neither poison
+daily PnL nor trip the HARD kill):
+
+1. **equity <= 0** — a "successful" fetch returning $0 is an empty/degraded
+   response, not reality.
+2. **partial-DEX** — a dex backing an open tracker is absent from
+   `queried_dexes`, so the aggregate is provably incomplete.
+3. **phantom crash** (`phantom_crash_unconfirmed`) — equity > 0 and every
+   held dex answered, yet the value is a crash-sized drop versus the last
+   *accepted* reading (reuses memory's `crash_down_pct`, default 40%) with
+   NO real-close event (`close`/`dsl_exit`/`ai_close`/
+   `external_close_recorded`/`hard_killswitch`) in the last 60s of
+   `events.jsonl` to explain it. A genuine liquidation closes positions and
+   emits those events, so a real crash is delayed at most one tick
+   (fail-CLOSED for entries/exits in between); a sustained phantom re-reads
+   as real on the next clean tick. Memory's own `track_daily_pnl` keeps the
+   complementary fail-open rule (a crash-sized drop is accepted immediately
+   there) so the two layers err on opposite sides: the heartbeat wants a
+   close event before acting on fiction, while the daily PnL state never
+   hides a real crash for longer than the re-confirm window.
 
 ### Risk gate composition philosophy
 
