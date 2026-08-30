@@ -41,6 +41,7 @@ sys.path.insert(0, str(_REPO))
 from hermes_trader.agents.config import get_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
+from hermes_trader.indicators import math as ind
 from hermes_trader.indicators import triggers as trig
 
 # Reuse helpers + DSL from the A/B backtest module.
@@ -55,7 +56,6 @@ from backtest_ab_compare import (
     _obv_slope,
     _regime_score,
     _resample_4h,
-    _rsi,
 )
 
 TARGET_COINS = ["kPEPE", "CRV", "ETH"]
@@ -82,7 +82,7 @@ def _dyn_context(window_1h: List[Any]) -> Dict[str, Any]:
     ext_atr = (closes_1h[-1] - e21) / atr_v if (atr_v and e21 and atr_v > 0) else 0.0
 
     # 4h RSI (same construction as _evaluate_entry).
-    rsi = _rsi([c.c for c in window_1h], 14) or 50.0  # fallback; 4h set by caller
+    rsi = ind.rsi_last([c.c for c in window_1h], 14) or 50.0  # fallback; 4h set by caller
 
     # 1d resonance (mirror backtest_ab_compare threshold: >=720 1h bars).
     daily_closes: List[float] = []
@@ -92,7 +92,7 @@ def _dyn_context(window_1h: List[Any]) -> Dict[str, Any]:
     rsi_1d: Optional[float] = None
     daily_uptrend = False
     if daily_closes:
-        rsi_1d = _rsi(daily_closes[-60:], 14)
+        rsi_1d = ind.rsi_last(daily_closes[-60:], 14)
         e_now = _ema_val(daily_closes, 21)
         e_prev = _ema_val(daily_closes[:-1], 21) if len(daily_closes) >= 2 else None
         daily_uptrend = e_now is not None and e_prev is not None and e_now > e_prev
@@ -114,7 +114,7 @@ def _dyn_context(window_1h: List[Any]) -> Dict[str, Any]:
 
     return {
         "bullish": bullish,
-        "rsi_1h": _rsi(closes_1h, 14),
+        "rsi_1h": ind.rsi_last(closes_1h, 14),
         "rsi_4h": rsi,
         "ext_atr": ext_atr,
         "adx": adx_v if adx_v is not None else 0.0,
@@ -357,7 +357,7 @@ def analyze_coin(
         if ctx["rsi_1d"] is not None:
             daily_data_available += 1
         # Use 4h RSI (matching _evaluate_entry).
-        ctx["rsi_4h"] = _rsi([c.c for c in window_4h], 14) or ctx.get("rsi_1h", 50.0)
+        ctx["rsi_4h"] = ind.rsi_last([c.c for c in window_4h], 14) or ctx.get("rsi_1h", 50.0)
 
         # Focus zone: ADX>=40 and RSI in 75-90 (plus >90 for dead-code check).
         if ctx["adx"] < 40:

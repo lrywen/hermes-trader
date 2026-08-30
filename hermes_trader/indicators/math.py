@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 
 from hermes_trader.models.types import Candle
 
@@ -60,15 +61,15 @@ def atr(candles: list[Candle], period: int = 14) -> list[float]:
     return out
 
 
-def rsi(candles: list[Candle], period: int = 14) -> list[float]:
-    """Relative strength index."""
-    out = [float("nan")] * len(candles)
-    if len(candles) <= period:
+def _rsi_from_closes(closes: list[float], period: int = 14) -> list[float]:
+    """Wilder RSI series from close prices (first `period` values are NaN)."""
+    out = [float("nan")] * len(closes)
+    if len(closes) <= period:
         return out
 
     g, l = 0.0, 0.0
     for i in range(1, period + 1):
-        d = candle_val(candles[i], "c") - candle_val(candles[i - 1], "c")
+        d = closes[i] - closes[i - 1]
         if d >= 0:
             g += d
         else:
@@ -78,8 +79,8 @@ def rsi(candles: list[Candle], period: int = 14) -> list[float]:
     avg_l = l / period
     out[period] = 100 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
 
-    for i in range(period + 1, len(candles)):
-        d = candle_val(candles[i], "c") - candle_val(candles[i - 1], "c")
+    for i in range(period + 1, len(closes)):
+        d = closes[i] - closes[i - 1]
         # gain = positive move else 0; loss = magnitude of a negative move else 0.
         # The loss term must be a non-negative magnitude — the previous
         # `d if d < 0 else -d` fed negatives in and drove RSI below 0.
@@ -88,6 +89,20 @@ def rsi(candles: list[Candle], period: int = 14) -> list[float]:
         out[i] = 100 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
 
     return out
+
+
+def rsi(candles: list[Candle], period: int = 14) -> list[float]:
+    """Relative strength index."""
+    closes = [candle_val(c, "c") for c in candles]
+    return _rsi_from_closes(closes, period)
+
+
+def rsi_last(closes: list[float], period: int = 14) -> float | None:
+    """Wilder RSI of the last close; None when data is insufficient or NaN."""
+    if len(closes) <= period:
+        return None
+    last = _rsi_from_closes(closes, period)[-1]
+    return last if math.isfinite(last) else None
 
 
 def adx(candles: list[Candle], period: int = 14) -> list[float]:

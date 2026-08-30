@@ -240,24 +240,6 @@ class DSL:
 # Indicator helpers (computed once per bar, shared by OLD and NEW)
 # ---------------------------------------------------------------------------
 
-def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    if len(gains) < period:
-        return None
-    avg_g = sum(gains[-period:]) / period
-    avg_l = sum(losses[-period:]) / period
-    if avg_l == 0:
-        return 100.0
-    rs = avg_g / avg_l
-    return 100 - 100 / (1 + rs)
-
-
 def _ema_val(closes: List[float], period: int) -> Optional[float]:
     if len(closes) < period:
         return None
@@ -374,9 +356,9 @@ def _evaluate_entry(
 
     # --- RSI on 4h (NEW veto input; computed but ignored by OLD) ---
     closes_4h = [c.c for c in window_4h] if window_4h else closes_1h
-    rsi = _rsi(closes_4h, 14)
+    rsi = ind.rsi_last(closes_4h, 14)
     if rsi is None:
-        rsi = _rsi(closes_1h, 14) or 50.0
+        rsi = ind.rsi_last(closes_1h, 14) or 50.0
 
     # --- 1d RSI / EMA21 for multi-timeframe resonance (dynamic RSI only) ---
     # Build daily closes by resampling the last 336 1h bars (14 days) into 24h groups.
@@ -386,7 +368,7 @@ def _evaluate_entry(
         daily_closes: List[float] = []
         for j in range(0, len(closes_1h) - 23, 24):
             daily_closes.append(closes_1h[j + 23])
-        rsi_1d = _rsi(daily_closes[-60:], 14)
+        rsi_1d = ind.rsi_last(daily_closes[-60:], 14)
         e_1d = _ema_val(daily_closes, 21)
         if e_1d is not None and len(daily_closes) >= 2:
             ema21_1d_prev = _ema_val(daily_closes[:-1], 21)

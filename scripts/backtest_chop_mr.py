@@ -70,24 +70,6 @@ ROUND_TRIP_FEE_BPS = 5.0
 # Indicator helpers (local copies to keep script self-contained)
 # ---------------------------------------------------------------------------
 
-def _rsi(closes: List[float], period: int = 14) -> Optional[float]:
-    if len(closes) < period + 1:
-        return None
-    gains, losses = [], []
-    for i in range(1, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains.append(max(d, 0))
-        losses.append(max(-d, 0))
-    if len(gains) < period:
-        return None
-    avg_g = sum(gains[-period:]) / period
-    avg_l = sum(losses[-period:]) / period
-    if avg_l == 0:
-        return 100.0
-    rs = avg_g / avg_l
-    return 100 - 100 / (1 + rs)
-
-
 def _ema_val(closes: List[float], period: int) -> Optional[float]:
     if len(closes) < period:
         return None
@@ -227,7 +209,7 @@ def _backtest_coin(
         if adx_v is None:
             continue
 
-        rsi_v = _rsi(closes, 14)
+        rsi_v = ind.rsi_last(closes, 14)
         if rsi_v is None or rsi_v >= rsi_long or rsi_v < rsi_floor:
             continue
 
