@@ -1053,11 +1053,27 @@ def place_hl_trigger_order(
     trigger_px: float,
     kind: str,  # 'sl' or 'tp'
     coin: str = "BTC",
+    limit_band_pct: Optional[float] = None,
 ) -> dict[str, Any]:
     """Place a reduce-only trigger order (stop-loss or take-profit).
 
-    Triggers a market order in the position-closing direction once the
-    trigger price is crossed.
+    Once the trigger price is crossed, closes the position in the opposite
+    direction, reduce-only.
+
+    C4-3 (HYPE postmortem follow-up): with ``limit_band_pct`` unset (default)
+    the trigger fires a MARKET order — guaranteed to fill, but in a liquidity
+    vacuum (HYPE 2026-08-19: mark gapped through the trigger with no book to
+    hit) the fill can print far past the trigger price, which is exactly the
+    un-capped slippage that turned the HYPE stop into a liquidation. When
+    ``limit_band_pct`` is a positive percent, the trigger instead rests a
+    LIMIT order at a worst-case price ``band`` past the trigger
+    (trigger*(1±band) on the adverse side, derived from the closing side:
+    sell → lower limit, buy → higher limit). The HL wire is the same trigger
+    order with isMarket=False; limit_px carries the worst-case price. This
+    caps slippage at the band. Trade-off: in a faster-than-band gap the limit
+    order rests unfilled (same residual risk as a missing stop) — the DSL
+    soft-stop and the retry/re-arm cycle remain the backstop, so the default
+    stays market and the limit band is operator opt-in.
     """
     if not PRIVATE_KEY_HEX:
         return {"ok": False, "error": "HYPERLIQUID_PRIVATE_KEY not set"}
@@ -1078,6 +1094,18 @@ def place_hl_trigger_order(
         trigger_f = float(trigger_str)
         size_str = f"{size:.{sz_dec}f}"
         order_notional = float(size_str) * trigger_f
+
+        # C4-3: optional worst-case limit band. is_buy=True (short SL/TP
+        # closes by BUYING) → limit sits ABOVE trigger; is_buy=False (long
+        # close by SELLING) → limit sits BELOW trigger. Round to tick so HL
+        # can't reject the limit price ("Invalid TP/SL price").
+        use_limit = bool(limit_band_pct) and limit_band_pct > 0
+        if use_limit:
+            raw_limit = trigger_f * (1.0 + limit_band_pct / 100.0) if is_buy \
+                else trigger_f * (1.0 - limit_band_pct / 100.0)
+            limit_f = float(_round_price_for_hl(raw_limit, sz_dec, is_perp=True))
+        else:
+            limit_f = trigger_f
 
         # H1: a resting trigger below the HL minimum is accepted at submit time
         # but ASYNCHRONOUSLY REJECTED ("minTradeNtlRejected") the moment it
@@ -1104,7 +1132,7 @@ def place_hl_trigger_order(
         order_type = OrderType(
             trigger=TriggerOrderType(
                 triggerPx=trigger_f,
-                isMarket=True,
+                isMarket=not use_limit,
                 tpsl="sl" if kind == "sl" else "tp",
             )
         )
@@ -1113,16 +1141,20 @@ def place_hl_trigger_order(
             f"[place_hl_trigger_order] SUBMIT {coin} kind={kind} "
             f"side={'buy' if is_buy else 'sell'} size={size_str} "
             f"trigger={trigger_str} notional=${order_notional:.2f} "
-            f"reduce_only=true (hl_min=${MIN_ORDER_USD:.2f}, "
+            f"reduce_only=true "
+            f"{'LIMIT band=' + format(limit_f, '.6g') + ' (worst fill capped)' if use_limit else 'MARKET on trigger'} "
+            f"(hl_min=${MIN_ORDER_USD:.2f}, "
             f"{'ABOVE min' if order_notional >= MIN_ORDER_USD else 'BELOW min — will be rejected on trigger!'})"
         )
 
-        # isMarket=True fills at market on trigger; limit_px is a reference.
+        # isMarket=True fills at market on trigger and limit_px is only a
+        # reference; isMarket=False (limit_band_pct set) fires a limit order
+        # at limit_f once the trigger crosses, capping the worst fill.
         result = exchange.order(
             coin,
             is_buy,
             float(size_str),
-            trigger_f,
+            limit_f if use_limit else trigger_f,
             order_type,
             reduce_only=True,
         )
@@ -1157,6 +1189,7 @@ def modify_sl_trigger(
     new_trigger_px: float,
     coin: str,
     oid: int,
+    limit_band_pct: Optional[float] = None,
 ) -> dict[str, Any]:
     """Modify an existing reduce-only SL trigger order's trigger price via batchModify.
 
@@ -1165,7 +1198,11 @@ def modify_sl_trigger(
     Callers MUST persist the new oid — the old one is immediately invalid.
 
     Mainnet-verified constraints (2026-08, ETH perp):
-      * `limit_px` MUST equal the new triggerPx (the SDK rejects mismatches).
+      * For MARKET triggers (default): `limit_px` MUST equal the new triggerPx
+        (the SDK rejects mismatches) — it's only a reference price.
+      * For LIMIT triggers (C4-3, limit_band_pct set): `limit_px` is the
+        worst-case fill price (trigger±band, same semantics as a fresh
+        placement via place_hl_trigger_order).
       * The price MUST be rounded to the coin's tick size via _round_price_for_hl;
         naive round() to 2 dp produces "Invalid TP/SL price" rejections.
       * Response is `{"statuses":[{"resting":{"oid": <NEW_OID>}}]}` — same shape
@@ -1188,26 +1225,37 @@ def modify_sl_trigger(
         trigger_f = float(trigger_str)
         size_str = f"{size:.{sz_dec}f}"
 
+        # C4-3: same worst-case limit band semantics as a fresh placement.
+        use_limit = bool(limit_band_pct) and limit_band_pct > 0
+        if use_limit:
+            raw_limit = trigger_f * (1.0 + limit_band_pct / 100.0) if is_buy \
+                else trigger_f * (1.0 - limit_band_pct / 100.0)
+            limit_f = float(_round_price_for_hl(raw_limit, sz_dec, is_perp=True))
+        else:
+            limit_f = trigger_f
+
         order_type = OrderType(
             trigger=TriggerOrderType(
                 triggerPx=trigger_f,
-                isMarket=True,
+                isMarket=not use_limit,
                 tpsl="sl",
             )
         )
 
         logger.info(
             f"[modify_sl_trigger] SUBMIT {coin} oid={oid} -> new_trigger={trigger_str} "
-            f"side={'buy' if is_buy else 'sell'} size={size_str} reduce_only=true"
+            f"side={'buy' if is_buy else 'sell'} size={size_str} reduce_only=true "
+            f"{'LIMIT band=' + format(limit_f, '.6g') if use_limit else 'MARKET on trigger'}"
         )
 
-        # limit_px MUST equal triggerPx for trigger SL modifications.
+        # MARKET: limit_px is a reference that MUST equal triggerPx. LIMIT:
+        # limit_px is the worst-case fill price carried on the wire.
         result = exchange.modify_order(
             oid=int(oid),
             name=coin,
             is_buy=is_buy,
             sz=float(size_str),
-            limit_px=trigger_f,
+            limit_px=limit_f if use_limit else trigger_f,
             order_type=order_type,
             reduce_only=True,
         )

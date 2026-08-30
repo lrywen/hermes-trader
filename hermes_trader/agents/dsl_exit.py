@@ -876,7 +876,7 @@ class DSLTracker:
                     exit=True,
                     reason=(
                         f"floor_breach ({self.consecutive_breaches}x consec"
-                        f"{held_for}, floor={floor:.2f}{index_note})"
+                        f"{held_for}, floor={floor:.6g}{index_note})"
                     ),
                     floor_price=floor, peak_price=self.peak_px,
                     phase=self._phase_label(),

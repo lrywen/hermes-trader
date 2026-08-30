@@ -202,29 +202,52 @@ scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '15'))
 
 ## 七、未解决的风险与后续建议（P1/P2，不在本次 P0 范围）
 
-以下问题在本次复盘中识别但未在 P0 修复，列出供后续排期：
+以下问题在本次复盘中识别。item 1–4 已在后续 C4 批次修复（见各项销账说明）；
+item 5 仍在 backlog。
 
-1. **DSL floor `f"{floor:.2f}"` 格式化 bug**（[dsl_exit.py:387](file:///home/ldy/hermes-trader/hermes_trader/agents/dsl_exit.py#L387)）：
-   对 BOME 这类 0.001 价位的币，日志显示 `floor=0.00`。仅影响日志可读性，
-   不影响策略判定，但建议改用 `:.6g`。
+1. ~~**DSL floor `f"{floor:.2f}"` 格式化 bug**~~ **【已修复 · C4-1】**
+   （[dsl_exit.py](file:///home/ldy/hermes-trader/hermes_trader/agents/dsl_exit.py)）：
+   低价币（BOME 等 0.001 价位）日志原显示 `floor=0.00`。已改用 `:.6g` 有效
+   数字格式，任意价位都能打印真实 floor。仅日志可读性，不影响策略判定。
 
-2. **DSL floor 与备份 SL 的参数仍然在两处定义**：本次通过 ceiling clamp 让它们在
-   结果上对齐，但 `sl_atr_mult=1.5`（备份）与 DSL 的 `1.2×` 倍数仍然不一致。
-   建议后续把"可接受最大止损宽度"提取成一个共享配置项，两层同时引用，从根上
-   避免再次漂移。
+2. ~~**DSL floor 与备份 SL 的参数在两处定义、倍数漂移**~~ **【已修复 · C4-2】**：
+   `dsl_exit.atr_stop` 块（`atr_mult` / `floor_pct`）现为 DSL 软止损与交易所
+   备份 SL 两层止损倍数与 floor 的**唯一规范来源**，两层同时引用；top-level
+   `sl_atr_mult` / `sl_floor_pct` 作为备份层显式覆盖，
+   `atr_risk_sizing.coin_overrides.<coin>.sl_floor_pct` 保持最高优先级。
+   备份层 ceiling（默认 3%）**刻意不**与 DSL ceiling（4%）共享——外网灾难兜底
+   必须比主止损更紧。备份层默认 floor 已由 1.2% 对齐到 1.0%（= DSL ExitPolicy）。
 
-3. **trigger market 的极端滑点保护**：交易所端用的是 trigger market 单，HYPE 这类
-   流动性瞬间枯竭时，market 单成交价可能劣于 trigger 价。可考虑用 trigger limit
-   加一个 worst-price band，或在触发后由 DSL 立刻补发一个保护单。
+3. ~~**trigger market 的极端滑点保护**~~ **【已修复 · C4-3】**：
+   [exchange.py](file:///home/ldy/hermes-trader/hermes_trader/client/exchange.py)
+   的 `place_hl_trigger_order` / `modify_sl_trigger` 新增可选参
+   `limit_band_pct`（配置键 `sl_limit_band_pct`，默认 `0.0`）：
+   - **默认 0 = trigger MARKET（fail-safe 保成交）**：流动性枯竭时限价单可能不
+     成交而导致裸奔，故默认仍用 market，确保止损一定触发；
+   - **opt-in 正值 = trigger LIMIT + worst-price band**：触发后挂限价单，限价
+     钉在 trigger 价平仓侧外 `band%`（平多卖出 → trigger×(1−band)，平空买入 →
+     trigger×(1+band)），按 tick 取整，把最坏成交价 cap 在 band 内；
+   - band 超过 ceiling 时 clamp 到 ceiling（防 worst-case 限价越过 P0 外网 cap）；
+     负值/NaN/非有限一律回退 market（方向永不反转）；retry 队列与 sl-mover
+     （`sync_exchange_sl`）均透传同一变体，运行时改配置即时生效。
+   生产配置无此键 → 生产行为保持 market 不变。残余风险（gap 快于 band 时限价
+   不成交）由 DSL 与 SL 重试兜底。
 
-4. **轮询缩短到 15s 后的限流与缓存预算**：目前 5m candle cache TTL = 50s，15s
-   轮询会复用同一份 K 线缓存 3–4 次，不增加 HL 历史 K 线请求；但 midpoint、
-   orderbook、持仓查询等实时接口的 QPS 会涨 4 倍，建议上线后观察 HL 返回的
-   429 / rate-limit 指标，必要时把"扫描"和"DSL 持仓检查"拆成两个独立 cadence
-   （扫描仍可 30–60s，DSL exit 检查单独 10–15s）。
+4. ~~**轮询缩短到 15s 后的限流与缓存预算**~~ **【已评估 · C4-4，按观测条件触发，暂不拆 cadence】**：
+   5m candle cache TTL = 50s，15s 轮询复用同一份 K 线缓存 3–4 次，不增加历史
+   K 线请求；midpoint / orderbook / 持仓等实时接口 QPS 上升。系统**已具备完整
+   的限流观测与自适应退避体系**，无需为拆分新增埋点：
+   [rate_limit.py](file:///home/ldy/hermes-trader/hermes_trader/client/rate_limit.py)
+   的 token-bucket 限流器在收到 429 / Retry-After 后通过 `penalize()` 跨进程扣
+   token 退避（`rate_429_retries` 可配），端点争用由
+   `hermes_hl_rate_gate_wait_seconds` 直方图指标暴露。
+   **结论与预案**：上线后观察 429 计数与 gate-wait 指标；仅当确实出现限流时，
+   再把"扫描"（可放宽到 30–60s）与"DSL 持仓检查"（保持 10–15s）拆成两个独立
+   cadence。当前单循环 15s 下 DSL monitor pass 已先于 scan 段执行且 OFF / feed-
+   halt 分支也照常跑 exits，拆分为低风险时间闸改造，留待限流证据出现后实施。
 
-5. **穿仓级别的熔断**：单笔损失超过某阈值（如 -50% ROE）时，是否应自动把 bot
-   切到 OFF 模式并告警。目前系统没有这个 self-halt 开关。
+5. **穿仓级别的熔断**（backlog，归属 C3）：单笔损失超过某阈值（如 -50% ROE）时，
+   是否应自动把 bot 切到 OFF 模式并告警。目前系统没有这个 self-halt 开关。
 
 ---
 

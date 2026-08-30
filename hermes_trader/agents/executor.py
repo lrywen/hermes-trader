@@ -147,9 +147,82 @@ _DEFAULT_SL_CEILING_PCT = 3.0
 # DSL's own atr_stop floor on low-volatility names, so the exchange stop fires
 # BEFORE the DSL floor on a normal wiggle (BOME class: a too-tight / zeroed stop).
 # The backup is a DISASTER NET, not the primary exit — it must sit just outside
-# the DSL blast radius, so it defaults to the DSL atr_stop floor (1.2%).
-_DEFAULT_SL_FLOOR_PCT = 1.2
+# the DSL blast radius, so it defaults to the DSL atr_stop floor (1.0%).
+_DEFAULT_SL_FLOOR_PCT = 1.0
+# C4-3 (HYPE postmortem follow-up): exchange trigger orders fire at MARKET by
+# default — guaranteed to fill, but in a liquidity vacuum the fill can gap far
+# past the trigger (HYPE 2026-08-19). Set sl_limit_band_pct > 0 to arm trigger
+# LIMIT orders whose worst-case fill is capped `band` percent past the trigger.
+# Default 0 = market: an unfilled limit would leave a naked position, so the
+# limit band is operator opt-in (see place_hl_trigger_order docstring).
+_DEFAULT_SL_LIMIT_BAND_PCT = 0.0
 TP_ATR_MULT = 1.0
+
+
+def _shared_atr_stop_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Return the canonical dsl_exit.atr_stop block both stop layers share.
+
+    C4-2 (HYPE postmortem follow-up): the DSL exit tracker and the exchange
+    backup SL historically each hard-coded their own stop WIDTH (the backup's
+    sl_atr_mult vs the DSL's atr_stop multiplier/floor). They happened to line
+    up after the P0 ceiling clamp, but an operator retuning one layer silently
+    re-opened the HYPE-class gap. `dsl_exit.atr_stop` in the agent config is now
+    the single canonical stop-width block: both layers resolve their multiplier
+    and FLOOR from it, with top-level `sl_atr_mult` / `sl_floor_pct` remaining
+    as explicit backup-layer overrides.
+
+    The backup CEILING is deliberately NOT shared: the DSL's atr_stop ceiling
+    (default 4%) bounds the DSL's OWN ATR floor, while the backup SL ceiling
+    (default `_DEFAULT_SL_CEILING_PCT` = 3%) is the post-HYPE outer-net maximum
+    distance the live position is allowed to fall before the exchange stop MUST
+    fire. Copying the wider DSL ceiling would loosen the P0 HYPE clamp, so the
+    backup keeps its own (narrower, separately hard-max-clamped) ceiling.
+    """
+    try:
+        return dict(((config or {}).get("dsl_exit", {}) or {}).get("atr_stop", {}) or {})
+    except Exception:
+        return {}
+
+
+def _resolve_sl_width_config(config: dict[str, Any], coin: str) -> dict[str, float]:
+    """Resolve backup-SL stop-width params with the shared dsl_exit.atr_stop block.
+
+    Precedence for multiplier/floor: explicit top-level `sl_*` override →
+    shared `dsl_exit.atr_stop` block → module default (which mirrors the DSL
+    ExitPolicy default). The per-coin `atr_risk_sizing.coin_overrides.<coin>.
+    sl_floor_pct` stays the highest-priority floor override.
+    """
+    shared = _shared_atr_stop_config(config)
+    mult_default = float(shared.get("atr_mult", _DEFAULT_SL_ATR_MULT))
+    if not (math.isfinite(mult_default) and mult_default > 0):
+        mult_default = _DEFAULT_SL_ATR_MULT
+    floor_default = float(shared.get("floor_pct", _DEFAULT_SL_FLOOR_PCT))
+    if not (math.isfinite(floor_default) and floor_default > 0):
+        floor_default = _DEFAULT_SL_FLOOR_PCT
+
+    sl_atr_mult = float(config.get("sl_atr_mult", mult_default))
+    # Ceiling is intentionally layer-specific (see _shared_atr_stop_config): it
+    # never inherits the shared atr_stop ceiling.
+    sl_ceiling_pct = float(config.get("sl_ceiling_pct", _DEFAULT_SL_CEILING_PCT))
+    sl_floor_pct = float(config.get("sl_floor_pct", floor_default))
+    try:
+        _coin_floor = ((config.get("atr_risk_sizing", {}) or {})
+                       .get("coin_overrides", {}).get(coin, {})
+                       .get("sl_floor_pct"))
+        if _coin_floor is not None:
+            sl_floor_pct = float(_coin_floor)
+    except Exception:
+        pass
+    # C4-3: trigger-limit worst-case band. 0 (default) = market-on-trigger; a
+    # positive value arms trigger LIMIT orders (see _DEFAULT_SL_LIMIT_BAND_PCT).
+    # Negative / non-finite values are ignored (market), never inverted.
+    sl_limit_band_pct = float(config.get("sl_limit_band_pct", _DEFAULT_SL_LIMIT_BAND_PCT))
+    if not (math.isfinite(sl_limit_band_pct) and sl_limit_band_pct >= 0):
+        sl_limit_band_pct = _DEFAULT_SL_LIMIT_BAND_PCT
+    return {"sl_atr_mult": sl_atr_mult,
+            "sl_floor_pct": sl_floor_pct,
+            "sl_ceiling_pct": sl_ceiling_pct,
+            "sl_limit_band_pct": sl_limit_band_pct}
 
 # Hyperliquid perp taker fee, in PERCENT (HL = 2.5 bps = 0.025%). Used to model
 # round-trip entry+exit cost in realized-PnL bookkeeping. Env-overridable so a
@@ -923,6 +996,7 @@ def _place_backup_sl(
     atr: float, entry_px: float, sl_atr_mult: float,
     sl_floor_pct: float, sl_ceiling_pct: float, size_in_coin: float,
     is_buy: bool, coin: str, trade_side: str, memory: Any,
+    sl_limit_band_pct: float = 0.0,
 ) -> bool:
     """Place the server-side backup stop for a freshly filled position.
 
@@ -951,18 +1025,22 @@ def _place_backup_sl(
             _slip_widen_pct = 0.0
         sl_width_pct = min(sl_width_pct + _slip_widen_pct, sl_ceiling_pct)
         sl_px = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
-        sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin)
+        # C4-3: sl_limit_band_pct > 0 arms a trigger LIMIT (worst-case fill
+        # capped `band` past the trigger); 0 keeps the market-on-trigger default.
+        _band_kw = {"limit_band_pct": sl_limit_band_pct} if sl_limit_band_pct > 0 else {}
+        sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
         if not sl_res.get("ok"):
             # One retry after a beat — observed failures are transient 429s; a
             # position with no server-side stop carries the full gap-through
             # risk between DSL checks, so a single retry is cheap insurance.
             time.sleep(2)
-            sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin)
+            sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
         if sl_res.get("ok"):
             logger.info(f"[executor] Placed backup SL at {sl_px:.6g} "
                         f"({sl_width_pct:.2f}% from entry; atr_mult={sl_atr_mult}, "
                         f"floor={sl_floor_pct}%, ceiling={sl_ceiling_pct}%, "
-                        f"slip+={_slip_widen_pct:.3f}%)")
+                        f"slip+={_slip_widen_pct:.3f}%, "
+                        f"limit_band={sl_limit_band_pct if sl_limit_band_pct > 0 else 'market'}%)")
             # Persist the new SL oid/px/size on the tracker so the dynamic mover
             # (batchModify) can target it and a restart reconciles correctly.
             set_bracket(coin, trade_side,
@@ -979,6 +1057,10 @@ def _place_backup_sl(
                 "sl_px": sl_px,
                 "coin": coin,
                 "side": trade_side,
+                # C4-3: carry the band so the retry queue re-arms the SAME
+                # trigger-limit variant instead of silently falling back to
+                # market after a transient placement failure.
+                "limit_band_pct": sl_limit_band_pct if sl_limit_band_pct > 0 else 0.0,
                 "retry_count": 0,
                 "last_attempt": time.time(),
             }
@@ -1820,7 +1902,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 risk_per_trade_pct=_risk_pct,
                 atr_abs=atr,
                 entry_px=mid_price,
-                sl_atr_mult=float(config.get("sl_atr_mult", _DEFAULT_SL_ATR_MULT)),
+                # C4-2: shared dsl_exit.atr_stop multiplier (top-level
+                # sl_atr_mult remains an explicit override).
+                sl_atr_mult=_resolve_sl_width_config(config, coin)["sl_atr_mult"],
                 max_trade_notional_usd=_cap,
                 coin_max_leverage=_coin_max_lev,
                 config_max_leverage=int(config.get("leverage", HL_LEVERAGE)),
@@ -1982,9 +2066,13 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         _h4_mid = mid_price
         _h4_atr = atr if atr > 0 else get_hl_atr("4h", 14, coin)
         if _h4_mid > 0 and _h4_atr > 0:
-            _h4_mult = float(config.get("sl_atr_mult", _DEFAULT_SL_ATR_MULT) or _DEFAULT_SL_ATR_MULT)
-            _h4_floor = float(config.get("sl_floor_pct", _DEFAULT_SL_FLOOR_PCT) or _DEFAULT_SL_FLOOR_PCT)
-            _h4_ceiling = float(config.get("sl_ceiling_pct", _DEFAULT_SL_CEILING_PCT) or _DEFAULT_SL_CEILING_PCT)
+            # C4-2: mirror the backup-SL resolution (shared dsl_exit.atr_stop
+            # block) so the pre-trade worst-case estimate matches what the
+            # post-fill _place_backup_sl will actually clamp to.
+            _h4_w = _resolve_sl_width_config(config, coin)
+            _h4_mult = _h4_w["sl_atr_mult"]
+            _h4_floor = _h4_w["sl_floor_pct"]
+            _h4_ceiling = _h4_w["sl_ceiling_pct"]
             if _h4_mult > 0 and _h4_ceiling > 0:
                 _h4_width = min(max((_h4_atr / _h4_mid) * _h4_mult * 100.0, _h4_floor), _h4_ceiling)
                 _h4_stop_distance_pct = min(_h4_width + _h4_ceiling * 0.5, _h4_ceiling * 1.5)
@@ -2772,19 +2860,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # / inverted trigger); a giant ceiling recreates the HYPE 43% gap. Clamp
     # to sane bounds and fall back to defaults on non-finite / non-positive
     # values rather than trusting arbitrary config.
-    sl_atr_mult = float(config.get("sl_atr_mult", _DEFAULT_SL_ATR_MULT))
-    sl_ceiling_pct = float(config.get("sl_ceiling_pct", _DEFAULT_SL_CEILING_PCT))
-    # Backup-SL floor (BOME class defense): default mirrors the DSL atr_stop
-    # floor so a low-ATR coin can't get an exchange stop tighter than the DSL
-    # floor. Per-coin override via atr_risk_sizing.coin_overrides.<coin>.sl_floor_pct.
-    _sl_floor_default = float(config.get("sl_floor_pct", _DEFAULT_SL_FLOOR_PCT))
-    try:
-        _coin_sl_floor = (config.get("atr_risk_sizing", {}) or {}).get("coin_overrides", {}).get(coin, {}).get("sl_floor_pct")
-        if _coin_sl_floor is not None:
-            _sl_floor_default = float(_coin_sl_floor)
-    except Exception:
-        pass
-    sl_floor_pct = _sl_floor_default
+    # C4-2: multiplier and floor resolve from the SHARED dsl_exit.atr_stop
+    # block (canonical for both the DSL floor and the exchange backup SL);
+    # top-level sl_* keys remain explicit backup-layer overrides. The ceiling
+    # stays backup-specific (outer-net post-HYPE cap) and does NOT inherit the
+    # shared atr_stop ceiling.
+    _sl_widths = _resolve_sl_width_config(config, coin)
+    sl_atr_mult = _sl_widths["sl_atr_mult"]
+    sl_ceiling_pct = _sl_widths["sl_ceiling_pct"]
+    sl_floor_pct = _sl_widths["sl_floor_pct"]
+    sl_limit_band_pct = _sl_widths["sl_limit_band_pct"]
     if not (math.isfinite(sl_atr_mult) and sl_atr_mult > 0):
         logger.warning(f"[executor] invalid sl_atr_mult={sl_atr_mult} — falling back to {_DEFAULT_SL_ATR_MULT}")
         sl_atr_mult = _DEFAULT_SL_ATR_MULT
@@ -2818,9 +2903,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # on the wrong side); pin it to ceiling if misconfigured.
     if sl_floor_pct > sl_ceiling_pct:
         sl_floor_pct = sl_ceiling_pct
+    # C4-3: band must never exceed the ceiling (the worst-case limit fill would
+    # otherwise print past the post-HYPE outer-net cap); pin it to ceiling.
+    if sl_limit_band_pct > sl_ceiling_pct:
+        logger.warning(f"[executor] sl_limit_band_pct={sl_limit_band_pct}% exceeds "
+                       f"ceiling {sl_ceiling_pct}% — clamping band to ceiling")
+        sl_limit_band_pct = sl_ceiling_pct
     sl_missing = _place_backup_sl(
         atr, entry_px, sl_atr_mult, sl_floor_pct, sl_ceiling_pct,
-        size_in_coin, is_buy, coin, trade_side, memory)
+        size_in_coin, is_buy, coin, trade_side, memory,
+        sl_limit_band_pct=sl_limit_band_pct)
 
     # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
     # fraction of the position SERVER-SIDE at the TP target so a winner is
@@ -3001,6 +3093,16 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                 continue
         _sl_move_state[coin] = (now, target)
 
+        # C4-3: live-resolve the trigger-limit band so a config edit takes
+        # effect without restart; 0/absent = market-on-trigger (default). A
+        # moved SL keeps the same variant as a freshly placed one.
+        try:
+            move_band = float(cfg_get("sl_limit_band_pct", _DEFAULT_SL_LIMIT_BAND_PCT))
+            if not (math.isfinite(move_band) and move_band >= 0):
+                move_band = _DEFAULT_SL_LIMIT_BAND_PCT
+        except (TypeError, ValueError):
+            move_band = _DEFAULT_SL_LIMIT_BAND_PCT
+        _move_band_kw = {"limit_band_pct": move_band} if move_band > 0 else {}
         try:
             res = modify_sl_trigger(
                 is_long_position=is_long,
@@ -3008,6 +3110,7 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                 new_trigger_px=target,
                 coin=coin,
                 oid=int(tracker.sl_oid),
+                **_move_band_kw,
             )
         except Exception as e:
             logger.warning(f"[sl-move] {coin} exception: {e}")
@@ -3800,8 +3903,13 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
         entry["retry_count"] = attempt + 1
         entry["last_attempt"] = now
         try:
+            # C4-3: re-arm the same trigger-limit variant as the original
+            # attempt (band carried in the retry entry).
+            _retry_band = float(entry.get("limit_band_pct", 0.0) or 0.0)
+            _retry_kw = {"limit_band_pct": _retry_band} if _retry_band > 0 else {}
             res = place_hl_trigger_order(
-                entry["is_buy"], entry["size"], entry["sl_px"], "sl", entry["coin"]
+                entry["is_buy"], entry["size"], entry["sl_px"], "sl", entry["coin"],
+                **_retry_kw
             )
             if res.get("ok"):
                 logger.info(f"[executor] Pending SL retry SUCCEEDED for {coin} "
