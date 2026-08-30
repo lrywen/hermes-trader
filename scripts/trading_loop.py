@@ -48,7 +48,7 @@ logging.basicConfig(
 from hermes_trader.agents.perception import scan_once
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.research import research
-from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl
+from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl, maybe_roe_blowup_halt
 from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import read_agent_config, cfg_get
@@ -806,6 +806,22 @@ while True:
                                     logger.warning(
                                         f"[executor] loss-cooldown arm failed "
                                         f"for {_tr.coin}: {_lc_e}")
+                            # C3 (HYPE RCA item 5): blow-up self-halt also
+                            # covers exchange-triggered closes (server-side SL
+                            # fill / liquidation) — the executor chokepoint is
+                            # bypassed on these, so arm the same ROE check here
+                            # on the backfilled realized ROE.
+                            try:
+                                maybe_roe_blowup_halt(
+                                    _tr.coin,
+                                    (_net_usd / _notional * 100.0 * _lev)
+                                    if _notional > 0 else None,
+                                    source="exchange_trigger",
+                                    event_log=log_event)
+                            except Exception as _rh_e:
+                                logger.warning(
+                                    f"[outcome-store] roe blow-up halt check "
+                                    f"failed for {_tr.coin}: {_rh_e}")
                         except Exception as _dc_e:
                             logger.warning(
                                 f"[outcome-store] drop-backfill failed for "

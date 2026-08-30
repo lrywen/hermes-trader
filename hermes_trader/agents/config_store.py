@@ -98,6 +98,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # unconditionally.
     "auto_flatten_on_global_halt": False,
     "auto_flatten_on_coin_circuit": False,
+    # C3 (HYPE RCA 2026-08-21 item 5): blow-up-level self-halt. When a SINGLE
+    # closing trade realizes a leveraged ROE loss at/under `roe_halt_threshold_pct`
+    # (default -50%, i.e. half the margin gone), flip the bot to mode=OFF and
+    # fire a risk alert. This is the nuclear kill-switch that the tiered breakers
+    # (time-windowed, open-blocking only) and the daily-loss USD switch do not
+    # cover: a single catastrophic gap-through (HYPE: -252% ROE). Default OFF —
+    # switching OFF is a deliberate operator action; the alert/audit still help.
+    "roe_halt_enabled": False,
+    "roe_halt_threshold_pct": -50.0,
     "daily_giveback_halt_pct": 0.35,
     "daily_giveback_min_peak_usd": 25.0,
     "crowded_with_min_conf": 0.8,

@@ -203,7 +203,7 @@ scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '15'))
 ## 七、未解决的风险与后续建议（P1/P2，不在本次 P0 范围）
 
 以下问题在本次复盘中识别。item 1–4 已在后续 C4 批次修复（见各项销账说明）；
-item 5 仍在 backlog。
+item 5 已在后续 C3 批次修复（见下方销账说明）。
 
 1. ~~**DSL floor `f"{floor:.2f}"` 格式化 bug**~~ **【已修复 · C4-1】**
    （[dsl_exit.py](file:///home/ldy/hermes-trader/hermes_trader/agents/dsl_exit.py)）：
@@ -246,8 +246,33 @@ item 5 仍在 backlog。
    cadence。当前单循环 15s 下 DSL monitor pass 已先于 scan 段执行且 OFF / feed-
    halt 分支也照常跑 exits，拆分为低风险时间闸改造，留待限流证据出现后实施。
 
-5. **穿仓级别的熔断**（backlog，归属 C3）：单笔损失超过某阈值（如 -50% ROE）时，
-   是否应自动把 bot 切到 OFF 模式并告警。目前系统没有这个 self-halt 开关。
+5. ~~**穿仓级别的熔断**~~ **【已修复 · C3】**：新增单笔灾难损失 self-halt 开关，
+   补齐现有三层风控（HARD 日亏 kill-switch 看当日累计 USD、tiered breaker 看
+   时间窗且仅拦新开仓、B-M11 opt-in auto-flatten）均不覆盖的"单笔 gap-through
+   穿仓"场景（HYPE 8x 多、-252.37% ROE 正是此类）。
+   - 配置键（[config_store.py](file:///home/ldy/hermes-trader/hermes_trader/agents/config_store.py)
+     CANONICAL_DEFAULTS + [config_schema.py](file:///home/ldy/hermes-trader/hermes_trader/agents/config_schema.py)
+     校验）：`roe_halt_enabled`（默认 **false**，opt-in）与
+     `roe_halt_threshold_pct`（默认 **-50.0**，schema 强制负值）。
+   - 共享 helper `maybe_roe_blowup_halt(coin, realized_pnl_pct, *, source, event_log)`
+     （[executor.py](file:///home/ldy/hermes-trader/hermes_trader/agents/executor.py)）：
+     当某笔平仓的**杠杆后净费 ROE ≤ 阈值**（`-252.37 ≤ -50` 命中）时——
+     ① 通过 `update_agent_config()` 上下文管理器（flock 全程持有、写前校验）
+     把 `mode` 切为 `OFF`，已 OFF 则幂等跳过配置写；② `notify.send_card` 发
+     `category="risk"` / `level="danger"` 告警卡（dedup_key=`roe_halt:<coin>`）；
+     ③ 写 `roe_halt` 审计事件（session_log，含 `realized_pnl_pct` / `threshold_pct`
+     / `source` / `mode_switched`）。
+   - **双触发点**覆盖两条平仓路径：`_close_position_market_locked` 平仓收口
+     （`source="close"`，DSL / 手动平仓）与
+     [trading_loop.py](file:///home/ldy/hermes-trader/scripts/trading_loop.py)
+     外部平仓回填（`source="exchange_trigger"`，交易所 trigger SL 成交 / 强平
+     对账——HYPE 实际路径，绕过 executor 收口）。
+   - **fail-safe**：默认关闭不改变现网行为；仅对真实成交（finite ROE）动作；
+     ROE 非数 / None / inf / NaN 一律忽略；阈值非法回退 -50；helper 与两个调用
+     点全部 try/except 兜底，**永不阻断平仓主流程、永不抛异常**。
+   - 回归：[test_c3_roe_blowup_halt.py](file:///home/ldy/hermes-trader/tests/test_c3_roe_blowup_halt.py)
+     8 例（开关默认关、HYPE -252.37% 触发切 OFF + 告警 + 审计、-20% 不触发、
+     边界 -50% 命中、盈利 / 小亏不触发、坏读忽略、已 OFF 幂等、配置写失败不抛）。
 
 ---
 

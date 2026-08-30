@@ -64,6 +64,8 @@ class _ConfigPatch(BaseModel):
     # or per-coin circuit breaker trips (default off; open-blocking only).
     auto_flatten_on_global_halt: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_global_halt"])
     auto_flatten_on_coin_circuit: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_coin_circuit"])
+    # C3 (HYPE RCA item 5): blow-up-level self-halt on a single trade's ROE loss.
+    roe_halt_enabled: bool = Field(default=CANONICAL_DEFAULTS["roe_halt_enabled"])
 
     # ── scalars: ints ─────────────────────────────────────────────────────
     leverage: int = Field(default=CANONICAL_DEFAULTS["leverage"], ge=1, le=50)
@@ -88,6 +90,10 @@ class _ConfigPatch(BaseModel):
     max_trade_notional_usd: float = Field(default=CANONICAL_DEFAULTS["max_trade_notional_usd"], ge=0.0)
     max_total_notional_pct: float = Field(default=CANONICAL_DEFAULTS["max_total_notional_pct"], ge=0.0, le=50.0)
     max_daily_loss_usd: float = Field(default=CANONICAL_DEFAULTS["max_daily_loss_usd"], le=0.0)
+    # C3 (HYPE RCA item 5): leveraged ROE loss (%) on a SINGLE closing trade
+    # that trips the blow-up self-halt (mode -> OFF). Negative; -50 = half the
+    # margin gone on one trade.
+    roe_halt_threshold_pct: float = Field(default=CANONICAL_DEFAULTS["roe_halt_threshold_pct"], lt=0.0)
     daily_giveback_halt_pct: float = Field(default=CANONICAL_DEFAULTS["daily_giveback_halt_pct"], ge=0.0, le=1.0)
     daily_giveback_min_peak_usd: float = Field(default=CANONICAL_DEFAULTS["daily_giveback_min_peak_usd"], ge=0.0)
     crowded_with_min_conf: float = Field(default=CANONICAL_DEFAULTS["crowded_with_min_conf"], ge=0.0, le=1.0)

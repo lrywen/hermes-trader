@@ -3870,12 +3870,116 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                             pass
         except Exception as _tb_e:
             logger.warning(f"[executor] tiered-breaker arm failed for {coin}: {_tb_e}")
+        # C3 (HYPE RCA item 5): blow-up-level self-halt. A single closing
+        # trade whose leveraged ROE loss breaches the threshold (default
+        # -50%) flips the bot to OFF + risk alert. Opt-in (roe_halt_enabled),
+        # self-contained; runs after the tiered breakers so a catastrophic
+        # one-trade gap-through (HYPE: -252% ROE) stops the book even when
+        # the daily/coin windows haven't tripped. Never raises.
+        try:
+            maybe_roe_blowup_halt(coin, out.get("realized_pnl_pct"), source="close")
+        except Exception as _rh_e:
+            logger.warning(f"[executor] roe blow-up halt check failed for {coin}: {_rh_e}")
         # C-M6: full settlement finished — record the dedupe signature so a
         # rapid repeat close for the SAME position skips record_close / loss
         # streak / breaker arming. A genuinely new position (different entry
         # or size) has a different signature and still settles.
         _CLOSE_SETTLED_AT[coin] = (_now_ms, side, _settle_sig)
     return out
+
+
+def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
+                          source: str = "close",
+                          event_log: Optional[Callable[..., None]] = None) -> bool:
+    """C3 (HYPE RCA item 5): blow-up-level self-halt on a single trade.
+
+    If a SINGLE closing trade realizes a leveraged ROE loss at/under
+    ``roe_halt_threshold_pct`` (default -50%), and the opt-in switch
+    ``roe_halt_enabled`` is on, flip the bot to mode=OFF and fire a risk
+    alert + audit event. This covers the gap-through / liquidation case
+    (HYPE: -252% ROE on one position) that the time-windowed tiered breakers
+    (open-blocking only) and the USD daily-loss switch do not.
+
+    Fail-safe design:
+      * Opt-in, default OFF. When OFF this returns False and does nothing —
+        the operator owns the mode switch.
+      * Only acts on a REAL fill: ``realized_pnl_pct`` must be a finite number
+        (the no-fill path passes ``None`` and is ignored).
+      * Never raises: every side effect (config write, notify, event log) is
+        wrapped; a failure is logged and swallowed so close settlement proceeds.
+      * Idempotent: if mode is already OFF the config write is skipped (the
+        notify dedup also throttles repeats).
+
+    Returns True if the halt actually fired this call.
+    """
+    try:
+        roe = float(realized_pnl_pct)
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(roe):
+        return False
+    try:
+        cfg = read_agent_config()
+        if not bool(cfg_get("roe_halt_enabled", config=cfg, default=False)):
+            return False
+        threshold = float(cfg_get("roe_halt_threshold_pct", config=cfg, default=-50.0))
+        if not math.isfinite(threshold) or threshold >= 0:
+            threshold = -50.0
+        # Loss is negative; a halt needs a loss AS BAD AS or WORSE than the
+        # (negative) threshold, e.g. roe=-252 <= threshold=-50.
+        if roe > threshold:
+            return False
+        # Skip the config write if already OFF (idempotent; still alert below).
+        old_mode = str(cfg.get("mode", "OFF")).upper()
+        switched = False
+        if old_mode != "OFF":
+            from hermes_trader.agents.config_store import update_agent_config
+            with update_agent_config() as wcfg:
+                wcfg["mode"] = "OFF"
+            switched = True
+        logger.critical(
+            f"[risk] ROE BLOW-UP HALT on {coin}: realized ROE {roe:.2f}% <= "
+            f"{threshold:.2f}% (source={source}) → mode switched OFF")
+        try:
+            from hermes_trader import notify
+            notify.send_card(
+                title="🚨 穿仓级别熔断 — bot 已切 OFF",
+                level="danger",
+                category="risk",
+                fields={
+                    "币种": coin,
+                    "已实现 ROE": f"{roe:.2f}%",
+                    "熔断阈值": f"{threshold:.2f}%",
+                    "触发来源": source,
+                    "模式": "OFF（需人工复盘后手动恢复）" if switched else "已处于 OFF",
+                },
+                markdown="单笔交易杠杆后亏损达到穿仓级阈值，系统已自动停止开新仓。"
+                         "请立即人工核查仓位、止损与行情，确认后再手动切回 LIVE。",
+                dedup_key=f"roe_halt:{coin}",
+            )
+        except Exception as _ne:
+            logger.warning(f"[risk] roe-halt notify failed for {coin}: {_ne}")
+        try:
+            if event_log is not None:
+                event_log({"event": "roe_halt", "coin": coin,
+                           "realized_pnl_pct": round(roe, 4),
+                           "threshold_pct": threshold, "source": source,
+                           "mode_switched": switched})
+            else:
+                # No injected sink (executor close chokepoint): fall back to
+                # the global session log lazily, so the halt is audited on
+                # every path. session_log.append is best-effort (never raises).
+                from hermes_trader import session_log
+                session_log.append({"event": "roe_halt", "coin": coin,
+                                    "realized_pnl_pct": round(roe, 4),
+                                    "threshold_pct": threshold, "source": source,
+                                    "mode_switched": switched})
+        except Exception as _le:
+            logger.warning(f"[risk] roe-halt event log failed for {coin}: {_le}")
+        return True
+    except Exception as e:
+        logger.error(f"[risk] roe blow-up halt check failed for {coin}: {e}")
+        return False
 
 
 def retry_pending_sl(retry_interval: int = 15) -> None:
