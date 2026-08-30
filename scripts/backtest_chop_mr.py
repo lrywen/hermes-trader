@@ -378,6 +378,14 @@ def _print_report(
     print(f"\n  RSI at entry buckets:")
     rsi_edges = [(0, 15, "<15"), (15, 20, "15-20"),
                  (20, 25, "20-25"), (25, 30, "25-30")]
+    # Entries satisfy rsi_floor <= RSI < rsi_long, so extend the bins in
+    # 5-point steps up to rsi_long when it is relaxed past the default 30 —
+    # otherwise entries above 30 fall into no bucket and vanish from the report.
+    edge = 30.0
+    while edge < args.rsi_long:
+        nxt = min(edge + 5.0, args.rsi_long)
+        rsi_edges.append((edge, nxt, f"{edge:g}-{nxt:g}"))
+        edge = nxt
     for lo, hi, label in rsi_edges:
         lst = [t for t in trades if lo <= t.rsi < hi]
         if not lst:
