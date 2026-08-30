@@ -975,7 +975,7 @@ update daily PnL until the next clean tick. **TODO** in the loop.
 
 ### Risk gate composition philosophy
 
-The 16 gates evaluate in parallel (no short-circuit) and the trade blocks
+The risk gates evaluate in parallel (no short-circuit) and the trade blocks
 if any returns `pass: False`. Two consequences:
 
 1. **You always see all gate results in the execute event's telemetry,
@@ -984,7 +984,7 @@ if any returns `pass: False`. Two consequences:
 2. **Adding a gate is additive.** Composition is a frozenset; you can't
    accidentally weaken safety by adding more gates, only by removing one.
 
-The 16 gates split into three layers conceptually:
+The gates split into three layers conceptually:
 
 - **Position-level** (confidence, opposite_guard, cooldown, debate,
   hta_risk) — about *this* trade in *this* moment, including the

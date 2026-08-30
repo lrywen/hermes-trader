@@ -1,4 +1,4 @@
-"""P0-1: manual /api/hl/place-order now routes through the same 16-gate risk
+"""P0-1: manual /api/hl/place-order now routes through the same risk-gate
 chain that the autonomous executor runs. ``_check_manual_order_gates`` is the
 extracted pure function we test here; the surrounding FastAPI route is
 covered by the dashboard-config integration tests.
@@ -8,7 +8,7 @@ Coverage:
   * max_concurrent 阻断 (position count cap hit)
   * equity_risk 阻断 (total notional vs equity cap)
   * liquidity floor 阻断 (24h volume below floor)
-  * happy path: clean context, all 17 gates pass
+  * happy path: clean context, all gates pass
   * confidence 不阻断 (manual path = operator-vetted, confidence=1.0 baked in)
   * bad input (zero equity, empty positions) 仍能走通评估不抛异常
   * config 读取失败 (磁盘满 / JSON 损坏) 不向上传播异常

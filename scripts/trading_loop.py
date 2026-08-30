@@ -1102,7 +1102,7 @@ while True:
                     # neutral / confidence / composite / trigger:<name> / blocked.
                     _all_gates = result.get("gate_results") or {}
                     mr = _all_gates.get("market_regime") or {}
-                    # Persist a compact pass/fail summary of ALL 16 gates so the
+                    # Persist a compact pass/fail summary of ALL gates so the
                     # event log can reconstruct which gates blocked a trade
                     # (previously only market_regime's 4 fields were saved).
                     _gates_summary = {

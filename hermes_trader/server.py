@@ -342,10 +342,11 @@ def _check_manual_order_gates(
     market_vol_24h: float,
     positions: list,
 ) -> dict[str, Any]:
-    """P0-1: gate manual ``/api/hl/place-order`` calls against the same 16-gate
-    risk chain that ``maybe_execute`` runs. Returns the raw ``eval_all_gates``
-    report dict so the caller can branch on ``report["blocked"]`` and surface
-    ``report["block_reasons"]`` to the operator. The function is pure-ish:
+    """P0-1: gate manual ``/api/hl/place-order`` calls against the same
+    risk-gate chain (``eval_all_gates``) that ``maybe_execute`` runs.
+    Returns the raw ``eval_all_gates`` report dict so the caller can branch
+    on ``report["blocked"]`` and surface ``report["block_reasons"]`` to the
+    operator. The function is pure-ish:
     it only reads ``memory`` / ``read_agent_config`` for context; it never
     places orders. Side effects (audit, alert) live in the caller so the
     bypass path is explicit.
