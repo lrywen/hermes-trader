@@ -5,10 +5,17 @@ on 2026-06-15). This runs at conftest import — before test modules are collect
 hence before memory.py / config_store.py freeze their module-level paths.
 """
 
+import atexit
 import os
+import shutil
 import tempfile
 
 _tmp = tempfile.mkdtemp(prefix="hermes-test-state-")
+# Clean up the throwaway dir at interpreter exit so each pytest session removes
+# its own state instead of leaking a hermes-test-state-* dir in /tmp (253 dirs /
+# 16MB accumulated before this). ignore_errors: cleanup must never mask test
+# results, and stale file handles on some /tmp mounts can make removal fail.
+atexit.register(shutil.rmtree, _tmp, ignore_errors=True)
 # Force (not setdefault): even if the dev shell exports these, tests must use
 # disposable paths.
 os.environ["HERMES_AGENT_MEMORY_FILE"] = os.path.join(_tmp, ".agent-memory.json")
