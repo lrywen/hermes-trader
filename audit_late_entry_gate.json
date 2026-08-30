@@ -1,0 +1,103 @@
+{
+  "audit_ts": "2026-08-30T01:01:58Z",
+  "repo": "/home/ldy/hermes-trader",
+  "branch": "refactor/audit-r11",
+  "head": "d01ec4c",
+  "scope": "下单前 late-entry 否决 / 硬闸门现状审计（证据驱动，10 项）",
+  "items": {
+    "1": {
+      "title": "late-entry 否决是否存在？独立 gate 还是散在 maybe_execute？",
+      "exists": true,
+      "file": "hermes_trader/agents/risk_gates.py",
+      "line": "896-1070 (def ta_late_entry_gate)；注册 risk_gates.py:1186",
+      "evidence": "risk_gates.py:1186 `results[\"ta_late_entry\"] = ta_late_entry_gate(ctx, config)`；函数为独立 gate，注册在 eval_all_gates 的 17 键闸门链末尾（_GATE_KEYS 含 \"ta_late_entry\"，risk_gates.py:1192-1200）。否决语义本身在纯函数 hermes_trader/agents/ta_filter.py:140 `def late_entry_check(candles_4h, candles_15m, side, params)`。maybe_execute 本身不含 late-entry 逻辑，只调用 eval_all_gates（executor.py:2029）。",
+      "conclusion": "存在，且是独立注册闸门（不是散在 maybe_execute）。三层共用同一纯函数 late_entry_check：预筛 ta_filter.analyze_perception（ta_filter.py:388）、硬闸门 ta_late_entry_gate（risk_gates.py:981）、回测 scripts/backtest.py:301。"
+    },
+    "2": {
+      "title": "eval_all_gates / ta_filter / ta_late_entry_gate / maybe_execute 各自职责",
+      "exists": true,
+      "file": "hermes_trader/agents/risk_gates.py, hermes_trader/agents/ta_filter.py, hermes_trader/agents/executor.py",
+      "line": "risk_gates.py:1072 (eval_all_gates), ta_filter.py:140/283 (late_entry_check/analyze_perception), risk_gates.py:896 (ta_late_entry_gate), executor.py:2029 (maybe_execute 调用点)",
+      "evidence": "eval_all_gates：17 个固定闸门顺序执行，任一 pass=False 即 blocked（risk_gates.py:1201-1210 `if not result.get(\"pass\"): blocked=True`）。ta_filter：付费 LLM 辩论前的宽口径省钱预筛，analyze_perception 内调 late_entry_check（ta_filter.py:388，mtf_enabled 强制 False），REJECTED 直接返回不调 LLM。ta_late_entry_gate：下单前用最新行情重算的硬闸门，mode=off/shadow/enforce（risk_gates.py:903-916）。maybe_execute：自主交易执行器，构造 GateContext 后调 eval_all_gates（executor.py:2029-2035），gate_output[\"blocked\"] 为真则不执行。",
+      "conclusion": "四者职责清晰分层：ta_filter=预筛（省钱层，REJECTED 不进 LLM），ta_late_entry_gate=最终否决层（下单前重算），eval_all_gates=17 闸门聚合器，maybe_execute=自主执行入口。"
+    },
+    "3": {
+      "title": "下单前是否用最新行情重算指标？数据源/缓存TTL/周期/价格源",
+      "exists": true,
+      "file": "hermes_trader/agents/risk_gates.py, hermes_trader/client/hl_client.py, hermes_trader/indicators/math.py",
+      "line": "risk_gates.py:931-935 (ThreadPool 并行 fetch)；hl_client.py:72-78 (_SharedCache)、hl_client.py:118 (TTL 配置)、hl_client.py:438-463 (fetch_hl_candles)；math.py:71 (close 价源)",
+      "evidence": "闸门在 order time 即时取数：`fut_c4 = pool.submit(fetch_hl_candles, coin, \"4h\", bars)` 与 15m 并行（risk_gates.py:931-935）。缓存：模块级 `_CANDLE_CACHE = _SharedCache()`（hl_client.py:75），TTL = cfg_get(\"candle_cache_ttl_s\", 90.0)（hl_client.py:118），缓存键 `(coin, interval, count)`（hl_client.py:459-461），且 hl_info/meta TTL 单独 300s。取数为 Hyperliquid candleSnapshot POST，endTime=当前毫秒（hl_client.py:446-448）。周期：4h 100 根 + 15m 100 根（fetch_bars 默认 100，config_store.py:689）。价格源：RSI 用收盘价（math.py:71 `d = candle_val(candles[i], \"c\") - candle_val(candles[i-1], \"c\")`）；扩展度用 close 与 EMA21 之差 / ATR(14)（ta_filter.py:97-105）；ATR 用 high/low/close（math.py:149-151）。",
+      "conclusion": "是，下单前重算。数据源 fetch_hl_candles + 90s 共享缓存（4h 键 (coin,\"4h\",100) 与 ta_filter 预筛逐字一致→热缓存命中；15m 全系统仅闸门抓取→恒冷缓存）。周期 4h+15m，RSI 价格源=close（非 hl2）。注意：快照 endTime=now，最后一根是正在成形的 K（见 item 8 风险）。"
+    },
+    "4": {
+      "title": "RSI 参数与扩展度定义在哪？是否多处实现、口径不一致？",
+      "exists": true,
+      "file": "hermes_trader/agents/ta_filter.py, hermes_trader/indicators/math.py",
+      "line": "ta_filter.py:62-67 (_compute_rsi)、ta_filter.py:89-105 (_extension_atr)；math.py:63-86 (rsi)、math.py:122-160 (atr)、math.py:16-47 (ema)",
+      "evidence": "RSI：`_compute_rsi` 调 `rsi(candles, 14)`（ta_filter.py:65），math.py:63 Wilder 平滑、close 价、period=14。扩展度：`_extension_atr` = (last_close - EMA21(closes,21)[-1]) / ATR(candles,14)[-1]（ta_filter.py:97-105），正=价在 EMA21 上方（追多已晚）。ADX：`_compute_adx` 调 `adx(candles, 14)`（ta_filter.py:70-77）。三处调用方（预筛/闸门/回测）全部 import 同一份 late_entry_check 与同一 indicators.math 函数，无第二套实现。阈值唯一事实源在 config_store.py:668-692 ta_late_entry 块。",
+      "conclusion": "生产闸门链口径单一：RSI=Wilder(14,close)、扩展度=(close-EMA21)/ATR(14)、ADX=14，均在 ta_filter.py + indicators/math.py 一处实现，三处共用。注意：scripts/ 下研究脚本（attribution_adx40_rsi75_90.py、backtest_ab_compare.py、backtest_chop_mr.py）各自有 `_rsi` 本地实现，但不在闸门/回测主链上。"
+    },
+    "5": {
+      "title": "趋势例外/降档是否已实现（trend_relax_enabled？75→82、2.5→3.5xATR）？阈值写哪？",
+      "exists": true,
+      "file": "hermes_trader/agents/ta_filter.py, hermes_trader/agents/config_store.py",
+      "line": "ta_filter.py:207-228 (趋势判定+降档)；config_store.py:675-681 (阈值)",
+      "evidence": "config_store.py:676-681：`\"trend_relax_enabled\": True, \"adx_trend_threshold\": 35, \"rsi_ob_relaxed\": 82, \"rsi_os_relaxed\": 18, \"ext_ob_relaxed\": 3.5, \"ext_os_relaxed\": -3.5`。逻辑 ta_filter.py:207-217：ADX>=35 且 EMA8/21 多头排列→trend_direction=\"up\"；:219-221 LONG 且 trend up 时 rsi_limit 75→82、ext_limit 2.5→3.5（SHORT 对称 25→18、-2.5→-3.5）；:228 `result[\"relaxed_by_trend\"]=True`。语义是降档不归零：超限（RSI>82 或 ext>3.5）仍 block。",
+      "conclusion": "已实现且为降档不归零（不是直接放行）。阈值全部在 CANONICAL_DEFAULTS ta_late_entry 块，env 可覆盖（HERMES_CFG_TA_LATE_ENTRY__<KEY>），无硬编码散落在外。"
+    },
+    "6": {
+      "title": "有没有 strategy_mode / mean_reversion / trend_following 概念？",
+      "exists": false,
+      "file": "全仓库 grep",
+      "line": "未找到",
+      "evidence": "`grep -rn 'strategy_mode|mean_reversion|trend_following|strategy_type' --include=*.py` → No matches found。仅有散落的行为 bool：trend_relax_enabled（趋势例外开关）、mtf_enabled（15m 联动开关）、block_counter_trend_bypass、whale_force_execute 等，无统一策略模式枚举。",
+      "conclusion": "未找到 strategy_mode / mean_reversion / trend_following 任何概念。策略风格自洽性（反转 vs 趋势跟随）目前只靠 trend_relax_enabled 这一个分散 bool 间接表达，无顶层模式开关——将来跑趋势跟随时需手工关超买否决，无统一入口。"
+    },
+    "7": {
+      "title": "AI/手动/MCP/回测四条入口是否走同一 gate？",
+      "exists": true,
+      "file": "hermes_trader/agents/executor.py, hermes_trader/server.py, scripts/hermes-mcp-server.py, scripts/backtest.py",
+      "line": "executor.py:2029 (AI 自主)；server.py:396 (手动 API)；hermes-mcp-server.py:1139 (MCP execute)；backtest.py:301 (回测)",
+      "evidence": "AI 自主：executor.py:2029 `gate_output = eval_all_gates(ctx, config, ...)`。手动/API：server.py:396 `return eval_all_gates(gate_ctx, cfg, trace_id=f\"manual:...\")`，place_order 在 server.py:971-1109 强制执行，bypass_gates=true 需 bypass_reason+审计+告警（server.py:979-985, 1109 事件 place_order_bypass_gates）。MCP：hermes-mcp-server.py:1139 `result = maybe_execute(analysis)` → 复用自主路径同一 eval_all_gates；MCP 平仓工具 hermes-mcp-server.py:1453 `place_hl_order(..., reduce_only=True)` 直连（平仓，不过闸门——符合硬闸只管入场）。回测：backtest.py:53 import late_entry_check、:301 调用同一纯函数。",
+      "conclusion": "四条入场入口收敛到同一否决逻辑：AI/手动/MCP 三入口经 eval_all_gates→ta_late_entry_gate（同一纯函数），回测直接调同一纯函数。平仓路径（MCP reduce_only、dsl_exit）不经过闸门链——硬闸只作用于入场，符合安全边界。手动 API 留有显式审计的 bypass 逃生舱。"
+    },
+    "8": {
+      "title": "回测是否同步？\"最后已收盘那根\"如何定？有无前视偏差？",
+      "exists": true,
+      "file": "scripts/backtest.py",
+      "line": "backtest.py:67-82 (_closed_slice)、backtest.py:295-310 (否决块)",
+      "evidence": "回测 import 同一纯函数（backtest.py:53 `from hermes_trader.agents.ta_filter import late_entry_check`）。闭合 K 选择：`_closed_slice` 用 decision_ms = bar.t + sim_ms（:298，bar i 收盘=i+1 开盘决策），cutoff = decision_ms - tf_ms，bisect_right 取 open_t <= cutoff 的前缀（:80-82），即只用该时点已收盘的高周期 K。否决块 :297-310 按 enforce 语义 block 即 continue。回测主周期可选 5m/15m/1h/4h/1d（_MS_PER :61-64），主周期恰为 4h/15m 时复用 base 序列。",
+      "conclusion": "回测侧严格无未来函数（只用已收盘 K）。但实盘侧 fetch_hl_candles 以 endTime=now 抓快照（hl_client.py:447），最后一根是正在成形的 4h K，闸门直接拿它算 RSI/ADX/ATR——回测不含成形 K、实盘含，二者信息集不一致（backtest.py:75-76 注释自称 'Matches the live gate' 与实际不符）。这是真实的实盘/回测语义漂移点。"
+    },
+    "9": {
+      "title": "gate 决策/拒绝原因/耗时是否入日志？有无 JSON 结构化记录？",
+      "exists": true,
+      "file": "hermes_trader/agents/risk_gates.py, hermes_trader/metrics.py",
+      "line": "risk_gates.py:975-997 (shadow JSONL)、risk_gates.py:1003-1014/1045-1058 (埋点)；metrics.py:208-226",
+      "evidence": "结构化影子日志：shadow 模式每笔写 JSONL（risk_gates.py:992-997），字段 ts/coin/side/mode/would_block/reason/rsi4h/adx4h/extension/rsi15m/relaxed_by_trend/mtf_passed/trend_direction/data_ok/outcome/exit_px/pnl_usd；路径解析 config.shadow_log_path→env HERMES_TA_LATE_ENTRY_SHADOW_FILE→~/.hermes-trading/ta_late_entry_shadow.jsonl（:988-990）。指标：RISK_GATE_DURATION Histogram（gate,outcome 标签，桶 0.001-1.0s，metrics.py:208-215）+ TA_LATE_ENTRY_VERDICTS Counter（mode,side,verdict=pass/would_block/block/data_missing，:221-226）。闸门内部 logger.warning/info 文本日志（:912, :966, :1027, :1051）。block 时 reason 进 eval_all_gates 的 block_reasons（risk_gates.py:1204）。",
+      "conclusion": "有结构化 JSONL + Prometheus 指标 + 文本日志三层。缺口：(a) outcome/exit_px/pnl_usd 字段预留但全仓库无回填脚本（grep 仅见 scripts/reconcile_pullback_shadow.py，无 ta_late_entry 版）→反事实 P&L 当前永远为 null；(b) 无缓存 hit/miss 指标；(c) ta_filter 预筛的 late-entry REJECTED 不写 JSONL、无层标，与闸门拦截混不清。"
+    },
+    "10": {
+      "title": "反证：主动找与预期不符处",
+      "exists": true,
+      "file": "多处",
+      "line": "见 evidence",
+      "evidence": "①以为实盘/回测 100% 对齐→实际不符：实盘快照含正在成形的最后一根 4h K（hl_client.py:447 endTime=now），回测 _closed_slice 严格剔除成形 K（backtest.py:80-82）；系统已有 _drop_forming_bar（perception.py:167-173）但闸门和 ta_filter 预筛都没用。②以为反事实窗口在工作→实际空转：shadow 记录 outcome/pnl_usd 无任何脚本回填（risk_gates.py:984-986 注释 'filled by post-run reconciliation' 但该 reconciliation 不存在）。③以为 15m 缓存复用→实际恒冷：grep fetch_hl_candles 全仓库 15m interval 仅 risk_gates.py:934 一处，预筛只抓 1h/4h/1d（ta_filter.py:305-307），15m 缓存键永不命中，每次下单一发冷 HTTP（容器实测冷启 2294ms 主因）。④以为有策略模式→实际无（item 6）。⑤以为预筛/闸门拒绝可区分→预筛 REJECTED 不落 JSONL 无 layer 标（ta_filter.py:391-399）。⑥mtf_enabled 默认仍是 True（config_store.py:683），15m 越权否决在生产开启。",
+      "conclusion": "6 处与'已完工'预期不符，最关键的是①成形 K 漂移（回测对齐声明不成立）、②反事实回填缺失（影子窗口在空转）、③15m 恒冷抓取（P99 延迟风险 + 越权逻辑仍默认开启）。"
+    }
+  },
+  "risks": [
+    "R1（高，实盘/回测漂移）：实盘闸门含正在成形的 4h K，回测只用已收盘 K；成形 K 的 RSI/扩展度更偏极值，两侧指标值系统性不一致，回测 veto 结论不能外推实盘。修复：闸门/预筛取数后统一 _drop_forming_bar（perception.py:167 已有现成函数）。",
+    "R2（高，影子窗口空转）：shadow JSONL 的 outcome/exit_px/pnl_usd 无回填脚本，切 enforce 后被拦单永无结果可看，反事实 KPI（拦截精度/误杀率）无法计算。需新增 scripts/reconcile_ta_late_entry_shadow.py。",
+    "R3（中，15m 越权+恒冷）：mtf_enabled 默认 True，15m RSI 可否决 4h 拦截结论（小级别覆盖大级别），且 15m 是全系统唯一冷抓取（每次下单一发 HTTP，P99 延迟风险）。建议默认关闭、抓取挂开关后。",
+    "R4（中，两层不可区分）：ta_filter 预筛 late-entry REJECTED 不落 JSONL、无 gate_veto/prefilter_veto 层标，分析时无法判断拦截发生在哪一层。",
+    "R5（低，无策略模式）：无 strategy_mode，趋势例外/超买否决只能靠分散 bool；未来跑趋势跟随策略时超买否决会误杀动量入场，无统一开关。",
+    "R6（低，文档漂移）：server.py:345/894 注释仍称 '16-gate'，实际 17 键（含 ta_late_entry）；backtest.py:75-76 注释自称与实盘一致但成形 K 处理不一致。",
+    "R7（低，无缓存命中率埋点）：RISK_GATE_DURATION 只有延迟 Histogram，无 cache hit/miss 计数，无法证实'温缓存 miss 率趋近 0'。"
+  ],
+  "unexpected": [
+    "backtest.py:75-76 docstring 明确写 'Matches the live gate, which at order time sees only completed candles'——该声明与 hl_client 实际返回成形 K 的行为矛盾，属代码注释层面的错误断言。",
+    "MCP 平仓工具（hermes-mcp-server.py:1453）直连 place_hl_order(reduce_only=True) 不过闸门——这是符合'硬闸只管入场'预期的正确设计，但与'MCP 全走 gate'的朴素预期不同，需明确这是有意为之。",
+    "scripts/ 下 3 个研究/回测脚本各自实现 _rsi（attribution_adx40_rsi75_90.py、backtest_ab_compare.py、backtest_chop_mr.py），虽不在主链，但口径漂移的潜在来源。"
+  ]
+}

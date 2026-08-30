@@ -137,6 +137,31 @@ def _check_ema_cross_recent(candles: list[Candle]) -> bool:
     return False
 
 
+def forming_readings_4h(candles: Optional[list[Candle]]) -> dict[str, Any]:
+    """Readings of the still-forming 4h bar for SHADOW LOGGING ONLY.
+
+    Phase 0 (deep audit R1, 2026-08-30): the decision functions score the last
+    CLOSED bar (the live snapshot ends on the forming bar, the backtest never
+    sees it). The forming bar's RSI/extension are reported here so the shadow
+    log can quantify what the closed-bar rule misses, but they never feed a
+    verdict. Returns the forming readings and whether a forming bar was present.
+    """
+    out: dict[str, Any] = {
+        "forming_rsi4h": None,
+        "forming_extension": None,
+        "forming_bar_dropped": False,
+    }
+    if not candles:
+        return out
+    from hermes_trader.agents.perception import _drop_forming_bar
+    _, dropped = _drop_forming_bar(candles, "4h")
+    out["forming_bar_dropped"] = bool(dropped)
+    if dropped:
+        out["forming_rsi4h"] = _compute_rsi(candles)
+        out["forming_extension"] = _extension_atr(candles)
+    return out
+
+
 def late_entry_check(
     candles_4h: Optional[list[Candle]],
     candles_15m: Optional[list[Candle]],
@@ -377,17 +402,65 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
         # ta_filter 高危项, 2026-08-30): the SAME late_entry_check runs as the
         # pre-trade ta_late_entry_gate and in the backtest engine, so the
         # screen / live gate / backtest can never drift apart. The screen
-        # fetches no 15m candles, so the MTF continuation override is marked
-        # "not applicable" here; the gate re-checks at order time with 15m.
+        # fetches no 15m candles, so the MTF continuation override is "not
+        # applicable" here (Phase 0: the gate also defaults mtf_enabled=False,
+        # so neither layer fetches 15m unless a trader opts back in).
         # Copy: cfg_get may return the live/canonical config dict itself —
         # mutating it would permanently flip mtf_enabled in the shared config.
         le_params = dict(_late_entry_params())
         le_params["mtf_enabled"] = False
         le_side = "long" if intend_long else "short" if intend_short else None
         if le_side is not None:
-            le = late_entry_check(c4h, None, le_side, le_params)
+            # Phase 0 (audit R1): score the last CLOSED 4h bar only — the gate
+            # and backtest do the same. Scoring the still-forming bar made the
+            # screen veto a different rule than the gate; its readings are
+            # shadow-logged via forming_readings_4h but never decide.
+            forming = forming_readings_4h(c4h)
+            from hermes_trader.agents.perception import _drop_forming_bar
+            c4h_closed, _ = _drop_forming_bar(c4h, "4h")
+            le = late_entry_check(c4h_closed, None, le_side, le_params)
             if le.get("block"):
                 logger.info(f"[ta_filter] {coin} -> REJECTED ({le['reason']})")
+                # P0-4 (audit R4): prefilter vetoes land in the SAME shadow
+                # JSONL as the order-time gate, tagged layer="prefilter", so
+                # reconciliation scores both layers from one file.
+                try:
+                    from datetime import datetime, timezone
+                    from hermes_trader.agents.risk_gates import (
+                        _record_late_entry_shadow, late_entry_shadow_path,
+                    )
+                    rec = {
+                        "timestamp": datetime.now(timezone.utc).strftime(
+                            "%Y-%m-%dT%H:%M:%SZ"),
+                        "coin": coin,
+                        "side": le_side,
+                        "mode": str(le_params.get("mode", "shadow") or "shadow"),
+                        "layer": "prefilter",
+                        "blocked": True,
+                        "reason": le.get("reason", ""),
+                        "rsi4h": le.get("rsi4h"),
+                        "adx4h": le.get("adx4h"),
+                        "extension": le.get("extension"),
+                        "rsi15m": None,
+                        "relaxed_by_trend": le.get("relaxed_by_trend"),
+                        "mtf_passed": None,
+                        "trend_direction": le.get("trend_direction"),
+                        "forming_rsi4h": forming.get("forming_rsi4h"),
+                        "forming_extension": forming.get("forming_extension"),
+                        "forming_bar_dropped": forming.get("forming_bar_dropped"),
+                        "entry_px": None,
+                        "trade_notional_usd": None,
+                        "confidence": perception.get("composite_score"),
+                        "outcome": None,
+                        "exit_px": None,
+                        "pnl_usd": None,
+                    }
+                    _record_late_entry_shadow(rec, late_entry_shadow_path(le_params))
+                except Exception:  # noqa: BLE001 — shadow logging must never break the screen
+                    logger.debug(
+                        f"[ta_filter] {coin} late-entry shadow write failed",
+                        exc_info=True,
+                    )
                 return {
                     "signal": "REJECTED", "score": 0,
                     "trend1h": t1h, "trend4h": t4h, "trend1d": t1d,
@@ -396,6 +469,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                     "ema_cross": ema_cross, "volume_confirm": volume_confirm,
                     "extension_atr": extension,
                     "reason": le["reason"],
+                    "veto_layer": "prefilter",
                 }
 
         # Directional alignment scoring (our edge is LONG/trend-aligned):

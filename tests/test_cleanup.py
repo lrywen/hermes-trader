@@ -3716,7 +3716,10 @@ def test_ta_late_entry_canonical_config_present():
     assert block["mode"] == "shadow"  # gray release by default
     assert block["rsi_ob"] == 75 and block["rsi_os"] == 25
     assert block["adx_trend_threshold"] == 35
-    assert block["mtf_enabled"] is True and block["trend_relax_enabled"] is True
+    # Phase 0 (audit R3): the 15m continuation override DEFAULTED OFF — its
+    # fetch is the only cold candle HTTP in the gate path and it inverts the
+    # gate's HTF-tail-filter semantics. Opt back in per-trader via env.
+    assert block["mtf_enabled"] is False and block["trend_relax_enabled"] is True
 
 
 def test_ta_late_entry_schema_rejects_bad_values():
@@ -3726,6 +3729,136 @@ def test_ta_late_entry_schema_rejects_bad_values():
     assert any("rsi_ob" in e for e in errs)
     ok = validate_config_updates({"ta_late_entry": {"mode": "enforce", "rsi_ob": 70}})
     assert ok == []
+
+
+# ── Phase 0 (deep audit R1/R3/R4/R7): mtf default-off, forming bar, layers ──
+
+def _ms_trend_4h(n, start=100.0, step=0.6, forming=False):
+    """Trend candles on a REAL 4h-ms time axis ending at the current bucket.
+
+    ``forming=True`` appends one extra bar at the CURRENT (still-open) 4h
+    bucket, which _drop_forming_bar must remove. With ``forming=False`` the
+    last bar is the most recently CLOSED bucket.
+    """
+    import time as _time
+    BAR = 4 * 3600_000
+    cur_bucket = int(_time.time() * 1000) // BAR * BAR
+    n_total = n + (1 if forming else 0)
+    # Last bar sits ON the open bucket (forming) or on the most recently
+    # CLOSED bucket (cur_bucket - BAR); anything at cur_bucket is still
+    # forming and _drop_forming_bar removes it.
+    last_t = cur_bucket if forming else cur_bucket - BAR
+    out = []
+    for i in range(n_total):
+        t = last_t - (n_total - 1 - i) * BAR
+        c = start + i * step
+        out.append(_mk_candle(t, c, c + 0.8, c - 0.2, c, 1000.0 + i))
+    return out
+
+
+def test_ta_late_entry_gate_mtf_disabled_fetches_no_15m(monkeypatch, tmp_path):
+    """Phase 0 (R3): with mtf_enabled absent/False the gate fetches ONLY 4h —
+    the 15m cache key is never warmed by anything, so every 15m call was a
+    cold weight-20 HTTP."""
+    import hermes_trader.client.hl_client as hl
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    calls = []
+
+    def fake(coin, interval, count, *a, **k):
+        calls.append(interval)
+        return _trend_candles(100, start=100.0, step=0.6)
+
+    monkeypatch.setattr(hl, "fetch_hl_candles", fake)
+    monkeypatch.setattr(tf, "fetch_hl_candles", fake)
+    # Explicitly mtf_enabled=False (mirrors the canonical default).
+    cfg = _le_config(mode="shadow", mtf_enabled=False,
+                     shadow_log_path=str(tmp_path / "le.jsonl"))
+    r = ta_late_entry_gate(_ctx(trade_side="long"), cfg)
+    assert r["pass"] is True
+    assert "15m" not in calls and calls.count("4h") == 1, calls
+
+
+def test_ta_late_entry_gate_mtf_enabled_still_fetches_15m(monkeypatch, tmp_path):
+    """Opt-in mtf_enabled=True restores the parallel 4h+15m fetch path."""
+    import hermes_trader.client.hl_client as hl
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    calls = []
+
+    def fake(coin, interval, count, *a, **k):
+        calls.append(interval)
+        return _trend_candles(100, start=100.0, step=0.6)
+
+    monkeypatch.setattr(hl, "fetch_hl_candles", fake)
+    monkeypatch.setattr(tf, "fetch_hl_candles", fake)
+    cfg = _le_config(mode="shadow", mtf_enabled=True,
+                     shadow_log_path=str(tmp_path / "le.jsonl"))
+    ta_late_entry_gate(_ctx(trade_side="long"), cfg)
+    assert "15m" in calls and "4h" in calls, calls
+
+
+def test_forming_readings_4h_detects_dropped_bar():
+    """Phase 0 (R1): a snapshot ending on the open 4h bucket reports the
+    forming bar + readings; a snapshot ending on a closed bucket does not."""
+    from hermes_trader.agents.ta_filter import forming_readings_4h
+    open_snap = _ms_trend_4h(99, forming=True)
+    rd = forming_readings_4h(open_snap)
+    assert rd["forming_bar_dropped"] is True
+    assert rd["forming_rsi4h"] is not None and rd["forming_extension"] is not None
+    closed_snap = _ms_trend_4h(100, forming=False)
+    rc = forming_readings_4h(closed_snap)
+    assert rc["forming_bar_dropped"] is False
+    assert rc["forming_rsi4h"] is None and rc["forming_extension"] is None
+    assert forming_readings_4h([])["forming_bar_dropped"] is False
+
+
+def test_ta_late_entry_gate_shadow_records_forming_and_layer(monkeypatch, tmp_path):
+    """Gate JSONL rows carry layer="gate" and the forming-bar shadow fields;
+    the verdict itself scores the closed series (forming bar dropped)."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    snap = _ms_trend_4h(99, forming=True)
+    _patch_candles(monkeypatch, snap, snap)
+    log = tmp_path / "le_shadow.jsonl"
+    r = ta_late_entry_gate(
+        _ctx(trade_side="long", coin="TEST", entry_px=105.0),
+        _le_config(mode="shadow", mtf_enabled=False, shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_shadow"
+    rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    rec = rows[0]
+    assert rec["layer"] == "gate" and rec["blocked"] is True
+    assert rec["forming_bar_dropped"] is True
+    assert rec["forming_rsi4h"] is not None
+    assert rec["entry_px"] is not None and rec["trade_notional_usd"] is not None
+
+
+def test_ta_late_entry_prefilter_writes_same_jsonl_with_layer(monkeypatch, tmp_path):
+    """Phase 0 (R4): a prefilter veto writes the SAME shadow JSONL as the
+    gate, tagged layer="prefilter", and the REJECTED body carries
+    veto_layer="prefilter" — gate vs prefilter vetoes must be distinguishable."""
+    from hermes_trader.agents import ta_filter
+    monkeypatch.setenv("HERMES_TA_LATE_ENTRY_SHADOW_FILE",
+                       str(tmp_path / "le_shadow.jsonl"))
+    bull = _trend_candles(100, start=100.0, step=0.6)
+    flat = _flat_candles(100)
+    monkeypatch.setattr(ta_filter, "fetch_hl_candles",
+                        lambda *a, **k: bull if a[1] in ("1h", "4h") else flat)
+    perception = {
+        "coin": "TEST", "composite_score": 80,
+        "triggers": [{"name": "breakout", "fired": True, "score": 8},
+                     {"name": "momentumBurst", "fired": True, "score": 9}],
+    }
+    res = ta_filter.analyze_perception(perception)
+    assert res["signal"] == "REJECTED"
+    assert res.get("veto_layer") == "prefilter"
+    log = tmp_path / "le_shadow.jsonl"
+    rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert len(rows) == 1
+    rec = rows[0]
+    assert rec["layer"] == "prefilter" and rec["blocked"] is True
+    assert rec["entry_px"] is None and rec["trade_notional_usd"] is None
+    assert rec["rsi15m"] is None and rec["mtf_passed"] is None
 
 
 # ── backtest parity: same pure function, closed-bar information set ─────────
@@ -3803,6 +3936,195 @@ def test_backtest_simulate_enforces_late_entry_veto():
     assert len(trades_gated) <= len(trades_plain)
     assert all(v["reason"].startswith("late ") for v in vetoes)
     assert all(v["coin"] == "TEST" and v["side"] == "long" for v in vetoes)
+
+
+# ── Phase 0 (R7): candle cache hit/miss Prometheus counter ─────────────────
+
+def test_candle_cache_lookup_counter_miss_then_hit(monkeypatch):
+    """fetch_hl_candles increments hermes_candle_cache_lookups_total per
+    outcome: first call = miss (cold), second call within TTL = hit."""
+    import hermes_trader.client.hl_client as hl
+    from hermes_trader import metrics
+
+    class _FakeCache:
+        def __init__(self):
+            self.store = {}
+
+        def get(self, k):
+            return self.store.get(k)
+
+        def set(self, k, v, ttl=None):
+            self.store[k] = v
+
+    fake_cache = _FakeCache()
+    monkeypatch.setattr(hl, "_CANDLE_CACHE", fake_cache)
+    # No concurrent coalescing in this single-threaded test.
+    monkeypatch.setattr(hl, "_inflight", {})
+    monkeypatch.setattr(hl, "_inflight_results", {})
+    candles = _flat_candles(30)
+
+    def fake_raw(coin, interval, count, cache_key=None, opportunistic=False):
+        # The real raw() writes the cache on success (hl_client.py ~L546).
+        fake_cache.set(cache_key, candles)
+        return candles
+
+    monkeypatch.setattr(hl, "_fetch_hl_candles_raw", fake_raw)
+
+    def val(result):
+        return (metrics.CANDLE_CACHE_LOOKUPS
+                .labels(interval="4h", result=result)._value.get())
+
+    miss0, hit0 = val("miss"), val("hit")
+    hl.fetch_hl_candles("ZZZ", "4h", 30)   # cold → miss
+    assert val("miss") == miss0 + 1 and val("hit") == hit0
+    hl.fetch_hl_candles("ZZZ", "4h", 30)   # cached → hit
+    assert val("miss") == miss0 + 1 and val("hit") == hit0 + 1
+
+
+# ── Phase 0 (R2): reconcile_ta_late_entry_shadow counterfactual backfill ────
+
+def _load_reconcile_module():
+    import importlib.util
+    import sys as _sys
+    if "reconcile_le_under_test" not in _sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "reconcile_le_under_test",
+            str(pathlib.Path(__file__).resolve().parents[1]
+                / "scripts" / "reconcile_ta_late_entry_shadow.py"))
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["reconcile_le_under_test"] = mod
+        spec.loader.exec_module(mod)
+    return _sys.modules["reconcile_le_under_test"]
+
+
+def _recon_candles(prices, bar_ms=4 * 3600_000, t0=0):
+    return [_mk_candle(t0 + i * bar_ms, p, p + 0.1, p - 0.1, p, 1000.0)
+            for i, p in enumerate(prices)]
+
+
+def test_reconcile_score_hold_semantics():
+    """hold_bars=2 exits at B1.close (2nd bar to close after the signal,
+    ~8h); scores are side-aware, fee-netted, and MAE tracks adverse closes."""
+    rc = _load_reconcile_module()
+    # Signal fires while B0 (index 4) is forming; B1 is index 5.
+    prices = [100, 101, 102, 103, 104, 105, 106, 107]
+    cs = _recon_candles(prices)
+    fee = rc.ROUND_TRIP_FEE_BPS / 10000.0
+    exit_px, outcome, mae = rc._score("long", entry_px=104.0, b1_idx=5,
+                                      candles=cs, hold_bars=2, fee_pct=fee)
+    # hold_bars=2 -> exit_idx = 5 - 2 + 2 = 5 -> B1.close = 105
+    assert exit_px == 105.0
+    assert outcome == "win"  # +0.96% gross beats 0.05% fees
+    # MAE: closes from B0 (104) to exit (105): 104 is flat, no adverse close.
+    assert mae == 0.0
+    # hold_bars=3 -> exit_idx=6 -> B2.close = 106.
+    exit3, _, _ = rc._score("long", 104.0, 5, cs, 3, fee)
+    assert exit3 == 106.0
+    # Short: price rises against the position → loss + negative MAE.
+    exit_s, outcome_s, mae_s = rc._score("short", entry_px=104.0, b1_idx=5,
+                                         candles=cs, hold_bars=2, fee_pct=fee)
+    assert exit_s == 105.0 and outcome_s == "loss"
+    assert mae_s < 0.0  # adverse excursion for a short as price climbs
+
+
+def test_reconcile_score_mae_tracks_adverse_dip():
+    """An adverse dip between entry and exit is captured as negative MAE."""
+    rc = _load_reconcile_module()
+    # B0=104 (entry), then a dip to 101 on B1, recovery to 108 on B2.
+    prices = [100, 100, 100, 100, 104, 101, 108, 109]
+    cs = _recon_candles(prices)
+    fee = rc.ROUND_TRIP_FEE_BPS / 10000.0
+    _, _, mae = rc._score("long", entry_px=104.0, b1_idx=5,
+                          candles=cs, hold_bars=3, fee_pct=fee)
+    # worst close = 101 at B1: (101-104)/104 = -2.88%
+    assert mae < -2.8
+
+
+def test_reconcile_main_dry_run_scores_mature_vetoes(monkeypatch, tmp_path, capsys):
+    """main(): mature blocked rows (both layers) get counterfactual outcomes
+    in dry-run (no writeback); immature/non-blocked rows are skipped. Dry-run
+    works on freshly-deserialized dicts, so scoring is asserted via the
+    stdout summary, not the test's in-memory objects."""
+    rc = _load_reconcile_module()
+    from datetime import datetime, timezone, timedelta
+    log = tmp_path / "shadow.jsonl"
+    old = (datetime.now(timezone.utc) - timedelta(hours=20)
+           ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    recent = (datetime.now(timezone.utc) - timedelta(hours=1)
+              ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [
+        {"timestamp": old, "coin": "AAA", "side": "long", "blocked": True,
+         "layer": "gate", "entry_px": 104.0, "trade_notional_usd": 100.0},
+        {"timestamp": old, "coin": "AAA", "side": "long", "blocked": True,
+         "layer": "prefilter"},  # no entry_px → B0.close fallback
+        {"timestamp": recent, "coin": "AAA", "side": "long", "blocked": True,
+         "layer": "gate", "entry_px": 104.0},  # too young → skipped
+        {"timestamp": old, "coin": "AAA", "side": "long", "blocked": False,
+         "layer": "gate"},  # not a veto → skipped
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    # Signal lands while the 4th bar (index 4, open=T0+16h) is forming;
+    # candle at index 5 opens ~20h, after the 20h-old signal... build prices
+    # so B0.close=104, B1.close=105.
+    after_ts = datetime.fromisoformat(old.replace("Z", "+00:00"))
+    sig_ms = int(after_ts.timestamp() * 1000)
+    BAR = 4 * 3600_000
+    bucket = sig_ms // BAR * BAR
+    prices = [100, 101, 102, 103, 104, 105, 106, 107]
+    candles = [_mk_candle(bucket - 4 * BAR + i * BAR, p, p + 0.1, p - 0.1, p, 1000.0)
+               for i, p in enumerate(prices)]
+    monkeypatch.setattr(rc, "fetch_hl_candles",
+                        lambda coin, interval, count: candles)
+    monkeypatch.setattr(sys, "argv",
+                        ["reconcile", "--file", str(log), "--window-hours", "8"])
+    assert rc.main() == 0
+    reread = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    # Dry-run: file untouched → outcomes still None (only 2 of 4 rows mature).
+    assert all(r.get("outcome") is None for r in reread)
+    # Scoring is visible in the stdout summary: 2 mature vetoes (gate +
+    # prefilter), hold_bars=2 exits at B1.close=105; the 1h-old veto and the
+    # blocked:False row are excluded.
+    out = capsys.readouterr().out
+    assert "mature (>= 8h): 2" in out
+    assert "2 mature vetoes (2x4h hold)" in out
+    assert "layer=gate" in out and "layer=prefilter" in out
+    assert "exit=105.0000" in out
+    assert "dry-run" in out
+
+
+def test_reconcile_main_write_persists_outcomes(monkeypatch, tmp_path):
+    """--write flips outcome/exit_px/pnl_pct back into the JSONL; a veto
+    younger than the maturity window is left pending."""
+    rc = _load_reconcile_module()
+    from datetime import datetime, timezone, timedelta
+    log = tmp_path / "shadow.jsonl"
+    old = (datetime.now(timezone.utc) - timedelta(hours=20)
+           ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    young = (datetime.now(timezone.utc) - timedelta(minutes=30)
+             ).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rows = [
+        {"timestamp": old, "coin": "BBB", "side": "long", "blocked": True,
+         "layer": "gate", "entry_px": 104.0},
+        {"timestamp": young, "coin": "BBB", "side": "long", "blocked": True,
+         "layer": "gate", "entry_px": 104.0},
+    ]
+    log.write_text("\n".join(json.dumps(r) for r in rows) + "\n")
+    after_ts = datetime.fromisoformat(old.replace("Z", "+00:00"))
+    sig_ms = int(after_ts.timestamp() * 1000)
+    BAR = 4 * 3600_000
+    bucket = sig_ms // BAR * BAR
+    prices = [100, 101, 102, 103, 104, 105, 106, 107]
+    candles = [_mk_candle(bucket - 4 * BAR + i * BAR, p, p + 0.1, p - 0.1, p, 1000.0)
+               for i, p in enumerate(prices)]
+    monkeypatch.setattr(rc, "fetch_hl_candles",
+                        lambda coin, interval, count: candles)
+    monkeypatch.setattr(sys, "argv",
+                        ["reconcile", "--file", str(log), "--write"])
+    assert rc.main() == 0
+    out = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
+    assert out[0]["outcome"] in ("win", "loss")
+    assert out[0]["exit_px"] == 105.0 and out[0]["hold_bars"] == 2
+    assert out[1].get("outcome") is None  # immature record untouched
 
 
 # ── executor runner-gate RSI / extension veto (P0) ──────────────────────────

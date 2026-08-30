@@ -224,6 +224,17 @@ TA_LATE_ENTRY_VERDICTS = Counter(
     "verdict (pass/would_block/block/data_missing).",
     ["mode", "side", "verdict"],
 )
+# Candle cache outcome for fetch_hl_candles (deep audit ta_late_entry R7 /
+# Phase 0, 2026-08-30). result ∈ hit (served from TTL cache), coalesced
+# (another thread's in-flight fetch was awaited), miss (this call issued the
+# HTTP). Cache-miss rate per interval quantifies how often the gate/screen
+# actually pay a cold weight-20 candleSnapshot call vs reuse the 90s cache.
+CANDLE_CACHE_LOOKUPS = Counter(
+    "hermes_candle_cache_lookups_total",
+    "fetch_hl_candles outcomes, labelled by candle interval and result "
+    "(hit/coalesced/miss). Miss rate exposes cold-HTTP frequency per timeframe.",
+    ["interval", "result"],
+)
 
 # ── Trade-side tiered circuit breakers (executor.py / memory.py) ───────
 TRADE_CIRCUIT_TRIPS = Counter(

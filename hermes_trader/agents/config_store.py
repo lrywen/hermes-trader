@@ -680,7 +680,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "ext_ob_relaxed": 3.5,
         "ext_os_relaxed": -3.5,
         # --- multi-timeframe: 15m RSI continuation override ---
-        "mtf_enabled": True,
+        # Phase 0 (deep audit R3, 2026-08-30): DEFAULT OFF. The 15m fetch is
+        # the only cold candle HTTP in the gate path (the screen never warms
+        # that key), and a small frame "veto of the veto" inverts the gate's
+        # HTF-tail-filter semantics. Opt back in per-trader via env once
+        # shadow evidence supports it.
+        "mtf_enabled": False,
         "rsi15m_ob": 72,
         "rsi15m_os": 28,
         # --- data requirements / fetch sizing ---

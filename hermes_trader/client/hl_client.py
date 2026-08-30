@@ -366,6 +366,20 @@ _inflight_results: dict[str, Any] = {}
 _inflight_lock = threading.Lock()
 
 
+def _candle_cache_metric(interval: str, result: str) -> None:
+    """Best-effort Prometheus counter for candle cache outcomes (hit/coalesced/miss).
+
+    Phase 0 (deep audit R7): miss-rate per interval exposes how often the
+    gate/screen pay a cold weight-20 HTTP call instead of reusing the 90s
+    cache. Never raises — metrics must not touch the trading path.
+    """
+    try:
+        from hermes_trader import metrics
+        metrics.CANDLE_CACHE_LOOKUPS.labels(interval=interval, result=result).inc()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fetch_hl_candles(
     coin: str,
     interval: str = "5m",
@@ -384,6 +398,7 @@ def fetch_hl_candles(
         hit = _CANDLE_CACHE.get(cache_key)
         if hit is not None:
             logger.debug(f"[candles] {coin} {interval}: cache HIT ({len(hit)} bars)")
+            _candle_cache_metric(interval, "hit")
             return hit
 
     # Coalesce concurrent requests for the same key: if another thread is
@@ -407,6 +422,7 @@ def fetch_hl_candles(
                 f"[candles] {coin} {interval}: coalesced "
                 f"(waited {time.monotonic()-_wait_t0:.2f}s)"
             )
+            _candle_cache_metric(interval, "coalesced")
             return result
         # If the leader failed/timed out, fall through and fetch ourselves.
         logger.debug(f"[candles] {coin} {interval}: coalesce leader failed, fetching directly")
@@ -432,6 +448,7 @@ def fetch_hl_candles(
         logger.info(
             f"[candles] {coin} {interval}: fetch {len(candles)} bars in {_elapsed:.2f}s"
         )
+    _candle_cache_metric(interval, "miss")
     return candles
 
 

@@ -879,6 +879,19 @@ def debate_gate(
 # Fail-OPEN: any fetch / data / compute failure (or too little 4h data)
 # passes the order — a risk gate must not stall the exchange path — and is
 # surfaced via the data_missing verdict label.
+def late_entry_shadow_path(le_cfg: dict[str, Any]) -> str:
+    """Resolve the ta_late_entry shadow JSONL path (config → env → default).
+
+    Shared by the gate and the pre-filter screen so BOTH layers write the same
+    file and are indistinguishable to downstream reconciliation apart from the
+    record's ``layer`` field.
+    """
+    return str(le_cfg.get("shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_TA_LATE_ENTRY_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/ta_late_entry_shadow.jsonl"),
+    )
+
+
 def _record_late_entry_shadow(rec: dict[str, Any], path: str) -> None:
     """Best-effort append a late-entry shadow verdict to the audit JSONL."""
     import json
@@ -925,14 +938,35 @@ def ta_late_entry_gate(
 
     try:
         from concurrent.futures import ThreadPoolExecutor
-        from hermes_trader.agents.ta_filter import late_entry_check
+        from hermes_trader.agents.ta_filter import (
+            late_entry_check, forming_readings_4h,
+        )
+        from hermes_trader.agents.perception import _drop_forming_bar
         from hermes_trader.client.hl_client import fetch_hl_candles
         n = int(le_cfg.get("fetch_bars", 100) or 100)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            f4 = pool.submit(fetch_hl_candles, ctx.coin, "4h", n)
-            f15 = pool.submit(fetch_hl_candles, ctx.coin, "15m", n)
-            candles_4h = f4.result()
-            candles_15m = f15.result()
+        mtf_enabled = bool(le_cfg.get("mtf_enabled", False))
+        # Phase 0 (audit R3): 15m is fetched ONLY when MTF is enabled — the
+        # screen never warms that cache key, so the gate's 15m call was a cold
+        # weight-20 HTTP on every order. With mtf disabled the gate now does a
+        # single (usually cache-hot) 4h fetch.
+        if mtf_enabled:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f4 = pool.submit(fetch_hl_candles, ctx.coin, "4h", n)
+                f15 = pool.submit(fetch_hl_candles, ctx.coin, "15m", n)
+                candles_4h = f4.result()
+                candles_15m = f15.result()
+        else:
+            candles_4h = fetch_hl_candles(ctx.coin, "4h", n)
+            candles_15m = None
+        # Phase 0 (audit R1): score the last CLOSED bar only. fetch_hl_candles'
+        # snapshot ends on the still-forming bar; the backtest engine only ever
+        # sees closed bars, so scoring the forming bar made live diverge from
+        # backtest. The forming bar's readings are logged for shadow analysis
+        # but never participate in the verdict.
+        forming = forming_readings_4h(candles_4h)
+        candles_4h, _ = _drop_forming_bar(candles_4h, "4h")
+        if candles_15m is not None:
+            candles_15m, _ = _drop_forming_bar(candles_15m, "15m")
         verdict = late_entry_check(candles_4h, candles_15m, side, le_cfg)
     except Exception as e:  # noqa: BLE001 — fail OPEN, never stall orders
         logger.warning(
@@ -970,6 +1004,9 @@ def ta_late_entry_gate(
         "coin": ctx.coin,
         "side": side,
         "mode": mode,
+        # P0-4: distinguish the two decision layers writing this JSONL.
+        # "gate" = order-time hard gate; "prefilter" = pre-AI ta_filter veto.
+        "layer": "gate",
         "blocked": blocked,
         "reason": verdict.get("reason", ""),
         "rsi4h": verdict.get("rsi4h"),
@@ -979,16 +1016,20 @@ def ta_late_entry_gate(
         "relaxed_by_trend": verdict.get("relaxed_by_trend"),
         "mtf_passed": verdict.get("mtf_passed"),
         "trend_direction": verdict.get("trend_direction"),
+        # P0-2 (audit R1): readings of the still-forming 4h bar that was
+        # DROPPED before scoring. Observability only — the verdict uses the
+        # last closed bar, matching the backtest engine.
+        "forming_rsi4h": forming.get("forming_rsi4h"),
+        "forming_extension": forming.get("forming_extension"),
+        "forming_bar_dropped": forming.get("forming_bar_dropped"),
         "entry_px": ctx.entry_px or None,
+        "trade_notional_usd": ctx.trade_notional_usd or None,
         "confidence": ctx.confidence,
         "outcome": None,  # filled by post-run reconciliation
         "exit_px": None,
         "pnl_usd": None,
     }
-    path = str(le_cfg.get("shadow_log_path") or "").strip() or os.environ.get(
-        "HERMES_TA_LATE_ENTRY_SHADOW_FILE",
-        os.path.expanduser("~/.hermes-trading/ta_late_entry_shadow.jsonl"),
-    )
+    path = late_entry_shadow_path(le_cfg)
     _record_late_entry_shadow(rec, path)
 
     if not blocked:
