@@ -45,7 +45,7 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
 
-from hermes_trader.agents.perception import scan_once
+from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.research import research
 from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl, maybe_roe_blowup_halt
@@ -559,6 +559,14 @@ _last_research_by_coin: dict = {}
 # by RESEARCH_THROTTLE alone, including movers that ran +20%+ after the skip.
 # Waiting out a fixed window on a score that jumped is the expensive failure.
 _last_research_score_by_coin: dict = {}
+# O-2 content-level signal dedup: fingerprints (coin, closed-bar, fired
+# triggers) of setups we already paid AI research on THIS run. The time-based
+# research throttle is keyed on wall-clock and re-pays the LLM once its window
+# lapses even while the SAME closed bar keeps re-surfacing; this set keys on
+# the actual bar identity, so a given setup is researched at most once.
+# Held coins are exempt (their AI close-check must not be suppressed). Entries
+# keyed on a new bar_close_ms naturally fall out of scope; the set stays small.
+_researched_signal_fps: set = set()
 
 
 while True:
@@ -1175,6 +1183,24 @@ while True:
                 _cycle_outcomes.append((coin, "skip", False, f"TA {ta['signal']}"))
                 continue
             gate = 'CONFIRMED' if ta['signal'] == 'CONFIRMED' else f"{ta['signal']}+burst"
+            # O-2 content-level dedup: TA passed on a setup (coin + closed bar
+            # + fired triggers) we already paid AI research for this run →
+            # skip the paid LLM re-call. The time throttle re-pays once its
+            # window lapses even while the SAME closed bar keeps re-surfacing;
+            # this keys on the bar identity itself. Held coins are exempt (the
+            # AI close-check must not be suppressed). A None fingerprint (older
+            # payload without bar_close_ms) leaves the gate inert.
+            if coin not in held_coins:
+                _sig_fp = signal_fingerprint(perception)
+                if _sig_fp is not None and _sig_fp in _researched_signal_fps:
+                    logger.info(f"{coin}: same setup (bar_close {perception.get('bar_close_ms')}, "
+                                f"same triggers) already researched — content dedup skip")
+                    log_event({"event": "ta_skip", "coin": coin,
+                               "signal": "SIGNAL_DEDUP",
+                               "score": round(float(score), 1),
+                               "trigger_score": round(float(score), 1)})
+                    _cycle_outcomes.append((coin, "skip", False, "signal content dedup"))
+                    continue
             logger.info(f"Researching {coin} (trigger {score:.1f}, TA {gate})...")
             # Per-coin heartbeat: a 3-trigger cycle with slow HTA research can
             # take several minutes (observed 77s on a single GOOGL call). A
@@ -1187,6 +1213,12 @@ while True:
             # Snapshot the score this verdict was formed on, so the throttle
             # above can detect a material re-score during the window.
             _last_research_score_by_coin[coin] = float(score)
+            # O-2: mark this exact setup (coin + closed bar + fired triggers)
+            # as researched so a re-surfacing of the same closed bar skips the
+            # paid LLM call. None (legacy payload) simply leaves dedup inert.
+            _sig_fp = signal_fingerprint(perception)
+            if _sig_fp is not None:
+                _researched_signal_fps.add(_sig_fp)
 
             try:
                 # Pass the cycle-level account state snapshot so research()

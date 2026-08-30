@@ -84,6 +84,30 @@ def extract_fired_triggers(perception: Optional[dict[str, Any]]) -> list[str]:
     return list(seen.keys())
 
 
+def signal_fingerprint(perception: dict[str, Any] | None) -> tuple | None:
+    """O-2: content-level identity of the signal a perception represents.
+
+    Returns ``(coin, bar_close_ms, fired_triggers)`` — the closed bar the
+    triggers were scored on plus the exact set of triggers that fired on it.
+    Two perceptions produced from the SAME closed bar with the SAME fired
+    triggers are the same setup even if they were scanned on different cycles
+    and got different random perception ids; the paid LLM research (and any
+    downstream action) should happen once for that setup.
+
+    Returns ``None`` when the payload carries no ``bar_close_ms`` (older
+    payloads) or is not a perception dict — callers treat None as "no dedup
+    key", so the gate is inert rather than crashing the loop.
+    """
+    if not isinstance(perception, dict):
+        return None
+    bar_close_ms = perception.get("bar_close_ms")
+    if bar_close_ms is None:
+        return None
+    coin = perception.get("coin")
+    fired = tuple(sorted(extract_fired_triggers(perception)))
+    return (coin, bar_close_ms, fired)
+
+
 def _make_cache_key(coin: str, interval: str, count: int) -> str:
     return f"{coin}:{interval}:{count}"
 
@@ -466,11 +490,19 @@ def _scan_single_market(
             return (True, None)
 
         whale = (whale_signals or {}).get(market["coin"])
+        # O-2: expose the CLOSE TIME (ms) of the bar the triggers were scored
+        # on (= its open time + bar duration). `candles` here is the closed
+        # set the trigger eval used (the forming bar was dropped above), so
+        # this is the stable bar identity downstream content dedup keys on —
+        # unlike fired_at (scan wall-clock, different every cycle) or id
+        # (random per scan). No extra network fetch: the data is in hand.
+        scored_bar_close_ms = int(candles[-1].t) + int(bar_dur_ms)
         return (True, {
             "id": f"{market['coin']}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
             "coin": market["coin"],
             "type": market["type"],
             "fired_at": int(time.time() * 1000),
+            "bar_close_ms": scored_bar_close_ms,
             "mid": mid,
             "triggers": hits,
             "composite_score": score,

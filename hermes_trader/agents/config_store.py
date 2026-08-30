@@ -89,15 +89,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "max_daily_loss_usd": -30,
     # B-M11 (deep audit 2026-08-28): the global-halt and per-coin circuit
     # breakers only block NEW entries — positions already open keep bleeding
-    # to their DSL stops during the halt window. These opt-in switches make
-    # them HARD: when armed, the trading loop market-closes every open
-    # position (global halt) / the halted coin's position (coin circuit) the
-    # moment the breaker trips. Default OFF: flattening on a halt is a
-    # deliberate operator choice (it locks in the loss and forfeits any
-    # recovery), and the daily-loss USD kill-switch above already flattens
-    # unconditionally.
-    "auto_flatten_on_global_halt": False,
-    "auto_flatten_on_coin_circuit": False,
+    # to their DSL stops during the halt window. These switches make them
+    # HARD: when armed, the trading loop market-closes every open position
+    # (global halt) / the halted coin's position (coin circuit) the moment
+    # the breaker trips. H-1 (audit 2026-08-29): flipped to DEFAULT ON — a
+    # tripped breaker means risk is already out of control and leaving a
+    # 10-U micro-book naked (relying solely on each coin's own resting stop)
+    # is the more dangerous contract. Operators who want the old "block
+    # entries only" behavior can set either key to false explicitly.
+    "auto_flatten_on_global_halt": True,
+    "auto_flatten_on_coin_circuit": True,
     # C3 (HYPE RCA 2026-08-21 item 5): blow-up-level self-halt. When a SINGLE
     # closing trade realizes a leveraged ROE loss at/under `roe_halt_threshold_pct`
     # (default -50%, i.e. half the margin gone), flip the bot to mode=OFF and
@@ -177,7 +178,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     },
     "force_execute_composite": 30,
     "composite_force_execute": False,
-    "ta_sidestep_force_execute": True,
+    # O-3 (P1 audit): the TA sidestep force-execute switch bypasses AI
+    # confirmation, so like every other force_*/bypass switch its canonical
+    # default is False — arming it is an explicit operator decision (and is
+    # caught by the FORBIDDEN_OVERRIDE config gate).
+    "ta_sidestep_force_execute": False,
     "ta_sidestep_min_slow_burn_count": 99,
     "force_execute_slow_burn_count": 2,
     "conviction_sizing": False,

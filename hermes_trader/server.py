@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
@@ -45,7 +46,14 @@ from fastapi.responses import JSONResponse, StreamingResponse         # noqa: E4
 from hermes_trader.metrics import render_metrics                      # noqa: E402
 
 from hermes_trader import __version__, dashboard, session_log         # noqa: E402
-from hermes_trader.dashboard import _require_operator, require_operator_write  # noqa: E402
+from hermes_trader.dashboard import (
+    _client_ip,
+    _require_operator,
+    consume_force_confirm_token,
+    require_operator_or_internal,
+    require_operator_write,
+    updates_arm_force_override,
+)
 from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
 from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
 from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
@@ -60,6 +68,7 @@ from hermes_trader.client.hl_client import (                          # noqa: E4
     resolve_user_address,
 )
 from hermes_trader.client.universe import get_universe                # noqa: E402
+from hyperliquid.utils.types import Cloid
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -332,6 +341,58 @@ def _send_bypass_gates_alert_safe(coin: str, reason: str) -> bool:
         return False
 
 
+def _flatten_asset_positions(asset_positions: list) -> list[dict]:
+    """G-1 (P0 audit): flatten the raw Hyperliquid ``assetPositions`` shape
+    (``[{"type":"oneWay","position":{"coin","szi","entryPx",...}}]`` — nested,
+    camelCase, signed-szi strings) into the flat ``[{"coin","side","size_usd"}]``
+    shape the risk gates expect (mirrors executor.py:1760-1767).
+
+    Without this, the manual gate chain received the nested wrapper for every
+    position: ``p.get("coin")`` / ``p.get("side")`` were None on every entry,
+    so ``max_concurrent`` counted 0, ``opposite_direction_guard`` never found an
+    existing position (failed OPEN → a manual opposite-side/stacking order went
+    through), and ``correlation_cap`` counted 0 crypto longs. Positions with
+    zero szi (closed) are skipped. Malformed entries are skipped with a warning
+    rather than poisoning the whole list. A DSL-tracked-but-live-missing coin
+    is merged as held (re-entry backstop, mirrors executor.py:1776-1782).
+    """
+    flat: list[dict] = []
+    for _p in (asset_positions or []):
+        try:
+            _pos = _p.get("position") if isinstance(_p, dict) else None
+            if not _pos:
+                continue
+            _szi = float(_pos.get("szi") or 0.0)
+            if _szi == 0.0:
+                continue
+            _px = float(_pos.get("entryPx") or _pos.get("markPx") or 0.0)
+            flat.append({
+                "coin": _pos.get("coin"),
+                "side": "long" if _szi > 0 else "short",
+                "size_usd": abs(_szi) * _px,
+            })
+        except Exception as e:  # noqa: BLE001 — one bad row must not zero the book
+            logger.warning(
+                "[gates] flatten assetPositions row failed, skipping: %s: %s",
+                type(e).__name__, e,
+            )
+    try:
+        from hermes_trader.agents.dsl_exit import active_position_coins
+        _live_coins = {p["coin"] for p in flat}
+        for _coin, _side in active_position_coins().items():
+            if _coin not in _live_coins:
+                logger.warning(
+                    "[gates] %s tracked by DSL but absent from live account "
+                    "read — treating as held (manual-order re-entry backstop)",
+                    _coin,
+                )
+                flat.append({"coin": _coin, "side": _side, "size_usd": 0})
+    except Exception as e:  # noqa: BLE001 — backstop is best-effort
+        logger.debug("[gates] active_position_coins backstop skipped: %s: %s",
+                     type(e).__name__, e)
+    return flat
+
+
 def _check_manual_order_gates(
     *,
     coin: str,
@@ -341,6 +402,9 @@ def _check_manual_order_gates(
     total_open_notional: float,
     market_vol_24h: float,
     positions: list,
+    entry_px: float = 0.0,
+    leverage: float = 0.0,
+    stop_distance_pct: float = 0.0,
 ) -> dict[str, Any]:
     """P0-1: gate manual ``/api/hl/place-order`` calls against the same
     risk-gate chain (``eval_all_gates``) that ``maybe_execute`` runs.
@@ -393,6 +457,13 @@ def _check_manual_order_gates(
         has_binary_news_risk=False,
         equity=float(live_equity),
         total_open_notional=float(total_open_notional),
+        # G-2 (P0 audit): feed real liquidation-buffer inputs. The manual path
+        # previously sent none, so liquidation_buffer_gate saw zero entry/lev/
+        # stop and passed OPEN — a 10x manual entry whose liq price sat inside
+        # its own stop bracket was never checked (the HYPE blast pattern).
+        entry_px=float(entry_px or 0.0),
+        leverage=float(leverage or 0.0),
+        stop_distance_pct=float(stop_distance_pct or 0.0),
     )
     return eval_all_gates(
         gate_ctx,
@@ -693,8 +764,24 @@ async def agent_start_post() -> JSONResponse:
 
 
 @app.post("/api/agent/stop", dependencies=[Depends(require_operator_write)])
-async def agent_stop() -> JSONResponse:
-    """POST /api/agent/stop — terminate the scanner process."""
+async def agent_stop(request: Request) -> JSONResponse:
+    """POST /api/agent/stop — terminate the scanner process.
+
+    Red-line control: beyond operator-write auth + per-IP lockout + rate
+    limit, this requires an explicit, non-default ``X-Confirm-Stop: confirm``
+    header. Stopping the agent halts all automated risk management / exits, so
+    a single induced/CSRF POST must not be able to fire it — the caller has to
+    deliberately echo the confirmation. The rate limiter runs in the auth
+    dependency (before this handler), so a 429 still takes precedence.
+    """
+    if request.headers.get("x-confirm-stop", "").strip().lower() != "confirm":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Stopping the agent halts automated trading AND risk monitoring. "
+                "Re-send with header 'X-Confirm-Stop: confirm' to acknowledge."
+            ),
+        )
     if not os.path.exists(PID_FILE):
         return JSONResponse(content={"status": "not_running"})
 
@@ -733,6 +820,13 @@ async def update_config(request: Request) -> JSONResponse:
         raise HTTPException(400, "invalid JSON")
     if not isinstance(body, dict):
         raise HTTPException(400, "body must be a JSON object")
+    # O-1: arming a FORBIDDEN_OVERRIDE force-execute switch through this
+    # endpoint also requires the two-step confirmation token issued by
+    # POST /api/dashboard/config/force-confirm (bound to the same payload +
+    # operator IP, single-use, per-IP arming cooldown).
+    patch = {k: v for k, v in body.items() if v is not None and k != "confirm_token"}
+    if updates_arm_force_override(patch):
+        consume_force_confirm_token(patch, _client_ip(request), body.get("confirm_token"))
     # F27 / D-FCFG-4 (deep audit 2026-08-28): type/range/unknown-key gate
     # before the merge. This endpoint and POST /api/dashboard/config now
     # share the SAME strict write contract — unknown keys are 422, not
@@ -740,13 +834,14 @@ async def update_config(request: Request) -> JSONResponse:
     # hand-edited files / restores). None means "delete key" in the deep
     # merge and is excluded from validation.
     errors = validate_config_updates(
-        {k: v for k, v in body.items() if v is not None}, strict_keys=True
+        {k: v for k, v in patch.items()}, strict_keys=True
     )
     if errors:
         raise HTTPException(422, json.dumps({"errors": errors}))
+    write_body = {k: v for k, v in body.items() if k != "confirm_token"}
     try:
         with update_agent_config() as cfg:
-            merged = _deep_merge(cfg, body)
+            merged = _deep_merge(cfg, write_body)
             cfg.clear()
             cfg.update(merged)
     except RuntimeError as e:
@@ -892,7 +987,7 @@ async def place_order(request: Request) -> JSONResponse:
     """POST /api/hl/place-order — manual order with ATR-based SL/TP brackets.
 
     P0-1 (audit 2026-08-28): manual orders now pass through the same
-    ``eval_all_gates`` 16-risk-gate chain as autonomous ``maybe_execute``.
+    ``eval_all_gates`` 22-risk-gate chain as autonomous ``maybe_execute``.
     Without this, the operator endpoint was a full bypass of every
     kill-switch (daily_loss, global_halt, coin_circuit, equity_risk,
     notional_cap, max_concurrent, liquidity, market_regime …) — a manual
@@ -969,7 +1064,7 @@ async def place_order(request: Request) -> JSONResponse:
                 f"order notional ${position_notional:.2f} is below HL minimum ${min_notional:.2f}",
             )
 
-        # ── P0-1: 16-risk-gate chain on manual orders ───────────────────
+        # ── P0-1: 22-risk-gate chain on manual orders ──────────────────
         # The manual order endpoint was previously a complete bypass of
         # every kill-switch. We now construct a GateContext mirroring what
         # maybe_execute passes, evaluate eval_all_gates, and refuse with 403
@@ -986,19 +1081,31 @@ async def place_order(request: Request) -> JSONResponse:
             )
 
         # Live context for gates
+        _equity_read_failed = False
         try:
             live_equity_for_gates = float(await _fetch_live_equity())
         except Exception as e:
-            # R12-A1: equity readout failure used to fall through as 0.0
-            # silently. 0.0 trips max_total_notional_pct gate (zero
-            # notional budget) but the operator never saw the live-read
-            # failure. Warning level so the manual-order flow is still
-            # gated, but the cause is visible.
+            # O-5 (P1 audit): equity readout failure used to fall through as
+            # 0.0 silently — the equity_risk / notional gates then blocked the
+            # manual OPEN with a misleading "risk gate" 403 instead of
+            # pointing at the real cause (HL account read unavailable). The
+            # close/flatten endpoint is not gated, so de-risking stays
+            # possible; here we fail the OPEN loudly with 503 + retry hint.
             logger.warning(
-                "[gates] _fetch_live_equity failed, defaulting to 0.0: %s: %s",
+                "[gates] _fetch_live_equity failed, rejecting manual open with 503: %s: %s",
                 type(e).__name__, e,
             )
+            _equity_read_failed = True
             live_equity_for_gates = 0.0
+        if _equity_read_failed:
+            raise HTTPException(
+                503,
+                {
+                    "error": "live_equity_unavailable",
+                    "detail": "could not read live HL equity; risk gates cannot size this order — retry shortly",
+                    "note": "close/flatten endpoint (/api/hl/close-position) remains available for de-risking",
+                },
+            )
         try:
             user = resolve_user_address()
             acct = fetch_account_state(user, include_hip3=_hip3_on()) if user else {}
@@ -1051,6 +1158,22 @@ async def place_order(request: Request) -> JSONResponse:
                 coin, type(e).__name__, e,
             )
 
+        # G-2: pre-trade worst-case stop distance (spot %) for the
+        # liquidation_buffer gate. The manual bracket SL is placed at
+        # entry ± atr*sl_atr_mult (below), so the estimate is exactly that
+        # distance as a percent of mid. ATR read failure leaves it 0.0, and
+        # the gate passes open — same degradation contract as the auto path.
+        stop_distance_pct = 0.0
+        try:
+            _sl_mult_g = float(cfg.get("sl_atr_mult", 1.5) or 1.5)
+            if mid_price > 0 and atr > 0 and _sl_mult_g > 0:
+                stop_distance_pct = (atr * _sl_mult_g) / mid_price * 100.0
+        except Exception as e:  # noqa: BLE001 — pre-trade estimate is best-effort
+            logger.debug(
+                "[manual-order] stop-distance estimate failed for %s: %s: %s",
+                coin, type(e).__name__, e,
+            )
+
         gate_report = _check_manual_order_gates(
             coin=coin,
             is_buy=is_buy,
@@ -1058,7 +1181,16 @@ async def place_order(request: Request) -> JSONResponse:
             live_equity=locals().get("live_equity_for_gates", 0.0) or 0.0,
             total_open_notional=locals().get("total_open_notional", 0.0) or 0.0,
             market_vol_24h=float(market_vol_24h),
-            positions=locals().get("acct", {}).get("assetPositions") or [],
+            # G-1: flatten the nested camelCase assetPositions shape into the
+            # coin/side/size_usd list the gates consume — otherwise every gate
+            # reading current_positions (max_concurrent, opposite_direction_guard,
+            # correlation_cap) sees zero entries and fails open.
+            positions=_flatten_asset_positions(
+                locals().get("acct", {}).get("assetPositions") or []
+            ),
+            entry_px=float(mid_price),
+            leverage=float(leverage),
+            stop_distance_pct=float(stop_distance_pct),
         )
 
         if gate_report.get("blocked") and not bypass:
@@ -1077,6 +1209,45 @@ async def place_order(request: Request) -> JSONResponse:
                     "error": "blocked_by_risk_gates",
                     "blocked_by": blocked_by,
                     "note": "set bypass_gates=true + bypass_reason to override (audited)",
+                },
+            )
+
+        # G-3 (P0 audit): HARD kill-switches cannot be bypassed. The
+        # bypass_gates flag is an escape hatch for soft gates (confidence,
+        # regime, liquidity …), but daily-loss kill / global halt / coin
+        # circuit breaker are exchange-wide safety stops — allowing a manual
+        # order through them re-opens the exact state the kill was armed for.
+        # The flatten/close endpoint stays available (it does not run gates)
+        # so an operator can still de-risk; this only vetoes NEW entries.
+        _HARD_GATES = ("daily_loss", "global_halt", "coin_circuit")
+        _hard_tripped = [
+            k for k in _HARD_GATES
+            if not (gate_report.get("results", {}).get(k, {}) or {}).get("pass", True)
+        ]
+        if _hard_tripped:
+            _hard_reasons = [
+                (gate_report["results"].get(k, {}) or {}).get("reason", k)
+                for k in _hard_tripped
+            ]
+            await _append_session_log({
+                "event": "place_order_blocked_by_hard_kill_switch",
+                "coin": coin,
+                "side": side,
+                "hard_gates": _hard_tripped,
+                "reasons": _hard_reasons,
+                "bypass_attempted": bypass,
+                "notional_usd": float(position_notional),
+                "leverage": int(leverage),
+            })
+            raise HTTPException(
+                403,
+                {
+                    "error": "blocked_by_hard_kill_switch",
+                    "hard_gates": _hard_tripped,
+                    "reasons": _hard_reasons,
+                    "note": "daily_loss / global_halt / coin_circuit are hard "
+                            "kill-switches and cannot be bypassed; use the "
+                            "close/flatten endpoint to de-risk",
                 },
             )
 
@@ -1117,7 +1288,12 @@ async def place_order(request: Request) -> JSONResponse:
 
         size_in_coin = entry_size_for_notional(coin, position_notional, mid_price)
 
-        result = place_hl_order(is_buy, size_in_coin, mid_price, coin)
+        # E-3 (P0 audit): idempotency key. The SDK POST wrapper retries up to
+        # 5x on 408/5xx; without a cloid, a timed-out-but-resting manual order
+        # gets duplicated on every retry. One cloid per order intent (HL
+        # rejects a repeated cloid instead of filling twice).
+        entry_cloid = Cloid.from_int(uuid.uuid4().int)
+        result = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=entry_cloid)
 
         if not result.get("ok"):
             raise HTTPException(400, f"order failed: {result.get('error')}")
@@ -1141,8 +1317,12 @@ async def place_order(request: Request) -> JSONResponse:
             sl_px = entry_px - atr * sl_mult if is_buy else entry_px + atr * sl_mult
             tp_px = entry_px + atr * tp_mult if is_buy else entry_px - atr * tp_mult
 
-            sl = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin)
-            tp = place_hl_trigger_order(is_buy, size_in_coin, tp_px, "tp", coin)
+            # E-3: one cloid per bracket intent — SDK POST retries must arm
+            # the SL/TP exactly once, not stack duplicate triggers.
+            sl_cloid = Cloid.from_int(uuid.uuid4().int)
+            tp_cloid = Cloid.from_int(uuid.uuid4().int)
+            sl = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, cloid=sl_cloid)
+            tp = place_hl_trigger_order(is_buy, size_in_coin, tp_px, "tp", coin, cloid=tp_cloid)
             brackets = [
                 {"type": "SL", "price": sl_px, "ok": sl.get("ok")},
                 {"type": "TP", "price": tp_px, "ok": tp.get("ok")},
@@ -1216,6 +1396,92 @@ async def close_position(request: Request) -> JSONResponse:
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/hl/flatten-all", dependencies=[Depends(require_operator_write)])
+async def flatten_all(request: Request) -> JSONResponse:
+    """POST /api/hl/flatten-all — market-close EVERY open perp position.
+
+    H-1 (audit 2026-08-29): the emergency flat-all control. Previously no
+    such endpoint existed — an operator staring at a tripped global halt
+    had to close each coin one by one through /api/hl/close-position while
+    the book kept moving. This enumerates every open position (incl. HIP-3
+    clearinghouses) and closes each through the SAME close_position_market
+    path as a single manual close (reduce_only flatten, DSL-tracker
+    deregister, open-order cancel, realized-PnL record).
+
+    Red-line control: requires an explicit ``X-Confirm-Flatten: confirm``
+    header — a missing/wrong value is 409, so a CSRF single-shot POST or a
+    misdirected curl cannot flatten the whole book. Like single-close,
+    flatten is risk-REDUCTION and stays available in Mode=OFF (only new
+    opens are gated).
+    """
+    if request.headers.get("x-confirm-flatten", "").strip().lower() != "confirm":
+        raise HTTPException(
+            status_code=409,
+            detail=("Flatten-all market-closes EVERY open position at once. "
+                    "Re-send with header 'X-Confirm-Flatten: confirm' to "
+                    "acknowledge."))
+
+    user = resolve_user_address()
+    if not user:
+        raise HTTPException(400, "HL wallet not configured")
+    try:
+        # include_hip3=True: the flat-all must cover xyz:/vntl:/km: positions
+        # on the L1 clearinghouses too — a default fetch would miss them and
+        # report a flat book while HIP-3 exposure stays open.
+        state = fetch_account_state(user, include_hip3=True)
+    except Exception as e:  # noqa: BLE001 — emergency path must not 500
+        raise HTTPException(502, f"account fetch failed: {e}")
+
+    # Coin names come straight from the exchange payload, so HIP-3 names
+    # (xyz:MU, vntl:*) keep their ':' and case — no client-side normalize.
+    coins: list[str] = []
+    for p in (state.get("asset_positions") or []):
+        pos = p.get("position") or {}
+        try:
+            if float(pos.get("szi", "0") or 0) != 0 and pos.get("coin"):
+                coins.append(pos["coin"])
+        except (TypeError, ValueError):
+            continue
+    coins = list(dict.fromkeys(coins))  # de-dupe, preserve order
+
+    if not coins:
+        await _append_session_log({"event": "flatten_all",
+                                   "noop": "no_open_positions"})
+        return JSONResponse(content={"ok": True, "noop": "no_open_positions",
+                                     "total": 0, "flattened": [], "failed": []})
+
+    # Closes are independent: one coin's failure must not abort the rest of
+    # the book (an emergency flat-all that stops at the first error is worse
+    # than useless). Per-coin results are returned so the operator can retry
+    # the failures.
+    flattened: list[str] = []
+    failed: list[dict] = []
+    for coin in coins:
+        try:
+            result = await asyncio.to_thread(close_position_market, coin)
+            if result.get("ok"):
+                flattened.append(coin)
+            else:
+                failed.append({"coin": coin, "error": result.get("error")})
+        except Exception as e:  # noqa: BLE001 — isolate one coin's failure
+            failed.append({"coin": coin, "error": str(e)})
+
+    await _append_session_log({
+        "event": "flatten_all",
+        "total": len(coins),
+        "flattened": len(flattened),
+        "failed": len(failed),
+    })
+
+    # Every close failed → surface as an error; partial success returns 200
+    # with the failed list so successful flattens are never masked.
+    if failed and not flattened:
+        raise HTTPException(400, json.dumps({"flattened": flattened,
+                                             "failed": failed}))
+    return JSONResponse(content={"ok": True, "total": len(coins),
+                                 "flattened": flattened, "failed": failed})
+
+
 @app.post("/api/hl/cancel-order", dependencies=[Depends(require_operator_write)])
 async def cancel_order(request: Request) -> JSONResponse:
     """POST /api/hl/cancel-order — cancel an order by OID."""
@@ -1244,18 +1510,21 @@ async def health() -> dict[str, Any]:
     return {"service": "Hermes-Trader", "version": __version__, "status": "running"}
 
 
-@app.get("/metrics")
+@app.get("/metrics", dependencies=[Depends(require_operator_or_internal)])
 async def metrics() -> Response:
-    """Prometheus scrape target. Unauthenticated (like /api/health) so the
-    scraper needs no operator token; reads local state only — never hits HL."""
+    """Prometheus scrape target. L-2: open to LAN/loopback scrapers without a
+    token (Prometheus runs inside the network); external clients must present
+    a valid operator token. Reads local state only — never hits HL."""
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
 
 
 # ── Postmortem report viewer ─────────────────────────────────────────────────
-# Public read-only endpoints so the "view full report" button in Feishu push
-# cards can open the markdown in a browser without an operator token. Reports
-# contain no secrets — only market data, scores, and trigger metadata.
+# Read-only endpoints so the "view full report" button in Feishu push cards
+# can open the markdown in a browser. L-2: LAN/loopback viewers (the internal
+# network the Feishu card is opened from) stay token-free; external access
+# requires a valid operator token. Reports contain no secrets — only market
+# data, scores, and trigger metadata.
 
 _POSTMORTEM_DIR = Path(os.environ.get(
     "HERMES_POSTMORTEM_DIR", "/data/postmortems"))
@@ -1409,9 +1678,9 @@ a{color:#2980b9}
 """
 
 
-@app.get("/postmortems")
+@app.get("/postmortems", dependencies=[Depends(require_operator_or_internal)])
 async def list_postmortems() -> dict[str, Any]:
-    """List all surge postmortem reports (public, read-only)."""
+    """List all surge postmortem reports (read-only; L-2 LAN-open / token-gated)."""
     try:
         files = sorted(
             _POSTMORTEM_DIR.glob("*.md"),
@@ -1424,9 +1693,9 @@ async def list_postmortems() -> dict[str, Any]:
     return {"count": len(items), "reports": items}
 
 
-@app.get("/postmortems/{name}")
+@app.get("/postmortems/{name}", dependencies=[Depends(require_operator_or_internal)])
 async def view_postmortem(name: str) -> Response:
-    """Render a single postmortem markdown as an HTML page (public)."""
+    """Render a single postmortem markdown as an HTML page (L-2 LAN-open / token-gated)."""
     # Path traversal guard: only allow bare filenames.
     if "/" in name or "\\" in name or ".." in name or not name.endswith(".md"):
         raise HTTPException(status_code=400, detail="Invalid report name")

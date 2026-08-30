@@ -60,8 +60,10 @@ class _ConfigPatch(BaseModel):
     ta_sidestep_force_execute: bool = Field(default=CANONICAL_DEFAULTS["ta_sidestep_force_execute"])
     whale_force_execute: bool = Field(default=CANONICAL_DEFAULTS["whale_force_execute"])
     trend_surface_enabled: bool = Field(default=CANONICAL_DEFAULTS["trend_surface_enabled"])
-    # B-M11 (deep audit 2026-08-28): opt-in auto-flatten when the global halt
-    # or per-coin circuit breaker trips (default off; open-blocking only).
+    # B-M11 (deep audit 2026-08-28): auto-flatten when the global halt or
+    # per-coin circuit breaker trips. H-1 (2026-08-29): default ON — a tripped
+    # breaker already means uncontrolled risk; set to false to restore the
+    # old open-blocking-only behavior.
     auto_flatten_on_global_halt: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_global_halt"])
     auto_flatten_on_coin_circuit: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_coin_circuit"])
     # C3 (HYPE RCA item 5): blow-up-level self-halt on a single trade's ROE loss.
@@ -716,6 +718,9 @@ _FORCE_OVERRIDE_KEYS_FOR_GATE = (
     "whale_force_execute", "ta_sidestep_force_execute",
     "whale_regime_bypass", "spread_gate_fail_open",
 )
+
+# Public alias shared by the HTTP layer (O-1 two-step arming gate).
+FORCE_OVERRIDE_KEYS = _FORCE_OVERRIDE_KEYS_FOR_GATE
 
 
 def validate_forbidden_overrides(cfg: dict[str, Any]) -> list[str]:

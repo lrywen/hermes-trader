@@ -29,9 +29,13 @@ from hermes_trader.agents.config_store import (
 )
 from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.dashboard import (
+    _client_ip,
     _config_apply,
     _require_operator,
     _validate_config_updates,
+    consume_force_confirm_token,
+    issue_force_confirm_token,
+    updates_arm_force_override,
 )
 
 logger = logging.getLogger("hermes-dashboard")
@@ -45,6 +49,29 @@ def register_config_routes(app: FastAPI) -> None:
     # agents/config_schema.py (Pydantic model as the single source of truth),
     # shared with the terminal `set` handler, the CLI and the legacy endpoint.
 
+    @app.post("/api/dashboard/config/force-confirm")
+    async def dashboard_config_force_confirm(request: Request) -> JSONResponse:
+        """O-1: step 1 of arming a FORBIDDEN_OVERRIDE force-execute switch.
+
+        Body: ``{"updates": {"force_key": true, "override_requires_ai": true}}``.
+        Validates the patch (schema gate) and returns a one-time
+        ``confirm_token`` bound to the exact payload + operator IP. The client
+        then re-sends the SAME updates to POST /api/dashboard/config with the
+        token within the TTL; a per-IP arming cooldown also applies.
+        """
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:  # noqa: BLE001 — any decode failure maps to 422
+            raise HTTPException(422, "invalid JSON body")
+        updates = body.get("updates") if isinstance(body, dict) else None
+        if not isinstance(updates, dict) or not updates:
+            raise HTTPException(400, "updates must be a non-empty object")
+        result = issue_force_confirm_token(updates, _client_ip(request))
+        logger.warning("force-override arming confirmed (step 1) from %s: %s",
+                       _client_ip(request), result["arming"])
+        return JSONResponse({"ok": True, **result})
+
     @app.post("/api/dashboard/config")
     async def dashboard_config_write(request: Request) -> JSONResponse:
         """Apply a partial config update. Operator token required.
@@ -52,12 +79,16 @@ def register_config_routes(app: FastAPI) -> None:
         Body: ``{"updates": {"key": value, ...}}``.
         Validates types/ranges, backs up the current config, writes atomically,
         and appends an audit event to the session log.
+
+        O-1: a write that ARMS any FORBIDDEN_OVERRIDE switch must carry a
+        ``confirm_token`` obtained from POST /api/dashboard/config/force-confirm
+        for the same payload (two-step confirmation + per-IP cooldown).
         """
         _require_operator(request, write=True)
         # F7: a malformed JSON body must return 422, not a 500.
         try:
             body = await request.json()
-        except Exception:
+        except Exception:  # noqa: BLE001 — any decode failure maps to 422
             raise HTTPException(422, "invalid JSON body")
         updates = body.get("updates")
         if not isinstance(updates, dict) or not updates:
@@ -66,6 +97,13 @@ def register_config_routes(app: FastAPI) -> None:
         errors = _validate_config_updates(updates)
         if errors:
             raise HTTPException(422, json.dumps({"errors": errors}))
+
+        # O-1: arming a safety-gate bypass is a two-step write.
+        if updates_arm_force_override(updates):
+            consume_force_confirm_token(
+                updates, _client_ip(request),
+                body.get("confirm_token") if isinstance(body, dict) else None,
+            )
 
         def _apply() -> dict[str, Any]:
             # F20: _config_apply holds the process-wide config lock across the

@@ -17,9 +17,10 @@ Covers four P1 items:
 
 * B-M11 — breakers (global halt / per-coin circuit) only blocked new
   entries; they never flattened. Two opt-in switches
-  (``auto_flatten_on_global_halt`` / ``auto_flatten_on_coin_circuit``, BOTH
-  DEFAULT OFF) now flat-all / flat-that-coin via close_position_market and log
-  the action. Default-off preserves the legacy "stop adding risk" contract.
+  (``auto_flatten_on_global_halt`` / ``auto_flatten_on_coin_circuit``) now
+  flat-all / flat-that-coin via close_position_market and log the action.
+  H-1 (2026-08-29) flipped BOTH to DEFAULT ON: a tripped breaker means risk is
+  already out of control; an operator may set either key false to opt out.
 
 * A-F14 — no live candle/feed freshness gate. This batch delivers the REST
   mid-feed freshness door: a successful main-book all_mids fetch is stamped;
@@ -381,14 +382,19 @@ class _FakeMem:
         return self._c.get(coin, 0.0)
 
 
-def test_bm11_switches_default_off_even_when_halt_armed():
-    """Both switches DEFAULT OFF: an armed global halt flattens nothing."""
+def test_bm11_switches_respect_explicit_off_when_halt_armed():
+    """H-1 flipped both switches to DEFAULT ON (a tripped breaker must not
+    leave the book naked); an operator can still opt out explicitly by setting
+    either key to false. With cfg={} the loop reads the CANONICAL_DEFAULTS,
+    which are now ON — so we pin the OFF behavior by passing explicit False."""
     fn = _load_loop_fn("bm11_breaker_flatten")
     flattened = []
     events = []
     out = fn(equity=1000.0,
              positions=[{"position": {"coin": "ETH"}}],
-             cfg={}, mem=_FakeMem(global_min=30.0),
+             cfg={"auto_flatten_on_global_halt": False,
+                  "auto_flatten_on_coin_circuit": False},
+             mem=_FakeMem(global_min=30.0),
              flattener=lambda c: flattened.append(c) or {"ok": True},
              event_log=lambda e: events.append(e))
     assert out == set()

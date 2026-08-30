@@ -30,6 +30,7 @@ from hermes_trader.dashboard import (
     _redact,
     _request_has_operator_creds,
     _require_operator,
+    _risk_status_payload,
     _summary_payload,
     _tail_log_sse,
     _ttl_cached,
@@ -174,6 +175,22 @@ def register_public_routes(app: FastAPI) -> None:
         # ~1.3s on testnet). Run in a worker thread so the event loop stays
         # responsive to / and SSE while the live fetch is in flight.
         payload = await asyncio.to_thread(_positions_payload)
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/risk-status")
+    async def dashboard_risk_status() -> JSONResponse:
+        # O-4: read-only risk-control status (breakers / kill-switch / mode /
+        # feed liveness) for the risk-status viewer card. Only aggregate operational
+        # signals — no sizing/tuning secrets — so it is safe to serve
+        # anonymously like summary/positions. Reads the flushed memory file +
+        # session log in a worker thread; cached at the same 2s TTL as summary.
+        payload = await asyncio.to_thread(
+            lambda: _ttl_cached(
+                "risk-status",
+                _http_cache_params()["summary_ttl_s"],
+                _risk_status_payload,
+            )
+        )
         return JSONResponse(payload)
 
     @app.get("/api/dashboard/equity-curve")

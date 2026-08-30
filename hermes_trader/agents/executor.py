@@ -1028,6 +1028,14 @@ def _place_backup_sl(
         # C4-3: sl_limit_band_pct > 0 arms a trigger LIMIT (worst-case fill
         # capped `band` past the trigger); 0 keeps the market-on-trigger default.
         _band_kw = {"limit_band_pct": sl_limit_band_pct} if sl_limit_band_pct > 0 else {}
+        # E-2 (P0 audit): ONE cloid for this SL intent, reused across the
+        # immediate retry and the deferred re-arm in retry_pending_sl. The SDK
+        # retries POST 5x on 408/5xx, and our own 2s retry / pending queue add
+        # more attempts — with no cloid, a request that actually reached HL but
+        # whose response was lost would be re-submitted as a DUPLICATE stop.
+        # HL rejects a repeated cloid, so the SL arms exactly once.
+        _sl_cloid = Cloid.from_int(uuid.uuid4().int)
+        _band_kw["cloid"] = _sl_cloid
         sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
         if not sl_res.get("ok"):
             # One retry after a beat — observed failures are transient 429s; a
@@ -1061,6 +1069,10 @@ def _place_backup_sl(
                 # trigger-limit variant instead of silently falling back to
                 # market after a transient placement failure.
                 "limit_band_pct": sl_limit_band_pct if sl_limit_band_pct > 0 else 0.0,
+                # E-2: reuse the SAME cloid on the deferred re-arm so a retry
+                # cannot duplicate an SL that an earlier lost-response attempt
+                # may have actually armed.
+                "cloid": _sl_cloid,
                 "retry_count": 0,
                 "last_attempt": time.time(),
             }
@@ -1173,7 +1185,11 @@ def _place_tp_scale_out(
                 f"tp_px={tp_px_trig:.6g}]"
             )
             tp_size = tp_min_size
-            tp_res = place_hl_trigger_order(is_buy, tp_size, tp_px_trig, "tp", coin)
+            # E-2: cloid idempotency key — SDK POST retries must not duplicate
+            # the resting TP (one cloid per TP intent).
+            tp_res = place_hl_trigger_order(
+                is_buy, tp_size, tp_px_trig, "tp", coin,
+                cloid=Cloid.from_int(uuid.uuid4().int))
             if tp_res.get("ok"):
                 oid = tp_res.get("order_id", "N/A")
                 logger.info(
@@ -1189,7 +1205,10 @@ def _place_tp_scale_out(
                     f"error={tp_res.get('error')}"
                 )
     else:
-        tp_res = place_hl_trigger_order(is_buy, tp_size, tp_px_trig, "tp", coin)
+        # E-2: cloid idempotency key (same rationale as the upsized branch).
+        tp_res = place_hl_trigger_order(
+            is_buy, tp_size, tp_px_trig, "tp", coin,
+            cloid=Cloid.from_int(uuid.uuid4().int))
         if tp_res.get("ok"):
             oid = tp_res.get("order_id", "N/A")
             logger.info(
@@ -2205,7 +2224,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # ── INACTIVE: external HTA (:8766) size-veto channel retired ─────────
     # The native multi-perspective debate (research.py) replaced the external
     # HTA risk-review stream (server: "HTA risk-review streaming retired").
-    # No `hta_risk` gate is registered in eval_all_gates (17 fixed gate keys)
+    # No `hta_risk` gate is registered in eval_all_gates (22 fixed gate keys)
     # and GateContext carries no hta field, so gate_output["results"] never
     # contains hta_risk and a size_factor veto here would always be None. The
     # previous block claimed "R2 fix applied" but was unreachable dead code.
@@ -3504,8 +3523,13 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
     # reduce_only: a close must only FLATTEN. Without it, the $10-min size floor in
     # place_hl_order overshoots a sub-$10 position and flips it to the opposite side
     # (the BIRD short<->long churn loop). reduce_only makes HL ignore the excess.
+    # E-1 (P0 audit): cloid idempotency key — the SDK POST wrapper retries 5x on
+    # 408/5xx; a close whose response was lost could be re-sent as a second order.
+    # reduce_only bounds the damage, but a duplicate reduce-only IOC can still hit a
+    # partially-filled book; the cloid makes HL reject the duplicate outright.
+    _close_cloid = Cloid.from_int(uuid.uuid4().int)
     res = place_hl_order(is_buy=not is_long, size=abs(szi), mid_price=mid_price, coin=coin,
-                         reduce_only=True)
+                         reduce_only=True, cloid=_close_cloid)
     out: dict[str, Any] = {**res, "coin": coin, "side": side,
                             "entry_px": entry_px, "leverage": leverage}
 
@@ -3543,8 +3567,13 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
             # partials, escalate to a high-priority alert for manual review.
             _remain = _gap
             try:
-                _follow = place_hl_order(is_buy=not is_long, size=_remain, mid_price=mid_price,
-                                         coin=coin, reduce_only=True)
+                # E-1: the follow-up closes a DIFFERENT size (the residual only),
+                # so it is a distinct order intent — mint a fresh cloid rather
+                # than reusing the primary close's (which HL already matched).
+                _follow = place_hl_order(
+                    is_buy=not is_long, size=_remain, mid_price=mid_price,
+                    coin=coin, reduce_only=True,
+                    cloid=Cloid.from_int(uuid.uuid4().int))
             except Exception as _follow_e:
                 _follow = {"ok": False, "error": f"follow_close_exc:{_follow_e!r}"}
             try:
@@ -4011,6 +4040,16 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
             # attempt (band carried in the retry entry).
             _retry_band = float(entry.get("limit_band_pct", 0.0) or 0.0)
             _retry_kw = {"limit_band_pct": _retry_band} if _retry_band > 0 else {}
+            # E-2: reuse the original intent's cloid if carried (entries written
+            # before this field lack it — mint one and persist so subsequent
+            # attempts stay deduped). Reusing the cloid makes a re-arm idempotent
+            # with any earlier attempt whose response was lost: HL rejects the
+            # duplicate instead of arming two stops.
+            _retry_cloid = entry.get("cloid")
+            if _retry_cloid is None:
+                _retry_cloid = Cloid.from_int(uuid.uuid4().int)
+                entry["cloid"] = _retry_cloid
+            _retry_kw["cloid"] = _retry_cloid
             res = place_hl_trigger_order(
                 entry["is_buy"], entry["size"], entry["sl_px"], "sl", entry["coin"],
                 **_retry_kw

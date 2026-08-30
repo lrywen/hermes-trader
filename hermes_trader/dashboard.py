@@ -21,6 +21,7 @@ doesn't require a restart.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import json
 import logging
@@ -38,6 +39,7 @@ from fastapi.responses import JSONResponse
 from hermes_trader import event_log, session_log
 from hermes_trader.agents import dsl_exit
 from hermes_trader.agents.config_schema import (
+    FORCE_OVERRIDE_KEYS,
     coerce_config_value as _coerce_config_value,
     validate_config_updates as _validate_config_updates,
 )
@@ -46,7 +48,11 @@ from hermes_trader.agents.config_store import (
     read_agent_config,
     update_agent_config,
 )
-from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
+from hermes_trader.client.hl_client import (
+    _parse_liquidation_px,
+    fetch_account_state,
+    resolve_user_address,
+)
 from hermes_trader.positions_snapshot import read_snapshot as read_position_snapshot
 
 logger = logging.getLogger("hermes-dashboard")
@@ -415,6 +421,101 @@ def _summary_payload() -> dict[str, Any]:
     }
 
 
+# O-4: feed liveness for the risk-status card uses the same staleness window
+# as summary (a loop heartbeat older than this means the feed is stale/dead).
+_RISK_STATUS_STALE_AFTER_S = 180
+
+
+def _risk_status_payload() -> dict[str, Any]:
+    """O-4: read-only aggregate feeding the frontend's risk-control cards.
+
+    Fuses two sources, both non-sensitive operational signals so the endpoint
+    is anonymous like summary/positions:
+      * the flushed agent memory's tiered breakers — global halt + per-coin
+        circuit map (which coins are gated and for how long);
+      * the latest loop heartbeat in the session log — mode, daily PnL vs the
+        configured kill floor, open position count and feed liveness.
+
+    Degraded-by-design: any backing read that raises (corrupt memory file,
+    unreadable session log) must surface quiet defaults rather than a 500 —
+    the card shows "offline", never an error boundary.
+    """
+    now_ms = int(time.time() * 1000)
+    out: dict[str, Any] = {
+        "global_halt": False,
+        "global_halt_remaining_min": 0.0,
+        "coin_circuits": {},
+        "armed_coins": 0,
+        "mode": None,
+        "daily_pnl": None,
+        "daily_loss_limit": None,
+        "kill_armed": False,
+        "open_positions": 0,
+        "feed_status": "offline",
+        "feed_age_s": None,
+        "ts": now_ms,
+    }
+
+    # Breaker state from the flushed memory singleton (read-only snapshot).
+    try:
+        from hermes_trader.agents.memory import memory as _mem
+        snap = _mem.risk_status_snapshot()
+        out["global_halt"] = bool(snap.get("global_halt"))
+        out["global_halt_remaining_min"] = snap.get("global_halt_remaining_min", 0.0)
+        out["coin_circuits"] = snap.get("coin_circuits", {})
+        out["armed_coins"] = int(snap.get("armed_coins", 0) or 0)
+    except Exception:  # card stays readable even if memory is corrupt
+        logger.warning("[risk-status] memory breaker read failed; serving quiet breakers",
+                       exc_info=True)
+
+    # Mode / daily-PnL-vs-kill / feed liveness from the latest heartbeat.
+    try:
+        events = _read_log_lines()
+        hb = _last_event(events, "loop_heartbeat") or {}
+    except Exception:  # an unreadable log must not 500 the card
+        logger.warning("[risk-status] session-log read failed; feed=offline", exc_info=True)
+        hb = {}
+
+    if hb:
+        hb_ts = int(hb.get("ts", 0) or 0)
+        age_s = max(0, (now_ms - hb_ts) // 1000) if hb_ts else None
+        out["feed_age_s"] = age_s
+        if age_s is None:
+            out["feed_status"] = "offline"
+        elif age_s > _RISK_STATUS_STALE_AFTER_S:
+            out["feed_status"] = "stale"
+        else:
+            out["feed_status"] = "live"
+
+        mode = hb.get("mode")
+        cfg = hb.get("config") if isinstance(hb.get("config"), dict) else {}
+        # The loop heartbeat nests the running mode inside its config snapshot;
+        # fall back to a top-level mode for flat/older payloads.
+        if (not isinstance(mode, str) or not mode) and isinstance(cfg.get("mode"), str):
+            mode = cfg.get("mode")
+        if isinstance(mode, str) and mode:
+            out["mode"] = mode.upper()
+
+        daily_pnl = hb.get("daily_pnl")
+        if daily_pnl is not None:
+            out["daily_pnl"] = float(daily_pnl)
+        open_positions = hb.get("open_positions")
+        if open_positions is not None:
+            out["open_positions"] = int(open_positions or 0)
+
+        kill = cfg.get("kill")
+        if kill is not None:
+            kill_floor = float(kill)
+            out["daily_loss_limit"] = kill_floor
+            # Kill switch trips when a losing day's PnL reaches the negative
+            # USD floor (daily_pnl <= kill). Only evaluate when we have a
+            # real daily_pnl; a None floor / pnl leaves kill_armed False.
+            if daily_pnl is not None and float(daily_pnl) <= kill_floor:
+                out["kill_armed"] = True
+
+    return out
+
+
 _POSITIONS_CACHE: dict[str, Any] = {"ts": 0.0, "data": []}
 # F26: acceptable staleness for the display positions endpoint (env-overridable).
 _POSITIONS_CACHE_TTL_S = float(os.environ.get("HERMES_POSITIONS_CACHE_TTL_S", "5.0"))
@@ -507,6 +608,10 @@ def _parse_raw_position(pos: dict[str, Any]) -> Optional[dict[str, Any]]:
         "unrealized_usd": unrealized_usd,
         "margin_used": margin_used,
         "leverage": leverage,
+        # O-4: liquidation price run through the executor's defensive parser
+        # so "0"/None/missing ("fully margined" / tiny positions) map to None
+        # — the card renders "—" instead of a false 0.0 liquidation level.
+        "liq_px": _parse_liquidation_px(pos.get("liquidationPx")),
     }
 
 
@@ -526,6 +631,7 @@ def _rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
         unrealized_usd = parsed["unrealized_usd"]
         margin_used = parsed["margin_used"]
         leverage = parsed["leverage"]
+        liq_px = parsed.get("liq_px")
 
         spot_pct = ((mark - entry) / entry * 100 if side == "long"
                     else (entry - mark) / entry * 100) if entry else 0
@@ -548,6 +654,7 @@ def _rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
             "unrealized_pct": roe_pct,       # leveraged ROE — matches HL
             "spot_pct": spot_pct,            # bare price move, for the curious
             "dsl": dsl_info,
+            "liq_px": liq_px,                # O-4: None renders "—" in the card
         })
     return rows
 
@@ -1493,6 +1600,181 @@ def require_operator_write(request: Request) -> None:
     _require_operator(request, write=True)
 
 
+# ── O-1: two-step confirmation for FORBIDDEN_OVERRIDE arming ──────────────────
+#
+# Arming a force-execute / bypass switch (whale_force_execute, breakout_*, …)
+# flips a safety gate OFF, so it must never happen on a single leaked-token
+# keystroke. The operator first POSTs the patch to /force-confirm, which
+# validates it and mints a one-time confirm_token bound to (payload hash,
+# operator IP). The real write then echoes the SAME payload with that token;
+# the token is single-use, TTL-bounded, and a per-IP cooldown blocks rapid
+# re-arming. Disarming (false) and ordinary keys never enter this path.
+
+_FORCE_CONFIRM_TTL_S = float(os.environ.get("HERMES_FORCE_CONFIRM_TTL_S", "120"))
+# After one successful arm, the same IP cannot arm again for this long (429 +
+# Retry-After). Set to 0 via env to disable (tests use this).
+_FORCE_ARM_COOLDOWN_S = float(os.environ.get("HERMES_FORCE_ARM_COOLDOWN_S", "300"))
+_force_confirm_lock = threading.Lock()
+# confirm_token -> {"fp": payload fingerprint, "ip": client ip, "exp": epoch s}
+_force_confirm_tokens: dict[str, dict[str, Any]] = {}
+# ip -> last successful-arm epoch seconds (cooldown keyed per operator IP).
+_force_arm_last_at: dict[str, float] = {}
+
+
+def _reset_force_override_gate() -> None:
+    """Clear all pending confirm tokens and arm-cooldown timestamps.
+
+    Test/helper only — production state self-expires via TTL/cooldown."""
+    with _force_confirm_lock:
+        _force_confirm_tokens.clear()
+        _force_arm_last_at.clear()
+
+
+def updates_arm_force_override(updates: dict[str, Any]) -> bool:
+    """True iff ``updates`` ARMS (sets true) any FORBIDDEN_OVERRIDE switch.
+
+    Disarming (false) and ordinary keys return False — those writes never
+    require the confirmation token."""
+    if not isinstance(updates, dict):
+        return False
+    return any(
+        k in FORCE_OVERRIDE_KEYS and updates.get(k) is True
+        for k in updates
+    )
+
+
+def _force_payload_fingerprint(updates: dict[str, Any]) -> str:
+    """Stable hash of the arming payload — only the FORBIDDEN_OVERRIDE-relevant
+    keys matter, so a token minted for one switch cannot arm another."""
+    arming = sorted(
+        k for k in updates
+        if k in FORCE_OVERRIDE_KEYS or k == "override_requires_ai"
+    )
+    canonical = json.dumps(
+        {k: updates[k] for k in arming}, sort_keys=True, separators=(",", ":")
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def issue_force_confirm_token(updates: dict[str, Any], ip: str) -> dict[str, Any]:
+    """O-1 step 1: validate the arming patch and mint a one-time confirm token.
+
+    Raises 400 for a non-arming patch, 429 while the per-IP arm cooldown is
+    active, and 422 when the patch fails the shared schema gate. Returns
+    ``{"confirm_token": ..., "arming": [...], "expires_in_s": ...}``.
+    """
+    arming = sorted(k for k in updates if k in FORCE_OVERRIDE_KEYS and updates[k] is True)
+    if not arming:
+        raise HTTPException(
+            400, "updates do not arm any FORBIDDEN_OVERRIDE switch "
+            "(use the normal config write for non-force keys)",
+        )
+    # The patch must clear the schema gate (e.g. override_requires_ai=true)
+    # before we hand out a token — never issue a token for an invalid arm.
+    errors = _validate_config_updates(updates)
+    if errors:
+        raise HTTPException(422, json.dumps({"errors": errors}))
+
+    now = time.time()
+    with _force_confirm_lock:
+        last = _force_arm_last_at.get(ip, 0.0)
+        if _FORCE_ARM_COOLDOWN_S > 0 and now < last + _FORCE_ARM_COOLDOWN_S:
+            retry = int(last + _FORCE_ARM_COOLDOWN_S - now) + 1
+            raise HTTPException(
+                429,
+                "force-override arming cooldown active; wait before arming again",
+                headers={"Retry-After": str(max(1, retry))},
+            )
+        token = secrets.token_urlsafe(32)
+        _force_confirm_tokens[token] = {
+            "fp": _force_payload_fingerprint(updates),
+            "ip": ip,
+            "exp": now + _FORCE_CONFIRM_TTL_S,
+        }
+        # Opportunistic sweep of expired tokens.
+        if len(_force_confirm_tokens) > 1024:
+            for t in [t for t, v in _force_confirm_tokens.items() if v["exp"] <= now]:
+                _force_confirm_tokens.pop(t, None)
+    return {
+        "confirm_token": token,
+        "arming": arming,
+        "expires_in_s": int(_FORCE_CONFIRM_TTL_S),
+    }
+
+
+def consume_force_confirm_token(updates: dict[str, Any], ip: str, token: str | None) -> None:
+    """O-1 step 2: validate + single-use consume the confirm token for an
+    arming write. Raises 409 on missing/mismatched/expired/replayed token.
+
+    On success the token is consumed (single use) and the per-IP arm cooldown
+    starts. The actual config write happens in the caller only after this
+    returns — a raised HTTPException leaves config untouched.
+    """
+    if not token:
+        raise HTTPException(
+            409,
+            "arming a FORBIDDEN_OVERRIDE switch requires two-step confirmation: "
+            "first POST the same updates to /api/dashboard/config/force-confirm "
+            "to obtain a confirm_token, then repeat this write with it",
+        )
+    fp = _force_payload_fingerprint(updates)
+    now = time.time()
+    with _force_confirm_lock:
+        rec = _force_confirm_tokens.pop(token, None)  # single use: always pop
+        if rec is None:
+            raise HTTPException(409, "invalid or already-used force confirm_token")
+        if rec["exp"] <= now:
+            raise HTTPException(409, "force confirm_token expired; request a new one")
+        if rec["ip"] != ip:
+            raise HTTPException(409, "force confirm_token bound to a different operator IP")
+        if rec["fp"] != fp:
+            raise HTTPException(
+                409,
+                "force confirm_token does not match this payload "
+                "(token is bound to the exact updates sent to force-confirm)",
+            )
+        # Arm succeeded — start the per-IP re-arm cooldown.
+        _force_arm_last_at[ip] = now
+
+
+def require_operator_or_internal(request: Request) -> None:
+    """L-2: gate read-only diagnostic endpoints (/metrics, /postmortems).
+
+    Allow either a valid operator token OR a loopback/LAN peer (Prometheus
+    scraper / internal viewer on the same host or private network). A remote,
+    unauthenticated caller is rejected with 401. Write endpoints never use
+    this — they require the full operator token via ``require_operator_write``.
+    """
+    if _request_has_operator_creds(request):
+        _require_operator(request)  # raises 401/429/503 on bad creds
+        return
+    ip = _client_ip(request)
+    if _is_internal_ip(ip):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="operator token or internal/LAN origin required",
+        headers={"WWW-Authenticate": 'Bearer realm="hermes-trader"'},
+    )
+
+
+def _is_internal_ip(ip: str) -> bool:
+    """True for loopback and RFC-1918 private addresses (LAN scrapers)."""
+    if not ip or ip in ("unknown",):
+        return False
+    # "testclient" is Starlette TestClient's loopback peer (offline tests).
+    if ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return True
+    # Strip an IPv4-mapped IPv6 prefix (::ffff:10.0.0.1).
+    ip = ip.removeprefix("::ffff:")
+    try:
+        import ipaddress
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr.is_private or addr.is_link_local
+
+
 # D-FCFG-3: short-lived SSE feed tickets. The browser EventSource API cannot
 # set request headers, so the operator token (Authorization/X-Operator-Token)
 # cannot ride the stream connection directly. Instead an authenticated UI
@@ -1860,6 +2142,20 @@ async def _h_set(parts: list[str], cmd: str) -> Optional[JSONResponse]:
     key = parts[1]
     raw = " ".join(parts[2:]).strip()
     new_val = _coerce_config_value(raw)
+    # O-1: the free-form terminal `set` verb is a single, unconfirmed keystroke
+    # — it must never be able to ARM a FORBIDDEN_OVERRIDE switch. Disarming
+    # (false) stays allowed; arming (true) is refused and pointed at the
+    # two-step HTTP force-confirm flow.
+    if new_val is True and key in FORCE_OVERRIDE_KEYS:
+        return JSONResponse({
+            "response": (
+                f"refused: arming {key} via terminal `set` is disabled. "
+                "Arming a FORBIDDEN_OVERRIDE switch requires two-step confirmation "
+                "via POST /api/dashboard/config/force-confirm (then repeat the "
+                "config write with the returned confirm_token)."
+            ),
+            "kind": "error",
+        })
     # F4: same whitelist/type/range gate as the web config API —
     # terminal `set` must not be an unvalidated write path.
     errors = _validate_config_updates({key: new_val})

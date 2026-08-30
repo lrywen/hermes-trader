@@ -940,6 +940,33 @@ class AgentMemory:
             halted = int(self._global_halt_until_ms or 0) > now_ms
         return {"armed_coins": armed, "global_halt": bool(halted)}
 
+    def risk_status_snapshot(self) -> dict[str, Any]:
+        """O-4 (audit 2026-08-31): richer read-only breaker view for the
+        dashboard's risk-status card. Like ``circuit_snapshot`` this never
+        mutates (no purge) — expired entries are excluded by timestamp, not
+        deleted — so a read-only scrape can never alter trading state.
+
+        Returns ``global_halt`` armed flag + remaining minutes, and the map of
+        currently-armed per-coin circuits with their remaining minutes, so the
+        UI can show WHICH coins are gated and for how long (not just a count).
+        """
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            g_exp = int(self._global_halt_until_ms or 0)
+            global_halt = g_exp > now_ms
+            global_remaining_min = max(0.0, (g_exp - now_ms) / 60_000) if global_halt else 0.0
+            coin_circuits = {
+                str(coin): round(max(0.0, (int(exp) - now_ms) / 60_000), 1)
+                for coin, exp in self._coin_circuit.items()
+                if int(exp or 0) > now_ms
+            }
+        return {
+            "global_halt": global_halt,
+            "global_halt_remaining_min": round(global_remaining_min, 1),
+            "coin_circuits": coin_circuits,
+            "armed_coins": len(coin_circuits),
+        }
+
     def record_loss_outcome(self, coin: str, realized_pnl_pct: float) -> None:
         """Update the per-coin consecutive-loss streak from a realized close.
         A loss increments (the breaker gate decides whether the count trips);
