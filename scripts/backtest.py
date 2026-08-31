@@ -4,7 +4,9 @@
 Walks 1h-bar history per coin, evaluates the same triggers + TA-filter
 logic as the live scanner, simulates entries with the current sizing
 formula (equity_fraction x per-coin-max leverage), and exits via the DSL
-two-phase trailing-stop engine. PnL is net of round-trip taker fees.
+two-phase trailing-stop engine. PnL is net of the round-trip taker fee AND
+adverse entry/exit slippage plus a stop-out delay penalty (H-7 cost model;
+--no-slippage restores the fee-only baseline).
 
 The AI research step is *substituted* with a deterministic heuristic that
 mirrors the system prompt's entry rules — calling OpenRouter per signal
@@ -84,20 +86,41 @@ def _closed_slice(series: Optional[List[Candle]], ts_ms: List[int],
 # Hyperliquid perp taker fee model used by the live executor: 2.5 bps per side.
 ROUND_TRIP_FEE_BPS = 5.0
 
+# H-7 (supplemental audit 2026-08-30): the old model charged ONLY the 5 bps
+# round-trip fee and filled stops intra-bar at the exact stop price, while the
+# live system (a) pays adverse slippage on every IOC entry/exit (live caps:
+# 1.5% open / 5.0% close, exchange.py max_slippage_*), and (b) never fills at
+# the stop price — the exit signal fires on a confirmed bar and the marketable
+# IOC lands several seconds later through the book. Costs below default to
+# live-observed conservative values and can be overridden via CLI; when
+# --use-memory-slip is set, per-coin realized adverse exit slip from
+# memory.avg_exit_slip_bps overrides the exit default (same data the live
+# stop-widener uses).
+DEFAULT_ENTRY_SLIP_BPS = 5.0    # ~typical taker adverse fill on entry
+DEFAULT_EXIT_SLIP_BPS = 15.0    # exits are market/stop-driven → wider
+# Exit confirmation-delay penalty: live exits wait ~4s mid + oracle confirm +
+# IOC transit. In a 1h bar that drift is negligible, but a stop firing in a
+# fast move overshoots the stop price; modeled as extra adverse bps on
+# stop-out exits only (trailing/timeout exits use the regular exit slip).
+DEFAULT_STOP_DELAY_SLIP_BPS = 10.0
+
 
 @dataclass
 class Trade:
     coin: str
     side: str           # "long" or "short"
     entry_bar: int
-    entry_px: float
+    entry_px: float     # filled entry price AFTER adverse entry slippage (H-7)
     notional: float
     margin: float
     leverage: int
     exit_bar: int = 0
-    exit_px: float = 0.0
+    exit_px: float = 0.0  # filled exit price AFTER adverse exit slippage (H-7)
     pnl_usd: float = 0.0
     exit_reason: str = ""
+    # O-7 (supplemental audit 2026-08-30): in-sample vs out-of-sample tag for
+    # walk-forward validation. A trade entered on/after the split bar is OOS.
+    in_sample: bool = True
 
 
 @dataclass
@@ -236,11 +259,25 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
               candles_4h: Optional[List[Candle]] = None,
               candles_15m: Optional[List[Candle]] = None,
               late_entry_params: Optional[Dict[str, Any]] = None,
-              late_vetoes: Optional[List[dict]] = None) -> List[Trade]:
+              late_vetoes: Optional[List[dict]] = None,
+              entry_slip_bps: float = DEFAULT_ENTRY_SLIP_BPS,
+              exit_slip_bps: float = DEFAULT_EXIT_SLIP_BPS,
+              stop_delay_slip_bps: float = DEFAULT_STOP_DELAY_SLIP_BPS,
+              fee_bps: float = ROUND_TRIP_FEE_BPS,
+              oos_split_bar: Optional[int] = None) -> List[Trade]:
     trades: List[Trade] = []
     open_t: Optional[Trade] = None
     open_dsl: Optional[DSL] = None
-    fee_pct = ROUND_TRIP_FEE_BPS / 10000.0
+    # O-8 (supplemental audit 2026-08-30): fee_bps can be overridden per coin
+    # from memory.avg_round_trip_fee_bps (measured exchange fees); defaults to
+    # the conservative ROUND_TRIP_FEE_BPS constant when history is thin.
+    fee_pct = fee_bps / 10000.0
+
+    # H-7: adverse-fill helpers. A marketable IOC BUY fills ABOVE the reference
+    # price and a SELL fills BELOW; ``bps`` is the adverse fraction in bps.
+    def _fill(px: float, is_buy: bool, bps: float) -> float:
+        adj = px * bps / 10000.0
+        return px + adj if is_buy else px - adj
 
     # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live
     # ta_late_entry_gate re-runs late_entry_check() on FRESH 4h (+15m) candles
@@ -266,8 +303,18 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
 
         # Manage open position
         if open_t and open_dsl:
-            done, exit_px, reason = open_dsl.check_bar(i, bar)
+            done, exit_ref, reason = open_dsl.check_bar(i, bar)
             if done:
+                # H-7: the DSL stop price is a TRIGGER, not a fill. The live
+                # exit waits for mid-hold + oracle confirm then crosses the
+                # book with a marketable IOC — always adverse, and a stop-out
+                # in a fast move overshoots (extra delay penalty). Closing a
+                # long = SELL (fills below ref); closing a short = BUY (fills
+                # above). Trail/timeout exits pay the regular exit slip.
+                is_stop_out = reason.startswith("max_loss")
+                slip = exit_slip_bps + (stop_delay_slip_bps if is_stop_out else 0.0)
+                close_is_buy = open_t.side == "short"
+                exit_px = _fill(exit_ref, close_is_buy, slip)
                 gross_pct = ((exit_px - open_t.entry_px) / open_t.entry_px
                              if open_t.side == "long"
                              else (open_t.entry_px - exit_px) / open_t.entry_px)
@@ -275,6 +322,11 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
                 open_t.exit_px = exit_px
                 open_t.pnl_usd = open_t.notional * (gross_pct - fee_pct)
                 open_t.exit_reason = reason
+                # O-7: classify by ENTRY bar — a position opened before the split
+                # that exits after it still belongs to the in-sample generation
+                # (the decision used only in-sample information).
+                if oos_split_bar is not None:
+                    open_t.in_sample = open_t.entry_bar < oos_split_bar
                 trades.append(open_t)
                 open_t = open_dsl = None
             else:
@@ -312,7 +364,11 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
         lev = min(lev_ceiling, max_lev)
         notional = equity * equity_fraction * lev
         margin = equity * equity_fraction
-        open_t = Trade(coin=coin, side=side, entry_bar=i + 1, entry_px=next_bar.o,
+        # H-7: entry IOC fills adverse to next bar's open (long BUY fills above,
+        # short SELL fills below). The stop/trail ladder anchors on the FILLED
+        # price, matching live dsl_exit which tracks the actual entry price.
+        entry_px = _fill(next_bar.o, side == "long", entry_slip_bps)
+        open_t = Trade(coin=coin, side=side, entry_bar=i + 1, entry_px=entry_px,
                        notional=notional, margin=margin, leverage=lev)
         # ATR-stop mode: stop width = atr_mult × ATR% at entry, clamped — mirrors
         # the live dsl_exit.atr_stop feature. atr_mult=0 keeps the fixed stop.
@@ -321,17 +377,134 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
             eff_max_loss = min(max(atr_pct * atr_mult, atr_floor), atr_ceiling)
             if stop_widths is not None:
                 stop_widths.append(eff_max_loss)
-        open_dsl = DSL(side=side, entry_px=next_bar.o, entry_bar=i + 1,
-                       peak_px=next_bar.o, max_loss_pct=eff_max_loss,
+        open_dsl = DSL(side=side, entry_px=entry_px, entry_bar=i + 1,
+                       peak_px=entry_px, max_loss_pct=eff_max_loss,
                        protect_pct=protect_pct, retrace_threshold=retrace_threshold)
     return trades
 
 
-def _print_summary(all_trades: List[Trade], equity: float, days: int) -> None:
+# O-7 (supplemental audit 2026-08-30): walk-forward / out-of-sample split.
+def oos_split_index(n_bars: int, warmup: int, oos_frac: float) -> int:
+    """Bar index at which the out-of-sample window starts.
+
+    Only bars in [warmup, n_bars) can generate entries (the loop decision
+    window), so the split is placed ``oos_frac`` of the way through THAT
+    window. Trades with entry_bar >= the returned index are out-of-sample.
+    The fixed ``warmup`` indicator prefix is always in-sample (no leakage —
+    indicators on OOS bars only read past bars).
+    """
+    if n_bars <= warmup:
+        return n_bars  # nothing tradeable → all "in-sample"
+    return int(warmup + (n_bars - warmup) * (1.0 - oos_frac))
+
+
+def _split_metrics(trades: List[Trade], equity: float) -> Dict[str, Any]:
+    """Stats for one walk-forward segment: count, win rate, expectancy, total
+    PnL, per-trade Sharpe (365/active-days annualization), and the peak-to-trough
+    max drawdown of the cumulative-PnL path (USD)."""
+    n = len(trades)
+    out: Dict[str, Any] = {"n": n}
+    if n == 0:
+        return out
+    pnls = [t.pnl_usd for t in trades]
+    wins = sum(1 for p in pnls if p > 0)
+    total = sum(pnls)
+    out.update(
+        n=n, wins=wins, win_rate=wins / n * 100,
+        expectancy=total / n, pnl=total, pnl_pct=total / equity * 100,
+    )
+    # Per-trade Sharpe, annualized over the span the trades actually cover.
+    # One trade per coin at a time but many coins run concurrently, so the
+    # trading span is taken from first entry to last exit bar.
+    mean = total / n
+    var = sum((p - mean) ** 2 for p in pnls) / (n - 1) if n > 1 else 0.0
+    sd = math.sqrt(var)
+    span_days = 0
+    try:
+        # exit_bar - entry_bar differences are per-coin; the segment's calendar
+        # span is (last exit - first entry) of the whole merged trade list, but
+        # bars here are per-coin indices so we only use the mean holding span as
+        # a conservative per-trade horizon. Sharpe is reported for relative
+        # IS-vs-OOS comparison, not as an absolute fund Sharpe.
+        span_days = max(
+            1.0,
+            sum((t.exit_bar - t.entry_bar) for t in trades) / n / 24.0,
+        )
+    except Exception:
+        span_days = 1.0
+    if sd > 0:
+        out["sharpe"] = mean / sd * math.sqrt(365.0 / span_days)
+    else:
+        out["sharpe"] = 0.0
+    # Max drawdown over the chronological cumulative-PnL path. Trades from
+    # different coins interleave on bars; ordering by exit bar gives a close
+    # approximation of the realized equity curve (constant-equity assumption).
+    ordered = sorted(trades, key=lambda t: (t.exit_bar, t.coin))
+    peak = 0.0
+    cum = 0.0
+    mdd = 0.0
+    for t in ordered:
+        cum += t.pnl_usd
+        if cum > peak:
+            peak = cum
+        dd = peak - cum
+        if dd > mdd:
+            mdd = dd
+    out["max_dd"] = mdd
+    return out
+
+
+def _print_walk_forward(all_trades: List[Trade], equity: float) -> None:
+    """O-7: print the in-sample vs out-of-sample comparison block."""
+    is_tr = [t for t in all_trades if t.in_sample]
+    oos_tr = [t for t in all_trades if not t.in_sample]
+    print("\n=== WALK-FORWARD / OUT-OF-SAMPLE (O-7) ===")
+    if not oos_tr:
+        print("no out-of-sample trades (raise --oos-frac or widen the window)")
+        return
+    ms = _split_metrics(is_tr, equity)
+    mo = _split_metrics(oos_tr, equity)
+
+    print(f"  {'Segment':<22s} {'IN-SAMPLE':>14s} {'OUT-OF-SAMPLE':>14s}")
+    print(f"  {'-'*22} {'-'*14} {'-'*14}")
+
+    def _line(label: str, vs: str, vo: str) -> None:
+        print(f"  {label:<22s} {vs:>14s} {vo:>14s}")
+
+    _line("trades", str(ms.get("n", 0)), str(mo.get("n", 0)))
+    _line("win rate",
+          f"{ms['win_rate']:.1f}%" if ms.get("n") else "-",
+          f"{mo['win_rate']:.1f}%" if mo.get("n") else "-")
+    _line("expectancy/trade",
+          f"${ms['expectancy']:+.3f}" if ms.get("n") else "-",
+          f"${mo['expectancy']:+.3f}" if mo.get("n") else "-")
+    _line("total PnL",
+          f"${ms['pnl']:+.2f}" if ms.get("n") else "-",
+          f"${mo['pnl']:+.2f}" if mo.get("n") else "-")
+    _line("return on equity",
+          f"{ms['pnl_pct']:+.1f}%" if ms.get("n") else "-",
+          f"{mo['pnl_pct']:+.1f}%" if mo.get("n") else "-")
+    _line("Sharpe (per-trade)",
+          f"{ms['sharpe']:.2f}" if ms.get("n") else "-",
+          f"{mo['sharpe']:.2f}" if mo.get("n") else "-")
+    _line("max drawdown",
+          f"${ms['max_dd']:.2f}" if ms.get("n") else "-",
+          f"${mo['max_dd']:.2f}" if mo.get("n") else "-")
+    oos_ok = mo.get("n", 0) > 0 and mo.get("expectancy", 0.0) > 0
+    print("\n  The strategy is validated out-of-sample only when the OOS "
+          "expectancy/PnL stays positive and its Sharpe is in the same "
+          "ballpark as in-sample — a large IS-OOS gap means overfitting.")
+    print(f"  OOS verdict: {'EDGE HELD out-of-sample' if oos_ok else 'OOS edge not present — treat IS results with caution'}")
+
+
+def _print_summary(all_trades: List[Trade], equity: float, days: int,
+                   cost_note: str = "", oos: bool = False) -> None:
     print("\n=== SUMMARY ===")
     n = len(all_trades)
     if n == 0:
         print("no trades fired")
+        if cost_note:
+            print(f"\nCaveats:\n  - {cost_note}")
         return
     wins = [t for t in all_trades if t.pnl_usd > 0]
     losses = [t for t in all_trades if t.pnl_usd < 0]
@@ -364,13 +537,16 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int) -> None:
 
     print("\nCaveats:")
     print("  - AI verdict substituted with a heuristic (score / trend / burst). Real LLM not replayed.")
-    print(f"  - No funding cost, no slippage beyond a {ROUND_TRIP_FEE_BPS:.1f}-bps round-trip fee.")
+    if cost_note:
+        print(f"  - {cost_note}")
     print("  - One open position per coin at a time; max_concurrent cap NOT enforced across coins.")
     print("  - Equity held constant (no compounding); cooldown_min not applied.")
     print("  - ta_late_entry hard gate is 100% aligned with live: same late_entry_check() "
           "pure function, ENFORCED (backtests evaluate the final rule set), and only "
           "4h/15m bars CLOSED by the decision instant are used — no look-ahead.")
     print("  - Past performance does NOT imply future results.")
+    if oos:
+        _print_walk_forward(all_trades, equity)
 
 
 def main() -> int:
@@ -398,7 +574,31 @@ def main() -> int:
     ap.add_argument("--no-late-entry", action="store_true",
                     help="disable the live ta_late_entry hard gate (default: enforced, "
                          "100% parity with the live order-time gate)")
+    ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
+                    help=f"adverse entry slippage in bps (default {DEFAULT_ENTRY_SLIP_BPS})")
+    ap.add_argument("--exit-slip-bps", type=float, default=DEFAULT_EXIT_SLIP_BPS,
+                    help=f"adverse exit slippage in bps (default {DEFAULT_EXIT_SLIP_BPS})")
+    ap.add_argument("--stop-delay-slip-bps", type=float, default=DEFAULT_STOP_DELAY_SLIP_BPS,
+                    help="extra adverse bps on max_loss stop-outs (confirm-delay/overshoot; "
+                         f"default {DEFAULT_STOP_DELAY_SLIP_BPS})")
+    ap.add_argument("--use-memory-slip", action="store_true",
+                    help="override --exit-slip-bps per coin with memory.avg_exit_slip_bps "
+                         "(realized adverse exit slip from live closes; falls back to the "
+                         "default when a coin has < the configured min samples)")
+    ap.add_argument("--use-memory-fee", action="store_true",
+                    help="O-8: calibrate the round-trip fee per coin with "
+                         "memory.avg_round_trip_fee_bps (actual exchange fee_usd from live "
+                         "closes; falls back to the 5-bps default when a coin has < the "
+                         "configured min samples)")
+    ap.add_argument("--no-slippage", action="store_true",
+                    help="zero all slippage/penalty (fee-only, pre-H-7 behavior)")
+    ap.add_argument("--oos-frac", type=float, default=0.0,
+                    help="O-7: fraction of the tradeable window held out as "
+                         "out-of-sample for walk-forward validation (e.g. 0.3 = "
+                         "last 30%%; 0 disables the IS/OOS report)")
     args = ap.parse_args()
+    if not 0.0 <= args.oos_frac < 1.0:
+        ap.error("--oos-frac must be in [0, 1) (0 disables the OOS report)")
 
     live = read_agent_config()
     live_dsl = live.get("dsl_exit", {}) or {}
@@ -418,6 +618,42 @@ def main() -> int:
     # order-time gate reads). The backtest ENFORCES the veto regardless of the
     # live mode (shadow/enforce is a deployment control, not a rule difference).
     late_entry_params: Dict[str, Any] = {} if args.no_late_entry else dict(live.get("ta_late_entry") or {})
+
+    # H-7 cost model (see constants above). --no-slippage restores the
+    # fee-only baseline; otherwise defaults are live-conservative and the
+    # per-coin exit slip can be overridden from realized live closes.
+    if args.no_slippage:
+        entry_slip_bps = exit_slip_bps = stop_delay_slip_bps = 0.0
+    else:
+        entry_slip_bps = float(args.entry_slip_bps)
+        exit_slip_bps = float(args.exit_slip_bps)
+        stop_delay_slip_bps = float(args.stop_delay_slip_bps)
+    _mem = None
+    if args.use_memory_slip and not args.no_slippage:
+        try:
+            from hermes_trader.agents.memory import memory as _mem_obj
+            _mem = _mem_obj
+        except Exception as e:  # read-only best effort; defaults stay in place
+            print(f"  (memory slip unavailable: {e}; using --exit-slip-bps default)")
+    # O-8: measured round-trip fee source. Fee is charged regardless of the
+    # slippage toggle, so this is independent of --no-slippage.
+    _mem_fee = None
+    if args.use_memory_fee:
+        try:
+            from hermes_trader.agents.memory import memory as _mem_fee
+        except Exception as e:  # read-only best effort; default fee stays
+            print(f"  (memory fee unavailable: {e}; using {ROUND_TRIP_FEE_BPS:.1f}-bps default)")
+            _mem_fee = None
+
+    _fee_tag = " per-coin calibrated from live fills" if _mem_fee is not None else ""
+    if args.no_slippage:
+        cost_note = (f"Fee-only model (--no-slippage): {ROUND_TRIP_FEE_BPS:.1f}-bps "
+                     f"round-trip fee{_fee_tag}, no slippage.")
+    else:
+        cost_note = (f"Cost model (H-7): {ROUND_TRIP_FEE_BPS:.1f}-bps round-trip fee{_fee_tag} + "
+                     f"{entry_slip_bps:.1f}-bps entry slip / {exit_slip_bps:.1f}-bps exit slip"
+                     f"{' (per-coin from live memory where available)' if _mem is not None else ''}"
+                     f" + {stop_delay_slip_bps:.1f}-bps stop-out delay penalty; no funding cost.")
 
     bars_per_day = {"5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}[args.interval]
     total_bars = args.days * bars_per_day + 100  # +warmup
@@ -465,6 +701,32 @@ def main() -> int:
                 except Exception as e:
                     print(f"  {coin:8} late-entry gate unavailable ({e}) — running without it")
                     candles_4h = candles_15m = None
+            # H-7: per-coin realized adverse exit slip (when enabled and the
+            # coin has enough live closes), else the CLI/default value.
+            coin_exit_slip = exit_slip_bps
+            if _mem is not None:
+                try:
+                    _ms = float(_mem.avg_exit_slip_bps(coin))
+                    if _ms > 0.0:
+                        coin_exit_slip = _ms
+                except Exception:
+                    pass
+            # O-8: per-coin measured round-trip fee (when enabled and enough
+            # live closes), else the static default.
+            coin_fee_bps = ROUND_TRIP_FEE_BPS
+            if _mem_fee is not None:
+                try:
+                    _mf = float(_mem_fee.avg_round_trip_fee_bps(coin))
+                    if _mf > 0.0:
+                        coin_fee_bps = _mf
+                except Exception:
+                    pass
+            # O-7: walk-forward split. The decision window runs from `warmup`
+            # (100) to the last candle; --oos-frac holds its tail out. The 100-
+            # bar warmup prefix is always in-sample (indicators only read the
+            # past, so it leaks nothing into OOS).
+            coin_oos_bar = (oos_split_index(len(candles), 100, args.oos_frac)
+                            if args.oos_frac > 0 else None)
             trades = _simulate(
                 coin, candles, max_lev,
                 equity=args.equity, equity_fraction=equity_fraction,
@@ -475,6 +737,9 @@ def main() -> int:
                 atr_ceiling=atr_ceiling, stop_widths=stop_widths,
                 candles_4h=candles_4h, candles_15m=candles_15m,
                 late_entry_params=late_entry_params, late_vetoes=late_vetoes,
+                entry_slip_bps=entry_slip_bps, exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip_bps,
+                fee_bps=coin_fee_bps, oos_split_bar=coin_oos_bar,
             )
             pnl = sum(t.pnl_usd for t in trades)
             w = sum(1 for t in trades if t.pnl_usd > 0)
@@ -490,7 +755,8 @@ def main() -> int:
         if len(late_vetoes) > 8:
             print(f"  ... and {len(late_vetoes) - 8} more")
 
-    _print_summary(all_trades, args.equity, args.days)
+    _print_summary(all_trades, args.equity, args.days, cost_note=cost_note,
+                   oos=args.oos_frac > 0)
     if stop_widths:
         sw = sorted(stop_widths)
         n = len(sw)

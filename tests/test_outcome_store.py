@@ -76,3 +76,46 @@ def test_get_win_rate_falls_back_when_no_closes():
     m = _mem()  # no closes recorded
     wr = m.get_win_rate()
     assert wr["total"] == 0 and wr["rate"] == 0
+
+
+# ── O-8 (supplemental audit 2026-08-30): measured round-trip fee ──────────
+
+def _fee_close(fee_usd, notional_usd, *, fee_actual, coin="F"):
+    """A close row carrying (or not) real exchange fees. closed_at=now (ms)
+    so it falls inside the 30-day lookback window."""
+    import time as _t
+    return {
+        "coin": coin, "side": "long", "entry_px": 100.0, "exit_px": 100.0,
+        "realized_pnl_pct": 0.0, "spot_pct": 0.0, "realized_pnl_usd": 0.0,
+        "leverage": 1, "closed_at": int(_t.time() * 1000),
+        "fee_usd": fee_usd, "notional_usd": notional_usd,
+        "fee_actual": fee_actual,
+    }
+
+
+def test_avg_round_trip_fee_bps_from_real_closes():
+    # $1000 notional, $0.40/$0.60/$0.50 round-trip fees → 4/6/5 bps → mean 5.
+    m = _mem()
+    m.record_close(_fee_close(0.40, 1000.0, fee_actual=True))
+    m.record_close(_fee_close(0.60, 1000.0, fee_actual=True))
+    m.record_close(_fee_close(0.50, 1000.0, fee_actual=True))
+    bps = m.avg_round_trip_fee_bps("F")
+    assert abs(bps - 5.0) < 1e-9
+
+
+def test_avg_fee_ignores_modeled_close_rows():
+    # In-process DSL closes model fee_usd as 2.5bpsx2 and are NOT flagged
+    # fee_actual — they must not calibrate the backtest constant (circular).
+    m = _mem()
+    for _ in range(5):
+        m.record_close(_fee_close(0.05, 1000.0, fee_actual=False))
+    # Insufficient REAL samples → 0.0 (caller keeps the conservative default).
+    assert m.avg_round_trip_fee_bps("F") == 0.0
+
+
+def test_avg_fee_below_min_samples_returns_zero():
+    m = _mem()
+    m.record_close(_fee_close(0.40, 1000.0, fee_actual=True))
+    m.record_close(_fee_close(0.60, 1000.0, fee_actual=True))
+    # Only 2 real samples < min_samples=3 → no calibration on noise.
+    assert m.avg_round_trip_fee_bps("F") == 0.0

@@ -254,6 +254,12 @@ class AgentMemory:
         # (load/replay) and updated incrementally in record_close.
         self._close_stats_built: bool = False
         self._slip_series: dict[str, Deque[tuple[float, float]]] = {}
+        # O-8 (supplemental audit 2026-08-30): coin -> deque of
+        # (closed_at_epoch_s, realized_round_trip_fee_bps>0). Calibrates the
+        # backtests' hardcoded 5-bps round-trip fee against ACTUAL exchange
+        # fees (fee_usd / notional_usd from closes marked fee_actual=True —
+        # i.e. real exchange fill fees, not the in-process modeled estimate).
+        self._fee_series: dict[str, Deque[tuple[float, float]]] = {}
         self._day_realized_usd: dict[str, float] = {}
         self._day_stats_start_ts: int = 0
         self._initialized = False
@@ -1024,6 +1030,7 @@ class AgentMemory:
         replaced (_rebuild_from_events). Idempotent: fold order is the
         _closes append order."""
         self._slip_series = {}
+        self._fee_series = {}
         self._day_realized_usd = {}
         day_start = self._day_start_ts
         for c in self._closes:
@@ -1061,6 +1068,29 @@ class AgentMemory:
                 dq.append((ts_s, v))
                 if len(dq) > _memory_limits()["closes"]:
                     dq.popleft()
+        # O-8: fold the REALIZED round-trip fee (bps of notional) into the
+        # fee deque, but only for closes carrying actual exchange fees
+        # (fee_actual=True). In-process DSL/AI closes model fee_usd as
+        # 2.5bps×2×notional, so averaging them would just echo the constant
+        # the backtest is trying to calibrate — circular. The external
+        # stop/backfill paths read the fill's real `fee`; those rows get
+        # marked. Backfill rows with no usable notional (entry_px=0) carry
+        # fee_actual=False so they never bias the series low.
+        if c.get("fee_actual"):
+            try:
+                fee_usd = float(c.get("fee_usd") or 0.0)
+                notional = float(c.get("notional_usd") or 0.0)
+            except (TypeError, ValueError):
+                fee_usd = notional = 0.0
+            if fee_usd > 0 and notional > 0:
+                fee_bps = fee_usd / notional * 1e4
+                fdq = self._fee_series.get(coin)
+                if fdq is None:
+                    fdq = deque()
+                    self._fee_series[coin] = fdq
+                fdq.append((ts_s, fee_bps))
+                if len(fdq) > _memory_limits()["closes"]:
+                    fdq.popleft()
         if day_start is None:
             day_start = self._day_start_ts
         # Mirror the old scan: rows without a usable closed_at (0/None) were
@@ -1094,6 +1124,19 @@ class AgentMemory:
                 v = 0.0
             if head_ts == ts_s and abs(head_v - v) < 1e-9:
                 dq.popleft()
+        # O-8: drop the fee deque head when the evicted close was its source
+        # (same coin + closed_at). Fee entries share the _closes append order.
+        fdq = self._fee_series.get(coin)
+        if fdq and c.get("fee_actual"):
+            head_ts, _head_fb = fdq[0]
+            try:
+                _fee = float(c.get("fee_usd") or 0.0)
+                _not = float(c.get("notional_usd") or 0.0)
+                _fb = (_fee / _not * 1e4) if (_fee > 0 and _not > 0) else 0.0
+            except (TypeError, ValueError):
+                _fb = 0.0
+            if head_ts == ts_s and abs(_head_fb - _fb) < 1e-6:
+                fdq.popleft()
         if ts_s and ts_s >= float(self._day_stats_start_ts):
             pnl = c.get("realized_pnl_usd")
             if pnl is not None:
@@ -1158,6 +1201,33 @@ class AgentMemory:
             # at the configured closes limit, so this stays far cheaper than
             # the old full-_closes scan. Rows without a usable closed_at (ts==0.0)
             # were kept by the old scan as well (never aged out).
+            samples = [v for ts, v in (dq or ()) if not ts or ts >= cutoff]
+        if len(samples) < min_samples:
+            return 0.0
+        return sum(samples) / len(samples)
+
+    def avg_round_trip_fee_bps(self, coin: str, days: Optional[float] = None,
+                               min_samples: Optional[int] = None) -> float:
+        """Mean REALIZED round-trip fee in bps of notional over the last
+        `days` for `coin`, derived from close rows that carried actual
+        exchange fill fees (fee_actual=True, fee_usd/notional_usd).
+
+        O-8 (supplemental audit 2026-08-30): the backtests hardcode a 5-bps
+        round-trip taker fee; this lets them calibrate that constant against
+        the venue's real charges. Returns 0.0 when there are fewer than
+        `min_samples` qualifying closes (insufficient history → keep the
+        backtest's conservative default rather than calibrate on noise).
+        Reuses the slip window/sample params (slip_window_days=30.0 /
+        slip_min_samples=3) — same rationale, no extra config surface."""
+        _q = _memory_quality_params()
+        if days is None:
+            days = _q["slip_window_days"]
+        if min_samples is None:
+            min_samples = _q["slip_min_samples"]
+        cutoff = time.time() - days * 86400.0
+        with self._lock:
+            self._ensure_close_stats_nolock()
+            dq = self._fee_series.get(coin)
             samples = [v for ts, v in (dq or ()) if not ts or ts >= cutoff]
         if len(samples) < min_samples:
             return 0.0

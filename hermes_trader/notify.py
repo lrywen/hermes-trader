@@ -41,6 +41,8 @@ import logging
 import os
 import time
 import threading
+import urllib.error
+import urllib.parse
 import urllib.request
 from typing import Any, Optional
 
@@ -162,7 +164,6 @@ def _is_retryable_error(exc: BaseException, status: int) -> bool:
     """
     if status != -1:
         return status == 429 or 500 <= status < 600
-    import urllib.error
     if isinstance(exc, (urllib.error.URLError, TimeoutError, ConnectionError)):
         return True
     if isinstance(exc, OSError):
@@ -229,6 +230,17 @@ def _post_with_retry(
         logger.debug("notify: circuit open, skipping send to %s", channel_url)
         return False
 
+    # M-9 (supplemental audit 2026-08-30): webhook URLs must be plain http(s).
+    # A misconfigured/attacker-controlled channel_url must never reach urllib
+    # as file:// (local file read / LFI) or another non-web scheme.
+    try:
+        if urllib.parse.urlsplit(channel_url).scheme not in ("http", "https"):
+            logger.warning("notify: refusing non-http(s) webhook URL: %r", channel_url)
+            return False
+    except Exception:
+        logger.warning("notify: unparseable webhook URL: %r", channel_url)
+        return False
+
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     if channel_secret:
         ts = int(time.time())
@@ -236,7 +248,6 @@ def _post_with_retry(
         payload["sign"] = _sign(channel_secret, ts)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
 
-    import urllib.error
     last_exc: Optional[BaseException] = None
     last_status: int = -1
     for attempt in range(_RETRY_MAX_TRIES):

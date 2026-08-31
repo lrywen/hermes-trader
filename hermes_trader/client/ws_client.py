@@ -12,7 +12,10 @@ All market data streams through ONE websocket connection:
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
+import math
 import os
 import random
 import ssl
@@ -66,6 +69,10 @@ _WS_HEARTBEAT_S = float(_HL_CLIENT_IO["ws_heartbeat_s"])
 # R13-B13: canonical hl_client_io.ws_seq_max_backward (import-time snapshot;
 # legacy HERMES_WS_SEQ_MAX_BACKWARD env channel still wins at boot).
 _WS_SEQ_MAX_BACKWARD = int(_HL_CLIENT_IO["ws_seq_max_backward"])
+# M-11 (supplemental audit 2026-08-30): import-time snapshot of the per-coin
+# single-tick jump cap (fraction vs previous accepted mid); legacy env
+# HERMES_WS_MAX_TICK_JUMP_FRAC still wins at boot.
+_WS_MAX_TICK_JUMP_FRAC = float(_HL_CLIENT_IO["ws_max_tick_jump_frac"])
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
@@ -102,6 +109,11 @@ class RealtimeSnapshot:
     last_update_time: float = field(default_factory=time.time)
     last_seq: int = 0
     app_heartbeat_at: float = field(default_factory=time.time)
+    # M-10: content hash of the last APPLIED allMids payload. Used to detect
+    # replayed/duplicate frames (HL replays a window after reconnect and the
+    # app heartbeat re-requests the same snapshot); a frame whose payload
+    # matches the last applied one carries no new information.
+    last_payload_hash: str = ""
 
     def get_price(self, coin: str) -> float:
         """Get mid price for a coin."""
@@ -153,6 +165,13 @@ class HyperliquidWebSocket:
         self._seq: int = 0
         self._dropped_dup: int = 0
         self._dropped_stale: int = 0
+        # M-10: frames dropped because their payload hash matched the last
+        # applied frame (true replay/duplicate detection on payload content,
+        # not on the always-incrementing local seq).
+        self._dropped_replay: int = 0
+        # M-11: per-coin mid updates suppressed because a single tick moved the
+        # price by more than _WS_MAX_TICK_JUMP_FRAC vs the previous mid.
+        self._dropped_spike: int = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
 
@@ -192,16 +211,91 @@ class HyperliquidWebSocket:
             self._latest.last_seq = incoming
             return True
 
+    @staticmethod
+    def _payload_hash(mids: dict[str, Any]) -> str:
+        """M-10: stable content hash of an allMids payload.
+
+        Hyperliquid does not emit a per-frame sequence number for allMids, so
+        the old code assigned a LOCAL seq (``self._seq += 1``) and fed it to
+        ``_accept_seq`` — but a locally-incremented seq is always strictly
+        greater than the last, so that dedup could never fire and a replayed
+        frame (HL re-sends the same snapshot after a reconnect / on the app
+        heartbeat re-subscribe) was indistinguishable from a fresh one. We
+        instead hash the payload CONTENT (canonical JSON of the sorted
+        coin->mid map); a frame identical to the last applied one is a replay.
+        """
+        try:
+            blob = json.dumps(mids, sort_keys=True, separators=(",", ":"))
+            return hashlib.sha256(blob.encode("utf-8")).hexdigest()
+        except Exception:
+            return ""
+
+    def _filter_spikes(
+        self, incoming: dict[str, Any], prev: dict[str, str]
+    ) -> tuple[dict[str, str], int]:
+        """M-11: reject per-coin single-tick mid jumps beyond the cap.
+
+        Compares each incoming mid against the previously accepted mid for the
+        SAME coin. If a tick moves the price by more than
+        ``_WS_MAX_TICK_JUMP_FRAC`` (fraction), the new value is treated as a
+        bad print (fat finger / corrupt tick) and the coin's PREVIOUS mid is
+        retained instead; coins with no prior mid (new listing / first
+        observation) and non-finite / <=0 values pass through unchanged. The
+        frame is still applied for every well-behaved coin — only the spiking
+        coin is suppressed. Returns (filtered_mids, n_suppressed).
+        """
+        out: dict[str, str] = dict(prev)  # keep every prior coin as the baseline
+        n_suppressed = 0
+        for coin, raw in incoming.items():
+            try:
+                new_px = float(raw)
+            except (TypeError, ValueError):
+                # Non-numeric mid: keep prior value if we have one.
+                if coin not in out and isinstance(raw, str):
+                    out[coin] = raw
+                continue
+            if new_px <= 0.0 or not math.isfinite(new_px):
+                continue
+            old_raw = prev.get(coin)
+            if old_raw is None:
+                out[coin] = str(raw)  # first observation — nothing to compare
+                continue
+            try:
+                old_px = float(old_raw)
+            except (TypeError, ValueError):
+                out[coin] = str(raw)
+                continue
+            if old_px > 0.0 and abs(new_px - old_px) / old_px > _WS_MAX_TICK_JUMP_FRAC:
+                n_suppressed += 1  # suppress: leave the prior mid in `out`
+                logger.warning(
+                    "[ws] M-11 spike suppressed: %s mid jump %.4f -> %.4f "
+                    "(%.1f%% > cap %.1f%%); keeping previous mid",
+                    coin, old_px, new_px,
+                    abs(new_px - old_px) / old_px * 100.0,
+                    _WS_MAX_TICK_JUMP_FRAC * 100.0,
+                )
+                continue
+            out[coin] = str(raw)
+        return out, n_suppressed
+
     def _on_all_mids(self, data: Any) -> None:
         """Callback for allMids subscription.
 
         SDK wraps the raw message as:
         {"channel": "allMids", "data": {"mids": {"BTC": "50000", ...}}}
 
-        R11-D1: assigns a monotonically-increasing sequence number to
-        every received frame and drops duplicates / replays via
-        ``_accept_seq``. Dropped-frame counters are exposed via
-        ``get_diag()`` so R11-F1 can alert on a flapping dedup.
+        R11-D1: assigns a monotonically-increasing sequence number to every
+        received frame (exposed via ``get_diag`` for ops/alerting).
+
+        M-10 (supplemental audit 2026-08-30): the local seq always increments,
+        so by itself it cannot detect a replayed frame. We additionally hash
+        the payload content and drop frames identical to the last applied one
+        (``_dropped_replay``) — this is what actually catches HL's reconnect
+        replay window and the heartbeat re-subscribe echo.
+
+        M-11: per-coin single-tick jumps beyond ``_WS_MAX_TICK_JUMP_FRAC`` are
+        suppressed (prior mid retained) so a corrupt tick cannot spike pricing
+        downstream (entry pricing is independently cross-checked by H-6).
         """
         if isinstance(data, dict):
             # Extract mids from SDK wrapper
@@ -209,13 +303,35 @@ class HyperliquidWebSocket:
             if isinstance(inner, dict):
                 mids = inner.get("mids", {})
                 if isinstance(mids, dict):
-                    # R11-D1: assign a seq BEFORE the dedup check so
-                    # even dropped frames count against a stuck counter.
+                    # R11-D1: assign a seq BEFORE the dedup check so even
+                    # dropped frames count against a stuck counter.
                     self._seq += 1
-                    if not self._accept_seq(self._seq):
-                        return
+                    # Keep _accept_seq wired (counters/diag/tests) but note the
+                    # local-seq check alone cannot catch a replayed frame; the
+                    # content-hash check below is the real replay guard.
+                    self._accept_seq(self._seq)
+
+                    payload_hash = self._payload_hash(mids)
                     with self._lock:
-                        self._latest.all_mids = dict(mids)
+                        # M-10: identical payload to the last applied frame →
+                        # replay/duplicate, no new information. Drop it but do
+                        # NOT refresh last_update_time (a replayed frame must
+                        # not mask a genuinely stalled feed). An empty mids
+                        # payload yields an empty hash and skips this guard
+                        # (nothing to dedup); it still bumps the seq below.
+                        if payload_hash and payload_hash == self._latest.last_payload_hash:
+                            self._dropped_replay += 1
+                            return
+
+                        # M-11: suppress per-coin bad prints before applying.
+                        # Empty payload: nothing to filter, keep the snapshot.
+                        if mids:
+                            filtered, n_spike = self._filter_spikes(
+                                mids, self._latest.all_mids
+                            )
+                            self._dropped_spike += n_spike
+                            self._latest.all_mids = filtered
+                            self._latest.last_payload_hash = payload_hash
                         self._latest.last_update_time = time.time()
 
     def start(self) -> None:
@@ -334,6 +450,9 @@ class HyperliquidWebSocket:
         - ``last_seq``: sequence number of the last accepted frame.
         - ``dropped_dup``: frames dropped because they duplicated ``last_seq``.
         - ``dropped_stale``: frames dropped because their seq was less than ``last_seq``.
+        - ``dropped_replay`` (M-10): frames dropped because their payload content
+          matched the last applied frame (true replay/duplicate).
+        - ``dropped_spike`` (M-11): per-coin mid updates suppressed as bad prints.
         - ``data_age_s``: age (in seconds) of the latest applied allMids payload.
 
         All values are read under ``self._lock`` so a concurrent callback
@@ -345,6 +464,8 @@ class HyperliquidWebSocket:
                 "last_seq": self._latest.last_seq,
                 "dropped_dup": self._dropped_dup,
                 "dropped_stale": self._dropped_stale,
+                "dropped_replay": self._dropped_replay,
+                "dropped_spike": self._dropped_spike,
                 "data_age_s": time.time() - self._latest.last_update_time,
             }
 
@@ -373,10 +494,14 @@ class HyperliquidWebSocket:
                     # re-emit frames we'd otherwise drop as stale).
                     # Reset both the internal counter and the
                     # last accepted seq so the first frame on the
-                    # new connection is always accepted.
+                    # new connection is always accepted. M-10: also clear
+                    # the last payload hash — otherwise an identical-price
+                    # snapshot on the fresh connection would be mistaken for
+                    # a replay and skipped, leaving last_update_time stale.
                     with self._lock:
                         self._seq = 0
                         self._latest.last_seq = 0
+                        self._latest.last_payload_hash = ""
                     logger.info("[ws] Reconnect successful")
                 except Exception as e:
                     logger.error(f"[ws] Reconnect failed: {e}")

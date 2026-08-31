@@ -749,6 +749,15 @@ while True:
                                 "funding_cost_usd": None,
                                 "close_source": "exchange_trigger",
                                 "close_oid": _fill.get("oid"),
+                                # O-8: fee_usd here = REAL exchange closing
+                                # fee (userFills.fee) + the 2.5bps entry-fee
+                                # estimate on real entry notional — the closest
+                                # row to an actual round-trip fee. Flag it so
+                                # memory.avg_round_trip_fee_bps calibrates the
+                                # backtest fee constant on measured (not
+                                # modeled) cost. In-process DSL closes model
+                                # fee as 2.5bpsx2 and are deliberately unflagged.
+                                "fee_actual": True,
                             })
                             logger.info(
                                 f"[outcome-store] backfilled external close "

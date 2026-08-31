@@ -562,6 +562,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "ws_max_stale_s": 30,
         "ws_heartbeat_s": 10.0,
         "ws_seq_max_backward": 1024,
+        "ws_max_tick_jump_frac": 0.25,
     },
     # R13-B13: Hyperliquid rate-limiter knobs (client/rate_limit.py +
     # hl_client.py call sites). Seven leaves cover token-bucket refill /

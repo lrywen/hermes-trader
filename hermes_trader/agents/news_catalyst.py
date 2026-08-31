@@ -232,9 +232,22 @@ _inflight_lock = threading.Lock()
 _HTTP_TIMEOUT_S = 3.0
 
 
+# M-9 (supplemental audit 2026-08-30): only plain http/https URLs may be
+# fetched. Without an explicit scheme allowlist a manipulated URL could use
+# file:// (local file read / LFI) or ftp:// etc. through urllib.
+def _is_safe_web_url(url: str) -> bool:
+    try:
+        return urllib.parse.urlsplit(url).scheme in ("http", "https")
+    except Exception:
+        return False
+
+
 def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict]:
     if timeout is None:
         timeout = news_catalyst_params()["http_timeout_s"]
+    if not _is_safe_web_url(url):  # M-9: reject file:// and other non-web schemes
+        logger.warning(f"[news] refusing non-http(s) URL: {url[:80]!r}")
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
@@ -253,6 +266,9 @@ def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict]:
 def _get_text(url: str, timeout: Optional[float] = None) -> Optional[str]:
     if timeout is None:
         timeout = news_catalyst_params()["http_timeout_s"]
+    if not _is_safe_web_url(url):  # M-9: reject file:// and other non-web schemes
+        logger.warning(f"[news] refusing non-http(s) URL: {url[:80]!r}")
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:

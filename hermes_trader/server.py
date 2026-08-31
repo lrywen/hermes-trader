@@ -56,7 +56,12 @@ from hermes_trader.dashboard import (
 )
 from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
 from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
-from hermes_trader.agents.executor import close_position_market, maybe_execute  # noqa: E402
+from hermes_trader.agents.executor import (  # noqa: E402
+    _EXEC_LOCK,
+    _IN_FLIGHT_COINS,
+    close_position_market,
+    maybe_execute,
+)
 from hermes_trader.agents.risk_gates import GateContext, eval_all_gates       # noqa: E402
 from hermes_trader.agents.memory import memory                        # noqa: E402
 from hermes_trader.agents.perception import scan_once                 # noqa: E402
@@ -160,15 +165,27 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 app = FastAPI(title="Hermes-Trader", version=__version__, lifespan=lifespan)
 
+# L-6 (supplemental audit 2026-08-30): do not emit `Access-Control-Allow-
+# Origin: *` for browser traffic. The trader sits behind the Portal BFF, which
+# proxies server-to-server (no CORS involved); direct browser access is only a
+# local-dev convenience. Origins are therefore an explicit allowlist sourced
+# from HERMES_CORS_ORIGINS (comma-separated), defaulting to the usual Vite dev
+# servers. Tool/curl access is unaffected (curl ignores CORS entirely).
+_cors_env = os.environ.get("HERMES_CORS_ORIGINS", "")
+if _cors_env.strip():
+    _cors_origins = [o.strip() for o in _cors_env.split(",") if o.strip()]
+else:
+    _cors_origins = ["http://localhost:5173", "http://127.0.0.1:5173"]
+
 # Wildcard origins + credentials=True is invalid per the CORS spec and would
 # be silently rejected by browsers. Token auth happens via the X-Operator-Token
 # header (the legacy ?token= query transport is deprecated and only emits a
 # Warning header), which is not a credential the browser auto-sends, so we
-# don't need credentialed CORS. Keep wildcard origins for tool/curl access;
-# flip credentials off so a future cookie-auth flow can't be abused cross-origin.
+# don't need credentialed CORS. credentials stays off so a future cookie-auth
+# flow can't be abused cross-origin.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -187,7 +204,12 @@ async def _fetch_live_equity() -> float:
     user = resolve_user_address()
     if not user:
         return 0.0
-    state = fetch_account_state(user, include_hip3=_hip3_on())
+    # H-3 (supplemental audit 2026-08-30): fetch_account_state is a blocking
+    # HTTP round-trip; run it off the event loop so every caller (manual-order
+    # gates, dashboard equity poll) does not freeze the server while it waits.
+    state = await asyncio.to_thread(
+        fetch_account_state, user, include_hip3=_hip3_on()
+    )
     return float(state.get("equity", 0))
 
 
@@ -1023,6 +1045,24 @@ async def place_order(request: Request) -> JSONResponse:
     except (TypeError, ValueError):
         raise HTTPException(400, f"invalid leverage '{body.get('leverage')}'")
 
+    # H-2 (supplemental audit 2026-08-30): claim the SAME coin-dimension
+    # in-flight marker the autonomous executor uses. Without this, a manual
+    # order and an autonomous entry for the same coin (or two concurrent
+    # manual calls — the FastAPI handler is async so two requests run
+    # interleaved) both see no position and both place → double-open. The
+    # marker is released in the finally below on every path (gate reject,
+    # order failure, success). The exchange-side Cloid remains the network
+    # backstop; the pre-place live re-check below is the ordering backstop.
+    with _EXEC_LOCK:
+        if coin in _IN_FLIGHT_COINS:
+            raise HTTPException(
+                409,
+                {"error": "coin_order_in_flight",
+                 "detail": f"an order for {coin} is already being placed "
+                           f"(manual or autonomous); retry after it settles"},
+            )
+        _IN_FLIGHT_COINS.add(coin)
+
     try:
         from hermes_trader.client.exchange import (
             entry_size_for_notional,
@@ -1034,14 +1074,17 @@ async def place_order(request: Request) -> JSONResponse:
             set_leverage,
         )
 
-        mid_price = get_hl_price(coin)
+        # H-3 (supplemental audit): these are blocking SDK/HTTP calls inside an
+        # async handler — each froze the whole event loop (heartbeat, WS feed,
+        # every other request) for its duration. Run them off the loop.
+        mid_price = await asyncio.to_thread(get_hl_price, coin)
         if mid_price <= 0:
             raise HTTPException(400, f"invalid price for {coin}")
 
-        lev_res = set_leverage(coin, leverage)
+        lev_res = await asyncio.to_thread(set_leverage, coin, leverage)
         if not (lev_res or {}).get("ok"):
             raise HTTPException(400, f"set_leverage failed: {(lev_res or {}).get('error')}")
-        atr = get_hl_atr("4h", 14, coin)
+        atr = await asyncio.to_thread(get_hl_atr, "4h", 14, coin)
 
         # Sizing: use riskUSD if provided, else riskPct of live equity.
         risk_usd = body.get("riskUSD")
@@ -1108,7 +1151,10 @@ async def place_order(request: Request) -> JSONResponse:
             )
         try:
             user = resolve_user_address()
-            acct = fetch_account_state(user, include_hip3=_hip3_on()) if user else {}
+            # H-3: blocking account fetch off the event loop.
+            acct = await asyncio.to_thread(
+                fetch_account_state, user, include_hip3=_hip3_on()
+            ) if user else {}
         except Exception as e:
             # R12-A1: account-state readout failure used to silently empty
             # `acct` — meaning the manual-order gates see no current
@@ -1140,7 +1186,10 @@ async def place_order(request: Request) -> JSONResponse:
         market_vol_24h = 0.0
         try:
             from hermes_trader.client.hl_client import _http_post
-            _ctxs = _http_post("/info", {"type": "metaAndAssetCtxs"}, timeout=8) or []
+            # H-3: blocking info POST off the event loop.
+            _ctxs = await asyncio.to_thread(
+                _http_post, "/info", {"type": "metaAndAssetCtxs"}, 8
+            ) or []
             for _c in _ctxs:
                 _ctx = _c.get("ctx") if isinstance(_c, dict) else None
                 if not _ctx:
@@ -1288,12 +1337,52 @@ async def place_order(request: Request) -> JSONResponse:
 
         size_in_coin = entry_size_for_notional(coin, position_notional, mid_price)
 
+        # H-2 (supplemental audit): pre-place live position re-check, mirroring
+        # the autonomous executor's A-F4 guard. The gates above ran against the
+        # account snapshot fetched at handler start; between that read and this
+        # point an autonomous entry (or the other side of a concurrent manual
+        # call) may have opened the same coin and filled. The market order has
+        # not been sent yet, so a fresh live read settles it — refuse rather
+        # than double-open. Best-effort / fail-open: a read failure logs and
+        # proceeds (the in-flight marker + exchange Cloid remain backstops).
+        try:
+            _pre_user = locals().get("user") or resolve_user_address()
+            if _pre_user:
+                _pre_state = await asyncio.to_thread(
+                    fetch_account_state, _pre_user, include_hip3=_hip3_on()
+                )
+                _pre_pos = next(
+                    (ap for ap in (_pre_state.get("asset_positions") or [])
+                     if ap.get("position", {}).get("coin") == coin
+                     and abs(float(ap.get("position", {}).get("szi") or 0.0)) > 0),
+                    None,
+                )
+                if _pre_pos is not None:
+                    raise HTTPException(
+                        409,
+                        {"error": "position_already_open_pre_place",
+                         "detail": f"{coin} already has a live position "
+                                   f"(szi={_pre_pos.get('position', {}).get('szi')}); "
+                                   f"refusing to double-open"},
+                    )
+        except HTTPException:
+            raise
+        except Exception as _pre_e:  # noqa: BLE001 — fail-open re-check
+            logger.warning(
+                "[manual-order] H-2 pre-place re-check failed (fail-open) for %s: %r",
+                coin, _pre_e,
+            )
+
         # E-3 (P0 audit): idempotency key. The SDK POST wrapper retries up to
         # 5x on 408/5xx; without a cloid, a timed-out-but-resting manual order
         # gets duplicated on every retry. One cloid per order intent (HL
         # rejects a repeated cloid instead of filling twice).
         entry_cloid = Cloid.from_int(uuid.uuid4().int)
-        result = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=entry_cloid)
+        # H-3: blocking order placement off the event loop.
+        result = await asyncio.to_thread(
+            place_hl_order, is_buy, size_in_coin, mid_price, coin,
+            cloid=entry_cloid,
+        )
 
         if not result.get("ok"):
             raise HTTPException(400, f"order failed: {result.get('error')}")
@@ -1321,8 +1410,15 @@ async def place_order(request: Request) -> JSONResponse:
             # the SL/TP exactly once, not stack duplicate triggers.
             sl_cloid = Cloid.from_int(uuid.uuid4().int)
             tp_cloid = Cloid.from_int(uuid.uuid4().int)
-            sl = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, cloid=sl_cloid)
-            tp = place_hl_trigger_order(is_buy, size_in_coin, tp_px, "tp", coin, cloid=tp_cloid)
+            # H-3: blocking trigger placement off the event loop.
+            sl = await asyncio.to_thread(
+                place_hl_trigger_order, is_buy, size_in_coin, sl_px, "sl", coin,
+                cloid=sl_cloid,
+            )
+            tp = await asyncio.to_thread(
+                place_hl_trigger_order, is_buy, size_in_coin, tp_px, "tp", coin,
+                cloid=tp_cloid,
+            )
             brackets = [
                 {"type": "SL", "price": sl_px, "ok": sl.get("ok")},
                 {"type": "TP", "price": tp_px, "ok": tp.get("ok")},
@@ -1348,6 +1444,13 @@ async def place_order(request: Request) -> JSONResponse:
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+    finally:
+        # H-2 (supplemental audit): release the coin in-flight marker on EVERY
+        # exit — gate reject (403), hard kill-switch (403), conflict (409),
+        # order failure (400/500), or success. The claim was taken before the
+        # try; a leak here would wedge the coin against future orders.
+        with _EXEC_LOCK:
+            _IN_FLIGHT_COINS.discard(coin)
 
 
 @app.post("/api/hl/close-position", dependencies=[Depends(require_operator_write)])

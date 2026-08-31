@@ -11,7 +11,12 @@ event log (the PURR record-loss incident on 2026-08-22).
 
 Contract:
   * Every line is one JSON object: ``{"event": str, "trace_id": str,
-    "timestamp": "YYYY-MM-DDTHH:MM:SSZ", "payload": {...}}``.
+    "timestamp": "YYYY-MM-DDTHH:MM:SSZ", "payload": {...}}``. Since the
+    O-10 hardening it additionally carries a tamper-evident hash-chain
+    triple: ``{"seq": int, "prev_hash": str, "hash": str}`` where each
+    ``hash`` is a SHA-256 over the record body and ``prev_hash`` links to
+    the predecessor's ``hash`` (see :func:`verify_chain`). Records written
+    before this field existed are tolerated as legacy entries.
   * Writes are append-only and best-effort — a disk failure must never
     interrupt trading (mirrors ``session_log.append``).
   * The path is overridable via ``HERMES_EVENTS_FILE`` (same env var memory
@@ -24,6 +29,7 @@ forked here via :func:`fork_from_session`.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -40,8 +46,22 @@ EVENTS_FILE = os.environ.get(
     "HERMES_EVENTS_FILE",
     os.path.expanduser("~/.hermes-trading/events.jsonl"),
 )
-_EVENTS_PATH = Path(EVENTS_FILE)
 _LOCK = threading.Lock()
+
+
+def _events_path() -> Path:
+    """Active log path, resolved at call time.
+
+    Read as a runtime function (not an import-time constant) so tests that
+    monkeypatch ``EVENTS_FILE`` (and deployments overriding the env var)
+    redirect rotation, chaining and the anchor sidecar consistently.
+    """
+    return Path(EVENTS_FILE)
+
+
+def _anchor_path() -> Path:
+    """Chain-anchor sidecar path, derived from the active log path."""
+    return Path(f"{EVENTS_FILE}.chain")
 
 # Rotate events.jsonl when it exceeds this size (default 50 MB, matches the
 # external shared event_log module). Keeps 3 backup generations.
@@ -71,6 +91,92 @@ _FORKABLE_EVENTS = frozenset({
     "operator_action",
 })
 
+# ── O-10 (supplemental audit 2026-08-30): tamper-evident hash chain ──────
+# Every chained record carries {"seq", "prev_hash", "hash"} where
+#   hash = SHA256( canonical_json({event, trace_id, timestamp, payload, seq,
+#                                  prev_hash}) )
+# The hash binds the record's content to its predecessor's hash, so deleting
+# or rewriting any line breaks the link and is detected by verify_chain().
+# The head of the chain (last seq/hash of the active file) is persisted in a
+# small sidecar so a freshly-rotated events.jsonl can anchor to the tail of
+# the previous generation (rotation moves the whole file away, which would
+# otherwise reset the chain). Records written before this feature shipped
+# have no hash fields; verification treats them as legacy and only validates
+# the contiguous chained runs.
+_GENESIS_HASH = ""
+
+
+def _canonical_body(rec: dict[str, Any]) -> bytes:
+    """Deterministic byte serialization of the fields a chain hash covers."""
+    return json.dumps(
+        {
+            "event": rec.get("event"),
+            "trace_id": rec.get("trace_id"),
+            "timestamp": rec.get("timestamp"),
+            "payload": rec.get("payload"),
+            "seq": rec.get("seq"),
+            "prev_hash": rec.get("prev_hash"),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _record_hash(rec: dict[str, Any]) -> str:
+    return hashlib.sha256(_canonical_body(rec)).hexdigest()
+
+
+def _tail_of_file(path: Path) -> Optional[dict[str, Any]]:
+    """Return the last valid chained record in *path* (None if no chained tail)."""
+    tail: Optional[dict[str, Any]] = None
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(rec, dict) and rec.get("hash") and rec.get("seq") is not None:
+                    tail = rec
+    except OSError:
+        return tail
+    return tail
+
+
+def _chain_tail() -> tuple[int, str]:
+    """Resolve the current chain head as (seq, prev_hash) for the next append.
+
+    Caller must hold _LOCK. Prefers the actual tail of the active file; when
+    the file was just rotated away (empty/missing), falls back to the anchor
+    sidecar written at rotation time.
+    """
+    tail = _tail_of_file(_events_path())
+    if tail is not None:
+        return int(tail.get("seq", 0)), str(tail.get("hash", ""))
+    try:
+        anchor = _anchor_path()
+        if anchor.exists():
+            data = json.loads(anchor.read_text(encoding="utf-8"))
+            return int(data.get("seq", 0)), str(data.get("hash", ""))
+    except (OSError, ValueError, TypeError) as e:
+        logger.warning(f"[event_log] chain anchor unreadable, starting genesis: {e}")
+    return 0, _GENESIS_HASH
+
+
+def _write_anchor(seq: int, tail_hash: str) -> None:
+    """Durably persist the chain head so the next generation can anchor to it."""
+    anchor = _anchor_path()
+    tmp = Path(f"{anchor}.tmp")
+    tmp.write_text(
+        json.dumps({"seq": seq, "hash": tail_hash}),
+        encoding="utf-8",
+    )
+    os.replace(str(tmp), str(anchor))
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -78,20 +184,30 @@ def _now_iso() -> str:
 
 def _rotate_if_needed() -> None:
     """Rotate events.jsonl when it exceeds the size cap (caller holds _LOCK)."""
-    if not _EVENTS_PATH.exists():
+    events_path = _events_path()
+    if not events_path.exists():
         return
     try:
-        if _EVENTS_PATH.stat().st_size < _MAX_EVENTS_BYTES:
+        if events_path.stat().st_size < _MAX_EVENTS_BYTES:
             return
+        # O-10: anchor the hash chain to the tail of the about-to-rotate file
+        # so the fresh generation's first record links to the previous one
+        # instead of restarting at genesis (cross-generation chaining).
+        old_tail = _tail_of_file(events_path)
+        if old_tail is not None:
+            try:
+                _write_anchor(int(old_tail.get("seq", 0)), str(old_tail.get("hash", "")))
+            except OSError as e:
+                logger.warning(f"[event_log] chain anchor write on rotation failed: {e}")
         for i in range(_MAX_BACKUPS - 1, 0, -1):
-            src = Path(f"{_EVENTS_PATH}.{i}")
-            dst = Path(f"{_EVENTS_PATH}.{i + 1}")
+            src = Path(f"{events_path}.{i}")
+            dst = Path(f"{events_path}.{i + 1}")
             if src.exists():
                 dst.unlink(missing_ok=True)
                 shutil.move(str(src), str(dst))
-        backup = Path(f"{_EVENTS_PATH}.1")
+        backup = Path(f"{events_path}.1")
         backup.unlink(missing_ok=True)
-        shutil.move(str(_EVENTS_PATH), str(backup))
+        shutil.move(str(events_path), str(backup))
     except OSError as e:
         logger.warning(f"[event_log] rotation failed: {e}")
 
@@ -102,6 +218,12 @@ def append(event: str, payload: Optional[dict[str, Any]] = None,
 
     Every record is guaranteed to carry a non-empty ISO-8601 ``timestamp``.
     If the caller omits one, the current UTC instant is used.
+
+    O-10 (supplemental audit 2026-08-30): each record is also linked into a
+    tamper-evident SHA-256 chain via ``seq`` / ``prev_hash`` / ``hash``
+    fields (see module header). Chaining is best-effort like the write
+    itself — if the chain head cannot be read the record still lands and
+    starts a fresh genesis run rather than blocking trading.
 
     Returns True if the line was durably written. Best-effort: any I/O error
     is logged and swallowed so the trading loop is never blocked by audit
@@ -121,9 +243,22 @@ def append(event: str, payload: Optional[dict[str, Any]] = None,
             if parent:
                 os.makedirs(parent, exist_ok=True)
             _rotate_if_needed()
+            # Link this record to the current chain head (active file tail,
+            # or the cross-generation anchor right after a rotation).
+            prev_seq, prev_hash = _chain_tail()
+            rec["seq"] = prev_seq + 1
+            rec["prev_hash"] = prev_hash
+            rec["hash"] = _record_hash(rec)
             with open(EVENTS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 f.flush()
+            # Refresh the persisted chain head so a crash/rotation before the
+            # next append does not strand the chain. Best-effort: a failure
+            # here does not invalidate the just-written line.
+            try:
+                _write_anchor(rec["seq"], rec["hash"])
+            except OSError as e:
+                logger.warning(f"[event_log] chain anchor update failed: {e}")
         return True
     except OSError as e:
         logger.warning(f"[event_log] append {event} failed: {e}")
@@ -230,3 +365,115 @@ def query_events(
             logger.warning(f"[event_log] query read {fp} failed: {e}")
     out.sort(key=lambda r: r["_dt"])
     return out
+
+
+# ── O-10: chain integrity verification ──────────────────────────────────
+
+def verify_chain(path: Optional[str] = None) -> dict[str, Any]:
+    """Verify the tamper-evident hash chain across the active log and backups.
+
+    Scans the retained generations oldest-first (``.3`` .. ``.1`` then the
+    active file) and replays ONE continuous chain: rotation only splits the
+    feed across files, so the head of an older generation is the predecessor
+    of the first record of the next-newer generation. For each chained record
+    it recomputes the SHA-256 hash and checks the ``seq``/``prev_hash`` link.
+
+    Root policy: the first chained record seen is accepted as a chain root —
+    it is either the genuine genesis (``prev_hash == ""``) or the head of a
+    generation whose predecessor was already dropped by retention. A legacy
+    (pre-chain) record likewise resets the root, since chained records after
+    an upgrade start a fresh run. Records written before the hash-chain
+    feature shipped carry no ``hash``/``seq`` and are counted as
+    ``legacy_records`` (skipped, not errors). Every other break is reported.
+
+    Returns a result dict::
+
+        {"ok": bool, "chained_records": int, "legacy_records": int,
+         "corrupt_lines": int, "errors": [ {"file", "line", "reason", ...} ],
+         "last_seq": int}
+
+    ``ok`` is True only when no chain error was found (legacy records and an
+    empty log are both fine). Best-effort and read-only; never raises.
+    """
+    active = Path(path or EVENTS_FILE)
+    # Oldest generation first so seq/prev_hash are replayed in write order.
+    targets = [Path(f"{active}.{i}") for i in range(_MAX_BACKUPS, 0, -1)]
+    targets.append(active)
+
+    # None until the first chained record establishes a chain root.
+    expected_seq: Optional[int] = None
+    expected_prev: Optional[str] = None
+    chained = 0
+    legacy = 0
+    corrupt_lines = 0
+    errors: list[dict[str, Any]] = []
+
+    for fp in targets:
+        if not fp.exists():
+            continue
+        try:
+            with fp.open("r", encoding="utf-8") as f:
+                for lineno, line in enumerate(f, start=1):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        corrupt_lines += 1
+                        errors.append({
+                            "file": str(fp), "line": lineno,
+                            "reason": "unparseable_json",
+                        })
+                        continue
+                    if not isinstance(rec, dict) or not rec.get("hash"):
+                        # Pre-chain (legacy) record: tolerated. Chained records
+                        # written after it form a fresh genesis-anchored run.
+                        if isinstance(rec, dict) and "event" in rec:
+                            legacy += 1
+                            expected_seq = None
+                            expected_prev = None
+                        continue
+                    chained += 1
+                    seq = rec.get("seq")
+                    recomputed = _record_hash(rec)
+                    if recomputed != rec.get("hash"):
+                        errors.append({
+                            "file": str(fp), "line": lineno,
+                            "reason": "hash_mismatch", "seq": seq,
+                            "expected_hash": recomputed,
+                            "stored_hash": rec.get("hash"),
+                        })
+                        # Re-anchor to the stored record so subsequent links
+                        # can still be evaluated independently.
+                        expected_seq = int(seq) if isinstance(seq, int) else None
+                        expected_prev = str(rec.get("hash", ""))
+                        continue
+                    is_root = expected_seq is None or expected_prev is None
+                    if not is_root:
+                        if not isinstance(seq, int) or seq != expected_seq + 1:
+                            errors.append({
+                                "file": str(fp), "line": lineno,
+                                "reason": "seq_gap", "seq": seq,
+                                "expected_seq": (expected_seq or 0) + 1,
+                            })
+                        if rec.get("prev_hash") != expected_prev:
+                            errors.append({
+                                "file": str(fp), "line": lineno,
+                                "reason": "prev_hash_mismatch", "seq": seq,
+                                "expected_prev": expected_prev,
+                                "stored_prev": rec.get("prev_hash"),
+                            })
+                    expected_seq = int(seq) if isinstance(seq, int) else expected_seq
+                    expected_prev = str(rec.get("hash", ""))
+        except OSError as e:
+            errors.append({"file": str(fp), "line": 0, "reason": f"read_error: {e}"})
+
+    return {
+        "ok": not errors,
+        "chained_records": chained,
+        "legacy_records": legacy,
+        "corrupt_lines": corrupt_lines,
+        "errors": errors,
+        "last_seq": expected_seq or 0,
+    }

@@ -428,8 +428,18 @@ def test_cfg_camelcase_tolerance():
 def test_dsl_max_loss_exit_populates_coin(monkeypatch, tmp_path):
     from hermes_trader.agents.executor import monitor_exits
     dsl_exit, _ = _isolate_dsl_state(monkeypatch, tmp_path)
-    dsl_exit.register_position("ETH", "long", 100.0)
-    verdicts = dsl_exit.check_all_positions({"ETH": 96.0})  # 4% loss > 2.5% cap
+    # H-5 (supplemental audit 2026-08-30): the hard stop now wick-guards — a
+    # breach must persist hard_stop_confirm_sec (default 1.0s) before firing,
+    # so a single synchronous tick no longer exits. Pin the window to 0 here
+    # to exercise the immediate-stop verdict/coin plumbing the test asserts.
+    _immediate_stop = dsl_exit.ExitPolicy(hard_stop_confirm_sec=0.0)
+    dsl_exit.register_position("ETH", "long", 100.0, policy=_immediate_stop)
+    # H-5 wick guard also asks the index (oracle) to confirm the stop. Feed a
+    # test-world index consistent with the synthetic mid (no network) and stub
+    # the same fetch for the monitor_exits path, which fetches it internally.
+    _idx = {"ETH": 96.0}
+    monkeypatch.setattr(dsl_exit, "get_index_prices", lambda coins: _idx)
+    verdicts = dsl_exit.check_all_positions({"ETH": 96.0}, index_prices=_idx)  # 4% loss > cap
     assert len(verdicts) == 1 and verdicts[0].exit is True
     assert verdicts[0].coin == "ETH"          # field the cleanup added
     exits = monitor_exits({"ETH": 96.0})
@@ -2482,6 +2492,14 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
         captured["is_buy"] = is_buy; captured["size"] = size; captured["coin"] = coin
         return {"ok": True, "order_id": "OID1", "avg_px": mid}
     monkeypatch.setattr(executor, "place_hl_order", _place)
+    # H-6 (supplemental audit 2026-08-30): the entry path cross-checks the HL
+    # mid against live Binance spot; this fixture's world prices every coin at
+    # a synthetic 100.0, which a real network check would (correctly) veto.
+    # Stub the safety net to fail-open/checked=False, mirroring how every other
+    # external I/O surface in this fixture is isolated.
+    monkeypatch.setattr(
+        "hermes_trader.client.price_crosscheck.crosscheck_price",
+        lambda coin, px: {"ok": True, "checked": False, "reason": "test_stub"})
     monkeypatch.setattr(executor, "register_position", lambda *a, **k: None)
     monkeypatch.setattr(executor.memory, "track_daily_pnl", lambda *a, **k: None)
     monkeypatch.setattr(executor.memory, "get_daily_pnl", lambda: 0.0)
@@ -3936,6 +3954,107 @@ def test_backtest_simulate_enforces_late_entry_veto():
     assert len(trades_gated) <= len(trades_plain)
     assert all(v["reason"].startswith("late ") for v in vetoes)
     assert all(v["coin"] == "TEST" and v["side"] == "long" for v in vetoes)
+
+
+# ── O-7 (supplemental audit 2026-08-30): walk-forward / out-of-sample ──────
+
+def _load_bt_module():
+    import importlib.util
+    import sys as _sys
+    if "bt_under_test" not in _sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "bt_under_test", str(pathlib.Path(__file__).resolve().parents[1] / "scripts" / "backtest.py"))
+        mod = importlib.util.module_from_spec(spec)
+        _sys.modules["bt_under_test"] = mod
+        spec.loader.exec_module(mod)
+    return _sys.modules["bt_under_test"]
+
+
+def test_oos_split_index_holds_tail_out_after_warmup():
+    """The split sits oos_frac of the way through the TRADEABLE window
+    [warmup, n_bars); the warmup indicator prefix is always in-sample."""
+    bt = _load_bt_module()
+    # 100 warmup + 1000 tradeable bars, 30% OOS -> split at 100 + 700 = 800.
+    assert bt.oos_split_index(1100, 100, 0.3) == 800
+    # 0% OOS -> split at the end (nothing is out-of-sample).
+    assert bt.oos_split_index(1100, 100, 0.0) == 1100
+    # Degenerate: fewer bars than warmup -> all in-sample (split == n_bars).
+    assert bt.oos_split_index(50, 100, 0.3) == 50
+
+
+def test_oos_split_tags_trades_by_entry_bar():
+    """_simulate flags in_sample=False only for trades whose ENTRY bar is at or
+    after the split bar; the fixed warmup prefix never becomes OOS."""
+    bt = _load_bt_module()
+    H = 3600_000
+    # Flat stretch, then ramp → crash → ramp → crash so positions actually
+    # CLOSE on both sides of the split. A single steady ramp never retraces to
+    # the trailing floor and the 180-bar hard timeout lands past the data end,
+    # so its one open position is never recorded as a trade.
+    base = [_mk_candle(i * H, c.o, c.h, c.l, c.c, c.v)
+            for i, c in enumerate(_flat_candles(420))]
+
+    def _seg(lo, hi, start_px, step, vol=5000):
+        # Replace bars [lo, hi) with a steady ramp; OHLC keeps h >= o,c >= l.
+        for k, i in enumerate(range(lo, hi)):
+            px = start_px + k * step
+            if step >= 0:
+                base[i] = _mk_candle(i * H, px - step, px + 0.8,
+                                     px - step - 0.2, px, vol)
+            else:
+                base[i] = _mk_candle(i * H, px - step, px - step + 0.2,
+                                     px - 0.8, px, vol)
+
+    # split_bar=324 cuts through the second ramp.
+    _seg(260, 301, 100.0, 0.7)    # ramp-up: IS long trails out in the crash
+    _seg(301, 317, 126.4, -1.6)   # crash:   IS short trails out in recovery
+    _seg(317, 357, 103.1, 0.7)    # ramp-up: OOS long trails out in the crash
+    _seg(357, 397, 128.8, -1.6)   # crash:   OOS short stops on flat recovery
+    cfg = {"_interval": "1h",
+           "thresholds": {"sigmaThreshold": 2.0, "bbLength": 20, "bbStdDev": 2.0,
+                          "adxPeriod": 14, "breakoutLookback": 20,
+                          "breakoutMinRvol": 1.5, "breakoutRvolWindow": 20,
+                          "breakoutAtrScoreMult": 3.0,
+                          "momentumLookback": 10, "momentumPct": 2.0},
+           "weights": {}}
+    split_bar = bt.oos_split_index(len(base), 100, 0.3)  # 100 + 0.7*320 = 324
+    trades = bt._simulate(
+        "OOS", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5,
+        cfg=cfg, oos_split_bar=split_bar)
+    assert trades, "fixture should fire entries"
+    for t in trades:
+        # Classification must match the documented entry-bar rule.
+        assert t.in_sample == (t.entry_bar < split_bar)
+    # Closed trades must exist on BOTH sides of the split.
+    assert any(t.in_sample for t in trades)
+    assert any(not t.in_sample for t in trades)
+    # Split sits in the tradeable region and the warmup prefix is always IS.
+    assert split_bar == 324
+    assert all(t.entry_bar >= 100 for t in trades)
+
+
+def test_split_metrics_reports_sharpe_and_drawdown():
+    """_split_metrics computes win rate, expectancy, Sharpe and max drawdown;
+    an empty segment degrades to just {'n': 0}."""
+    bt = _load_bt_module()
+
+    def _tr(pnl, entry, exit_):
+        return bt.Trade(coin="X", side="long", entry_bar=entry, entry_px=100.0,
+                        notional=100.0, margin=10.0, leverage=5,
+                        exit_bar=exit_, exit_px=100.0, pnl_usd=pnl,
+                        exit_reason="x", in_sample=True)
+
+    # Equity path: +10 (peak 10), -4 (dd 4), +6 (peak 16), -10 (dd 10) -> MDD 10.
+    seg = [_tr(10, 0, 1), _tr(-4, 2, 3), _tr(6, 4, 5), _tr(-10, 6, 7)]
+    m = bt._split_metrics(seg, equity=100.0)
+    assert m["n"] == 4
+    assert m["wins"] == 2
+    assert abs(m["pnl"] - 2.0) < 1e-9
+    assert abs(m["expectancy"] - 0.5) < 1e-9
+    assert abs(m["max_dd"] - 10.0) < 1e-9
+    assert m["sharpe"] != 0.0  # non-zero dispersion -> finite Sharpe
+    empty = bt._split_metrics([], equity=100.0)
+    assert empty == {"n": 0}
 
 
 # ── Phase 0 (R7): candle cache hit/miss Prometheus counter ─────────────────

@@ -139,6 +139,13 @@ def _stub_deep_path(monkeypatch, fetch_fake=None, place_fake=None):
     monkeypatch.setattr(executor, "fetch_account_state", fetch_fake)
     monkeypatch.setattr(executor, "get_hl_price", lambda _c: 100.0)
     monkeypatch.setattr(executor, "get_hl_atr", lambda *_a, **_k: 10.0)
+    # H-6 (supplemental audit 2026-08-30): the entry path cross-checks the HL
+    # mid against live Binance spot; this fixture's world price is a synthetic
+    # 100.0 which a real network check would (correctly) veto. Stub the safety
+    # net to fail-open/checked=False, matching the other isolated I/O surfaces.
+    monkeypatch.setattr(
+        "hermes_trader.client.price_crosscheck.crosscheck_price",
+        lambda coin, px: {"ok": True, "checked": False, "reason": "test_stub"})
     monkeypatch.setattr(executor, "min_entry_notional_usd", lambda _c, _m: 10.5)
     monkeypatch.setattr(executor, "entry_size_for_notional",
                         lambda _c, n, m: n / m)

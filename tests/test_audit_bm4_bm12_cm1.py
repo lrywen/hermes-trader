@@ -186,7 +186,15 @@ def test_cm1_garbage_mid_values_are_blind_ticks(monkeypatch, tmp_path, caplog):
 def test_cm1_healthy_mids_still_evaluate_exits(monkeypatch, tmp_path, caplog):
     """Regression: valid prices evaluate normally and fire the max-loss exit."""
     dsl_exit = _isolate_dsl(monkeypatch, tmp_path)
-    dsl_exit.register_position("ETH", "long", 100.0)
+    # H-5 (supplemental audit 2026-08-30): the hard stop now wick-guards — the
+    # breach must persist hard_stop_confirm_sec (default 1.0s) AND be confirmed
+    # by the index (oracle). This is one synchronous tick in a synthetic 100.0
+    # world; pin the window to 0 and feed a consistent test index (stubbed, no
+    # network) so the immediate max-loss verdict this test asserts can fire.
+    policy = dsl_exit.ExitPolicy(hard_stop_confirm_sec=0.0)
+    dsl_exit.register_position("ETH", "long", 100.0, policy=policy)
+    monkeypatch.setattr(dsl_exit, "get_index_prices",
+                        lambda coins: {"ETH": 96.0})
     with caplog.at_level(logging.ERROR, logger="hermes_trader.agents.dsl_exit"):
         verdicts = dsl_exit.check_all_positions({"ETH": 96.0})  # -4% > 2.5% cap
     assert len(verdicts) == 1 and verdicts[0].exit is True

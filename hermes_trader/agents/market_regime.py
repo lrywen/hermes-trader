@@ -31,7 +31,7 @@ import logging
 import time
 from typing import Literal, Optional
 
-from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.hl_client import closed_candles_only, fetch_hl_candles
 from hermes_trader.indicators.math import adx, atr as _atr_ind, ema, obv as _obv_ind
 from hermes_trader.agents.config_store import cfg_get
 
@@ -459,7 +459,10 @@ def _detect_for_proxy(proxy: str) -> Regime:
     """Network path — fetch candles for `proxy`, compute regime.
     Wrapped by `detect_regime` for caching."""
     try:
-        candles = fetch_hl_candles(proxy, interval="1h", count=100)
+        raw = fetch_hl_candles(proxy, interval="1h", count=100)
+        # H-8: classify CLOSED bars only — the forming bar's partial range
+        # biases EMA slope / ADX / RSI.
+        candles, _ = closed_candles_only(raw, "1h")
         if not candles:
             return "neutral"
         return _classify_candles(candles)
@@ -472,7 +475,9 @@ def _detect_for_proxy_with_score(proxy: str) -> tuple[Regime, float]:
     """Same candle fetch as _detect_for_proxy but returns (regime, score).
     Populates _score_cache so a subsequent detect_regime() reuses it."""
     try:
-        candles = fetch_hl_candles(proxy, interval="1h", count=100)
+        raw = fetch_hl_candles(proxy, interval="1h", count=100)
+        # H-8: score CLOSED bars only (same forming-bar bias as classify).
+        candles, _ = closed_candles_only(raw, "1h")
         if not candles:
             return "neutral", 0.0
         return _classify_candles(candles), regime_strength_score(candles)

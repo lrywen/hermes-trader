@@ -189,3 +189,145 @@ def test_dashboard_redact_scrubs_secrets():
     msg = _redact("request failed: Bearer sk-secret-123 not authorized")
     assert "sk-secret-123" not in msg
     assert "Bearer <redacted>" in msg
+
+
+# ── O-10 (supplemental audit 2026-08-30): tamper-evident hash chain ──────
+
+def test_hash_chain_links_and_verifies_clean(tmp_path, monkeypatch):
+    """A sequence of appended records forms a valid hash chain: seq increments
+    from 1, each prev_hash links to the prior hash, and verify_chain() is ok."""
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+    for i in range(5):
+        assert event_log.append("execute", {"coin": "BTC", "i": i}, trace_id=f"t{i}")
+
+    rows = _read_events(str(ev_file))
+    assert len(rows) == 5
+    assert [r["seq"] for r in rows] == [1, 2, 3, 4, 5]
+    assert rows[0]["prev_hash"] == ""
+    for i in range(1, 5):
+        assert rows[i]["prev_hash"] == rows[i - 1]["hash"]
+        assert rows[i]["hash"] and len(rows[i]["hash"]) == 64  # sha256 hexdigest
+
+    res = event_log.verify_chain(str(ev_file))
+    assert res["ok"] is True, res["errors"]
+    assert res["chained_records"] == 5
+    assert res["last_seq"] == 5
+
+
+def test_hash_chain_detects_tampered_payload(tmp_path, monkeypatch):
+    """Rewriting one record's payload must break its hash -> hash_mismatch."""
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+    for i in range(4):
+        event_log.append("execute", {"coin": "BTC", "px": 100 + i})
+
+    # Tamper with the third line's payload (simulate post-hoc editing).
+    lines = ev_file.read_text().splitlines()
+    rec = json.loads(lines[2])
+    rec["payload"]["px"] = 9999
+    lines[2] = json.dumps(rec)
+    ev_file.write_text("\n".join(lines) + "\n")
+
+    res = event_log.verify_chain(str(ev_file))
+    assert res["ok"] is False
+    reasons = [e["reason"] for e in res["errors"]]
+    assert "hash_mismatch" in reasons
+    bad = [e for e in res["errors"] if e["reason"] == "hash_mismatch"][0]
+    assert bad["line"] == 3
+
+
+def test_hash_chain_detects_deleted_line(tmp_path, monkeypatch):
+    """Deleting an interior record breaks the link for the following line."""
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+    for i in range(5):
+        event_log.append("execute", {"coin": "ETH", "i": i})
+
+    lines = ev_file.read_text().splitlines()
+    # Drop record seq=3 (the third line).
+    del lines[2]
+    ev_file.write_text("\n".join(lines) + "\n")
+
+    res = event_log.verify_chain(str(ev_file))
+    assert res["ok"] is False
+    reasons = [e["reason"] for e in res["errors"]]
+    # The record that used to be 4th now sits at seq=4 while the predecessor
+    # is seq=2 -> seq_gap; its prev_hash also points at the deleted hash.
+    assert "seq_gap" in reasons or "prev_hash_mismatch" in reasons
+
+
+def test_hash_chain_tolerates_legacy_records(tmp_path, monkeypatch):
+    """Pre-chain records (no hash fields) are counted as legacy and tolerated;
+    chained records after them anchor a fresh genesis run and still verify."""
+    ev_file = tmp_path / "events.jsonl"
+    # Write two legacy lines in the old 4-field schema, then append chained ones.
+    legacy = [
+        {"event": "order", "trace_id": "", "timestamp": "2026-08-20T00:00:00Z",
+         "payload": {"coin": "OLD"}},
+        {"event": "close", "trace_id": "", "timestamp": "2026-08-20T00:01:00Z",
+         "payload": {"coin": "OLD"}},
+    ]
+    ev_file.write_text("".join(json.dumps(r) + "\n" for r in legacy))
+
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+    assert event_log.append("execute", {"coin": "NEW"})
+
+    res = event_log.verify_chain(str(ev_file))
+    assert res["ok"] is True, res["errors"]
+    assert res["legacy_records"] == 2
+    assert res["chained_records"] == 1  # fresh run restarts at seq=1
+
+
+def test_hash_chain_anchors_across_rotation(tmp_path, monkeypatch):
+    """After rotation the first record of the new generation links to the tail
+    of the rotated file via the anchor sidecar (no genesis reset of the
+    running chain head), and both generations verify individually."""
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+    monkeypatch.setattr(event_log, "_MAX_BACKUPS", 3)
+
+    # First append: file empty, no rotation; anchor written with its hash.
+    event_log.append("execute", {"coin": "BTC", "i": 1})
+    one_line = ev_file.read_text()
+    # Cap at exactly one line's size so the NEXT append sees size >= cap and
+    # rotates (rotation triggers when the existing file meets the cap).
+    monkeypatch.setattr(event_log, "_MAX_EVENTS_BYTES", len(one_line))
+
+    # Second append: the prior line meets the cap, so the file is rotated
+    # to .1 (its tail anchored) and a fresh genesis file starts — but
+    # _chain_tail() reads the anchor so the new record's seq continues at 2.
+    event_log.append("execute", {"coin": "BTC", "i": 2})
+    # Restore a large cap so the append into the fresh file does not rotate
+    # again and keeps the .1 generation stable.
+    monkeypatch.setattr(event_log, "_MAX_EVENTS_BYTES", 50 * 1024 * 1024)
+    # Third append into the fresh file: no rotation, chains onto seq 2.
+    event_log.append("execute", {"coin": "BTC", "i": 3})
+
+    backup = tmp_path / "events.jsonl.1"
+    assert backup.exists(), "rotation should have moved the first generation"
+    b_rows = _read_events(str(backup))
+    a_rows = _read_events(str(ev_file))
+    assert len(b_rows) == 1 and len(a_rows) == 2
+    # The running chain continues across the rotation via the anchor sidecar:
+    # the first record of the new generation carries seq=2 and links its
+    # prev_hash to the rotated tail, then seq=3 chains onto it normally.
+    assert a_rows[0]["seq"] == 2
+    assert a_rows[0]["prev_hash"] == b_rows[0]["hash"]
+    assert a_rows[1]["seq"] == 3
+    assert a_rows[1]["prev_hash"] == a_rows[0]["hash"]
+
+    # Verifying the active path replays the retained generations oldest-first
+    # as ONE continuous chain (backup tail -> active head), so the rotated
+    # link must hold and all 3 records verify with no gap/mismatch.
+    res = event_log.verify_chain(str(ev_file))
+    assert res["ok"] is True, res["errors"]
+    assert res["chained_records"] == 3
+    assert res["last_seq"] == 3
+
+    # The rotated backup's single record is a self-consistent genesis record
+    # (seq=1, empty prev_hash): recompute its hash and confirm it matches.
+    b = b_rows[0]
+    assert b["seq"] == 1
+    assert b["prev_hash"] == ""
+    assert event_log._record_hash(b) == b["hash"]

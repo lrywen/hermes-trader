@@ -75,6 +75,16 @@ from hermes_trader.indicators import triggers as trig
 from hermes_trader.models.types import Candle
 
 ROUND_TRIP_FEE_BPS = 5.0
+# H-7 (supplemental audit 2026-08-30): realistic cost model. Live IOC orders
+# tolerate up to 1.5% adverse slippage on entry / 5.0% on close
+# (rate_limit.py max_slippage_pct), and a DSL max_loss stop is a TRIGGER price,
+# not a fill price — exits need mid-hold ~4s + oracle confirm + IOC crossing the
+# book, so stop-outs pay an extra delay/overshoot penalty. --no-slippage
+# restores the old fee-only baseline; --use-memory-slip backfills the per-coin
+# measured adverse exit slippage from memory.avg_exit_slip_bps.
+DEFAULT_ENTRY_SLIP_BPS = 5.0       # ~typical taker adverse fill on entry
+DEFAULT_EXIT_SLIP_BPS = 15.0       # exits are market/stop-driven → wider
+DEFAULT_STOP_DELAY_SLIP_BPS = 10.0  # extra adverse bps on max_loss stop-outs
 
 
 # ---------------------------------------------------------------------------
@@ -601,12 +611,23 @@ def _simulate(
     veto_log: Optional[List[Dict[str, Any]]] = None,
     rsi_variant: str = "strict",
     plan_b_enabled: bool = True,
+    entry_slip_bps: float = DEFAULT_ENTRY_SLIP_BPS,
+    exit_slip_bps: float = DEFAULT_EXIT_SLIP_BPS,
+    stop_delay_slip_bps: float = DEFAULT_STOP_DELAY_SLIP_BPS,
+    fee_bps: float = ROUND_TRIP_FEE_BPS,
 ) -> List[Trade]:
     trades: List[Trade] = []
     open_t: Optional[Trade] = None
     open_dsl: Optional[DSL] = None
-    fee_pct = ROUND_TRIP_FEE_BPS / 10000.0
+    # O-8 (supplemental audit 2026-08-30): fee_bps can be calibrated per coin
+    # from memory.avg_round_trip_fee_bps; defaults to the static 5-bps constant.
+    fee_pct = fee_bps / 10000.0
     candles_4h = _resample_4h(candles_1h)
+
+    # H-7: adverse fill — a BUY fills above the reference price, a SELL below.
+    def _fill(px: float, is_buy: bool, bps: float) -> float:
+        adj = px * bps / 10000.0
+        return px + adj if is_buy else px - adj
 
     for i in range(warmup, len(candles_1h) - 1):
         window_1h = candles_1h[: i + 1]
@@ -621,8 +642,15 @@ def _simulate(
 
         # Manage open position
         if open_t and open_dsl:
-            done, exit_px, reason = open_dsl.check_bar(i, bar)
+            done, exit_ref, reason = open_dsl.check_bar(i, bar)
             if done:
+                # H-7: the DSL stop/exit price is a trigger, not a fill. Apply
+                # adverse exit slippage; max_loss stop-outs additionally pay the
+                # confirm-delay / order-book-cross penalty. Closing a long is a
+                # SELL (is_buy=False); closing a short is a BUY (is_buy=True).
+                is_stop_out = reason.startswith("max_loss")
+                slip = exit_slip_bps + (stop_delay_slip_bps if is_stop_out else 0.0)
+                exit_px = _fill(exit_ref, open_t.side == "short", slip)
                 gross_pct = ((exit_px - open_t.entry_px) / open_t.entry_px
                              if open_t.side == "long"
                              else (open_t.entry_px - exit_px) / open_t.entry_px)
@@ -679,14 +707,17 @@ def _simulate(
         eff_max_loss = max_loss_pct
         if rsi_variant == "regime" and regime_label in ("TREND", "STRONG_TREND"):
             eff_max_loss = max(max_loss_pct, 0.8)
+        # H-7: fill the next bar's open at an adverse entry price (BUY above,
+        # SELL below); anchor the DSL to the actual fill, matching live dsl_exit.
+        entry_px = _fill(next_bar.o, side == "long", entry_slip_bps)
         open_t = Trade(
-            coin=coin, side=side, entry_bar=i + 1, entry_px=next_bar.o,
+            coin=coin, side=side, entry_bar=i + 1, entry_px=entry_px,
             rsi_at_entry=rsi, ext_atr_at_entry=ext_atr, adx_at_entry=adx_v,
             notional=notional, size_mult=size_mult, regime_label=regime_label,
         )
         open_dsl = DSL(
-            side=side, entry_px=next_bar.o, entry_bar=i + 1,
-            peak_px=next_bar.o, max_loss_pct=eff_max_loss,
+            side=side, entry_px=entry_px, entry_bar=i + 1,
+            peak_px=entry_px, max_loss_pct=eff_max_loss,
             protect_pct=protect_pct, retrace_threshold=retrace_threshold,
         )
     return trades
@@ -757,6 +788,7 @@ def _print_report(
     dyn_vetoes: List[Dict],
     regime_vetoes: List[Dict],
     days: int,
+    cost_note: str = "",
 ) -> None:
     from collections import Counter
 
@@ -891,7 +923,10 @@ def _print_report(
 
     print(f"\n  Caveats:")
     print(f"    - AI verdict substituted with deterministic heuristic")
-    print(f"    - Round-trip fee {ROUND_TRIP_FEE_BPS:.1f} bps, no slippage/funding")
+    if cost_note:
+        print(f"    - {cost_note}")
+    else:
+        print(f"    - Round-trip fee {ROUND_TRIP_FEE_BPS:.1f} bps, no slippage/funding")
     print(f"    - One position per coin; max_concurrent not enforced across coins")
     print(f"    - No cooldown, no compounding, no equity curve dynamics")
     print(f"    - REGIME: CHOP 0.5x size (A); TREND RSI 40-60 halved (B); "
@@ -908,6 +943,21 @@ def main() -> int:
     ap.add_argument("--equity", type=float, default=200.0)
     ap.add_argument("--max-loss", type=float, default=None,
                     help="Override DSL max_loss_pct (e.g. 1.0 for 1%%)")
+    # H-7 cost model knobs.
+    ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
+                    help="Adverse entry slippage in bps (H-7; default %(default)s)")
+    ap.add_argument("--exit-slip-bps", type=float, default=DEFAULT_EXIT_SLIP_BPS,
+                    help="Adverse exit slippage in bps (H-7; default %(default)s)")
+    ap.add_argument("--stop-delay-slip-bps", type=float, default=DEFAULT_STOP_DELAY_SLIP_BPS,
+                    help="Extra adverse bps on max_loss stop-outs (default %(default)s)")
+    ap.add_argument("--use-memory-slip", action="store_true",
+                    help="Backfill per-coin exit slippage from memory.avg_exit_slip_bps")
+    ap.add_argument("--use-memory-fee", action="store_true",
+                    help="O-8: calibrate per-coin round-trip fee from "
+                         "memory.avg_round_trip_fee_bps (actual exchange fee_usd; "
+                         "falls back to the 5-bps default on thin samples)")
+    ap.add_argument("--no-slippage", action="store_true",
+                    help="Zero all slippage (restore the fee-only baseline)")
     args = ap.parse_args()
 
     from hermes_trader.agents.config_store import read_agent_config, cfg_get
@@ -918,6 +968,37 @@ def main() -> int:
     max_loss = args.max_loss if args.max_loss is not None else float(cfg_get("dsl_exit.max_loss_pct", config=dsl))
     protect = float(cfg_get("dsl_exit.protect_pct", config=dsl))
     retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl))
+
+    # H-7 cost model (see constants above).
+    if args.no_slippage:
+        entry_slip = exit_slip = stop_delay_slip = 0.0
+    else:
+        entry_slip = float(args.entry_slip_bps)
+        exit_slip = float(args.exit_slip_bps)
+        stop_delay_slip = float(args.stop_delay_slip_bps)
+    _mem = None
+    if args.use_memory_slip and not args.no_slippage:
+        try:
+            from hermes_trader.agents.memory import memory as _mem
+        except Exception as _e:  # best-effort: fall back to the static default
+            print(f"  [warn] memory slip unavailable ({_e}); using default exit slip")
+            _mem = None
+    # O-8: measured round-trip fee source (independent of the slip toggle).
+    _mem_fee = None
+    if args.use_memory_fee:
+        try:
+            from hermes_trader.agents.memory import memory as _mem_fee
+        except Exception as _e:  # best-effort: fall back to the static default
+            print(f"  [warn] memory fee unavailable ({_e}); using default fee")
+            _mem_fee = None
+    if args.no_slippage:
+        cost_note = (f"Round-trip fee {ROUND_TRIP_FEE_BPS:.1f} bps only "
+                     f"(--no-slippage); no slippage/funding")
+    else:
+        cost_note = (f"Fee {ROUND_TRIP_FEE_BPS:.1f} bps RT + adverse slip "
+                     f"entry {entry_slip:.1f}/exit {exit_slip:.1f} bps"
+                     f"{' (per-coin via memory)' if _mem is not None else ''}"
+                     f", +{stop_delay_slip:.1f} bps on max_loss stop-outs; no funding")
 
     bars_per_day = 24
     total_bars = args.days * bars_per_day + 150
@@ -943,6 +1024,25 @@ def main() -> int:
     for m in coins:
         coin = m["coin"]
         max_lev = int(m.get("maxLeverage", 5))
+        # H-7: per-coin measured adverse exit slippage overrides the default
+        # when enough live samples exist (memory returns 0.0 otherwise).
+        coin_exit_slip = exit_slip
+        if _mem is not None:
+            try:
+                _ms = float(_mem.avg_exit_slip_bps(coin))
+                if _ms > 0.0:
+                    coin_exit_slip = _ms
+            except Exception:
+                pass
+        # O-8: per-coin measured round-trip fee (falls back to the default).
+        coin_fee_bps = ROUND_TRIP_FEE_BPS
+        if _mem_fee is not None:
+            try:
+                _mf = float(_mem_fee.avg_round_trip_fee_bps(coin))
+                if _mf > 0.0:
+                    coin_fee_bps = _mf
+            except Exception:
+                pass
         try:
             candles = fetch_hl_candles(coin, "1h", total_bars)
             if len(candles) < 150:
@@ -954,6 +1054,8 @@ def main() -> int:
                 cfg=cfg, use_new_rules=False,
                 max_loss_pct=max_loss, protect_pct=protect,
                 retrace_threshold=retrace,
+                entry_slip_bps=entry_slip, exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip, fee_bps=coin_fee_bps,
             )
             nt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
@@ -962,6 +1064,8 @@ def main() -> int:
                 max_loss_pct=max_loss, protect_pct=protect,
                 retrace_threshold=retrace, veto_log=strict_vetoes,
                 rsi_variant="strict",
+                entry_slip_bps=entry_slip, exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip, fee_bps=coin_fee_bps,
             )
             dt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
@@ -970,6 +1074,8 @@ def main() -> int:
                 max_loss_pct=max_loss, protect_pct=protect,
                 retrace_threshold=retrace, veto_log=dyn_vetoes,
                 rsi_variant="dynamic",
+                entry_slip_bps=entry_slip, exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip, fee_bps=coin_fee_bps,
             )
             gt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
@@ -978,6 +1084,8 @@ def main() -> int:
                 max_loss_pct=max_loss, protect_pct=protect,
                 retrace_threshold=retrace, veto_log=regime_vetoes,
                 rsi_variant="regime",
+                entry_slip_bps=entry_slip, exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip, fee_bps=coin_fee_bps,
             )
             op = sum(t.pnl_usd for t in ot)
             np_ = sum(t.pnl_usd for t in nt)
@@ -1007,7 +1115,7 @@ def main() -> int:
     _print_report(
         old_stats, new_stats, dyn_stats, regime_stats,
         strict_vetoes, dyn_vetoes, regime_vetoes,
-        args.days,
+        args.days, cost_note=cost_note,
     )
     return 0
 

@@ -61,6 +61,8 @@ IO_LEAVES = (
     "max_slippage_close_pct", "meta_ttl_s", "atr_ttl_s",
     "candle_cache_ttl_s", "candle_cache_max", "funding_cache_ttl_s",
     "ws_max_stale_s", "ws_heartbeat_s", "ws_seq_max_backward",
+    # M-11 (supplemental audit 2026-08-30): per-coin single-tick jump filter.
+    "ws_max_tick_jump_frac",
 )
 RL_LEAVES = (
     "rate_refill_per_sec", "rate_capacity", "rate_max_wait_s",
@@ -76,7 +78,7 @@ _LEGACY_ENVS = (
     "HERMES_CANDLE_CACHE_TTL_S", "HERMES_CANDLE_CACHE_MAX",
     "HERMES_FUNDING_CACHE_TTL_S",
     "HERMES_WS_MAX_STALE_SECONDS", "HERMES_WS_HEARTBEAT_S",
-    "HERMES_WS_SEQ_MAX_BACKWARD",
+    "HERMES_WS_SEQ_MAX_BACKWARD", "HERMES_WS_MAX_TICK_JUMP_FRAC",
     "HERMES_HL_RATE_REFILL_PER_SEC", "HERMES_HL_RATE_CAPACITY",
     "HERMES_HL_RATE_MAX_WAIT_S", "HERMES_HL_429_RETRIES",
     "HERMES_HL_RATE_OPPORTUNISTIC_WAIT_S", "HERMES_HL_RATE_SHARED",
@@ -108,7 +110,7 @@ def test_r13_b13_blocks_registered():
     assert RL_BLOCK in CANONICAL_DEFAULTS
     assert isinstance(CANONICAL_DEFAULTS[IO_BLOCK], dict)
     assert isinstance(CANONICAL_DEFAULTS[RL_BLOCK], dict)
-    assert len(CANONICAL_DEFAULTS[IO_BLOCK]) == 12
+    assert len(CANONICAL_DEFAULTS[IO_BLOCK]) == 13
     assert len(CANONICAL_DEFAULTS[RL_BLOCK]) == 7
     assert set(CANONICAL_DEFAULTS[IO_BLOCK]) == set(IO_LEAVES)
     assert set(CANONICAL_DEFAULTS[RL_BLOCK]) == set(RL_LEAVES)
@@ -195,7 +197,7 @@ def test_r13_b13_cfg_get_all_rl_leaves():
 def test_r13_b13_cfg_get_full_blocks():
     b_io = cfg_get(IO_BLOCK, config={})
     b_rl = cfg_get(RL_BLOCK, config={})
-    assert isinstance(b_io, dict) and len(b_io) == 12
+    assert isinstance(b_io, dict) and len(b_io) == 13
     assert isinstance(b_rl, dict) and len(b_rl) == 7
     assert b_io["sdk_timeout_s"] == 30.0 and b_io["ws_seq_max_backward"] == 1024
     assert b_rl["rate_capacity"] == 600 and b_rl["rate_shared"] is True
@@ -284,7 +286,7 @@ def test_r13_b13_config_patch_knows_blocks():
     assert RL_BLOCK in fields
     fb_io = fields[IO_BLOCK].default_factory()
     fb_rl = fields[RL_BLOCK].default_factory()
-    assert len(fb_io) == 12 and fb_io["sdk_timeout_s"] == 30.0
+    assert len(fb_io) == 13 and fb_io["sdk_timeout_s"] == 30.0
     assert len(fb_rl) == 7 and fb_rl["rate_capacity"] == 600
     assert fb_rl["rate_per_endpoint_gate"] is True
 
@@ -344,7 +346,7 @@ def test_r13_b13_spec_min_guards():
     zero_ok_io = {
         "sdk_timeout_s", "max_slippage_pct", "max_slippage_close_pct",
         "meta_ttl_s", "atr_ttl_s", "candle_cache_ttl_s",
-        "funding_cache_ttl_s", "ws_heartbeat_s",
+        "funding_cache_ttl_s", "ws_heartbeat_s", "ws_max_tick_jump_frac",
     }
     for leaf in zero_ok_io:
         assert rl._HL_CLIENT_IO_SPEC[leaf][2] == 0.0, leaf

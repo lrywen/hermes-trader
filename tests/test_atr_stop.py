@@ -25,7 +25,12 @@ def _policy(**kw) -> ExitPolicy:
                 retrace_threshold=0.40, hard_timeout_minutes=99999.0,
                 atr_stop_enabled=True, atr_stop_mult=1.5,
                 atr_stop_floor_pct=1.0, atr_stop_ceiling_pct=4.0,
-                stale_flat_timeout_minutes=0.0)
+                stale_flat_timeout_minutes=0.0,
+                # H-5 (supplemental audit 2026-08-30): the hard stop wick-guards
+                # for hard_stop_confirm_sec (default 1.0s). _stop_pct probes check()
+                # in a tight millisecond loop where that window never elapses, so
+                # pin it to 0 to keep exercising the immediate-stop width logic.
+                hard_stop_confirm_sec=0.0)
     base.update(kw)
     return ExitPolicy(**base)
 

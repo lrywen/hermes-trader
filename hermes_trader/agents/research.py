@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import logging
 import math
 import os
 import re
+import stat
 import sys
 import time
 import uuid
@@ -94,26 +96,84 @@ def _http() -> httpx.Client:
 
 
 # ── Shared infrastructure (cross-component single source of truth) ──────
+# M-8 (supplemental audit 2026-08-30): the shared cross-component dir is
+# loaded by ABSOLUTE file path, never via sys.path injection. Inserting a
+# user-writable directory at sys.path[0] meant any .py dropped into it could
+# shadow/hijack these imports and execute at import time. We now harden the
+# directory to 0700 (owner-only; refuse to load when not owned by the current
+# uid) and import each module explicitly from its absolute path.
 _SHARED_DIR = os.path.expanduser("~/.hermes-trading")
-if _SHARED_DIR not in sys.path and os.path.isdir(_SHARED_DIR):
-    sys.path.insert(0, _SHARED_DIR)
-try:
-    from timeutil import today_utc_str, utcnow, to_iso_z  # type: ignore
-    from signal_bus import get_bus  # type: ignore
-    from signal_schema import Signal, Verdict  # type: ignore
-    from event_log import new_trace_id, record_risk, record_system  # type: ignore
-    _SHARED_OK = True
-except Exception:  # pragma: no cover - shared dir optional
+
+
+def _harden_shared_dir() -> bool:
+    """Ensure the shared dir exists, is owned by the current uid, and is
+    mode 0700. Returns False when the dir is absent/untrusted."""
+    try:
+        if not os.path.isdir(_SHARED_DIR):
+            return False
+        st = os.stat(_SHARED_DIR)
+        if st.st_uid != os.geteuid():
+            return False
+        if st.st_mode & 0o077:
+            os.chmod(_SHARED_DIR, stat.S_IRWXU)
+        return True
+    except Exception:
+        return False
+
+
+def _load_shared_module(name: str):
+    """Load ~/.hermes-trading/<name>.py by absolute path (no sys.path change).
+    Returns None when the module is absent or fails to load."""
+    if not _harden_shared_dir():
+        return None
+    path = os.path.join(_SHARED_DIR, f"{name}.py")
+    try:
+        if not os.path.isfile(path):
+            return None
+        spec = importlib.util.spec_from_file_location(name, path)
+        if spec is None or spec.loader is None:
+            return None
+        mod = importlib.util.module_from_spec(spec)
+        # Register under the module's BARE name so intra-dir sibling imports
+        # (signal_bus does `from signal_schema import ...`) resolve from
+        # sys.modules WITHOUT appending the shared dir to sys.path.
+        sys.modules[name] = mod
+        try:
+            spec.loader.exec_module(mod)
+        except Exception:
+            sys.modules.pop(name, None)
+            raise
+        return mod
+    except Exception:
+        return None
+
+
+# Load in dependency order: signal_schema first (signal_bus imports it).
+_tu = _load_shared_module("timeutil")
+if _tu is not None:
+    today_utc_str = _tu.today_utc_str
+    utcnow = _tu.utcnow
+    to_iso_z = _tu.to_iso_z
+else:  # pragma: no cover - shared dir optional
     today_utc_str = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")  # noqa: E731
     utcnow = lambda: datetime.now(timezone.utc)  # noqa: E731
     to_iso_z = lambda v: ""  # noqa: E731
-    get_bus = None  # type: ignore
-    Signal = None  # type: ignore
-    Verdict = None  # type: ignore
+
+_ss = _load_shared_module("signal_schema")
+Signal = getattr(_ss, "Signal", None) if _ss is not None else None
+Verdict = getattr(_ss, "Verdict", None) if _ss is not None else None
+_sb = _load_shared_module("signal_bus")
+get_bus = getattr(_sb, "get_bus", None) if _sb is not None else None
+_el = _load_shared_module("event_log")
+if _el is not None:
+    new_trace_id = _el.new_trace_id
+    record_risk = _el.record_risk
+    record_system = _el.record_system
+else:  # pragma: no cover - shared dir optional
     new_trace_id = lambda prefix="trc": f"{prefix}-{uuid.uuid4().hex[:12]}"  # noqa: E731
-    record_risk = None  # type: ignore
-    record_system = None  # type: ignore
-    _SHARED_OK = False
+    record_risk = None
+    record_system = None
+_SHARED_OK = all(x is not None for x in (_tu, _sb, _ss, _el))
 
 # ── Shared config (跨组件单一配置源) ────────────────────────────────
 # Canonical loader lives in hermes_trader.shared_config; kept as a thin
@@ -2069,9 +2129,18 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     if len(c4h) < 30:
         return _thin_history_pass(coin, perception, c4h, news)
 
-    tf1h = _compute_indicators(c1h)
-    tf4h = _compute_indicators(c4h)
-    tf1d = _compute_indicators(c1d)
+    # H-8 (supplemental audit 2026-08-30): score indicators on CLOSED bars
+    # only. fetch_hl_candles' candleSnapshot includes the still-forming final
+    # bar, whose partial h/l/c biases EMA/RSI/ATR/ADX and _compute_indicators'
+    # ``candles[-1]``/arrays[-1] reads (look-ahead on data that does not exist
+    # at decision time). Aligned with perception/ta_filter/risk_gates.
+    from hermes_trader.agents.perception import _drop_forming_bar
+    c1h_closed, _ = _drop_forming_bar(c1h, "1h")
+    c4h_closed, _ = _drop_forming_bar(c4h, "4h")
+    c1d_closed, _ = _drop_forming_bar(c1d, "1d")
+    tf1h = _compute_indicators(c1h_closed)
+    tf4h = _compute_indicators(c4h_closed)
+    tf1d = _compute_indicators(c1d_closed)
 
     # P2-6: canonical fired-trigger names once, reused by every signal flag.
     fired_names = set(extract_fired_triggers(perception))

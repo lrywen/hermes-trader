@@ -262,6 +262,14 @@ def _h6_baseline(monkeypatch, cfg_overrides=None):
     monkeypatch.setattr(executor, "fetch_account_state", lambda u, **kw: state)
     monkeypatch.setattr(executor, "get_hl_price", lambda c: 100.0)
     monkeypatch.setattr(executor, "get_hl_atr", lambda *a, **k: 2.0)
+    # H-6 (supplemental audit 2026-08-30): this fixture's world prices every
+    # coin at a synthetic 100.0; the live Binance cross-check would (correctly)
+    # veto that divergence before place_hl_order is ever reached, making the
+    # reconcile paths below unreachable. Stub the safety net fail-open, matching
+    # every other network surface isolated in this fixture.
+    monkeypatch.setattr(
+        "hermes_trader.client.price_crosscheck.crosscheck_price",
+        lambda coin, px: {"ok": True, "checked": False, "reason": "test_stub"})
     monkeypatch.setattr(executor, "get_max_leverage", lambda c: 40)
     monkeypatch.setattr(executor, "get_orderbook_spread",
                         lambda c: {"ok": True, "spread_pct": 0.01,

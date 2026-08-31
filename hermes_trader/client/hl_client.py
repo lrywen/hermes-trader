@@ -452,6 +452,29 @@ def fetch_hl_candles(
     return candles
 
 
+def closed_candles_only(
+    candles: "list[Candle]", interval: str
+) -> "tuple[list[Candle], bool]":
+    """H-8 (supplemental audit 2026-08-30): drop the still-forming final bar.
+
+    candleSnapshot with ``endTime=now`` always includes the in-progress bar;
+    its h/l/c are mid-bar values that WILL change before close. Indicators
+    computed on it (ATR, EMA, RSI, ADX, trigger evaluation) see a partially
+    filled range that shrinks ATR and biases signals — a look-ahead on data
+    that does not yet exist at decision time. Return ``(series_to_score,
+    dropped)`` where ``dropped`` reports whether a forming bar was removed.
+    Client-layer counterpart of ``agents.perception._drop_forming_bar``
+    (agents may import client, never the reverse).
+    """
+    if not candles:
+        return candles, False
+    last = candles[-1]
+    bar_dur_ms = _MS_PER_CANDLE.get(interval, 300_000)
+    if time.time() * 1000.0 >= float(getattr(last, "t")) + bar_dur_ms:
+        return candles, False
+    return candles[:-1], True
+
+
 def _fetch_hl_candles_raw(
     coin: str,
     interval: str,

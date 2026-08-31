@@ -199,6 +199,52 @@ class TestOnAllMids:
         assert ws._latest.last_seq == 1
         assert ws.get_all_mids() == {}
 
+    def test_m10_identical_payload_counted_as_replay(
+        self, ws: HyperliquidWebSocket,
+    ) -> None:
+        """M-10: a second frame whose payload CONTENT is identical to the
+        last applied one is a replay (HL reconnect window / heartbeat echo).
+        It must be counted in dropped_replay and must not advance state."""
+        frame = _all_mids_frame({"BTC": "50000", "ETH": "3000"})
+        ws._on_all_mids(frame)
+        first_age = ws._latest.last_update_time
+        assert ws.get_all_mids() == {"BTC": "50000", "ETH": "3000"}
+        # Re-send the identical payload (as HL would on replay).
+        time.sleep(0.01)
+        ws._on_all_mids(_all_mids_frame({"BTC": "50000", "ETH": "3000"}))
+        assert ws._seq == 2  # raw frame counter still advances...
+        assert ws._dropped_replay == 1  # ...but the replay is dropped
+        # snapshot unchanged and update time NOT refreshed
+        assert ws.get_all_mids() == {"BTC": "50000", "ETH": "3000"}
+        assert ws._latest.last_update_time == first_age
+
+    def test_m11_single_coin_spike_suppressed(
+        self, ws: HyperliquidWebSocket, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """M-11: a tick that moves one coin's mid beyond the jump cap is
+        suppressed (prior mid kept); well-behaved coins in the same frame
+        still apply."""
+        monkeypatch.setattr(ws_client, "_WS_MAX_TICK_JUMP_FRAC", 0.25)
+        ws._on_all_mids(_all_mids_frame({"BTC": "50000", "ETH": "3000"}))
+        # BTC jumps +100% (bad print) while ETH moves normally.
+        ws._on_all_mids(_all_mids_frame({"BTC": "100000", "ETH": "3010"}))
+        mids = ws.get_all_mids()
+        assert mids["BTC"] == "50000"   # spike suppressed, prior kept
+        assert mids["ETH"] == "3010"    # normal move applied
+        assert ws._dropped_spike == 1
+
+    def test_m11_new_coin_without_prior_is_accepted(
+        self, ws: HyperliquidWebSocket, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """M-11: a coin seen for the first time has no prior mid to compare
+        against and must be accepted regardless of magnitude (new listing)."""
+        monkeypatch.setattr(ws_client, "_WS_MAX_TICK_JUMP_FRAC", 0.25)
+        ws._on_all_mids(_all_mids_frame({"BTC": "50000"}))
+        ws._on_all_mids(_all_mids_frame({"BTC": "50010", "DOGE": "0.123"}))
+        mids = ws.get_all_mids()
+        assert mids["DOGE"] == "0.123"
+        assert ws._dropped_spike == 0
+
 
 # ---------------------------------------------------------------------------
 # get_diag
@@ -208,7 +254,8 @@ class TestGetDiag:
     def test_keys_present(self, ws: HyperliquidWebSocket) -> None:
         d = ws.get_diag()
         assert set(d.keys()) == {
-            "seq", "last_seq", "dropped_dup", "dropped_stale", "data_age_s",
+            "seq", "last_seq", "dropped_dup", "dropped_stale",
+            "dropped_replay", "dropped_spike", "data_age_s",
         }
 
     def test_initial_values(self, ws: HyperliquidWebSocket) -> None:
@@ -217,6 +264,8 @@ class TestGetDiag:
         assert d["last_seq"] == 0
         assert d["dropped_dup"] == 0
         assert d["dropped_stale"] == 0
+        assert d["dropped_replay"] == 0
+        assert d["dropped_spike"] == 0
         assert 0.0 <= d["data_age_s"] < 5.0  # freshly constructed
 
     def test_values_track_callbacks(

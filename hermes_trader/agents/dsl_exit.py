@@ -481,6 +481,19 @@ class ExitPolicy:
     # and exit confirmation additionally requires the INDEX price (oracle,
     # which a single-book wick cannot move) to be through the floor.
     breach_confirm_sec: float = 4.0
+    # ── H-5 (supplemental audit 2026-08-30): hard max_loss stop wick guard ──
+    # The trailing floor_breach below gets both a time gate (breach_confirm_sec)
+    # and an INDEX (oracle) cross-check (A-F5), but the max_loss hard stop above
+    # them fired on the FIRST mid tick at the cap — a single-book wick through
+    # the hard stop market-closed a position even when the index never traded
+    # there. The hard stop still has to be FAST (it bounds catastrophe and the
+    # exchange-side bracket SL is the ultimate net), so its persistence window
+    # is deliberately SHORT (default 1.0s — enough to reject a one-tick wick at
+    # a ~15s poll, far inside the exchange backup-SL slippage budget) and the
+    # index cross-check only SUPPRESSES while the index is healthy and on the
+    # safe side. 0 disables the time gate. A missing/invalid index degrades to
+    # the time gate on mid alone (fail-open; exchange backup SL remains).
+    hard_stop_confirm_sec: float = 1.0
     # ── Patch A: don't exit inside the noise band (sub-first-tier) ──────────
     # Phase-3 finding: on strong movers we trailing-exited at +0.6–1.2% (the 0.30
     # give-back applied to a barely-green position) while the trend kept running,
@@ -527,6 +540,12 @@ class DSLTracker:
         # restart it just re-arms from the first post-restart breach tick.
         self._first_breach_ts: Optional[float] = None
         self._last_floor: Optional[float] = None
+        # H-5: monotonic() timestamp of the first tick at/through the hard
+        # max_loss cap in the current run; None while not at the hard stop or
+        # after price recovers back inside it. Mirrors _first_breach_ts but is
+        # on the tighter hard_stop_confirm_sec window. Not persisted (re-arms
+        # from the first post-restart tick).
+        self._first_hardstop_ts: Optional[float] = None
 
         # Exchange-side bracket order IDs (for the static backup SL / TP scale-out).
         # Persisted across restarts so the dynamic SL mover (batchModify) can target
@@ -742,17 +761,66 @@ class DSLTracker:
             loss_pct, effective_max_loss, rel_tol=1e-9, abs_tol=1e-9
         ):
             roe_loss = loss_pct * lev
-            _record_exit("max_loss")
-            _request_save(force=True)
-            return self._verdict(
-                exit=True,
-                reason=(f"max_loss ({loss_pct:.2f}% spot / {roe_loss:.1f}% ROE "
-                        f">= {effective_max_loss:.2f}% spot cap; "
-                        f"spot_cap={spot_cap_display:.2f}{'[atr]' if atr_active else ''}, "
-                        f"roe_cap={pol.max_loss_roe_pct}/{lev}x)"),
-                floor_price=self._hard_stop_floor(effective_max_loss),
-                peak_price=self.peak_px, phase="phase1", unrealized_pct=upct,
+            # H-5 (supplemental audit): wick guard for the hard stop. The
+            # immediate-return below fired on the FIRST mid tick at the cap; a
+            # single order-book wick that the index (oracle blend) never
+            # traded at could market-close a position. Require (a) the breach
+            # to persist for hard_stop_confirm_sec and (b) when a healthy index
+            # price is available, the index to ALSO be through the hard-stop
+            # floor. Kept short (default 1s): the hard stop bounds catastrophe
+            # and the exchange-side bracket SL remains the ultimate net, so a
+            # fail-open on missing index still exits, only slightly delayed.
+            _hs_floor = self._hard_stop_floor(effective_max_loss)
+            now_hs = time.monotonic()
+            if self._first_hardstop_ts is None:
+                self._first_hardstop_ts = now_hs
+            hs_elapsed = now_hs - self._first_hardstop_ts
+            hs_time_ok = (
+                pol.hard_stop_confirm_sec <= 0
+                or hs_elapsed >= pol.hard_stop_confirm_sec
             )
+            hs_index_ok = True
+            hs_index_note = ""
+            try:
+                _hs_idx = float(index_px) if index_px is not None else 0.0
+            except (TypeError, ValueError):
+                _hs_idx = 0.0
+            if _hs_idx > 0.0 and math.isfinite(_hs_idx):
+                hs_index_ok = sgn * (_hs_idx - _hs_floor) <= 0 or math.isclose(
+                    sgn * (_hs_idx - _hs_floor), 0.0, abs_tol=1e-12
+                )
+                hs_index_note = (
+                    ", idx-confirmed" if hs_index_ok
+                    else f", mid-only wick? idx={_hs_idx:.6g} safe-side of stop"
+                )
+            if hs_time_ok and hs_index_ok:
+                _record_exit("max_loss")
+                _request_save(force=True)
+                return self._verdict(
+                    exit=True,
+                    reason=(f"max_loss ({loss_pct:.2f}% spot / {roe_loss:.1f}% ROE "
+                            f">= {effective_max_loss:.2f}% spot cap; "
+                            f"spot_cap={spot_cap_display:.2f}{'[atr]' if atr_active else ''}, "
+                            f"roe_cap={pol.max_loss_roe_pct}/{lev}x"
+                            f"{', held %.1fs' % hs_elapsed if pol.hard_stop_confirm_sec > 0 else ''}"
+                            f"{hs_index_note})"),
+                    floor_price=_hs_floor,
+                    peak_price=self.peak_px, phase="phase1", unrealized_pct=upct,
+                )
+            # Not yet confirmed: hold this tick (the exchange backup SL is the
+            # net for a true gap), but log the suppressed wick so the guard is
+            # observable. Do NOT reset the timer — if the breach is real the
+            # next tick confirms; a tick back inside the cap resets it below.
+            logger.info(
+                f"[dsl:wick] {self.coin} {self.side} mark={mark_px:.6g} at hard "
+                f"stop floor={_hs_floor:.6g} — holding for confirm "
+                f"({hs_elapsed:.1f}/{pol.hard_stop_confirm_sec:.1f}s{hs_index_note}); "
+                f"exchange backup SL remains the net."
+            )
+        else:
+            # Price recovered back inside the hard-stop cap → reset the H-5
+            # confirmation timer so the next touch re-arms from zero.
+            self._first_hardstop_ts = None
 
         retrace_used = 0.0
         if profit_pct >= pol.protect_pct:
@@ -1060,6 +1128,9 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
         consecutive_breaches_required=pol_raw.get("consecutive_breaches_required", 1),
         # A-F5: fallback default moved to 4.0s (see ExitPolicy.breach_confirm_sec).
         breach_confirm_sec=float(pol_raw.get("breach_confirm_sec", 4.0) or 0.0),
+        # H-5: hard max_loss stop wick-guard window (default 1.0s; see
+        # ExitPolicy.hard_stop_confirm_sec).
+        hard_stop_confirm_sec=float(pol_raw.get("hard_stop_confirm_sec", 1.0) or 0.0),
         breakeven_trigger_pct=pol_raw.get("breakeven_trigger_pct", ExitPolicy.breakeven_trigger_pct),
         breakeven_lock_pct=pol_raw.get("breakeven_lock_pct", ExitPolicy.breakeven_lock_pct),
         atr_stop_enabled=pol_raw.get("atr_stop_enabled", ExitPolicy.atr_stop_enabled),
@@ -1497,6 +1568,8 @@ def _build_policy_from_config() -> ExitPolicy:
             consecutive_breaches_required=int(dsl.get("consecutive_breaches_required", 1) or 1),
             # A-F5: default 4.0s breach confirmation (was 0.0 = single-tick exit).
             breach_confirm_sec=float(dsl.get("breach_confirm_sec", 4.0) or 0.0),
+            # H-5: hard max_loss stop wick-guard window (default 1.0s).
+            hard_stop_confirm_sec=float(dsl.get("hard_stop_confirm_sec", 1.0) or 0.0),
             noise_band_enabled=bool(noise_cfg.get("enabled", False)),
             noise_band_atr_mult=float(noise_cfg.get("atr_mult", ExitPolicy.noise_band_atr_mult)),
             phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,

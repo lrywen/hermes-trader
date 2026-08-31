@@ -28,6 +28,7 @@ import re
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Optional
@@ -217,6 +218,13 @@ def fetch_cboe(ticker: str, timeout: Optional[float] = None) -> Optional[dict[st
     if timeout is None:
         timeout = options_gex_params()["http_timeout_s"]
     url = f"https://cdn.cboe.com/api/global/delayed_quotes/options/{ticker}.json"
+    # M-9 (supplemental audit 2026-08-30): only http/https URLs may be fetched
+    # (defense-in-depth against file:// / LFI if the URL is ever influenced).
+    try:
+        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            return None
+    except Exception:
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         return json.load(urllib.request.urlopen(req, timeout=timeout, context=_SSL))

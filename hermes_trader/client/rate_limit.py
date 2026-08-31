@@ -85,6 +85,14 @@ _HL_CLIENT_IO_DEFAULTS: dict[str, Any] = {
     "ws_max_stale_s": 30,
     "ws_heartbeat_s": 10.0,
     "ws_seq_max_backward": 1024,
+    # M-11 (supplemental audit 2026-08-30): per-coin mid jump filter. A single
+    # allMids tick that moves a coin's price by more than this fraction vs the
+    # previous accepted mid is treated as a bad print: that coin's stale value
+    # is kept (frame still applied for every other coin) and the jump is
+    # counted/alerted. Fraction of 1.0 = 100%; default 0.25 = 25% — wide enough
+    # to admit genuine crypto volatility, narrow enough to reject a fat-finger
+    # / corrupt tick (H-6 already cross-checks entry pricing against Binance).
+    "ws_max_tick_jump_frac": 0.25,
 }
 
 # leaf -> (legacy env or None, kind "i"/"f"/"b", min guard value).
@@ -101,6 +109,7 @@ _HL_CLIENT_IO_SPEC: dict[str, tuple[Optional[str], str, float]] = {
     "ws_max_stale_s": ("HERMES_WS_MAX_STALE_SECONDS", "i", 1.0),
     "ws_heartbeat_s": ("HERMES_WS_HEARTBEAT_S", "f", 0.0),
     "ws_seq_max_backward": ("HERMES_WS_SEQ_MAX_BACKWARD", "i", 1.0),
+    "ws_max_tick_jump_frac": ("HERMES_WS_MAX_TICK_JUMP_FRAC", "f", 0.0),
 }
 
 _HL_RATE_LIMIT_DEFAULTS: dict[str, Any] = {

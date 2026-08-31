@@ -31,10 +31,17 @@ import secrets
 import threading
 import time
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Optional
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Optional
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+
+# L-5 (supplemental audit 2026-08-30): httpx is imported lazily inside
+# _llm_client() to keep the import off the hot module-load path; the TYPE_CHECKING
+# block only makes the "httpx.AsyncClient" annotations resolvable to static
+# checkers (ruff F821) without changing runtime behaviour.
+if TYPE_CHECKING:
+    import httpx
 
 from hermes_trader import event_log, session_log
 from hermes_trader.agents import dsl_exit

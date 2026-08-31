@@ -27,6 +27,7 @@ import logging
 import ssl
 import threading
 import time
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -196,6 +197,13 @@ def _fetch_day(date: str, timeout: Optional[float] = None) -> Optional[str]:
     if timeout is None:
         timeout = short_volume_params()["http_timeout_s"]
     url = _BASE.format(date=date)
+    # M-9 (supplemental audit 2026-08-30): only http/https URLs may be fetched
+    # (defense-in-depth against file:// / LFI if the URL is ever influenced).
+    try:
+        if urllib.parse.urlsplit(url).scheme not in ("http", "https"):
+            return None
+    except Exception:
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:

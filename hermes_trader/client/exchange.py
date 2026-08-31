@@ -135,6 +135,7 @@ from hermes_trader.client.hl_client import (
     HL_API,
     _http_post,
     assess_candle_quality,
+    closed_candles_only,
     fetch_hl_candles,
     resolve_user_address,
 )
@@ -1404,8 +1405,8 @@ def reconcile_order_fill(
     requested price.
 
     Returns a dict (never raises):
-      • status="filled":    {"status","avg_px","total_sz","filled_at_ms",
-                             "oid","cloid","n_fills"}
+      • status="filled":    {"status","avg_px","total_sz","fee_usd",
+                             "filled_at_ms","oid","cloid","n_fills"}
       • status="not_filled": {"status","reason"} — no matching fill after
                              retries (the order truly did not execute)
       • status="unknown":   {"status","reason"} — the LOOKUP itself failed
@@ -1459,6 +1460,7 @@ def reconcile_order_fill(
             # most recent matches. Aggregate weighted avg price + total size.
             tot_sz = 0.0
             tot_notional = 0.0
+            tot_fee = 0.0
             latest_ms = 0
             fill_oid = None
             n = 0
@@ -1472,6 +1474,14 @@ def reconcile_order_fill(
                     continue
                 tot_sz += sz
                 tot_notional += sz * px
+                # O-8 (supplemental audit 2026-08-30): userFills rows carry
+                # the REAL exchange fee charged on the fill — the SDK envelope
+                # does not surface it, so it was previously discarded. Sum it
+                # so callers get measured fees instead of the 2.5bps model.
+                try:
+                    tot_fee += float(f.get("fee") or 0.0)
+                except (TypeError, ValueError):
+                    pass
                 try:
                     tms = int(f.get("time") or 0)
                 except (TypeError, ValueError):
@@ -1495,6 +1505,9 @@ def reconcile_order_fill(
                     "status": "filled",
                     "avg_px": avg_px,
                     "total_sz": tot_sz,
+                    # O-8: total REAL exchange fee (USD) across the matched
+                    # fills; 0.0 when the venue reports none.
+                    "fee_usd": round(tot_fee, 6),
                     "filled_at_ms": latest_ms or None,
                     "oid": str(fill_oid) if fill_oid is not None else (str(oid) if oid else None),
                     "cloid": cloid_str,
@@ -1575,7 +1588,11 @@ def get_hl_atr(
         if hit and (now - hit[0]) < _ATR_TTL_S:
             return hit[1]
 
-    candles = fetch_hl_candles(coin, interval, period + 10)
+    raw_candles = fetch_hl_candles(coin, interval, period + 10)
+    # H-8 (supplemental audit 2026-08-30): never compute TR/ATR on the
+    # still-forming last bar — its partial range shrinks ATR → oversized
+    # position and a stop tighter than the true bar range. Score CLOSED bars.
+    candles, _dropped = closed_candles_only(raw_candles, interval)
     # C-M2 (deep audit 2026-08-28): fail CLOSED on distorted data. A gappy /
     # stale / truncated candle series silently shrinks ATR → oversized position
     # and a stop tighter than the real bar range; the executor treats atr<=0 as

@@ -804,9 +804,17 @@ def get_atr_hist_mean_pct(coin: str, interval: str = "4h", lookback_candles: int
     same units DSL uses for entry_atr_pct.
     """
     try:
-        from hermes_trader.client.hl_client import assess_candle_quality, fetch_hl_candles
+        from hermes_trader.client.hl_client import (
+            assess_candle_quality,
+            closed_candles_only,
+            fetch_hl_candles,
+        )
         period = 14
-        candles = fetch_hl_candles(coin, interval, lookback_candles)
+        # H-8: baseline ATR% must exclude the still-forming bar (its partial
+        # range is not a closed-bar observation and biases the mean).
+        candles, _ = closed_candles_only(
+            fetch_hl_candles(coin, interval, lookback_candles), interval
+        )
         if not candles or len(candles) < period + 2:
             return 0.0
         # C-M2: a gappy/stale/truncated history distorts the mean baseline
@@ -1101,8 +1109,11 @@ def _place_tp_scale_out(
 
     Banks a fraction of the position server-side so a winner is captured at
     target instead of round-tripping into the trailing stop; the remainder
-    rides the DSL trail. Upsizes sub-notional TPs to the exchange minimum
-    unless that would consume ≥90% of the position (then skips).
+    rides the DSL trail. On micro accounts, where the intended TP slice is
+    below the exchange minimum, scale-out is disabled explicitly (a faithful
+    fractional fill is venue-impossible — see O-9 below); otherwise upsizes
+    sub-notional TPs to the exchange minimum unless that would consume ≥90%
+    of the position (then skips).
     """
     tp_scale_fraction = float(config.get("tp_scale_fraction", 0.5))
     if not (atr > 0 and size_in_coin > 0 and 0 < tp_scale_fraction <= 1.0):
@@ -1136,6 +1147,31 @@ def _place_tp_scale_out(
     # the DSL trail handle the entire exit.
     tp_min_size = entry_size_for_notional(coin, tp_size * tp_px_trig, tp_px_trig)
     tp_min_notional = tp_min_size * tp_px_trig
+
+    # O-9 (supplemental audit 2026-08-30): micro accounts (e.g. a $10 equity
+    # tier on this venue, MIN_ORDER_USD=$10.5) cannot scale out faithfully.
+    # The intended TP slice (e.g. a 50% slice of a $11 position = $5.5) is
+    # below the exchange minimum, so the old code silently UPSIZED it to the
+    # $10.5 minimum — which fills ~95% of the position at target. What looks
+    # like "bank half, trail half" actually closes nearly the whole position
+    # in the TP leg and guts the trailing remainder. When the fractional TP
+    # slice itself is under the venue minimum, a real partial fill is
+    # impossible, so disable scale-out explicitly and let the DSL trail own
+    # the full exit, instead of masquerading a near-total close as a
+    # scale-out. The upsize path below still serves larger accounts whose
+    # slice is sub-minimum only by size-step rounding.
+    if tp_intended_notional < MIN_ORDER_USD:
+        upsized_frac = (tp_min_size / size_in_coin) if size_in_coin > 0 else 0.0
+        logger.warning(
+            f"[executor:tp] SKIP {coin} — intended TP slice ${tp_intended_notional:.2f} "
+            f"({tp_scale_fraction:.0%} of ${full_notional:.2f}) is below the HL "
+            f"minimum (${MIN_ORDER_USD:.2f}); upsizing would fill "
+            f"{upsized_frac:.0%} of the position (near-total close), so scale-out "
+            f"is disabled for this micro position. The DSL trailing floor handles "
+            f"the full exit. "
+            f"[skip_reason=micro_account_scale_out_disabled, tp_px={tp_px_trig:.6g}]"
+        )
+        return
 
     # Hard safety clamp: a scale-out TP must NEVER be sized larger than the
     # position it is supposed to partially close. entry_size_for_notional()
@@ -2444,6 +2480,49 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             }
     except Exception as _pre_e:
         logger.warning(f"[executor] A-F4 pre-place re-check failed (fail-open): {_pre_e!r}")
+
+    # H-6 (supplemental audit 2026-08-30): cross-source price veto. Every gate
+    # and the order itself price off the single Hyperliquid mid (WS allMids /
+    # same-origin REST); a stale or manipulated feed cannot be detected from
+    # inside HL. Compare against Binance spot right before placing: a BLOCK-
+    # level divergence refuses the ENTRY (exits are never gated here). Fail-open
+    # when the secondary source is unavailable/unsupported — it is a safety net,
+    # not a hard dependency.
+    try:
+        from hermes_trader.client.price_crosscheck import crosscheck_price
+        _px_check = crosscheck_price(coin, mid_price)
+    except Exception as _px_e:
+        logger.warning(f"[executor] H-6 price cross-check raised (fail-open): {_px_e!r}")
+        _px_check = {"ok": True, "checked": False, "reason": f"exception:{_px_e!r}"}
+    if _px_check.get("checked") and not _px_check.get("ok"):
+        _reason = _px_check.get("reason", "price divergence")
+        if _px_check.get("action") == "block":
+            logger.error(
+                f"[executor] H-6 BLOCK {coin} entry: {_reason} (analysis {_aid}).")
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"🚫 H-6 跨源价格偏离否决开仓 {coin}: {_reason}",
+                    category="risk")
+            except Exception:
+                pass
+            with _EXEC_LOCK:
+                _IN_FLIGHT_ANALYSES.discard(_aid)
+                _IN_FLIGHT_COINS.discard(coin)
+            return {
+                "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                "reason": f"price_divergence_blocked: {_reason}",
+                "price_check": _px_check,
+                "gate_results": gate_output["results"],
+            }
+        logger.warning(f"[executor] H-6 price divergence alert (proceeding): {_reason}")
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"⚠️ H-6 跨源价格偏离告警 {coin}: {_reason}（未超过否决阈值，继续开仓）",
+                category="risk")
+        except Exception:
+            pass
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
