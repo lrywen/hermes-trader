@@ -229,7 +229,7 @@ def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict[str, A
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:  # nosec B310 (supplemental audit 2026-08-30): scheme allowlisted by _is_safe_web_url above
             data = json.loads(r.read().decode("utf-8", "replace"))
             _elapsed = time.monotonic() - _t0
             if _elapsed > 1.5:

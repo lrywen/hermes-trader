@@ -1422,7 +1422,11 @@ def _debate_cache_key(coin: str, perception: dict[str, Any]) -> str:
         score = 0.0
     bucket = round(score / 0.05)
     triggers = ",".join(sorted(extract_fired_triggers(perception)))
-    digest = hashlib.sha1(triggers.encode("utf-8", "replace")).hexdigest()[:12]
+    # (supplemental audit 2026-08-30) B324: this is an in-process debate-cache
+    # fingerprint, NOT a security signature. Use blake2b to silence the weak-
+    # hash warning; the only effect is that pre-existing in-memory cache
+    # entries miss once and are rebuilt (the cache is never persisted).
+    digest = hashlib.blake2b(triggers.encode("utf-8", "replace")).hexdigest()[:12]
     return f"{coin}|s{bucket}|t{digest}"
 
 

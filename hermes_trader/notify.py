@@ -258,7 +258,7 @@ def _post_with_retry(
                 headers={"Content-Type": "application/json; charset=utf-8"},
                 method="POST",
             )
-            with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:
+            with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as resp:  # nosec B310 (supplemental audit 2026-08-30): webhook scheme allowlisted (http/https only) above
                 raw = resp.read().decode("utf-8", errors="replace")
             try:
                 data = json.loads(raw)

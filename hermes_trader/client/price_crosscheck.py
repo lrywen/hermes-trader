@@ -87,7 +87,13 @@ def _env_float(name: str, default: float) -> float:
 
 def binance_spot(coin: str) -> Optional[tuple[str, float]]:
     """HL crypto coin -> (Binance USDT symbol, price scale). None for coins
-    with no comparable Binance spot pair (xyz: equity perps)."""
+    with no comparable Binance spot pair (xyz: equity perps).
+
+    (supplemental audit 2026-08-30) OPERATIONAL CONSTRAINT: a coin with no
+    Binance pair returns None, so crosscheck_price fail-OPENs on the single HL
+    source with no second-source veto. Equity / HIP-3 perps (``xyz:``-style
+    tickers) therefore must NOT be enabled for live trading until an
+    independent second price source is wired in here. Crypto perps are covered."""
     if not coin or ":" in coin:
         return None
     return _SYMBOL_SCALE_OVERRIDE.get(coin, (f"{coin.upper()}USDT", 1.0))
