@@ -347,6 +347,38 @@ WS_APP_HEARTBEAT_AGE_S = Gauge(
     "hermes_ws_app_heartbeat_age_seconds",
     "Age (in seconds) since the app-level heartbeat last fired (R11-D1).",
 )
+# Phase-4 P1: REST weight observability. Counters live in the flock'd shared
+# token-bucket state file (/dev/shm) so the server /metrics process sees the
+# trading loop's traffic too (HL's 1200 weight/min budget is per-IP, shared
+# across both processes). Gauges are used (not Counters) because the value is
+# read cross-process from a file; a scrape stays network-free. Alert when
+# granted_weight's 1m rate approaches 800/min (WS degraded) — with WS healthy
+# it should stay under ~300/min.
+HL_REST_GRANTED_WEIGHT = Gauge(
+    "hermes_hl_rest_granted_weight_total",
+    "Cumulative request-weight granted by the HL token bucket since the "
+    "state file was created (cross-process; Phase-4 P1).",
+)
+HL_REST_GRANTED_REQUESTS = Gauge(
+    "hermes_hl_rest_granted_requests_total",
+    "Cumulative number of REST requests granted by the HL token bucket "
+    "(cross-process; Phase-4 P1).",
+)
+HL_REST_DENIED_REQUESTS = Gauge(
+    "hermes_hl_rest_denied_requests_total",
+    "Cumulative requests skipped because the HL rate budget was exhausted "
+    "after max_wait (cross-process; Phase-4 P1).",
+)
+HL_REST_PENALIZED_REQUESTS = Gauge(
+    "hermes_hl_rest_penalized_requests_total",
+    "Cumulative requests that received a 429 and drained the bucket "
+    "(cross-process; Phase-4 P1).",
+)
+HL_REST_TOKENS_AVAILABLE = Gauge(
+    "hermes_hl_rest_tokens_available",
+    "Token-bucket balance right now (0 = saturated, callers will queue; "
+    "Phase-4 P1).",
+)
 
 
 def _to_float(value: object) -> float:
@@ -440,6 +472,23 @@ def _refresh() -> None:
                 pass
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[metrics] ws diag read failed: {e}")
+
+    # Phase-4 P1: HL REST rate-limiter counters. The shared bucket keeps its
+    # cumulative totals in the flock'd /dev/shm state file, so this read is
+    # network-free and reflects BOTH processes (trading loop + server). The
+    # in-process fallback bucket reports its own counters with shared=False.
+    try:
+        from hermes_trader.client.rate_limit import HL_LIMITER
+
+        if hasattr(HL_LIMITER, "stats"):
+            st = HL_LIMITER.stats()
+            HL_REST_GRANTED_WEIGHT.set(float(st.get("granted_weight", 0.0)))
+            HL_REST_GRANTED_REQUESTS.set(float(st.get("granted_requests", 0)))
+            HL_REST_DENIED_REQUESTS.set(float(st.get("denied_requests", 0)))
+            HL_REST_PENALIZED_REQUESTS.set(float(st.get("penalized_requests", 0)))
+            HL_REST_TOKENS_AVAILABLE.set(float(st.get("tokens_available", 0.0)))
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"[metrics] hl rate stats read failed: {e}")
 
 
 def render_metrics() -> tuple[bytes, str]:

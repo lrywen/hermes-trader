@@ -218,6 +218,14 @@ class TokenBucket:
         self._refill = float(refill_per_sec)
         self._last = time.monotonic()
         self._lock = threading.Lock()
+        # Phase-4 P1: cumulative REST-weight observability (in-process
+        # fallback counters; SharedTokenBucket mirrors these in the flock'd
+        # state file so the server /metrics process sees the trading loop's
+        # traffic too). Gated by HERMES_HL_RATE_STATS (default on).
+        self._stat_granted_w = 0.0
+        self._stat_granted_n = 0
+        self._stat_denied_n = 0
+        self._stat_penalized_n = 0
 
     @property
     def refill_per_sec(self) -> float:
@@ -238,12 +246,20 @@ class TokenBucket:
                 self._last = now
                 if self._tokens >= weight:
                     self._tokens -= weight
+                    if _rate_stats_enabled():
+                        self._stat_granted_w += float(weight)
+                        self._stat_granted_n += 1
                     return True
                 if self._refill <= 0:
+                    if _rate_stats_enabled():
+                        self._stat_denied_n += 1
                     return False  # no refill → will never recover
                 deficit = weight - self._tokens
                 sleep_for = deficit / self._refill
             if time.monotonic() + sleep_for > deadline:
+                if _rate_stats_enabled():
+                    with self._lock:
+                        self._stat_denied_n += 1
                 return False
             time.sleep(min(sleep_for, 0.5))
 
@@ -256,6 +272,22 @@ class TokenBucket:
         with self._lock:
             self._tokens = max(0.0, self._tokens - float(weight))
             self._last = time.monotonic()
+            if _rate_stats_enabled():
+                self._stat_penalized_n += 1
+
+    def stats(self) -> dict:
+        """Phase-4 P1: cumulative REST-weight counters for /metrics.
+        ``shared`` is False for the in-process bucket (no cross-process
+        view); SharedTokenBucket overrides this with file-backed totals."""
+        with self._lock:
+            return {
+                "granted_weight": self._stat_granted_w,
+                "granted_requests": self._stat_granted_n,
+                "denied_requests": self._stat_denied_n,
+                "penalized_requests": self._stat_penalized_n,
+                "tokens_available": max(0.0, self._tokens),
+                "shared": False,
+            }
 
 
 class SharedTokenBucket:
@@ -295,26 +327,53 @@ class SharedTokenBucket:
     def refill_per_sec(self) -> float:
         return self._refill
 
-    def _read_state(self, fd: int) -> tuple[float, float]:
+    def _read_state(self, fd: int) -> tuple[float, float, float, int, int, int, int]:
+        """Read (tokens, last, granted_weight, granted_n, denied_n,
+        penalized_n). Phase-4 P1 appended the four cumulative counters;
+        a legacy 2-field file (or an empty/corrupt read) yields zeroed
+        counters so mixed-version rollout never mis-counts or crashes."""
         try:
             os.lseek(fd, 0, os.SEEK_SET)
-            raw = os.read(fd, 64)
+            raw = os.read(fd, 256)
             if not raw:
-                return self._capacity, time.monotonic()
+                return self._capacity, time.monotonic(), 0.0, 0, 0, 0
             parts = raw.decode("utf-8", "ignore").split()
-            if len(parts) != 2:
-                return self._capacity, time.monotonic()
-            return float(parts[0]), float(parts[1])
+            if len(parts) < 2:
+                return self._capacity, time.monotonic(), 0.0, 0, 0, 0
+            tokens, last = float(parts[0]), float(parts[1])
+
+            def _fi(i: int) -> float:
+                return float(parts[i]) if len(parts) > i else 0.0
+
+            def _ii(i: int) -> int:
+                try:
+                    return int(float(parts[i])) if len(parts) > i else 0
+                except ValueError:
+                    return 0
+
+            return tokens, last, _fi(2), _ii(3), _ii(4), _ii(5)
         except (OSError, ValueError):
-            return self._capacity, time.monotonic()
+            return self._capacity, time.monotonic(), 0.0, 0, 0, 0
 
     @staticmethod
-    def _write_state(fd: int, tokens: float, last: float) -> None:
+    def _write_state(
+        fd: int,
+        tokens: float,
+        last: float,
+        granted_w: float = 0.0,
+        granted_n: int = 0,
+        denied_n: int = 0,
+        penalized_n: int = 0,
+    ) -> None:
         # In-place write while the caller holds the exclusive flock. The lock
         # guarantees no other process/thread reads mid-write, so an atomic
-        # rename isn't needed (and would invalidate the held fd). Keep the
-        # write short (<64 bytes, one syscall on tmpfs).
-        data = f"{tokens:.6f} {last:.6f}\n".encode("utf-8")
+        # rename isn't needed (and would invalidate the held fd). One short
+        # syscall on tmpfs; the four trailing ints/floats are the Phase-4 P1
+        # cumulative counters (legacy readers see len!=2 and safely reset).
+        data = (
+            f"{tokens:.6f} {last:.6f} {granted_w:.3f} "
+            f"{granted_n} {denied_n} {penalized_n}\n"
+        ).encode("utf-8")
         os.lseek(fd, 0, os.SEEK_SET)
         os.ftruncate(fd, 0)
         os.write(fd, data)
@@ -327,6 +386,7 @@ class SharedTokenBucket:
         """
         if self._refill <= 0:
             return False, 0.0
+        stats_on = _rate_stats_enabled()
         with self._thread_lock:
             try:
                 fd = os.open(self._path, os.O_RDWR)
@@ -337,7 +397,7 @@ class SharedTokenBucket:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
-                    tokens, last = self._read_state(fd)
+                    tokens, last, gw, gn, dn, pn = self._read_state(fd)
                     now = time.monotonic()
                     tokens = min(
                         self._capacity,
@@ -346,11 +406,17 @@ class SharedTokenBucket:
                     if tokens >= weight:
                         if deduct:
                             tokens -= weight
-                        self._write_state(fd, tokens, now)
+                            if stats_on:
+                                gw += float(weight)
+                                gn += 1
+                        self._write_state(fd, tokens, now, gw, gn, dn, pn)
                         return True, 0.0
                     deficit = weight - tokens
-                    # Persist the refilled (but not deducted) state.
-                    self._write_state(fd, tokens, now)
+                    # Persist the refilled (but not deducted) state. A denied
+                    # attempt only counts once: the caller (acquire) bumps the
+                    # denied counter via _bump_denied() when it gives up after
+                    # max_wait, not on every inner retry.
+                    self._write_state(fd, tokens, now, gw, gn, dn, pn)
                     return False, deficit / self._refill
                 finally:
                     fcntl.flock(fd, fcntl.LOCK_UN)
@@ -362,6 +428,75 @@ class SharedTokenBucket:
                 except OSError:
                     pass
 
+    def _bump_denied(self) -> None:
+        """Phase-4 P1: increment the cross-process denied-request counter
+        once per acquire() that gave up (not per inner retry)."""
+        if not self._available or not _rate_stats_enabled():
+            return
+
+        def _bump() -> None:
+            try:
+                fd = os.open(self._path, os.O_RDWR)
+            except OSError:
+                return
+            try:
+                import fcntl
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    tokens, last, gw, gn, dn, pn = self._read_state(fd)
+                    now = time.monotonic()
+                    tokens = min(self._capacity, tokens + (now - last) * self._refill)
+                    self._write_state(fd, tokens, now, gw, gn, dn + 1, pn)
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+        with self._thread_lock:
+            _bump()
+
+    def stats(self) -> dict:
+        """Phase-4 P1: read the cross-process cumulative counters from the
+        flock'd state file. Never raises — an unreadable file yields zeros
+        (the trading path itself degrades to grant-on-open-failure)."""
+        empty = {
+            "granted_weight": 0.0,
+            "granted_requests": 0,
+            "denied_requests": 0,
+            "penalized_requests": 0,
+            "tokens_available": 0.0,
+            "shared": self._available,
+        }
+        if not self._available:
+            return empty
+        try:
+            with self._thread_lock:
+                fd = os.open(self._path, os.O_RDWR)
+                try:
+                    import fcntl
+                    fcntl.flock(fd, fcntl.LOCK_SH)
+                    try:
+                        tokens, _last, gw, gn, dn, pn = self._read_state(fd)
+                    finally:
+                        fcntl.flock(fd, fcntl.LOCK_UN)
+                finally:
+                    os.close(fd)
+        except OSError:
+            return empty
+        return {
+            "granted_weight": gw,
+            "granted_requests": gn,
+            "denied_requests": dn,
+            "penalized_requests": pn,
+            "tokens_available": max(0.0, tokens),
+            "shared": True,
+        }
+
     def acquire(self, weight: int = 20, max_wait: float = 10.0) -> bool:
         if not self._available:
             return True
@@ -371,6 +506,8 @@ class SharedTokenBucket:
             if granted:
                 return True
             if time.monotonic() + sleep_for > deadline:
+                # Phase-4 P1: one denied count per give-up (not per retry).
+                self._bump_denied()
                 return False
             # Sleep without holding any lock so other processes can proceed.
             time.sleep(min(sleep_for, 0.5))
@@ -379,6 +516,7 @@ class SharedTokenBucket:
         """Drain `weight` tokens cross-process after a 429."""
         if not self._available or weight <= 0:
             return
+        stats_on = _rate_stats_enabled()
 
         def _drain() -> None:
             try:
@@ -389,11 +527,13 @@ class SharedTokenBucket:
                 import fcntl
                 fcntl.flock(fd, fcntl.LOCK_EX)
                 try:
-                    tokens, last = self._read_state(fd)
+                    tokens, last, gw, gn, dn, pn = self._read_state(fd)
                     now = time.monotonic()
                     tokens = min(self._capacity, tokens + (now - last) * self._refill)
                     tokens = max(0.0, tokens - float(weight))
-                    self._write_state(fd, tokens, now)
+                    if stats_on:
+                        pn += 1
+                    self._write_state(fd, tokens, now, gw, gn, dn, pn)
                 finally:
                     fcntl.flock(fd, fcntl.LOCK_UN)
             except OSError:
@@ -457,6 +597,17 @@ def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
 # the dashboard which already serializes per UI request).
 
 import contextlib  # noqa: E402
+
+
+def _rate_stats_enabled() -> bool:
+    """Phase-4 P1: REST-weight observability switch. Call-time env read so
+    tests/ops can toggle ``HERMES_HL_RATE_STATS`` after import and have it
+    take effect immediately (mirrors the per-endpoint gate switch). Default
+    ON; set to 0 to revert to the pre-Phase-4 state (counters stay zero)."""
+    raw = os.environ.get("HERMES_HL_RATE_STATS")
+    if raw is None or raw.strip() == "":
+        return True
+    return raw.strip().lower() in _TRUE_TOKENS
 
 
 def _per_endpoint_gate_enabled() -> bool:
