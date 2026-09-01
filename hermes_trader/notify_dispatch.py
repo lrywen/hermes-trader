@@ -58,6 +58,8 @@ def dispatch(record: dict[str, Any]) -> None:
         elif event == "loop_stop":
             notify.send_card("交易循环已停止（用户手动停止）",
                              category="system", level="warn")
+        elif event == "ws_status":
+            _on_ws_status(record)
         # scan / ta_skip / near_miss / loop_heartbeat: deliberately ignored.
     except Exception:  # never let notification break the caller
         # P1-17: this was logged at debug, so a malformed record (None where a
@@ -209,3 +211,44 @@ def _on_loop_start(r: dict[str, Any]) -> None:
     }
     notify.send_card("Hermes 交易系统已启动", fields=fields,
                      category="system", level="info")
+
+
+# Phase 4 P0-3: feed-status transitions. The trading loop only emits this on
+# an EDGE after a 30s hysteresis window (see realtime_feed.FeedStatusTracker),
+# so a card here means the WS mid feed genuinely changed state — not a frame
+# blip. ``down`` is the fail-closed posture: the af14 feed gate independently
+# blocks new entries on stale mids; this card is the human-facing signal.
+_FEED_STATUS_CN = {"ok": "正常（WS 实时）", "degraded": "降级（WS 断连，已切 REST）",
+                   "down": "中断（WS+REST 双失败）"}
+
+
+def _on_ws_status(r: dict[str, Any]) -> None:
+    status = str(r.get("status", "")).lower()
+    if status not in _FEED_STATUS_CN:
+        return
+    previous = str(r.get("previous", "")).lower()
+    fields = {
+        "当前状态": _FEED_STATUS_CN[status],
+        "上一状态": _FEED_STATUS_CN.get(previous, _v(previous or "—")),
+        "WS 数据龄期": f"{r.get('ws_age_s')}s" if r.get("ws_age_s") is not None else "无数据",
+        "REST 数据龄期": f"{r.get('rest_age_s')}s" if r.get("rest_age_s") is not None else "无数据",
+    }
+    if status == "down":
+        title = "行情馈送中断 — 已停止开新仓"
+        level = "danger"
+        detail = ("WS 与 REST 均无法获取有效行情，系统已 fail-closed："
+                  "停止开新仓；持仓止损仍由本地监控独立执行。请立即检查网络。")
+    elif status == "degraded":
+        title = "行情馈送降级 — 已切换 REST 轮询"
+        level = "warn"
+        detail = "WS allMids 中断，扫描已自动降速并回退 REST 快照；平仓感知延迟增大。"
+    else:  # ok — recovery
+        title = "行情馈送恢复 — WS 实时通道已恢复"
+        level = "success"
+        detail = "WS allMids 恢复实时推送，扫描周期与平仓感知恢复低延迟。"
+    # Distinct dedup key per transition direction so a recovery card is never
+    # throttled by the preceding degradation card; 10-min dedup still absorbs
+    # any unexpected same-direction repeat.
+    notify.send_card(title, fields=fields, markdown=f"**说明**\n{detail}",
+                     category="system", level=level,
+                     dedup_key=f"ws_status:{previous}->{status}")

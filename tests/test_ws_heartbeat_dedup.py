@@ -256,6 +256,7 @@ class TestGetDiag:
         assert set(d.keys()) == {
             "seq", "last_seq", "dropped_dup", "dropped_stale",
             "dropped_replay", "dropped_spike", "data_age_s",
+            "user_fills_count", "user_fills_user",
         }
 
     def test_initial_values(self, ws: HyperliquidWebSocket) -> None:

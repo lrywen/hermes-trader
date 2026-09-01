@@ -1048,6 +1048,54 @@ def drain_ws_user_fills() -> list[dict[str, Any]]:
             return []
 
 
+def ws_feed_diag() -> dict[str, Any] | None:
+    """Return the persistent WS diagnostic snapshot, or None if not started.
+
+    Thin read-only accessor for the trading loop / metrics / ws_status path.
+    Never raises — a torn-down WS mid-flight reads as ``None`` (no feed).
+    """
+    ws = _get_ws_mids_instance()
+    if ws is None:
+        return None
+    try:
+        return ws.get_diag()
+    except Exception as e:  # noqa: BLE001 — diagnostics must never break callers
+        logger.warning(f"[hl] ws_feed_diag failed (non-fatal): {e}")
+        return None
+
+
+def ws_feed_age_seconds() -> float | None:
+    """Age of the newest allMids frame, or None when the WS is not running."""
+    diag = ws_feed_diag()
+    if diag is None:
+        return None
+    try:
+        return float(diag.get("data_age_s", 0.0))
+    except (TypeError, ValueError):
+        return None
+
+
+def wait_for_ws_user_fills(timeout: float) -> bool:
+    """Block up to ``timeout`` seconds until a userFill is enqueued.
+
+    Wakes the trading loop's between-cycle / between-batch sleep the moment a
+    fill frame arrives on the WS thread, while the fill itself is still
+    drained and reported on the MAIN thread (single-writer rule: the WS
+    callback thread never touches the session log / SSE). Returns True when
+    woken early, False on timeout or when the WS is not running.
+    """
+    ws = _get_ws_mids_instance()
+    if ws is None:
+        time.sleep(max(0.0, timeout))
+        return False
+    try:
+        return bool(ws.wait_for_fills(timeout))
+    except Exception as e:  # noqa: BLE001 — treat any failure as a plain sleep
+        logger.warning(f"[hl] wait_for_ws_user_fills failed (non-fatal): {e}")
+        time.sleep(max(0.0, timeout))
+        return False
+
+
 def fetch_funding_history(
     coin: str, start_time: int, end_time: Optional[int] = None,
 ) -> list[dict[str, Any]]:

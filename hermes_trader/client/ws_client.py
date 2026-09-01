@@ -23,7 +23,7 @@ import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import certifi
 from hyperliquid.info import Info
@@ -202,6 +202,13 @@ class HyperliquidWebSocket:
         self._fills_queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
         self._seen_tids: set[str] = set()
         self._seen_tids_lock = threading.Lock()
+        # Phase 4 (low-latency wake): set by the WS callback thread right
+        # after a fill is enqueued, waited on by the MAIN thread between
+        # cycles/batches. threading.Event is internally synchronized, so
+        # the callback thread still touches NOTHING but this Event + the
+        # queue + dedup set (single-writer rule preserved: the main thread
+        # is still the only writer of the session log / SSE).
+        self._fills_wake = threading.Event()
         # Soft cap on the dedup set so a long-running session doesn't
         # grow it unboundedly. 10k entries ~ 1MB; well below concern.
         # When exceeded we drop the oldest half (set is unordered so
@@ -478,6 +485,10 @@ class HyperliquidWebSocket:
                 }
                 try:
                     self._fills_queue.put_nowait(enqueued)
+                    # Wake a main-thread wait_for_fills() immediately.
+                    # set() is idempotent and thread-safe; the wait side
+                    # clears it after draining.
+                    self._fills_wake.set()
                 except Exception as put_err:
                     # queue.Queue.put_nowait only raises Full if a maxsize
                     # was set — we never set one, so this is defensive.
@@ -491,7 +502,7 @@ class HyperliquidWebSocket:
             # subscription. Swallow and continue.
             logger.warning("[ws:user-fills] callback error (non-fatal): %s", e)
 
-    def drain_user_fills(self) -> List[dict[str, Any]]:
+    def drain_user_fills(self) -> list[dict[str, Any]]:
         """Drain ALL queued user fills (NON-BLOCKING, Phase 2).
 
         Returns a list of normalized fill dicts (see ``_on_user_fills``
@@ -513,13 +524,35 @@ class HyperliquidWebSocket:
         suppressed). The set is bounded by ``_seen_tids_cap`` and is
         only reset by cap pressure, never by drain.
         """
-        out: List[dict[str, Any]] = []
+        # Re-arm BEFORE draining. The callback's ordering is put_nowait()
+        # THEN set(), so clearing the Event first and then draining until
+        # empty is wake-loss-free: any fill whose item is NOT caught by this
+        # drain (put after the final Empty observation) also signals set()
+        # after this clear() → the Event stays set and the next
+        # wait_for_fills() returns immediately. A fill whose item IS caught
+        # but whose set() lands after clear() leaves the Event set too —
+        # worst case one spurious immediate wake that drains an empty queue.
+        self._fills_wake.clear()
+        out: list[dict[str, Any]] = []
         while True:
             try:
                 out.append(self._fills_queue.get_nowait())
             except queue.Empty:
                 break
         return out
+
+    def wait_for_fills(self, timeout: float) -> bool:
+        """Block up to ``timeout`` seconds until a fill is enqueued.
+
+        Returns True if woken by a fill (queue may be drained immediately),
+        False on timeout. The caller — ALWAYS the main thread — then runs
+        ``drain_user_fills`` and logs/sends SSE itself, so the WS callback
+        thread never touches the session log. ``timeout`` <= 0 returns
+        immediately with the Event's current state without sleeping.
+        """
+        if timeout <= 0:
+            return self._fills_wake.is_set()
+        return self._fills_wake.wait(timeout=timeout)
 
     def subscribe_user_fills(self, user: str) -> bool:
         """Subscribe to ``userFills`` for ``user`` (Phase 1 — log only).

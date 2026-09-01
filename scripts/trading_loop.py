@@ -55,10 +55,11 @@ from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.memory import memory
 from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache, mid_feed_age_seconds, MID_FEED_MAX_STALE_S
 from hermes_trader.client.universe import get_universe
-from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address, start_ws_mids, stop_ws_mids, start_ws_user_fills, stop_ws_user_fills, drain_ws_user_fills
+from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address, start_ws_mids, stop_ws_mids, start_ws_user_fills, stop_ws_user_fills, drain_ws_user_fills, ws_feed_age_seconds, wait_for_ws_user_fills
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.session_log import append as log_event
 from hermes_trader.surge_postmortem import SurgeDetector, SurgeConfig
+from hermes_trader.realtime_feed import dynamic_scan_interval, classify_feed_status, FeedStatusTracker
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +403,98 @@ def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
     return 0
 
 
+def _effective_scan_interval() -> int:
+    """Effective inter-cycle sleep seconds (P0-1).
+
+    Fixed ``scan_interval`` unless HERMES_SCAN_DYNAMIC is enabled, in which
+    case a fresh allMids WS feed yields the fast cadence and a stopped/stale
+    WS (REST fallback) yields the slow cadence. Never raises — on any
+    diagnostic failure the fixed cadence is used.
+    """
+    if not _scan_dynamic_on:
+        return scan_interval
+    try:
+        return dynamic_scan_interval(
+            scan_interval,
+            ws_age_s=ws_feed_age_seconds(),
+            dynamic_on=_scan_dynamic_on,
+            fresh_s=_scan_dynamic_fresh_s,
+            fast_s=_scan_interval_fast,
+            slow_s=_scan_interval_slow,
+        )
+    except Exception as _dyn_e:
+        logger.warning(f"[phase4] dynamic interval failed (using fixed): {_dyn_e}")
+        return scan_interval
+
+
+def _cycle_sleep(seconds: int) -> None:
+    """Sleep between cycles, interruptible by a WS userFill (P0-2).
+
+    With HERMES_WS_FILL_WAKE off (default) this is a plain ``time.sleep`` —
+    identical to Phase 1. With it on, the wait returns the instant the WS
+    callback thread enqueues a fill; the drain + SSE reporting then happen on
+    THIS main thread (the callback thread still never touches the session
+    log — single-writer rule preserved), and a close fill triggers an
+    immediate positions refresh so Positions/Overview drop the closed coin
+    without waiting out the rest of the inter-cycle sleep. Never raises.
+    """
+    if not _ws_fill_wake_on or seconds <= 0:
+        time.sleep(max(0, int(seconds)))
+        return
+    try:
+        _woken = wait_for_ws_user_fills(float(seconds))
+        if _woken:
+            _n = _drain_and_report_fills()
+            logger.info(f"[phase4] fill-wake: drained {_n} fill(s) mid-sleep")
+            # A close fill flattens a position — refresh the snapshot on the
+            # main thread immediately (mirrors _exit_checkpoint's behaviour).
+            _refresh_positions_after_close("fill_wake")
+    except Exception as _wake_e:
+        # Any failure must not break the loop's cadence: fall back to the
+        # remainder of the wait as a plain sleep is unnecessary — the wrapper
+        # itself slept the full timeout on failure — just log.
+        logger.warning(f"[phase4] fill-wake wait failed (non-fatal): {_wake_e}")
+
+
+def _maybe_emit_ws_status() -> None:
+    """Classify combined feed liveness once per cycle; emit ws_status on edges.
+
+    P0-3. Edge-triggered (with downgrade hysteresis via FeedStatusTracker) so
+    the SSE stream carries an event only when ok→degraded→down and back. The
+    event is operator-only (NOT added to _PUBLIC_FEED_EVENTS). This NEVER
+    affects trading: entries/exits are still gated independently by af14_feed_decision
+    (fail-closed). Disabled unless HERMES_WS_STATUS_EVENT is on. Never raises.
+    """
+    if not _ws_status_event_on:
+        return
+    try:
+        _ws_age = ws_feed_age_seconds()
+        _rest_age = mid_feed_age_seconds()
+        _status = classify_feed_status(
+            ws_age_s=_ws_age,
+            rest_age_s=_rest_age,
+            ws_fresh_s=_ws_status_fresh_s,
+            rest_fresh_s=MID_FEED_MAX_STALE_S,
+        )
+        _transition = _feed_status_tracker.evaluate(_status)
+        if _transition is not None:
+            log_event({
+                "event": "ws_status",
+                "status": str(_transition.get("status", _status)),
+                "previous": str(_transition.get("previous", "")),
+                "reason": str(_transition.get("reason", "")),
+                "ws_age_s": round(_ws_age, 1) if isinstance(_ws_age, (int, float)) else None,
+                "rest_age_s": round(_rest_age, 1) if isinstance(_rest_age, (int, float)) else None,
+                "ts": int(time.time() * 1000),
+            })
+            logger.warning(
+                f"[phase4] ws_status {_transition.get('previous')} → "
+                f"{_transition.get('status')} (ws_age={_ws_age}, rest_age={_rest_age})"
+            )
+    except Exception as _se:
+        logger.warning(f"[phase4] ws_status emit failed (non-fatal): {_se}")
+
+
 threading.Thread(target=_watchdog, name="hermes-watchdog", daemon=True).start()
 logger.info(f"[watchdog] armed pre-startup: re-exec if no progress for {_watchdog_timeout_s}s")
 
@@ -507,6 +600,39 @@ except Exception as _uf_err:
 # the same closed candle; intra-candle price is fetched live via midpoint.
 scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '15'))
 min_score = config['scan']['minCompositeScore']
+
+# ── Phase 4 realtime optimisations (all default OFF → Phase-1 behaviour) ──────
+# P0-1 dynamic cadence: when the allMids WS feed is fresh, scan faster to
+# shrink position/equity/close latency; when the WS is down (REST fallback),
+# scan slower to spare REST rate budget. Off by default → fixed scan_interval.
+_scan_dynamic_on = os.environ.get('HERMES_SCAN_DYNAMIC', '0').lower() in ('1', 'true', 'yes', 'on')
+_scan_dynamic_fresh_s = float(os.environ.get('HERMES_SCAN_FRESH_S', '10'))
+_scan_interval_fast = int(os.environ.get('HERMES_SCAN_INTERVAL_FAST', '8'))
+_scan_interval_slow = int(os.environ.get('HERMES_SCAN_INTERVAL_SLOW', '20'))
+# P0-2 fill wake: between cycles, sleep on a threading.Event that the WS
+# callback thread sets the instant a userFill is enqueued, so an external
+# close is drained + SSE-reported immediately instead of after the full
+# inter-cycle sleep. The drain/report still runs on the MAIN thread (the
+# callback thread never touches the session log). Off by default → time.sleep.
+_ws_fill_wake_on = os.environ.get('HERMES_WS_FILL_WAKE', '0').lower() in ('1', 'true', 'yes', 'on')
+# P0-3 ws_status: edge-triggered SSE event (with downgrade hysteresis) so the
+# Portal can show feed green/yellow/red and dispatch Feishu/voice alerts. Off
+# by default → no ws_status events are emitted.
+_ws_status_event_on = os.environ.get('HERMES_WS_STATUS_EVENT', '0').lower() in ('1', 'true', 'yes', 'on')
+_ws_status_hold_s = float(os.environ.get('HERMES_WS_STATUS_HOLD_S', '30'))
+_ws_status_fresh_s = float(os.environ.get('HERMES_WS_STATUS_FRESH_S', '10'))
+
+if _scan_dynamic_on or _ws_fill_wake_on or _ws_status_event_on:
+    logger.info(
+        f"[phase4] realtime opts enabled: dynamic_scan={_scan_dynamic_on} "
+        f"(fast={_scan_interval_fast}s/slow={_scan_interval_slow}s, "
+        f"fresh<{_scan_dynamic_fresh_s}s), fill_wake={_ws_fill_wake_on}, "
+        f"ws_status={_ws_status_event_on} (hold={_ws_status_hold_s}s)"
+    )
+
+# P0-3 edge/hysteresis tracker: seeded silently on first classify, so a normal
+# startup WS connect window never fires a false degraded/down alarm.
+_feed_status_tracker = FeedStatusTracker(hold_seconds=_ws_status_hold_s)
 
 logger.info(f"Scan interval: {scan_interval}s, Min score: {min_score}")
 log_event({
@@ -1215,11 +1341,18 @@ while True:
 
         _beat("dsl_exit")
 
+        # P0-3: classify the combined WS/REST feed and emit a ws_status SSE
+        # event on edge transitions (no-op unless HERMES_WS_STATUS_EVENT=1).
+        # Purely observational: the fail-closed entry/exit gates above are the
+        # only things that ever change trading behaviour.
+        _maybe_emit_ws_status()
+
+        _sleep_s = _effective_scan_interval()
         if str(_cfg.get("mode", "OFF")).upper() == "OFF":
             logger.info("[mode] OFF — skipping scan/research/execution; exits still monitored")
             _last_progress_ts = time.time()
-            logger.info(f"Sleeping {scan_interval}s until next scan...")
-            time.sleep(scan_interval)
+            logger.info(f"Sleeping {_sleep_s}s until next scan...")
+            _cycle_sleep(_sleep_s)
             continue
 
         # C-M1: price feed is dead or blind to a held coin — skip ALL new-entry
@@ -1230,8 +1363,8 @@ while True:
             logger.error(f"[feed] FEED-FRESHNESS halt — skipping entries this cycle: {_feed_halt_reason}")
             log_event({"event": "feed_halt", "reason": _feed_halt_reason})
             _last_progress_ts = time.time()
-            logger.info(f"Sleeping {scan_interval}s until next scan...")
-            time.sleep(scan_interval)
+            logger.info(f"Sleeping {_sleep_s}s until next scan...")
+            _cycle_sleep(_sleep_s)
             continue
 
         # Hot-toggle `enable_hip3`: the universe is a startup snapshot (see the
@@ -1619,8 +1752,8 @@ while True:
             logger.info("=" * 60)
         else:
             logger.info("Cycle summary — no triggers this scan")
-        logger.info(f"Sleeping {scan_interval}s until next scan...")
-        time.sleep(scan_interval)
+        logger.info(f"Sleeping {_sleep_s}s until next scan...")
+        _cycle_sleep(_sleep_s)
 
     except KeyboardInterrupt:
         logger.info("Trading loop stopped by user")
@@ -1642,5 +1775,6 @@ while True:
     except Exception as e:
         logger.error(f"Trading loop error: {e}")
         log_event({"event": "error", "error": str(e)})
-        logger.info(f"Sleeping {scan_interval}s before retry...")
-        time.sleep(scan_interval)
+        _retry_s = _effective_scan_interval()
+        logger.info(f"Sleeping {_retry_s}s before retry...")
+        _cycle_sleep(_retry_s)
