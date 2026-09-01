@@ -55,7 +55,7 @@ from hermes_trader.agents.config_store import read_agent_config, cfg_get
 from hermes_trader.agents.memory import memory
 from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache, mid_feed_age_seconds, MID_FEED_MAX_STALE_S
 from hermes_trader.client.universe import get_universe
-from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address
+from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address, start_ws_mids, stop_ws_mids, start_ws_user_fills, stop_ws_user_fills, drain_ws_user_fills
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.session_log import append as log_event
 from hermes_trader.surge_postmortem import SurgeDetector, SurgeConfig
@@ -163,6 +163,130 @@ def _beat(stage: str) -> None:
     logger.debug(f"[watchdog] beat: {stage}")
 
 
+# ── Intra-cycle DSL exit checkpoint ─────────────────────────────────────────
+# The main loop evaluates DSL exits once per cycle, at the TOP of the loop
+# before the scan. A cold scan (~3 min) plus N serial LLM researches (a single
+# GOOGL HTA call was observed at 77s; a full batch can run several minutes)
+# therefore opens an inter-cycle blind window of up to the ~600s watchdog
+# budget during which a breached floor is not acted on even though the WS
+# real-time mid (Phase 3) already reflects the move.
+#
+# `_exit_checkpoint()` is a LIGHTWEIGHT re-run of the exit decision that we
+# call between trigger coins during the research batch (and after the scan).
+# It deliberately does NOT do the heavy per-cycle work — no
+# rehydrate_from_exchange (that needs the fresh account snapshot + dexes and
+# issues extra POSTs), no sync_exchange_sl / retry_pending_sl (those ratchet
+# and POST per held coin) — it only re-checks the DSL floor against the
+# freshest available price and market-closes anything breached. monitor_exits
+# already prefers the WS real-time mid (Phase 3) and falls back to the passed
+# REST snapshot, so passing the cycle's `mids` is safe and cheap.
+#
+# Concurrency: this runs on the SAME main thread, never from the WS callback.
+# No new thread, no lock — it simply shortens the time between two otherwise
+# identical main-thread exit evaluations.
+_EXIT_CHECKPOINT_MIN_INTERVAL_S = float(
+    os.environ.get("HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S", "5.0"))
+_last_exit_checkpoint_ts = 0.0
+
+
+def _process_exits(exits, *, source: str = "dsl") -> int:
+    """Market-close every DSL exit verdict and emit telemetry.
+
+    Shared by the per-cycle monitor pass and the intra-cycle checkpoint so a
+    close is executed/logged identically regardless of where it fired. Returns
+    the number of closes attempted. Never raises into the caller.
+    """
+    n = 0
+    for ex in exits:
+        coin = ex["coin"]
+        lev = ex.get("leverage", 1)
+        lpct = ex.get("leveraged_pct", ex["unrealized_pct"] * lev)
+        _reg = ex.get("entry_regime") or "unknown"
+        _hold = ex.get("hold_min") or 0.0
+        _mfe = ex.get("mfe_pct") or 0.0
+        _tag = "DSL" if source == "dsl" else "DSL-CHECKPOINT"
+        logger.info(f"[{_tag}] Closing {coin} {ex.get('side','?')} ({lev}x): "
+                    f"{ex['reason']} (margin {lpct:+.2f}% · spot {ex['unrealized_pct']:+.2f}%)")
+        _r = ex["reason"]
+        _canon = "trailing_stop" if _r.startswith("floor_breach") else (
+            "max_loss" if _r.startswith("max_loss") else (
+            "hard_timeout" if _r.startswith("hard_timeout") else (
+            "stale_flat_timeout" if _r.startswith("stale_flat_timeout") else _r.split(" ")[0])))
+        logger.info(f"[dsl:exit_stats] coin={coin} side={ex.get('side','?')} "
+                    f"lev={lev} regime={_reg} reason={_canon} "
+                    f"hold_min={_hold:.1f} mfe_spot_pct={_mfe:+.2f} "
+                    f"exit_spot_pct={ex['unrealized_pct']:+.2f} "
+                    f"exit_margin_pct={lpct:+.2f}")
+        res = close_position_market(coin)
+        evt = {
+            "event": "dsl_exit",
+            "coin": coin,
+            "side": ex.get("side"),
+            "leverage": lev,
+            "reason": ex["reason"],
+            "exit_reason": _canon,
+            "entry_regime": _reg,
+            "hold_min": round(_hold, 2),
+            "mfe_spot_pct": round(_mfe, 4),
+            "unrealized_pct": round(ex["unrealized_pct"], 4),
+            "leveraged_pct": round(lpct, 4),
+            "executed": bool(res.get("ok")),
+            "detail": res.get("order_id") or res.get("noop") or res.get("error"),
+            "close_source": source,
+        }
+        if res.get("realized_pnl_pct") is not None:
+            evt["fill_px"] = res.get("fill_px")
+            evt["entry_px"] = res.get("entry_px")
+            evt["realized_spot_pct"] = res.get("spot_pct")
+            evt["realized_pnl_pct"] = res.get("realized_pnl_pct")
+            evt["fees_pct"] = res.get("fees_pct")
+        log_event(evt)
+        n += 1
+    return n
+
+
+def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
+    """Lightweight intra-cycle DSL exit re-evaluation.
+
+    Re-runs monitor_exits on the freshest price (WS real-time mid preferred,
+    REST `mids` as fallback) and closes any newly-breached position, clamping
+    the worst-case inter-cycle blind window to ~HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S
+    instead of the full scan+research duration.
+
+    Safety gates, kept identical in spirit to the per-cycle pass:
+      * Throttled to at most once per _EXIT_CHECKPOINT_MIN_INTERVAL_S so a fast
+        research batch can't hammer the exit path.
+      * A-F14 STALE feed → skip exit DECISIONS here too (closing on a stale mid
+        is the wick exit A-F5 hardened against; exchange backup SLs stay live).
+      * Wrapped so a checkpoint failure can never abort the research batch.
+    Returns the number of closes performed (0 most of the time).
+    """
+    global _last_exit_checkpoint_ts
+    now = time.time()
+    if (now - _last_exit_checkpoint_ts) < _EXIT_CHECKPOINT_MIN_INTERVAL_S:
+        return 0
+    _last_exit_checkpoint_ts = now
+    try:
+        _age = mid_feed_age_seconds()
+        if _age is not None and _age > MID_FEED_MAX_STALE_S:
+            # A-F14: don't make market-close decisions on a stale REST feed.
+            # The WS mid inside monitor_exits may still be fresh, but the gate
+            # here mirrors the per-cycle policy (fail closed); the next normal
+            # cycle pass re-evaluates with a full snapshot.
+            logger.debug(f"[dsl:checkpoint] {tag}: skip — feed stale ({_age:.0f}s)")
+            return 0
+        exits = monitor_exits(mids)
+        if exits:
+            n = _process_exits(exits, source="checkpoint")
+            logger.info(f"[dsl:checkpoint] {tag}: {n} position(s) closed "
+                        f"mid-research to cap the exit blind window")
+            _beat(f"exit_checkpoint:{tag}")
+            return n
+    except Exception as e:
+        logger.error(f"[dsl:checkpoint] {tag} failed (non-fatal): {e}")
+    return 0
+
+
 threading.Thread(target=_watchdog, name="hermes-watchdog", daemon=True).start()
 logger.info(f"[watchdog] armed pre-startup: re-exec if no progress for {_watchdog_timeout_s}s")
 
@@ -234,6 +358,32 @@ _startup_grace_s = float(os.environ.get('HERMES_STARTUP_GRACE_S', '12'))
 if _startup_grace_s > 0:
     logger.info(f"[startup] grace delay {_startup_grace_s:.0f}s — letting HL rate budget refill before the first cold scan")
     time.sleep(_startup_grace_s)
+
+# Start the persistent allMids WebSocket so the loop reads sub-second
+# top-of-book instead of paying a REST POST per scan. Falls back to REST
+# automatically if WS fails to start or goes stale (see ws_client.py).
+try:
+    start_ws_mids()
+except Exception as _ws_err:
+    logger.warning(f"[ws] start_ws_mids failed (will fall back to REST): {_ws_err}")
+
+# Phase 1 (WS user-fills feasibility): subscribe to the wallet's fill
+# stream on the SAME WS connection as allMids. Callback is LOG-ONLY in
+# Phase 1 — no exit decisions are driven off it yet. Failures are
+# non-fatal: the trading loop's REST-based monitor_exits keeps working.
+# ``resolve_user_address()`` returns the master or wallet address (or
+# empty string when neither env is set — in which case we skip the
+# subscription entirely; the empty-user guard in ws_client.subscribe_user_fills
+# would log a warning and return False anyway, but doing the check
+# here keeps the startup log clean).
+try:
+    _ws_user_addr = resolve_user_address()
+    if _ws_user_addr:
+        start_ws_user_fills(_ws_user_addr)
+    else:
+        logger.info("[ws:user-fills] skipped — no user address configured")
+except Exception as _uf_err:
+    logger.warning(f"[ws:user-fills] start_ws_user_fills failed (non-fatal): {_uf_err}")
 
 # Scan cadence: env-overridable, default 15s.
 # Post-HYPE postmortem (2026-08-21): shortened from 60s to 15s to shrink the
@@ -613,7 +763,83 @@ while True:
         # without its own fetch_account_state call (which, sharing this IP,
         # was doubling HL load and tripping per-IP rate limits).
         write_snapshot(positions)
+        # Emit a position_update event so the dashboard SSE feed can drive
+        # event-based refresh on the Positions/Trades pages instead of relying
+        # on 10-30s setInterval polling. The SSE _tail_log_sse picks this up
+        # via the operator ticket; the public feed filter (D-FCFG-3) drops it
+        # automatically because "position_update" is not in _PUBLIC_FEED_EVENTS.
+        try:
+            _pos_coins = [str((p.get("position") or {}).get("coin") or "") for p in positions]
+            _pos_coins = [c for c in _pos_coins if c]
+            log_event({
+                "event": "position_update",
+                "count": len(positions),
+                "coins": _pos_coins,
+                "ts": int(time.time() * 1000),
+            })
+        except Exception:
+            pass
         _beat("account_sync")
+
+        # ── Phase 2: drain WS userFills and emit SSE events ──────────────
+        # The trading loop still drives EXIT DECISIONS via monitor_exits
+        # (below) on its regular cadence; Phase 2's job is to surface
+        # exchange fills to the dashboard IMMEDIATELY so the operator
+        # sees a close in the Trades table without waiting for the next
+        # scan's dsl_exit/ai_close event (which can lag by up to
+        # scan_interval). Drain is non-blocking; if WS isn't running
+        # (REST fallback) the drain returns [] and we skip cleanly.
+        # We classify a fill as "close" when closedPnl != "0" OR dir
+        # contains "Close" / "Liquidation" — those are the fills the
+        # dashboard cares about; open fills are still logged in the WS
+        # callback for diagnostics but don't fire a separate SSE event
+        # here (the next position_update SSE already covers them).
+        try:
+            _drained_fills = drain_ws_user_fills()
+            for _f in _drained_fills:
+                _f_dir = str(_f.get("dir", ""))
+                _closed_pnl = str(_f.get("closedPnl", "0"))
+                _is_close = (
+                    _closed_pnl not in ("0", "0.0", "", "0.00000")
+                    or "close" in _f_dir.lower()
+                    or "liquidation" in _f_dir.lower()
+                )
+                # Always log the drained fill (Phase 1 diagnostic parity).
+                logger.info(
+                    "[ws:user-fills:drain] coin=%s side=%s dir=%s sz=%s "
+                    "px=%s closedPnl=%s tid=%s is_close=%s",
+                    _f.get("coin"), _f.get("side"), _f_dir,
+                    _f.get("sz"), _f.get("px"), _closed_pnl,
+                    _f.get("tid"), _is_close,
+                )
+                if _is_close:
+                    # SSE event — Trades.vue subscribes via
+                    # REFRESH_EVENTS (already includes 'dsl_exit' etc.)
+                    # and refreshes on ws_user_fill too. Payload carries
+                    # the close facts so the dashboard can show them
+                    # without re-fetching. The public feed filter
+                    # (D-FCFG-3) drops this if 'ws_user_fill' isn't in
+                    # _PUBLIC_FEED_EVENTS — same gate as other private
+                    # events.
+                    log_event({
+                        "event": "ws_user_fill",
+                        "kind": "close",
+                        "coin": str(_f.get("coin", "")),
+                        "side": str(_f.get("side", "")),
+                        "dir": _f_dir,
+                        "sz": str(_f.get("sz", "")),
+                        "px": str(_f.get("px", "")),
+                        "closedPnl": _closed_pnl,
+                        "tid": str(_f.get("tid", "")),
+                        "t": int(_f.get("t", 0) or 0),
+                        "ts": int(time.time() * 1000),
+                    })
+        except Exception as _drain_err:
+            # Drain failures must never break the trading loop. WS
+            # feed issues are surfaced via the WS client's own logs.
+            logger.warning(
+                f"[ws:user-fills:drain] error (non-fatal): {_drain_err}"
+            )
 
         # ── HARD daily-loss kill-switch ─────────────────────────────────────
         # The daily_loss GATE (risk_gates) only blocks NEW entries — it can't
@@ -886,56 +1112,12 @@ while True:
                 exits = []
             else:
                 exits = monitor_exits(mids)
-            for ex in exits:
-                coin = ex["coin"]
-                lev = ex.get("leverage", 1)
-                lpct = ex.get("leveraged_pct", ex["unrealized_pct"] * lev)
-                _reg = ex.get("entry_regime") or "unknown"
-                _hold = ex.get("hold_min") or 0.0
-                _mfe = ex.get("mfe_pct") or 0.0
-                logger.info(f"[dsl] Closing {coin} {ex.get('side','?')} ({lev}x): "
-                            f"{ex['reason']} (margin {lpct:+.2f}% · spot {ex['unrealized_pct']:+.2f}%)")
-                # Structured per-exit telemetry — machine-parseable for the
-                # trailing-stop conservatism audit (avg realized profit / hold
-                # time / MFE grouped by entry_regime). reason is canonicalized
-                # so floor_breach* -> trailing_stop for grouping.
-                _r = ex["reason"]
-                _canon = "trailing_stop" if _r.startswith("floor_breach") else (
-                    "max_loss" if _r.startswith("max_loss") else (
-                    "hard_timeout" if _r.startswith("hard_timeout") else (
-                    "stale_flat_timeout" if _r.startswith("stale_flat_timeout") else _r.split(" ")[0])))
-                logger.info(f"[dsl:exit_stats] coin={coin} side={ex.get('side','?')} "
-                            f"lev={lev} regime={_reg} reason={_canon} "
-                            f"hold_min={_hold:.1f} mfe_spot_pct={_mfe:+.2f} "
-                            f"exit_spot_pct={ex['unrealized_pct']:+.2f} "
-                            f"exit_margin_pct={lpct:+.2f}")
-                res = close_position_market(coin)
-                # The close response carries authoritative realized PnL when
-                # the order filled with a parseable avgPx — prefer it over the
-                # tick-time estimate, which is gross of fees and off by the
-                # fill slippage.
-                evt = {
-                    "event": "dsl_exit",
-                    "coin": coin,
-                    "side": ex.get("side"),
-                    "leverage": lev,
-                    "reason": ex["reason"],
-                    "exit_reason": _canon,
-                    "entry_regime": _reg,
-                    "hold_min": round(_hold, 2),
-                    "mfe_spot_pct": round(_mfe, 4),
-                    "unrealized_pct": round(ex["unrealized_pct"], 4),
-                    "leveraged_pct": round(lpct, 4),
-                    "executed": bool(res.get("ok")),
-                    "detail": res.get("order_id") or res.get("noop") or res.get("error"),
-                }
-                if res.get("realized_pnl_pct") is not None:
-                    evt["fill_px"] = res.get("fill_px")
-                    evt["entry_px"] = res.get("entry_px")
-                    evt["realized_spot_pct"] = res.get("spot_pct")
-                    evt["realized_pnl_pct"] = res.get("realized_pnl_pct")
-                    evt["fees_pct"] = res.get("fees_pct")
-                log_event(evt)
+            # Execute the per-cycle exits via the shared close path (also used
+            # by the intra-cycle _exit_checkpoint so behaviour is identical).
+            _process_exits(exits, source="dsl")
+            # Reset the checkpoint throttle: the cycle just did a full eval, so
+            # the next intra-research checkpoint gets a fresh interval budget.
+            _last_exit_checkpoint_ts = time.time()
 
             # ── Dynamic exchange-SL coordination ──────────────────────────
             # After processing DSL exits, pull each Phase-2 position's static
@@ -1016,7 +1198,15 @@ while True:
 
         logger.info("Scanning markets...")
         _beat("scan_start")
-        results = scan_once(universe=universe, min_score=min_score, config=config)
+        # Cold scan sweeps hundreds of markets in batches and blocks this thread
+        # for minutes. The batch-complete hook re-runs the lightweight exit
+        # checkpoint between batches so the blind window during a cold scan is
+        # capped to ~one batch + throttle, not the whole sweep.
+        results = scan_once(
+            universe=universe, min_score=min_score, config=config,
+            on_batch_complete=lambda _done, _total: _exit_checkpoint(
+                mids, tag="cold-scan"),
+        )
         _beat("scan_done")
         logger.info(f"Scan found {len(results)} triggers")
         # Per-cycle heartbeat — proof of life even when nothing triggers.
@@ -1325,6 +1515,12 @@ while True:
             # Post-coin beat — covers both research+execute path and exception
             # path, so one slow coin doesn't eat the whole cycle's budget.
             _beat(f"research_done:{coin}")
+            # Intra-cycle exit checkpoint: a single research() can take tens of
+            # seconds (long HTA prompts) and blocks this thread. Re-evaluate DSL
+            # exits between coins so a stop/floor breach during research is
+            # actioned within ~HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S instead of
+            # waiting for the next loop top. Throttled + never raises.
+            _exit_checkpoint(mids, tag=f"research:{coin}")
 
         _last_progress_ts = time.time()  # watchdog: a full cycle completed
         # End-of-cycle summary: one line per trigger coin so you can see at a
@@ -1357,6 +1553,19 @@ while True:
     except KeyboardInterrupt:
         logger.info("Trading loop stopped by user")
         log_event({"event": "loop_stop"})
+        # Phase 1: clear user-fills subscription BEFORE tearing down the
+        # WS connection so the "clearing subscription state" log line is
+        # visible while the socket is still alive. Non-fatal on failure
+        # — stop_ws_mids() below tears down the SDK subscription
+        # registry regardless.
+        try:
+            stop_ws_user_fills()
+        except Exception:
+            pass
+        try:
+            stop_ws_mids()
+        except Exception:
+            pass
         break
     except Exception as e:
         logger.error(f"Trading loop error: {e}")

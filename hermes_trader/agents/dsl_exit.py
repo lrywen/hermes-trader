@@ -1836,6 +1836,17 @@ def check_all_positions(mids: dict[str, float], index_prices: Optional[dict[str,
     price → no defensible market close; the exchange-side backup SL is the
     backstop), but the blind tick is logged at ERROR level, throttled per
     coin, instead of being silently swallowed.
+
+    Phase 3 alt: when the persistent allMids WebSocket is fresh
+    (data_age < 2s), we substitute the scan-snapshot mid for each held
+    coin with the WS's real-time mid. This shaves up to scan_interval
+    (~15s) off the floor_breach blind window on fast crashes WITHOUT
+    changing the main loop cadence or introducing condition variables.
+    Falls back to scan mids when WS isn't fresh, isn't connected, or
+    doesn't have a particular coin (e.g. HIP-3 namespaced coins — the
+    WS allMids channel only carries native HL perp names). The main
+    loop's A-F14 feed-freshness gate still runs on the scan mids, so a
+    degraded WS never overrides a halt decision.
     """
     exits = []
     now = time.monotonic()
@@ -1846,8 +1857,39 @@ def check_all_positions(mids: dict[str, float], index_prices: Optional[dict[str,
         except Exception as _e:
             logger.warning(f"[dsl] A-F5 index-price fetch failed (degrading to mid-only): {_e}")
             _idx = {}
+
+    # Phase 3 alt: probe the persistent WS for a fresher mid than the
+    # scan snapshot. Best-effort — any failure (WS not started, stale,
+    # coin missing) silently falls back to the scan mids, preserving
+    # the original behavior. Local import avoids a top-level cycle.
+    _ws = None
+    _ws_fresh = False
+    try:
+        from hermes_trader.client.hl_client import _get_ws_mids_instance
+        _ws = _get_ws_mids_instance()
+        if _ws is not None and _ws.is_connected():
+            _ws_fresh = _ws.get_data_age_seconds() < 2.0
+    except Exception:
+        _ws = None
+    _ws_substituted = 0
+
     for tracker in list(_active_positions.values()):
-        mark_px = mids.get(tracker.coin)
+        # Phase 3 alt: prefer the WS real-time mid over the scan-snapshot
+        # mid for the floor_breach decision. Falls back to scan mids
+        # when WS isn't fresh or doesn't carry this coin (HIP-3 namespaced
+        # coins aren't on the native allMids channel, so they naturally
+        # take the fallback path here).
+        mark_px = None
+        if _ws is not None and _ws_fresh:
+            try:
+                _ws_px = _ws.get_price(tracker.coin)
+                if _ws_px > 0.0 and math.isfinite(_ws_px):
+                    mark_px = _ws_px
+                    _ws_substituted += 1
+            except Exception:
+                pass
+        if mark_px is None:
+            mark_px = mids.get(tracker.coin)
         # Handle both str and float values from different sources
         if mark_px is not None:
             try:
@@ -1867,4 +1909,23 @@ def check_all_positions(mids: dict[str, float], index_prices: Optional[dict[str,
         verdict = tracker.check(mark_px, index_px=(_idx or {}).get(tracker.coin))
         if verdict.exit:
             exits.append(verdict)
+
+    # Phase 3 alt: log substitution stats so ops can verify the path is
+    # exercised. Only logs when SOME but not ALL positions fell back to
+    # scan mids (a partial substitution means WS missed coins that the
+    # operator might want to know about — e.g. a HIP-3 position holding
+    # alongside native perps). All-or-nothing paths (full substitution
+    # or zero substitution) stay silent to avoid log spam at scan cadence.
+    if _ws is not None and _ws_fresh:
+        try:
+            _total = len(_active_positions)
+            if 0 < _ws_substituted < _total:
+                logger.info(
+                    "[dsl:ws-mid] %d/%d positions used WS real-time mid; "
+                    "rest fell back to scan mids (HIP-3 or missing)",
+                    _ws_substituted, _total,
+                )
+        except Exception:
+            pass
+
     return exits

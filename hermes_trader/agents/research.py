@@ -1848,7 +1848,12 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> dict[str, Any]:
     so issue them together to collapse serial latency into max(T).
 
     Returns a dict with keys c1h/c4h/c1d/funding_raw/news/signals_block.
-    Raises RuntimeError if any future fails or exceeds the per-fetch timeout.
+    Raises RuntimeError if a REQUIRED source (candles/funding/news) fails or
+    exceeds its per-fetch timeout. The positioning ``signals`` block is a free,
+    non-essential prompt hint (supplemental audit 2026-08-31): it degrades
+    fail-open to a "none flagged" placeholder on timeout/failure so that a
+    hung GEX/FINRA/whale/catalyst source for a cold hip3 coin cannot abort the
+    whole coin's research and discard the candles/funding already fetched.
     """
     # Per-fetch timeout for the parallel pre-LLM data gather. Each individual
     # HTTP call already has its own sub-timeout (hl_client: 5s+3 retries;
@@ -1905,34 +1910,58 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> dict[str, Any]:
     )
     f_signals = pool.submit(_timed_fetch, coin, "signals", _signals_block, coin)
 
-    # (future, result-key, source-label, per-source timeout). P1-7: wait each
-    # future with its OWN ceiling and report the specific source that stalled,
-    # instead of one flat timeout that lets a light call hang for 45s.
+    # (future, result-key, source-label, per-source timeout, optional?).
+    # P1-7: wait each future with its OWN ceiling and report the specific
+    # source that stalled, instead of one flat timeout that lets a light call
+    # hang for 45s.
+    # (supplemental audit 2026-08-31) signals is marked optional: the GEX /
+    # FINRA short-vol / whale / catalyst sources are free positioning hints,
+    # NOT decision inputs. A cold hip3 ticker with no options chain or a slow
+    # home-broadband FINRA call must fail OPEN (degrade to "none flagged") and
+    # leave research intact, whereas candles/funding/news stay fail-CLOSED so
+    # the ATR / quality gates never trade on missing market data.
+    _SIGNALS_EMPTY = "Positioning signals (GEX/whale/short-vol/news): none flagged"
     _specs = [
-        (f_1h, "c1h", "candles-1h", t_candles),
-        (f_4h, "c4h", "candles-4h", t_candles),
-        (f_1d, "c1d", "candles-1d", t_candles),
-        (f_funding, "funding_raw", "funding", t_funding),
-        (f_news, "news", "news", t_news),
-        (f_signals, "signals_block", "signals", t_signals),
+        (f_1h, "c1h", "candles-1h", t_candles, False),
+        (f_4h, "c4h", "candles-4h", t_candles, False),
+        (f_1d, "c1d", "candles-1d", t_candles, False),
+        (f_funding, "funding_raw", "funding", t_funding, False),
+        (f_news, "news", "news", t_news, False),
+        (f_signals, "signals_block", "signals", t_signals, True),
     ]
     out: dict[str, Any] = {}
     timed_src = ""
     timed_after = 0.0
+    optional_failed: list[str] = []
     try:
-        for fut, key, label, t in _specs:
+        for fut, key, label, t, _optional in _specs:
             try:
                 out[key] = fut.result(timeout=t)
             except FuturesTimeoutError:
+                if _optional:
+                    # Fail-open: degrade the free signals hint and keep going.
+                    out[key] = _SIGNALS_EMPTY
+                    optional_failed.append(f"{label} timed out after {t:.0f}s")
+                    if not fut.done():
+                        fut.cancel()
+                    continue
                 # Re-raise with the source label so the failure message (and
-                # the caller's log) names exactly which fetch stalled.
+                # the caller's log) names exactly which required fetch stalled.
                 timed_src, timed_after = label, t
                 raise TimeoutError(f"{label} timed out after {t:.0f}s")
+            except Exception as _src_e:
+                if _optional:
+                    # _timed_fetch already logged FAIL; degrade fail-open.
+                    out[key] = _SIGNALS_EMPTY
+                    optional_failed.append(f"{label} {type(_src_e).__name__}")
+                    continue
+                raise
     except Exception as _e:
-        # Cancel anything still running so a stuck HL/LLM call can't leak a
-        # thread; raise so the caller's per-coin try/except logs the failure
-        # and the trading loop moves on to the next trigger.
-        for fut, _key, _label, _t in _specs:
+        # A REQUIRED source failed/timed out. Cancel anything still running so
+        # a stuck HL/LLM call can't leak a thread; raise so the caller's
+        # per-coin try/except logs the failure and the trading loop moves on to
+        # the next trigger. (Optional signals failures never reach here.)
+        for fut, _key, _label, _t, _opt in _specs:
             if not fut.done():
                 fut.cancel()
         _total = time.monotonic() - _fetch_t0
@@ -1946,6 +1975,12 @@ def _parallel_prefetch(coin: str, skip_news_flag: bool) -> dict[str, Any]:
             f"parallel data-fetch for {coin} failed/timed out ({_detail})"
         ) from _e
 
+    if optional_failed:
+        # Visible but non-fatal: research proceeds without the free hints.
+        logger.warning(
+            f"[research] {coin}: optional positioning signals degraded fail-open "
+            f"({'; '.join(optional_failed)}); continuing research without hints"
+        )
     _fetch_total = time.monotonic() - _fetch_t0
     logger.info(f"[research] {coin}: parallel data-fetch DONE in {_fetch_total:.2f}s")
     return out

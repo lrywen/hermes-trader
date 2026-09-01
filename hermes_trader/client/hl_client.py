@@ -964,6 +964,88 @@ def stop_ws_mids() -> None:
             logger.info("[hl] WebSocket stopped")
 
 
+# Phase 1 (WS user-fills feasibility): the ``userFills`` channel pushes a
+# frame every time the wallet's orders match on the exchange. Phase 1 is
+# LOG-ONLY — the callback in ws_client.py records a one-liner per fill
+# and bumps a counter; no exit decisions are driven off it. The trading
+# loop calls ``start_ws_user_fills(resolve_user_address())`` right after
+# ``start_ws_mids()`` so both subscriptions share the same WS connection.
+# If the subscription fails (SDK auth change, 429 on meta, etc.) the
+# trading loop is unaffected — it falls back to the existing REST-based
+# exit polling in monitor_exits.
+def start_ws_user_fills(user: str) -> bool:
+    """Start the ``userFills`` subscription on the persistent WebSocket.
+
+    Must be called AFTER ``start_ws_mids()`` — it reuses the same WS
+    connection (one socket, two subscriptions: allMids + userFills).
+    Returns True on success, False on failure (non-fatal: trading loop
+    continues on REST-based exit polling).
+
+    Phase 1 boundary: the callback is LOG-ONLY. Phase 2 will route
+    fills into a queue drained by the main loop.
+    """
+    if not user:
+        logger.warning("[hl] start_ws_user_fills skipped — empty user")
+        return False
+    with _ws_mids_lock:
+        if _ws_mids_instance is None:
+            # start_ws_mids() wasn't called or failed — user-fills can't
+            # ride a connection that doesn't exist. Non-fatal: the
+            # trading loop's REST exit polling still backs us up.
+            logger.warning(
+                "[hl] start_ws_user_fills skipped — no WS mids instance "
+                "(start_ws_mids failed or not called)"
+            )
+            return False
+        try:
+            return _ws_mids_instance.subscribe_user_fills(user)
+        except Exception as e:
+            logger.warning(
+                f"[hl] start_ws_user_fills failed (non-fatal): {e}"
+            )
+            return False
+
+
+def stop_ws_user_fills() -> None:
+    """Clear the ``userFills`` subscription state.
+
+    Called by the trading loop on shutdown BEFORE ``stop_ws_mids()``
+    so the diagnostic log line ("clearing subscription state") is
+    visible while the connection is still alive. The SDK's own
+    subscription registry is torn down by ``stop_ws_mids``.
+    """
+    with _ws_mids_lock:
+        if _ws_mids_instance is None:
+            return
+        try:
+            _ws_mids_instance.unsubscribe_user_fills()
+        except Exception as e:
+            logger.warning(f"[hl] stop_ws_user_fills failed (non-fatal): {e}")
+
+
+def drain_ws_user_fills() -> list[dict[str, Any]]:
+    """Drain queued ``userFills`` events (Phase 2).
+
+    Returns a list of normalized fill dicts (see
+    ``HyperliquidWebSocket.drain_user_fills`` for the shape) in FIFO
+    order. Empty list when no fills queued or WS not running.
+
+    Called from the main trading loop's exit-decision stage so a CLOSE
+    fill can trigger an immediate exit scan, bypassing the 15s
+    scan_interval wait. Non-blocking so the loop never stalls.
+    """
+    with _ws_mids_lock:
+        if _ws_mids_instance is None:
+            return []
+        try:
+            return _ws_mids_instance.drain_user_fills()
+        except Exception as e:
+            logger.warning(
+                f"[hl] drain_ws_user_fills failed (non-fatal): {e}"
+            )
+            return []
+
+
 def fetch_funding_history(
     coin: str, start_time: int, end_time: Optional[int] = None,
 ) -> list[dict[str, Any]]:

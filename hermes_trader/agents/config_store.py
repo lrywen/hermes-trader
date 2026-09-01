@@ -82,11 +82,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "enable_hip3": True,
     "equity_fraction_per_trade": 0.2,
     "leverage": 10,
-    "max_trade_notional_usd": 800,
+    # F4 (supplemental audit 2026-08-31): keys that config_schema declares as
+    # float must have a float canonical default too — _TYPE_KIND_BY_KEY derives
+    # the kind from type(default), so an int literal made the store-side gate
+    # expect int while the on-disk/pydantic value is float, spamming
+    # "expected int, got float" schema warnings on every config read. The float
+    # branch accepts both int and float; the literals just must be float-typed.
+    "max_trade_notional_usd": 800.0,
     "tp_scale_fraction": 0.5,
     "max_concurrent": 10,
     "max_total_notional_pct": 10.0,
-    "max_daily_loss_usd": -30,
+    "max_daily_loss_usd": -30.0,  # F4: float default aligns with schema (supplemental audit 2026-08-31)
     # B-M11 (deep audit 2026-08-28): the global-halt and per-coin circuit
     # breakers only block NEW entries — positions already open keep bleeding
     # to their DSL stops during the halt window. These switches make them
@@ -118,9 +124,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "min_ai_confidence": 0.7,
     "counter_regime_min_conf": 0.8,
     "max_crypto_long_correlated": 3,
-    "min_market_volume_usd": 5_000_000,
-    "min_hip3_volume_usd": 5_000_000,
-    "min_short_volume_usd": 50_000_000,
+    "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
+    "min_hip3_volume_usd": 5_000_000.0,    # F4: float per schema (supplemental audit 2026-08-31)
+    "min_short_volume_usd": 50_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
     "coin_allowlist": [],
     "coin_blocklist": ["TON", "TRX"],
     "hip3_dex_allowlist": ["xyz"],
@@ -371,7 +377,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # 鲸鱼扫描绕过趋势检查
     "whale_scan_bypass": False,
     # 持仓评分变化豁免研判冷却
-    "research_rescore_delta": 0,
+    "research_rescore_delta": 0.0,  # F4: float per schema (supplemental audit 2026-08-31)
     # 资金轮动（弱势仓换强势标的）
     "capital_rotation": {
         "enabled": False,

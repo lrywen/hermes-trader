@@ -17,12 +17,13 @@ import json
 import logging
 import math
 import os
+import queue
 import random
 import ssl
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import certifi
 from hyperliquid.info import Info
@@ -174,6 +175,38 @@ class HyperliquidWebSocket:
         self._dropped_spike: int = 0
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
+        # Phase 1 (WS user-fills feasibility): persistent subscription
+        # state so a reconnect re-subscribes automatically. ``_user_fills_user``
+        # is the wallet address we're subscribed to (or None when not
+        # subscribed). ``_user_fills_sub_id`` is the SDK subscription id
+        # returned by ``info.subscribe``; used only for diagnostics — the
+        # SDK's own subscription registry is the source of truth and is
+        # torn down by ``info.disconnect_websocket`` on stop.
+        # Callback is INTENTIONALLY log-only in Phase 1: no decision
+        # integration, no shared-state mutation, so a misbehaving feed
+        # cannot affect trading. Phase 2 will route fills to a queue.
+        self._user_fills_user: Optional[str] = None
+        self._user_fills_sub_id: Optional[int] = None
+        self._user_fills_count: int = 0
+        # Phase 2: thread-safe queue + dedup set so the WS callback
+        # thread can hand fills to the main trading loop without data
+        # races. ``_fills_queue`` is the handoff channel (queue.Queue
+        # is internally synchronized so put_nowait / get_nowait are
+        # safe across threads). ``_seen_tids`` is a bounded dedup set
+        # so a fill replayed after a reconnect (HL re-sends a small
+        # window) is dropped instead of re-processed. Both fields are
+        # touched ONLY from inside ``_on_user_fills`` (put) and
+        # ``drain_user_fills`` (get) — no other access paths exist.
+        # ``_seen_tids_lock`` guards the dedup set; the queue itself
+        # needs no extra lock.
+        self._fills_queue: "queue.Queue[dict[str, Any]]" = queue.Queue()
+        self._seen_tids: set[str] = set()
+        self._seen_tids_lock = threading.Lock()
+        # Soft cap on the dedup set so a long-running session doesn't
+        # grow it unboundedly. 10k entries ~ 1MB; well below concern.
+        # When exceeded we drop the oldest half (set is unordered so
+        # we rebuild from the queue's not-yet-drained state).
+        self._seen_tids_cap: int = 10000
 
     def _accept_seq(self, incoming: int) -> bool:
         """Decide whether to accept a frame with the given sequence number.
@@ -334,6 +367,222 @@ class HyperliquidWebSocket:
                             self._latest.last_payload_hash = payload_hash
                         self._latest.last_update_time = time.time()
 
+    # ── Phase 2: userFills subscription (log + enqueue, drives exit) ────
+    # The Hyperliquid ``userFills`` channel pushes a ``Fill`` (or list of
+    # fills) every time the subscribed wallet's orders match. Phase 1
+    # proved the subscription works (LOG ONLY). Phase 2 additionally
+    # enqueues each deduped fill into ``_fills_queue`` so the trading
+    # loop can drain it and trigger an immediate exit scan when a CLOSE
+    # fill lands (closedPnl != 0 or dir contains "Close"), bypassing the
+    # 15s scan_interval wait. This shaves the exit-polling blind window
+    # during fast crashes.
+    #
+    # Auth: the SDK's ``info.subscribe`` accepts a plain ``user`` address
+    # for ``userFills`` (no L2 agent signature required — the server
+    # filters by the public address). If the server rejects the
+    # subscription (e.g. requires L2 auth in a future SDK version), the
+    # callback simply never fires and Phase 1's diagnostic counter stays
+    # at 0; the trading loop is unaffected (REST-based monitor_exits
+    # still backs us up).
+    def _on_user_fills(self, data: Any) -> None:
+        """Phase 2 callback for ``userFills`` subscription — log + enqueue.
+
+        SDK wrapper shape:
+            {"channel": "userFills", "data": {"fills": [ {Fill}, ... ]}}
+
+        A ``Fill`` (per hyperliquid/utils/types.py) includes:
+            tid, side ("A" buy / "B" sell), price, sz, coin, dir,
+            closedPnl (str), fee (str), feeToken, hash, time, ...
+
+        Phase 2:
+        - Logs a compact one-liner per fill (Phase 1 diagnostic retained)
+        - Enqueues each deduped fill into ``_fills_queue`` so the main
+          trading loop can drain it and drive exit decisions without
+          polling. ``tid`` is the dedup key — HL's per-fill trade id,
+          stable across reconnect replays.
+
+        Thread safety: this method runs in the SDK's WS callback thread.
+        The queue is internally synchronized (queue.Queue). The dedup
+        set is guarded by ``_seen_tids_lock``. No other shared state
+        is touched.
+        """
+        try:
+            self._user_fills_count += 1
+            inner = data.get("data", {}) if isinstance(data, dict) else {}
+            fills = inner.get("fills", []) if isinstance(inner, dict) else []
+            n = len(fills) if isinstance(fills, list) else 0
+            if n == 0:
+                logger.info(
+                    "[ws:user-fills] frame #%d user=%s n_fills=0 "
+                    "(empty payload — possibly a subscription ack)",
+                    self._user_fills_count,
+                    self._user_fills_user,
+                )
+                return
+            for f in fills:
+                if not isinstance(f, dict):
+                    continue
+                coin = f.get("coin", "?")
+                side = f.get("side", "?")  # "A"=buy, "B"=sell
+                sz = f.get("sz", "?")
+                px = f.get("px", f.get("price", "?"))
+                closed_pnl = f.get("closedPnl", "0")
+                f_dir = f.get("dir", "?")  # "Open"/"Close"/"Liquidation"
+                t = f.get("time", 0)
+                tid = f.get("tid", "")
+                logger.info(
+                    "[ws:user-fills] frame #%d user=%s coin=%s side=%s "
+                    "sz=%s px=%s dir=%s closedPnl=%s t=%s tid=%s",
+                    self._user_fills_count, self._user_fills_user,
+                    coin, side, sz, px, f_dir, closed_pnl, t, tid,
+                )
+                # Dedup by tid. If tid is missing, fall back to a synthetic
+                # key (coin+side+sz+px+t) so a non-conforming payload still
+                # has SOME dedup. Without a tid we have to assume the SDK
+                # always emits one; if it doesn't, the synthetic key is the
+                # best we can do.
+                if not tid:
+                    tid = f"_synthetic:{coin}:{side}:{sz}:{px}:{t}"
+                with self._seen_tids_lock:
+                    if tid in self._seen_tids:
+                        # Already enqueued — a replayed frame from a
+                        # reconnect. Skip the put so the main loop doesn't
+                        # process the same fill twice.
+                        continue
+                    if len(self._seen_tids) >= self._seen_tids_cap:
+                        # Cap reached: drop the whole set and start fresh.
+                        # Rare path (10k+ fills without a process restart).
+                        # During the rebuild window a fast re-fill could
+                        # double-process — acceptable at this volume.
+                        logger.warning(
+                            "[ws:user-fills] dedup set cap %d reached — "
+                            "resetting (rare path)",
+                            self._seen_tids_cap,
+                        )
+                        self._seen_tids.clear()
+                    self._seen_tids.add(tid)
+                # Enqueue a NORMALIZED copy of the fill so the main loop
+                # doesn't have to re-parse the raw SDK shape. We pull
+                # only what the consumer needs (closedPnl/dir/side/coin/
+                # sz/px/t/tid) — anything else can be re-fetched from
+                # the exchange if needed downstream.
+                enqueued = {
+                    "coin": str(coin),
+                    "side": str(side),
+                    "sz": str(sz),
+                    "px": str(px),
+                    "dir": str(f_dir),
+                    "closedPnl": str(closed_pnl),
+                    "tid": str(tid),
+                    "t": int(t) if isinstance(t, (int, float)) else 0,
+                }
+                try:
+                    self._fills_queue.put_nowait(enqueued)
+                except Exception as put_err:
+                    # queue.Queue.put_nowait only raises Full if a maxsize
+                    # was set — we never set one, so this is defensive.
+                    logger.warning(
+                        "[ws:user-fills] queue put failed (non-fatal): %s",
+                        put_err,
+                    )
+        except Exception as e:
+            # Log path must never raise into the SDK's WS thread —
+            # an exception in a callback would silently kill the
+            # subscription. Swallow and continue.
+            logger.warning("[ws:user-fills] callback error (non-fatal): %s", e)
+
+    def drain_user_fills(self) -> List[dict[str, Any]]:
+        """Drain ALL queued user fills (NON-BLOCKING, Phase 2).
+
+        Returns a list of normalized fill dicts (see ``_on_user_fills``
+        for the shape) in FIFO order. Empty list if no fills queued.
+
+        Called from the main trading loop at the start of each cycle
+        (and immediately before ``monitor_exits`` so a CLOSE fill can
+        trigger an instant exit decision). The drain is non-blocking
+        (``get_nowait`` raises ``queue.Empty`` when the queue is empty)
+        so the main loop never stalls waiting for a fill.
+
+        Thread safety: the queue is internally synchronized; we hold
+        NO lock here. The dedup set is NOT touched by drain (a tid
+        stays in the dedup set even after the fill has been drained,
+        so a reconnect replay of an already-processed fill is still
+        suppressed). The set is bounded by ``_seen_tids_cap`` and is
+        only reset by cap pressure, never by drain.
+        """
+        out: List[dict[str, Any]] = []
+        while True:
+            try:
+                out.append(self._fills_queue.get_nowait())
+            except queue.Empty:
+                break
+        return out
+
+    def subscribe_user_fills(self, user: str) -> bool:
+        """Subscribe to ``userFills`` for ``user`` (Phase 1 — log only).
+
+        Idempotent: a second call with the same ``user`` is a no-op so
+        the trading loop can call it on every start without leaking
+        subscriptions. Returns True on success, False on failure (the
+        caller logs and continues; the trading loop is unaffected).
+
+        Stores ``user`` in ``_user_fills_user`` so ``_connect_and_subscribe``
+        can re-subscribe automatically after a reconnect.
+        """
+        if not user:
+            logger.warning("[ws:user-fills] subscribe skipped — empty user")
+            return False
+        if not self._info:
+            logger.warning("[ws:user-fills] subscribe skipped — no Info (not started?)")
+            return False
+        # Idempotent guard: same user already subscribed.
+        if self._user_fills_user == user and self._user_fills_sub_id is not None:
+            return True
+        try:
+            sub_id = self._info.subscribe(
+                {"type": "userFills", "user": user},
+                self._on_user_fills,
+            )
+            self._user_fills_user = user
+            self._user_fills_sub_id = sub_id
+            logger.info(
+                "[ws:user-fills] subscribed user=%s sub_id=%s (Phase 1 log-only)",
+                user, sub_id,
+            )
+            return True
+        except Exception as e:
+            # Common failure modes:
+            #  - SDK requires agent wallet (L2 auth) → caught here
+            #  - 429 from /info meta during a freshly-killed reconnect
+            #  - subscription channel rejected by server
+            # All are non-fatal: trading loop keeps running on REST.
+            logger.warning(
+                "[ws:user-fills] subscribe FAILED user=%s err=%s "
+                "(non-fatal — trading loop unaffected)",
+                user, e,
+            )
+            # Reset so a reconnect can retry cleanly.
+            self._user_fills_user = None
+            self._user_fills_sub_id = None
+            return False
+
+    def unsubscribe_user_fills(self) -> None:
+        """Clear the Phase 1 user-fills subscription state.
+
+        The SDK's own subscription registry is torn down by
+        ``info.disconnect_websocket`` on ``stop()``, so we don't need
+        to call an explicit unsubscribe on the wire. This method just
+        clears our persistent state so a later ``subscribe_user_fills``
+        on a NEW connection starts fresh.
+        """
+        if self._user_fills_user is not None:
+            logger.info(
+                "[ws:user-fills] clearing subscription state user=%s sub_id=%s",
+                self._user_fills_user, self._user_fills_sub_id,
+            )
+        self._user_fills_user = None
+        self._user_fills_sub_id = None
+
     def start(self) -> None:
         """Start the WebSocket connection and subscribe to allMids."""
         if self._running:
@@ -405,6 +654,21 @@ class HyperliquidWebSocket:
             logger.error(f"[ws] Subscribe failed: {e}")
             raise
 
+        # Phase 1: if we previously had a userFills subscription, re-establish
+        # it on the fresh connection. On the very first start this is a no-op
+        # (``_user_fills_user`` is None); on a reconnect it re-subscribes the
+        # wallet so the feed resumes without the trading loop having to call
+        # ``subscribe_user_fills`` again. We reset sub_id BEFORE re-subscribing
+        # so the idempotent guard in ``subscribe_user_fills`` doesn't see a
+        # stale sub_id from the dead connection and skip the re-subscribe.
+        if self._user_fills_user is not None:
+            self._user_fills_sub_id = None
+            try:
+                self.subscribe_user_fills(self._user_fills_user)
+            except Exception as e:
+                # Non-fatal: allMids is already up; user-fills is best-effort.
+                logger.warning(f"[ws:user-fills] re-subscribe on reconnect failed (non-fatal): {e}")
+
     def _heartbeat_loop(self) -> None:
         """R11-D1: application-level heartbeat loop.
 
@@ -467,6 +731,14 @@ class HyperliquidWebSocket:
                 "dropped_replay": self._dropped_replay,
                 "dropped_spike": self._dropped_spike,
                 "data_age_s": time.time() - self._latest.last_update_time,
+                # Phase 1: user-fills liveness counters. ``user_fills_count``
+                # is incremented OUTSIDE the lock from the WS callback thread
+                # — the read here is a snapshot, may be one behind; that's
+                # fine for a "is the feed alive?" diagnostic. A non-zero
+                # count after the trading loop has placed/closed an order
+                # proves the subscription is wired correctly.
+                "user_fills_count": self._user_fills_count,
+                "user_fills_user": self._user_fills_user,
             }
 
     def _reconnect_loop(self) -> None:
@@ -551,6 +823,12 @@ class HyperliquidWebSocket:
         if self._reconnect_thread:
             self._reconnect_thread.join(timeout=timeout)
         self._stop_internal()
+        # Phase 1: clear user-fills subscription state. This is a FINAL
+        # stop (vs ``_stop_internal`` which is also called from the
+        # reconnect loop and must PRESERVE state so the new connection
+        # re-subscribes). Clearing here means a subsequent ``start()``
+        # + ``subscribe_user_fills(user)`` starts from a clean slate.
+        self.unsubscribe_user_fills()
         logger.info("[ws] Disconnected")
 
     def _stop_internal(self) -> None:

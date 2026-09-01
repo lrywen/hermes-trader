@@ -14,7 +14,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
 from hermes_trader.agents.config_store import cfg_get
@@ -605,6 +605,7 @@ def scan_once(
     config: Optional[dict[str, Any]] = None,
     parallel_workers: Optional[int] = None,
     coin: Optional[str] = None,
+    on_batch_complete: Optional[Callable[[int, int], None]] = None,
 ) -> list[dict[str, Any]]:
     """Scan Hyperliquid markets for trigger signals.
 
@@ -620,6 +621,10 @@ def scan_once(
             volume/budget/sweep selection. Used by the operator console's
             single-coin scan so a typed symbol is always evaluated even if it
             ranks outside the top-N budget.
+        on_batch_complete: optional callback invoked on the main thread after
+            each scan batch with (completed, total). Lets the caller run a
+            cheap intra-scan tick (e.g. DSL exit checkpoint); exceptions are
+            swallowed so the hook can never break the scan.
     """
     started = time.time()
     _reset_data_gaps()
@@ -954,6 +959,16 @@ def scan_once(
         completed += len(batch)
         if completed % 100 == 0 or completed == total:
             logger.info(f"[scan] progress: {completed}/{total} ({completed/total*100:.0f}%), {len(results)} triggers so far")
+
+        # Batch-complete hook: lets the caller (trading loop) run a lightweight
+        # intra-scan tick — e.g. re-evaluate DSL exits — so a multi-minute cold
+        # sweep doesn't extend the exit blind window. Called on the MAIN thread
+        # between batches; must be cheap and must never raise into the scan.
+        if on_batch_complete is not None:
+            try:
+                on_batch_complete(completed, total)
+            except Exception as e:
+                logger.warning(f"[scan] on_batch_complete hook failed (non-fatal): {e}")
 
         if batch_end < total:
             time.sleep(batch_sleep)
