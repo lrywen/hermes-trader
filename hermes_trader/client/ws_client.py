@@ -498,10 +498,13 @@ class HyperliquidWebSocket:
         for the shape) in FIFO order. Empty list if no fills queued.
 
         Called from the main trading loop at the start of each cycle
-        (and immediately before ``monitor_exits`` so a CLOSE fill can
-        trigger an instant exit decision). The drain is non-blocking
-        (``get_nowait`` raises ``queue.Empty`` when the queue is empty)
-        so the main loop never stalls waiting for a fill.
+        (and from the intra-cycle ``_exit_checkpoint``), so close fills
+        are reported to the dashboard at batch granularity instead of
+        waiting for the next full cycle. The drain itself does NOT make
+        exit decisions — exit re-evaluation is the job of the regular
+        ``monitor_exits`` pass and ``_exit_checkpoint``. The drain is
+        non-blocking (``get_nowait`` raises ``queue.Empty`` when the
+        queue is empty) so the main loop never stalls waiting for a fill.
 
         Thread safety: the queue is internally synchronized; we hold
         NO lock here. The dedup set is NOT touched by drain (a tid

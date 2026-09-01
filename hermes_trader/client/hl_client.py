@@ -1030,9 +1030,11 @@ def drain_ws_user_fills() -> list[dict[str, Any]]:
     ``HyperliquidWebSocket.drain_user_fills`` for the shape) in FIFO
     order. Empty list when no fills queued or WS not running.
 
-    Called from the main trading loop's exit-decision stage so a CLOSE
-    fill can trigger an immediate exit scan, bypassing the 15s
-    scan_interval wait. Non-blocking so the loop never stalls.
+    Called from the main trading loop (once per cycle) and from the
+    intra-cycle ``_exit_checkpoint`` so a CLOSE fill is reported to the
+    dashboard at batch granularity. The drain does NOT trigger an exit
+    scan — exit re-evaluation stays with ``monitor_exits`` and the
+    ``_exit_checkpoint``. Non-blocking so the loop never stalls.
     """
     with _ws_mids_lock:
         if _ws_mids_instance is None:

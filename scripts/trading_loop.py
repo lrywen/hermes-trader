@@ -245,6 +245,102 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
     return n
 
 
+def _drain_and_report_fills() -> int:
+    """Drain queued WS userFills and surface close fills to the dashboard.
+
+    Shared by the main loop (once per cycle) and the intra-cycle exit
+    checkpoint, so an externally-triggered close (manual flat / another
+    session / liquidation) lands in the dashboard Trades feed at checkpoint
+    granularity instead of waiting out a whole multi-minute scan+research
+    cycle. Non-blocking and never raises into the caller; returns the number
+    of fills drained. The drain does NOT make exit decisions — it only
+    reports fills; exits stay with monitor_exits / _exit_checkpoint.
+    """
+    try:
+        _drained_fills = drain_ws_user_fills()
+        for _f in _drained_fills:
+            _f_dir = str(_f.get("dir", ""))
+            _closed_pnl = str(_f.get("closedPnl", "0"))
+            _is_close = (
+                _closed_pnl not in ("0", "0.0", "", "0.00000")
+                or "close" in _f_dir.lower()
+                or "liquidation" in _f_dir.lower()
+            )
+            # Always log the drained fill (Phase 1 diagnostic parity).
+            logger.info(
+                "[ws:user-fills:drain] coin=%s side=%s dir=%s sz=%s "
+                "px=%s closedPnl=%s tid=%s is_close=%s",
+                _f.get("coin"), _f.get("side"), _f_dir,
+                _f.get("sz"), _f.get("px"), _closed_pnl,
+                _f.get("tid"), _is_close,
+            )
+            if _is_close:
+                # SSE event — Trades.vue refreshes on ws_user_fill via
+                # REFRESH_EVENTS. The Portal BFF sends the operator ticket so
+                # the full feed is delivered; the public feed filter
+                # (D-FCFG-3) drops it for anonymous clients because
+                # 'ws_user_fill' is not in _PUBLIC_FEED_EVENTS.
+                log_event({
+                    "event": "ws_user_fill",
+                    "kind": "close",
+                    "coin": str(_f.get("coin", "")),
+                    "side": str(_f.get("side", "")),
+                    "dir": _f_dir,
+                    "sz": str(_f.get("sz", "")),
+                    "px": str(_f.get("px", "")),
+                    "closedPnl": _closed_pnl,
+                    "tid": str(_f.get("tid", "")),
+                    "t": int(_f.get("t", 0) or 0),
+                    "ts": int(time.time() * 1000),
+                })
+        return len(_drained_fills)
+    except Exception as _drain_err:
+        # Drain failures must never break the trading loop or a research batch.
+        logger.warning(
+            f"[ws:user-fills:drain] error (non-fatal): {_drain_err}"
+        )
+        return 0
+
+
+def _refresh_positions_after_close(reason: str) -> None:
+    """Re-fetch positions after a confirmed mid-cycle close and republish.
+
+    The positions snapshot (read by the dashboard /api/dashboard/positions
+    endpoint, which prefers the snapshot for 120s) and the position_update SSE
+    event are otherwise only refreshed once per full cycle at the loop top.
+    After a checkpoint or external close the snapshot would still list the
+    closed coin for the rest of a multi-minute scan, so the Positions/Overview
+    pages render a zombie position until the next cycle. This re-syncs ONLY
+    when a close actually happened (never on the every-5s no-op path), and
+    skips the write on a degraded read (equity<=0) so it can never publish an
+    empty list over the real positions. Never raises.
+    """
+    try:
+        _eq, _positions, _avail, _spot, _qdexes, _state = _sync_account_state()
+        if _eq <= 0:
+            logger.warning(
+                f"[positions] post-close refresh skipped ({reason}): "
+                f"degraded read equity=${_eq:.2f}, keeping previous snapshot")
+            return
+        write_snapshot(_positions)
+        _pos_coins = [str((p.get("position") or {}).get("coin") or "")
+                      for p in _positions]
+        _pos_coins = [c for c in _pos_coins if c]
+        log_event({
+            "event": "position_update",
+            "count": len(_positions),
+            "coins": _pos_coins,
+            "reason": reason,
+            "ts": int(time.time() * 1000),
+        })
+        logger.info(f"[positions] post-close refresh ({reason}): "
+                    f"{len(_positions)} open position(s)")
+    except Exception as _refresh_err:
+        logger.warning(
+            f"[positions] post-close refresh failed (non-fatal): {_refresh_err}"
+        )
+
+
 def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
     """Lightweight intra-cycle DSL exit re-evaluation.
 
@@ -253,11 +349,20 @@ def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
     the worst-case inter-cycle blind window to ~HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S
     instead of the full scan+research duration.
 
+    Also drains queued WS userFills on the same throttle so an EXTERNAL close
+    (manual flat / another session) is reported to the dashboard mid-cycle
+    instead of only at the next loop top, and refreshes the positions snapshot
+    whenever a close (checkpoint or external fill) actually happened so the
+    Positions/Overview pages drop the closed coin immediately.
+
     Safety gates, kept identical in spirit to the per-cycle pass:
       * Throttled to at most once per _EXIT_CHECKPOINT_MIN_INTERVAL_S so a fast
         research batch can't hammer the exit path.
       * A-F14 STALE feed → skip exit DECISIONS here too (closing on a stale mid
         is the wick exit A-F5 hardened against; exchange backup SLs stay live).
+        The fill drain still runs (a queued external fill must not wait on the
+        feed gate) and a post-close snapshot refresh still runs (it reads
+        positions, not mids).
       * Wrapped so a checkpoint failure can never abort the research batch.
     Returns the number of closes performed (0 most of the time).
     """
@@ -267,21 +372,31 @@ def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
         return 0
     _last_exit_checkpoint_ts = now
     try:
+        # Surface externally-triggered fills (manual flat / another session)
+        # without waiting for the next full cycle. Independent of the stale
+        # feed gate: it reports what already happened on the exchange.
+        _n_fills = _drain_and_report_fills()
         _age = mid_feed_age_seconds()
         if _age is not None and _age > MID_FEED_MAX_STALE_S:
             # A-F14: don't make market-close decisions on a stale REST feed.
             # The WS mid inside monitor_exits may still be fresh, but the gate
             # here mirrors the per-cycle policy (fail closed); the next normal
             # cycle pass re-evaluates with a full snapshot.
-            logger.debug(f"[dsl:checkpoint] {tag}: skip — feed stale ({_age:.0f}s)")
-            return 0
-        exits = monitor_exits(mids)
-        if exits:
-            n = _process_exits(exits, source="checkpoint")
-            logger.info(f"[dsl:checkpoint] {tag}: {n} position(s) closed "
-                        f"mid-research to cap the exit blind window")
-            _beat(f"exit_checkpoint:{tag}")
-            return n
+            logger.debug(f"[dsl:checkpoint] {tag}: skip exit scan — feed stale ({_age:.0f}s)")
+        else:
+            exits = monitor_exits(mids)
+            if exits:
+                n = _process_exits(exits, source="checkpoint")
+                logger.info(f"[dsl:checkpoint] {tag}: {n} position(s) closed "
+                            f"mid-research to cap the exit blind window")
+                _beat(f"exit_checkpoint:{tag}")
+                _refresh_positions_after_close(f"checkpoint:{tag}")
+                return n
+        # An external close fill may have flattened a position even though the
+        # exit scan was skipped (stale feed) or found nothing — refresh so it
+        # vanishes from the dashboard Positions table immediately.
+        if _n_fills:
+            _refresh_positions_after_close(f"external_fill:{tag}")
     except Exception as e:
         logger.error(f"[dsl:checkpoint] {tag} failed (non-fatal): {e}")
     return 0
@@ -794,52 +909,9 @@ while True:
         # dashboard cares about; open fills are still logged in the WS
         # callback for diagnostics but don't fire a separate SSE event
         # here (the next position_update SSE already covers them).
-        try:
-            _drained_fills = drain_ws_user_fills()
-            for _f in _drained_fills:
-                _f_dir = str(_f.get("dir", ""))
-                _closed_pnl = str(_f.get("closedPnl", "0"))
-                _is_close = (
-                    _closed_pnl not in ("0", "0.0", "", "0.00000")
-                    or "close" in _f_dir.lower()
-                    or "liquidation" in _f_dir.lower()
-                )
-                # Always log the drained fill (Phase 1 diagnostic parity).
-                logger.info(
-                    "[ws:user-fills:drain] coin=%s side=%s dir=%s sz=%s "
-                    "px=%s closedPnl=%s tid=%s is_close=%s",
-                    _f.get("coin"), _f.get("side"), _f_dir,
-                    _f.get("sz"), _f.get("px"), _closed_pnl,
-                    _f.get("tid"), _is_close,
-                )
-                if _is_close:
-                    # SSE event — Trades.vue subscribes via
-                    # REFRESH_EVENTS (already includes 'dsl_exit' etc.)
-                    # and refreshes on ws_user_fill too. Payload carries
-                    # the close facts so the dashboard can show them
-                    # without re-fetching. The public feed filter
-                    # (D-FCFG-3) drops this if 'ws_user_fill' isn't in
-                    # _PUBLIC_FEED_EVENTS — same gate as other private
-                    # events.
-                    log_event({
-                        "event": "ws_user_fill",
-                        "kind": "close",
-                        "coin": str(_f.get("coin", "")),
-                        "side": str(_f.get("side", "")),
-                        "dir": _f_dir,
-                        "sz": str(_f.get("sz", "")),
-                        "px": str(_f.get("px", "")),
-                        "closedPnl": _closed_pnl,
-                        "tid": str(_f.get("tid", "")),
-                        "t": int(_f.get("t", 0) or 0),
-                        "ts": int(time.time() * 1000),
-                    })
-        except Exception as _drain_err:
-            # Drain failures must never break the trading loop. WS
-            # feed issues are surfaced via the WS client's own logs.
-            logger.warning(
-                f"[ws:user-fills:drain] error (non-fatal): {_drain_err}"
-            )
+        # Shared with the intra-cycle checkpoint (_exit_checkpoint) so an
+        # external close mid-scan is surfaced at batch granularity too.
+        _drain_and_report_fills()
 
         # ── HARD daily-loss kill-switch ─────────────────────────────────────
         # The daily_loss GATE (risk_gates) only blocks NEW entries — it can't
