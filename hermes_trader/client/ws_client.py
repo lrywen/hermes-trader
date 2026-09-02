@@ -74,6 +74,22 @@ _WS_SEQ_MAX_BACKWARD = int(_HL_CLIENT_IO["ws_seq_max_backward"])
 # single-tick jump cap (fraction vs previous accepted mid); legacy env
 # HERMES_WS_MAX_TICK_JUMP_FRAC still wins at boot.
 _WS_MAX_TICK_JUMP_FRAC = float(_HL_CLIENT_IO["ws_max_tick_jump_frac"])
+# P1-6 (2026-09-02): M-11 spike-suppression WARNING rate limiting. A single
+# bad-print coin fires the suppress path on EVERY allMids frame (HL pushes ~1
+# frame/5s), so the unconditional per-tick WARNING flooded the log (observed
+# 117k+ identical lines). The suppression BEHAVIOR is unchanged (prior mid is
+# still kept every time); only the log volume is throttled:
+#   - the detailed per-coin WARNING logs only ONCE per coin per process (the
+#     first time that coin spikes) — enough to surface a NEW bad feed;
+#   - every _WS_SPIKE_WARN_INTERVAL_S a single aggregate SUMMARY reports the
+#     total suppressed ticks and affected coins, so an ongoing feed problem
+#     still surfaces without per-frame spam.
+# Import-time snapshot; legacy env channel still wins at boot. Default 30 min
+# keeps a continuously-spiking feed at ~48 summary lines/day plus one line per
+# newly-bad coin — comfortably under the 100 lines/day target.
+_WS_SPIKE_WARN_INTERVAL_S = float(
+    os.environ.get("HERMES_WS_SPIKE_WARN_INTERVAL_S", "1800")
+)
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
@@ -173,6 +189,17 @@ class HyperliquidWebSocket:
         # M-11: per-coin mid updates suppressed because a single tick moved the
         # price by more than _WS_MAX_TICK_JUMP_FRAC vs the previous mid.
         self._dropped_spike: int = 0
+        # P1-6: rate-limit state for the M-11 suppression WARNING. All fields
+        # are touched only from _on_all_mids -> _filter_spikes, which runs
+        # under self._lock, so no separate lock is needed.
+        # coins that have already emitted a first-time detailed WARNING this
+        # process (a persistently bad-print coin re-spikes every frame, so its
+        # detailed line logs only ONCE; ongoing activity is covered by summary).
+        self._spike_warned_coins: set[str] = set()
+        # Window-accumulated stats for the aggregate summary.
+        self._spike_suppressed_window: int = 0
+        self._spike_coins_window: set[str] = set()
+        self._spike_summary_at: float = 0.0
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop = threading.Event()
         # Phase 1 (WS user-fills feasibility): persistent subscription
@@ -307,16 +334,72 @@ class HyperliquidWebSocket:
                 continue
             if old_px > 0.0 and abs(new_px - old_px) / old_px > _WS_MAX_TICK_JUMP_FRAC:
                 n_suppressed += 1  # suppress: leave the prior mid in `out`
-                logger.warning(
-                    "[ws] M-11 spike suppressed: %s mid jump %.4f -> %.4f "
-                    "(%.1f%% > cap %.1f%%); keeping previous mid",
-                    coin, old_px, new_px,
-                    abs(new_px - old_px) / old_px * 100.0,
-                    _WS_MAX_TICK_JUMP_FRAC * 100.0,
-                )
+                self._note_spike_suppressed(coin, old_px, new_px)
                 continue
             out[coin] = str(raw)
         return out, n_suppressed
+
+    def _note_spike_suppressed(
+        self, coin: str, old_px: float, new_px: float
+    ) -> None:
+        """P1-6: record a suppressed M-11 spike with a throttled WARNING.
+
+        Called from ``_filter_spikes`` (under ``self._lock``). The suppression
+        itself has already happened (prior mid kept); this only decides what to
+        LOG so a persistently bad-print coin cannot flood the log:
+
+        - the DETAILED line (old/new price, magnitude) logs only ONCE per coin
+          per process for TRADEABLE coins — enough to surface a newly-bad feed.
+          HL's allMids also carries ~700 internal-index entries (``#NNNNN`` /
+          ``@NNN``) for delisted/expired markets whose mids are stale garbage;
+          they are never traded and constantly flip >cap, so their suppressions
+          are counted in the aggregate ONLY (a detailed line per junk id would
+          flood the log with entries nobody can act on);
+        - every ``_WS_SPIKE_WARN_INTERVAL_S`` a single aggregate SUMMARY reports
+          suppressed ticks / affected coins over the preceding window, so an
+          ongoing problem remains visible at a bounded volume.
+        """
+        now = time.time()
+        # End-of-window aggregate FIRST (covers the preceding window, excludes
+        # this tick) so a continuously-spiking feed emits exactly one summary
+        # per interval regardless of how many coins spike.
+        if self._spike_summary_at and (
+            now - self._spike_summary_at
+        ) >= _WS_SPIKE_WARN_INTERVAL_S:
+            logger.warning(
+                "[ws] M-11 spike summary: %d suppressed ticks across %d coins "
+                "in last %.0fs (jump cap %.1f%%); most recent: %s",
+                self._spike_suppressed_window,
+                len(self._spike_coins_window),
+                _WS_SPIKE_WARN_INTERVAL_S,
+                _WS_MAX_TICK_JUMP_FRAC * 100.0,
+                coin,
+            )
+            self._spike_suppressed_window = 0
+            self._spike_coins_window = set()
+            self._spike_summary_at = now
+        elif not self._spike_summary_at:
+            self._spike_summary_at = now
+
+        # Accumulate window stats (covers ongoing spikes between summaries).
+        self._spike_suppressed_window += 1
+        self._spike_coins_window.add(coin)
+
+        # Detailed per-coin line only for a TRADEABLE coin (HL internal-index
+        # entries like "#12090" / "@226" are delisted/expired markets that are
+        # never traded; their garbage mids are covered by the summary above),
+        # and only the FIRST time that tradeable coin spikes this process.
+        is_tradeable = coin[:1] not in ("#", "@")
+        if is_tradeable and coin not in self._spike_warned_coins:
+            self._spike_warned_coins.add(coin)
+            logger.warning(
+                "[ws] M-11 spike suppressed: %s mid jump %.4f -> %.4f "
+                "(%.1f%% > cap %.1f%%); keeping previous mid "
+                "(further suppression of this coin logged in the periodic summary)",
+                coin, old_px, new_px,
+                abs(new_px - old_px) / old_px * 100.0,
+                _WS_MAX_TICK_JUMP_FRAC * 100.0,
+            )
 
     def _on_all_mids(self, data: Any) -> None:
         """Callback for allMids subscription.
