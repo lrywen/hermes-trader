@@ -46,6 +46,26 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
 
+# ── 持久化轮转日志（2026-09-02，替代 compose 的 `tee -a`）────────────────
+# tee 追加的文件无任何轮转机制（14 天涨到 140MB）。这里用
+# RotatingFileHandler 按 50MB × 5 代轮转；stdout/stderr 仍由 basicConfig 的
+# StreamHandler 输出（docker logs，json-file 另有 50m×5 轮转）。
+# 单进程写（trading_loop 只有一个 loop 进程），无跨进程竞争。
+# 文件不可写等任何失败都回落到纯 stderr（handleError 不抛异常），观测链不断。
+_loop_log_path = os.environ.get("HERMES_LOOP_LOG_FILE", "/data/trading-loop.log")
+try:
+    from logging.handlers import RotatingFileHandler
+    _loop_fh = RotatingFileHandler(
+        _loop_log_path, maxBytes=50 * 1024 * 1024, backupCount=5,
+        encoding="utf-8",
+    )
+    _loop_fh.setFormatter(logging.Formatter(
+        '%(asctime)s %(levelname)s:%(name)s:%(message)s'))
+    logging.getLogger().addHandler(_loop_fh)
+except Exception as _loop_log_err:
+    logging.getLogger(__name__).warning(
+        "loop file handler disabled (stderr only): %s", _loop_log_err)
+
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.research import research

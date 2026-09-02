@@ -107,6 +107,15 @@ class HLSSLOptWebsocketManager(WebsocketManager):
         """Override to inject SSL options into run_forever()."""
         self.ping_sender.start()
         self.ws.run_forever(sslopt=self._sslopt)
+        # 2026-09-02 (P3)：run_forever 返回意味着底层 socket 已关闭（断线）。
+        # 此前此处静默返回、SDK 线程退出，生产环境只能靠"数据陈旧"间接发现
+        # 断连。现在记录关闭码/原因，供排障定位断连来源。
+        _close = getattr(self.ws, "last_close", None)
+        logger.info(
+            "[ws] socket closed, run_forever exited (close_code=%s, reason=%r)",
+            getattr(_close, "status_code", None) if _close is not None else None,
+            getattr(_close, "reason", None) if _close is not None else None,
+        )
 
 
 @dataclass
@@ -174,6 +183,9 @@ class HyperliquidWebSocket:
         self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
         self._reconnect_stop = threading.Event()
         self._reconnect_thread: Optional[threading.Thread] = None
+        # 2026-09-02 (P3)：连续重连尝试计数（成功后归零），用于日志展示
+        # "第 N 次重连/重连失败"，排障时量化断连严重程度。
+        self._reconnect_attempts = 0
         # R11-D1: monotonically-increasing sequence number assigned to
         # every accepted frame. A duplicate or out-of-order frame (one
         # with seq <= the last accepted) is dropped, and a frame whose
@@ -715,6 +727,7 @@ class HyperliquidWebSocket:
 
         # Launch background reconnect monitor.
         self._reconnect_delay = _WS_RECONNECT_BASE_DELAY
+        self._reconnect_attempts = 0  # 2026-09-02 (P3): 全新启动，计数清零
         self._reconnect_stop.clear()
         self._reconnect_thread = threading.Thread(target=self._reconnect_loop, daemon=True, name="ws-reconnect")
         self._reconnect_thread.start()
@@ -757,6 +770,29 @@ class HyperliquidWebSocket:
         try:
             self._ws_manager = HLSSLOptWebsocketManager(self._info.base_url)
             self._info.ws_manager = self._ws_manager
+            # 2026-09-02 (P3)：SDK 创建 WebSocketApp 时只设了 on_message/on_open，
+            # 断连/错误完全静默。包装 on_open 追加连接成功日志，并补挂
+            # on_close/on_error，让连接/断连/异常都有 INFO/WARNING 记录（含端点、
+            # 关闭码与异常类型）。包装器先调原 SDK 回调（保持 queued 订阅重放
+            # 等原行为），再打日志。
+            _ws_app = self._ws_manager.ws
+            _ep = getattr(_ws_app, "url", self._info.base_url)
+            _sdk_on_open = _ws_app.on_open
+
+            def _on_open(_w):
+                _sdk_on_open(_w)
+                logger.info(f"[ws] WebSocket connected: {_ep}")
+
+            def _on_close(_w, close_status_code, close_msg):
+                logger.info(f"[ws] WebSocket disconnected: {_ep} "
+                            f"(close_code={close_status_code}, reason={close_msg!r})")
+
+            def _on_error(_w, err):
+                logger.warning(f"[ws] WebSocket error on {_ep}: {type(err).__name__}: {err}")
+
+            _ws_app.on_open = _on_open
+            _ws_app.on_close = _on_close
+            _ws_app.on_error = _on_error
             self._ws_manager.start()
             logger.info("[ws] WebSocket manager started (with certifi SSL)")
         except Exception as e:
@@ -867,15 +903,18 @@ class HyperliquidWebSocket:
             if self._reconnect_stop.is_set():
                 break
             if self.get_data_age_seconds() > _WS_MAX_STALE_SECONDS:
+                self._reconnect_attempts += 1  # 2026-09-02 (P3)
                 logger.warning(
                     f"[ws] Data stale for {self.get_data_age_seconds():.0f}s "
                     f"(threshold={_WS_MAX_STALE_SECONDS}s) — reconnecting in "
-                    f"{self._reconnect_delay:.0f}s..."
+                    f"{self._reconnect_delay:.0f}s (attempt {self._reconnect_attempts})..."
                 )
                 # Exponential backoff with jitter
                 self._reconnect_stop.wait(self._reconnect_delay)
                 if self._reconnect_stop.is_set():
                     break
+                logger.info(f"[ws] Reconnect attempt {self._reconnect_attempts}: "
+                            f"tearing down and re-subscribing...")
                 try:
                     self._stop_internal()
                     self._connect_and_subscribe()
@@ -893,9 +932,13 @@ class HyperliquidWebSocket:
                         self._seq = 0
                         self._latest.last_seq = 0
                         self._latest.last_payload_hash = ""
-                    logger.info("[ws] Reconnect successful")
+                    logger.info(f"[ws] Reconnect successful after "
+                                f"{self._reconnect_attempts} attempt(s)")
+                    self._reconnect_attempts = 0  # 成功后清零（日志之后，保留序号）
                 except Exception as e:
-                    logger.error(f"[ws] Reconnect failed: {e}")
+                    logger.error(f"[ws] Reconnect attempt {self._reconnect_attempts} failed "
+                                 f"({type(e).__name__}: {e}); backing off "
+                                 f"{self._reconnect_delay:.0f}s")
                     self._reconnect_delay = min(
                         self._reconnect_delay * 2 * random.uniform(1 - _WS_RECONNECT_JITTER, 1 + _WS_RECONNECT_JITTER),
                         _WS_RECONNECT_MAX_DELAY,
@@ -961,16 +1004,19 @@ class HyperliquidWebSocket:
                     if sock and hasattr(sock, 'close'):
                         try:
                             sock.shutdown(2)  # SHUT_RDWR
-                        except OSError:
-                            pass
+                        except OSError as _se:
+                            # 2026-09-02 (P3)：socket 可能已关闭（ENOTCONN 等），
+                            # 属于正常竞态；降为 debug 保留排障痕迹，不再静默。
+                            logger.debug(f"[ws] sock.shutdown during stop: {type(_se).__name__}: {_se}")
                         sock.close()
-            except Exception:
-                pass
+            except Exception as _e:
+                # 2026-09-02 (P3)：teardown 失败不再静默吞掉，debug 记录异常类型。
+                logger.debug(f"[ws] manager teardown error during stop: {type(_e).__name__}: {_e}")
         if self._info:
             try:
                 self._info.disconnect_websocket()
-            except Exception:
-                pass
+            except Exception as _e:
+                logger.debug(f"[ws] disconnect_websocket during stop: {type(_e).__name__}: {_e}")
 
     def __enter__(self) -> "HyperliquidWebSocket":
         self.start()

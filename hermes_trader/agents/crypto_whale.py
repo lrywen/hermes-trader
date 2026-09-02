@@ -28,6 +28,7 @@ import logging
 import ssl
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
@@ -187,6 +188,24 @@ _CACHE_MAX = 1024
 _cache: dict[str, tuple] = {}
 _lock = threading.Lock()
 
+# 2026-09-02：Binance 对未上市/已下架的机械拼造 symbol（{COIN}USDT，如
+# CASHCATUSDT）稳定返回 HTTP 400 + body {"code":-1121,"msg":"Invalid symbol"}。
+# 此前每次扫描都重试并刷 warning（"GET failed ... HTTP Error 400"）。对这类
+# 确定性错误做 60 分钟负缓存：命中即跳过请求、日志降为 DEBUG。60 分钟后重试，
+# 以便新币上市 / 币种恢复后能自动恢复（无人工干预）。
+_INVALID_SYMBOL_TTL_S = 3600.0
+_invalid_symbols: dict[str, float] = {}
+
+
+def _is_invalid_symbol(symbol: str) -> bool:
+    return time.time() < _invalid_symbols.get(symbol, 0.0)
+
+
+def _mark_invalid_symbol(symbol: str, code: int) -> None:
+    _invalid_symbols[symbol] = time.time() + _INVALID_SYMBOL_TTL_S
+    logger.info(f"[whale] Binance reports {symbol} invalid (HTTP {code}, code=-1121); "
+                f"skipping for {int(_INVALID_SYMBOL_TTL_S / 60)} min")
+
 # Single-flight coalescing for cold misses.
 _inflight: dict[str, threading.Event] = {}
 _inflight_results: dict[str, object] = {}
@@ -220,7 +239,8 @@ def _is_safe_web_url(url: str) -> bool:
         return False
 
 
-def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict[str, Any]]:
+def _get_json(url: str, timeout: Optional[float] = None,
+              symbol: Optional[str] = None) -> Optional[dict[str, Any]]:
     if timeout is None:
         timeout = crypto_whale_params()["http_timeout_s"]
     if not _is_safe_web_url(url):  # M-9: reject file:// and other non-web schemes
@@ -235,6 +255,23 @@ def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict[str, A
             if _elapsed > 1.5:
                 logger.info(f"[whale] GET {url[:80]}... in {_elapsed:.2f}s")
             return data
+    except urllib.error.HTTPError as _he:
+        # 2026-09-02：HTTP 400 + Binance -1121 = 该 symbol 不存在（确定性错误，
+        # 重试无意义）。读 body 判定后登记负缓存，日志降为 DEBUG（只打一次 INFO，
+        # 见 _mark_invalid_symbol）。其他 HTTP 错误仍按原级别 warning。
+        if symbol and _he.code == 400:
+            try:
+                _body = _he.read().decode("utf-8", "replace")
+            except Exception:
+                _body = ""
+            if '"code":-1121' in _body.replace(" ", ""):
+                _mark_invalid_symbol(symbol, _he.code)
+                logger.debug(f"[whale] {symbol} invalid-symbol response (HTTP 400, -1121); "
+                             f"negatively cached for {int(_INVALID_SYMBOL_TTL_S / 60)} min")
+                return None
+        _elapsed = time.monotonic() - _t0
+        logger.warning(f"[whale] GET failed after {_elapsed:.2f}s: HTTPError: {_he}")
+        return None
     except Exception as _e:
         _elapsed = time.monotonic() - _t0
         logger.warning(f"[whale] GET failed after {_elapsed:.2f}s: {type(_e).__name__}: {_e}")
@@ -254,7 +291,8 @@ def fetch_aggtrades_window(symbol: str, window_minutes: Optional[float] = None,
         max_pages = int(p["max_pages"])
     sym = urllib.parse.quote(symbol)
     start_ms = int((time.time() - window_minutes * 60) * 1000)
-    payload = _get_json(f"{_AGG}?symbol={sym}&startTime={start_ms}&limit={page_limit}")
+    payload = _get_json(f"{_AGG}?symbol={sym}&startTime={start_ms}&limit={page_limit}",
+                        symbol=symbol)
     if not isinstance(payload, list):
         return []
     prints = parse_aggtrades(payload)
@@ -263,7 +301,8 @@ def fetch_aggtrades_window(symbol: str, window_minutes: Optional[float] = None,
         last_id = payload[-1].get("a")
         if last_id is None:
             break
-        payload = _get_json(f"{_AGG}?symbol={sym}&fromId={int(last_id) + 1}&limit={page_limit}")
+        payload = _get_json(f"{_AGG}?symbol={sym}&fromId={int(last_id) + 1}&limit={page_limit}",
+                            symbol=symbol)
         if not isinstance(payload, list):
             break
         prints.extend(parse_aggtrades(payload))
@@ -293,6 +332,11 @@ def crypto_whale_signal(coin: str, min_usd: Optional[float] = None,
     http_timeout_s = p["http_timeout_s"]
     sym = binance_symbol(coin)
     if not sym:
+        return None
+    # 2026-09-02：已知无效 symbol（Binance -1121，如未上市的 CASHCATUSDT）
+    # 在 60min 负缓存窗口内直接跳过，不发请求、不刷 warning。
+    if allow_fetch and _is_invalid_symbol(sym):
+        logger.debug(f"[whale] crypto_whale_signal({coin}) skipped: {sym} in invalid-symbol cache")
         return None
     now = time.time()
     key = f"{sym}::{int(min_usd)}::{window_minutes}"

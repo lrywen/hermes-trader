@@ -65,7 +65,10 @@ MAX_AGE_DAYS_DEFAULT = {"perceptions": 30.0, "analyses": 30.0, "trades": 0.0}
 # Candidate timestamp keys (ms epoch) per list, in priority order. Records with
 # no usable timestamp are kept (never silently evict what we can't date).
 _AGE_TS_KEYS = {
-    "perceptions": ("ts", "created_at", "timestamp"),
+    # 2026-09-02：perception 记录的时间戳字段是 fired_at（perception.py 写入
+    # int(time.time()*1000)），此前候选键里没有它 → 所有 perception 都被当成
+    # “无法定龄”而保留，30 天 TTL 形同虚设。fired_at 前置作为首选键。
+    "perceptions": ("fired_at", "ts", "created_at", "timestamp"),
     "analyses": ("created_at", "ts", "timestamp"),
     "trades": ("executed_at", "created_at", "ts", "timestamp"),
 }

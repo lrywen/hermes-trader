@@ -7,6 +7,15 @@ ENV PYTHONUNBUFFERED=1 \
 
 WORKDIR /app
 
+# 2026-09-02 (P3)：基础排障工具。slim 镜像默认无 ps/top/ss，容器内排障只能
+# 翻 /proc。procps=ps/top/pgrep；curl=健康检查与 HTTP 排障；iproute2=ss 查
+# socket 连接状态。Debian 官方源在国内直连偏慢，这里用阿里云 Debian 镜像。
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g; s|security.debian.org|mirrors.aliyun.com|g' \
+        /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list 2>/dev/null || true \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends procps curl iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
 # Install deps first so `pip install` is cached across code changes.
 # 使用清华 PyPI 镜像（国内直连可达，无需代理）
 COPY pyproject.toml ./
