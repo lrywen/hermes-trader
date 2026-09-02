@@ -21,6 +21,7 @@ import sys
 import threading
 import time
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 # Load .env.local (CWD-relative, matches skill restart command).
 env_path = '.env.local'
@@ -621,6 +622,18 @@ _ws_fill_wake_on = os.environ.get('HERMES_WS_FILL_WAKE', '0').lower() in ('1', '
 _ws_status_event_on = os.environ.get('HERMES_WS_STATUS_EVENT', '0').lower() in ('1', 'true', 'yes', 'on')
 _ws_status_hold_s = float(os.environ.get('HERMES_WS_STATUS_HOLD_S', '30'))
 _ws_status_fresh_s = float(os.environ.get('HERMES_WS_STATUS_FRESH_S', '10'))
+# P0-4 cross-coin research parallelism: the per-cycle research loop is 100%
+# serial across triggered coins (for perception in results), and each research()
+# blocks tens of seconds on the LLM — with a slow provider and trend_surface
+# fanning out many triggers, the costs ADD LINEARLY and blow the tick to
+# hundreds of seconds. When on, the paid research() calls for a cycle run
+# concurrently on a bounded pool. ONLY the read-only research() is parallelised:
+# all gating (held/cooldown/throttle/TA/dedup), verdict routing and order
+# placement stay on the main thread in trigger order, so execution semantics
+# (account state, position gates, session log) are unchanged. Off by default
+# → the original serial loop.
+_research_parallel_on = os.environ.get('HERMES_RESEARCH_PARALLEL', '0').lower() in ('1', 'true', 'yes', 'on')
+_research_parallel_workers = int(os.environ.get('HERMES_RESEARCH_PARALLEL_WORKERS', '4'))
 
 if _scan_dynamic_on or _ws_fill_wake_on or _ws_status_event_on:
     logger.info(
@@ -1469,6 +1482,11 @@ while True:
 
         # Per-cycle outcome tracker for the end-of-cycle summary log.
         _cycle_outcomes = []  # list of (coin, action, executed, detail)
+        # P0-4: coins that pass every cheap gate and need the paid LLM research.
+        # Phase 1 (this loop, main thread) runs all gates serially and only
+        # collects jobs; phase 2 runs the read-only research() concurrently;
+        # phase 3 routes verdicts (order side-effects) back on the main thread.
+        _research_jobs = []  # list of (coin, perception, score, gate)
 
         for perception in results:
             coin = perception['coin']
@@ -1606,126 +1624,169 @@ while True:
                     _cycle_outcomes.append((coin, "skip", False, "signal content dedup"))
                     continue
             logger.info(f"Researching {coin} (trigger {score:.1f}, TA {gate})...")
-            # Per-coin heartbeat: a 3-trigger cycle with slow HTA research can
-            # take several minutes (observed 77s on a single GOOGL call). A
-            # beat before each paid research prevents the watchdog from
-            # re-exec'ing mid-batch while coins are still making progress.
-            _beat(f"research_start:{coin}")
-            # Record the paid-research time so the held-coin throttle above can
-            # pace the next AI close-check on this position.
+            # Stamp the paid-research time / score / setup fingerprint BEFORE
+            # dispatching so parallel workers can't race on these maps, and so
+            # the held/research throttles above see the same "researched" mark
+            # as the old serial code (they're written before research() runs).
             _last_research_by_coin[coin] = now_ms
-            # Snapshot the score this verdict was formed on, so the throttle
-            # above can detect a material re-score during the window.
             _last_research_score_by_coin[coin] = float(score)
-            # O-2: mark this exact setup (coin + closed bar + fired triggers)
-            # as researched so a re-surfacing of the same closed bar skips the
-            # paid LLM call. None (legacy payload) simply leaves dedup inert.
             _sig_fp = signal_fingerprint(perception)
             if _sig_fp is not None:
                 _researched_signal_fps.add(_sig_fp)
+            _research_jobs.append((coin, perception, float(score), gate))
 
+        # ---- Phase 2: paid research (read-only), parallel if enabled ----
+        def _run_research(_j_coin, _j_perception, _j_score, _j_gate):
+            # Runs on a worker thread when HERMES_RESEARCH_PARALLEL is on. It MUST
+            # stay side-effect free: research() only performs LLM calls + read-only
+            # data prefetch — it never places orders or mutates trading state.
+            # account_snapshot=state is the per-cycle heartbeat snapshot already
+            # taken above. All verdict routing/logging stays on the main thread.
             try:
                 # Pass the cycle-level account state snapshot so research()
                 # doesn't re-fetch it (saves N × (2+M) HL POSTs per cycle).
-                analysis = research(coin, perception, account_snapshot=state)
-                logger.info(f"Verdict: {analysis['verdict']}, Confidence: {analysis['confidence']}")
-                # Store the full LLM reasoning verbatim — no character cap.
-                # The feed shows the complete rationale.
-                _r = (analysis.get('reasoning') or '').strip()
-                log_event({"event": "research", "coin": coin,
-                           "verdict": analysis['verdict'],
-                           "confidence": round(float(analysis['confidence']), 2),
-                           "reasoning": _r,
-                           "news_risk": analysis.get('news_risk'),
-                           "entry_px": analysis.get('entry_px'),
-                           "stop_px": analysis.get('stop_px'),
-                           "tp_px": analysis.get('tp_px')})
-
-                # All verdict→action routing lives in executor.route_verdict
-                # (unit-tested) so no verdict can be silently dropped again.
-                routed = route_verdict(analysis)
-                action = routed["action"]
-                result = routed["result"] or {}
-                if action == "execute":
-                    executed = bool(result.get("executed"))
-                    if executed:
-                        _oid = result.get("order_id", "")
-                        _sz = result.get("size_usd", 0)
-                        logger.info(f"✅ {coin} ORDER PLACED — side={analysis['side']} "
-                                    f"size=${_sz:.0f} order_id={_oid}")
-                    else:
-                        _blocks = result.get("blocked_by") or []
-                        _reason = result.get("reason") or "; ".join(_blocks) or "unknown"
-                        logger.info(f"🚫 {coin} BLOCKED — {_reason}")
-                    # Surface the regime decision so the log answers "why did a
-                    # counter-regime trade fire?" — via is one of aligned /
-                    # neutral / confidence / composite / trigger:<name> / blocked.
-                    _all_gates = result.get("gate_results") or {}
-                    mr = _all_gates.get("market_regime") or {}
-                    # Persist a compact pass/fail summary of ALL gates so the
-                    # event log can reconstruct which gates blocked a trade
-                    # (previously only market_regime's 4 fields were saved).
-                    _gates_summary = {
-                        gk: bool(gv.get("pass")) for gk, gv in _all_gates.items()
-                        if isinstance(gv, dict)
-                    }
-                    log_event({"event": "execute", "coin": coin,
-                               "side": analysis['side'],
-                               "executed": executed,
-                               "detail": result.get("order_id")
-                               or result.get("reason")
-                               or result.get("blocked_by"),
-                               "blocked_by": result.get("blocked_by") if not executed else None,
-                               "size_usd": result.get("size_usd"),
-                               "entry_px": result.get("entry_px"),
-                               "stop_px": result.get("stop_px"),
-                               "tp_px": result.get("tp_px"),
-                               "regime": mr.get("regime"),
-                               "funding_regime": mr.get("funding"),
-                               "regime_via": mr.get("via"),
-                               "counter_regime": mr.get("counter_trend") or mr.get("against_funding"),
-                               "gates": _gates_summary,
-                               "gate_results": _all_gates})
-                    _cycle_outcomes.append((coin, "execute", executed,
-                                           result.get("order_id") or
-                                           "; ".join(result.get("blocked_by") or []) or
-                                           result.get("reason") or ""))
-                elif action == "close":
-                    logger.info(f"Closed {coin} per AI CLOSE verdict: {result}")
-                    log_event({"event": "ai_close", "coin": coin,
-                               "executed": bool(result.get("ok")),
-                               "detail": result.get("order_id")
-                               or result.get("noop")
-                               or result.get("error"),
-                               "reasoning": (analysis.get("reasoning") or "")})
-                    _cycle_outcomes.append((coin, "close", bool(result.get("ok")),
-                                           result.get("order_id") or result.get("noop") or ""))
-                elif action == "unknown":
-                    log_event({"event": "error", "coin": coin,
-                               "error": f"unhandled verdict {routed['verdict']!r}"})
-                    _cycle_outcomes.append((coin, "unknown", False, routed.get("verdict", "")))
-                else:
-                    # PASS / HOLD / no-action verdict — coin was researched but
-                    # the AI chose not to act.
-                    _cycle_outcomes.append((coin, action or "pass", False,
-                                           f"verdict={analysis.get('verdict', '?')}"))
-            except Exception as e:
+                _analysis = research(_j_coin, _j_perception, account_snapshot=state)
+                return (_j_coin, _j_score, _j_gate, _analysis, None)
+            except Exception as _je:
                 # repr(e) not str(e): a bare exception (e.g. some httpx errors)
                 # stringifies to "" and produced blank "Error processing X:" lines.
-                detail = repr(e) if str(e) == "" else str(e)
-                logger.error(f"Error processing {coin}: {type(e).__name__}: {detail}")
-                log_event({"event": "error", "coin": coin,
-                           "error": f"{type(e).__name__}: {detail}"})
-                _cycle_outcomes.append((coin, "error", False, f"{type(e).__name__}: {detail}"))
-            # Post-coin beat — covers both research+execute path and exception
-            # path, so one slow coin doesn't eat the whole cycle's budget.
-            _beat(f"research_done:{coin}")
-            # Intra-cycle exit checkpoint: a single research() can take tens of
-            # seconds (long HTA prompts) and blocks this thread. Re-evaluate DSL
-            # exits between coins so a stop/floor breach during research is
-            # actioned within ~HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S instead of
-            # waiting for the next loop top. Throttled + never raises.
-            _exit_checkpoint(mids, tag=f"research:{coin}")
+                _detail = repr(_je) if str(_je) == "" else str(_je)
+                return (_j_coin, _j_score, _j_gate, None,
+                        f"{type(_je).__name__}: {_detail}")
+
+        _research_results = []
+        if _research_jobs:
+            if _research_parallel_on and len(_research_jobs) > 1:
+                _workers = max(1, min(_research_parallel_workers, len(_research_jobs)))
+                logger.info(f"[p0-4] parallel research: {len(_research_jobs)} coin(s) "
+                            f"on {_workers} worker(s)")
+                _beat("research_batch_start")
+                # DSL exit checkpoint before we block on the slowest coin, so a
+                # stop/floor breach during the parallel batch is still actioned.
+                _exit_checkpoint(mids, tag="research:batch-pre")
+                with ThreadPoolExecutor(max_workers=_workers,
+                                        thread_name_prefix="research-coin") as _pool:
+                    _futures = [_pool.submit(_run_research, *_job) for _job in _research_jobs]
+                    # Futures are appended in trigger order, so iterating them
+                    # re-serializes results deterministically for phase 3.
+                    for _fut in _futures:
+                        _research_results.append(_fut.result())
+                _beat("research_batch_done")
+            else:
+                # Serial path — identical ordering/behavior to the original loop.
+                for _job in _research_jobs:
+                    _j_coin = _job[0]
+                    _beat(f"research_start:{_j_coin}")
+                    _research_results.append(_run_research(*_job))
+
+        # ---- Phase 3: route verdicts on the MAIN thread (order side-effects) ----
+        # executor.route_verdict may place/close orders, so it never runs in a
+        # worker. Results are iterated in the original trigger order.
+        for _r_coin, _r_score, _r_gate, analysis, _r_err in _research_results:
+            if _r_err is not None:
+                logger.error(f"Error processing {_r_coin}: {_r_err}")
+                log_event({"event": "error", "coin": _r_coin, "error": _r_err})
+                _cycle_outcomes.append((_r_coin, "error", False, _r_err))
+            else:
+                try:
+                    logger.info(f"Verdict: {analysis['verdict']}, Confidence: {analysis['confidence']}")
+                    # Store the full LLM reasoning verbatim — no character cap.
+                    # The feed shows the complete rationale.
+                    _r = (analysis.get('reasoning') or '').strip()
+                    log_event({"event": "research", "coin": _r_coin,
+                               "verdict": analysis['verdict'],
+                               "confidence": round(float(analysis['confidence']), 2),
+                               "reasoning": _r,
+                               "news_risk": analysis.get('news_risk'),
+                               "entry_px": analysis.get('entry_px'),
+                               "stop_px": analysis.get('stop_px'),
+                               "tp_px": analysis.get('tp_px')})
+
+                    # All verdict→action routing lives in executor.route_verdict
+                    # (unit-tested) so no verdict can be silently dropped again.
+                    routed = route_verdict(analysis)
+                    action = routed["action"]
+                    result = routed["result"] or {}
+                    if action == "execute":
+                        executed = bool(result.get("executed"))
+                        if executed:
+                            _oid = result.get("order_id", "")
+                            _sz = result.get("size_usd", 0)
+                            logger.info(f"✅ {_r_coin} ORDER PLACED — side={analysis['side']} "
+                                        f"size=${_sz:.0f} order_id={_oid}")
+                        else:
+                            _blocks = result.get("blocked_by") or []
+                            _reason = result.get("reason") or "; ".join(_blocks) or "unknown"
+                            logger.info(f"🚫 {_r_coin} BLOCKED — {_reason}")
+                        # Surface the regime decision so the log answers "why did a
+                        # counter-regime trade fire?" — via is one of aligned /
+                        # neutral / confidence / composite / trigger:<name> / blocked.
+                        _all_gates = result.get("gate_results") or {}
+                        mr = _all_gates.get("market_regime") or {}
+                        # Persist a compact pass/fail summary of ALL gates so the
+                        # event log can reconstruct which gates blocked a trade
+                        # (previously only market_regime's 4 fields were saved).
+                        _gates_summary = {
+                            gk: bool(gv.get("pass")) for gk, gv in _all_gates.items()
+                            if isinstance(gv, dict)
+                        }
+                        log_event({"event": "execute", "coin": _r_coin,
+                                   "side": analysis['side'],
+                                   "executed": executed,
+                                   "detail": result.get("order_id")
+                                   or result.get("reason")
+                                   or result.get("blocked_by"),
+                                   "blocked_by": result.get("blocked_by") if not executed else None,
+                                   "size_usd": result.get("size_usd"),
+                                   "entry_px": result.get("entry_px"),
+                                   "stop_px": result.get("stop_px"),
+                                   "tp_px": result.get("tp_px"),
+                                   "regime": mr.get("regime"),
+                                   "funding_regime": mr.get("funding"),
+                                   "regime_via": mr.get("via"),
+                                   "counter_regime": mr.get("counter_trend") or mr.get("against_funding"),
+                                   "gates": _gates_summary,
+                                   "gate_results": _all_gates})
+                        _cycle_outcomes.append((_r_coin, "execute", executed,
+                                               result.get("order_id") or
+                                               "; ".join(result.get("blocked_by") or []) or
+                                               result.get("reason") or ""))
+                    elif action == "close":
+                        logger.info(f"Closed {_r_coin} per AI CLOSE verdict: {result}")
+                        log_event({"event": "ai_close", "coin": _r_coin,
+                                   "executed": bool(result.get("ok")),
+                                   "detail": result.get("order_id")
+                                   or result.get("noop")
+                                   or result.get("error"),
+                                   "reasoning": (analysis.get("reasoning") or "")})
+                        _cycle_outcomes.append((_r_coin, "close", bool(result.get("ok")),
+                                               result.get("order_id") or result.get("noop") or ""))
+                    elif action == "unknown":
+                        log_event({"event": "error", "coin": _r_coin,
+                                   "error": f"unhandled verdict {routed['verdict']!r}"})
+                        _cycle_outcomes.append((_r_coin, "unknown", False, routed.get("verdict", "")))
+                    else:
+                        # PASS / HOLD / no-action verdict — coin was researched but
+                        # the AI chose not to act.
+                        _cycle_outcomes.append((_r_coin, action or "pass", False,
+                                               f"verdict={analysis.get('verdict', '?')}"))
+                except Exception as e:
+                    # repr(e) not str(e): a bare exception (e.g. some httpx errors)
+                    # stringifies to "" and produced blank "Error processing X:" lines.
+                    detail = repr(e) if str(e) == "" else str(e)
+                    logger.error(f"Error processing {_r_coin}: {type(e).__name__}: {detail}")
+                    log_event({"event": "error", "coin": _r_coin,
+                               "error": f"{type(e).__name__}: {detail}"})
+                    _cycle_outcomes.append((_r_coin, "error", False, f"{type(e).__name__}: {detail}"))
+            # Intra-cycle exit checkpoint: research (and, on the parallel path,
+            # the whole batch) can take tens of seconds. Re-evaluate DSL exits
+            # between coins so a stop/floor breach is actioned within
+            # ~HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S. Throttled + never raises.
+            _exit_checkpoint(mids, tag=f"research:{_r_coin}")
+            # Post-coin heartbeat — placed after routing so it covers both the
+            # parallel and serial paths (and route latency) the same way the
+            # original serial loop did. Keeps the watchdog fed.
+            _beat(f"research_done:{_r_coin}")
 
         _last_progress_ts = time.time()  # watchdog: a full cycle completed
         # End-of-cycle summary: one line per trigger coin so you can see at a
