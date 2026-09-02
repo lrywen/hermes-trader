@@ -8,6 +8,7 @@ limits the sweep to the top-N markets by 24h volume to stay within HL's
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import threading
@@ -62,6 +63,32 @@ def _get_data_gaps() -> int:
 # layer keeps the 1h data around for longer (1h bars don't change intra-hour).
 _CANDLE_CACHE_MAX = int(os.environ.get("HERMES_PERCEPTION_CACHE_MAX", "512"))
 _candle_cache: _Cache = _Cache(max_size=_CANDLE_CACHE_MAX, default_ttl=50.0)
+
+# ── 1h candle cache expiry staggering (e11) ──────────────────────────────────
+# The 60 swept 1h markets are populated in the same cold-scan window and share
+# a flat absolute TTL (expiry = write_time + ttl), so they all expire in the
+# same tick and a single scan refetches all 120 candle requests cold, draining
+# the shared rate bucket and producing the ~90s "extremely slow" scan cluster.
+# We give the LONG-TTL (1h) cache entry a deterministic per-coin TTL *lengthening*
+# so each coin's refetch period differs; after a few cycles the expiries fan out
+# across ticks instead of landing together. The jitter only extends the TTL
+# (never shortens it), so no coin fetches more often than the flat baseline.
+# Applies to the 1h interval only; the 5m path keeps its short TTL and bar-close
+# force-refresh semantics untouched. Set to 0 to restore flat TTL (rollback).
+_1H_TTL_JITTER_FRAC = float(os.environ.get("HERMES_PERCEPTION_1H_TTL_JITTER_FRAC", "0.5"))
+
+
+def _jittered_ttl_s(coin: str, interval: str, ttl_s: float) -> float:
+    """Deterministic per-coin TTL lengthening used to stagger long-TTL (1h)
+    cache expiries across ticks. Returns the base ``ttl_s`` unchanged for short
+    intervals or when the jitter is disabled (frac <= 0). The fractional
+    extension is in ``[0, frac)`` and is a stable function of the coin name so a
+    given coin always gets the same period (no per-write churn)."""
+    if interval != "1h" or _1H_TTL_JITTER_FRAC <= 0.0 or ttl_s <= 0.0:
+        return ttl_s
+    digest = hashlib.md5(coin.encode("utf-8")).hexdigest()
+    unit = int(digest[:8], 16) / 0xFFFFFFFF  # deterministic float in [0, 1)
+    return ttl_s * (1.0 + _1H_TTL_JITTER_FRAC * unit)
 
 
 # P2-6: single canonical way to read fired trigger names off a perception.
@@ -143,7 +170,7 @@ def _fetch_candles_sync(
             candles = fetch_hl_candles(coin, interval, count)
             if not candles:
                 return None
-            _candle_cache.set(key, candles, ttl=ttl_s)
+            _candle_cache.set(key, candles, ttl=_jittered_ttl_s(coin, interval, ttl_s))
             return candles
         except Exception as e:
             err_str = str(e).lower()
