@@ -33,6 +33,8 @@ import time
 import uuid
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
+
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -134,45 +136,14 @@ def _now_ms() -> int:
 
 
 def _write_atomic(path: str, data: dict[str, Any]) -> bool:
-    lock_fd = os.open(path + ".lock", os.O_CREAT | os.O_RDWR, 0o644)
+    # Durability contract (tmp-in-dir + fsync file + replace + fsync dir,
+    # serialised by an flock on <path>.lock) lives in agents.atomic_io.
     try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        tmp = path + ".tmp"
-        tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-        try:
-            with os.fdopen(tmp_fd, "w") as f:
-                json.dump(data, f, indent=2)
-            with open(tmp, "r") as fr:
-                os.fsync(fr.fileno())
-        except Exception:
-            try:
-                os.unlink(tmp)
-            except OSError:
-                pass
-            raise
-        os.replace(tmp, path)
-        parent = os.path.dirname(path) or "."
-        try:
-            dir_fd = os.open(parent, os.O_RDONLY)
-            try:
-                os.fsync(dir_fd)
-            finally:
-                os.close(dir_fd)
-        except OSError:
-            pass
+        atomic_io.locked_write_json_atomic(path, data, indent=2, fsync=True)
         return True
     except Exception as e:
         logger.error(f"[shadow_book] save failed: {e}")
         return False
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        try:
-            os.close(lock_fd)
-        except OSError:
-            pass
 
 
 def _read_state(path: str) -> Optional[dict[str, Any]]:

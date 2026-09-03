@@ -21,6 +21,8 @@ import os
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
+
 logger = logging.getLogger(__name__)
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -37,10 +39,9 @@ def write_snapshot(asset_positions: list[dict[str, Any]]) -> None:
             "saved_at": int(time.time() * 1000),
             "asset_positions": asset_positions or [],
         }
-        tmp = SNAPSHOT_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump(payload, f)
-        os.replace(tmp, SNAPSHOT_FILE)
+        # Regenerable every loop cycle: atomic rename only (no torn reads),
+        # but fsync=False — agents.atomic_io owns the tmp+replace machinery.
+        atomic_io.write_json_atomic(SNAPSHOT_FILE, payload, indent=None, fsync=False)
     except OSError as e:
         logger.warning(f"[snapshot] failed to persist positions: {e}")
 

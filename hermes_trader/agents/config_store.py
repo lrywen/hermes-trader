@@ -24,6 +24,8 @@ from contextlib import contextmanager
 from copy import deepcopy
 from typing import Any, Iterator, Optional, TypeVar
 
+from hermes_trader.agents import atomic_io
+
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
@@ -1548,31 +1550,13 @@ def _write_raw_locked(cfg: dict[str, Any], *, backup: bool = True) -> None:
         except OSError as e:
             logger.warning(f"[config] backup failed (non-fatal): {e}")
 
-    tmp = CONFIG_PATH + ".tmp"
-    try:
-        with open(tmp, "w") as f:
-            json.dump(cfg, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(tmp, CONFIG_PATH)
-    except OSError as replace_err:
-        # EBUSY: single-file bind mount (e.g. docker -v host:guest).
-        # EXDEV/EPERM can surface on similarly restricted filesystems.
-        # Fall back to an in-place overwrite of the mounted target.
-        if replace_err.errno not in (getattr(os, "EBUSY", 16),):
-            raise
-        logger.warning(
-            f"[config] os.replace onto {CONFIG_PATH} hit EBUSY "
-            f"(bind-mounted file); rewriting in place instead"
-        )
-        with open(CONFIG_PATH, "w") as f:
-            json.dump(cfg, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    # tmp-in-dir + fsync file + os.replace + fsync dir, with the EBUSY
+    # bind-mount in-place rewrite, lives in agents.atomic_io. The caller
+    # already holds LOCK_EX on _CONFIG_LOCK_PATH (a second flock in this
+    # process would self-deadlock), so we call the unlocked helper directly.
+    atomic_io.write_json_atomic(
+        CONFIG_PATH, cfg, indent=2, fsync=True, ebusy_fallback=True
+    )
     # P1-10: drop any cached raw config so the next read reloads from
     # disk. Covers both the os.replace() and EBUSY in-place paths.
     _invalidate_raw_cache()

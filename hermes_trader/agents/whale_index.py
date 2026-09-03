@@ -18,6 +18,7 @@ import os
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
 from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.universe import get_universe
 
@@ -303,12 +304,12 @@ def oi_surge_accumulation(
                 "mid_price": mid,
             })
 
-    # persist current snapshot (best-effort, atomic)
+    # persist current snapshot (best-effort, atomic rename; regenerable cache
+    # so fsync=False — agents.atomic_io owns the tmp+replace machinery).
     try:
-        tmp = _OI_HISTORY_FILE + ".tmp"
-        with open(tmp, "w") as f:
-            json.dump({"ts": now, "oi": cur}, f)
-        os.replace(tmp, _OI_HISTORY_FILE)
+        atomic_io.write_json_atomic(
+            _OI_HISTORY_FILE, {"ts": now, "oi": cur}, indent=None, fsync=False
+        )
     except OSError as e:
         logger.warning(f"[whale] OI history persist failed: {e}")
 

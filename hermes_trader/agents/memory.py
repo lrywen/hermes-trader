@@ -10,7 +10,6 @@ longer truncate or race the live trading loop's memory file.
 
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
@@ -18,6 +17,8 @@ import threading
 import time
 from collections import deque
 from typing import Any, Deque, Optional
+
+from hermes_trader.agents import atomic_io
 
 logger = logging.getLogger(__name__)
 
@@ -551,62 +552,16 @@ class AgentMemory:
           * The directory entry is also ``fsync``'d so the rename is
             durable on the journal.
         """
-        lock_fd = os.open(MEMORY_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
+        # R11-B1 guarantees (flock before tmp work, fsync before replace,
+        # fsync dir after replace, lock released even on error) now live in
+        # agents.atomic_io.locked_write_json_atomic; MEMORY_LOCK_FILE is
+        # MEMORY_FILE + ".lock", matching the helper's lock convention.
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            tmp = MEMORY_FILE + ".tmp"
-            tmp_fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_TRUNC, 0o644)
-            try:
-                with os.fdopen(tmp_fd, "w") as f:
-                    json.dump(data, f, indent=2)
-                # json.dump + close already flushed Python buffers, but the
-                # OS page cache may not be on disk yet. fsync the file so
-                # os.replace below swaps in a durable blob even on power
-                # loss. We re-open briefly to fsync the same inode after
-                # fdopen has closed it.
-                with open(tmp, "r") as fr:
-                    os.fsync(fr.fileno())
-            except Exception:
-                # Bad tmp shouldn't shadow the real file: clean it up
-                # before re-raising so the next flush starts from a
-                # known-good state.
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            os.replace(tmp, MEMORY_FILE)
-            # fsync the parent directory so the rename is durable across
-            # a crash that happens after os.replace but before the
-            # directory entry is on disk.
-            parent = os.path.dirname(MEMORY_FILE) or "."
-            try:
-                dir_fd = os.open(parent, os.O_RDONLY)
-                try:
-                    os.fsync(dir_fd)
-                finally:
-                    os.close(dir_fd)
-            except OSError:
-                # On a non-fsyncable filesystem (e.g. some CI sandboxes) the
-                # data is already durable in the file itself; the dir entry
-                # is best-effort.
-                pass
+            atomic_io.locked_write_json_atomic(MEMORY_FILE, data, indent=2, fsync=True)
             return True
         except Exception as e:
             logger.error(f"[memory] save failed: {e}")
             return False
-        finally:
-            # ALWAYS release the kernel lock — even on a crash inside
-            # json.dump — otherwise a stuck flock would block every other
-            # process touching the memory file until this process dies.
-            try:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            except OSError:
-                pass
-            try:
-                os.close(lock_fd)
-            except OSError:
-                pass
 
     def _observe_flush_metric(self, t0: float, force: bool, ok: bool) -> None:
         """Best-effort: record flush latency / failure counter.

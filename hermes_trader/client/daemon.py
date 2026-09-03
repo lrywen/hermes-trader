@@ -19,6 +19,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
+from hermes_trader.agents import atomic_io
+
 from .lock import scanner_lock
 
 logger = logging.getLogger(__name__)
@@ -71,11 +73,16 @@ def _interruptible_sleep(seconds: float, stop_event: threading.Event) -> bool:
 
 
 def _atomic_write(path: Path, data: dict[str, Any]) -> None:
-    """Write JSON atomically (temp file + os.replace)."""
-    tmp = path.with_suffix('.tmp')
+    """Write JSON atomically (same-dir temp file + rename; best-effort cache).
+
+    Compact JSON with ``default=str`` so Path/datetime values stringify as
+    before; fsync is skipped (regenerable daemon state) — the atomic rename
+    still guarantees readers never see a torn file.
+    """
     try:
-        tmp.write_text(json.dumps(data, default=str))
-        tmp.replace(path)
+        atomic_io.write_json_atomic(
+            path, data, indent=None, fsync=False, default=str
+        )
     except OSError as e:
         logger.warning(f"[daemon] State write failed: {e}")
 

@@ -36,6 +36,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
 
+from hermes_trader.agents import atomic_io
 from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.hl_client import _http_post
 
@@ -1266,7 +1267,6 @@ def _save_state() -> None:
         "saved_at": int(time.time() * 1000),
         "positions": [_tracker_to_dict(t) for t in _active_positions.values()],
     }
-    tmp = DSL_STATE_FILE + ".tmp"
     lock_fd = None
     last_err: Optional[OSError] = None
     try:
@@ -1278,9 +1278,13 @@ def _save_state() -> None:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         for attempt in range(_SAVE_MAX_ATTEMPTS):
             try:
-                with open(tmp, "w") as f:
-                    json.dump(payload, f)
-                os.replace(tmp, DSL_STATE_FILE)
+                # atomic_io gives the durability contract the bare
+                # open()+os.replace here used to lack: fsync the file before
+                # the rename and fsync the directory after, so a power loss
+                # mid-save cannot leave a zero-length/old state file.
+                atomic_io.write_json_atomic(
+                    DSL_STATE_FILE, payload, indent=None, fsync=True
+                )
                 last_err = None
                 break
             except OSError as e:

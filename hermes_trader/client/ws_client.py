@@ -29,6 +29,7 @@ import certifi
 from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
+from hermes_trader.agents import atomic_io
 from hermes_trader.client.hl_client import _http_post
 # R13-B13: WS tuning knobs live in canonical block hl_client_io; rate_limit
 # is a leaf (stdlib + lazy config_store only), so this import cannot cycle.
@@ -346,12 +347,14 @@ class HyperliquidWebSocket:
             keep = max(100, self._seen_tids_cap // 2)
             if len(tids) > keep:
                 tids = tids[-keep:]
-            tmp_path = _USER_FILLS_SEEN_FILE + ".tmp"
-            tmp_dir = os.path.dirname(_USER_FILLS_SEEN_FILE) or "."
-            os.makedirs(tmp_dir, exist_ok=True)
-            with open(tmp_path, "w", encoding="utf-8") as fh:
-                json.dump({"version": 1, "tids": tids}, fh)
-            os.replace(tmp_path, _USER_FILLS_SEEN_FILE)
+            # Best-effort atomic rename (regenerable dedup cache → fsync=False);
+            # atomic_io creates the parent dir and owns the tmp+replace.
+            atomic_io.write_json_atomic(
+                _USER_FILLS_SEEN_FILE,
+                {"version": 1, "tids": tids},
+                indent=None,
+                fsync=False,
+            )
             self._user_fills_seen_dirty = False
             self._user_fills_last_persist = now
         except Exception as exc:  # noqa: BLE001 — persistence is best-effort

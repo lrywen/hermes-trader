@@ -15,17 +15,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@v5
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
         with:
-          python-version: ${{ matrix.python-version }}
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          enable-cache: true
 
-      - name: Install (with dev extras)
-        run: pip install -e ".[dev]"
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      # uv lock --check fails if uv.lock drifts from pyproject.toml (a dependency
+      # was edited without re-locking). --frozen below then installs exactly the
+      # locked resolution — CI never resolves, so deps are reproducible.
+      - name: Verify lockfile is up to date
+        run: uv lock --check
+
+      - name: Install (locked, with dev extras)
+        run: uv sync --frozen --extra dev
 
       # pytest's addopts deselects the `online` and `live` markers, so this runs
       # only the offline suite — no network, no real-money orders, CI-safe.
       - name: Run offline test suite
-        run: pytest
+        run: uv run pytest
