@@ -982,6 +982,46 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # global min_ai_confidence applies uniformly). Was implicit via
     # config.get("aligned_min_conf") in risk_gates.
     "aligned_min_conf": None,
+    # P1-6: trading_loop runtime knobs (scripts/trading_loop.py). Eighteen
+    # leaves covering the loop log file path, the surge-postmortem notify
+    # threshold, the self-heal watchdog timeout, the intra-cycle exit
+    # checkpoint throttle, the meta-cache prewarm bound, the universe
+    # refresh TTL, the HL-budget startup grace, the base scan cadence, the
+    # P0-1 dynamic-cadence trio (on / fresh window / fast / slow), the P0-2
+    # WS fill-wake switch, the P0-3 ws_status event switch + hold/fresh
+    # windows, and the P0-4 research-parallel switch + pool width. They
+    # were previously read only via os.environ.get(HERMES_*, <literal>) at
+    # scripts/trading_loop.py module load and never appeared in
+    # CANONICAL_DEFAULTS — invisible to dashboard dump /
+    # validate_config_updates and un-tunable via the canonical config
+    # channel. loop_runtime.loop_runtime_params() keeps every legacy
+    # HERMES_* env var as the top-priority override (operator / compose /
+    # k8s-configmap knobs keep working), then falls through to this block
+    # via cfg_get (HERMES_CFG_LOOP_RUNTIME__* env + agent-config). The four
+    # boolean switches are coerced with the same 1/true/yes/on truth-set the
+    # loop used inline; the loop_log_path stays a string. Defaults mirror
+    # the trading_loop.py literals verbatim; behaviour unchanged — this is
+    # a startup-tuning block, not a strategy block.
+    "loop_runtime": {
+        "loop_log_path": "/data/trading-loop.log",
+        "surge_min_score": 40.0,
+        "watchdog_timeout_s": 600,
+        "exit_checkpoint_min_interval_s": 5.0,
+        "meta_prewarm_timeout_s": 3.0,
+        "universe_refresh_s": 1800,
+        "startup_grace_s": 12.0,
+        "scan_interval": 15,
+        "scan_dynamic": False,
+        "scan_fresh_s": 10.0,
+        "scan_interval_fast": 8,
+        "scan_interval_slow": 20,
+        "ws_fill_wake": False,
+        "ws_status_event": False,
+        "ws_status_hold_s": 30.0,
+        "ws_status_fresh_s": 10.0,
+        "research_parallel": True,
+        "research_parallel_workers": 4,
+    },
     # 配置文件注释字段（不参与交易逻辑）
     "_comment": "",
 }

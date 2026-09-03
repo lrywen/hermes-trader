@@ -46,13 +46,24 @@ logging.basicConfig(
     format='%(asctime)s %(levelname)s:%(name)s:%(message)s'
 )
 
+# P1-6: the loop's HERMES_* startup/runtime knobs resolve through one
+# canonical helper (legacy HERMES_* env highest priority → HERMES_CFG_
+# LOOP_RUNTIME__* / agent-config → CANONICAL_DEFAULTS → inline literals),
+# so they're now visible to the dashboard config dump + validate_config_updates
+# instead of being invisible inline os.environ.get reads. Resolved once here
+# (before the file-log handler needs loop_log_path) and re-bound to the same
+# module-level names below; defaults are byte-for-byte the old literals.
+from hermes_trader.loop_runtime import loop_runtime_params as _loop_runtime_params
+
+_rt = _loop_runtime_params()
+
 # ── 持久化轮转日志（2026-09-02，替代 compose 的 `tee -a`）────────────────
 # tee 追加的文件无任何轮转机制（14 天涨到 140MB）。这里用
 # RotatingFileHandler 按 50MB × 5 代轮转；stdout/stderr 仍由 basicConfig 的
 # StreamHandler 输出（docker logs，json-file 另有 50m×5 轮转）。
 # 单进程写（trading_loop 只有一个 loop 进程），无跨进程竞争。
 # 文件不可写等任何失败都回落到纯 stderr（handleError 不抛异常），观测链不断。
-_loop_log_path = os.environ.get("HERMES_LOOP_LOG_FILE", "/data/trading-loop.log")
+_loop_log_path = _rt["loop_log_path"]
 try:
     from logging.handlers import RotatingFileHandler
     _loop_fh = RotatingFileHandler(
@@ -114,7 +125,7 @@ logger = logging.getLogger(__name__)
 # The surge NOTIFY threshold is intentionally INDEPENDENT of the scan/trade
 # gate (minCompositeScore, 54): we want to be alerted earlier (score>=40) even
 # though a trade isn't actionable until 54. Override via HERMES_SURGE_MIN_SCORE.
-_surge_min = float(os.environ.get("HERMES_SURGE_MIN_SCORE", "40"))
+_surge_min = _rt["surge_min_score"]
 _surge_detector = SurgeDetector(SurgeConfig(min_score=_surge_min))
 
 
@@ -133,7 +144,7 @@ def _remaining_minutes(ms_remaining: float) -> int:
 # rehydrates trackers from disk; the stacking backstop prevents a re-entry
 # pyramid). A persistent DNS outage just re-execs every ~600s until it clears.
 _last_progress_ts = time.time()
-_watchdog_timeout_s = int(os.environ.get('HERMES_WATCHDOG_TIMEOUT_S', '600'))
+_watchdog_timeout_s = _rt["watchdog_timeout_s"]
 
 
 def _pre_exec_flush(timeout_s: float = 3.0) -> None:
@@ -229,8 +240,7 @@ def _beat(stage: str) -> None:
 # Concurrency: this runs on the SAME main thread, never from the WS callback.
 # No new thread, no lock — it simply shortens the time between two otherwise
 # identical main-thread exit evaluations.
-_EXIT_CHECKPOINT_MIN_INTERVAL_S = float(
-    os.environ.get("HERMES_EXIT_CHECKPOINT_MIN_INTERVAL_S", "5.0"))
+_EXIT_CHECKPOINT_MIN_INTERVAL_S = _rt["exit_checkpoint_min_interval_s"]
 _last_exit_checkpoint_ts = 0.0
 
 
@@ -589,14 +599,14 @@ def _prewarm_meta_cache_bounded(timeout_s: float) -> None:
         logger.warning(f"[startup] meta prewarm failed (will warm lazily): {state['error']}")
 
 
-_prewarm_meta_cache_bounded(float(os.environ.get('HERMES_META_PREWARM_TIMEOUT_S', '3')))
+_prewarm_meta_cache_bounded(_rt["meta_prewarm_timeout_s"])
 # The universe carries prevDayPx / dayNtlVlm / funding which DRIFT over the
 # day; fetched once here they'd freeze at loop-start for the whole process,
 # so mover-selection + volume-ranking would rank stale 24h windows (a coin
 # ripping now would never enter the movers slot). Re-fetch on a TTL so those
 # fields track the live market. metaAndAssetCtxs is ~20 weight (+~8 POSTs for
 # HIP-3) — trivial against HL's 1200 weight/min. Env-overridable; 0 disables.
-universe_refresh_s = int(os.environ.get('HERMES_UNIVERSE_REFRESH_S', '1800'))
+universe_refresh_s = _rt["universe_refresh_s"]
 _last_universe_refresh = time.time()
 memory.load()  # hydrate from .agent-memory.json so cache + flush work.
 
@@ -606,7 +616,7 @@ memory.load()  # hydrate from .agent-memory.json so cache + flush work.
 # ~30% scan data-gaps for ~2min, loop stalled). Pause so the rate-limiter bucket
 # refills before the first scan fires its full candle burst. Env-overridable;
 # 0 disables. Cheap one-time cost; steady-state scans are unaffected.
-_startup_grace_s = float(os.environ.get('HERMES_STARTUP_GRACE_S', '12'))
+_startup_grace_s = _rt["startup_grace_s"]
 if _startup_grace_s > 0:
     logger.info(f"[startup] grace delay {_startup_grace_s:.0f}s — letting HL rate budget refill before the first cold scan")
     time.sleep(_startup_grace_s)
@@ -642,29 +652,29 @@ except Exception as _uf_err:
 # DSL exit polling blind window during fast crashes. The 5m candle cache TTL
 # (50s) is keyed by candle timestamp so repeated reads within a TTL still see
 # the same closed candle; intra-candle price is fetched live via midpoint.
-scan_interval = int(os.environ.get('HERMES_SCAN_INTERVAL', '15'))
+scan_interval = _rt["scan_interval"]
 min_score = config['scan']['minCompositeScore']
 
 # ── Phase 4 realtime optimisations (all default OFF → Phase-1 behaviour) ──────
 # P0-1 dynamic cadence: when the allMids WS feed is fresh, scan faster to
 # shrink position/equity/close latency; when the WS is down (REST fallback),
 # scan slower to spare REST rate budget. Off by default → fixed scan_interval.
-_scan_dynamic_on = os.environ.get('HERMES_SCAN_DYNAMIC', '0').lower() in ('1', 'true', 'yes', 'on')
-_scan_dynamic_fresh_s = float(os.environ.get('HERMES_SCAN_FRESH_S', '10'))
-_scan_interval_fast = int(os.environ.get('HERMES_SCAN_INTERVAL_FAST', '8'))
-_scan_interval_slow = int(os.environ.get('HERMES_SCAN_INTERVAL_SLOW', '20'))
+_scan_dynamic_on = _rt["scan_dynamic"]
+_scan_dynamic_fresh_s = _rt["scan_fresh_s"]
+_scan_interval_fast = _rt["scan_interval_fast"]
+_scan_interval_slow = _rt["scan_interval_slow"]
 # P0-2 fill wake: between cycles, sleep on a threading.Event that the WS
 # callback thread sets the instant a userFill is enqueued, so an external
 # close is drained + SSE-reported immediately instead of after the full
 # inter-cycle sleep. The drain/report still runs on the MAIN thread (the
 # callback thread never touches the session log). Off by default → time.sleep.
-_ws_fill_wake_on = os.environ.get('HERMES_WS_FILL_WAKE', '0').lower() in ('1', 'true', 'yes', 'on')
+_ws_fill_wake_on = _rt["ws_fill_wake"]
 # P0-3 ws_status: edge-triggered SSE event (with downgrade hysteresis) so the
 # Portal can show feed green/yellow/red and dispatch Feishu/voice alerts. Off
 # by default → no ws_status events are emitted.
-_ws_status_event_on = os.environ.get('HERMES_WS_STATUS_EVENT', '0').lower() in ('1', 'true', 'yes', 'on')
-_ws_status_hold_s = float(os.environ.get('HERMES_WS_STATUS_HOLD_S', '30'))
-_ws_status_fresh_s = float(os.environ.get('HERMES_WS_STATUS_FRESH_S', '10'))
+_ws_status_event_on = _rt["ws_status_event"]
+_ws_status_hold_s = _rt["ws_status_hold_s"]
+_ws_status_fresh_s = _rt["ws_status_fresh_s"]
 # P0-4 cross-coin research parallelism: the per-cycle research loop is 100%
 # serial across triggered coins (for perception in results), and each research()
 # blocks tens of seconds on the LLM — with a slow provider and trend_surface
@@ -676,8 +686,8 @@ _ws_status_fresh_s = float(os.environ.get('HERMES_WS_STATUS_FRESH_S', '10'))
 # (account state, position gates, session log) are unchanged. Default ON
 # (audit 2026-09-03 P1-4): matches the production deployment; set
 # HERMES_RESEARCH_PARALLEL=0 to fall back to the original serial loop.
-_research_parallel_on = os.environ.get('HERMES_RESEARCH_PARALLEL', '1').lower() in ('1', 'true', 'yes', 'on')
-_research_parallel_workers = int(os.environ.get('HERMES_RESEARCH_PARALLEL_WORKERS', '4'))
+_research_parallel_on = _rt["research_parallel"]
+_research_parallel_workers = _rt["research_parallel_workers"]
 
 if _scan_dynamic_on or _ws_fill_wake_on or _ws_status_event_on:
     logger.info(

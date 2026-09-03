@@ -261,6 +261,13 @@ class _ConfigPatch(BaseModel):
     # thresholds shared by the ta_filter pre-filter, the ta_late_entry_gate
     # pre-trade gate and the backtest engine (one source of truth).
     ta_late_entry: dict[str, Any] = Field(default_factory=lambda: _dict_default("ta_late_entry"))
+    # P1-6: trading_loop startup/runtime knobs (scripts/trading_loop.py).
+    # Eighteen keys: loop log path, surge notify threshold, watchdog timeout,
+    # exit-checkpoint throttle, meta prewarm bound, universe refresh TTL,
+    # startup grace, base scan cadence, dynamic-cadence trio, WS fill-wake /
+    # ws_status switches + windows, and research-parallel switch + width.
+    # Legacy HERMES_* env vars remain the top-priority channel.
+    loop_runtime: dict[str, Any] = Field(default_factory=lambda: _dict_default("loop_runtime"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
