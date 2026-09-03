@@ -1034,6 +1034,11 @@ while True:
             "dex_available": dex_available,
             "spot_usdc": round(spot_usdc, 4),
             "daily_pnl": round(daily_pnl, 4),
+            # P0-1: cumulative net external capital flow (deposit − withdraw)
+            # since the ledger baseline, stamped per-tick so the dashboard can
+            # render a cash-flow-neutral curve (equity − cum_contrib). Display
+            # only; the risk gates / sizing below still consume raw equity.
+            "cum_contrib": round(memory.cumulative_external_contributions(), 4),
             "open_positions": len(positions),
             "config": {
                 "mode": _cfg.get("mode"),

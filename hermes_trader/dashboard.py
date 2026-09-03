@@ -1227,6 +1227,15 @@ def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
     flash-crash is never hidden, but the UI may render it dashed/greyed and it
     does not feed the trailing reference window. Using the *trailing* (not
     global) median preserves genuine gradual growth across the window.
+
+    P0-1 (cash-flow-neutral): each point also carries ``equity_adj`` = raw
+    equity minus the cumulative net external capital flow (``cum_contrib`` from
+    the heartbeat), so a deposit/withdrawal does not bend the curve as trading
+    profit/loss. ``return_pct`` is the window-relative, cash-flow-neutral return
+    in percent from the first point's adjusted equity. Heartbeats written
+    before this upgrade lack ``cum_contrib`` and degrade to ``equity_adj`` =
+    raw equity (no adjustment), so the curve fills in correctly as new
+    heartbeats arrive. This is display-only; risk gates/sizing never consume it.
     """
     from statistics import median
 
@@ -1247,19 +1256,39 @@ def _equity_curve_payload(range_s: int) -> list[dict[str, Any]]:
         eq = float(e.get("equity", 0) or 0)
         if eq <= 0:
             continue
-        raw.append((e["ts"], eq))
+        # P0-1: cumulative net external flow stamped by the loop; absent
+        # (pre-upgrade) → 0 so adjustment is a no-op for legacy points.
+        try:
+            cum = float(e.get("cum_contrib", 0) or 0)
+        except (TypeError, ValueError):
+            cum = 0.0
+        raw.append((e["ts"], eq, cum))
 
     series: list[dict[str, Any]] = []
     window: list[float] = []  # last N accepted equities (trailing reference)
-    for ts, eq in raw:
+    base_adj: Optional[float] = None  # first accepted point's adjusted equity
+    for ts, eq, cum in raw:
         ref = median(window) if window else eq
         degraded = bool(window) and eq < dip_ratio * ref
-        series.append({"ts": ts, "equity": round(eq, 2),
-                       "flag": "degraded" if degraded else "ok"})
+        equity_adj = round(eq - cum, 2)
+        point = {"ts": ts, "equity": round(eq, 2),
+                 "equity_adj": equity_adj, "flag": "degraded" if degraded else "ok"}
         if not degraded:
             window.append(eq)
             if len(window) > dip_window:
                 window.pop(0)
+            # Anchor the cash-neutral return on the first accepted (non-degraded)
+            # point so a transient partial-dex blip can't skew the baseline.
+            if base_adj is None:
+                base_adj = equity_adj
+        # Cash-flow-neutral window return: trading-only change over the window,
+        # relative to the starting adjusted equity. None until a baseline exists
+        # (or on a zero/absurd baseline).
+        if base_adj and base_adj > 0:
+            point["return_pct"] = round((equity_adj - base_adj) / base_adj * 100, 4)
+        else:
+            point["return_pct"] = None
+        series.append(point)
     return series
 
 

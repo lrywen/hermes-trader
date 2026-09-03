@@ -260,6 +260,16 @@ class AgentMemory:
         self._dd_last_baseline_ms: int = 0
         self._start_of_day_equity: float = 0
         self._day_start_ts: int = 0
+        # P0-1 (v3): cumulative net EXTERNAL capital flow into the tradeable
+        # equity pool (deposit − withdrawal, incl. cross-pool transfers in),
+        # used solely to render a cash-flow-neutral equity curve / return on
+        # the dashboard — a deposit must not show up as trading profit. Risk
+        # gates and position sizing keep reading raw equity and are untouched.
+        #   _contrib_folded_total: flow across fully-elapsed UTC days;
+        #   _contrib_today: today's running total (re-fetched from the ledger
+        #     each tick, folded into the total at the UTC roll).
+        self._contrib_folded_total: float = 0.0
+        self._contrib_today: float = 0.0
         self._open_positions: list[dict[str, Any]] = []
         # ── Tiered circuit-breaker state (sizing/risk-overhaul 2026-08-26) ──
         # coin -> epoch-ms until which new entries on that coin are blocked
@@ -644,6 +654,9 @@ class AgentMemory:
                 "dailyPnl": self._daily_pnl,
                 "startOfDayEquity": self._start_of_day_equity,
                 "dayStartTs": self._day_start_ts,
+                # P0-1: cumulative external capital flow (display-only).
+                "cumContribFolded": self._contrib_folded_total,
+                "cumContribToday": self._contrib_today,
                 "peakEquity": self._peak_equity,  # B-F7 all-time equity HWM
                 "equityTrail": [(ts, eq) for ts, eq in self._equity_trail],
                 "ddFrozenSinceMs": int(self._dd_frozen_since_ms or 0),
@@ -880,7 +893,18 @@ class AgentMemory:
             today_utc = int(datetime.now(timezone.utc).replace(
                 hour=0, minute=0, second=0, microsecond=0
             ).timestamp())
-            if self._day_start_ts < today_utc or self._start_of_day_equity == 0:
+            # P0-1: a genuine UTC day roll (a prior recorded day ended) folds
+            # yesterday's running external-flow total into the cumulative
+            # folded total so the dashboard's cash-flow-neutral curve stays
+            # correct across midnight. Display-only — risk gates read raw
+            # equity and never touch these fields. The `_start_of_day_equity
+            # == 0` reset case is intentionally NOT folded: on a fresh/restore
+            # load folded_total already holds the persisted value and today's
+            # running total is 0, so there is nothing to fold.
+            day_rolled = bool(self._day_start_ts) and self._day_start_ts < today_utc
+            if day_rolled or self._start_of_day_equity == 0:
+                if day_rolled:
+                    self._contrib_folded_total += self._contrib_today
                 # Re-baseline at day roll or after a memory reset. If there were
                 # already contributions today (e.g. operator transferred USDC
                 # spot→perp before starting the bot), the baseline must exclude
@@ -897,6 +921,11 @@ class AgentMemory:
                 self._consecutive_losses = {}
             else:
                 self._daily_pnl = current_equity - self._start_of_day_equity - net_contributions
+            # P0-1: today's net external flow is re-fetched from the ledger each
+            # tick (authoritative since-SOD window); folded_total covers prior
+            # UTC days. Their sum is the cumulative flow the dashboard subtracts
+            # to render a cash-flow-neutral curve.
+            self._contrib_today = float(net_contributions or 0.0)
             # Track the day's peak PnL so a give-back breaker can lock in green days.
             self._peak_daily_pnl = max(self._peak_daily_pnl, self._daily_pnl)
             # B-F7: all-time equity high-water mark for the drawdown gate. The
@@ -917,6 +946,17 @@ class AgentMemory:
     def peak_daily_pnl(self) -> float:
         """Intraday high-water mark of daily PnL (resets at UTC midnight)."""
         return self._peak_daily_pnl
+
+    def cumulative_external_contributions(self) -> float:
+        """P0-1: cumulative net EXTERNAL capital flow into the tradeable pool
+        since the first observed ledger (deposit − withdrawal, incl. cross-pool
+        transfers in). Display-only input for the dashboard's cash-flow-neutral
+        equity curve — ``equity_adjusted = equity − cumulative_flow`` so a
+        deposit does not read as trading profit. Risk gates / sizing MUST NOT
+        use this; they read raw equity.
+        """
+        with self._lock:
+            return self._contrib_folded_total + self._contrib_today
 
     def daily_realized_pnl(self) -> float:
         """(supplemental audit 2026-09-02) Today's total REALIZED PnL (USD),

@@ -211,6 +211,36 @@ def test_day_roll_resets_baseline_peak_and_streak():
     assert m._start_of_day_equity == 1100.0
 
 
+def test_cumulative_contributions_tracks_intraday_flow():
+    # P0-1: cumulative external flow powers the dashboard's cash-flow-neutral
+    # curve. _contrib_today is the authoritative since-SOD net flow re-fetched
+    # each tick, so it is replaced (not accumulated) within the day.
+    m = _fresh_memory()
+    m.track_daily_pnl(1000.0, net_contributions=50.0)   # $50 deposited
+    assert m.cumulative_external_contributions() == 50.0
+
+    m.track_daily_pnl(1000.0, net_contributions=80.0)   # another $30 in
+    assert m.cumulative_external_contributions() == 80.0
+    assert m._contrib_folded_total == 0.0               # no UTC day ended yet
+
+
+def test_cumulative_contributions_folds_across_day_roll():
+    m = _fresh_memory()
+    m.track_daily_pnl(1000.0, net_contributions=50.0)   # day 1: +$50
+    assert m.cumulative_external_contributions() == 50.0
+
+    # Force the UTC day-roll: day-1's running total folds into the cumulative
+    # total, and day 2 starts from a fresh SOD window.
+    m._day_start_ts = int(time.time()) - 2 * 86400
+    m.track_daily_pnl(1100.0, net_contributions=0.0)    # first day-2 tick
+    assert m._contrib_folded_total == 50.0
+    assert m._contrib_today == 0.0
+    assert m.cumulative_external_contributions() == 50.0
+
+    m.track_daily_pnl(1100.0, net_contributions=20.0)   # day 2: +$20
+    assert m.cumulative_external_contributions() == 70.0
+
+
 def test_consecutive_loss_streak_counts_and_resets_on_win():
     m = _fresh_memory()
     m.track_daily_pnl(1000.0)  # establish today's baseline (no roll mid-test)
