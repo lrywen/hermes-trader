@@ -673,6 +673,52 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "resp_unknown_halt_n": 3,
         "resp_unknown_halt_min": 60.0,
     },
+    # market_circuit (roadmap §3, 2026-09-04): MARKET-level tail-risk breaker.
+    # circuit_breaker above halts after THIS bot loses money (per-coin/daily
+    # PnL); this block adds non-PnL market triggers that fire BEFORE the loss
+    # flows through our own fills — an index flash crash (BTC/ETH short-window
+    # drop), a correlated cluster of our own DSL stops, and (opt-in) extreme
+    # index funding. A trip arms the EXISTING global halt (set_global_halt),
+    # which global_halt_gate enforces and bm11_breaker_flatten turns into a
+    # hard flatten when auto_flatten_on_global_halt is on (default on).
+    # mode mirrors ta_late_entry's gray-release: "off" = absent (DEFAULT —
+    # roadmap: explicitly arm after shadow review); "shadow" = verdict/metrics/
+    # JSONL recorded but halt NEVER armed; "enforce" = arms the global halt.
+    # False trips flatten a healthy book, so the defaults are deliberately
+    # conservative and every trigger is independently disable-able.
+    "market_circuit": {
+        "mode": "off",
+        # --- Trigger 1: index short-window crash (BTC/ETH) ---
+        "index_crash_enabled": True,
+        # Candle timeframe for the crash leg ("1m"/"5m"/"15m"). The watched
+        # proxies are fixed to BTC/ETH in market_circuit.py (DEFAULT_INDEX_COINS)
+        # — the whole crypto book correlates to BTC and ETH is the #2 macro
+        # asset; no per-trader knob is warranted for a tail circuit.
+        "index_crash_interval": "5m",
+        # Peak(high)-to-last-close drop, in %, over the last N CLOSED bars
+        # that trips (e.g. 2.0 = a >=2% fall within ~15min on 5m bars).
+        "index_crash_pct": 2.0,
+        "index_crash_window_bars": 3,
+        # --- Trigger 2: correlated DSL-stop cluster (our own book) ---
+        "stop_cluster_enabled": True,
+        # Distinct coins whose DSL stops fire within this window that trip.
+        "stop_cluster_window_s": 180.0,
+        "stop_cluster_min_coins": 3,
+        # --- Trigger 3: extreme index funding (off by default; opt-in) ---
+        "funding_enabled": False,
+        # Funding rate as a FRACTION per interval (0.005 = 0.5% = ~50bp).
+        "funding_extreme_frac": 0.005,
+        # --- Disposal / pacing ---
+        # Global-halt duration armed on an enforce trip (minutes).
+        "halt_minutes": 60.0,
+        # While a halt with at least this many minutes remaining is already
+        # armed, don't re-arm / re-alert (sustained-crash dedup).
+        "cooldown_minutes": 60.0,
+        # Candle fetch sizing (per index coin; cache is shared/90s).
+        "fetch_bars": 20,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
     # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard gate.
     # The same late_entry_check() pure function (agents/ta_filter.py) runs in
     # three places with ONE source of truth for thresholds:

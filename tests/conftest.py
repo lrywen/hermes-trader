@@ -33,3 +33,8 @@ os.environ["SESSION_LOG_PATH"] = os.path.join(_tmp, "session-log.jsonl")
 # explicit shadow_log_path or monkeypatch.setenv to their own tmp_path.
 os.environ["HERMES_TA_LATE_ENTRY_SHADOW_FILE"] = os.path.join(
     _tmp, "ta_late_entry_shadow.jsonl")
+# Redirect the market_circuit shadow JSONL (roadmap §3) the same way:
+# market_circuit.shadow_log_path falls back to this env var, so shadow/enforce
+# tests never append to the developer's real market_circuit_shadow.jsonl.
+os.environ["HERMES_MARKET_CIRCUIT_SHADOW_FILE"] = os.path.join(
+    _tmp, "market_circuit_shadow.jsonl")

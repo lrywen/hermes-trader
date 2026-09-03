@@ -168,6 +168,11 @@ class _ConfigPatch(BaseModel):
     coin_overrides: dict[str, Any] = Field(default_factory=lambda: _dict_default("coin_overrides"))
     # R12-C1: single-coin / daily drawdown halt thresholds.
     circuit_breaker: dict[str, Any] = Field(default_factory=lambda: _dict_default("circuit_breaker"))
+    # roadmap §3 (2026-09-04): market-level tail-risk circuit breaker.
+    # Non-PnL market triggers (index crash / correlated stop cluster / extreme
+    # funding) that arm the existing global halt. mode off|shadow|enforce,
+    # default off.
+    market_circuit: dict[str, Any] = Field(default_factory=lambda: _dict_default("market_circuit"))
     # R13-A1: perception scan-tick block. Nested because perception reads it
     # as `config["scan"]` (and TRIGGER_CONFIG["scan"] is itself a dict).
     scan: dict[str, Any] = Field(default_factory=lambda: _dict_default("scan"))
@@ -452,6 +457,28 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "min_bars_4h": ("int", 10, 500),
         "min_bars_15m": ("int", 5, 500),
         "fetch_bars": ("int", 30, 1000),
+        "shadow_log_path": ("str",),
+    },
+    # roadmap §3 (2026-09-04): market-level tail-risk circuit breaker. All
+    # leaves scalar; mode is the off/shadow/enforce gray-release switch.
+    "market_circuit": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        # Trigger 1: BTC/ETH short-window crash leg.
+        "index_crash_enabled": ("bool",),
+        "index_crash_interval": ("str",),
+        "index_crash_pct": _num_leaf(0.1, 50.0),
+        "index_crash_window_bars": ("int", 2, 100),
+        # Trigger 2: correlated DSL-stop cluster on our own book.
+        "stop_cluster_enabled": ("bool",),
+        "stop_cluster_window_s": _num_leaf(10.0, 3600.0),
+        "stop_cluster_min_coins": ("int", 2, 50),
+        # Trigger 3: extreme index funding (opt-in).
+        "funding_enabled": ("bool",),
+        "funding_extreme_frac": _num_leaf(0.0001, 0.1),
+        # Disposal / pacing.
+        "halt_minutes": _num_leaf(1.0, 1440.0),
+        "cooldown_minutes": _num_leaf(0.0, 1440.0),
+        "fetch_bars": ("int", 5, 500),
         "shadow_log_path": ("str",),
     },
 }

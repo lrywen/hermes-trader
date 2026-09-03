@@ -249,6 +249,17 @@ TRADE_CIRCUIT_STATE = Gauge(
     "network-free from local memory state. Scope: global/coin_armed.",
     ["scope"],
 )
+# ── Market-level tail-risk circuit breaker (market_circuit.py) ─────────
+# roadmap §3 (2026-09-04). One verdict per loop tick while mode != off.
+# Bounded labels: mode (shadow/enforce), verdict (trip/no_trip/data_missing).
+# In shadow mode a `trip` is a would-trigger (halt NOT armed); compare against
+# the subsequent tape before flipping mode=enforce.
+MARKET_CIRCUIT_VERDICTS = Counter(
+    "hermes_market_circuit_verdicts_total",
+    "market_circuit evaluations, labelled by mode and bounded verdict "
+    "(trip/no_trip/data_missing). In shadow mode trip = would-trigger.",
+    ["mode", "verdict"],
+)
 
 # ── State persistence (dsl_exit.py / memory.py) ────────────────────────
 # Alert when save/flush p95 > 0.5s (disk contention) or FLUSH_ERRORS /

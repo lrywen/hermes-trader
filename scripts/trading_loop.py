@@ -88,6 +88,8 @@ from hermes_trader.agents.executor import (
     route_verdict,
     sync_exchange_sl,
 )
+from hermes_trader.agents.market_circuit import evaluate as market_circuit_evaluate
+from hermes_trader.agents.market_circuit import record_stop as market_circuit_record_stop
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.research import research
@@ -296,6 +298,9 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
             evt["realized_pnl_pct"] = res.get("realized_pnl_pct")
             evt["fees_pct"] = res.get("fees_pct")
         log_event(evt)
+        # Feed the market-circuit stop-cluster window (roadmap §3 trigger 2).
+        # Best-effort; covers both the per-cycle and checkpoint close paths.
+        market_circuit_record_stop(coin)
         n += 1
     return n
 
@@ -790,6 +795,87 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
             event_log({"event": "coin_circuit_auto_flatten", "coin": _coin,
                        "remaining_min": round(_crem, 1)})
     return flattened
+
+
+def _market_circuit_funding(coin):
+    """Read current funding rate (fraction) for a coin from the cached
+    universe — zero extra HTTP (universe is already refreshed per cycle)."""
+    try:
+        from hermes_trader.client.universe import get_market_by_coin
+        m = get_market_by_coin(coin) or {}
+        return float(m.get("funding"))
+    except Exception:
+        return None
+
+
+def market_circuit_tick(cfg, mem, equity, positions, *,
+                        evaluator=market_circuit_evaluate,
+                        flattener=close_position_market,
+                        funding_fetcher=_market_circuit_funding,
+                        event_log=log_event):
+    """Roadmap §3 market-level tail-risk breaker — one check per loop tick.
+
+    Runs AFTER the DSL exit pass (so this tick's stops are already in the
+    cluster window) and BEFORE scan/research/entry decisions. Off by default
+    (``market_circuit.mode``); in ``shadow`` mode it only records a would-
+    trigger; in ``enforce`` it arms the existing global halt via
+    ``mem.set_global_halt``. New entries are blocked the same tick by the
+    global-halt gate; open risk is cut the same tick by an explicit flatten
+    when ``auto_flatten_on_global_halt`` is on (the bm11 flatten otherwise
+    fires next tick), so a flash-crash trip de-risks immediately.
+
+    Pure delegation + best-effort: all decision/side-effect logic lives in
+    ``market_circuit`` and never raises; this wrapper only supplies the loop's
+    funding reader, notifier and a same-tick flatten. Returns the verdict dict
+    (or None when the block is absent).
+    """
+    mc_cfg = cfg.get("market_circuit") if isinstance(cfg, dict) else None
+    if not isinstance(mc_cfg, dict):
+        return None
+    if str(mc_cfg.get("mode", "off") or "off").lower() == "off":
+        return None
+
+    def _notify(trigger, reasons, halt_min):
+        try:
+            from hermes_trader import notify
+            notify.send_card(
+                title="🚨 市场级极端行情熔断 — 全局停机已触发",
+                level="danger",
+                category="risk",
+                fields={
+                    "触发器": trigger,
+                    "停机时长(分)": f"{halt_min:.0f}",
+                    "详情": reasons[:400],
+                },
+                markdown="检测到市场级尾部风险（指数急跌/多币联动止损/资金费率极端），"
+                         "已进入全局停机并按配置全平。请立即人工核查行情与仓位，"
+                         "确认后再手动恢复。",
+                dedup_key=f"market_circuit:{trigger}",
+            )
+        except Exception as _ne:
+            logger.warning(f"[market_circuit] notify failed: {_ne}")
+
+    verdict = evaluator(
+        mc_cfg, mem=mem,
+        funding_fetcher=funding_fetcher,
+        notifier=_notify, event_log=event_log)
+
+    # Same-tick hard flatten on an enforce trip (bm11 would otherwise do it
+    # next tick). Mirrors the kill-switch guards: equity>0 so a degraded read
+    # can never trigger a flatten; idempotent (close re-fetches live state).
+    if (verdict and verdict.get("action") == "halt_armed"
+            and equity > 0 and positions
+            and bool(cfg_get("auto_flatten_on_global_halt", config=cfg))):
+        for _p in positions:
+            _coin = (_p.get("position") or {}).get("coin")
+            if not _coin:
+                continue
+            try:
+                _res = flattener(_coin)
+                logger.warning(f"[market_circuit] halt-flatten {_coin}: ok={_res.get('ok')}")
+            except Exception as _e:
+                logger.error(f"[market_circuit] halt-flatten failed for {_coin}: {_e}")
+    return verdict
 
 
 def af14_feed_decision(mids, stale_age, missing_mids,
@@ -1402,6 +1488,16 @@ while True:
             # Reset the checkpoint throttle: the cycle just did a full eval, so
             # the next intra-research checkpoint gets a fresh interval budget.
             _last_exit_checkpoint_ts = time.time()
+
+            # ── Roadmap §3: market-level extreme-conditions circuit breaker ──
+            # Runs after this tick's DSL stops have entered the cluster window,
+            # before scan/research/entry. Off by default (market_circuit.mode);
+            # shadow records would-trips, enforce arms the existing global halt
+            # and flattens same-tick. Fully best-effort — never breaks the loop.
+            try:
+                market_circuit_tick(_cfg, memory, equity, positions)
+            except Exception as _mc_e:
+                logger.error(f"[market_circuit] tick failed (non-fatal): {_mc_e}")
 
             # ── SHADOW paper-ledger mark-to-market ─────────────────────────
             # When the engine runs in mode=SHADOW, would-be fills are booked
