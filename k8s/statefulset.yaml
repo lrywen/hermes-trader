@@ -46,12 +46,23 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          # P1-3: split liveness vs readiness semantics.
+          #  * liveness  -> /api/health : process-level only; a failure RESTARTS
+          #    the pod, so it must never check the feed/loop (an HL API blip
+          #    would otherwise cause a restart cascade).
+          #  * readiness -> /api/ready  : dependency-level; it fuses the loop's
+          #    feed-heartbeat freshness and returns 503 when stale/dead, which
+          #    only pulls the pod out of service rotation — never restarts it.
           readinessProbe:
             httpGet:
-              path: /api/health
+              path: /api/ready
               port: http
-            initialDelaySeconds: 5
-            periodSeconds: 10
+            # The readiness endpoint itself enforces a ~300s boot grace during
+            # which a missing heartbeat is tolerated; keep the probe permissive
+            # early so a slow loop start doesn't flap the Service endpoint.
+            initialDelaySeconds: 10
+            periodSeconds: 15
+            failureThreshold: 20
           livenessProbe:
             httpGet:
               path: /api/health

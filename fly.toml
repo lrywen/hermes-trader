@@ -27,12 +27,17 @@ primary_region = "iad"  # change to a region near you
   min_machines_running = 1
   processes = ["web"]
 
+  # P1-3: readiness check — /api/ready fuses the loop feed-heartbeat freshness
+  # and returns 503 when stale/dead, so Fly stops routing traffic to a wedged
+  # instance (it does NOT restart it — restart decisions stay with the process
+  # supervisor). The endpoint enforces its own ~300s boot grace; keep the Fly
+  # grace aligned so a slow loop start never flaps the machine out.
   [[http_service.checks]]
-    grace_period = "30s"
+    grace_period = "300s"
     interval = "30s"
     method = "GET"
     timeout = "10s"
-    path = "/api/health"
+    path = "/api/ready"
 
 [[vm]]
   size = "shared-cpu-1x"

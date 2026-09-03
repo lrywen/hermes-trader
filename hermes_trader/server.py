@@ -1624,7 +1624,92 @@ async def cancel_order(request: Request) -> JSONResponse:
 
 @app.get("/api/health")
 async def health() -> dict[str, Any]:
+    """Liveness probe — process-level only.
+
+    Returns 200 whenever the web process can serve HTTP. Deliberately does NOT
+    check the trading loop, the Hyperliquid feed, or any other dependency: a
+    liveness failure restarts the pod, and a transient API blip must never
+    trigger a restart cascade. Dependency-level "should this receive traffic"
+    gating lives in /api/ready (readiness), which only pulls the pod out of
+    service rotation — it never restarts it.
+    """
     return {"service": "Hermes-Trader", "version": __version__, "status": "running"}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to `default` on missing/garbage input.
+    Boundary parsing only — never raises on operator misconfiguration."""
+    try:
+        return float(os.environ.get(name, "").strip() or default)
+    except (TypeError, ValueError):
+        return default
+
+
+# P1-3: readiness tuning. Readiness reflects "can this pod serve traffic right
+# now" — and for this singleton the key dependency is the autonomous loop's
+# market-feed heartbeat (a wedged loop or dead feed means the dashboard/API
+# would serve stale, misleading state). All knobs have safe defaults and are
+# overridable via env so an operator can relax gating during a known feed
+# outage without a code change. Read-only: the probe never trades or mutates.
+_READINESS_REQUIRE_LOOP = os.environ.get(
+    "HERMES_READINESS_REQUIRE_LOOP", "1").strip().lower() not in ("0", "false", "no", "off")
+# Grace period after process start during which a missing/stale heartbeat is
+# tolerated (the loop takes time to boot, fetch state, and emit its first
+# heartbeat). Default 300s mirrors the loop container's startup window.
+_READINESS_GRACE_S = _env_float("HERMES_READINESS_GRACE_S", 300.0)
+# A heartbeat older than this is "stale" (mirrors the dashboard's 180s window);
+# beyond a hard max the feed is considered dead and the pod is not ready.
+_READINESS_STALE_S = _env_float("HERMES_READINESS_STALE_S", 180.0)
+_READINESS_DEAD_S = _env_float("HERMES_READINESS_DEAD_S", 600.0)
+_PROCESS_START_TS = time.time()
+
+
+@app.get("/api/ready")
+async def ready() -> Response:
+    """Readiness probe — dependency-level, read-only.
+
+    Fuses the loop's feed heartbeat (via the dashboard's existing liveness
+    logic) into a traffic-routing signal. Returns 200 when the process is up
+    and (once the boot grace elapses) the loop heartbeat is fresh; 503 when
+    the feed is stale/dead so k8s/Fly pull the pod from rotation WITHOUT
+    restarting it. Degraded-by-design: any read failure yields a conservative
+    503 after grace (better to stop routing traffic than serve stale state),
+    but never raises.
+    """
+    checks: dict[str, Any] = {"web": "ok"}
+    ready = True
+
+    if _READINESS_REQUIRE_LOOP:
+        uptime_s = time.time() - _PROCESS_START_TS
+        try:
+            risk = dashboard._risk_status_payload()
+            feed_status = risk.get("feed_status", "offline")
+            feed_age_s = risk.get("feed_age_s")
+            checks["feed_status"] = feed_status
+            checks["feed_age_s"] = feed_age_s
+        except Exception:  # never 500 a probe on a read error
+            logger.warning("[ready] feed liveness read failed", exc_info=True)
+            feed_status, feed_age_s = "offline", None
+            checks["feed_status"] = "unknown"
+
+        # Boot grace: tolerate no/stale heartbeat while the loop is starting.
+        if uptime_s < _READINESS_GRACE_S:
+            checks["loop"] = "warming"
+        elif feed_status == "live" and (feed_age_s is None or feed_age_s <= _READINESS_STALE_S):
+            checks["loop"] = "ok"
+        elif feed_status != "dead" and feed_age_s is not None and feed_age_s <= _READINESS_DEAD_S:
+            # Stale but within the hard dead window: still serve (the loop may
+            # be in a slow research pass), but flag it for operators.
+            checks["loop"] = "stale"
+        else:
+            checks["loop"] = "unavailable"
+            ready = False
+
+    body = {"service": "Hermes-Trader", "version": __version__,
+            "ready": ready, "checks": checks}
+    if not ready:
+        return JSONResponse(status_code=503, content=body)
+    return JSONResponse(status_code=200, content=body)
 
 
 @app.get("/metrics", dependencies=[Depends(require_operator_or_internal)])
