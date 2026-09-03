@@ -1462,6 +1462,38 @@ def test_track_daily_pnl_subtracts_contributions():
     assert m.get_daily_pnl() == 20.0  # 270 - 200 - 50
 
 
+def test_track_daily_pnl_day_roll_rebases_with_todays_contributions():
+    """Regression (supplemental audit 2026-09-02): on the FIRST tick after a UTC
+    midnight roll the baseline must re-seed using ONLY today's contributions.
+
+    The phantom-$30-loss bug: a perp->spot transfer made YESTERDAY (yesterday's
+    net_contributions=-30) was re-queried over a stale day_start window on the
+    first tick today, seeding startOfDayEquity = equity - (-30) = equity+30,
+    after which every tick read daily_pnl = equity - (equity+30) - 0 = -30 —
+    falsely tripping the hard daily-loss kill switch. With the heartbeat fixed
+    to query contributions from TODAY's boundary, a pre-SOD transfer returns 0
+    today, so the roll re-baselines at the true equity and daily_pnl reads 0."""
+    from hermes_trader.agents.memory import AgentMemory
+    from datetime import datetime, timezone
+
+    today_utc = int(datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    m = AgentMemory()
+    # Yesterday's already-baseline book: $50.9 equity at yesterday's start.
+    m._start_of_day_equity = 50.9
+    m._day_start_ts = today_utc - 86400  # yesterday → day-roll triggers
+    # Overnight a perp->spot $30 transfer happened; equity now 20.9. Today's
+    # contribution window (post-fix) correctly excludes yesterday's move → 0.
+    m.track_daily_pnl(current_equity=20.9, net_contributions=0.0)
+    # Baseline reseeds at true equity; no phantom loss carried over.
+    assert m._start_of_day_equity == 20.9
+    assert m.get_daily_pnl() == 0.0
+    # A later tick today with equity flat and no transfers still reads ~0,
+    # proving the ghost -$30 never re-appears.
+    m.track_daily_pnl(current_equity=20.9, net_contributions=0.0)
+    assert m.get_daily_pnl() == 0.0
+
+
 # ── enable_crypto / enable_hip3 asset-class toggles ──────────────────────
 def _scan_with_config(monkeypatch, cfg):
     """Scaffolding: run perception.scan_once with a fake universe + config,

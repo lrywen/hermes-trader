@@ -453,6 +453,7 @@ def _risk_status_payload() -> dict[str, Any]:
         "global_halt_remaining_min": 0.0,
         "coin_circuits": {},
         "armed_coins": 0,
+        "drawdown": None,
         "mode": None,
         "daily_pnl": None,
         "daily_loss_limit": None,
@@ -471,6 +472,9 @@ def _risk_status_payload() -> dict[str, Any]:
         out["global_halt_remaining_min"] = snap.get("global_halt_remaining_min", 0.0)
         out["coin_circuits"] = snap.get("coin_circuits", {})
         out["armed_coins"] = int(snap.get("armed_coins", 0) or 0)
+        # Drawdown freeze state (frozen flag, dd%, peak/equity, freeze duration
+        # and cooldown remaining) — the frontend surfaces a freeze banner from it.
+        out["drawdown"] = snap.get("drawdown")
     except Exception:  # card stays readable even if memory is corrupt
         logger.warning("[risk-status] memory breaker read failed; serving quiet breakers",
                        exc_info=True)
@@ -2381,11 +2385,13 @@ async def _terminal_llm_chat(cmd: str) -> JSONResponse:
             f"LIVE STATE: {json.dumps(ctx, default=str)}"
         )
         # Model is env-overridable so the operator can swap without a
-        # code change. Default is xAI Grok 4.3 — fast, strong on
-        # numeric/financial reasoning, and the operator picked it.
-        # Override with HERMES_CHAT_MODEL=<openrouter-slug> in .env.local.
-        # Catalog: https://openrouter.ai/models
-        chat_model = os.environ.get("HERMES_CHAT_MODEL", "x-ai/grok-4.3")
+        # code change. Override with HERMES_CHAT_MODEL=<model-id> in
+        # .env.local. The endpoint follows OPENROUTER_BASE_URL so the chat
+        # path works against any OpenAI-compatible gateway (OpenRouter,
+        # Volcengine Ark, or a local LiteLLM proxy); it defaults to the
+        # same model as the research path when HERMES_CHAT_MODEL is unset.
+        chat_model = os.environ.get("HERMES_CHAT_MODEL") or os.environ.get("OPENROUTER_MODEL", "ark-code")
+        chat_base = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1").rstrip("/")
         # F15: fast-fail while the circuit breaker is open instead of
         # stacking requests onto a dead upstream.
         if _llm_circuit_open():
@@ -2394,7 +2400,7 @@ async def _terminal_llm_chat(cmd: str) -> JSONResponse:
                                  "kind": "error"})
         try:
             r = await _llm_client().post(
-                "https://openrouter.ai/api/v1/chat/completions",
+                f"{chat_base}/chat/completions",
                 headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
                 json={
                     "model": chat_model,
@@ -2402,7 +2408,11 @@ async def _terminal_llm_chat(cmd: str) -> JSONResponse:
                         {"role": "system", "content": system_msg},
                         {"role": "user", "content": cmd},
                     ],
-                    "max_tokens": 240,
+                    # glm-5.3-flash (ark-code) spends reasoning tokens from the
+                    # completion budget; 240 could leave the answer empty after
+                    # reasoning. 400 leaves room for reasoning + the 2-4 sentence
+                    # operator reply.
+                    "max_tokens": 400,
                     "temperature": 0.6,
                 },
             )
@@ -2440,8 +2450,13 @@ def register_routes(app: FastAPI) -> None:
     from hermes_trader.dashboard_routes.config import register_config_routes
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
+    from hermes_trader.dashboard_routes.shadow import register_shadow_routes
 
     register_config_routes(app)
     register_operator_routes(app)
+    # SHADOW paper-ledger: read endpoints are anonymous-safe; writes are
+    # operator-gated. Must register before public so the SPA catch-all does not
+    # shadow /api/dashboard/shadow/*.
+    register_shadow_routes(app)
     register_public_routes(app)
 

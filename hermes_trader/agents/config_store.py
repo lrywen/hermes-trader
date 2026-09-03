@@ -843,6 +843,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "backoff_base_sec": 1.0,
         "backoff_cap_sec": 15.0,
         "continuations": 2,
+        # Audit 2026-09-03 P0-2: hard per-call cap for the single-LLM
+        # fallback path (debate failed -> _call_ai). 0 disables the cap
+        # (legacy 60s inheritance). Mirrors research.py literal verbatim.
+        "fallback_timeout_sec": 30.0,
     },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
@@ -946,6 +950,30 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "taker_fee_pct": 0.025,
         # Number of taker fills modeled per round trip (entry + exit = 2).
         "round_trip_fills": 2,
+    },
+    # SHADOW-mode paper-trading ledger (shadow_book.py). When mode=SHADOW and a
+    # decision passes EVERY risk gate, instead of only returning
+    # "shadow_mode_would_execute" the engine books a VIRTUAL fill into an
+    # isolated paper account, marks it to live mids each loop, runs the SAME
+    # DSL exit policy the live engine uses, and books a virtual close +
+    # realized PnL when a stop / target / timeout fires. Nothing here touches
+    # the real exchange, real orders, or the real .agent-memory ledger — it is
+    # a decision-rehearsal book that lets the dashboard show what the strategy
+    # WOULD have done with a configurable virtual bankroll.
+    "shadow_book": {
+        # Book virtual fills while in SHADOW mode. When false the engine keeps
+        # the old "log-only" shadow behaviour (no paper positions).
+        "enabled": True,
+        # Virtual USDC the paper account starts with (operator-configurable).
+        "starting_balance": 10000.0,
+        # Per-fill taker fee in PERCENT, modeled on close across the round trip
+        # (mirrors execution.taker_fee_pct; HL = 0.025% per fill).
+        "taker_fee_pct": 0.025,
+        # Number of fills per round trip (entry + exit = 2).
+        "round_trip_fills": 2,
+        # Cap on concurrent virtual positions (defensive; live max_concurrent
+        # already gates entries, this bounds the paper book).
+        "max_positions": 10,
     },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the

@@ -83,21 +83,51 @@ So at `equity_fraction_per_trade: 0.10`, a 0.90-confidence trade sizes at an eff
 ## Risk safety
 
 ### `max_daily_loss_usd` (negative number, default `-30`)
-Daily-loss killswitch. When `daily_pnl <= this`, ALL new trades blocked until UTC midnight reset.
+Hard daily-loss killswitch. When MTM `daily_pnl <= this`, ALL new trades blocked until UTC midnight reset.
 
-| Account size | Recommended |
-|---|---|
-| < $500 | -25 to -50 (10-20% of equity) |
-| $500–$2000 | -100 to -200 |
-| $2000+ | -500+ |
+**This is an ABSOLUTE-USD outer envelope, not the primary daily stop — calibrate it to equity.**
+It sits outside the equity-percentage timed halt `circuit_breaker.daily_loss_pct` (default 8% of
+start-of-day equity → 120 min global halt). The percentage halt fires FIRST and gives the book a
+cooldown; the USD kill only stays latched to UTC if the day keeps bleeding after re-arm. Keep the
+USD number at **≈ -10% of current equity**, i.e. deliberately LOOSER than the 8% inner halt so the
+timed circuit can trip first. A fixed USD value silently miscalibrates as equity moves (measured
+2026-09-03, `daily_pnl` is mark-to-market incl. unrealized float):
 
-Too loose = catastrophic days possible. Too tight = locks you out on a normal variance day.
+| Equity | `daily_loss_pct` 8% halts at (inner, timed) | `max_daily_loss_usd` (outer, to UTC) |
+|---|---|---|
+| $25 | -$2.00 | -2.5 |
+| $50 | -$4.00 | -5 |
+| $100 | -$8.00 | -10 |
+| $250 | -$20.00 | -25 |
+| $500 | -$40.00 | -50 |
+| $1000 | -$80.00 | -100 |
+| $2000 | -$160.00 | -200 |
+
+Holding `-2` constant: at $20.9 equity it is 9.6% (correctly the outer layer); at $1000 it is 0.2%
+(any normal variance day hard-locks to UTC); at $10 it is 20% (too loose). Too loose = catastrophic
+days possible; too tight = locks you out on a normal variance day.
+
+> Do NOT set it tighter than 8% of equity — that makes the timed halt dead code and hard-freezes
+> every losing day to UTC. Size-invariant backstops (`consecutive_loss_limit=3`,
+> `coin_daily_loss_pct=5`, `max_drawdown_pct=15`) need NO equity scaling.
 
 ### `daily_giveback_halt_pct` (float 0-1, default `0` = off)
 **Daily give-back breaker** (2026-06-06). Once the day's PnL has peaked at `>= daily_giveback_min_peak_usd`, block NEW entries if it then retraces more than this fraction from that peak. Existing positions keep riding their own stops; resets at the UTC roll. Locks in green days so a won day can't fully round-trip (e.g. `0.35` = halt after giving back 35% from peak). Measures TRUE account PnL (aggregate equity, not main-dex-only). `0` disables.
 
 ### `daily_giveback_min_peak_usd` (float, default `20`)
-Arm threshold for the give-back breaker — it stays disarmed until the day's peak PnL reaches this, so a tiny `+$2` peak can't trip a halt. Scale to account size.
+Arm threshold for the give-back breaker — it stays disarmed until the day's **realized** (closed-trade) peak PnL reaches this, so a tiny `+$2` peak can't trip a halt. This is an ABSOLUTE-USD size-sensitive gate: set it at **≈ 5% of current equity** so it only arms on a genuinely good day.
+
+| Equity | `daily_giveback_min_peak_usd` (5% of equity) |
+|---|---|
+| $25 | 1.25 |
+| $50 | 2.5 |
+| $100 | 5.0 |
+| $250 | 12.5 |
+| $500 | 25.0 (matches old default) |
+| $1000 | 50.0 |
+| $2000 | 100.0 |
+
+Holding `1.2` constant (measured 2026-09-03 at $20.9 equity → 5.74%): at $1000 it is 0.12% — arms on a single scratch win and blocks every fresh entry until UTC; at $10 it is 12% — a thin micro-book essentially never arms, so no green-day protection. `daily_giveback_halt_pct` itself is equity-fractional and needs no scaling; at 0.55 the current config locks ~45% of peak realized PnL.
 
 ### `cooldown_min` (int, default `30`)
 Minimum minutes between trades on the same coin. Prevents over-trading a single market. 30-60 reasonable for active strategies; 120+ for slower. Also skips the paid AI research call for a non-held coin still inside this window (a re-entry would be gate-blocked anyway).
@@ -250,6 +280,35 @@ Gated experiments (see commit history). `momentum_reentry` backtested net-negati
 ### Structural-override gates (LONG-only — upgrade an AI PASS on strong TA/whale)
 `force_execute_composite` (bar), `composite_force_execute` (forcing AI-rejects = adverse selection → OFF), `breakout_force_execute`, `whale_force_execute`, `force_execute_slow_burn_count`.
 
+### Pre-LIVE equity calibration checklist
+The three ABSOLUTE-USD knobs do NOT auto-scale with the account and must be re-set from funded
+equity at the SHADOW→LIVE flip (and re-checked whenever equity drifts). The percentage gates do
+NOT need calibration. Audit 2026-09-03.
+
+**Re-calibrate (formula-driven, plug in funded equity `E`):**
+1. `max_daily_loss_usd` ≈ `-0.10 × E` — outer hard kill, keep looser than the 8% inner timed halt.
+2. `daily_giveback_min_peak_usd` ≈ `0.05 × E` — arm the give-back lock only on a ≥5% green day.
+3. `max_trade_notional_usd` — absolute per-trade notional cap; at `$30` on a thin book it binds
+   before sizing, at a large account it can let one trade exceed the intended fraction. Set so the
+   cap is ≥ `equity_fraction_per_trade × leverage × E` (i.e. it stops overriding sizing) but still
+   a sane hard ceiling.
+
+**Do NOT touch (already equity-fractional / size-invariant):**
+- `circuit_breaker.daily_loss_pct` (8% SOD equity → timed global halt; primary daily stop),
+  `coin_daily_loss_pct` (5%), `single_coin_loss_pct` (3%), `max_drawdown_pct` (15% rolling peak),
+  `consecutive_loss_limit` (3), `daily_giveback_halt_pct` (fraction), `max_total_notional_pct`,
+  `equity_fraction_per_trade`.
+
+**Re-calibration triggers:** any deposit/withdrawal, equity moving ±25% from the last calibration,
+or a preset-tier change. Note `scripts/config_preset.py` account-size presets (`small_*`, etc.)
+predate this PnL audit and are blocked by default (`--allow-legacy-risk-preset` required) — they
+hard-code `-25/-150/-500` USD gates for $100-2000+ books and are NOT pre-scaled for a micro-book
+or LIVE use.
+
+Reference layering for daily loss (loose → tight, independent, defense-in-depth):
+`consecutive_loss=3` (streak) → per-coin 5% → **timed global halt 8% SOD equity (120 min)** →
+**hard USD kill ≈10% equity (to UTC)** → rolling drawdown 15% → `roe_halt` single-trade nuke.
+
 ---
 
 ## What to actually tune day-to-day
@@ -257,7 +316,9 @@ Gated experiments (see commit history). `momentum_reentry` backtested net-negati
 Most of these knobs you set once and leave. The three you'd realistically touch:
 
 1. **`mode`**: flip to `OFF` when you want the bot to stop trading (it keeps scanning, just doesn't execute)
-2. **`max_daily_loss_usd`**: drop if you want a tighter circuit breaker for the day
+2. **`max_daily_loss_usd`**: drop if you want a tighter circuit breaker for the day — it is an
+   ABSOLUTE-USD value; see the **Pre-LIVE equity calibration checklist** above for scaling it to the
+   account (≈ -10% of equity, looser than the 8% timed halt).
 3. **`min_ai_confidence`**: raise to filter trades when the AI is being too loose; lower to accept more
 
 Everything else is structural — change it deliberately, not reactively.

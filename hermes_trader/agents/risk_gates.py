@@ -49,6 +49,13 @@ class GateContext:
     whale_signal_fired: bool = False
     binary_news_match: str = ""
     peak_daily_pnl: float = 0.0
+    # (supplemental audit 2026-09-02) Today's REALIZED (locked-in, closed-trade)
+    # PnL and its intraday high-water mark — exclude unrealized float so the
+    # give-back gate arms only on profit actually banked. Default 0.0 keeps
+    # callers that lack the ledger (manual path before its fix) fail-closed: no
+    # realized peak => the give-back gate simply does not arm.
+    daily_realized_pnl: float = 0.0
+    peak_daily_realized_pnl: float = 0.0
     # H4 (deep audit 2026-08-29): liquidation-price pre-check inputs. Zero
     # values mean "not applicable" (manual-order path / caller without the
     # data) and liquidation_buffer_gate passes open. entry_px is the planned
@@ -74,6 +81,9 @@ class GateContext:
         self.trade_notional_usd = _num(self.trade_notional_usd)
         self.daily_pnl = _num(self.daily_pnl)
         self.peak_daily_pnl = _num(self.peak_daily_pnl)
+        # (supplemental audit 2026-09-02) coerce the realized-PnL inputs.
+        self.daily_realized_pnl = _num(self.daily_realized_pnl)
+        self.peak_daily_realized_pnl = _num(self.peak_daily_realized_pnl)
         self.market_volume_24h_usd = _num(self.market_volume_24h_usd)
         self.equity = _num(self.equity)
         self.total_open_notional = _num(self.total_open_notional)
@@ -135,19 +145,36 @@ def daily_loss_kill_switch(ctx: GateContext, max_daily_loss: float) -> GateResul
 
 
 def daily_giveback_gate(ctx: GateContext, halt_pct: float, min_peak_usd: float) -> GateResult:
-    """Lock in a green day: once daily PnL has peaked at >= `min_peak_usd`, block
-    NEW positions if it then retraces more than `halt_pct` from that peak. Existing
-    positions keep riding their own stops; this only stops opening fresh risk so a
-    won day can't fully round-trip. Disabled when halt_pct<=0. Resets at the UTC
-    day roll (peak_daily_pnl resets in memory.track_daily_pnl)."""
-    if halt_pct <= 0 or ctx.peak_daily_pnl < min_peak_usd:
+    """Lock in a green day: once REALIZED daily PnL has peaked at >=
+    `min_peak_usd`, block NEW positions if it then retraces more than
+    `halt_pct` from that peak. Existing positions keep riding their own stops;
+    this only stops opening fresh risk so a won day can't fully round-trip.
+    Disabled when halt_pct<=0. Resets at the UTC day roll.
+
+    (supplemental audit 2026-09-02) Arming and retracement are measured off
+    REALIZED (locked-in closed-trade) PnL — `peak_daily_realized_pnl` /
+    `daily_realized_pnl` — NOT the mark-to-market `peak_daily_pnl` /
+    `daily_pnl`, which include unrealized float. The old MTM peak latched the
+    gate the moment an open position's paper PnL spiked past `min_peak_usd`;
+    when that float later evaporated (price mean-reverted or the trade closed
+    near breakeven) the gate read it as a >halt_pct give-back and blocked every
+    fresh entry until the UTC roll — even though no profit had ever been banked
+    to give back. Realized PnL only rises on an actual close, so the gate now
+    arms exclusively on profit truly taken. Callers that don't supply realized
+    values pass 0.0, which never arms (fail-closed: no locked-in profit => no
+    give-back to protect, and no false block)."""
+    if halt_pct <= 0:
         return {"pass": True}
-    floor = ctx.peak_daily_pnl * (1.0 - halt_pct)
-    if ctx.daily_pnl <= floor:
+    peak_realized = ctx.peak_daily_realized_pnl
+    realized = ctx.daily_realized_pnl
+    if peak_realized < min_peak_usd:
+        return {"pass": True}
+    floor = peak_realized * (1.0 - halt_pct)
+    if realized <= floor:
         return {"pass": False,
-                "reason": (f"daily give-back halt: PnL ${ctx.daily_pnl:.0f} retraced "
-                           f">{halt_pct*100:.0f}% from peak ${ctx.peak_daily_pnl:.0f} "
-                           f"(floor ${floor:.0f}) — no new entries until UTC roll")}
+                "reason": (f"daily give-back halt: realized PnL ${realized:.2f} retraced "
+                           f">{halt_pct*100:.0f}% from realized peak ${peak_realized:.2f} "
+                           f"(floor ${floor:.2f}) — no new entries until UTC roll")}
     return {"pass": True}
 
 
@@ -305,31 +332,85 @@ def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResul
 
 
 def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
-    """B-F7: block ALL new entries when account equity has fallen more than
-    `max_drawdown_pct` (%) from its all-time high-water mark.
+    """B-F7 (fixed 2026-09-03): block ALL new entries when account equity has
+    fallen more than `max_drawdown_pct` (%) below its high-water mark.
 
-    The USD daily-loss kill-switch (daily_loss_kill_switch) and the daily
-    circuit halt only see the CURRENT day: a slow multi-day grind — losing
-    $10/day for two weeks from a $200 peak — trips no single-day limit while
-    the account bleeds out. This gate measures peak-to-current equity instead.
-    The peak is tracked in memory.track_daily_pnl (post implausible-read
-    filter) and persisted (peakEquity). Disabled when max_drawdown_pct <= 0 or
-    no reference peak exists yet (fail open on missing reference; once a peak
-    is recorded the gate fails closed). Read failure fails open.
+    Recovery fix — the gate originally measured against the ALL-TIME peak,
+    which only ever rises. After a permanent equity drop (realized loss,
+    withdrawal, balance rebase) the drawdown stayed above threshold forever
+    with NO recovery path: observed peak $50.9 vs equity $20.9 (−58.9%) latched
+    the gate from 2026-09-01 04:19 onward, blocking 100% of entries (111
+    consecutive blocks). The gate now:
+
+      * measures against a ROLLING peak over ``drawdown_peak_window_days``
+        (default 14d) instead of the all-time high — old peaks age out, so a
+        permanently lower balance stops looking like a fresh drawdown;
+      * RE-BASELINES after ``drawdown_cooldown_hours`` (default 24h) of a
+        continuous freeze — entries resume once even if the rolling window
+        hasn't aged the peak out yet (bounded recovery, no permanent lock);
+      * on the FIRST gate evaluation after the upgrade (empty equity trail —
+        legacy memory), an over-threshold drawdown is re-baselined once
+        immediately, releasing the pre-existing latched deadlock.
+
+    Disabled when max_drawdown_pct <= 0 or no reference peak exists yet (fail
+    open on missing reference; fail closed once a real peak exists). Read
+    failure fails open.
     """
     if max_drawdown_pct <= 0:
         return {"pass": True}
     try:
         from hermes_trader.agents.memory import memory
-        peak = float(memory.peak_equity() or 0.0)
-        if peak <= 0 or ctx.equity <= 0:
-            return {"pass": True}  # no reference peak / no live equity yet
-        dd_pct = (peak - ctx.equity) / peak * 100.0
+        window_days = float(cfg_get(
+            "circuit_breaker.drawdown_peak_window_days", 14.0) or 0.0)
+        cooldown_hours = float(cfg_get(
+            "circuit_breaker.drawdown_cooldown_hours", 24.0) or 0.0)
+        equity = ctx.equity
+        if equity <= 0:
+            return {"pass": True}
+        # Legacy-memory one-shot: no rolling trail yet (pre-upgrade store).
+        # If the OLD all-time peak is already latched beyond threshold,
+        # re-baseline to current equity once so the deadlock lifts immediately
+        # on deploy instead of waiting a full cooldown / window.
+        legacy_peak = memory.peak_equity()
+        trail_len = len(memory._equity_trail)  # noqa: SLF001 (same package; read-only)
+        if trail_len == 0 and legacy_peak > 0:
+            legacy_dd = (legacy_peak - equity) / legacy_peak * 100.0
+            if legacy_dd >= max_drawdown_pct:
+                # rebase_drawdown_peak() clears and re-seeds the rolling trail
+                # at the new baseline, so the subsequent
+                # rolling_peak_equity() reads the rebased peak instead of the
+                # latched all-time high.
+                memory.rebase_drawdown_peak(
+                    equity,
+                    reason=(f"legacy all-time peak ${legacy_peak:.2f} latched "
+                            f"({legacy_dd:.1f}% drawdown) — one-shot rebase on "
+                            f"upgraded rolling-peak gate"))
+        peak = float(memory.rolling_peak_equity(window_days) or 0.0)
+        if peak <= 0:
+            return {"pass": True}  # no reference peak yet
+        dd_pct = (peak - equity) / peak * 100.0
         if dd_pct >= max_drawdown_pct:
+            since_ms = memory.mark_drawdown_frozen()
+            frozen_min = max(0.0, (int(time.time() * 1000) - since_ms) / 60_000)
+            # Cooldown recovery: a continuous freeze lasting cooldown_hours
+            # re-baselines the peak to current equity and lets entries resume.
+            if cooldown_hours > 0 and frozen_min >= cooldown_hours * 60.0:
+                memory.rebase_drawdown_peak(
+                    equity,
+                    reason=(f"drawdown freeze held for {frozen_min / 60:.1f}h "
+                            f">= cooldown {cooldown_hours:.0f}h"))
+                logger.warning(
+                    "[risk] drawdown gate cooldown recovery after %.1fh freeze "
+                    "— entries re-armed at equity $%.2f", frozen_min / 60.0, equity)
+                return {"pass": True}
+            remain_min = max(0.0, cooldown_hours * 60.0 - frozen_min)
             return {"pass": False,
-                    "reason": f"account drawdown halt: equity ${ctx.equity:.0f} is "
-                              f"{dd_pct:.1f}% below peak ${peak:.0f} "
-                              f"(>= {max_drawdown_pct:.1f}%) — no new entries"}
+                    "reason": f"account drawdown halt: equity ${equity:.0f} is "
+                              f"{dd_pct:.1f}% below {window_days:.0f}d peak ${peak:.0f} "
+                              f"(>= {max_drawdown_pct:.1f}%) — new entries frozen "
+                              f"for {frozen_min / 60:.1f}h (re-arm in {remain_min / 60:.1f}h)"}
+        # Below threshold: ensure a stale freeze episode clears on recovery.
+        memory.clear_drawdown_freeze()
     except Exception as e:  # noqa: BLE001
         logger.debug(f"[risk] drawdown gate state read failed: {e}")
     return {"pass": True}

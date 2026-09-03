@@ -650,9 +650,10 @@ _ws_status_fresh_s = float(os.environ.get('HERMES_WS_STATUS_FRESH_S', '10'))
 # concurrently on a bounded pool. ONLY the read-only research() is parallelised:
 # all gating (held/cooldown/throttle/TA/dedup), verdict routing and order
 # placement stay on the main thread in trigger order, so execution semantics
-# (account state, position gates, session log) are unchanged. Off by default
-# → the original serial loop.
-_research_parallel_on = os.environ.get('HERMES_RESEARCH_PARALLEL', '0').lower() in ('1', 'true', 'yes', 'on')
+# (account state, position gates, session log) are unchanged. Default ON
+# (audit 2026-09-03 P1-4): matches the production deployment; set
+# HERMES_RESEARCH_PARALLEL=0 to fall back to the original serial loop.
+_research_parallel_on = os.environ.get('HERMES_RESEARCH_PARALLEL', '1').lower() in ('1', 'true', 'yes', 'on')
 _research_parallel_workers = int(os.environ.get('HERMES_RESEARCH_PARALLEL_WORKERS', '4'))
 
 if _scan_dynamic_on or _ws_fill_wake_on or _ws_status_event_on:
@@ -959,7 +960,21 @@ def _sync_account_state():
 
     # Subtract net USDC contributions so transfers/deposits don't show
     # up as trading PnL in the equity-diff calculation.
-    sod_ts_ms = memory.get_day_start_ts() * 1000
+    # (supplemental audit 2026-09-02) Use the CURRENT UTC day boundary, not the
+    # memory's stored day_start_ts: on the FIRST tick after a UTC midnight roll
+    # memory.get_day_start_ts() still returns YESTERDAY's epoch (track_daily_pnl
+    # below is what re-baselines it forward). Querying contributions over that
+    # stale window double-counts yesterday's perp->spot transfer: e.g. a $30
+    # transfer made yesterday re-appears as net_contributions=-30 on today's
+    # first tick, seeding SOD baseline = equity - (-30) = equity+30, after which
+    # every tick reads daily_pnl = equity - (equity+30) - 0 = -30 — a phantom
+    # $30 daily loss that false-trips the hard kill switch. Anchoring the lookup
+    # to today's boundary makes a pre-SOD transfer return 0.0 contributions so
+    # the baseline seeds at the true current equity.
+    from datetime import datetime, timezone
+    _today_utc = int(datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    sod_ts_ms = _today_utc * 1000
     contributions = 0.0
     if sod_ts_ms > 0:
         try:
@@ -1350,6 +1365,53 @@ while True:
             # the next intra-research checkpoint gets a fresh interval budget.
             _last_exit_checkpoint_ts = time.time()
 
+            # ── SHADOW paper-ledger mark-to-market ─────────────────────────
+            # When the engine runs in mode=SHADOW, would-be fills are booked
+            # into the isolated shadow_book (see executor maybe_execute). Mark
+            # those paper positions to the SAME live mids each cycle and run
+            # them through the SAME DSL exit engine; a fired stop books a
+            # virtual close with realized paper PnL. Skipped on a stale feed
+            # for the same reason real DSL exits are (no closing on a dead
+            # mid). Fully best-effort — never raises into the loop.
+            try:
+                if not _stale_skip_exits:
+                    from hermes_trader.agents import shadow_book
+                    _sh_idx: dict = {}
+                    try:
+                        from hermes_trader.agents.dsl_exit import get_index_prices
+                        _sh_acct = shadow_book.get_account()
+                        _sh_coins = {p.get("coin") for p in _sh_acct.get("positions", []) if p.get("coin")}
+                        if _sh_coins:
+                            _sh_idx = get_index_prices(_sh_coins)
+                    except Exception:
+                        _sh_idx = {}
+                    _sh_closes = shadow_book.mark_to_market(mids, _sh_idx or None)
+                    for _cf in _sh_closes:
+                        logger.info(
+                            f"[shadow_book] paper CLOSE {_cf.get('coin')} "
+                            f"{_cf.get('side')} reason={_cf.get('reason')} "
+                            f"roe={_cf.get('realized_pnl_pct', 0):+.2f}% "
+                            f"pnl=${_cf.get('realized_pnl_usd', 0):+.2f} "
+                            f"fee=${_cf.get('fee_usd', 0):.3f}")
+                        log_event({
+                            "event": "shadow_exit",
+                            "coin": _cf.get("coin"),
+                            "side": _cf.get("side"),
+                            "leverage": _cf.get("leverage"),
+                            "reason": _cf.get("reason"),
+                            "entry_px": _cf.get("entry_px"),
+                            "fill_px": _cf.get("price"),
+                            "spot_pct": _cf.get("spot_pct"),
+                            "realized_pnl_pct": _cf.get("realized_pnl_pct"),
+                            "realized_pnl_usd": _cf.get("realized_pnl_usd"),
+                            "fee_usd": _cf.get("fee_usd"),
+                            "hold_min": _cf.get("hold_minutes"),
+                            "mfe_spot_pct": _cf.get("mfe_pct"),
+                            "paper": True,
+                        })
+            except Exception as _sh_e:
+                logger.warning(f"[shadow_book] mark-to-market failed (non-fatal): {_sh_e}")
+
             # ── Dynamic exchange-SL coordination ──────────────────────────
             # After processing DSL exits, pull each Phase-2 position's static
             # exchange backup SL up behind the ratcheted DSL floor (throttled,
@@ -1436,6 +1498,15 @@ while True:
 
         logger.info("Scanning markets...")
         _beat("scan_start")
+        # (supplemental audit 2026-09-02) Record the scan START wall-clock here.
+        # session_log.append() stamps `ts` at record time, i.e. when scan_once
+        # RETURNS — so for a cold scan that blocks minutes (or a cycle that
+        # backs off under AI/rate-limit throttling) the event's `ts` reflects
+        # completion, not when the sweep actually began. Emitting start_ts_ms +
+        # scan_duration_ms lets the portal place the scan at its true start and
+        # show how long the sweep took instead of inferring it from the gap to
+        # the next event.
+        _scan_started_ms = int(time.time() * 1000)
         # Cold scan sweeps hundreds of markets in batches and blocks this thread
         # for minutes. The batch-complete hook re-runs the lightweight exit
         # checkpoint between batches so the blind window during a cold scan is
@@ -1445,12 +1516,15 @@ while True:
             on_batch_complete=lambda _done, _total: _exit_checkpoint(
                 mids, tag="cold-scan"),
         )
+        _scan_done_ms = int(time.time() * 1000)
         _beat("scan_done")
         logger.info(f"Scan found {len(results)} triggers")
         # Per-cycle heartbeat — proof of life even when nothing triggers.
         # `coin_scores` carries the composite score for each trigger so the
         # feed can show *why* a coin was picked, not just that it was.
         log_event({"event": "scan", "triggers": len(results),
+                   "start_ts_ms": _scan_started_ms,
+                   "scan_duration_ms": max(0, _scan_done_ms - _scan_started_ms),
                    "coins": [p['coin'] for p in results],
                    "coin_scores": [{"coin": p['coin'],
                                     "score": round(p.get('composite_score', 0), 1),

@@ -187,6 +187,10 @@ class _ConfigPatch(BaseModel):
     # number of taker fills modeled per round trip. Defaults mirror the
     # existing module literals (0.025 / 2) verbatim.
     execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("execution"))
+    # SHADOW-mode paper-trading ledger (shadow_book.py). Nested dict — leaf
+    # values (enabled / starting_balance / taker_fee_pct / round_trip_fills /
+    # max_positions) are read via cfg_get with canonical defaults.
+    shadow_book: dict[str, Any] = Field(default_factory=lambda: _dict_default("shadow_book"))
     # R13-B7: free-signal-suite blocks — CBOE GEX cache/timeout, FINRA
     # short-volume thresholds, Binance whale-flow window/thresholds, GDELT
     # news-catalyst surge/timeout, and the HL whale-index OI/funding knobs.

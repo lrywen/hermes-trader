@@ -62,7 +62,7 @@ FETCH_BLOCK = "research_fetch"
 LLM_LEAVES = (
     "model", "base_url", "temperature", "max_tokens", "debate_max_tokens",
     "timeout_sec", "connect_timeout_sec", "retries", "backoff_base_sec",
-    "backoff_cap_sec", "continuations",
+    "backoff_cap_sec", "continuations", "fallback_timeout_sec",
 )
 FETCH_LEAVES = (
     "pool_workers", "max_connections", "max_keepalive_connections",
@@ -96,7 +96,7 @@ def _clear_research_env(monkeypatch):
 def test_r13_b10_research_llm_block_registered():
     assert LLM_BLOCK in CANONICAL_DEFAULTS
     assert isinstance(CANONICAL_DEFAULTS[LLM_BLOCK], dict)
-    assert len(CANONICAL_DEFAULTS[LLM_BLOCK]) == 11
+    assert len(CANONICAL_DEFAULTS[LLM_BLOCK]) == 12  # Audit 2026-09-03 P0-2: +fallback_timeout_sec
     assert set(CANONICAL_DEFAULTS[LLM_BLOCK]) == set(LLM_LEAVES)
 
 
@@ -123,7 +123,7 @@ def test_r13_b10_canonical_fetch_defaults_mirror_research_literals():
 
 
 def test_r13_b10_individual_llm_leaf_values_sentinel():
-    """逐叶 sentinel：锁死 11 个 LLM 默认值（零行为变化基线）。"""
+    """逐叶 sentinel：锁死 12 个 LLM 默认值（零行为变化基线）。"""
     b = CANONICAL_DEFAULTS[LLM_BLOCK]
     assert b["model"] == "deepseek-v4-flash"
     assert b["base_url"] == "https://openrouter.ai/api/v1"
@@ -136,6 +136,8 @@ def test_r13_b10_individual_llm_leaf_values_sentinel():
     assert b["backoff_base_sec"] == 1.0
     assert b["backoff_cap_sec"] == 15.0
     assert b["continuations"] == 2
+    # Audit 2026-09-03 P0-2: fallback path per-call cap; 0 disables.
+    assert b["fallback_timeout_sec"] == 30.0
 
 
 def test_r13_b10_individual_fetch_leaf_values_sentinel():
@@ -159,7 +161,7 @@ def test_r13_b10_leaf_types_match_literals():
     for leaf in ("max_tokens", "debate_max_tokens", "retries", "continuations"):
         assert isinstance(lb[leaf], int), leaf
     for leaf in ("temperature", "timeout_sec", "connect_timeout_sec",
-                 "backoff_base_sec", "backoff_cap_sec"):
+                 "backoff_base_sec", "backoff_cap_sec", "fallback_timeout_sec"):
         assert isinstance(lb[leaf], float), leaf
     fb = CANONICAL_DEFAULTS[FETCH_BLOCK]
     for leaf in ("pool_workers", "max_connections", "max_keepalive_connections"):
@@ -184,7 +186,7 @@ def test_r13_b10_cfg_get_all_fetch_leaves():
 
 def test_r13_b10_cfg_get_full_blocks():
     lb = cfg_get(LLM_BLOCK, config={})
-    assert isinstance(lb, dict) and len(lb) == 11
+    assert isinstance(lb, dict) and len(lb) == 12  # Audit 2026-09-03 P0-2: +fallback_timeout_sec
     assert lb["model"] == "deepseek-v4-flash"
     assert lb["retries"] == 2
     fb = cfg_get(FETCH_BLOCK, config={})
@@ -289,7 +291,8 @@ def test_r13_b10_config_patch_knows_both_blocks():
     fields = _ConfigPatch.model_fields
     assert LLM_BLOCK in fields and FETCH_BLOCK in fields
     lb = fields[LLM_BLOCK].default_factory()
-    assert len(lb) == 11 and lb["model"] == "deepseek-v4-flash" and lb["retries"] == 2
+    # Audit 2026-09-03 P0-2: 12 leaves (+fallback_timeout_sec).
+    assert len(lb) == 12 and lb["model"] == "deepseek-v4-flash" and lb["retries"] == 2
     fb = fields[FETCH_BLOCK].default_factory()
     assert len(fb) == 9 and fb["pool_workers"] == 16 and fb["max_keepalive_connections"] == 8
 
@@ -312,6 +315,8 @@ def test_r13_b10_spec_maps_legacy_envs():
     HERMES_RESEARCH_*；其余纯硬编码叶 legacy=None。"""
     assert _RESEARCH_LLM_SPEC["model"][0] == "OPENROUTER_MODEL"
     assert _RESEARCH_LLM_SPEC["base_url"][0] == "OPENROUTER_BASE_URL"
+    # Audit 2026-09-03 P0-2: fallback cap has its own legacy env.
+    assert _RESEARCH_LLM_SPEC["fallback_timeout_sec"][0] == "HERMES_RESEARCH_FALLBACK_TIMEOUT_S"
     assert _RESEARCH_FETCH_SPEC["pool_workers"][0] == "HERMES_RESEARCH_POOL_WORKERS"
     assert _RESEARCH_FETCH_SPEC["signals_timeout_sec"][0] == "HERMES_RESEARCH_SIGNALS_TIMEOUT_S"
     assert _RESEARCH_FETCH_SPEC["fetch_timeout_default_sec"][0] == "HERMES_RESEARCH_FETCH_TIMEOUT_S"
@@ -335,11 +340,13 @@ def test_r13_b10_spec_kinds_and_guards():
     for leaf in ("max_tokens", "debate_max_tokens", "retries", "continuations"):
         assert _RESEARCH_LLM_SPEC[leaf][1] == "i", leaf
     for leaf in ("temperature", "timeout_sec", "connect_timeout_sec",
-                 "backoff_base_sec", "backoff_cap_sec"):
+                 "backoff_base_sec", "backoff_cap_sec", "fallback_timeout_sec"):
         assert _RESEARCH_LLM_SPEC[leaf][1] == "f", leaf
     assert _RESEARCH_LLM_SPEC["max_tokens"][2] == 1
     assert _RESEARCH_LLM_SPEC["retries"][2] == 0
     assert _RESEARCH_LLM_SPEC["timeout_sec"][2] == 0.1
+    # Audit 2026-09-03 P0-2: 0 is the legal "cap disabled" sentinel.
+    assert _RESEARCH_LLM_SPEC["fallback_timeout_sec"][2] == 0.0
     for leaf in ("pool_workers", "max_connections", "max_keepalive_connections"):
         assert _RESEARCH_FETCH_SPEC[leaf][1] == "i", leaf
     for leaf in FETCH_LEAVES[3:]:

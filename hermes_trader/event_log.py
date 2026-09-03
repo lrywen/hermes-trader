@@ -48,6 +48,65 @@ EVENTS_FILE = os.environ.get(
 )
 _LOCK = threading.Lock()
 
+# Audit 2026-09-03 P2-5: events.jsonl is written from TWO processes — the
+# trading loop (direct appends) and the web/dashboard process (operator
+# events via session_log.fork_from_session). The threading.Lock above only
+# serialises threads within one process; a cross-process flock on a sidecar
+# makes rotate+append+anchor-advance atomic across both writers so they can't
+# interleave a rotation with an append. Best-effort: if the sidecar cannot be
+# opened (read-only volume / exotic FS) we fall back to the in-process lock.
+import contextlib  # noqa: E402
+
+try:
+    import fcntl  # type: ignore  # POSIX only
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - Windows/dev
+    fcntl = None  # type: ignore
+    _HAVE_FCNTL = False
+
+_LOCK_FD: Optional[Any] = None
+_LOCK_FD_LOCK = threading.Lock()
+
+
+def _lock_fd() -> Optional[Any]:
+    """Lazily open (and keep open) the flock sidecar file descriptor."""
+    global _LOCK_FD
+    if not _HAVE_FCNTL:
+        return None
+    if _LOCK_FD is None:
+        with _LOCK_FD_LOCK:
+            if _LOCK_FD is None:
+                try:
+                    parent = os.path.dirname(EVENTS_FILE)
+                    if parent:
+                        os.makedirs(parent, exist_ok=True)
+                    _LOCK_FD = open(f"{EVENTS_FILE}.lock", "a+")
+                except OSError as e:
+                    logger.warning(f"[event_log] flock sidecar open failed: {e}")
+                    return None
+    return _LOCK_FD
+
+
+@contextlib.contextmanager
+def _cross_process_lock():
+    """Hold both the in-process lock and an exclusive cross-process flock."""
+    with _LOCK:
+        fd = _lock_fd()
+        if fd is not None:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
+            except OSError as e:  # pragma: no cover - defensive
+                logger.warning(f"[event_log] flock acquire failed: {e}")
+            try:
+                yield
+            finally:
+                try:
+                    fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+                except OSError:  # pragma: no cover - defensive
+                    pass
+        else:
+            yield
+
 
 def _events_path() -> Path:
     """Active log path, resolved at call time.
@@ -237,7 +296,7 @@ def append(event: str, payload: Optional[dict[str, Any]] = None,
         "payload": dict(payload or {}),
     }
     try:
-        with _LOCK:
+        with _cross_process_lock():
             # Ensure parent dir exists (first run on a fresh volume).
             parent = os.path.dirname(EVENTS_FILE)
             if parent:

@@ -60,15 +60,27 @@ _DISABLED_CONFIG = {
 def _patch(monkeypatch, *, daily_pnl: float = 0.0, config: dict | None = None):
     """Stub the two module-level dependencies _check_manual_order_gates reads.
 
-    * ``server.memory.daily_pnl``  — the live PnL feed
+    * ``server.memory``  — the live PnL feed
     * ``server.read_agent_config`` — the runtime config (gates fall back to 0)
 
     We import lazily so the test module can sit at the top of the test tree
     without re-triggering conftest side effects.
+
+    (supplemental audit 2026-09-02) The manual path now reads PnL through the
+    real AgentMemory accessors (get_daily_pnl / peak_daily_pnl /
+    daily_realized_pnl / peak_daily_realized_pnl), so the fake memory exposes
+    those as callables. The old stub modeled a bare ``daily_pnl`` attribute —
+    the very non-existent attribute that made the production code always read
+    0.0 and fail open.
     """
     import hermes_trader.server as srv
 
-    fake_mem = SimpleNamespace(daily_pnl=daily_pnl, peak_daily_pnl=0.0)
+    fake_mem = SimpleNamespace(
+        get_daily_pnl=lambda: daily_pnl,
+        peak_daily_pnl=lambda: 0.0,
+        daily_realized_pnl=lambda: 0.0,
+        peak_daily_realized_pnl=lambda: 0.0,
+    )
     monkeypatch.setattr(srv, "memory", fake_mem, raising=False)
     merged = dict(_DISABLED_CONFIG)
     if config:
@@ -227,8 +239,17 @@ def test_config_read_failure_fails_closed_safely(monkeypatch):
         raise RuntimeError("config disk on fire")
 
     monkeypatch.setattr(srv, "read_agent_config", _boom, raising=False)
+    # (supplemental audit 2026-09-02) real accessor interface (callables).
     monkeypatch.setattr(
-        srv, "memory", SimpleNamespace(daily_pnl=0.0), raising=False
+        srv,
+        "memory",
+        SimpleNamespace(
+            get_daily_pnl=lambda: 0.0,
+            peak_daily_pnl=lambda: 0.0,
+            daily_realized_pnl=lambda: 0.0,
+            peak_daily_realized_pnl=lambda: 0.0,
+        ),
+        raising=False,
     )
     report = srv._check_manual_order_gates(**_clean_ctx())
     assert isinstance(report, dict)

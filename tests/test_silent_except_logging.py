@@ -126,16 +126,30 @@ def test_r12_a1_gates_read_agent_config_logs_exception(monkeypatch, caplog):
 
 
 def test_r12_a1_gates_daily_pnl_coercion_logs_warning(monkeypatch, caplog):
-    """server.py:244 — memory.daily_pnl coercion warns and falls back 0.0."""
+    """server.py — memory PnL accessor coercion warns and falls back 0.0.
+
+    (supplemental audit 2026-09-02) The manual gate path now reads PnL through
+    the real AgentMemory accessors (get_daily_pnl / peak_daily_pnl /
+    daily_realized_pnl / peak_daily_realized_pnl), not the old non-existent
+    ``daily_pnl`` attribute. The bad-memory stub raises on the FIRST accessor
+    called so the float(...) coercion still throws and the warning fires."""
     from hermes_trader import server
 
-    # Patch the imported `memory` module attribute that _check_manual_order_gates
-    # reads via getattr(memory, "daily_pnl", 0.0). A property that raises on
-    # access forces the float(...) coercion to throw.
+    # Patch the imported `memory` singleton that _check_manual_order_gates
+    # reads via memory.get_daily_pnl() et al. A raising method forces the
+    # float(...) coercion to throw.
     class _BadMemory:
-        @property
-        def daily_pnl(self):
+        def get_daily_pnl(self):
             raise _Boom("daily_pnl boom")
+
+        def peak_daily_pnl(self):
+            raise _Boom("peak boom")
+
+        def daily_realized_pnl(self):
+            raise _Boom("realized boom")
+
+        def peak_daily_realized_pnl(self):
+            raise _Boom("peak_realized boom")
 
     monkeypatch.setattr(server, "read_agent_config", lambda: {}, raising=True)
     monkeypatch.setattr(server, "memory", _BadMemory())

@@ -506,6 +506,22 @@ class ExitPolicy:
     # old too-tight 1.2% stop: exiting inside the noise band is -EV churn.
     noise_band_enabled: bool = False
     noise_band_atr_mult: float = 1.0  # pull-back tolerated = this × entry ATR% (only sub-first-tier)
+    # ── P2 candidate: smooth phase1→phase2 floor transition ───────────────
+    # At the arm instant (peak profit crosses protect_pct) the baseline floor
+    # SNAPS in one tick from the hard max-loss stop (below entry) up to the
+    # full trailing floor (~entry + protect*(1-retrace), already ABOVE entry).
+    # A noise wick right at that boundary can then stop the trade out before
+    # the peak ever meaningfully extends — and the arm+exit can happen inside
+    # a single 1m candle, invisible to OHLCV replay. When enabled, the phase-2
+    # floor instead RAMPS from the hard stop to the full trailing floor across
+    # a peak-profit band of width `smooth_band_pct` (progress 0 at peak==
+    # protect, progress 1 at peak>=protect+band). Past the band the floor is
+    # byte-identical to the baseline trail; the monotonic clamp downstream
+    # still guarantees the floor never loosens. DEFAULT OFF (inert) — enabled
+    # only for tick-level A/B replay (scripts/p2_smooth_replay.py), same
+    # validation gate as the noise band above.
+    smooth_transition_enabled: bool = False
+    smooth_band_pct: float = 1.0  # peak-profit % over which the floor ramps hard→trail
 
 
 class DSLTracker:
@@ -644,6 +660,29 @@ class DSLTracker:
         """Phase-2 trailing floor: entry + sgn * favorable_range * (1-retrace)."""
         favorable_range = self._sgn() * (self.peak_px - self.entry_px)
         return self.entry_px + self._sgn() * favorable_range * (1 - retrace)
+
+    def _smooth_phase2_floor(self, retrace: float, effective_max_loss: float) -> float:
+        """Phase-2 floor ramped from the hard stop up to the full trail.
+
+        Inert when ``smooth_transition_enabled`` is False or the band is
+        non-positive: returns the plain trailing floor (byte-identical to the
+        baseline). Otherwise linearly interpolates (in favorable-offset space,
+        so it is correct for both longs and shorts) between the hard-stop floor
+        and the full trailing floor as peak profit travels from ``protect_pct``
+        to ``protect_pct + smooth_band_pct``. The interpolation factor is 0 at
+        arm (floor = hard stop) and 1 once the band is exhausted (floor = full
+        trail). The downstream ``_monotonic_clamp`` still guarantees the ramped
+        floor never loosens relative to the prior tick.
+        """
+        pol = self.policy
+        trail = self._trailing_floor(retrace)
+        if not pol.smooth_transition_enabled or pol.smooth_band_pct <= 0:
+            return trail
+        peak_pct = self._peak_profit_pct()
+        progress = (peak_pct - pol.protect_pct) / pol.smooth_band_pct
+        progress = 0.0 if progress < 0.0 else (1.0 if progress > 1.0 else progress)
+        hard = self._hard_stop_floor(effective_max_loss)
+        return hard + (trail - hard) * progress
 
     def _apply_breakeven(self, floor: float) -> float:
         """Clamp the floor to the breakeven lock once peak profit arms it."""
@@ -823,11 +862,23 @@ class DSLTracker:
             self._first_hardstop_ts = None
 
         retrace_used = 0.0
-        if profit_pct >= pol.protect_pct:
+        # Phase 2 arms on the PEAK favorable excursion, not the current mark.
+        # This matches _phase_label (L621), _active_tier (tier by peak) and the
+        # noise-band gate, all of which already key off the peak: a spike that
+        # cleared protect_pct must keep trailing the peak on retracement rather
+        # than snapping back to the phase-1 hard floor while the label already
+        # reads "phase2". The floor is monotonic-clamped regardless, so this
+        # only makes the activation criterion consistent (and keeps a restart-
+        # restored tracker whose peak>=protect but mark<protect in phase2).
+        if self._peak_profit_pct() >= pol.protect_pct:
             # Phase 2: floor trails peak by (1-retrace) of the favorable range.
             tier = self._active_tier(self.peak_px)  # Use PEAK for tier, not current
             retrace_used = tier.retrace_threshold
-            floor = self._trailing_floor(tier.retrace_threshold)
+            # P2 candidate: ramp the floor hard→trail across smooth_band_pct
+            # instead of snapping it at arm. Inert (== plain trail) when the
+            # smooth transition is disabled (default) — see ExitPolicy.
+            floor = self._smooth_phase2_floor(tier.retrace_threshold,
+                                              effective_max_loss)
         else:
             # Phase 1: floor at the effective hard stop.
             floor = self._hard_stop_floor(effective_max_loss)

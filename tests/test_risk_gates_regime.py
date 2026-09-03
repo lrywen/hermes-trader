@@ -13,6 +13,7 @@ load()), so flush() no-ops and nothing touches disk.
 """
 
 import time
+from datetime import datetime, timezone
 
 from hermes_trader.agents import risk_gates
 from hermes_trader.agents.memory import AgentMemory
@@ -220,3 +221,121 @@ def test_consecutive_loss_streak_counts_and_resets_on_win():
 
     m.record_loss_outcome("ETH", 0.5)         # a win clears the streak
     assert m.consecutive_losses("ETH") == 0
+
+
+# ── daily give-back gate on REALIZED (locked-in) PnL ─────────────────────
+# (supplemental audit 2026-09-02) The breaker must arm off realized, banked
+# profit only — a transient mark-to-market float spike on an open position
+# never locks in money, so it must not arm the gate and freeze entries.
+
+_HALT_PCT = 0.55
+_MIN_PEAK = 1.2
+
+
+def test_giveback_ignores_unrealized_float_spike():
+    """MTM float ran +$50 then faded to +$10, but NOTHING was closed —
+    realized PnL and realized peak stay 0. The gate must pass (no false arm)."""
+    r = risk_gates.daily_giveback_gate(
+        _ctx(daily_pnl=10.0, peak_daily_pnl=50.0,
+             daily_realized_pnl=0.0, peak_daily_realized_pnl=0.0),
+        _HALT_PCT, _MIN_PEAK)
+    assert r["pass"] is True
+
+
+def test_giveback_blocks_realized_retracement():
+    """$3.00 of realized profit was banked (>= min peak); subsequent realized
+    losses took the day back to $1.00. floor = 3.0*(1-.55) = 1.35; 1.0 <= 1.35
+    -> halt."""
+    r = risk_gates.daily_giveback_gate(
+        _ctx(daily_realized_pnl=1.0, peak_daily_realized_pnl=3.0),
+        _HALT_PCT, _MIN_PEAK)
+    assert r["pass"] is False
+    assert "give-back" in r["reason"]
+
+
+def test_giveback_passes_shallow_retracement():
+    """Realized peak $3.00, current realized $2.00 > floor $1.35 -> pass."""
+    r = risk_gates.daily_giveback_gate(
+        _ctx(daily_realized_pnl=2.0, peak_daily_realized_pnl=3.0),
+        _HALT_PCT, _MIN_PEAK)
+    assert r["pass"] is True
+
+
+def test_giveback_does_not_arm_below_min_peak():
+    """A realized peak under min_peak_usd is too small to protect -> never arms,
+    even a full round-trip back to zero passes."""
+    r = risk_gates.daily_giveback_gate(
+        _ctx(daily_realized_pnl=0.0, peak_daily_realized_pnl=0.80),
+        _HALT_PCT, _MIN_PEAK)
+    assert r["pass"] is True
+
+
+def test_giveback_missing_realized_fields_fails_closed():
+    """Callers that don't supply realized values default to 0.0 -> the gate
+    never arms (fail-closed, no false block) rather than blowing up."""
+    r = risk_gates.daily_giveback_gate(_ctx(), _HALT_PCT, _MIN_PEAK)
+    assert r["pass"] is True
+
+
+# ── AgentMemory realized-PnL high-water mark ─────────────────────────────
+
+def _record_close_at(m: AgentMemory, coin: str, usd: float, ts_ms: float) -> None:
+    """record_close is a no-op on disk for a directly-instantiated AgentMemory
+    (flush is safe), so it can drive the ledger in unit tests."""
+    m.record_close({
+        "coin": coin, "side": "long", "entry_px": 100.0, "exit_px": 101.0,
+        "spot_pct": 1.0, "realized_pnl_pct": 1.0,
+        "realized_pnl_usd": usd, "leverage": 2.0,
+        "closed_at": int(ts_ms),
+    })
+
+
+def test_realized_peak_tracks_banked_profit_only():
+    m = _fresh_memory()
+    m.track_daily_pnl(1000.0)  # establish today's baseline
+    now_ms = time.time() * 1000
+
+    # Bank +$2.00 realized on BTC: realized total AND peak = 2.0.
+    _record_close_at(m, "BTC", 2.0, now_ms)
+    assert m.daily_realized_pnl() == 2.0
+    assert m.peak_daily_realized_pnl() == 2.0
+
+    # A later close gives $0.80 back: realized total drops to 1.2 but the
+    # high-water mark holds at 2.0.
+    _record_close_at(m, "ETH", -0.8, now_ms)
+    assert abs(m.daily_realized_pnl() - 1.2) < 1e-9
+    assert m.peak_daily_realized_pnl() == 2.0
+
+    # An MTM float spike on an open position must NOT touch the realized peak.
+    m.track_daily_pnl(1055.0)  # +55 paper float
+    assert m.peak_daily_pnl() == 55.0
+    assert m.peak_daily_realized_pnl() == 2.0
+    assert m.daily_realized_pnl() == 1.2
+
+
+def test_realized_peak_rebuilds_on_day_roll():
+    """After the UTC roll the lazy accessor (first call before any heartbeat
+    tick) must rebuild the realized peak from TODAY's closes only — yesterday's
+    peak must not linger and arm the gate against the new day's first orders."""
+    m = _fresh_memory()
+    m.track_daily_pnl(1000.0)
+    now_s = time.time()
+    now_ms = now_s * 1000
+    today_utc = int(datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    yesterday_utc = today_utc - 86400
+
+    # Run "yesterday": baseline at yesterday midnight, bank +$5 realized.
+    m._day_start_ts = yesterday_utc
+    _record_close_at(m, "BTC", 5.0, (now_s - 86400) * 1000)
+    assert m.daily_realized_pnl() == 5.0
+    assert m.peak_daily_realized_pnl() == 5.0
+
+    # Today, before any heartbeat tick: bank +$1 realized, then roll the day
+    # start to today's UTC midnight (what track_daily_pnl would do) and call the
+    # lazy accessor — it must rebuild totals AND peak from today's closes only.
+    _record_close_at(m, "BTC", 1.0, now_ms)
+    m._day_start_ts = today_utc
+
+    assert abs(m.daily_realized_pnl() - 1.0) < 1e-9  # yesterday's $5 excluded
+    assert m.peak_daily_realized_pnl() == 1.0        # rebuilt off today only

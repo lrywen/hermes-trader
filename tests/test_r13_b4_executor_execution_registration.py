@@ -410,3 +410,66 @@ def test_r13_b4_zero_behavior_change_module_fallbacks():
     assert executor._LIQ_BUFFER_USD == 10.0
     assert executor._HL_TAKER_FEE_PCT == 0.025
     assert executor._HL_ROUND_TRIP_FILLS == 2
+
+
+# ── 13. O-9: sub-minimum TP slice — micro skip vs small-account upsize ──────
+# Before O-9 a sub-minimum TP slice was ALWAYS skipped, which silently disabled
+# scale-out for small-but-not-micro accounts: a 30% slice of a $30 position is
+# ~$9 (< the $10.5 HL minimum), yet upsizing to the minimum fills only ~35% of
+# the position and leaves a genuine trail remainder. The skip must fire only
+# when upsize would itself be a near-total close (>=90% of the position).
+def _patch_tp_deps(monkeypatch, min_size, placed):
+    """entry_size_for_notional -> min_size; record placed orders; noop bracket."""
+    monkeypatch.setattr(
+        executor, "entry_size_for_notional",
+        lambda coin, notional, px: min_size,
+    )
+    monkeypatch.setattr(executor, "set_bracket", lambda *a, **k: None)
+
+    def _fake_place(is_buy, size, trig_px, kind, coin, **kw):
+        placed.append({"size": size, "px": trig_px, "kind": kind, "coin": coin})
+        return {"ok": True, "order_id": "OID-1"}
+
+    monkeypatch.setattr(executor, "place_hl_trigger_order", _fake_place)
+
+
+def test_o9_micro_account_sub_min_slice_still_skipped(monkeypatch):
+    """$11 position, 50% slice = $5.5; min size ~= 95% of position -> SKIP,
+    no order placed (near-total close masquerading as a scale-out)."""
+    placed = []
+    _patch_tp_deps(monkeypatch, min_size=0.95, placed=placed)
+    executor._place_tp_scale_out(
+        config={"tp_scale_fraction": 0.5}, atr=1.0,
+        size_in_coin=1.0, entry_px=11.0, is_buy=True, coin="TEST", trade_side="long",
+    )
+    assert placed == []
+
+
+def test_o9_small_account_sub_min_slice_upsized_instead_of_skipped(monkeypatch):
+    """$30 position, 30% slice = ~$9 (< $10.5 min); min size ~= 35% of the
+    position -> UPSIZE to the minimum and place the TP leg (was blanket-skipped
+    before O-9, which left the 20U tier with NO server-side take-profit)."""
+    placed = []
+    _patch_tp_deps(monkeypatch, min_size=0.35, placed=placed)
+    executor._place_tp_scale_out(
+        config={"tp_scale_fraction": 0.3}, atr=1.0,
+        size_in_coin=1.0, entry_px=30.0, is_buy=True, coin="TEST", trade_side="long",
+    )
+    assert len(placed) == 1
+    assert placed[0]["kind"] == "tp"
+    assert placed[0]["size"] == 0.35  # upsized to the exchange minimum
+    # Trigger price respects tp_atr_mult (long: entry + atr*mult above entry).
+    assert placed[0]["px"] == pytest.approx(31.0)
+
+
+def test_o9_above_min_slice_places_normally(monkeypatch):
+    """Slice already above the venue minimum: placed at the intended fractional
+    size, no upsize, no skip (regression for the normal path)."""
+    placed = []
+    _patch_tp_deps(monkeypatch, min_size=0.1, placed=placed)
+    executor._place_tp_scale_out(
+        config={"tp_scale_fraction": 0.5}, atr=1.0,
+        size_in_coin=1.0, entry_px=100.0, is_buy=True, coin="TEST", trade_side="long",
+    )
+    assert len(placed) == 1
+    assert placed[0]["size"] == pytest.approx(0.5)  # intended fraction, untouched

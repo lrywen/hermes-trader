@@ -1109,11 +1109,11 @@ def _place_tp_scale_out(
 
     Banks a fraction of the position server-side so a winner is captured at
     target instead of round-tripping into the trailing stop; the remainder
-    rides the DSL trail. On micro accounts, where the intended TP slice is
-    below the exchange minimum, scale-out is disabled explicitly (a faithful
-    fractional fill is venue-impossible — see O-9 below); otherwise upsizes
-    sub-notional TPs to the exchange minimum unless that would consume ≥90%
-    of the position (then skips).
+    rides the DSL trail. A sub-minimum TP slice is upsized to the exchange
+    minimum unless that would consume ≥90% of the position (then skipped —
+    see O-9 below); only a genuinely micro account (upsize ≈ near-total
+    close) disables scale-out explicitly, since a faithful fractional fill
+    is venue-impossible.
     """
     tp_scale_fraction = float(config.get("tp_scale_fraction", 0.5))
     if not (atr > 0 and size_in_coin > 0 and 0 < tp_scale_fraction <= 1.0):
@@ -1154,24 +1154,34 @@ def _place_tp_scale_out(
     # below the exchange minimum, so the old code silently UPSIZED it to the
     # $10.5 minimum — which fills ~95% of the position at target. What looks
     # like "bank half, trail half" actually closes nearly the whole position
-    # in the TP leg and guts the trailing remainder. When the fractional TP
-    # slice itself is under the venue minimum, a real partial fill is
-    # impossible, so disable scale-out explicitly and let the DSL trail own
-    # the full exit, instead of masquerading a near-total close as a
-    # scale-out. The upsize path below still serves larger accounts whose
-    # slice is sub-minimum only by size-step rounding.
+    # in the TP leg and guts the trailing remainder. But the blanket skip that
+    # fixed that also disabled scale-out for SMALL-but-not-micro accounts
+    # where upsize is perfectly sane: a 30% slice of a $30 position ($9) is
+    # sub-min, yet upsizing to $10.5 fills only ~35% of the position and
+    # leaves a genuine 65% trail remainder. So skip ONLY when upsizing would
+    # itself be a near-total close (>=90% of the position, the same threshold
+    # enforced by the min-size clamp below); otherwise fall through to the
+    # tp_size < tp_min_size upsize branch and bank the minimum-size leg.
     if tp_intended_notional < MIN_ORDER_USD:
         upsized_frac = (tp_min_size / size_in_coin) if size_in_coin > 0 else 0.0
+        if upsized_frac >= 0.9:
+            logger.warning(
+                f"[executor:tp] SKIP {coin} — intended TP slice ${tp_intended_notional:.2f} "
+                f"({tp_scale_fraction:.0%} of ${full_notional:.2f}) is below the HL "
+                f"minimum (${MIN_ORDER_USD:.2f}); upsizing would fill "
+                f"{upsized_frac:.0%} of the position (near-total close), so scale-out "
+                f"is disabled for this micro position. The DSL trailing floor handles "
+                f"the full exit. "
+                f"[skip_reason=micro_account_scale_out_disabled, tp_px={tp_px_trig:.6g}]"
+            )
+            return
         logger.warning(
-            f"[executor:tp] SKIP {coin} — intended TP slice ${tp_intended_notional:.2f} "
+            f"[executor:tp] {coin} — intended TP slice ${tp_intended_notional:.2f} "
             f"({tp_scale_fraction:.0%} of ${full_notional:.2f}) is below the HL "
-            f"minimum (${MIN_ORDER_USD:.2f}); upsizing would fill "
-            f"{upsized_frac:.0%} of the position (near-total close), so scale-out "
-            f"is disabled for this micro position. The DSL trailing floor handles "
-            f"the full exit. "
-            f"[skip_reason=micro_account_scale_out_disabled, tp_px={tp_px_trig:.6g}]"
+            f"minimum (${MIN_ORDER_USD:.2f}), but upsizing to the minimum fills only "
+            f"{upsized_frac:.0%} of the position (<90%); falling through to upsize. "
+            f"[reason=sub_min_slice_upsize, tp_px={tp_px_trig:.6g}]"
         )
-        return
 
     # Hard safety clamp: a scale-out TP must NEVER be sized larger than the
     # position it is supposed to partially close. entry_size_for_notional()
@@ -2153,6 +2163,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # counter-regime gate. Missing config fails closed.
         whale_signal_fired=bool(analysis.get("whale_signal")) and bool(config.get("whale_regime_bypass", False)),
         peak_daily_pnl=memory.peak_daily_pnl(),
+        # (supplemental audit 2026-09-02) Feed REALIZED (locked-in) PnL to the
+        # give-back breaker so it arms only on profit actually banked, not on a
+        # transient open-position paper float (which marks daily_pnl/peak and
+        # previously latched the gate, blocking all fresh entries to UTC roll).
+        daily_realized_pnl=memory.daily_realized_pnl(),
+        peak_daily_realized_pnl=memory.peak_daily_realized_pnl(),
         # H4: pre-trade liquidation-price check inputs.
         entry_px=mid_price if mid_price > 0 else 0.0,
         leverage=float(leverage),
@@ -2249,6 +2265,31 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
 
     if shadow_mode:
         _record_decision("shadow")
+        # Paper-book the would-be fill into the isolated SHADOW ledger so the
+        # dashboard can show what the strategy would have traded. No real order,
+        # no real funds, no touch of .agent-memory — fully best-effort.
+        try:
+            from hermes_trader.agents import shadow_book
+            _sh_entry = mid_price if mid_price > 0 else 0.0
+            try:
+                _sh_atr_pct = (atr / _sh_entry * 100.0) if (_sh_entry > 0 and atr > 0) else 0.0
+            except Exception:
+                _sh_atr_pct = 0.0
+            _sh_regime = ""
+            try:
+                from hermes_trader.agents.market_regime import detect_regime
+                _sh_regime = detect_regime(coin) or ""
+            except Exception:
+                _sh_regime = ""
+            if _sh_entry > 0:
+                shadow_book.shadow_open(
+                    coin=coin, side=trade_side, entry_px=_sh_entry,
+                    size_usd=trade_notional, leverage=leverage,
+                    entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
+                    analysis_id=analysis["id"],
+                )
+        except Exception as _shadow_e:  # noqa: BLE001 — paper book never blocks the loop
+            logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
         return {
             "executed": False, "mode": mode,
             "analysis_id": analysis["id"],

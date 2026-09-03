@@ -457,7 +457,18 @@ def _check_manual_order_gates(
         )
         cfg = {}
     try:
-        daily_pnl = float(getattr(memory, "daily_pnl", 0.0) or 0.0)
+        # (supplemental audit 2026-09-02) Read PnL through the real accessors.
+        # The old `getattr(memory, "daily_pnl", 0.0)` referenced an attribute
+        # that does not exist (AgentMemory exposes get_daily_pnl(), not a
+        # `daily_pnl` field), so it ALWAYS fell back to 0.0 — that made the
+        # daily-loss hard kill switch silently fail-open on manual orders, and
+        # peak_daily_pnl was never passed so the give-back breaker never armed
+        # either. Manual orders now go through the exact same PnL gates as the
+        # automated path.
+        daily_pnl = float(memory.get_daily_pnl() or 0.0)
+        _peak_daily_pnl = float(memory.peak_daily_pnl() or 0.0)
+        _daily_realized = float(memory.daily_realized_pnl() or 0.0)
+        _peak_realized = float(memory.peak_daily_realized_pnl() or 0.0)
     except Exception as e:
         # R12-A1: memory.daily_pnl readout is a number-coercion guard.
         # If it raises, we treat the day as zero (most-conservative PnL
@@ -468,11 +479,21 @@ def _check_manual_order_gates(
             type(e).__name__, e,
         )
         daily_pnl = 0.0
+        _peak_daily_pnl = 0.0
+        _daily_realized = 0.0
+        _peak_realized = 0.0
     gate_ctx = GateContext(
         confidence=1.0,
         current_positions=list(positions or []),
         trade_notional_usd=float(position_notional),
         daily_pnl=daily_pnl,
+        # (supplemental audit 2026-09-02) feed the same MTM + realized PnL
+        # peaks as the automated path so the daily-loss and give-back gates
+        # apply identically to manual orders (previously all three were absent
+        # -> PnL gates fail-open on the manual path).
+        peak_daily_pnl=_peak_daily_pnl,
+        daily_realized_pnl=_daily_realized,
+        peak_daily_realized_pnl=_peak_realized,
         market_volume_24h_usd=float(market_vol_24h),
         coin=str(coin),
         trade_side="long" if is_buy else "short",

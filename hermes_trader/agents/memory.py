@@ -226,12 +226,37 @@ class AgentMemory:
         self._equity: float = 0
         self._daily_pnl: float = 0
         self._peak_daily_pnl: float = 0  # high-water mark of daily_pnl (intraday, resets at UTC roll)
+        # (supplemental audit 2026-09-02) High-water mark of REALIZED daily
+        # PnL only (locked-in closes), excluding unrealized float. The give-back
+        # breaker arms off this so a transient open-position paper spike can no
+        # longer latch the gate and block fresh entries for the rest of the UTC
+        # day. Rebuilt from the persisted _closes ledger on day-roll/restart, so
+        # it is restart-safe (unlike _peak_daily_pnl, which is mark-to-market).
+        self._peak_daily_realized_pnl: float = 0
         # B-F7 (deep audit 2026-08-28): all-time high-water mark of equity,
         # backing the account max-drawdown gate. Unlike _peak_daily_pnl this
         # does NOT reset at UTC roll — a drawdown is measured from the highest
         # equity the account has ever reached. Updated on every accepted equity
         # tick in track_daily_pnl (after the implausible-read filter).
         self._peak_equity: float = 0
+        # Drawdown-gate recovery (fix 2026-09-03): the all-time peak above
+        # never resets, so after a permanent equity drop (realized loss,
+        # withdrawal, balance rebase) the drawdown gate latched FOREVER with
+        # no recovery path (observed: peak $50.9 vs equity $20.9 → −58.9%,
+        # 111 consecutive blocks). The gate now measures against a ROLLING
+        # peak over a configurable window instead of the all-time high.
+        #   _equity_trail: deque of (epoch_s, equity), one sample ~per
+        #     scan tick (age-pruned); rolling_peak_equity(window_days) takes
+        #     the max over samples newer than window_days, falling back to the
+        #     all-time peak when no windowed samples exist.
+        self._equity_trail: Deque[tuple[float, float]] = deque()
+        # Drawdown freeze bookkeeping (epoch ms): when the gate freezes it
+        # stamps _dd_frozen_since_ms; once the freeze has lasted the
+        # configured cooldown, the baseline re-arms to current equity (the
+        # same event the rolling peak would produce organically as old highs
+        # age out, but bounded to ~cooldown hours instead of a full window).
+        self._dd_frozen_since_ms: int = 0
+        self._dd_last_baseline_ms: int = 0
         self._start_of_day_equity: float = 0
         self._day_start_ts: int = 0
         self._open_positions: list[dict[str, Any]] = []
@@ -266,6 +291,16 @@ class AgentMemory:
         self._day_realized_usd: dict[str, float] = {}
         self._day_stats_start_ts: int = 0
         self._initialized = False
+        # Cross-process freshness (fix 2026-09-03): the API server and the
+        # trading loop are SEPARATE processes, each with its own memory
+        # singleton. The loop writes the drawdown/circuit state to disk; the
+        # server's in-memory copy is a snapshot from its own startup and never
+        # refreshes (load() is _initialized-guarded), so the risk dashboard
+        # showed a STALE freeze long after the loop had released it. The
+        # read-only refresher below re-reads the risk fields when the file's
+        # mtime advances. It never sets _dirty nor flushes, so a read-only
+        # server scrape can never overwrite the loop's authoritative file.
+        self._risk_file_mtime: float = 0.0
 
     @classmethod
     def get_instance(cls) -> "AgentMemory":
@@ -374,6 +409,24 @@ class AgentMemory:
                     self._peak_equity = float(data.get("peakEquity", 0) or 0)
                 except (TypeError, ValueError):
                     self._peak_equity = 0.0
+                # Drawdown recovery state (absent in old files → empty trail /
+                # zero stamps; the trail seeds itself from the next accepted
+                # equity tick, and the first gate pass after upgrade re-baselines
+                # a pre-existing latched freeze immediately rather than after a
+                # full cooldown window).
+                trail = []
+                for row in (data.get("equityTrail") or []):
+                    try:
+                        ts_s = float(row[0])
+                        eq = float(row[1])
+                        if ts_s > 0 and eq > 0:
+                            trail.append((ts_s, eq))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+                trail.sort(key=lambda r: r[0])
+                self._equity_trail = deque(trail[-4320:])  # ≤ ~30d at 10-min cadence
+                self._dd_frozen_since_ms = int(data.get("ddFrozenSinceMs", 0) or 0)
+                self._dd_last_baseline_ms = int(data.get("ddLastBaselineMs", 0) or 0)
                 self._open_positions = data.get("openPositions", [])
 
                 # Tiered circuit-breaker state (best-effort restore; a stale/
@@ -416,6 +469,69 @@ class AgentMemory:
                     self.flush(force=True)
                 except Exception:
                     pass
+
+    def refresh_risk_state_from_disk(self) -> None:
+        """Read-only cross-process refresh of risk/drawdown fields.
+
+        The API server and trading loop run as separate processes with
+        independent memory singletons. The loop owns trading state and writes
+        it to MEMORY_FILE; the server's copy is only hydrated at startup. This
+        re-reads the live risk fields (equity, rolling peak trail, drawdown
+        freeze stamps, circuit breakers) when the file's mtime has advanced,
+        so the dashboard reflects the loop's CURRENT gate state instead of a
+        startup snapshot.
+
+        Strictly read-only on the write side: it never sets ``_dirty`` and
+        never flushes, so a server scrape cannot clobber the loop's
+        authoritative file. Cheap (one stat per call; a json read only when
+        the mtime changed); safe to call on every poll.
+        """
+        try:
+            mtime = os.path.getmtime(MEMORY_FILE)
+        except OSError:
+            return
+        if mtime <= self._risk_file_mtime:
+            return
+        try:
+            with open(MEMORY_FILE, "r") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        now_ms = int(time.time() * 1000)
+        with self._lock:
+            # Equity + rolling peak trail (drawdown gate inputs).
+            try:
+                self._equity = float(data.get("equity", 0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._peak_equity = float(data.get("peakEquity", 0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            trail = []
+            for row in (data.get("equityTrail") or []):
+                try:
+                    ts_s = float(row[0])
+                    eq = float(row[1])
+                    if ts_s > 0 and eq > 0:
+                        trail.append((ts_s, eq))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            trail.sort(key=lambda r: r[0])
+            self._equity_trail = deque(trail[-4320:])
+            self._dd_frozen_since_ms = int(data.get("ddFrozenSinceMs", 0) or 0)
+            self._dd_last_baseline_ms = int(data.get("ddLastBaselineMs", 0) or 0)
+            # Circuit breakers (same cross-process staleness issue).
+            self._global_halt_until_ms = int(data.get("globalHaltUntilMs", 0) or 0)
+            if self._global_halt_until_ms < now_ms:
+                self._global_halt_until_ms = 0
+            self._coin_circuit = {
+                str(k): int(v) for k, v in (data.get("coinCircuit") or {}).items()
+                if int(v) > now_ms
+            }
+        # Record the mtime only after a successful read so a torn/transient
+        # read is retried on the next poll.
+        self._risk_file_mtime = mtime
 
     def _write_atomic(self, data: dict[str, Any]) -> bool:
         """Persist ``data`` to MEMORY_FILE atomically with cross-process lock +
@@ -574,6 +690,9 @@ class AgentMemory:
                 "startOfDayEquity": self._start_of_day_equity,
                 "dayStartTs": self._day_start_ts,
                 "peakEquity": self._peak_equity,  # B-F7 all-time equity HWM
+                "equityTrail": [(ts, eq) for ts, eq in self._equity_trail],
+                "ddFrozenSinceMs": int(self._dd_frozen_since_ms or 0),
+                "ddLastBaselineMs": int(self._dd_last_baseline_ms or 0),
                 "openPositions": list(self._open_positions),
                 "coinCircuit": dict(self._coin_circuit),
                 "globalHaltUntilMs": int(self._global_halt_until_ms or 0),
@@ -816,6 +935,7 @@ class AgentMemory:
                 self._day_start_ts = today_utc
                 self._daily_pnl = 0
                 self._peak_daily_pnl = 0  # reset high-water mark at the UTC day roll
+                self._peak_daily_realized_pnl = 0  # (supplemental audit 2026-09-02) reset realized peak too
                 # A new trading day clears the consecutive-loss streak and any
                 # lingering per-coin circuit (global halt intentionally survives
                 # until its own wall-clock expiry).
@@ -830,6 +950,11 @@ class AgentMemory:
             # blip can neither inflate the peak nor fake a crash below it.
             self._peak_equity = max(self._peak_equity, current_equity)
             self._equity = current_equity
+            # Drawdown-gate rolling peak (fix 2026-09-03): append the accepted
+            # equity tick, then age-prune the trail. Samples are appended at
+            # most one per ~600s so the deque stays tiny (≤ ~4,320 for 30d)
+            # while still giving the rolling-window peak daily resolution.
+            self._append_equity_trail_nolock(now_s, current_equity)
             # P1-6: every accepted equity tick mutates dailyPnl/peak/equity;
             # coalesced onto the trading loop's periodic (throttled) flush.
             self._dirty = True
@@ -837,6 +962,31 @@ class AgentMemory:
     def peak_daily_pnl(self) -> float:
         """Intraday high-water mark of daily PnL (resets at UTC midnight)."""
         return self._peak_daily_pnl
+
+    def daily_realized_pnl(self) -> float:
+        """(supplemental audit 2026-09-02) Today's total REALIZED PnL (USD),
+        summed across coins from the _closes ledger — excludes unrealized
+        float. Recomputed on demand off the per-coin running total (which is
+        rebuilt from persisted closes on a day-roll/restart), so it is
+        restart-safe."""
+        with self._lock:
+            self._ensure_close_stats_nolock()
+            self._recheck_day_stats_nolock()
+            return float(sum(self._day_realized_usd.values()))
+
+    def peak_daily_realized_pnl(self) -> float:
+        """(supplemental audit 2026-09-02) Intraday high-water mark of REALIZED
+        daily PnL only. Updated on demand whenever gates read it: the give-back
+        breaker arms off this rather than the mark-to-market peak, so a paper
+        float spike that never gets locked in can't latch the gate."""
+        with self._lock:
+            self._ensure_close_stats_nolock()
+            self._recheck_day_stats_nolock()
+            realized = float(sum(self._day_realized_usd.values()))
+            if realized > self._peak_daily_realized_pnl:
+                self._peak_daily_realized_pnl = realized
+                self._dirty = True
+            return float(self._peak_daily_realized_pnl)
 
     def peak_equity(self) -> float:
         """All-time high-water mark of equity (B-F7 drawdown gate baseline).
@@ -847,6 +997,139 @@ class AgentMemory:
         real peak exists)."""
         with self._lock:
             return float(self._peak_equity)
+
+    # ── Drawdown-gate recovery (fix 2026-09-03) ────────────────────────────
+    # The drawdown gate previously measured against the ALL-TIME peak, which
+    # never recovers: after a permanent equity drop (realized loss, withdraw,
+    # balance rebase) dd stays forever above threshold and the gate latched
+    # with zero new entries and no recovery path. The gate now measures
+    # against a rolling peak over a configurable window, re-baselines after a
+    # cooldown, and exposes its freeze state to the dashboard.
+
+    _EQUITY_TRAIL_MIN_SPACING_S = 600.0   # ≤ one sample per ~10 scan minutes
+    _EQUITY_TRAIL_MAX_AGE_S = 45 * 86400  # retain ~45 days (window is ≤ this)
+
+    def _append_equity_trail_nolock(self, now_s: float, equity: float) -> None:
+        """Append an accepted equity tick to the rolling trail (call under lock).
+
+        Samples land at most once per _EQUITY_TRAIL_MIN_SPACING_S; a fresh
+        accepted tick simply refreshes the latest value, so the window's peak
+        always reflects the newest reading. Age-prunes from the left (trail is
+        time-ordered) and caps length so the persisted file stays small.
+        """
+        if self._equity_trail and (now_s - self._equity_trail[-1][0]) < self._EQUITY_TRAIL_MIN_SPACING_S:
+            self._equity_trail[-1] = (now_s, float(equity))
+        else:
+            self._equity_trail.append((now_s, float(equity)))
+        cutoff = now_s - self._EQUITY_TRAIL_MAX_AGE_S
+        while self._equity_trail and self._equity_trail[0][0] < cutoff:
+            self._equity_trail.popleft()
+        while len(self._equity_trail) > 4320:
+            self._equity_trail.popleft()
+
+    def rolling_peak_equity(self, window_days: float) -> float:
+        """High-water mark of equity over the trailing ``window_days`` days.
+
+        Falls back to the all-time peak when the trail is empty/has no samples
+        inside the window (cold start / pre-upgrade memory) so the gate never
+        silently disarms. window_days <= 0 means "use the all-time peak"
+        (legacy behavior)."""
+        with self._lock:
+            if window_days <= 0:
+                return float(self._peak_equity)
+            cutoff = time.time() - float(window_days) * 86400.0
+            window_vals = [eq for ts, eq in self._equity_trail if ts >= cutoff]
+            if window_vals:
+                return float(max(window_vals))
+            return float(self._peak_equity)
+
+    def mark_drawdown_frozen(self) -> int:
+        """Stamp the drawdown-freeze start on first block (call when gate
+        trips). Returns the epoch-ms freeze start. Idempotent: a stamp is only
+        written once per freeze episode (cleared on recovery)."""
+        with self._lock:
+            if not self._dd_frozen_since_ms:
+                self._dd_frozen_since_ms = int(time.time() * 1000)
+                self._dirty = True
+        # Risk-blocking state: persist immediately so a restart cannot erase a
+        # freeze stamp (mirrors set_loss_cooldown's force-flush policy).
+        self.flush(force=True)
+        with self._lock:
+            return int(self._dd_frozen_since_ms)
+
+    def clear_drawdown_freeze(self) -> None:
+        """Clear the drawdown freeze bookkeeping on recovery (gate passing)."""
+        with self._lock:
+            if self._dd_frozen_since_ms:
+                self._dd_frozen_since_ms = 0
+                self._dirty = True
+
+    def rebase_drawdown_peak(self, new_peak: float, reason: str = "") -> None:
+        """Re-arm the drawdown baseline to ``new_peak`` after cooldown / a
+        permanent drop, releasing a latched freeze. Also clears the freeze
+        stamp AND the rolling trail (reseeded at the new baseline) so the gate
+        starts measuring forward from here instead of re-tripping on stale
+        highs still inside the window — the next genuine drawdown starts a
+        fresh freeze episode."""
+        with self._lock:
+            old = float(self._peak_equity)
+            self._peak_equity = float(new_peak)
+            self._dd_frozen_since_ms = 0
+            self._dd_last_baseline_ms = int(time.time() * 1000)
+            # Reset the rolling trail to the accepted new baseline: any older
+            # (higher) samples would otherwise keep rolling_peak_equity above
+            # threshold and re-freeze on the very next gate pass.
+            self._equity_trail.clear()
+            self._equity_trail.append((time.time(), float(new_peak)))
+            self._dirty = True
+        self.flush(force=True)
+        logger.warning(
+            "[risk] drawdown baseline re-armed: peak $%.2f -> $%.2f (%s)",
+            old, float(new_peak), reason or "cooldown recovery")
+
+    def drawdown_freeze_status(self, max_drawdown_pct: float,
+                               window_days: float, cooldown_hours: float) -> dict[str, Any]:
+        """Read-only live drawdown-freeze status for the dashboard card.
+
+        Computes the gate decision against CURRENT memory (same rolling peak
+        the gate enforces) so the UI sees the freeze the instant it trips,
+        independent of trade attempts. Read-only: never stamps/clears/baselines.
+        """
+        with self._lock:
+            equity = float(self._equity or 0.0)
+            at_peak = float(self._peak_equity or 0.0)
+            cutoff = time.time() - float(window_days) * 86400.0 if window_days > 0 else 0.0
+            window_vals = [eq for ts, eq in self._equity_trail
+                           if window_days <= 0 or ts >= cutoff]
+            peak = float(max(window_vals)) if window_vals else at_peak
+            frozen_since = int(self._dd_frozen_since_ms or 0)
+            last_baseline = int(self._dd_last_baseline_ms or 0)
+            trail_len = len(self._equity_trail)
+        now_ms = int(time.time() * 1000)
+        dd_pct = ((peak - equity) / peak * 100.0) if peak > 0 and equity > 0 else 0.0
+        frozen = bool(peak > 0 and equity > 0 and dd_pct >= float(max_drawdown_pct))
+        cooldown_remaining_min = 0.0
+        frozen_for_min = 0.0
+        if frozen_since:
+            frozen_for_min = max(0.0, (now_ms - frozen_since) / 60_000)
+            if cooldown_hours > 0:
+                cooldown_remaining_min = max(
+                    0.0, float(cooldown_hours) * 60.0 - frozen_for_min)
+        return {
+            "frozen": frozen,
+            "dd_pct": round(dd_pct, 2),
+            "threshold_pct": float(max_drawdown_pct),
+            "peak_equity": round(peak, 4),
+            "all_time_peak_equity": round(at_peak, 4),
+            "equity": round(equity, 4),
+            "window_days": float(window_days),
+            "frozen_since_ms": frozen_since if frozen else 0,
+            "frozen_for_min": round(frozen_for_min, 1),
+            "cooldown_hours": float(cooldown_hours),
+            "cooldown_remaining_min": round(cooldown_remaining_min, 1),
+            "last_baseline_ms": last_baseline,
+            "trail_samples": trail_len,
+        }
 
     def last_equity_reading(self) -> tuple[float, float]:
         """Most recent ACCEPTED equity reading and its epoch-seconds timestamp.
@@ -943,6 +1226,10 @@ class AgentMemory:
         coins are simply excluded from the armed count by comparing timestamps.
         Returns ``{"armed_coins": int, "global_halt": bool}``.
         """
+        # Cross-process freshness (fix 2026-09-03): the API server is a
+        # separate process from the trading loop; pull the loop's latest
+        # risk state from disk (read-only) before reporting.
+        self.refresh_risk_state_from_disk()
         now_ms = int(time.time() * 1000)
         with self._lock:
             armed = sum(1 for exp in self._coin_circuit.values() if int(exp or 0) > now_ms)
@@ -959,6 +1246,12 @@ class AgentMemory:
         currently-armed per-coin circuits with their remaining minutes, so the
         UI can show WHICH coins are gated and for how long (not just a count).
         """
+        # Cross-process freshness (fix 2026-09-03): the API server is a
+        # separate process from the trading loop; pull the loop's latest
+        # risk state (equity trail, drawdown freeze, halts) from disk
+        # read-only before reporting so the dashboard never shows a stale
+        # startup snapshot.
+        self.refresh_risk_state_from_disk()
         now_ms = int(time.time() * 1000)
         with self._lock:
             g_exp = int(self._global_halt_until_ms or 0)
@@ -969,12 +1262,24 @@ class AgentMemory:
                 for coin, exp in self._coin_circuit.items()
                 if int(exp or 0) > now_ms
             }
-        return {
+        out = {
             "global_halt": global_halt,
             "global_halt_remaining_min": round(global_remaining_min, 1),
             "coin_circuits": coin_circuits,
             "armed_coins": len(coin_circuits),
         }
+        # Drawdown freeze (fix 2026-09-03): live gate state for the dashboard
+        # freeze banner — evaluated read-only against current memory. Config is
+        # read lazily inside to keep this layer free of a config_store import.
+        try:
+            from hermes_trader.agents.config_store import cfg_get
+            max_dd = float(cfg_get("circuit_breaker.max_drawdown_pct") or 0.0)
+            window = float(cfg_get("circuit_breaker.drawdown_peak_window_days", 14.0) or 0.0)
+            cooldown = float(cfg_get("circuit_breaker.drawdown_cooldown_hours", 24.0) or 0.0)
+            out["drawdown"] = self.drawdown_freeze_status(max_dd, window, cooldown)
+        except Exception:  # noqa: BLE001
+            out["drawdown"] = None
+        return out
 
     def record_loss_outcome(self, coin: str, realized_pnl_pct: float) -> None:
         """Update the per-coin consecutive-loss streak from a realized close.
@@ -1107,6 +1412,20 @@ class AgentMemory:
                     )
                 except (TypeError, ValueError):
                     pass
+                # (supplemental audit 2026-09-02) Fold the banked profit into the
+                # realized high-water mark AT CLOSE TIME. Sampling the peak only
+                # when the gate runs could miss a spike that two gate evaluations
+                # straddle (a profit taken then partially given back before the
+                # next order attempt). Updating here — the single point every
+                # realized total flows through, including _rebuild on restart —
+                # captures the true peak and stays restart-safe.
+                try:
+                    _day_total = float(sum(self._day_realized_usd.values()))
+                    if _day_total > self._peak_daily_realized_pnl:
+                        self._peak_daily_realized_pnl = _day_total
+                        self._dirty = True
+                except (TypeError, ValueError):
+                    pass
 
     def _evict_close_stats_nolock(self, c: dict[str, Any]) -> None:
         """Detach stats for a close row evicted from the bounded _closes list
@@ -1159,6 +1478,17 @@ class AgentMemory:
             return
         day_start = self._day_start_ts
         day_totals: dict[str, float] = {}
+        # (supplemental audit 2026-09-02) Rebuild the realized high-water mark
+        # on roll as well. track_daily_pnl() resets _peak_daily_realized_pnl at
+        # the UTC roll, but a lazy accessor (daily_realized_pnl() /
+        # peak_daily_realized_pnl()) can be the FIRST call after midnight —
+        # e.g. a manual order before the first heartbeat tick. Without this the
+        # stale yesterday peak would still arm the give-back gate and block the
+        # new day's first entries. Replaying today's closes in append order and
+        # tracking the running max reproduces the exact peak that the
+        # _accumulate_close_nolock updates would have produced.
+        running_total = 0.0
+        rebuilt_peak = 0.0
         for c in self._closes:
             ts_s = self._close_ts_s(c)
             if not ts_s or ts_s < float(day_start):
@@ -1170,10 +1500,15 @@ class AgentMemory:
             if pnl is None:
                 continue
             try:
-                day_totals[coin] = day_totals.get(coin, 0.0) + float(pnl)
+                v = float(pnl)
+                day_totals[coin] = day_totals.get(coin, 0.0) + v
+                running_total += v
+                if running_total > rebuilt_peak:
+                    rebuilt_peak = running_total
             except (TypeError, ValueError):
                 continue
         self._day_realized_usd = day_totals
+        self._peak_daily_realized_pnl = float(rebuilt_peak)
         self._day_stats_start_ts = day_start
 
     def avg_exit_slip_bps(self, coin: str, days: Optional[float] = None,

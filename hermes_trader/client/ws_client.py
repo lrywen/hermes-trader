@@ -91,6 +91,33 @@ _WS_SPIKE_WARN_INTERVAL_S = float(
     os.environ.get("HERMES_WS_SPIKE_WARN_INTERVAL_S", "1800")
 )
 
+# WS userFills: dedup-set persistence + historical-replay filtering.
+#
+# Hyperliquid replays a backlog window of recent fills EVERY time a
+# ``userFills`` subscription is (re)established — including on every
+# process restart / container rebuild. The in-memory ``_seen_tids`` dedup
+# set alone cannot survive a restart, so the same historical closes get
+# re-enqueued and re-emitted as ``ws_user_fill`` SSE events on every boot
+# (observed: 16 real Aug fills fanned out into 240 events across ~15
+# restarts). Two complementary guards:
+#
+#   1. Persist seen tids to disk (atomic replace, throttled) and reload on
+#      startup, so a fill already reported in a previous process is never
+#      reported again.
+#   2. A subscription watermark: any fill whose HL ``time`` is older than
+#      the FIRST successful subscribe in this process (minus a small clock
+#      skew / subscription-latency grace) is treated as historical replay
+#      and dropped — even before the dedup check. The watermark is set
+#      once and is NOT reset on a reconnect, so a fill that genuinely
+#      happened during a brief disconnect (newer than first subscribe)
+#      still passes through to dedup and is processed once.
+_USER_FILLS_SEEN_FILE = os.environ.get(
+    "HERMES_WS_USER_FILLS_SEEN_FILE",
+    os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), ".ws-user-fills-seen.json"),
+)
+_USER_FILLS_PERSIST_MIN_INTERVAL_S = 5.0
+_USER_FILLS_HIST_GRACE_MS = 30_000  # clock-skew / subscribe-latency slack
+
 
 class HLSSLOptWebsocketManager(WebsocketManager):
     """WebsocketManager that passes certifi SSL context to run_forever()."""
@@ -253,6 +280,85 @@ class HyperliquidWebSocket:
         # When exceeded we drop the oldest half (set is unordered so
         # we rebuild from the queue's not-yet-drained state).
         self._seen_tids_cap: int = 10000
+        # Dedup-set persistence + historical-replay watermark (see the
+        # module-level comment above). ``_user_fills_first_sub_at`` is the
+        # epoch-seconds of the FIRST successful userFills subscribe in this
+        # process; 0.0 means "never subscribed" and disables the watermark
+        # filter (so direct-callback unit tests are unaffected). It is set
+        # once and deliberately NOT reset on reconnect.
+        self._user_fills_first_sub_at: float = 0.0
+        self._user_fills_seen_dirty: bool = False
+        self._user_fills_last_persist: float = 0.0
+        self._user_fills_hist_dropped: int = 0
+        # Warm the in-memory dedup set from the on-disk snapshot so a fill
+        # already reported by a previous process is never re-emitted.
+        self._load_seen_tids()
+
+    def _load_seen_tids(self) -> None:
+        """Best-effort load of persisted seen-tids into the dedup set.
+
+        Missing / corrupt / unreadable files are ignored: the watermark
+        filter and in-memory dedup still work, only cross-process dedup is
+        lost. Runs under ``_seen_tids_lock`` so it is safe versus the WS
+        callback thread (in practice it runs from ``__init__`` before any
+        subscription exists).
+        """
+        try:
+            with open(_USER_FILLS_SEEN_FILE, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            tids = data.get("tids") if isinstance(data, dict) else None
+            if not isinstance(tids, list):
+                return
+            with self._seen_tids_lock:
+                for tid in tids:
+                    if isinstance(tid, str) and tid:
+                        self._seen_tids.add(tid)
+            logger.info(
+                "[ws:user-fills] loaded %d persisted seen tids from %s",
+                len(self._seen_tids), _USER_FILLS_SEEN_FILE,
+            )
+        except FileNotFoundError:
+            pass
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            logger.warning(
+                "[ws:user-fills] could not load seen-tids file %s: %s",
+                _USER_FILLS_SEEN_FILE, exc,
+            )
+
+    def _persist_seen_tids(self, force: bool = False) -> None:
+        """Best-effort atomic snapshot of the seen-tids set to disk.
+
+        Throttled to at most once per ``_USER_FILLS_PERSIST_MIN_INTERVAL_S``
+        unless ``force`` (used by ``stop()``). Keeps only the newest
+        ``_seen_tids_cap // 2`` tids (set iteration order is insertion
+        order in CPython) so the file cannot grow without bound. Any
+        failure is swallowed — persistence must never break the feed.
+        """
+        now = time.time()
+        if not force and (
+            not self._user_fills_seen_dirty
+            or (now - self._user_fills_last_persist) < _USER_FILLS_PERSIST_MIN_INTERVAL_S
+        ):
+            return
+        try:
+            with self._seen_tids_lock:
+                tids = list(self._seen_tids)
+            keep = max(100, self._seen_tids_cap // 2)
+            if len(tids) > keep:
+                tids = tids[-keep:]
+            tmp_path = _USER_FILLS_SEEN_FILE + ".tmp"
+            tmp_dir = os.path.dirname(_USER_FILLS_SEEN_FILE) or "."
+            os.makedirs(tmp_dir, exist_ok=True)
+            with open(tmp_path, "w", encoding="utf-8") as fh:
+                json.dump({"version": 1, "tids": tids}, fh)
+            os.replace(tmp_path, _USER_FILLS_SEEN_FILE)
+            self._user_fills_seen_dirty = False
+            self._user_fills_last_persist = now
+        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+            logger.debug(
+                "[ws:user-fills] could not persist seen-tids to %s: %s",
+                _USER_FILLS_SEEN_FILE, exc,
+            )
 
     def _accept_seq(self, incoming: int) -> bool:
         """Decide whether to accept a frame with the given sequence number.
@@ -545,6 +651,30 @@ class HyperliquidWebSocket:
                 # best we can do.
                 if not tid:
                     tid = f"_synthetic:{coin}:{side}:{sz}:{px}:{t}"
+                # Historical-replay guard. HL replays a backlog window of
+                # recent fills on EVERY (re)subscribe — including process
+                # restarts. A fill older than this process's first
+                # successful subscribe (minus clock-skew grace) is replay,
+                # not a live event: drop it BEFORE dedup so it is neither
+                # enqueued nor added to the seen set. The watermark is set
+                # once and never reset on reconnect, so a fill that truly
+                # happened during a brief disconnect (newer than first
+                # subscribe) still flows through dedup and is handled once.
+                # Watermark == 0.0 means "never subscribed" (e.g. direct
+                # callback in unit tests) → filter disabled.
+                if self._user_fills_first_sub_at > 0 and isinstance(t, (int, float)) and t > 0:
+                    wm_ms = int(self._user_fills_first_sub_at * 1000)
+                    if t < wm_ms - _USER_FILLS_HIST_GRACE_MS:
+                        self._user_fills_hist_dropped += 1
+                        if self._user_fills_hist_dropped <= 3 or self._user_fills_hist_dropped % 50 == 0:
+                            logger.info(
+                                "[ws:user-fills] dropping historical replay "
+                                "(fill_t=%s < watermark=%s, grace=%dms) "
+                                "coin=%s tid=%s total_hist_dropped=%d",
+                                t, wm_ms, _USER_FILLS_HIST_GRACE_MS,
+                                coin, tid, self._user_fills_hist_dropped,
+                            )
+                        continue
                 with self._seen_tids_lock:
                     if tid in self._seen_tids:
                         # Already enqueued — a replayed frame from a
@@ -563,6 +693,10 @@ class HyperliquidWebSocket:
                         )
                         self._seen_tids.clear()
                     self._seen_tids.add(tid)
+                    self._user_fills_seen_dirty = True
+                # Persist the new tid (throttled; best-effort) so a restart
+                # won't re-report this fill.
+                self._persist_seen_tids()
                 # Enqueue a NORMALIZED copy of the fill so the main loop
                 # doesn't have to re-parse the raw SDK shape. We pull
                 # only what the consumer needs (closedPnl/dir/side/coin/
@@ -676,6 +810,18 @@ class HyperliquidWebSocket:
             )
             self._user_fills_user = user
             self._user_fills_sub_id = sub_id
+            # Set the historical-replay watermark on the FIRST successful
+            # subscribe only. Reconnects re-enter this method (sub_id was
+            # reset by _connect_and_subscribe) but the watermark stays at
+            # the original first-subscribe time, so fills genuinely made
+            # during a disconnect gap are not mistaken for replay.
+            if self._user_fills_first_sub_at == 0.0:
+                self._user_fills_first_sub_at = time.time()
+                logger.info(
+                    "[ws:user-fills] replay watermark set at %s "
+                    "(fills older than %dms before this are dropped)",
+                    self._user_fills_first_sub_at, _USER_FILLS_HIST_GRACE_MS,
+                )
             logger.info(
                 "[ws:user-fills] subscribed user=%s sub_id=%s (Phase 1 log-only)",
                 user, sub_id,
@@ -984,6 +1130,9 @@ class HyperliquidWebSocket:
             self._heartbeat_thread.join(timeout=timeout)
         if self._reconnect_thread:
             self._reconnect_thread.join(timeout=timeout)
+        # Final flush of the seen-tids set so a restart inherits every tid
+        # seen this process (best-effort; never blocks shutdown).
+        self._persist_seen_tids(force=True)
         self._stop_internal()
         # Phase 1: clear user-fills subscription state. This is a FINAL
         # stop (vs ``_stop_internal`` which is also called from the

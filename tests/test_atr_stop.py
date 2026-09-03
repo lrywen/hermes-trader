@@ -366,3 +366,84 @@ def test_stale_flat_timeout_cuts_drifters_spares_peakers():
                      entry_atr_pct=1.0)
     v3 = off.check(99.0)
     assert "stale_flat" not in (v3.reason or "")
+
+
+# ── P1: Phase-2 activation must key off the PEAK, not the current mark ───────
+# _phase_label/_active_tier/noise-band gate all classify by peak; the floor
+# activation used the live mark, so a spike that cleared protect_pct followed
+# by a retrace below it (or a restart restoring peak but no persisted floor)
+# would compute the loose phase-1 hard-stop floor on the next check while the
+# label already read "phase2". These tests pin the peak-keyed behaviour.
+def _phase_test_policy(**kw) -> ExitPolicy:
+    # breach_confirm_sec=0 like hard_stop_confirm_sec: a floor breach in the
+    # probe is evaluated immediately instead of waiting for the 4s time gate.
+    return _policy(breach_confirm_sec=0.0, noise_band_enabled=False, **kw)
+
+
+def test_phase2_arms_on_peak_after_restart_long():
+    """Restart-restored tracker: peak>=protect, mark<protect, no last_floor.
+
+    New (peak-keyed) floor = phase-2 trail (tight); old (mark-keyed) floor =
+    phase-1 hard stop (loose). A mark between the two breaches only the tight
+    trail, so exit/floor distinguishes the code paths.
+    """
+    # protect=1.0%, retrace=40%: peak 102 -> trail floor 101.2;
+    # effective max-loss: atr 1.5% x mult 1.5 = 2.25% -> hard floor 97.75.
+    t = DSLTracker("P2R", "long", 100.0, time.time(),
+                   _phase_test_policy(), leverage=1, entry_atr_pct=1.5)
+    t.check(102.0)  # peak clears protect; would persist floor 101.2 live
+    # Simulate a restart that restores peak but loses the persisted floor
+    # (legacy state / flush gap): _last_floor resets to None.
+    d = _tracker_to_dict(t)
+    d.pop("last_floor", None)
+    t2 = _tracker_from_dict(d)
+    assert t2.peak_px == 102.0 and t2._last_floor is None
+    # mark 100.5: below the 101.2 phase-2 trail but far above the 97.75 hard
+    # stop. Peak-keyed floor breaches and exits; mark-keyed would hold.
+    v = t2.check(100.5)
+    assert v.phase == "phase2"
+    assert v.exit and "floor_breach" in v.reason
+    assert v.floor_price == pytest.approx(101.2, abs=1e-6)
+
+
+def test_phase2_arms_on_peak_after_restart_short():
+    """Mirror for shorts: peak favorable = lowest price; trail floor above."""
+    t = DSLTracker("P2RS", "short", 100.0, time.time(),
+                   _phase_test_policy(), leverage=1, entry_atr_pct=1.5)
+    t.check(98.0)  # favorable peak for a short -> trail floor 98.8
+    d = _tracker_to_dict(t)
+    d.pop("last_floor", None)
+    t2 = _tracker_from_dict(d)
+    assert t2.peak_px == 98.0 and t2._last_floor is None
+    # mark 99.5: above the 98.8 short trail but below the 102.25 hard stop.
+    v = t2.check(99.5)
+    assert v.phase == "phase2"
+    assert v.exit and "floor_breach" in v.reason
+    assert v.floor_price == pytest.approx(98.8, abs=1e-6)
+
+
+def test_phase2_floor_never_snaps_back_on_live_retrace():
+    """Live path (floor persisted each tick): with a loose retrace the trail
+    floor sits BELOW protect, so a mark can fall below protect while still
+    above the floor. The monotonic clamp must keep the tight trailing floor
+    even under the old mark-keyed activation — this is the invariant that
+    bounds the P1 change to the restart/no-floor case."""
+    # retrace 0.80: peak 102 -> trail floor 100.4 (below the 101.0 protect).
+    t = DSLTracker("P2L", "long", 100.0, time.time(),
+                   _phase_test_policy(retrace_threshold=0.80),
+                   leverage=1, entry_atr_pct=1.5)
+    t.check(102.0)                      # arm phase-2: floor 100.4
+    v = t.check(100.7)                  # mark below protect (+0.7%), above floor
+    assert not v.exit and v.phase == "phase2"
+    assert v.floor_price == pytest.approx(100.4, abs=1e-6)
+
+
+def test_phase1_hard_floor_before_peak_clears_protect():
+    """Below protect on both peak and mark: floor stays the phase-1 hard
+    stop (guards against an over-tightened activation always choosing trail)."""
+    t = DSLTracker("P1F", "long", 100.0, time.time(),
+                   _phase_test_policy(), leverage=1, entry_atr_pct=1.5)
+    v = t.check(100.3)                  # peak never clears protect_pct=1.0
+    assert v.phase == "phase1"
+    assert not v.exit                   # 100.3 well above the 97.75 hard floor
+    assert v.floor_price == pytest.approx(97.75, abs=1e-6)

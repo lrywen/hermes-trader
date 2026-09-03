@@ -211,6 +211,12 @@ _RESEARCH_LLM_DEFAULTS: dict[str, Any] = {
     "backoff_base_sec": 1.0,
     "backoff_cap_sec": 15.0,
     "continuations": 2,
+    # Audit 2026-09-03 P0-2: hard per-call cap for the SINGLE-LLM FALLBACK
+    # path (debate timed out/failed → _call_ai). The debate path has its own
+    # 18s/24s caps, but the fallback used to inherit the full 60s timeout ×
+    # (retries+1) ≈ 180s worst case, which produced the 30-46s slow-scan
+    # cluster. 0 disables the cap (legacy behaviour).
+    "fallback_timeout_sec": 30.0,
 }
 # leaf -> (legacy env var or None, kind "i"/"f"/"s", minimum guard).
 _RESEARCH_LLM_SPEC: dict[str, tuple[Optional[str], str, float]] = {
@@ -225,6 +231,8 @@ _RESEARCH_LLM_SPEC: dict[str, tuple[Optional[str], str, float]] = {
     "backoff_base_sec": (None, "f", 0.0),
     "backoff_cap_sec": (None, "f", 0.0),
     "continuations": (None, "i", 0),
+    # Audit 2026-09-03 P0-2: 0 = cap disabled (legacy 60s behaviour).
+    "fallback_timeout_sec": ("HERMES_RESEARCH_FALLBACK_TIMEOUT_S", "f", 0.0),
 }
 
 _RESEARCH_FETCH_DEFAULTS: dict[str, Any] = {
@@ -768,15 +776,19 @@ def _build_user_message(
     ])
 
 
-def _call_ai(system_prompt: str, user_message: str, *, trace_id: str = "") -> str:
+def _call_ai(system_prompt: str, user_message: str, *, trace_id: str = "",
+             timeout: Optional[float] = None) -> str:
     """Call the AI for analysis via the in-process OpenRouter path.
 
     Uses the native in-process multi-perspective debate (``_debate_research``,
     enabled via ``debate_research.enabled``) when available; otherwise goes
     straight to the OpenAI-compatible gateway.
+
+    Audit 2026-09-03 P0-2: ``timeout`` (seconds) bounds the per-request read
+    timeout for this fallback call; None falls back to research_llm.timeout_sec.
     """
     t0 = time.time()
-    result = _call_openrouter(system_prompt, user_message)
+    result = _call_openrouter(system_prompt, user_message, timeout=timeout)
     elapsed_ms = int((time.time() - t0) * 1000)
     if result:
         logger.info(
@@ -2243,7 +2255,14 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         )
 
     if parsed is None:
-        ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id)
+        # Audit 2026-09-03 P0-2: cap the single-LLM fallback per-call timeout
+        # so a debate failure cannot be followed by up to 60s×3 on the legacy
+        # path (the observed 30-46s slow-scan cluster). fallback_timeout_sec=0
+        # preserves the legacy 60s behaviour. This is a latency bound only —
+        # no strategy/verdict logic changes.
+        _fb_timeout = float(research_llm_params(config=config).get("fallback_timeout_sec", 0) or 0)
+        ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id,
+                           timeout=(_fb_timeout if _fb_timeout > 0 else None))
         parsed = parse_verdict(
             ai_text, coin, perception,
             atr_abs=_atr_4h,
