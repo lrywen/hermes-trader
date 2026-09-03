@@ -287,8 +287,13 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> lis
 
 
 def get_market_by_coin(coin: str) -> Optional[dict[str, Any]]:
-    """Get a single market by coin name."""
-    for m in get_universe():
+    """Get a single market by coin name.
+
+    P2-4: HIP-3 markets are namespaced ``<dex>:<symbol>`` and only present in
+    the HIP-3-inclusive universe, so include it for namespaced lookups (same
+    convention as ``get_day_ntl_vlm``).
+    """
+    for m in get_universe(include_hip3=(":" in coin)):
         if m["coin"] == coin:
             return m
     return None

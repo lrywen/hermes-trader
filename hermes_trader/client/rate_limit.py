@@ -47,6 +47,7 @@ _ENDPOINT_WEIGHT = {
     "perpDexs": 2,
     "portfolio": 2,
     "userFills": 2,
+    "userFillsByTime": 2,
     "openOrders": 2,
 }
 

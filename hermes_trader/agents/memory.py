@@ -436,6 +436,10 @@ class AgentMemory:
                         return default
                 self._equity = _num("equity", float, 0.0)
                 self._daily_pnl = _num("dailyPnl", float, 0.0)
+                # P2-1: restore intraday PnL peak (absent in old files → 0.0;
+                # the UTC day-roll check on the next tick re-baselines it if the
+                # persisted day_start_ts is from a prior day).
+                self._peak_daily_pnl = _num("peakDailyPnl", float, 0.0)
                 self._start_of_day_equity = _num("startOfDayEquity", float, 0.0)
                 self._day_start_ts = _num("dayStartTs", int, 0)
                 # P0-1: restore cumulative external-flow state (absent in files
@@ -703,6 +707,9 @@ class AgentMemory:
                 "cooldowns": [{"coin": coin, "expires": exp} for coin, exp in self._cooldowns.items()],
                 "equity": self._equity,
                 "dailyPnl": self._daily_pnl,
+                # P2-1: persist the intraday PnL high-water mark so the
+                # give-back breaker survives a restart within the same UTC day.
+                "peakDailyPnl": self._peak_daily_pnl,
                 "startOfDayEquity": self._start_of_day_equity,
                 "dayStartTs": self._day_start_ts,
                 # P0-1: cumulative external capital flow (display-only).

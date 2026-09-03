@@ -177,6 +177,10 @@ def _strip_doc(p: dict) -> dict:
 
 
 def _auto_pick(equity: float) -> str:
+    # P2-5: every equity-based preset is a LEGACY risk preset (see
+    # LEGACY_RISK_PRESETS). The mapping is retained only so an explicit
+    # --allow-legacy-risk-preset still reproduces the old sizing tiers; the
+    # default path is refused up-front in cmd_apply with guidance.
     if equity < 500: return "small_aggressive"
     if equity < 2000: return "medium_balanced"
     return "large_steady"
@@ -211,6 +215,24 @@ def cmd_apply(
     if name is None:
         if account_size is None:
             print("provide --account-size or a preset name")
+            return 2
+        # P2-5: equity auto-pick only maps to legacy risk presets, which are
+        # refused by default. Refuse up-front with actionable guidance instead
+        # of printing "auto-picked …" and then rejecting it (the old flow made
+        # `apply --account-size N` fail with a contradictory message).
+        if not allow_legacy_risk_preset:
+            picked = _auto_pick(account_size)
+            print(
+                f"auto-pick for ${account_size:.0f} resolves to legacy risk preset "
+                f"`{picked}`, which is refused by default because it overwrites "
+                "audited live-risk gates.\n"
+                "Options:\n"
+                "  • apply a non-risk overlay preset explicitly "
+                "(hip3_only / crypto_only / both_classes)\n"
+                "  • name a preset yourself: `apply <preset> --allow-legacy-risk-preset`\n"
+                "  • rerun with --allow-legacy-risk-preset to intentionally use "
+                f"`{picked}`"
+            )
             return 2
         name = _auto_pick(account_size)
         print(f"auto-picked preset for ${account_size:.0f}: {name}\n")

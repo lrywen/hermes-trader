@@ -185,9 +185,13 @@ def live_sized_notional(
         risk_pct = float(atr_cfg.get("risk_per_trade_pct", 0.0075) or 0.0)
         basis = str(atr_cfg.get("sizing_basis", "atr_stop") or "atr_stop").lower()
         if basis in ("primary_stop", "dsl_stop"):
+            # P2-9: no inline `or 2.0 / or 40.0` fallbacks — those stale values
+            # diverged from the audited live gates (executor.py uses cfg_get with
+            # the canonical default). Let a missing/None value surface from
+            # cfg_get like the live path and simulate_dsl_exit do.
             stop_frac = min(
-                float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg) or 2.0),
-                float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg) or 40.0) / max(1, coin_lev),
+                float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg)),
+                float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg)) / max(1, coin_lev),
             ) / 100.0
             if equity <= 0 or risk_pct <= 0 or stop_frac <= 0:
                 return 0.0, "primary_stop_invalid"

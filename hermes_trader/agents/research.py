@@ -2133,23 +2133,31 @@ def _account_context(
 
     if user:
         state = account_snapshot if account_snapshot is not None else fetch_account_state(user, include_hip3=True)
-        equity = float(state.get("equity", "0"))
+        # P2-7: `or "0"` guards against JSON null (HL can return None, where the
+        # "0" default alone does not kick in) so float(None) can't crash research.
+        equity = float(state.get("equity") or "0")
         dex_equity = state.get("dex_equity") or {}
         if account_snapshot is None:
             memory.update_equity(equity)
 
-        open_positions = [
-            {
-                "coin": p.get("position", {}).get("coin", ""),
-                "side": "long" if float(p.get("position", {}).get("szi", "0")) > 0 else "short",
-                "size_usd": float(p.get("position", {}).get("positionValue", "0")) or (
-                    abs(float(p.get("position", {}).get("szi", "0"))) *
-                    float(p.get("position", {}).get("entryPx", "0"))
-                ),
-            }
-            for p in (state.get("asset_positions") or [])
-            if float(p.get("position", {}).get("szi", "0")) != 0
-        ]
+        open_positions = []
+        for p in (state.get("asset_positions") or []):
+            pos = p.get("position") or {}
+            try:
+                szi = float(pos.get("szi") or "0")
+                position_value = float(pos.get("positionValue") or "0")
+                entry_px = float(pos.get("entryPx") or "0")
+            except (TypeError, ValueError):
+                continue
+            if szi == 0:
+                continue
+            open_positions.append(
+                {
+                    "coin": pos.get("coin", ""),
+                    "side": "long" if szi > 0 else "short",
+                    "size_usd": position_value or (abs(szi) * entry_px),
+                }
+            )
 
     return equity, dex_equity, open_positions
 

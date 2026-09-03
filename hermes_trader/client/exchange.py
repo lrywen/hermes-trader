@@ -574,15 +574,17 @@ def _is_isolated_only(coin: str) -> bool:
     Reads the per-market meta (main dex or the namespace-prefix HIP-3 dex)
     and returns the `onlyIsolated` flag. Defaults to False (cross) if lookup
     fails so native crypto behavior is preserved.
+
+    P2-13: goes through _cached_universe() (TTL + H11 stampede lock + stale
+    fallback) instead of hitting info.meta() directly on every leverage set.
     """
-    info = _get_info()
     try:
-        for m in info.meta().get("universe", []):
+        for m in _cached_universe():
             if m["name"] == coin:
                 return bool(m.get("onlyIsolated", False))
         if ":" in coin:
             dex = coin.split(":", 1)[0]
-            for m in info.meta(dex=dex).get("universe", []):
+            for m in _cached_universe(dex=dex):
                 if m["name"] == coin:
                     return bool(m.get("onlyIsolated", False))
     except Exception as e:
