@@ -42,3 +42,26 @@ markers = [
     "online: exercises the live Hyperliquid public API (read-only); deselected by default (run with: pytest -m online)",
     "live: real-money e2e — places orders and calls the billable LLM; deselected by default and additionally requires HERMES_E2E=1 (run with: HERMES_E2E=1 pytest -m live)",
 ]
+
+# P1-2: explicit, deterministic lint contract. Pinning the rule set here keeps
+# CI (clean runner) and every developer machine in sync regardless of ruff's
+# upstream default changes (e.g. 0.16 expanded the default set) or global user
+# config. We deliberately opt into high-signal, low-noise checks only — pyflakes
+# (F, real bugs: unused imports/vars, redefinitions, malformed literals) and
+# import sorting (I) — and leave the large stylistic backlog (line length,
+# blind-except, pyupgrade modernization) out of the gate for now.
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["F", "I", "RUF100"]
+
+[tool.ruff.lint.per-file-ignores]
+# Dev/analysis tooling: unused locals and redefined fixtures are noise here.
+"scripts/*" = ["F841", "F811"]
+# Tests commonly redefine fixtures/helpers and bind results for readability.
+"tests/*" = ["F841", "F811"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["hermes_trader"]

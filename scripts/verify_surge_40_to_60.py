@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import logging
 import sys
-from pathlib import Path
 
 from hermes_trader.surge_postmortem import (
     POSTMORTEM_DIR,

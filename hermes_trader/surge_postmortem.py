@@ -537,7 +537,7 @@ def _render_markdown(
         "blocked": "被风控拦截",
         "blocked_bypass": "被风控拦截（绕过）",
         "shadow_mode_would_execute": "影子模式（未真实执行）",
-        "no_atr_no_stop": "无 ATR 无法设止损",
+        "no_atr_no_stop": "无 ATR 无法设止损",  # noqa: F601  (P1-2 baseline: duplicate of line above; identical value, harmless)
     }
 
     def _zh_verdict(v: Any) -> str:

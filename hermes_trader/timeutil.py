@@ -9,7 +9,7 @@ from __future__ import annotations
 import importlib.util
 import os
 import stat
-from datetime import datetime, timezone, date
+from datetime import date, datetime, timezone
 from typing import Union
 
 _SHARED = os.path.expanduser("~/.hermes-trading")

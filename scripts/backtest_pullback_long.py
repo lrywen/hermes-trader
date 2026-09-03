@@ -28,7 +28,7 @@ import argparse
 import math
 import os
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -47,7 +47,7 @@ if _env.is_file():
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
 from hermes_trader.indicators import math as ind
@@ -413,7 +413,7 @@ def _print_report(base: Dict[str, Any], pb: Dict[str, Any],
     _row("Return on equity", "pnl_pct", pct=True)
 
     # Pullback-only breakdown
-    print(f"\n  --- Pullback-long bypass trades (only in PULLBACK column) ---")
+    print("\n  --- Pullback-long bypass trades (only in PULLBACK column) ---")
     if pb.get("pb_n", 0) > 0:
         print(f"  Pullback-admitted trades   : {pb['pb_n']}")
         print(f"  Pullback win rate          : {pb['pb_win_rate']:.1f}%")
@@ -421,7 +421,7 @@ def _print_report(base: Dict[str, Any], pb: Dict[str, Any],
     else:
         print("  (no pullback trades fired)")
 
-    print(f"\n  Exit reasons:")
+    print("\n  Exit reasons:")
     for c in cols:
         if c["n"] > 0:
             print(f"    {c['label']}: {c['exit_reasons']}")

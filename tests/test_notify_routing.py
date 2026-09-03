@@ -15,15 +15,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
-import io
 import json
 from unittest import mock
 
 import pytest
 
-from hermes_trader import notify
-from hermes_trader import notify_dispatch
-
+from hermes_trader import notify, notify_dispatch
 
 PRIMARY_URL = "https://open.feishu.cn/hook/PRIMARY"
 PRIMARY_SECRET = "primary-secret"

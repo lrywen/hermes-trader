@@ -42,7 +42,7 @@ import json
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 COIN = "BOME"
 
@@ -247,7 +247,7 @@ def main() -> int:
     args = ap.parse_args()
 
     data_dir = _resolve_data_dir(args.data_dir)
-    print(f"=== BOME floor=0 retrospective audit ===")
+    print("=== BOME floor=0 retrospective audit ===")
     print(f"data_dir: {data_dir}")
 
     ev = audit_events(data_dir)
@@ -264,20 +264,20 @@ def main() -> int:
         print(f"        {n:>3}× {reason}")
     print(f"    close events ............ {len(ev['closes'])}")
 
-    print(f"\n[2] Outcome store (.agent-memory.json)")
+    print("\n[2] Outcome store (.agent-memory.json)")
     print(f"    present ................. {mem['memory_present']}")
     print(f"    total closes/trades ..... {mem.get('total_closes',0)} / "
           f"{mem.get('total_trades',0)}")
     print(f"    BOME closes/trades ...... {mem['bome_closes']} / {mem['bome_trades']}")
 
-    print(f"\n[3] trading-loop.log DSL floor + backup SL")
+    print("\n[3] trading-loop.log DSL floor + backup SL")
     print(f"    BOME floor updates ...... {logs['floor_updates']}")
     if logs["floor_updates"]:
         print(f"    floor price range ....... {logs['floor_min']} → {logs['floor_max']}")
     print(f"    invalid(<=0/wrong-side).. {len(logs['non_positive_or_invalid_floors'])}")
     print(f"    BOME backup SL placements {logs['backup_sl_placements']}")
 
-    print(f"\n[4] Source defense presence")
+    print("\n[4] Source defense presence")
     for k, v in src.items():
         print(f"    [{'OK' if v else 'MISSING'}] {k}")
 
@@ -287,7 +287,7 @@ def main() -> int:
     bad_floors = len(logs["non_positive_or_invalid_floors"])
     defenses_ok = all(src.values())
 
-    print(f"\n=== VERDICT ===")
+    print("\n=== VERDICT ===")
     if not real_position:
         print("    BOME had NO real position in the retained window: every BOME")
         print("    signal was blocked by gates (max-positions / runner_gate / shadow).")

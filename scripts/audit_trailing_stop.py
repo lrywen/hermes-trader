@@ -27,7 +27,7 @@ import statistics
 import sys
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 os.environ["HERMES_BACKTEST"] = "1"
 
@@ -43,13 +43,13 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config import get_config  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
+from hermes_trader.agents.config import get_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
+from hermes_trader.models.types import Candle
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backtest_ab_compare import Trade, _simulate, ROUND_TRIP_FEE_BPS  # noqa: E402
+from backtest_ab_compare import ROUND_TRIP_FEE_BPS, Trade, _simulate
 
 
 def _mfe_mae(candles: List[Candle], t: Trade) -> Dict[str, float]:
@@ -241,13 +241,13 @@ def main() -> int:
         print(f"  PnL from trailing_stop: ${pnl_ts:+.2f}  "
               f"WR={wins_ts/len(ts_trades)*100:.1f}%")
 
-        print(f"\n  --- Profit distribution (directional %, fee stripped) ---")
+        print("\n  --- Profit distribution (directional %, fee stripped) ---")
         _summarize(realized_pcts, "Realized at exit")
         _summarize(mfes, "MFE (peak favorable)")
         _summarize(maes, "MAE (peak adverse)")
         _summarize(givebacks, "Peak-to-exit giveback")
 
-        print(f"\n  --- Holding period (1h bars) ---")
+        print("\n  --- Holding period (1h bars) ---")
         _summarize([float(h) for h in holds], "Bars held", fmt="{:.1f}")
         if holds_win:
             print(f"    winners: n={len(holds_win)}  median={statistics.median(holds_win):.1f}h  "
@@ -256,7 +256,7 @@ def main() -> int:
             print(f"    losers : n={len(holds_loss)}  median={statistics.median(holds_loss):.1f}h  "
                   f"mean={statistics.mean(holds_loss):.1f}h")
 
-        print(f"\n  --- Trailing_stop trades by hold bucket ---")
+        print("\n  --- Trailing_stop trades by hold bucket ---")
         print(f"  {'bucket':<8} {'n':>4} {'WR':>6} {'PnL':>10} {'avg MFE':>9} "
               f"{'avg real':>9} {'avg give':>9}")
         print(f"  {'-'*8} {'-'*4} {'-'*6} {'-'*10} {'-'*9} {'-'*9} {'-'*9}")

@@ -10,8 +10,6 @@ consumers (``get_hl_atr``, ``get_atr_hist_mean_pct``) treat a failed gate as
 
 import time
 
-import pytest
-
 from hermes_trader.client.hl_client import assess_candle_quality
 from hermes_trader.models.types import Candle
 

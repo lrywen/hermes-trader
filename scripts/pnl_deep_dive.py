@@ -11,7 +11,6 @@ from typing import Any, Callable, Iterable
 
 from _memory_io import load_memory
 
-
 Row = dict[str, Any]
 
 

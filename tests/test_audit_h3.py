@@ -9,9 +9,7 @@ runtime chokepoint and the sixth switch (ta_sidestep_force_execute).
 
 from __future__ import annotations
 
-from hermes_trader.agents import executor
-from hermes_trader.agents import config_schema
-
+from hermes_trader.agents import config_schema, executor
 
 # ── schema / executor key lists stay in sync (six switches) ──────────────
 

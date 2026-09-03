@@ -39,13 +39,31 @@ def _load_env_local_early() -> None:
 
 _load_env_local_early()
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response  # noqa: E402
-from fastapi.middleware.cors import CORSMiddleware                   # noqa: E402
-from fastapi.responses import JSONResponse, StreamingResponse         # noqa: E402
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from hyperliquid.utils.types import Cloid
 
-from hermes_trader.metrics import render_metrics                      # noqa: E402
-
-from hermes_trader import __version__, dashboard, session_log         # noqa: E402
+from hermes_trader import __version__, dashboard, session_log
+from hermes_trader.agents.config_schema import validate_config_updates
+from hermes_trader.agents.config_store import _deep_merge, read_agent_config, update_agent_config
+from hermes_trader.agents.executor import (
+    _EXEC_LOCK,
+    _IN_FLIGHT_COINS,
+    close_position_market,
+    maybe_execute,
+)
+from hermes_trader.agents.memory import memory
+from hermes_trader.agents.perception import scan_once
+from hermes_trader.agents.research import research
+from hermes_trader.agents.risk_gates import GateContext, eval_all_gates
+from hermes_trader.client.hl_client import (
+    fetch_account_state,
+    fetch_all_mids,
+    fetch_hl_candles,
+    resolve_user_address,
+)
+from hermes_trader.client.universe import get_universe
 from hermes_trader.dashboard import (
     _client_ip,
     _require_operator,
@@ -54,26 +72,7 @@ from hermes_trader.dashboard import (
     require_operator_write,
     updates_arm_force_override,
 )
-from hermes_trader.agents.config_store import read_agent_config, update_agent_config, _deep_merge  # noqa: E402
-from hermes_trader.agents.config_schema import validate_config_updates  # noqa: E402
-from hermes_trader.agents.executor import (  # noqa: E402
-    _EXEC_LOCK,
-    _IN_FLIGHT_COINS,
-    close_position_market,
-    maybe_execute,
-)
-from hermes_trader.agents.risk_gates import GateContext, eval_all_gates       # noqa: E402
-from hermes_trader.agents.memory import memory                        # noqa: E402
-from hermes_trader.agents.perception import scan_once                 # noqa: E402
-from hermes_trader.agents.research import research                    # noqa: E402
-from hermes_trader.client.hl_client import (                          # noqa: E402
-    fetch_account_state,
-    fetch_all_mids,
-    fetch_hl_candles,
-    resolve_user_address,
-)
-from hermes_trader.client.universe import get_universe                # noqa: E402
-from hyperliquid.utils.types import Cloid
+from hermes_trader.metrics import render_metrics
 
 # ── Logging ────────────────────────────────────────────────────────────────────
 
@@ -127,6 +126,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     # first research request doesn't pay cold-start HTTP latency for 3 TFs.
     def _warm_candles() -> None:
         from concurrent.futures import ThreadPoolExecutor
+
         from hermes_trader.client.hl_client import fetch_hl_candles
         tickers = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "LINK", "DOT"]
         t0 = time.monotonic()
@@ -393,7 +393,7 @@ def _flatten_asset_positions(asset_positions: list) -> list[dict]:
                 "side": "long" if _szi > 0 else "short",
                 "size_usd": abs(_szi) * _px,
             })
-        except Exception as e:  # noqa: BLE001 — one bad row must not zero the book
+        except Exception as e:
             logger.warning(
                 "[gates] flatten assetPositions row failed, skipping: %s: %s",
                 type(e).__name__, e,
@@ -409,7 +409,7 @@ def _flatten_asset_positions(asset_positions: list) -> list[dict]:
                     _coin,
                 )
                 flat.append({"coin": _coin, "side": _side, "size_usd": 0})
-    except Exception as e:  # noqa: BLE001 — backstop is best-effort
+    except Exception as e:
         logger.debug("[gates] active_position_coins backstop skipped: %s: %s",
                      type(e).__name__, e)
     return flat
@@ -1229,7 +1229,7 @@ async def place_order(request: Request) -> JSONResponse:
             _sl_mult_g = float(cfg.get("sl_atr_mult", 1.5) or 1.5)
             if mid_price > 0 and atr > 0 and _sl_mult_g > 0:
                 stop_distance_pct = (atr * _sl_mult_g) / mid_price * 100.0
-        except Exception as e:  # noqa: BLE001 — pre-trade estimate is best-effort
+        except Exception as e:
             logger.debug(
                 "[manual-order] stop-distance estimate failed for %s: %s: %s",
                 coin, type(e).__name__, e,
@@ -1381,7 +1381,7 @@ async def place_order(request: Request) -> JSONResponse:
                     )
         except HTTPException:
             raise
-        except Exception as _pre_e:  # noqa: BLE001 — fail-open re-check
+        except Exception as _pre_e:
             logger.warning(
                 "[manual-order] H-2 pre-place re-check failed (fail-open) for %s: %r",
                 coin, _pre_e,
@@ -1546,7 +1546,7 @@ async def flatten_all(request: Request) -> JSONResponse:
         # on the L1 clearinghouses too — a default fetch would miss them and
         # report a flat book while HIP-3 exposure stays open.
         state = fetch_account_state(user, include_hip3=True)
-    except Exception as e:  # noqa: BLE001 — emergency path must not 500
+    except Exception as e:
         raise HTTPException(502, f"account fetch failed: {e}")
 
     # Coin names come straight from the exchange payload, so HIP-3 names
@@ -1580,7 +1580,7 @@ async def flatten_all(request: Request) -> JSONResponse:
                 flattened.append(coin)
             else:
                 failed.append({"coin": coin, "error": result.get("error")})
-        except Exception as e:  # noqa: BLE001 — isolate one coin's failure
+        except Exception as e:
             failed.append({"coin": coin, "error": str(e)})
 
     await _append_session_log({

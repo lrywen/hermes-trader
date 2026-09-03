@@ -13,7 +13,13 @@ Sources (all read-only):
 
 Usage: python3 scripts/movers_attribution.py [--hours 6]
 """
-import json, os, re, sys, time, glob
+import glob
+import json
+import os
+import re
+import sys
+import time
+
 from _memory_io import load_memory
 
 HOURS = 6

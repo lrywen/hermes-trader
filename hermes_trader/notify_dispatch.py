@@ -71,7 +71,7 @@ def dispatch(record: dict[str, Any]) -> None:
             from hermes_trader import metrics
 
             metrics.NOTIFY_DISPATCH_ERRORS.inc()
-        except Exception:  # noqa: BLE001 — metrics must never mask the original
+        except Exception:
             pass
 
 

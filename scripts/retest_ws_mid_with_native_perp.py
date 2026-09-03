@@ -101,10 +101,10 @@ def main() -> int:
     logging.getLogger().addHandler(cap)
     log = logging.getLogger("retest")
 
-    from hermes_trader.client.hl_client import start_ws_mids, stop_ws_mids, fetch_account_state
-    from hermes_trader.client.exchange import get_all_hl_mids
     from hermes_trader.agents import dsl_exit
     from hermes_trader.agents.dsl_exit import DSLTracker, check_all_positions
+    from hermes_trader.client.exchange import get_all_hl_mids
+    from hermes_trader.client.hl_client import fetch_account_state, start_ws_mids, stop_ws_mids
 
     failures: list[str] = []
 

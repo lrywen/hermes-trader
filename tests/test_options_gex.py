@@ -2,8 +2,13 @@
 
 from hermes_trader.agents import options_gex
 from hermes_trader.agents.options_gex import (
-    OptRow, GexReport, parse_occ, underlying_for, compute_gex, compute_max_pain,
+    GexReport,
+    OptRow,
+    compute_gex,
+    compute_max_pain,
     gex_override_caution,
+    parse_occ,
+    underlying_for,
 )
 
 

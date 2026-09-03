@@ -26,9 +26,6 @@ reference peak exists, then fails CLOSED once a real peak is recorded.
 import json
 import time
 
-import pytest
-
-
 # ── helpers ───────────────────────────────────────────────────────────────
 
 def _ctx(**kw):
@@ -44,8 +41,8 @@ def _ctx(**kw):
 def _isolated_memory(monkeypatch, tmp_path):
     """AgentMemory pointed at tmp paths (memory + lock + events), hydrated,
     and installed as the module-level singleton the gates import lazily."""
-    from hermes_trader.agents import memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import memory as memory_mod
     mem_path = str(tmp_path / ".agent-memory.json")
     monkeypatch.setattr(memory_mod, "MEMORY_FILE", mem_path)
     monkeypatch.setattr(memory_mod, "MEMORY_LOCK_FILE", mem_path + ".lock")

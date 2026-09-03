@@ -632,7 +632,7 @@ def _round_price_for_hl(price: float, sz_decimals: int, is_perp: bool = True,
     match → "could not immediately match" rejection. Passing None falls
     back to ROUND_HALF_UP for non-order callsites.
     """
-    from decimal import Decimal, ROUND_HALF_UP, ROUND_CEILING, ROUND_FLOOR, getcontext
+    from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_UP, Decimal, getcontext
     getcontext().prec = 28
 
     if price <= 0:

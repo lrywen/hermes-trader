@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ── 1. _parse_liquidation_px defensive parsing ───────────────────────────
 
 
@@ -325,6 +324,7 @@ class TestExecutePlanLiqGateIntegration:
         flow the executor uses (in-flight add → gate → conditional
         discard)."""
         import uuid as _uuid
+
         from hermes_trader.agents import executor
         from hermes_trader.client import hl_client
         aid = str(_uuid.uuid4())

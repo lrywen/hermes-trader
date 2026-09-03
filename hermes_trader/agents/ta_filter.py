@@ -11,9 +11,9 @@ import os
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Optional
 
-from hermes_trader.indicators.math import adx, atr, candle_val, ema, obv, rsi
 from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.indicators.math import adx, atr, candle_val, ema, obv, rsi
 from hermes_trader.models.types import Candle
 
 logger = logging.getLogger(__name__)
@@ -315,7 +315,7 @@ def _late_entry_params() -> dict[str, Any]:
         from hermes_trader.agents.config_store import cfg_get
 
         block = cfg_get("ta_late_entry", default={}) or {}
-    except Exception:  # noqa: BLE001 — config layer must never break TA
+    except Exception:
         block = {}
     return block if isinstance(block, dict) else {}
 
@@ -390,7 +390,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
         }
         # momentumBurst is direction-agnostic by name; disambiguate using the
         # extension sign (price above EMA21 => the burst was up).
-        burst_up = "momentumBurst" in fired_names and (extension or 0) > 0
+        burst_up = "momentumBurst" in fired_names and (extension or 0) > 0  # noqa: F841  (P1-2 baseline: symmetric with burst_down; trading logic untouched)
         burst_down = "momentumBurst" in fired_names and (extension or 0) < 0
         intend_long = bool(bullish_triggers) and not burst_down
         intend_short = bool(fired_names & {"downtrendMomentum"}) or burst_down
@@ -426,8 +426,10 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                 # reconciliation scores both layers from one file.
                 try:
                     from datetime import datetime, timezone
+
                     from hermes_trader.agents.risk_gates import (
-                        _record_late_entry_shadow, late_entry_shadow_path,
+                        _record_late_entry_shadow,
+                        late_entry_shadow_path,
                     )
                     rec = {
                         "timestamp": datetime.now(timezone.utc).strftime(
@@ -456,7 +458,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                         "pnl_usd": None,
                     }
                     _record_late_entry_shadow(rec, late_entry_shadow_path(le_params))
-                except Exception:  # noqa: BLE001 — shadow logging must never break the screen
+                except Exception:
                     logger.debug(
                         f"[ta_filter] {coin} late-entry shadow write failed",
                         exc_info=True,

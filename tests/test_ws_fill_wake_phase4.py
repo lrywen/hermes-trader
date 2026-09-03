@@ -30,9 +30,7 @@ import time
 import pytest
 
 from hermes_trader.client import hl_client
-from hermes_trader.client import ws_client as ws_client_mod
 from hermes_trader.client.ws_client import HyperliquidWebSocket
-
 
 # ---------------------------------------------------------------------------
 # Fixtures / helpers

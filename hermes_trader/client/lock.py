@@ -5,15 +5,15 @@ scan crashed: fcntl flock is released by the kernel on process death, so a
 stale lock file is reclaimed on the next acquire.
 """
 
-import fcntl
 import calendar
+import fcntl
 import json
 import logging
 import os
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator, Optional, Any
+from typing import Any, Iterator, Optional
 
 logger = logging.getLogger(__name__)
 

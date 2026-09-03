@@ -20,13 +20,10 @@ state-changing requests. This file pins that down:
 
 from __future__ import annotations
 
-import os
 import inspect
 
 import pytest
-from fastapi import Depends
 from fastapi.testclient import TestClient
-
 
 # Module-level operator token; we set the env var at fixture setup so
 # ``_require_operator`` accepts our Authorization: Bearer header.
@@ -138,7 +135,6 @@ class TestWriteRouteInventory:
     @pytest.mark.parametrize("method,path", _WRITE_ROUTES)
     def test_write_route_uses_require_operator_write(self, _env, method, path):
         from hermes_trader.server import app
-        from hermes_trader.dashboard import require_operator_write
         route = _find_route(app, method, path)
         assert route is not None, f"{method} {path} not registered"
         deps = _route_dependencies(route)
@@ -153,7 +149,6 @@ class TestWriteRouteInventory:
     @pytest.mark.parametrize("method,path", _READ_ROUTES)
     def test_read_route_still_on_require_operator(self, _env, method, path):
         from hermes_trader.server import app
-        from hermes_trader.dashboard import _require_operator
         route = _find_route(app, method, path)
         assert route is not None, f"{method} {path} not registered"
         deps = _route_dependencies(route)
@@ -175,7 +170,7 @@ def test_require_operator_write_passes_write_true(_env):
     """The wrapper must internally invoke _require_operator with write=True.
     Pinned by signature inspection so a refactor cannot silently drop the
     write flag again."""
-    from hermes_trader.dashboard import _require_operator, require_operator_write
+    from hermes_trader.dashboard import require_operator_write
     src = inspect.getsource(require_operator_write)
     assert "_require_operator" in src
     assert "write=True" in src, (

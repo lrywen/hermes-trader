@@ -31,9 +31,11 @@ import logging
 import time
 from typing import Literal, Optional
 
-from hermes_trader.client.hl_client import closed_candles_only, fetch_hl_candles
-from hermes_trader.indicators.math import adx, atr as _atr_ind, ema, obv as _obv_ind
 from hermes_trader.agents.config_store import cfg_get
+from hermes_trader.client.hl_client import closed_candles_only, fetch_hl_candles
+from hermes_trader.indicators.math import adx, ema
+from hermes_trader.indicators.math import atr as _atr_ind
+from hermes_trader.indicators.math import obv as _obv_ind
 
 logger = logging.getLogger(__name__)
 

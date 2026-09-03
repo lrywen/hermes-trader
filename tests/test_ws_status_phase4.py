@@ -24,9 +24,7 @@ from unittest import mock
 
 import pytest
 
-from hermes_trader import notify, notify_dispatch
-from hermes_trader import dashboard
-
+from hermes_trader import dashboard, notify, notify_dispatch
 
 # ---------------------------------------------------------------------------
 # Fixtures

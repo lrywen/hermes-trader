@@ -28,7 +28,6 @@ import pytest
 
 from hermes_trader.agents.config_schema import validate_config_updates
 
-
 _FORCE_OVERRIDE_KEYS = (
     "composite_force_execute",
     "breakout_force_execute",

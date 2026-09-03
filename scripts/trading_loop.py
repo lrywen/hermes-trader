@@ -15,12 +15,12 @@ Flags (tolerant — unknown flags are ignored so legacy callers keep working):
                     `nohup ... &` / Hermes background. Kept for skill scripts.
 """
 import argparse
+import logging
 import math
 import os
 import sys
 import threading
 import time
-import logging
 from concurrent.futures import ThreadPoolExecutor
 
 # Load .env.local (CWD-relative, matches skill restart command).
@@ -66,21 +66,44 @@ except Exception as _loop_log_err:
     logging.getLogger(__name__).warning(
         "loop file handler disabled (stderr only): %s", _loop_log_err)
 
-from hermes_trader.agents.perception import scan_once, signal_fingerprint
-from hermes_trader.agents.ta_filter import analyze_perception
-from hermes_trader.agents.research import research
-from hermes_trader.agents.executor import close_position_market, maybe_execute, monitor_exits, route_verdict, sync_exchange_sl, retry_pending_sl, maybe_roe_blowup_halt
-from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
+from hermes_trader.agents.executor import (
+    close_position_market,
+    maybe_roe_blowup_halt,
+    monitor_exits,
+    retry_pending_sl,
+    route_verdict,
+    sync_exchange_sl,
+)
 from hermes_trader.agents.memory import memory
-from hermes_trader.client.exchange import get_all_hl_mids, prewarm_meta_cache, mid_feed_age_seconds, MID_FEED_MAX_STALE_S
+from hermes_trader.agents.perception import scan_once, signal_fingerprint
+from hermes_trader.agents.research import research
+from hermes_trader.agents.ta_filter import analyze_perception
+from hermes_trader.client.exchange import (
+    MID_FEED_MAX_STALE_S,
+    get_all_hl_mids,
+    mid_feed_age_seconds,
+    prewarm_meta_cache,
+)
+from hermes_trader.client.hl_client import (
+    drain_ws_user_fills,
+    fetch_account_state,
+    fetch_aggregate_contributions_since,
+    resolve_user_address,
+    start_ws_mids,
+    start_ws_user_fills,
+    stop_ws_mids,
+    stop_ws_user_fills,
+    wait_for_ws_user_fills,
+    ws_feed_age_seconds,
+)
 from hermes_trader.client.universe import get_universe
-from hermes_trader.client.hl_client import fetch_account_state, fetch_aggregate_contributions_since, resolve_user_address, start_ws_mids, stop_ws_mids, start_ws_user_fills, stop_ws_user_fills, drain_ws_user_fills, ws_feed_age_seconds, wait_for_ws_user_fills
 from hermes_trader.positions_snapshot import write_snapshot
+from hermes_trader.realtime_feed import FeedStatusTracker, classify_feed_status, dynamic_scan_interval
 from hermes_trader.session_log import append as log_event
-from hermes_trader.surge_postmortem import SurgeDetector, SurgeConfig
-from hermes_trader.realtime_feed import dynamic_scan_interval, classify_feed_status, FeedStatusTracker
+from hermes_trader.surge_postmortem import SurgeConfig, SurgeDetector
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +166,7 @@ def _pre_exec_flush(timeout_s: float = 3.0) -> None:
         t.join(timeout_s)
         if t.is_alive():
             logger.warning("[watchdog] pre-exec flush timed out "
-                           f"(lock held by hung main thread) — proceeding to re-exec")
+                           "(lock held by hung main thread) — proceeding to re-exec")
 
 
 def _watchdog() -> None:
@@ -839,7 +862,7 @@ def phantom_crash_unconfirmed(equity, prev_eq, prev_ts, *,
     # Crash-sized drop. Only call the log query on this (rare) path.
     if query_fn is None:
         return False
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     start_iso = (datetime.fromtimestamp(_now, tz=timezone.utc)
                  - timedelta(seconds=lookback_s)
                  ).strftime("%Y-%m-%dT%H:%M:%SZ")

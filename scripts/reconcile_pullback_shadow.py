@@ -28,7 +28,7 @@ os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.models.types import Candle
 
@@ -168,7 +168,7 @@ def main() -> int:
         for r in results:
             by_reason[r["exit_reason"]] = by_reason.get(r["exit_reason"], 0) + 1
         print(f"  exits      : {by_reason}")
-        print(f"\n  per-signal detail:")
+        print("\n  per-signal detail:")
         for r in sorted(results, key=lambda x: x["timestamp"]):
             print(f"    {r['timestamp']}  {r['coin']:8}  "
                   f"entry={r.get('entry_px',0):.4f}  exit={r['exit_px']:.4f}  "

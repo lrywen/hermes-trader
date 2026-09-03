@@ -835,7 +835,7 @@ def _print_report(
     _row("Total PnL", "pnl", dollar=True)
     _row("Return on equity", "pnl_pct", pct=True)
 
-    print(f"\n  --- Entry quality (lower RSI extremes / extension = better) ---")
+    print("\n  --- Entry quality (lower RSI extremes / extension = better) ---")
     _row("RSI at entry (mean)", "rsi_mean", fmt="{:.1f}")
     _row("RSI >75 entries", "rsi_overbought_pct", pct=True)
     _row("RSI <25 entries", "rsi_oversold_pct", pct=True)
@@ -858,7 +858,7 @@ def _print_report(
                 print(f"    Winrate: {exc_wr:.1f}%")
                 print(f"    Avg PnL: ${exc_pnl/len(exc_trades):+.3f}/trade")
 
-    print(f"\n  --- Exit reason distribution ---")
+    print("\n  --- Exit reason distribution ---")
     all_reasons = sorted(set(
         list(old.get("exit_reasons", {}).keys())
         + list(strict.get("exit_reasons", {}).keys())
@@ -891,7 +891,7 @@ def _print_report(
 
     # Per-regime breakdown for REGIME variant (actual labels from Trade)
     if regime["n"] > 0:
-        print(f"\n  --- REGIME: entry distribution by regime label ---")
+        print("\n  --- REGIME: entry distribution by regime label ---")
         regime_counts: Counter = Counter()
         regime_pnl: Dict[str, float] = {}
         regime_wins: Dict[str, int] = {}
@@ -921,18 +921,18 @@ def _print_report(
                       f"ext={t.ext_atr_at_entry:+.1f} sz×{t.size_mult:.1f}  "
                       f"${t.pnl_usd:+.2f}  {t.exit_reason}")
 
-    print(f"\n  Caveats:")
-    print(f"    - AI verdict substituted with deterministic heuristic")
+    print("\n  Caveats:")
+    print("    - AI verdict substituted with deterministic heuristic")
     if cost_note:
         print(f"    - {cost_note}")
     else:
         print(f"    - Round-trip fee {ROUND_TRIP_FEE_BPS:.1f} bps, no slippage/funding")
-    print(f"    - One position per coin; max_concurrent not enforced across coins")
-    print(f"    - No cooldown, no compounding, no equity curve dynamics")
-    print(f"    - REGIME: CHOP 0.5x size (A); TREND RSI 40-60 halved (B); "
-          f"STRONG_TREND/TREND max_loss 0.8% vs CHOP/NEUTRAL 0.4% (C)")
-    print(f"    - STRONG_TREND widens RSI to 95/5 and ext to 3.5 ATR")
-    print(f"    - Past performance does NOT imply future results")
+    print("    - One position per coin; max_concurrent not enforced across coins")
+    print("    - No cooldown, no compounding, no equity curve dynamics")
+    print("    - REGIME: CHOP 0.5x size (A); TREND RSI 40-60 halved (B); "
+          "STRONG_TREND/TREND max_loss 0.8% vs CHOP/NEUTRAL 0.4% (C)")
+    print("    - STRONG_TREND widens RSI to 95/5 and ext to 3.5 ATR")
+    print("    - Past performance does NOT imply future results")
     print()
 
 
@@ -960,7 +960,7 @@ def main() -> int:
                     help="Zero all slippage (restore the fee-only baseline)")
     args = ap.parse_args()
 
-    from hermes_trader.agents.config_store import read_agent_config, cfg_get
+    from hermes_trader.agents.config_store import cfg_get, read_agent_config
     live = read_agent_config()
     equity_fraction = float(live.get("equity_fraction_per_trade", 0.10))
     lev_ceiling = int(cfg_get("leverage", config=live))
@@ -1008,7 +1008,7 @@ def main() -> int:
     perps = [m for m in universe if m["type"] == "perp" and not m["coin"].startswith("@")]
     coins = sorted(perps, key=lambda m: m.get("dayNtlVlm", 0), reverse=True)[: args.coins]
 
-    print(f"=== A/B/C backtest: OLD vs STRICT vs DYNAMIC vs REGIME ===")
+    print("=== A/B/C backtest: OLD vs STRICT vs DYNAMIC vs REGIME ===")
     print(f"Period: {args.days} days | Universe: top-{args.coins} by volume | Equity: ${args.equity:.0f}")
     print(f"Fraction: {equity_fraction:.0%} | Lev ceiling: {lev_ceiling}x | DSL: {max_loss}%/{protect}%/{retrace}")
     print()

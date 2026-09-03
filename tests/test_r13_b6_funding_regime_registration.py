@@ -32,18 +32,17 @@
 import json
 
 from hermes_trader.agents import config_store, hyperfeed
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.hyperfeed import (
-    _FUNDING_REGIME_TTL_S,
     _FUNDING_REGIME_DEFAULTS,
+    _FUNDING_REGIME_TTL_S,
     funding_regime_params,
 )
-
 
 # ── helpers ───────────────────────────────────────────────────────────
 

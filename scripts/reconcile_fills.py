@@ -45,7 +45,7 @@ import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 HL_API = os.environ.get("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz")
 

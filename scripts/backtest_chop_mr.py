@@ -31,7 +31,7 @@ import sys
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 os.environ["HERMES_BACKTEST"] = "1"
 
@@ -47,17 +47,16 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config import get_config  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
-from hermes_trader.indicators import math as ind  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
+from hermes_trader.agents.config import get_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
+from hermes_trader.indicators import math as ind
+from hermes_trader.models.types import Candle
 
 # Canonical regime classifier shared with backtest_ab_compare.py — single
 # source of truth for _REGIME_TABLE / weights / OBV slope.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backtest_ab_compare import (  # noqa: E402
-    RegimeParams,
+from backtest_ab_compare import (
     _REGIME_TABLE,
     _obv_slope,
     _regime_score,
@@ -362,7 +361,7 @@ def _print_report(
     by_reason: Dict[str, List[MRTrade]] = defaultdict(list)
     for t in trades:
         by_reason[t.exit_reason].append(t)
-    print(f"\n  Exit reasons:")
+    print("\n  Exit reasons:")
     for reason in ("target", "stop", "stop_grace", "timeout"):
         lst = by_reason.get(reason, [])
         if not lst:
@@ -375,7 +374,7 @@ def _print_report(
               f"avg=${rp / len(lst):+6.2f}")
 
     # --- RSI buckets ---
-    print(f"\n  RSI at entry buckets:")
+    print("\n  RSI at entry buckets:")
     rsi_edges = [(0, 15, "<15"), (15, 20, "15-20"),
                  (20, 25, "20-25"), (25, 30, "25-30")]
     # Entries satisfy rsi_floor <= RSI < rsi_long, so extend the bins in
@@ -396,7 +395,7 @@ def _print_report(
               f"PnL=${p:+8.2f}")
 
     # --- ADX buckets ---
-    print(f"\n  ADX at entry buckets:")
+    print("\n  ADX at entry buckets:")
     adx_edges = [(0, 10, "<10"), (10, 15, "10-15"),
                  (15, 20, "15-20")]
     for lo, hi, label in adx_edges:
@@ -411,7 +410,7 @@ def _print_report(
     # --- Regime buckets (only when regime mode was used) ---
     regime_labels = {t.regime_label for t in trades if t.regime_label}
     if regime_labels and "LEGACY" not in regime_labels:
-        print(f"\n  Regime label at entry:")
+        print("\n  Regime label at entry:")
         for rl in ("CHOP", "NEUTRAL", "TREND", "STRONG_TREND"):
             lst = [t for t in trades if t.regime_label == rl]
             if not lst:
@@ -423,7 +422,7 @@ def _print_report(
                   f"PnL=${p:+8.2f}  avg_score={avg_s:.3f}")
 
     # --- Hold-time buckets ---
-    print(f"\n  Holding period (bars):")
+    print("\n  Holding period (bars):")
     hold_edges = [(1, 3, "1-3h"), (4, 6, "4-6h"),
                   (7, 12, "7-12h"), (13, 24, "13-24h")]
     for lo, hi, label in hold_edges:
@@ -440,7 +439,7 @@ def _print_report(
     for t in trades:
         by_coin[t.coin].append(t)
     ranked = sorted(by_coin.items(), key=lambda kv: -sum(t.pnl_usd for t in kv[1]))
-    print(f"\n  Per-coin breakdown (sorted by PnL):")
+    print("\n  Per-coin breakdown (sorted by PnL):")
     print(f"  {'coin':>10}  {'n':>4}  {'WR':>6}  {'PnL':>10}  {'avg':>8}")
     print(f"  {'-'*10}  {'-'*4}  {'-'*6}  {'-'*10}  {'-'*8}")
     for coin, lst in ranked:
@@ -531,7 +530,7 @@ def main() -> int:
     if args.leverage is None:
         args.leverage = int(live.get("leverage", 12))
 
-    cfg = get_config()  # noqa: F841 — ensures thresholds module loads cleanly
+    cfg = get_config()
     universe = get_universe()
     excluded = {s.strip().upper() for s in args.exclude.split(",") if s.strip()}
     perps = [m for m in universe

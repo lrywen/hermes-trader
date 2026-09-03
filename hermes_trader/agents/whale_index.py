@@ -266,7 +266,7 @@ def oi_surge_accumulation(
             prev = blob.get("oi", {})
             prev_ts = blob.get("ts", 0)
     except (OSError, json.JSONDecodeError):
-        prev_ts = 0
+        prev_ts = 0  # noqa: F841  (P1-2 baseline: legacy unused; trading logic untouched)
 
     cur = {}
     results = []

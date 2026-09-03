@@ -259,14 +259,14 @@ def rotate() -> Optional[str]:
             # the rotated-out inode; the next process to open will
             # see a fresh empty file).
             try:
-                with open(SESSION_LOG_FILE, "w") as f:
+                with open(SESSION_LOG_FILE, "w") as f:  # noqa: F841  (P1-2 baseline: context-managed truncate)
                     pass
             except OSError:
                 # If we can't truncate, the next rotation will pick up
                 # the not-yet-emptied file. Not a disaster.
                 pass
 
-            removed = _enforce_retention()
+            removed = _enforce_retention()  # noqa: F841  (P1-2 baseline: side-effect call; return value unused)
             return gz_path
         finally:
             try:

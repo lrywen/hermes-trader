@@ -625,6 +625,7 @@ def test_r13_b11_avg_exit_slip_min_samples_semantics_unchanged(monkeypatch):
     <3 条 adverse close → 0.0；≥3 条出均值；favorable close 不进 adverse deque。
     默认 days/min_samples 从 memory_quality 块解析（30.0 / 3）。"""
     import time as _time
+
     from hermes_trader import event_log
     monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
     m = memory_mod.AgentMemory()

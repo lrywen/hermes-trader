@@ -1324,7 +1324,7 @@ def _save_state() -> None:
                 from hermes_trader.metrics import DSL_STATE_SAVE_ERRORS
 
                 DSL_STATE_SAVE_ERRORS.inc()
-            except Exception:  # noqa: BLE001 — metrics must never mask the I/O error
+            except Exception:
                 pass
             try:
                 from hermes_trader import notify
@@ -1341,7 +1341,7 @@ def _save_state() -> None:
                     level="danger",
                     dedup_key="dsl-state-save-failed",
                 )
-            except Exception:  # noqa: BLE001 — notify is best-effort
+            except Exception:
                 pass
         # P3-1: save latency (covers lock + all retries) and dirty gauge.
         try:
@@ -1351,7 +1351,7 @@ def _save_state() -> None:
                 outcome="ok" if last_err is None else "failed"
             ).observe(max(0.0, time.monotonic() - _t0))
             metrics.DSL_STATE_DIRTY.set(0.0 if last_err is None else 1.0)
-        except Exception:  # noqa: BLE001 — metrics must never mask the I/O error
+        except Exception:
             pass
 
 
@@ -1715,8 +1715,9 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
             # exists within a 2% price band of the exchange entry, so a
             # blackout-induced re-synthesize does not double-count.
             try:
-                from hermes_trader.agents.memory import memory as _mem
                 import uuid as _uuid
+
+                from hermes_trader.agents.memory import memory as _mem
                 _already = any(
                     t.get("coin") == coin and t.get("side") == side
                     and abs(float(t.get("entry_px") or 0) - entry) / entry < 0.02

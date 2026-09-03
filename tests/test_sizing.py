@@ -7,11 +7,9 @@ module is not yet wired — wiring is gated/default-off and presented separately
 import math
 
 from hermes_trader.agents.sizing import (
-    SizingResult,
     atr_equal_risk_notional,
     risk_of_ruin,
 )
-
 
 # ── Equal-dollar-risk: the core invariant ────────────────────────────────────
 

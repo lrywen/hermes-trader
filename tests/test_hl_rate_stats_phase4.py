@@ -13,13 +13,10 @@ suite never touches production limiter state.
 """
 from __future__ import annotations
 
-import os
-
 import pytest
 
 from hermes_trader.client import rate_limit
 from hermes_trader.client.rate_limit import SharedTokenBucket, TokenBucket
-
 
 # ── in-process TokenBucket ──────────────────────────────────────────────
 

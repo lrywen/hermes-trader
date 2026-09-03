@@ -30,7 +30,6 @@ from hermes_trader.agents.config_store import (
     write_agent_config,
 )
 
-
 # ── canonical 登记：默认值必须严格等于原调用点硬编码值 ──────────────────────
 
 def test_r12_c1_circuit_breaker_registered_with_hardcoded_defaults():

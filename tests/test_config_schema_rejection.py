@@ -33,7 +33,6 @@ import pytest
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
-    backup_config,
     create_snapshot,
     read_agent_config,
     restore_backup,
@@ -42,7 +41,6 @@ from hermes_trader.agents.config_store import (
     validate_config_dict,
     write_agent_config,
 )
-
 
 # ── validate_config_dict unit tests ────────────────────────────────────────
 

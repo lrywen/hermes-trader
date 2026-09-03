@@ -60,7 +60,7 @@ def register_shadow_routes(app: FastAPI) -> None:
         _require_operator(request, write=True)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 — any decode failure maps to 422
+        except Exception:
             raise HTTPException(422, "invalid JSON body")
         starting_balance = None
         if isinstance(body, dict) and body.get("starting_balance") is not None:
@@ -86,7 +86,7 @@ def register_shadow_routes(app: FastAPI) -> None:
                     return _config_apply({"shadow_book": block}, backup=True)
 
                 await asyncio.to_thread(_persist_bankroll)
-            except Exception as _cfg_e:  # noqa: BLE001 — reset still proceeds
+            except Exception as _cfg_e:
                 logger.warning("shadow reset: config persist failed (non-fatal): %s", _cfg_e)
 
         result = await asyncio.to_thread(shadow_book.reset, starting_balance)
@@ -105,7 +105,7 @@ def register_shadow_routes(app: FastAPI) -> None:
         _require_operator(request, write=True)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 — any decode failure maps to 422
+        except Exception:
             raise HTTPException(422, "invalid JSON body")
         coin = (body.get("coin") or "").strip()
         if not coin:

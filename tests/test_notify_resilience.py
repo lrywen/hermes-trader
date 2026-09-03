@@ -24,9 +24,7 @@ from unittest import mock
 
 import pytest
 
-from hermes_trader import notify
-from hermes_trader import metrics
-
+from hermes_trader import metrics, notify
 
 PRIMARY_URL = "https://open.feishu.cn/hook/PRIMARY"
 PRIMARY_SECRET = "primary-secret"

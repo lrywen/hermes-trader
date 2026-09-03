@@ -26,9 +26,6 @@ exceptions after submit were not distinguished from definite rejections.
 import time
 import uuid
 
-import pytest
-
-
 # ── C-M3: exception classification ────────────────────────────────────────
 
 def _exc(name, msg=""):

@@ -45,8 +45,8 @@ os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.models.types import Candle
 
 SHADOW_FILE = os.environ.get(
     "HERMES_TA_LATE_ENTRY_SHADOW_FILE",
@@ -170,7 +170,7 @@ def main() -> int:
             continue
         try:
             candles = fetch_hl_candles(coin, "4h", FETCH_COUNT)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"  {coin}: fetch error: {e}")
             continue
         idx = _find_entry_bar(candles, after_ts)
@@ -220,7 +220,7 @@ def main() -> int:
                 print(f"  layer={layer:9s}: {len(sub):3d} vetoes, "
                       f"would-be win rate {w/len(sub)*100:5.1f}%, "
                       f"expectancy {sum(r['pnl_pct'] for r in sub)/len(sub):+.3f}%")
-        print(f"\n  per-veto detail:")
+        print("\n  per-veto detail:")
         for r in sorted(results, key=lambda x: x["timestamp"]):
             print(f"    {r['timestamp']}  {r.get('layer','gate'):9s} "
                   f"{r['coin']:8} {r.get('side','long'):5s} "

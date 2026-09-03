@@ -73,7 +73,7 @@ def _get_json(url, tries=4, timeout=12):
             req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
             with _OPENER.open(req, timeout=timeout) as r:
                 return json.loads(r.read().decode())
-        except Exception as e:  # noqa: BLE001 — retry any transient network error
+        except Exception as e:
             last = e
             time.sleep(0.8 * (k + 1))
     raise RuntimeError(f"GET failed after {tries} tries: {url}: {last}")
@@ -320,7 +320,7 @@ def main():
             continue
         try:
             candles = fetch_klines(sym, start_ms, end_ms)
-        except Exception as e:  # noqa: BLE001
+        except Exception as e:
             print(f"[{coin}] klines failed: {e}")
             continue
         runs = find_runs(candles, protect_pct=args.protect)
@@ -334,7 +334,7 @@ def main():
             try:
                 r = run_one(coin, run, leverage, args.smooth_band, end_ms,
                             tick_hours=args.tick_hours)
-            except Exception as e:  # noqa: BLE001
+            except Exception as e:
                 print(f"  !! run@{run['entry_px']:.6g} failed: {e}")
                 continue
             if r is None:
@@ -381,7 +381,7 @@ def main():
         print(f"  smooth  : exited={ns_exit} open(end-of-window)={ns_open}")
         print(f"  avg resolved PnL  baseline={avg_b:+.3f}%   smooth={avg_s:+.3f}%   "
               f"(smooth-base)={avg_s-avg_b:+.3f}%")
-        print(f"    ('open' = still holding at window end, marked at last print)")
+        print("    ('open' = still holding at window end, marked at last print)")
         print(f"  smooth vs baseline: better={wins} worse={losses} tie={ties}")
         print(f"  baseline kinds: {mix('baseline')}")
         print(f"  smooth   kinds: {mix('smooth')}")

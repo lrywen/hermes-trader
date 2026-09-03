@@ -33,24 +33,21 @@
 
 import json
 
-import pytest
-
 from hermes_trader.agents import config_store, executor, market_regime
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.market_regime import (
-    REGIME_WEIGHTS,
-    REGIME_TTL_S,
     _SLOPE_LOOKBACK,
+    REGIME_TTL_S,
+    REGIME_WEIGHTS,
     regime_score_params,
     regime_strength_score,
 )
 from hermes_trader.models.types import Candle
-
 
 # ── helpers ───────────────────────────────────────────────────────────
 
@@ -438,7 +435,9 @@ def test_r13_b5_executor_label_and_score_share_calibration():
     """
     # 先用真实 candles 算出一组强趋势指标值
     candles = _trend_candles(80, start=100.0, step=0.8)
-    from hermes_trader.indicators.math import adx as _adx, atr as _atr, ema
+    from hermes_trader.indicators.math import adx as _adx
+    from hermes_trader.indicators.math import atr as _atr
+    from hermes_trader.indicators.math import ema
     closes = [c.c for c in candles]
     e8 = ema(closes, 8)[-1]
     e21 = ema(closes, 21)[-1]

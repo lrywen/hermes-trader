@@ -25,7 +25,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
 
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
@@ -66,8 +65,8 @@ def _exchange():
         sys.exit(2)
     if pk.startswith("0x"):
         pk = pk[2:]
-    from hyperliquid.exchange import Exchange
     from eth_account import Account
+    from hyperliquid.exchange import Exchange
     acct = Account.from_key(pk)
     return Exchange(acct, base_url="https://api.hyperliquid.xyz")
 
@@ -213,7 +212,7 @@ def cmd_fund_dex(args, *, target_token: str, target_dex: str, spot_pair: str) ->
     print(f"\n=== Fund {target_dex} ({target_token}) with ${amount:.2f} ===\n")
 
     # 1. Move USDC main perp → spot
-    print(f"[1/3] USDC main perp → spot")
+    print("[1/3] USDC main perp → spot")
     r1 = ex.usd_class_transfer(amount, to_perp=False)
     print(f"      response: {r1}")
     if not (isinstance(r1, dict) and r1.get("status") == "ok"):

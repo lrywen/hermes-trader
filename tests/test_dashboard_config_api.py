@@ -13,7 +13,6 @@ Covers:
   * GET  /config                          — SPA shell (200) or redirect (no dist)
 """
 
-import os
 import json
 
 import pytest
@@ -22,12 +21,11 @@ from fastapi.testclient import TestClient
 
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config_store import (
+    backup_config,
     read_agent_config,
     write_agent_config,
-    backup_config,
 )
 from hermes_trader.dashboard import register_routes
-
 
 _OP_TOKEN = "test-op-secret-123"
 
@@ -413,13 +411,14 @@ def test_post_config_list_wrong_type_422(client):
 # dashboard.register_routes(app)), not on a bare dashboard-only app — so hit
 # them through server.app with the operator token env set.
 
-import pytest as _pytest  # noqa: E402
+import pytest as _pytest
 
 
 @_pytest.fixture()
 def server_client(monkeypatch):
     """TestClient over the real server app with a known operator token."""
     from fastapi.testclient import TestClient
+
     from hermes_trader import server
     monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
     return TestClient(server.app)
@@ -557,7 +556,7 @@ def test_operator_mode_paper_rejected_400(client):
 def test_operator_close_writes_audit_event(client, monkeypatch, tmp_path):
     """F22: a web operator close must persist an operator_action event to the
     session log AND fork it into the authoritative events.jsonl."""
-    from hermes_trader import session_log, event_log
+    from hermes_trader import event_log, session_log
     sess = tmp_path / "session.jsonl"
     ev = tmp_path / "events.jsonl"
     monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(sess))
@@ -600,7 +599,9 @@ def test_agent_config_endpoint_concurrent_merge(client):
     serialize and every key survives. D-FCFG-4: the payload keys must be
     canonical (unknown keys are now 422'd)."""
     import threading
+
     from fastapi.testclient import TestClient
+
     from hermes_trader import server
 
     # Each thread writes a DISTINCT canonical scalar key — under correct
@@ -835,6 +836,7 @@ def test_feed_stream_anonymous_projects(client, monkeypatch):
     sensitive event type (drives _tail_log_sse directly so the infinite poll
     loop is bounded)."""
     import asyncio
+
     from hermes_trader.dashboard import _tail_log_sse
 
     async def _collect():

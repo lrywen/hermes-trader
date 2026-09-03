@@ -37,14 +37,12 @@ uptrend_momentum/downtrend_momentum 的签名默认都是 **3.0**。运行时经
 import inspect
 import json
 
-import pytest
-
 from hermes_trader.agents import config as config_mod
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config import (
-    TRIGGER_CONFIG,
     _TRIGGER_THRESHOLDS_KEYMAP,
     _TRIGGER_WEIGHTS_KEYMAP,
+    TRIGGER_CONFIG,
     trigger_thresholds_params,
     trigger_weights_params,
 )
@@ -53,7 +51,6 @@ from hermes_trader.agents.config_store import (
     cfg_get,
     read_agent_config,
 )
-
 
 # ── canonical 登记：两块存在且为 dict ──────────────────────────────────────
 

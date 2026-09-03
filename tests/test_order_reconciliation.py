@@ -17,9 +17,6 @@ Two distinct surfaces:
 
 from __future__ import annotations
 
-import pytest
-
-
 # ---------------------------------------------------------------------------
 # _oid_is_valid
 # ---------------------------------------------------------------------------
@@ -161,8 +158,7 @@ def _patch_info(monkeypatch, hl_client, *, open_orders=None, fills=None):
 
 class TestVerifyOrderExists:
     def test_oid_in_open_orders_verified(self, monkeypatch):
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client, open_orders=[{"coin": "ETH", "oid": 12345}], fills=[])
         out = exchange.verify_order_exists(coin="ETH", oid="12345")
@@ -171,8 +167,7 @@ class TestVerifyOrderExists:
         assert out["in_user_fills"] is False
 
     def test_oid_in_fills_verified(self, monkeypatch):
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client, open_orders=[], fills=[{"coin": "ETH", "oid": 12345}])
         out = exchange.verify_order_exists(coin="ETH", oid="12345")
@@ -180,8 +175,7 @@ class TestVerifyOrderExists:
         assert out["in_user_fills"] is True
 
     def test_cloid_in_open_orders_verified(self, monkeypatch):
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client, open_orders=[{"coin": "ETH", "oid": 999, "cloid": "0xabc"}], fills=[])
         # Cloid is matched as string, so we just pass a string and the matcher
@@ -190,8 +184,7 @@ class TestVerifyOrderExists:
         assert out["verified"] is True
 
     def test_oid_missing_everywhere_unverified(self, monkeypatch):
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client, open_orders=[{"coin": "ETH", "oid": 99999}], fills=[])
         out = exchange.verify_order_exists(coin="ETH", oid="11111")
@@ -203,8 +196,7 @@ class TestVerifyOrderExists:
     def test_coin_narrowing_matters(self, monkeypatch):
         """An oid that exists in openOrders but for a DIFFERENT coin must not
         count as verified — we don't want a stale BTC oid to mask a missing ETH one."""
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client, open_orders=[{"coin": "BTC", "oid": 12345}], fills=[])
         out = exchange.verify_order_exists(coin="ETH", oid="12345")
@@ -218,8 +210,7 @@ class TestVerifyOrderExists:
         assert "no_user_address" in out["reason"]
 
     def test_no_oid_or_cloid_unverified(self, monkeypatch):
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client)
         out = exchange.verify_order_exists(coin="ETH")
@@ -230,8 +221,7 @@ class TestVerifyOrderExists:
         """verify must NEVER raise — a /info outage is best-effort, the order
         is already on the wire. Report unverified (caller will alert) but
         never propagate the exception."""
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         def boom(path, payload, **kw):
             if (payload or {}).get("type") == "openOrders":
                 raise RuntimeError("network down")
@@ -251,8 +241,7 @@ class TestVerifyOrderExists:
 
     def test_user_fills_oid_string_match(self, monkeypatch):
         """userFills oid is numeric too; verify oid-string match against an int-filled entry."""
-        from hermes_trader.client import exchange
-        from hermes_trader.client import hl_client
+        from hermes_trader.client import exchange, hl_client
         exchange.resolve_user_address = lambda: "0xUSER"
         _patch_info(monkeypatch, hl_client,
                     open_orders=[],

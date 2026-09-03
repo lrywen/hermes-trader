@@ -12,9 +12,6 @@ C-M1:  a held coin with no usable mark price is a blind DSL tick: it must be
 import json
 import logging
 
-import pytest
-
-
 # ── B-M4: opposite_direction_guard fail-closed on malformed position ──────
 
 def _ctx(**kw):
@@ -135,6 +132,7 @@ def test_bm12_setters_call_flush_with_force_true(monkeypatch, tmp_path):
     """Source-level guard: all three risk-blocking setters must pass
     force=True (a plain self.flush() would be throttled)."""
     import inspect
+
     from hermes_trader.agents import memory as memory_mod
     src = inspect.getsource(memory_mod.AgentMemory)
     for setter in ("set_coin_circuit", "set_global_halt", "set_loss_cooldown"):

@@ -38,18 +38,19 @@ from typing import Any, Dict, List, Optional, Tuple
 # Make the repo importable when run directly from scripts/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from hermes_trader.client.exchange import (  # noqa: E402
+from hyperliquid.utils.signing import (
+    OrderType,
+    TriggerOrderType,
+)
+
+from hermes_trader.client.exchange import (
     _http_post,
     _make_exchange,
     _round_price_for_hl,
     get_coin_index,
     resolve_user_address,
 )
-from hermes_trader.client.hl_client import HL_API  # noqa: E402
-from hyperliquid.utils.signing import (  # noqa: E402
-    OrderType,
-    TriggerOrderType,
-)
+from hermes_trader.client.hl_client import HL_API
 
 
 def _section(title: str) -> None:
@@ -335,14 +336,14 @@ def main() -> int:
 
     oid = int(sl_order["oid"]) if str(sl_order.get("oid", "")).isdigit() else sl_order["oid"]
     sz = float(sl_order.get("sz", 0) or 0)
-    print(f"\n  identified SL order:")
+    print("\n  identified SL order:")
     print(f"    oid:           {oid}")
     print(f"    sz:            {sz}")
     print(f"    triggerPx:     {_order_trigger_px(sl_order)}")
     print(f"    orderType:     {sl_order.get('orderType')}")
     print(f"    reduceOnly:    {sl_order.get('reduceOnly')}")
     if placed_new:
-        print(f"    (freshly placed in this run)")
+        print("    (freshly placed in this run)")
 
     # ── 2. Compute the new trigger price ─────────────────────────────────────
     is_buy, cur_trigger, new_trigger = determine_side_and_new_trigger(coin, position, sl_order, args.bps)
@@ -353,7 +354,7 @@ def main() -> int:
     print(f"  sz:                 {sz}")
     print(f"  current triggerPx:  {cur_trigger}")
     print(f"  new     triggerPx:  {new_trigger}  (moved {args.bps:g} bps safe-direction)")
-    print(f"  order_type:         trigger / isMarket=True / tpsl=sl / reduce_only=True")
+    print("  order_type:         trigger / isMarket=True / tpsl=sl / reduce_only=True")
 
     # Sanity: never move the SL AWAY from the market (looser). Reject if the
     # computed direction would loosen the stop (defensive — shouldn't happen).
@@ -421,9 +422,9 @@ def main() -> int:
                 if resting and "oid" in resting:
                     new_oid = int(resting["oid"])
         if new_oid is not None:
-            print(f"\n  >>> batchModify SUCCEEDED via cancel+replace.")
+            print("\n  >>> batchModify SUCCEEDED via cancel+replace.")
             print(f"  >>> old oid {oid} is CANCELLED; new resting oid = {new_oid}")
-            print(f"  >>> production code MUST persist the new oid.")
+            print("  >>> production code MUST persist the new oid.")
 
     # ── 5. Re-query open orders to show actual state ────────────────────────
     _section("5. OPEN ORDERS (post-modify)" if not dry_run
@@ -443,7 +444,7 @@ def main() -> int:
     print(json.dumps(eth_after, indent=2))
 
     if sl_after:
-        print(f"\n  SL order after:")
+        print("\n  SL order after:")
         print(f"    oid:           {sl_after.get('oid')}  "
               f"({'SAME oid — modify was in-place' if str(sl_after.get('oid')) == str(oid) else 'DIFFERENT oid — exchange replaced the order'})")
         print(f"    triggerPx:     {_order_trigger_px(sl_after)}")

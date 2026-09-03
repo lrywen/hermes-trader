@@ -34,19 +34,14 @@ hot-path 隐式字段（紧贴 cfg_get 已接线的 chop_min_score / min_trend_s
 """
 
 import os
-import sys
-from copy import deepcopy
-
-import pytest
 
 from hermes_trader.agents import config_store, risk_gates
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
-
 
 # ── 1. canonical 登记断言：analyst_scoring 块 8 字段 ─────────────────
 

@@ -11,10 +11,13 @@ fill open slots with the BEST. Measures net, win%, avgW/avgL, maxDD, ripper-capt
 
 Usage: python3 scripts/concentration_backtest.py --days 21 --coins 40 --interval 1h
 """
-import argparse, os, sys
+import argparse
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from backtest import (Candle, DSL, _evaluate, _trend_and_atr_pct,
-                      _heuristic_verdict, _ta_confirmed, ROUND_TRIP_FEE_BPS)
+from backtest import DSL, ROUND_TRIP_FEE_BPS, _evaluate, _heuristic_verdict, _ta_confirmed, _trend_and_atr_pct
+
 from hermes_trader.agents.config import get_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe

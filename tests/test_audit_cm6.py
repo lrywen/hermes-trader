@@ -19,8 +19,6 @@ from __future__ import annotations
 import threading
 import time
 
-import pytest
-
 
 def _setup(monkeypatch, tmp_path, *, coin="ETH", szi="1.0", entry="100",
            fill_px=94.0, mutable_live=None):
@@ -28,8 +26,8 @@ def _setup(monkeypatch, tmp_path, *, coin="ETH", szi="1.0", entry="100",
     dict the test may mutate between calls (e.g. pop the coin after fill to
     simulate the exchange going flat); otherwise the position is always
     reported (used for the dedupe tests)."""
-    from hermes_trader.agents import dsl_exit, executor
     from hermes_trader import notify
+    from hermes_trader.agents import dsl_exit, executor
 
     state_file = tmp_path / "dsl.json"
     monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE", str(state_file))

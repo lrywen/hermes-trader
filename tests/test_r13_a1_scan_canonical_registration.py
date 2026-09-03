@@ -37,9 +37,7 @@ from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
-    write_agent_config,
 )
-
 
 # ── canonical 登记：scan 块 7 字段默认值与 TRIGGER_CONFIG 严格一致 ─────────
 

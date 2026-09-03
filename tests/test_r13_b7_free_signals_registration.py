@@ -46,19 +46,19 @@ from hermes_trader.agents import (
     crypto_whale,
     news_catalyst,
     options_gex,
+    shadow_signals,
     short_volume,
     whale_index,
 )
-from hermes_trader.agents import shadow_signals
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.crypto_whale import (
-    Print,
     _CRYPTO_WHALE_DEFAULTS,
+    Print,
     crypto_whale_params,
 )
 from hermes_trader.agents.news_catalyst import (
@@ -66,8 +66,8 @@ from hermes_trader.agents.news_catalyst import (
     news_catalyst_params,
 )
 from hermes_trader.agents.options_gex import (
-    GexReport,
     _OPTIONS_GEX_DEFAULTS,
+    GexReport,
     options_gex_params,
 )
 from hermes_trader.agents.short_volume import (
@@ -78,7 +78,6 @@ from hermes_trader.agents.whale_index import (
     _WHALE_INDEX_DEFAULTS,
     whale_index_params,
 )
-
 
 # ── helpers ─────────────────────────────────────────────────────────────
 

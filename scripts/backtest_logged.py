@@ -17,7 +17,6 @@ import os
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,13 +35,14 @@ if _env.exists():
                 continue
             os.environ.setdefault(k.strip(), v.strip())
 
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from _memory_io import load_memory
+
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.sizing import atr_equal_risk_notional
 from hermes_trader.client.exchange import get_max_leverage
-from hermes_trader.indicators.math import atr as calc_atr
 from hermes_trader.client.hl_client import _http_post
+from hermes_trader.indicators.math import atr as calc_atr
 from hermes_trader.models.types import Candle
-from _memory_io import load_memory
 
 _INTERVAL_MS = {"5m": 300_000, "1h": 3_600_000, "4h": 14_400_000}
 _CANDLE_CACHE: Dict[Tuple[str, str, int, int], Optional[List[Candle]]] = {}

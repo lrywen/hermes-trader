@@ -11,26 +11,25 @@ import os
 import re
 import stat
 import sys
+import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeoutError
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
-import asyncio
-import threading
-
 import httpx
 
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.market_regime import _obv_slope_sign
+from hermes_trader.agents.memory import memory
+from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.agents.research_schema import (
     ResearchVerdict,
     parse_structured,
     structured_to_analysis_fields,
 )
-from hermes_trader.agents.memory import memory
-from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.agents.system_prompt import build_system_prompt
 from hermes_trader.client.hl_client import (
     fetch_account_state,
@@ -155,9 +154,9 @@ if _tu is not None:
     utcnow = _tu.utcnow
     to_iso_z = _tu.to_iso_z
 else:  # pragma: no cover - shared dir optional
-    today_utc_str = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")  # noqa: E731
-    utcnow = lambda: datetime.now(timezone.utc)  # noqa: E731
-    to_iso_z = lambda v: ""  # noqa: E731
+    today_utc_str = lambda: datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    utcnow = lambda: datetime.now(timezone.utc)
+    to_iso_z = lambda v: ""
 
 _ss = _load_shared_module("signal_schema")
 Signal = getattr(_ss, "Signal", None) if _ss is not None else None
@@ -170,7 +169,7 @@ if _el is not None:
     record_risk = _el.record_risk
     record_system = _el.record_system
 else:  # pragma: no cover - shared dir optional
-    new_trace_id = lambda prefix="trc": f"{prefix}-{uuid.uuid4().hex[:12]}"  # noqa: E731
+    new_trace_id = lambda prefix="trc": f"{prefix}-{uuid.uuid4().hex[:12]}"
     record_risk = None
     record_system = None
 _SHARED_OK = all(x is not None for x in (_tu, _sb, _ss, _el))
@@ -354,7 +353,7 @@ def _llm_record_success() -> None:
 
         if not _llm_circuit_open():
             metrics.LLM_CIRCUIT_STATE.set(0.0)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -379,7 +378,7 @@ def _llm_record_failure() -> None:
 
             metrics.LLM_CIRCUIT_TRIPS.inc()
             metrics.LLM_CIRCUIT_STATE.set(1.0)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -812,7 +811,7 @@ def _llm_metric_outcome(path: str, outcome: str, started: float) -> None:
         metrics.LLM_REQUEST_DURATION.labels(path=path, outcome=outcome).observe(
             max(0.0, time.time() - started)
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -875,7 +874,7 @@ def _call_openrouter(
         from hermes_trader import metrics
 
         metrics.LLM_CIRCUIT_STATE.set(0.0)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     url = base_url.rstrip("/") + "/chat/completions"
@@ -947,7 +946,7 @@ def _call_openrouter(
                     from hermes_trader import metrics
 
                     metrics.LLM_RETRIES.labels(cause="network").inc()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
                 time.sleep(wait)
                 continue
@@ -961,7 +960,7 @@ def _call_openrouter(
                     from hermes_trader import metrics
 
                     metrics.LLM_RETRIES.labels(cause="rate_limit").inc()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
                 time.sleep(wait)
                 continue
@@ -1016,7 +1015,7 @@ def _call_openrouter(
                     from hermes_trader import metrics
 
                     metrics.LLM_RETRIES.labels(cause="continuation").inc()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
                 cont_messages = messages + [
                     {"role": "assistant", "content": content},
@@ -1472,7 +1471,7 @@ def _debate_cache_sweep_locked(now: float) -> None:
                 metrics.DEBATE_CACHE_EVICTIONS.labels(reason="expired").inc(len(expired))
             if evicted:
                 metrics.DEBATE_CACHE_EVICTIONS.labels(reason="capacity").inc(evicted)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
 
 
@@ -1540,7 +1539,7 @@ def _debate_direct(
     is retained so future callers can opt in, but the arbiter path relies on
     :func:`parse_structured` to extract JSON from prose/code-fences.
     """
-    dcfg = _debate_cfg()
+    dcfg = _debate_cfg()  # noqa: F841  (P1-2 baseline: legacy unused binding; kept to preserve behavior)
     # R13-B10: the debate path's tighter token budget resolves through
     # research_llm_params (canonical research_llm.debate_max_tokens → the
     # former 350 literal).
@@ -1573,7 +1572,7 @@ def _debate_direct(
             metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="failed").observe(
                 max(0.0, time.time() - t0)
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         raise
     # _call_openrouter swallows HTTP/timeout errors and returns "" — treat that
@@ -1591,7 +1590,7 @@ def _debate_direct(
             metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="empty").observe(
                 max(0.0, time.time() - t0)
             )
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         raise TimeoutError(f"empty LLM response after {elapsed}ms (role={role})")
     logger.info(
@@ -1604,7 +1603,7 @@ def _debate_direct(
         metrics.DEBATE_STAGE_DURATION.labels(stage=role, outcome="ok").observe(
             max(0.0, time.time() - t0)
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return out
 
@@ -1674,7 +1673,7 @@ def _debate_metric(
             metric.observe(value)
         elif kind == "set":
             metric.set(value)
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 

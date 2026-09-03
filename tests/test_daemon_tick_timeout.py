@@ -17,9 +17,9 @@ import time
 import pytest
 
 from hermes_trader.client.daemon import (
-    _TickTimeout,
     _arm_tick_alarm,
     _disarm_tick_alarm,
+    _TickTimeout,
 )
 
 # _arm_tick_alarm uses int(seconds) + 1, so the minimum real budget is 1s.

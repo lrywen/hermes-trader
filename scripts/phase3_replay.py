@@ -14,10 +14,12 @@ and % of the move KEPT after fees + funding at the stated leverage.
 Usage: python3 scripts/phase3_replay.py GRASS 0.47055 3 7.27   # coin entry lev spot_move%
        (spot_move% optional, just annotates the target)
 """
-import sys, time, json
-from hermes_trader.client.hl_client import fetch_hl_candles  # paced via the shared limiter
+import sys
+import time
+
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.dsl_exit import DSLTracker, ExitPolicy, RetraceTier
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.client.hl_client import fetch_hl_candles  # paced via the shared limiter
 
 INTERVAL = "1m"   # match the ~60s live loop cadence: one mark per tick, true time order
 BARS = 1500       # ~25h of 1m (covers a 24h run + lead-in)
@@ -269,7 +271,7 @@ def main():
         print(f"  >>> EXIT @ bar+{e['bars_after_entry']} ({time.strftime('%m-%d %H:%M', time.gmtime(e['ts']/1000))}) "
               f"px~{e['px']:.6g}  reason: {e['reason']}  (unrl {e['unrl_pct']}%)")
     else:
-        print(f"  >>> NO EXIT in window — rode to peak (or still open at data end)")
+        print("  >>> NO EXIT in window — rode to peak (or still open at data end)")
 
 
 if __name__ == "__main__":

@@ -27,11 +27,6 @@ L2389 已通过 ``cfg_get("sl_buffer_bps", _SL_BUFFER_BPS)`` 接线——是「�
 """
 
 import json
-import os
-import sys
-from pathlib import Path
-
-import pytest
 
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config_store import (
@@ -39,7 +34,6 @@ from hermes_trader.agents.config_store import (
     cfg_get,
     read_agent_config,
 )
-
 
 # ── canonical 登记：sl_move 块 2 字段默认值与原 literals 严格一致 ──────
 

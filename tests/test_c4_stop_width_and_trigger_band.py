@@ -20,9 +20,8 @@ import math
 
 import pytest
 
-from hermes_trader.client import exchange
 from hermes_trader.agents import executor
-
+from hermes_trader.client import exchange
 
 # ── C4-2: _resolve_sl_width_config ──────────────────────────────────────────
 

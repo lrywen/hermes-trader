@@ -9,8 +9,10 @@ Replays session-log scan+execute events and reports:
   5. score distribution of admitted/blocked
 """
 from __future__ import annotations
-import json, os
-from collections import Counter, defaultdict
+
+import json
+import os
+from collections import Counter
 
 SESSION_LOG = os.environ.get("SESSION_LOG_PATH", "/data/session-log.jsonl")
 MIN_SCORE = 30.0
@@ -89,7 +91,7 @@ def main():
 
     admitted = [e for e in long_events if is_admitted(e)]
     blocked = [e for e in long_events if not is_admitted(e)]
-    print(f"=== 2. New fresh_impulse formula ===")
+    print("=== 2. New fresh_impulse formula ===")
     print(f"  fresh_impulse TRUE:  {len(admitted)} ({len(admitted)/n*100:.1f}%)")
     print(f"  fresh_impulse FALSE: {len(blocked)} ({len(blocked)/n*100:.1f}%)\n")
 

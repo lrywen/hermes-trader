@@ -2,12 +2,14 @@
 """E2c: Forward-PnL for breakout signals blocked by the with-crowd
 LONG_CROWDED veto (confidence < 0.80), to quantify the cost of that gate."""
 from __future__ import annotations
-import json, os, sys
-from collections import Counter
+
+import json
+import os
+import sys
 from datetime import datetime, timezone
 
 sys.path.insert(0, "/app")
-from hermes_trader.client.hl_client import _http_post  # noqa
+from hermes_trader.client.hl_client import _http_post
 
 SESSION_LOG = os.environ.get("SESSION_LOG_PATH", "/data/session-log.jsonl")
 HORIZON_BARS = 72

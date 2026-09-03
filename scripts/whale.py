@@ -5,6 +5,7 @@ Usage: python3 scripts/whale.py BTC
        python3 scripts/whale.py BTC ETH SOL --min 250000
 """
 import sys
+
 from hermes_trader.agents.crypto_whale import crypto_whale_signal
 
 

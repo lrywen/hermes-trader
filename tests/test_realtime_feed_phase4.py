@@ -8,7 +8,6 @@ The pure decision module carries no I/O, so trading behaviour is never
 exercised here; the trading-loop wiring is exercised separately.
 """
 
-import time
 
 import pytest
 
@@ -20,7 +19,6 @@ from hermes_trader.realtime_feed import (
     classify_feed_status,
     dynamic_scan_interval,
 )
-
 
 # ── P0-1: dynamic_scan_interval ───────────────────────────────────────────────
 

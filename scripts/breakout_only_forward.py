@@ -16,13 +16,16 @@ Outputs per signal: coin, signal time (UTC), score, entry, stop, target,
 exit reason, bars held, R multiple, and MFE/MAE in R.
 """
 from __future__ import annotations
-import json, os, sys, math
+
+import json
+import os
+import sys
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, Optional
 
 sys.path.insert(0, "/app")
 
-from hermes_trader.client.hl_client import _http_post  # noqa: E402
+from hermes_trader.client.hl_client import _http_post
 
 SESSION_LOG = os.environ.get("SESSION_LOG_PATH", "/data/session-log.jsonl")
 MIN_SCORE = 30.0          # runner_gate min_composite

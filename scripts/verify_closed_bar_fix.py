@@ -17,10 +17,10 @@ import argparse
 import datetime as dt
 from typing import Any, List, Tuple
 
+from hermes_trader.agents import perception as perc
+from hermes_trader.agents.config import get_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.indicators import triggers as trigger_mod
-from hermes_trader.agents.config import get_config
-from hermes_trader.agents import perception as perc
 
 CFG = get_config()
 WEIGHTS = CFG["weights"]
@@ -61,7 +61,6 @@ def _simulate_api_window(candles: List[Any], target_idx: int,
     历史已收盘 bar 保持真实值；若最后一根 target bar 处于形成中，
     按进度插值其 close/volume(用真实最终值做份额)，模拟盘中快照。
     """
-    import copy
     window = list(candles[: target_idx + 1])
     target = candles[target_idx]
     t_open = int(getattr(target, "t"))

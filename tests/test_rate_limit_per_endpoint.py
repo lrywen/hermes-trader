@@ -24,8 +24,8 @@ from unittest import mock
 
 import pytest
 
-from hermes_trader.client import rate_limit
 from hermes_trader import metrics
+from hermes_trader.client import rate_limit
 
 
 @pytest.fixture(autouse=True)

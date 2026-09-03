@@ -47,7 +47,11 @@ from hermes_trader import event_log, session_log
 from hermes_trader.agents import dsl_exit
 from hermes_trader.agents.config_schema import (
     FORCE_OVERRIDE_KEYS,
+)
+from hermes_trader.agents.config_schema import (
     coerce_config_value as _coerce_config_value,
+)
+from hermes_trader.agents.config_schema import (
     validate_config_updates as _validate_config_updates,
 )
 from hermes_trader.agents.config_store import (

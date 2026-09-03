@@ -168,7 +168,7 @@ def _resolve_hl_block(
             if kind == "b" or v >= min_v:
                 p[leaf] = v
         return p
-    except Exception as e:  # noqa: BLE001 — config must never break HTTP
+    except Exception as e:
         logger.debug("[hl] %s params read failed, using literals: %s", block, e)
         return dict(defaults)
 
@@ -596,7 +596,7 @@ def _build_limiter() -> Union["TokenBucket", "SharedTokenBucket"]:
 # cost. ``HERMES_HL_RATE_PER_ENDPOINT_GATE=0`` disables it (e.g. for
 # the dashboard which already serializes per UI request).
 
-import contextlib  # noqa: E402
+import contextlib
 
 
 def _rate_stats_enabled() -> bool:
@@ -662,7 +662,7 @@ try:
     from hermes_trader import metrics  # type: ignore
 
     _GATE_WAIT_S = metrics.HL_RATE_GATE_WAIT  # Histogram {endpoint}
-except Exception:  # noqa: BLE001 — never break module import
+except Exception:
     metrics = None  # type: ignore
     _GATE_WAIT_S = None
 

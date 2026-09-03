@@ -6,10 +6,11 @@ walk the bar series with the DSL exit engine.
 """
 from __future__ import annotations
 
-import os, sys, math
-from pathlib import Path
+import math
+import os
+import sys
 from dataclasses import dataclass
-from typing import List
+from pathlib import Path
 
 os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]
@@ -243,9 +244,9 @@ def main():
 
     print("=== hermes-trader A/B/C breakout backtest ===")
     print(f"period: {args.days}d  interval: {args.interval}  coins: top-{args.coins}")
-    print(f"A = OLD breakout (close-only, pct score)")
-    print(f"B = NEW breakout (RVOL>=1.5 + ATR-normalized score)")
-    print(f"C = NEW + ATR-env gate (breakout only fires when ATR(14)>SMA(ATR,20))\n")
+    print("A = OLD breakout (close-only, pct score)")
+    print("B = NEW breakout (RVOL>=1.5 + ATR-normalized score)")
+    print("C = NEW + ATR-env gate (breakout only fires when ATR(14)>SMA(ATR,20))\n")
 
     old_all, new_all, atr_all = [], [], []
     for m in coins:
@@ -265,7 +266,7 @@ def main():
                   f"ATR-gate:{len(ct):3}t/${cpp:+6.2f}")
             old_all.extend(ot); new_all.extend(nt); atr_all.extend(ct)
         except Exception as e:
-            import traceback; traceback.print_exc()
+            import traceback; traceback.print_exc()  # noqa: I001  (P1-2 baseline: inline debug import in analysis script)
             print(f"  {coin:8} error: {e}")
 
     a = _summarize("A: OLD breakout (close-only)", old_all, args.equity)
@@ -273,7 +274,7 @@ def main():
     c = _summarize("C: NEW + ATR-environment gate", atr_all, args.equity)
 
     print(f"\n{'='*64}\n  DELTA\n{'='*64}")
-    print(f"  B - A (RVOL+ATR vs old):")
+    print("  B - A (RVOL+ATR vs old):")
     print(f"    trades         : {b['n']-a['n']:+d}  ({a['n']} -> {b['n']})")
     if a['n'] and b['n']:
         print(f"    win rate       : {b['winrate']-a['winrate']:+.1f} pp  "
@@ -281,7 +282,7 @@ def main():
     print(f"    PnL            : ${b['pnl']-a['pnl']:+.2f}  "
           f"(${a['pnl']:+.2f} -> ${b['pnl']:+.2f})")
     print(f"    breakout trades: {b['bo']-a['bo']:+d}  ({a['bo']} -> {b['bo']})")
-    print(f"  C - B (ATR-env gate vs RVOL+ATR):")
+    print("  C - B (ATR-env gate vs RVOL+ATR):")
     print(f"    trades         : {c['n']-b['n']:+d}  ({b['n']} -> {c['n']})")
     if b['n'] and c['n']:
         print(f"    win rate       : {c['winrate']-b['winrate']:+.1f} pp  "
@@ -289,7 +290,7 @@ def main():
     print(f"    PnL            : ${c['pnl']-b['pnl']:+.2f}  "
           f"(${b['pnl']:+.2f} -> ${c['pnl']:+.2f})")
     print(f"    breakout trades: {c['bo']-b['bo']:+d}  ({b['bo']} -> {c['bo']})")
-    print(f"  C - A (ATR-env gate vs old):")
+    print("  C - A (ATR-env gate vs old):")
     print(f"    PnL            : ${c['pnl']-a['pnl']:+.2f}  "
           f"(${a['pnl']:+.2f} -> ${c['pnl']:+.2f})")
     print(f"\nCaveats: AI verdict substituted by heuristic; no funding/slippage beyond "

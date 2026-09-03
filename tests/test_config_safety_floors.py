@@ -23,7 +23,6 @@ import pytest
 
 from hermes_trader.agents.config_schema import validate_config_updates
 
-
 # ── mode enum ─────────────────────────────────────────────────────────────
 
 

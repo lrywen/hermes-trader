@@ -34,7 +34,6 @@ from hermes_trader.agents.config_store import (
     read_agent_config,
 )
 
-
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DSL_EXIT_PATH = REPO_ROOT / "hermes_trader" / "agents" / "dsl_exit.py"
 

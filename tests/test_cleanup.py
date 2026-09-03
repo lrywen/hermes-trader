@@ -76,7 +76,7 @@ def test_directional_momentum_triggers_are_symmetric():
     """uptrend_momentum fires on a sustained UP move, downtrend_momentum on a
     sustained DOWN move, and each stays silent on the opposite/flat — the
     symmetric surfacing pair that lets the bot short downtrends."""
-    from hermes_trader.indicators.triggers import uptrend_momentum, downtrend_momentum
+    from hermes_trader.indicators.triggers import downtrend_momentum, uptrend_momentum
     from hermes_trader.models.types import Candle
     up = [Candle(t=i, o=100, h=101, l=99, c=100.0 * (1.0006 ** i), v=10) for i in range(80)]   # ~+5% over 80
     down = [Candle(t=i, o=100, h=101, l=99, c=100.0 * (0.9994 ** i), v=10) for i in range(80)] # ~-5% over 80
@@ -94,7 +94,7 @@ def test_directional_momentum_triggers_are_symmetric():
 
 
 def test_atr_rsi_adx_produce_finite_output():
-    from hermes_trader.indicators.math import atr, rsi, adx
+    from hermes_trader.indicators.math import adx, atr, rsi
     cs = _candles(150)
     for fn in (atr, rsi, adx):
         out = fn(cs, 14)
@@ -106,7 +106,7 @@ def test_rsi_and_adx_stay_in_0_100_bound():
     """RSI and ADX are mathematically bounded 0-100 — every finite output
     value must respect that. A negative RSI means the loss/gain accumulator
     math is broken (regression guard for the avg_l sign bug)."""
-    from hermes_trader.indicators.math import rsi, adx
+    from hermes_trader.indicators.math import adx, rsi
     # exercise rising, falling and choppy series so the smoothing loop runs
     rising = [Candle(t=i, o=100 + i, h=101 + i, l=99 + i, c=100 + i, v=10) for i in range(150)]
     falling = [Candle(t=i, o=250 - i, h=251 - i, l=249 - i, c=250 - i, v=10) for i in range(150)]
@@ -121,7 +121,11 @@ def test_rsi_and_adx_stay_in_0_100_bound():
 # ── triggers ────────────────────────────────────────────────────────────
 def test_triggers_return_shape():
     from hermes_trader.indicators.triggers import (
-        pct_move_spike, volume_spike, breakout, range_compression, trend_strength,
+        breakout,
+        pct_move_spike,
+        range_compression,
+        trend_strength,
+        volume_spike,
     )
     cs = _candles(150)
     for fn in (pct_move_spike, volume_spike, breakout, range_compression, trend_strength):
@@ -131,7 +135,7 @@ def test_triggers_return_shape():
 
 
 def test_composite_score_in_range():
-    from hermes_trader.indicators.triggers import pct_move_spike, volume_spike, composite_score
+    from hermes_trader.indicators.triggers import composite_score, pct_move_spike, volume_spike
     cs = _candles(150)
     weights = {"pctMoveSpike": 0.35, "volumeSpike": 0.25}
     s = composite_score([pct_move_spike(cs), volume_spike(cs)], weights)
@@ -689,8 +693,8 @@ def test_memory_load_tolerates_corrupt_rows(monkeypatch, tmp_path):
     abort hydration — pre-fix the direct cooldown subscript / dict
     comprehensions raised and were swallowed by the broad except, losing ALL
     history. Valid entries survive; bad ones degrade to defaults."""
-    from hermes_trader.agents import memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import memory as memory_mod
     mem_path = tmp_path / "agent-memory.json"
     monkeypatch.setattr(memory_mod, "MEMORY_FILE", str(mem_path))
     monkeypatch.setattr(memory_mod, "MEMORY_LOCK_FILE", str(mem_path) + ".lock")
@@ -827,7 +831,7 @@ def test_detect_regime_caches_and_uses_proxy(monkeypatch):
 
 
 def test_market_regime_gate_aligned_passes(monkeypatch):
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -841,7 +845,7 @@ def test_market_regime_gate_aligned_passes(monkeypatch):
 def test_market_regime_gate_via_reports_trigger_bypass(monkeypatch):
     """A counter-regime trade that clears only via a slow-burn trigger reports
     via='trigger:slow_burn' and counter context — this is the LINK/FARTCOIN case."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -859,7 +863,7 @@ def test_market_regime_gate_via_reports_trigger_bypass(monkeypatch):
 
 
 def test_market_regime_gate_via_confidence_and_blocked(monkeypatch):
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -876,7 +880,7 @@ def test_market_regime_gate_via_confidence_and_blocked(monkeypatch):
 
 
 def test_market_regime_gate_neutral_passes(monkeypatch):
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -886,7 +890,7 @@ def test_market_regime_gate_neutral_passes(monkeypatch):
 
 
 def test_market_regime_gate_counter_low_conf_blocks(monkeypatch):
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -899,7 +903,7 @@ def test_market_regime_gate_counter_low_conf_blocks(monkeypatch):
 def test_market_regime_gate_counter_high_conf_passes(monkeypatch):
     """A 0.85-confidence counter-trend trade should sneak through the gate —
     high-conviction contrarian trades are the whole point of the bypass."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -913,7 +917,7 @@ def test_market_regime_gate_against_funding_empty_env_no_crash(monkeypatch):
     cfg_get return '', and float('') raises ValueError. The gate must coerce to
     the elevated-bar defaults instead of crashing (and still block a low-conv
     counter-funding long)."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -931,7 +935,7 @@ def test_market_regime_gate_against_funding_empty_env_no_crash(monkeypatch):
 def test_market_regime_gate_wired_into_eval_all(monkeypatch):
     """The new gate is part of the 12-gate evaluation now and blocks at the
     right time — regression guard against forgetting to wire it in."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import eval_all_gates
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("up", 1.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",
@@ -1120,7 +1124,7 @@ def test_funding_regime_cache_short_circuits_repeated_calls(monkeypatch):
 def test_funding_regime_per_class_crypto_short_crowded_does_not_gate_oil(monkeypatch):
     """xyz:CL (oil, commodity class) long must pass even when the crypto
     funding regime is SHORT_CROWDED — oil has its own funding market."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
@@ -1144,7 +1148,7 @@ def test_funding_regime_per_class_crypto_short_crowded_does_not_gate_arm(monkeyp
     """xyz:ARM (semis, equity class) long passes when the crypto regime is
     SHORT_CROWDED but the equity regime is NEUTRAL — this is the actual
     bug that snuck xyz:ARM through the gate in production."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
@@ -1167,7 +1171,7 @@ def test_funding_regime_per_class_equity_short_crowded_gates_equity_long(monkeyp
     """When the EQUITY class itself is SHORT_CROWDED, an equity long is the
     one that faces the elevated bar — proving the per-class lookup applies
     correctly to the matching asset class."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime", lambda: {
@@ -1192,7 +1196,7 @@ def test_funding_regime_per_class_falls_back_to_legacy_when_missing(monkeypatch)
     """Older callers / unit-test stubs may return a dict without
     `regimes_by_class`. The gate must fall back to the legacy `regime` field
     rather than silently disabling the overlay."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("neutral", 0.0))
     # NO regimes_by_class key — legacy shape.
@@ -1495,8 +1499,9 @@ def test_fetch_aggregate_contributions_skips_when_no_user(monkeypatch):
 
 def test_track_daily_pnl_subtracts_contributions():
     """A $50 spot→perp transfer must not appear as $50 of trading profit."""
-    from hermes_trader.agents.memory import AgentMemory
     import time
+
+    from hermes_trader.agents.memory import AgentMemory
     m = AgentMemory()
     # Seed start-of-day so the function takes the "established baseline" branch.
     m._start_of_day_equity = 200.0
@@ -1521,8 +1526,9 @@ def test_track_daily_pnl_day_roll_rebases_with_todays_contributions():
     falsely tripping the hard daily-loss kill switch. With the heartbeat fixed
     to query contributions from TODAY's boundary, a pre-SOD transfer returns 0
     today, so the roll re-baselines at the true equity and daily_pnl reads 0."""
-    from hermes_trader.agents.memory import AgentMemory
     from datetime import datetime, timezone
+
+    from hermes_trader.agents.memory import AgentMemory
 
     today_utc = int(datetime.now(timezone.utc).replace(
         hour=0, minute=0, second=0, microsecond=0).timestamp())
@@ -1797,8 +1803,8 @@ def test_regime_gate_bypasses_on_whale_signal():
     even at low confidence and zero composite — the oi_funding_anomaly
     signal (whale accumulation, negative funding, flat price) is its own
     bypass path, parallel to slow_burn_fired."""
-    from hermes_trader.agents.risk_gates import market_regime_gate, GateContext
     import hermes_trader.agents.market_regime as mr
+    from hermes_trader.agents.risk_gates import GateContext, market_regime_gate
     mr._regime_cache.clear()
     mr._regime_cache["BTC"] = ("down", 99999999999)
 
@@ -1910,8 +1916,8 @@ def test_regime_gate_bypasses_on_slow_burn():
     """A counter-regime LONG with neither high conviction nor momentumBurst
     should still pass if slow_burn_fired is True — the empirical fix for
     WLFI/ICP-style accumulation breakouts."""
-    from hermes_trader.agents.risk_gates import market_regime_gate, GateContext
     import hermes_trader.agents.market_regime as mr
+    from hermes_trader.agents.risk_gates import GateContext, market_regime_gate
     # Force regime = "down" so the gate engages on a LONG.
     mr._regime_cache.clear()
     mr._regime_cache["BTC"] = ("down", 99999999999)
@@ -1951,8 +1957,9 @@ def test_token_bucket_deducts_and_blocks_on_exhaustion():
 
 
 def test_token_bucket_refills_over_time():
-    from hermes_trader.client.rate_limit import TokenBucket
     import time
+
+    from hermes_trader.client.rate_limit import TokenBucket
     b = TokenBucket(capacity=20, refill_per_sec=100.0)  # refills fast
     assert b.acquire(20, max_wait=0.1) is True        # drains to 0
     assert b.acquire(20, max_wait=0.05) is False       # not enough yet
@@ -1983,8 +1990,9 @@ def test_http_session_is_singleton():
 
 # ── Perf: dashboard TTL cache ────────────────────────────────────────────
 def test_ttl_cache_serves_within_ttl_and_refreshes_after():
-    import hermes_trader.dashboard as d
     import time
+
+    import hermes_trader.dashboard as d
     d._TTL_CACHE.clear()
     calls = {"n": 0}
     def producer():
@@ -2043,7 +2051,7 @@ def test_maybe_execute_reentry_backstop_blocks_when_live_read_drops_position(mon
     """If the live account read returns NO positions but the DSL registry still
     tracks the coin (restart/flaky-read window), re-entry must be blocked — else
     the position pyramids. Regression for the xyz:SP500 stacking incident."""
-    from hermes_trader.agents import executor, dsl_exit
+    from hermes_trader.agents import dsl_exit, executor
     dsl_exit._active_positions.clear()
     # DSL knows we hold SP500 long, but the live read "forgot" it.
     dsl_exit.register_position("xyz:SP500", "long", 7500.0, leverage=10)
@@ -2397,8 +2405,7 @@ def test_maybe_execute_ta_sidestep_can_bypass_runner_gate(monkeypatch):
 
 
 def test_runner_gate_blocks_hip3_gex_pintrap_longs(monkeypatch):
-    from hermes_trader.agents import executor
-    from hermes_trader.agents import options_gex
+    from hermes_trader.agents import executor, options_gex
 
     monkeypatch.setattr(
         options_gex,
@@ -2428,8 +2435,7 @@ def test_runner_gate_blocks_hip3_gex_pintrap_longs(monkeypatch):
 
 
 def test_runner_gate_gex_shadow_mode_does_not_block(monkeypatch):
-    from hermes_trader.agents import executor
-    from hermes_trader.agents import options_gex
+    from hermes_trader.agents import executor, options_gex
 
     monkeypatch.setattr(
         options_gex,
@@ -2714,8 +2720,7 @@ def test_maybe_execute_whale_boosts_size(monkeypatch):
 
 # ── Coverage: configurable conviction-sizing tiers ──────────────────────
 def test_parse_conviction_tiers_default_and_malformed():
-    from hermes_trader.agents.executor import (
-        _parse_conviction_tiers, _DEFAULT_CONVICTION_TIERS)
+    from hermes_trader.agents.executor import _DEFAULT_CONVICTION_TIERS, _parse_conviction_tiers
     assert _parse_conviction_tiers(None) == _DEFAULT_CONVICTION_TIERS
     assert _parse_conviction_tiers([]) == _DEFAULT_CONVICTION_TIERS
     # malformed entries → fall back to defaults, never raise
@@ -3386,8 +3391,9 @@ def test_positions_snapshot_missing_returns_none(tmp_path, monkeypatch):
 
 def test_positions_snapshot_stale_returns_none(tmp_path, monkeypatch):
     """A snapshot older than max_age_s is treated as absent → caller refetches."""
-    from hermes_trader import positions_snapshot as ps
     import json as _json
+
+    from hermes_trader import positions_snapshot as ps
     f = tmp_path / "snap.json"
     f.write_text(_json.dumps({"saved_at": 0, "asset_positions": [{"x": 1}]}))
     monkeypatch.setattr(ps, "SNAPSHOT_FILE", str(f))
@@ -3397,9 +3403,10 @@ def test_positions_snapshot_stale_returns_none(tmp_path, monkeypatch):
 def test_positions_snapshot_legacy_unversioned_file_still_reads(tmp_path, monkeypatch):
     """P0-2c: a snapshot written before versioning (no ``version`` field) is a
     v0 legacy file with the same layout — it must still be accepted."""
-    from hermes_trader import positions_snapshot as ps
     import json as _json
     import time as _time
+
+    from hermes_trader import positions_snapshot as ps
     f = tmp_path / "snap.json"
     rows = [{"position": {"coin": "BTC", "szi": "1.0"}}]
     f.write_text(_json.dumps({"saved_at": int(_time.time() * 1000),
@@ -3412,9 +3419,10 @@ def test_positions_snapshot_legacy_unversioned_file_still_reads(tmp_path, monkey
 def test_positions_snapshot_future_version_returns_none(tmp_path, monkeypatch):
     """P0-2c: a version newer than this binary is rejected (downgrade guard) →
     caller falls back to a live fetch instead of mis-parsing."""
-    from hermes_trader import positions_snapshot as ps
     import json as _json
     import time as _time
+
+    from hermes_trader import positions_snapshot as ps
     f = tmp_path / "snap.json"
     f.write_text(_json.dumps({"version": 999,
                               "saved_at": int(_time.time() * 1000),
@@ -3426,9 +3434,10 @@ def test_positions_snapshot_future_version_returns_none(tmp_path, monkeypatch):
 def test_positions_snapshot_wrong_typed_fields_return_none(tmp_path, monkeypatch):
     """P0-2c: a non-list asset_positions (corrupt/hand-edited file) is ignored
     rather than returned as an unusable value."""
-    from hermes_trader import positions_snapshot as ps
     import json as _json
     import time as _time
+
+    from hermes_trader import positions_snapshot as ps
     f = tmp_path / "snap.json"
     f.write_text(_json.dumps({"version": 1,
                               "saved_at": int(_time.time() * 1000),
@@ -3443,6 +3452,7 @@ def test_shadow_book_load_tolerates_malformed_rows(tmp_path):
     list fields degrade to empty."""
     import json as _json
     import time as _time
+
     from hermes_trader.agents import shadow_book as sb
 
     path = tmp_path / "shadow.json"
@@ -3860,9 +3870,9 @@ def _le_config(mode="shadow", **over):
 def _patch_candles(monkeypatch, c4h, c15m):
     """Patch fetch at BOTH bindings: risk_gates imports hl_client's symbol
     lazily, and ta_filter holds a from-import binding."""
-    import hermes_trader.client.hl_client as hl
     import hermes_trader.agents.ta_filter as tf
-    fake = lambda coin, interval, count, *a, **k: (  # noqa: E731
+    import hermes_trader.client.hl_client as hl
+    fake = lambda coin, interval, count, *a, **k: (
         c4h if interval == "4h" else c15m)
     monkeypatch.setattr(hl, "fetch_hl_candles", fake)
     monkeypatch.setattr(tf, "fetch_hl_candles", fake)
@@ -3929,8 +3939,8 @@ def test_ta_late_entry_gate_mtf_override_passes_in_enforce(monkeypatch):
 
 def test_ta_late_entry_gate_fail_open_on_fetch_error(monkeypatch):
     """Any fetch/compute failure must PASS the order (never stall execution)."""
-    import hermes_trader.client.hl_client as hl
     import hermes_trader.agents.ta_filter as tf
+    import hermes_trader.client.hl_client as hl
 
     def boom(*a, **k):
         raise RuntimeError("hl down")
@@ -4021,8 +4031,8 @@ def test_ta_late_entry_gate_mtf_disabled_fetches_no_15m(monkeypatch, tmp_path):
     """Phase 0 (R3): with mtf_enabled absent/False the gate fetches ONLY 4h —
     the 15m cache key is never warmed by anything, so every 15m call was a
     cold weight-20 HTTP."""
-    import hermes_trader.client.hl_client as hl
     import hermes_trader.agents.ta_filter as tf
+    import hermes_trader.client.hl_client as hl
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     calls = []
 
@@ -4042,8 +4052,8 @@ def test_ta_late_entry_gate_mtf_disabled_fetches_no_15m(monkeypatch, tmp_path):
 
 def test_ta_late_entry_gate_mtf_enabled_still_fetches_15m(monkeypatch, tmp_path):
     """Opt-in mtf_enabled=True restores the parallel 4h+15m fetch path."""
-    import hermes_trader.client.hl_client as hl
     import hermes_trader.agents.ta_filter as tf
+    import hermes_trader.client.hl_client as hl
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     calls = []
 
@@ -4408,7 +4418,7 @@ def test_reconcile_main_dry_run_scores_mature_vetoes(monkeypatch, tmp_path, caps
     works on freshly-deserialized dicts, so scoring is asserted via the
     stdout summary, not the test's in-memory objects."""
     rc = _load_reconcile_module()
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     log = tmp_path / "shadow.jsonl"
     old = (datetime.now(timezone.utc) - timedelta(hours=20)
            ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4458,7 +4468,7 @@ def test_reconcile_main_write_persists_outcomes(monkeypatch, tmp_path):
     """--write flips outcome/exit_px/pnl_pct back into the JSONL; a veto
     younger than the maturity window is left pending."""
     rc = _load_reconcile_module()
-    from datetime import datetime, timezone, timedelta
+    from datetime import datetime, timedelta, timezone
     log = tmp_path / "shadow.jsonl"
     old = (datetime.now(timezone.utc) - timedelta(hours=20)
            ).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -4691,7 +4701,7 @@ def test_classify_candles_trend_overrides_chop():
 def test_chop_regime_gate_raises_conviction_bar(monkeypatch):
     """In chop, a weak long must be blocked; high conviction or momentum burst
     must pass. slow_burn/whale alone must NOT bypass chop."""
-    from hermes_trader.agents import market_regime, hyperfeed
+    from hermes_trader.agents import hyperfeed, market_regime
     from hermes_trader.agents.risk_gates import market_regime_gate
     monkeypatch.setattr(market_regime, "detect_regime_with_score", lambda c, force=False: ("chop", 0.0))
     monkeypatch.setattr(hyperfeed, "market_get_funding_regime",

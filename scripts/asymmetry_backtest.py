@@ -6,9 +6,13 @@ tanking net? Reuses the validated reentry/backtest primitives — no lookahead.
 
 Usage: python3 scripts/asymmetry_backtest.py --days 21 --coins 30 --interval 1h
 """
-import argparse, os, sys
+import argparse
+import os
+import sys
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from reentry_backtest import simulate
+
 from hermes_trader.agents.config import get_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe

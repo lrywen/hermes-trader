@@ -23,9 +23,9 @@ import logging
 import os
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 # P3-17: backtest process — never load a live mainnet private key.
 os.environ["HERMES_BACKTEST"] = "1"
@@ -44,7 +44,7 @@ if _env.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.market_regime import trend_from_closes
 from hermes_trader.client.hl_client import _http_post
 from hermes_trader.client.universe import get_universe
@@ -196,7 +196,7 @@ def simulate_dsl_exit(entry_px: float, side: str, leverage: int,
 def call_ai_research(coin: str, mid: float, composite: float, c1h: List[Candle], c4h: List[Candle], c1d: List[Candle],
                      slow_burn_hits: List[Dict[str, Any]]) -> Tuple[str, float, str]:
     """Real OpenRouter call. Returns (verdict, confidence, reasoning)."""
-    from hermes_trader.agents.research import _build_user_message, _call_ai, parse_verdict, _compute_indicators
+    from hermes_trader.agents.research import _build_user_message, _call_ai, _compute_indicators, parse_verdict
     from hermes_trader.agents.system_prompt import build_system_prompt
 
     tf1h = _compute_indicators(c1h)
@@ -270,7 +270,7 @@ def main() -> int:
     eligible.sort(key=lambda m: m.get("dayNtlVlm", 0), reverse=True)
     top_markets = eligible[:args.top_markets]
 
-    print(f"# Backtest config")
+    print("# Backtest config")
     print(f"  window:       last {args.hours}h ({len(ticks)} ticks at {args.tick_min}min)")
     print(f"  markets:      top {len(top_markets)} by volume")
     print(f"  LLM:          {'OFF (heuristic)' if args.no_llm else f'ON (cap {args.llm_cap} calls)'}")

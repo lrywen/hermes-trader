@@ -220,7 +220,7 @@ def fetch_live_dsl_config() -> Dict[str, Any]:
             stderr=subprocess.DEVNULL, timeout=15, text=True,
         )
         return json.loads(out.strip())
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {"error": f"unable to read live config: {e}"}
 
 
@@ -674,7 +674,7 @@ def _http_post(url: str, data: Dict[str, Any],
                 return {"ok": True, "raw": raw}
     except urllib.error.HTTPError as e:
         return {"ok": False, "status": e.code, "error": e.read().decode(errors="replace")}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return {"ok": False, "error": str(e)}
 
 

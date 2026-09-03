@@ -60,7 +60,7 @@ def test_ioc_cross_price_crosses_book():
     """The IOC limit price must cross the live book — a buy >= best ask,
     a sell <= best bid — or the order matches nothing ('could not
     immediately match')."""
-    from hermes_trader.client.exchange import _ioc_cross_price, _get_info, get_hl_price
+    from hermes_trader.client.exchange import _get_info, _ioc_cross_price, get_hl_price
     info = _get_info()
     for coin in ("BTC", "ETH"):
         mid = get_hl_price(coin)
@@ -77,8 +77,8 @@ def test_get_hl_atr_live():
 
 def test_funding_rate_live():
     """Verifies the funding-rate bug fix (_make_info -> fetch_funding_history)."""
-    from hermes_trader.client.hl_client import fetch_funding_history
     from hermes_trader.agents.research import _fetch_funding_rate
+    from hermes_trader.client.hl_client import fetch_funding_history
     hist = fetch_funding_history("BTC", int(time.time() * 1000) - 86_400_000)
     assert isinstance(hist, list) and hist
     assert "fundingRate" in hist[-1]

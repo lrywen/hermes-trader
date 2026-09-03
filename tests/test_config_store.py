@@ -21,18 +21,17 @@ import pytest
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
-    backup_config,
-    cfg_get,
-    read_agent_config,
-    restore_backup,
-    write_agent_config,
     _coerce,
     _deep_merge,
     _env_override,
     _lookup_default,
     _lookup_in_dict,
+    backup_config,
+    cfg_get,
+    read_agent_config,
+    restore_backup,
+    write_agent_config,
 )
-
 
 # ── CANONICAL_DEFAULTS integrity ────────────────────────────────────────────
 
@@ -313,7 +312,8 @@ def test_restore_snapshot_does_not_self_deadlock(tmp_path, monkeypatch):
     write_agent_config) blocking on LOCK_EX would self-deadlock forever. The
     restore runs in a worker thread; a 10s join timeout fails the regression."""
     import threading
-    from hermes_trader.agents.config_store import restore_snapshot, _snap_path
+
+    from hermes_trader.agents.config_store import _snap_path, restore_snapshot
 
     cfg_file = tmp_path / ".agent-config.json"
     monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))

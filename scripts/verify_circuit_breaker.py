@@ -28,10 +28,9 @@ import argparse
 import sys
 import threading
 import time
-from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional
+from typing import Callable, List, Optional
 
 # ── Shared in-process state for the mock backend ───────────────────────
 

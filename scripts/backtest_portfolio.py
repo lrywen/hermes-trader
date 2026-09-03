@@ -18,8 +18,8 @@ Usage: python3 scripts/backtest_portfolio.py --max-concurrent 8
 from __future__ import annotations
 
 import argparse
-import tempfile
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -27,14 +27,18 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 import backtest_logged as btlog
+from _memory_io import load_memory
 from backtest_logged import (  # reuse validated primitives
-    fetch_candles_at, detect_regime_at, passes_counter_regime,
-    _load_disk_cache, _save_disk_cache,
+    _load_disk_cache,
+    _save_disk_cache,
+    detect_regime_at,
+    fetch_candles_at,
+    passes_counter_regime,
 )
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.executor import _runner_entry_block_reason
 from hermes_trader.models.types import Candle
-from _memory_io import load_memory
 
 STEP_MS = 300_000  # 5-min clock
 ROUND_TRIP_FEE_RATE = 0.0005  # live executor model: 2.5 bps in + 2.5 bps out

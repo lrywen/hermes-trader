@@ -47,14 +47,14 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-
 # Reuse the byte-aligned classifiers from the architecture comparison.
-from compare_regime_architectures import (  # noqa: E402
+from compare_regime_architectures import (
     WARMUP,
     backtest_label,
     production_label,
 )
+
+from hermes_trader.client.hl_client import fetch_hl_candles
 
 # Non-trend states in each classifier's own label vocabulary.
 BT_NONTREND = {"NEUTRAL", "CHOP"}      # backtest raw labels

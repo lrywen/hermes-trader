@@ -25,7 +25,8 @@ sys.path.insert(0, str(_REPO / "scripts"))
 
 import backtest_logged as btlog
 from _memory_io import load_memory
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.executor import _runner_entry_block_reason
 from hermes_trader.agents.sizing import atr_equal_risk_notional
 from hermes_trader.indicators.math import atr as calc_atr

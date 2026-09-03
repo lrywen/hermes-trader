@@ -27,10 +27,10 @@ import json
 import os
 import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 _REPO = Path(__file__).resolve().parents[1]
 _env = _REPO / ".env.local"
@@ -47,14 +47,15 @@ sys.path.insert(0, str(_REPO / "scripts"))
 
 # Reuse the exact same entry evaluator + DSL exit model as the backtest, so the
 # gray-mode numbers are directly comparable to A/B/C results.
-from backtest_ab_compare import (  # noqa: E402
+from backtest_ab_compare import (
     DSL,
     _evaluate_entry,
     _resample_4h,
 )
-from hermes_trader.agents.config import get_config  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
+
+from hermes_trader.agents.config import get_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
 
 OBS_LOG = Path("/tmp/hermes_dynamic_rsi_gray.jsonl")
 SUMMARY_LOG = Path("/tmp/hermes_dynamic_rsi_summary.jsonl")
@@ -208,7 +209,7 @@ def evaluate_universe(
                     "dynamic_reason": d_block,
                 })
 
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors.append({"coin": coin, "error": str(exc)[:200]})
 
     return {
@@ -321,7 +322,7 @@ def main() -> int:
                     help="Run a single evaluation tick and exit (smoke test).")
     args = ap.parse_args()
 
-    from hermes_trader.agents.config_store import read_agent_config, cfg_get
+    from hermes_trader.agents.config_store import cfg_get, read_agent_config
     live = read_agent_config()
     equity_fraction = float(live.get("equity_fraction_per_trade", 0.10))
     lev_ceiling = int(cfg_get("leverage", config=live))
@@ -343,7 +344,7 @@ def main() -> int:
     closed_positions: List[PaperPos] = []
     started_at = time.time()
 
-    print(f"=== Dynamic RSI gray observer ===")
+    print("=== Dynamic RSI gray observer ===")
     print(f"Duration: {args.hours}h | Coins: {args.coins} | Tick every: {args.interval}s")
     print(f"Equity: ${args.equity:.0f} | Fraction: {equity_fraction:.0%} | "
           f"Lev: {lev_ceiling}x | DSL: {max_loss}%/{protect}%/{retrace}")

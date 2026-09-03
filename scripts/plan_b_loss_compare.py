@@ -24,7 +24,6 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List
 
@@ -42,12 +41,12 @@ sys.path.insert(0, str(_REPO))
 
 os.environ["HERMES_BACKTEST"] = "1"
 
-from hermes_trader.agents.config import get_config          # noqa: E402
-from hermes_trader.agents.config_store import read_agent_config, cfg_get  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe       # noqa: E402
+from backtest_ab_compare import _simulate
 
-from backtest_ab_compare import _simulate                    # noqa: E402
+from hermes_trader.agents.config import get_config
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
 
 RSI_LO, RSI_HI = 40.0, 60.0
 

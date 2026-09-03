@@ -32,7 +32,7 @@ from unittest import mock
 import pytest
 
 from hermes_trader.agents import memory as memory_mod
-from hermes_trader.agents.memory import AgentMemory, MEMORY_FILE, MEMORY_LOCK_FILE
+from hermes_trader.agents.memory import MEMORY_LOCK_FILE, AgentMemory
 
 
 @pytest.fixture

@@ -10,9 +10,9 @@ import logging
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.client.hl_client import _http_post, fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
-from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
 

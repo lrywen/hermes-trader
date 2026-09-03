@@ -51,7 +51,7 @@ if _env.is_file():
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import read_agent_config, cfg_get
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.ta_filter import late_entry_check
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe

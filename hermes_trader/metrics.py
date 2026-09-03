@@ -397,7 +397,7 @@ def _refresh() -> None:
         memory.load()
         EQUITY.set(_to_float(memory.get_full_state().get("equity", 0)))
         TRADES_TOTAL.set(len(memory.get_all_trades() or []))
-    except Exception as e:  # noqa: BLE001 — metrics must never break the endpoint
+    except Exception as e:
         logger.debug(f"[metrics] memory read failed: {e}")
 
     try:
@@ -405,7 +405,7 @@ def _refresh() -> None:
 
         mode = str(read_agent_config().get("mode", "OFF")).upper()
         LIVE_MODE.set(1.0 if mode == "LIVE" else 0.0)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] config read failed: {e}")
 
     try:
@@ -425,7 +425,7 @@ def _refresh() -> None:
         OPEN_POSITIONS.set(count)
         OPEN_NOTIONAL.set(notional)
         UNREALIZED_PNL.set(upnl)
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] snapshot read failed: {e}")
 
     # P3-1: trade-side tiered breakers — read-only snapshot, no mutation
@@ -436,7 +436,7 @@ def _refresh() -> None:
         cs = memory.circuit_snapshot()
         TRADE_CIRCUIT_STATE.labels(scope="global").set(1.0 if cs.get("global_halt") else 0.0)
         TRADE_CIRCUIT_STATE.labels(scope="coin_armed").set(float(cs.get("armed_coins", 0)))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] circuit read failed: {e}")
 
     # P3-1: debate cache size — local in-process dict, network-free.
@@ -444,7 +444,7 @@ def _refresh() -> None:
         from hermes_trader.agents.research import _debate_cache
 
         DEBATE_CACHE_ENTRIES.set(float(len(_debate_cache)))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] debate cache read failed: {e}")
 
     # R11-F1: WS diag snapshot. The WebSocket singleton is held by
@@ -470,7 +470,7 @@ def _refresh() -> None:
                 # Snapshot can be momentarily racy; never let a gauge
                 # read tear the metrics endpoint.
                 pass
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] ws diag read failed: {e}")
 
     # Phase-4 P1: HL REST rate-limiter counters. The shared bucket keeps its
@@ -487,7 +487,7 @@ def _refresh() -> None:
             HL_REST_DENIED_REQUESTS.set(float(st.get("denied_requests", 0)))
             HL_REST_PENALIZED_REQUESTS.set(float(st.get("penalized_requests", 0)))
             HL_REST_TOKENS_AVAILABLE.set(float(st.get("tokens_available", 0.0)))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[metrics] hl rate stats read failed: {e}")
 
 

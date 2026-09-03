@@ -3,8 +3,12 @@
 from datetime import datetime, timezone
 
 from hermes_trader.agents.news_catalyst import (
-    parse_gdelt_artlist, detect_surge, parse_gdelt_timeline,
-    parse_rss, filter_keywords, _parse_gdelt_date,
+    _parse_gdelt_date,
+    detect_surge,
+    filter_keywords,
+    parse_gdelt_artlist,
+    parse_gdelt_timeline,
+    parse_rss,
 )
 
 

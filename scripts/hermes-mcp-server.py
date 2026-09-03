@@ -14,8 +14,8 @@ Automatically loads .env.local from project root if present.
 """
 
 import json
-import sys
 import os
+import sys
 import time
 from typing import Any, Dict
 
@@ -38,19 +38,21 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from hermes_trader import __version__
 from hermes_trader.agents.config_store import read_agent_config
-from hermes_trader.agents.perception import scan_once
-from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 from hermes_trader.agents.hyperfeed import (
-    leaderboard_get_markets,
-    leaderboard_get_top as leaderboard_get_top_traders,
-    leaderboard_get_trader_positions,
     discovery_get_top_traders,
     discovery_get_trader_state,
+    leaderboard_get_markets,
+    leaderboard_get_trader_positions,
     market_get_asset_data,
     market_get_funding_regime,
-    market_list_instruments,
     market_get_mids,
+    market_list_instruments,
 )
+from hermes_trader.agents.hyperfeed import (
+    leaderboard_get_top as leaderboard_get_top_traders,
+)
+from hermes_trader.agents.perception import scan_once
+from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 
 # Per-subprocess perception cache so research can access the data from last scan
 _perception_cache: Dict[str, Dict[str, Any]] = {}
@@ -1170,8 +1172,8 @@ def handle_deep_research(params: Dict[str, Any]) -> str:
         sys.path.insert(0, _hta_path)
 
     try:
-        from tradingagents.graph.trading_graph import TradingAgentsGraph
         from tradingagents.default_config import DEFAULT_CONFIG
+        from tradingagents.graph.trading_graph import TradingAgentsGraph
 
         config = DEFAULT_CONFIG.copy()
         config["output_language"] = "English"
@@ -1802,7 +1804,7 @@ def handle_get_order_by_oid(params: Dict[str, Any]) -> str:
 def handle_get_user_fees_detailed(params: Dict[str, Any]) -> str:
     """Handle get_user_fees_detailed tool call."""
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         if hasattr(info, 'user_fees') and HL_ACCOUNT:
             res = info.user_fees(HL_ACCOUNT)
@@ -1816,7 +1818,7 @@ def handle_get_user_fills(params: Dict[str, Any]) -> str:
     """Handle get_user_fills tool call."""
     limit = int(params.get('limit', 100))
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         if not HL_ACCOUNT:
             return json.dumps({'error': 'no configured user address'}, default=str)
@@ -1833,7 +1835,7 @@ def handle_get_user_fills_by_time(params: Dict[str, Any]) -> str:
     start_time = int(params.get('start_time', 0))
     end_time = params.get('end_time')
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         if not HL_ACCOUNT:
             return json.dumps({'error': 'no configured user address'}, default=str)
@@ -1852,7 +1854,7 @@ def handle_get_user_funding_history(params: Dict[str, Any]) -> str:
     start_time = int(params.get('start_time', 0))
     end_time = params.get('end_time')
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         if not HL_ACCOUNT:
             return json.dumps({'error': 'no configured user address'}, default=str)
@@ -1869,7 +1871,7 @@ def handle_get_user_funding_history(params: Dict[str, Any]) -> str:
 def handle_get_historical_orders(params: Dict[str, Any]) -> str:
     """Handle get_historical_orders tool call."""
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         if not HL_ACCOUNT:
             return json.dumps({'error': 'no configured user address'}, default=str)
@@ -1885,7 +1887,7 @@ def handle_query_order_by_cloid(params: Dict[str, Any]) -> str:
     cloid = params.get('cloid', '')
     user = params.get('user')
     try:
-        from hermes_trader.client.exchange import _get_info, HL_ACCOUNT
+        from hermes_trader.client.exchange import HL_ACCOUNT, _get_info
         info = _get_info()
         addr = user or HL_ACCOUNT
         if not addr:

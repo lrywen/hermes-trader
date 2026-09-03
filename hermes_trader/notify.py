@@ -39,8 +39,8 @@ import hmac
 import json
 import logging
 import os
-import time
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -287,7 +287,7 @@ def _post_with_retry(
                 )
                 _cb_record(channel_url, succeeded=False)
                 return False
-        except Exception as e:  # noqa: BLE001 — never let notification break caller
+        except Exception as e:
             last_exc = e
             last_status = -1
             if not _is_retryable_error(e, -1):
@@ -539,7 +539,7 @@ def send_card(
             button_text=button_text,
             button_url=button_url,
         )
-    except Exception as e:  # noqa: BLE001 — never let notification break caller
+    except Exception as e:
         logger.warning(
             "notify: send_card swallowed unexpected exception: %r", e
         )
@@ -577,7 +577,7 @@ def send_text(text: str, *, category: str = "report") -> bool:
                 logger.info("notify: Feishu text push OK [%s]", category)
                 return True
         return False
-    except Exception as e:  # noqa: BLE001 — never let notification break caller
+    except Exception as e:
         logger.warning(
             "notify: send_text swallowed unexpected exception: %r", e
         )

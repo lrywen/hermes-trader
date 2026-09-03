@@ -38,17 +38,11 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config import get_config
-from hermes_trader.client.hl_client import fetch_hl_candles
-from hermes_trader.client.universe import get_universe
-from hermes_trader.indicators import math as ind
-from hermes_trader.indicators import triggers as trig
-
 # Reuse helpers + DSL from the A/B backtest module.
 from backtest_ab_compare import (
+    _REGIME_TABLE,
     DSL,
     ROUND_TRIP_FEE_BPS,
-    _REGIME_TABLE,
     _adx_val,
     _atr_val,
     _ema_val,
@@ -57,6 +51,11 @@ from backtest_ab_compare import (
     _regime_score,
     _resample_4h,
 )
+
+from hermes_trader.agents.config import get_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
+from hermes_trader.indicators import math as ind
 
 TARGET_COINS = ["kPEPE", "CRV", "ETH"]
 WARMUP = 120
@@ -489,7 +488,7 @@ def _print_coin(r: Dict[str, Any]) -> None:
     print(f"  Analyzed bars: {r['analyzed_bars']} | "
           f"bars with 1d resonance data: {r['daily_data_available']} "
           f"({r['daily_data_available']/max(1,r['analyzed_bars'])*100:.0f}%)")
-    print(f"  ADX>=40 + RSI>=75 LONG signal breakdown (current DYN):")
+    print("  ADX>=40 + RSI>=75 LONG signal breakdown (current DYN):")
     for cat in ("pass", "block_late_long", "block_overext", "block_chop"):
         n = c.get(cat, 0)
         pnl_v = p.get(cat, 0.0)
@@ -498,7 +497,7 @@ def _print_coin(r: Dict[str, Any]) -> None:
         print(f"    {cat:20s}: {n:4d}  trades | WR {wr:5.1f}% | "
               f"counterfactual PnL ${pnl_v:+8.2f}")
 
-    print(f"  After BOTH fixes (dead-code + overext exception):")
+    print("  After BOTH fixes (dead-code + overext exception):")
     for key in ("pass_full", "fix1_resonance_half", "fix2_strongtrend_half",
                 "still_blocked"):
         d = rec[key]
@@ -516,7 +515,7 @@ def _print_coin(r: Dict[str, Any]) -> None:
     rw = r["regime_wins"]
     rld = r["regime_label_dist"]
     total_sig = sum(rc.values()) or 1
-    print(f"  REGIME (data-driven score):")
+    print("  REGIME (data-driven score):")
     for key in ("regime_pass_full", "regime_pass_half",
                 "regime_block_rsi", "regime_block_ext"):
         n = rc.get(key, 0)
@@ -546,7 +545,7 @@ def _print_coin(r: Dict[str, Any]) -> None:
                   f"rec=${ex['pnl_rec']:+6.2f}")
 
     d = r["diag"]
-    print(f"  Diagnostics:")
+    print("  Diagnostics:")
     print(f"    RSI distribution (all ADX>=40 + RSI>=75 LONG signals): "
           f"{d['rsi_buckets']}")
     print(f"    RSI distribution (blocked only):                   "
@@ -580,7 +579,7 @@ def _print_coin(r: Dict[str, Any]) -> None:
 
 
 def main() -> int:
-    from hermes_trader.agents.config_store import read_agent_config, cfg_get
+    from hermes_trader.agents.config_store import cfg_get, read_agent_config
 
     cfg = get_config()
     live = read_agent_config()
@@ -698,7 +697,7 @@ def main() -> int:
     total_r_block = gr["regime_block_rsi"]["n"] + gr["regime_block_ext"]["n"]
     total_r_sig = total_r_pass + total_r_block
 
-    print(f"\n  REGIME (data-driven score) — grand total:")
+    print("\n  REGIME (data-driven score) — grand total:")
     for key in ("regime_pass_full", "regime_pass_half",
                 "regime_block_rsi", "regime_block_ext"):
         d = gr[key]
@@ -716,7 +715,7 @@ def main() -> int:
 
     dyn_passed_pnl = grand["pnl"].get("pass", 0.0)
     dyn_blocked = grand["counts"].get("block_late_long", 0) + grand["counts"].get("block_overext", 0)
-    print(f"\n  COMPARISON (ADX>=40 + RSI>=75 zone, 3 coins, 21 days):")
+    print("\n  COMPARISON (ADX>=40 + RSI>=75 zone, 3 coins, 21 days):")
     print(f"    DYN     : passed {grand['counts'].get('pass',0)} trades, "
           f"blocked {dyn_blocked}, passed-PnL ${dyn_passed_pnl:+8.2f}")
     print(f"    FIXED   : rescued {grand['rec_fix1']+grand['rec_fix2']} trades, "

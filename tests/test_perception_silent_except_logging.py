@@ -20,9 +20,6 @@ import sys
 import types
 from typing import Any, Dict
 
-import pytest
-
-
 _PERCEPTION_LOGGER = "hermes_trader.agents.perception"
 
 
@@ -39,7 +36,6 @@ def test_r12_d1_regime_classify_failure_logs_debug(monkeypatch, caplog):
     `trend_chop = False`; the fallback is correct (a classifier hiccup must
     not silence a real trend signal) but the failure used to be invisible.
     Lock in the DEBUG surface so the operator can see the hiccup."""
-    from hermes_trader.agents import perception
     import hermes_trader.agents.perception as p_mod
 
     def _explode(_candles):
@@ -81,8 +77,8 @@ def test_r12_d1_near_miss_session_log_failure_logs_warning(monkeypatch, caplog):
     silent; the row is what post-mortems read to reconstruct the score
     trajectory of coins that almost surfaced. WARNING is appropriate —
     this is rare, and the data is exactly what we need to keep."""
-    from hermes_trader.agents import perception
     import hermes_trader.session_log as sl_mod
+    from hermes_trader.agents import perception
 
     def _explode(_event):
         raise _Boom("session_log boom")
@@ -121,8 +117,7 @@ def test_r12_d1_scan_read_agent_config_failure_logs_warning(monkeypatch, caplog)
     crypto-only / no-bypass on config-read failure. That fallback is a real
     degraded-config state the operator must see (whale + trend surfacing
     are silently disabled for the whole scan cycle)."""
-    from hermes_trader.agents import perception
-    from hermes_trader.agents import config_store
+    from hermes_trader.agents import config_store, perception
 
     def _explode():
         raise _Boom("read_agent_config boom")

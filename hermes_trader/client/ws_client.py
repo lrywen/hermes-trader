@@ -31,6 +31,7 @@ from hyperliquid.websocket_manager import WebsocketManager
 
 from hermes_trader.agents import atomic_io
 from hermes_trader.client.hl_client import _http_post
+
 # R13-B13: WS tuning knobs live in canonical block hl_client_io; rate_limit
 # is a leaf (stdlib + lazy config_store only), so this import cannot cycle.
 from hermes_trader.client.rate_limit import _HL_CLIENT_IO
@@ -320,7 +321,7 @@ class HyperliquidWebSocket:
             )
         except FileNotFoundError:
             pass
-        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+        except Exception as exc:
             logger.warning(
                 "[ws:user-fills] could not load seen-tids file %s: %s",
                 _USER_FILLS_SEEN_FILE, exc,
@@ -357,7 +358,7 @@ class HyperliquidWebSocket:
             )
             self._user_fills_seen_dirty = False
             self._user_fills_last_persist = now
-        except Exception as exc:  # noqa: BLE001 — persistence is best-effort
+        except Exception as exc:
             logger.debug(
                 "[ws:user-fills] could not persist seen-tids to %s: %s",
                 _USER_FILLS_SEEN_FILE, exc,

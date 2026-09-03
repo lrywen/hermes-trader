@@ -1,15 +1,17 @@
 """Tests for the shadow-signal advisor (routing + summary; no network)."""
 
-import hermes_trader.agents.options_gex as gex_mod
-import hermes_trader.agents.short_volume as sv_mod
 import hermes_trader.agents.crypto_whale as cw_mod
 import hermes_trader.agents.news_catalyst as news_mod
-from hermes_trader.agents.shadow_signals import (
-    gather_shadow_signals, shadow_summary, _base_symbol,
-)
-from hermes_trader.agents.options_gex import GexReport
-from hermes_trader.agents.short_volume import ShortVolReport
+import hermes_trader.agents.options_gex as gex_mod
+import hermes_trader.agents.short_volume as sv_mod
 from hermes_trader.agents.crypto_whale import WhaleReport
+from hermes_trader.agents.options_gex import GexReport
+from hermes_trader.agents.shadow_signals import (
+    _base_symbol,
+    gather_shadow_signals,
+    shadow_summary,
+)
+from hermes_trader.agents.short_volume import ShortVolReport
 
 
 def test_base_symbol():
@@ -46,7 +48,7 @@ def test_gather_crypto_uses_whale(monkeypatch):
 
 
 def test_news_only_surfaces_when_elevated(monkeypatch):
-    from hermes_trader.agents.news_catalyst import CatalystReport, Article
+    from hermes_trader.agents.news_catalyst import Article, CatalystReport
     # not breaking, low surge -> omitted
     monkeypatch.setattr(news_mod, "catalyst_scan", lambda *a, **k: CatalystReport(
         query="ETH", n_recent=2, breaking=False, surge_x=1.0, headlines=[]))
@@ -66,7 +68,7 @@ def test_summary_empty():
 
 # ── enforcement (Veto + Boost) ───────────────────────────────────────────────
 
-from hermes_trader.agents.shadow_signals import enforce_signals, Enforcement
+from hermes_trader.agents.shadow_signals import Enforcement, enforce_signals
 
 _EN = {"signal_enforcement": {"enabled": True, "veto": True, "boost": True,
                               "gex_veto": True, "whale_veto_min_usd": 250000,

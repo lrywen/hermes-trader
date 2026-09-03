@@ -1,7 +1,10 @@
 """Tests for the free crypto whale-flow engine (pure functions; no network)."""
 
 from hermes_trader.agents.crypto_whale import (
-    binance_symbol, parse_aggtrades, compute_whale_flow, Print,
+    Print,
+    binance_symbol,
+    compute_whale_flow,
+    parse_aggtrades,
 )
 
 

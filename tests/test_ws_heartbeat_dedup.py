@@ -23,17 +23,14 @@ from __future__ import annotations
 
 import threading
 import time
-from unittest import mock
 
 import pytest
 
 from hermes_trader.client import ws_client
 from hermes_trader.client.ws_client import (
-    HLSSLOptWebsocketManager,
     HyperliquidWebSocket,
     RealtimeSnapshot,
 )
-
 
 # ---------------------------------------------------------------------------
 # Fixtures

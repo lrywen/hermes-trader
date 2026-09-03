@@ -18,9 +18,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 
@@ -265,8 +262,9 @@ def test_route_uses_blocked_key(monkeypatch):
     raised 403. The route must check ``report["blocked"]`` instead. We
     import the route body to verify the key name used.
     """
-    import hermes_trader.server as srv
     import inspect
+
+    import hermes_trader.server as srv
     src = inspect.getsource(srv.place_order)
     assert '"blocked"' in src or "'blocked'" in src, (
         "place_order must branch on report['blocked'] (eval_all_gates "
@@ -312,8 +310,9 @@ def test_place_order_route_reads_normalized_asset_positions_key():
     """Regression guard at the call site: the route must pass
     ``acct['asset_positions']`` (normalized) into the gates, never the raw
     ``assetPositions`` envelope key."""
-    import hermes_trader.server as srv
     import inspect
+
+    import hermes_trader.server as srv
     src = inspect.getsource(srv.place_order)
     assert '"asset_positions"' in src or "'asset_positions'" in src, (
         "place_order must read the normalized acct['asset_positions'] key"

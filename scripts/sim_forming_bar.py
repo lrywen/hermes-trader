@@ -18,9 +18,9 @@ import argparse
 import datetime as dt
 from typing import Any, Dict, List
 
+from hermes_trader.agents.config import get_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.indicators import triggers as trigger_mod
-from hermes_trader.agents.config import get_config
 
 # 复用与 perception._scan_single_market 完全一致的权重/阈值
 CFG = get_config()

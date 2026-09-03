@@ -21,16 +21,14 @@ We do NOT spin up a Prometheus server in tests; the contract is
 """
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 
 import pytest
 import yaml
+from prometheus_client import REGISTRY
 
 from hermes_trader import metrics as _metrics
-from prometheus_client import Counter, Gauge, Histogram, REGISTRY
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 RULE_PATH = REPO_ROOT / "k8s" / "prometheusrule.yaml"
@@ -72,7 +70,7 @@ def _build_name_to_metric() -> dict:
     has registered. We do this by walking REGISTRY and looking up
     each child's name."""
     out: dict = {}
-    for collector in list(REGISTRY._collector_to_names.keys()):  # noqa: SLF001
+    for collector in list(REGISTRY._collector_to_names.keys()):
         for metric in collector.collect():
             # metric is a protobuf; ``metric.name`` is the canonical
             # name (with the ``_total`` / ``_bucket`` / ``_count`` /
@@ -93,7 +91,7 @@ def _metric_kind(name_to_metric: dict, name: str) -> str | None:
     for a metric name as Prometheus would expose it. We need to
     walk the live collectors because prometheus_client doesn't
     expose a single ``Metric._type`` for the unwrapped form."""
-    for collector in list(REGISTRY._collector_to_names.keys()):  # noqa: SLF001
+    for collector in list(REGISTRY._collector_to_names.keys()):
         for metric in collector.collect():
             if metric.name == name:
                 t = metric.type
@@ -294,7 +292,7 @@ class TestMetricKindSuffixes:
     def test_counters_have_total_suffix(
         self, name_to_metric: dict,
     ) -> None:
-        for collector in list(REGISTRY._collector_to_names.keys()):  # noqa: SLF001
+        for collector in list(REGISTRY._collector_to_names.keys()):
             for metric in collector.collect():
                 if metric.type == "COUNTER":
                     assert metric.name.endswith("_total"), (

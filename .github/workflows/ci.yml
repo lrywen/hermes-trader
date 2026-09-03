@@ -36,3 +36,28 @@ jobs:
       # only the offline suite — no network, no real-money orders, CI-safe.
       - name: Run offline test suite
         run: uv run pytest
+
+  # P1-2: lint quality gate. The rule set is explicitly pinned in pyproject.toml
+  # ([tool.ruff]) so this is deterministic regardless of ruff's upstream defaults
+  # or machine-local config. Existing violations were baselined with targeted
+  # `# noqa: <code>  (P1-2 baseline: ...)` comments, so this gate only fails on
+  # *new* violations introduced after the baseline.
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install 3.11
+
+      - name: Install (locked, with dev extras)
+        run: uv sync --frozen --extra dev
+
+      - name: Ruff check
+        run: uv run ruff check hermes_trader/ scripts/ tests/

@@ -4,8 +4,9 @@
 Tests that breakout ALONE (without volumeSpike) now admits a long signal,
 while other gate conditions (confidence, RSI, structure) still apply.
 """
-import sys
 import os
+import sys
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from hermes_trader.agents.executor import _runner_entry_block_reason

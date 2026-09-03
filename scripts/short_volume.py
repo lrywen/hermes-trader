@@ -5,6 +5,7 @@ Usage: python3 scripts/short_volume.py HOOD
        python3 scripts/short_volume.py xyz:NVDA TSLA GME
 """
 import sys
+
 from hermes_trader.agents.short_volume import short_volume_signal
 
 

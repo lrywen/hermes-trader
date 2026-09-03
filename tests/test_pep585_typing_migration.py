@@ -27,9 +27,7 @@ because that's where type-checker compatibility matters.
 from __future__ import annotations
 
 import re
-import sys
 from pathlib import Path
-
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROD_ROOT = REPO_ROOT / "hermes_trader"

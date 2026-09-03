@@ -35,7 +35,6 @@ import logging
 import os
 import shutil
 import threading
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -55,7 +54,7 @@ _LOCK = threading.Lock()
 # makes rotate+append+anchor-advance atomic across both writers so they can't
 # interleave a rotation with an append. Best-effort: if the sidecar cannot be
 # opened (read-only volume / exotic FS) we fall back to the in-process lock.
-import contextlib  # noqa: E402
+import contextlib
 
 try:
     import fcntl  # type: ignore  # POSIX only

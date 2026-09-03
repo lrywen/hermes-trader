@@ -28,16 +28,23 @@ from typing import TYPE_CHECKING, Any, Optional
 import requests
 
 from hermes_trader.client.rate_limit import (
-    HL_LIMITER as _HL_LIMITER,
     _HL_CLIENT_IO,
     _HL_RATE_LIMIT,
+)
+from hermes_trader.client.rate_limit import (
+    HL_LIMITER as _HL_LIMITER,
+)
+from hermes_trader.client.rate_limit import (
     endpoint_weight as _endpoint_weight,
+)
+from hermes_trader.client.rate_limit import (
     timed_per_endpoint_gate as _per_endpoint_gate,
 )
 from hermes_trader.models.types import Candle
 
 if TYPE_CHECKING:
     from hyperliquid.info import Info
+
     from hermes_trader.client.ws_client import HyperliquidWebSocket
 
 logger = logging.getLogger(__name__)
@@ -376,7 +383,7 @@ def _candle_cache_metric(interval: str, result: str) -> None:
     try:
         from hermes_trader import metrics
         metrics.CANDLE_CACHE_LOOKUPS.labels(interval=interval, result=result).inc()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
 
@@ -678,8 +685,9 @@ def fetch_account_state(user: str, include_hip3: bool = False) -> dict[str, Any]
     available_aggregated = available  # starts as main; HIP-3 adds in
 
     if include_hip3:
-        from hermes_trader.client.universe import list_hip3_dexes
         from concurrent.futures import ThreadPoolExecutor
+
+        from hermes_trader.client.universe import list_hip3_dexes
         try:
             dexes = list_hip3_dexes()
         except Exception as e:
@@ -1059,7 +1067,7 @@ def ws_feed_diag() -> dict[str, Any] | None:
         return None
     try:
         return ws.get_diag()
-    except Exception as e:  # noqa: BLE001 — diagnostics must never break callers
+    except Exception as e:
         logger.warning(f"[hl] ws_feed_diag failed (non-fatal): {e}")
         return None
 
@@ -1090,7 +1098,7 @@ def wait_for_ws_user_fills(timeout: float) -> bool:
         return False
     try:
         return bool(ws.wait_for_fills(timeout))
-    except Exception as e:  # noqa: BLE001 — treat any failure as a plain sleep
+    except Exception as e:
         logger.warning(f"[hl] wait_for_ws_user_fills failed (non-fatal): {e}")
         time.sleep(max(0.0, timeout))
         return False

@@ -34,8 +34,7 @@ import json
 import os
 import sys
 import tempfile
-import types
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 # ── 1. Isolate state file BEFORE importing dsl_exit ───────────────────────
 _TMPDIR = tempfile.mkdtemp(prefix="dsl-sl-verify-")
@@ -43,16 +42,17 @@ os.environ["HERMES_DSL_STATE_FILE"] = os.path.join(_TMPDIR, ".dsl-state.json")
 # Ensure no real keys are needed by the (stubbed) exchange path.
 os.environ.setdefault("HYPERLIQUID_PRIVATE_KEY", "0x" + "0" * 64)
 
-from hermes_trader.agents import dsl_exit  # noqa: E402
-from hermes_trader.agents import executor    # noqa: E402
-from hermes_trader.agents.dsl_exit import (  # noqa: E402
+from hermes_trader.agents import (
+    dsl_exit,
+    executor,
+)
+from hermes_trader.agents.dsl_exit import (
     ExitPolicy,
-    register_position,
-    check_all_positions,
-    set_bracket,
-    get_tracker,
-    backfill_brackets_from_exchange,
     _active_positions,
+    backfill_brackets_from_exchange,
+    check_all_positions,
+    register_position,
+    set_bracket,
 )
 
 PASS = "\033[92mPASS\033[0m"

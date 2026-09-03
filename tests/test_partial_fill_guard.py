@@ -19,8 +19,6 @@ close was a no-op. This test pins the new behaviour:
 
 from __future__ import annotations
 
-import os
-import tempfile
 import pytest
 
 
@@ -102,8 +100,8 @@ def test_partial_fill_keeps_tracker_and_marks_partial(monkeypatch, tmp_path):
 
 def test_partial_fill_with_residual_alerts_and_keeps_tracker(monkeypatch, tmp_path):
     """Both attempts partial → residual_sz > 0 → high-priority notify + still no deregister."""
-    from hermes_trader.agents import dsl_exit, executor
     from hermes_trader import notify
+    from hermes_trader.agents import dsl_exit, executor
     dsl_exit, executor = _isolate(monkeypatch, tmp_path)
     dsl_exit.register_position("BTC", "long", 100.0, leverage=10)
     _patch_account(monkeypatch, executor, coin="BTC", szi="0.5", entry="100")

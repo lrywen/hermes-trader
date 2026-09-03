@@ -11,13 +11,10 @@ without any network or external HTA container. Covers:
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from hermes_trader.agents import research as R
 from hermes_trader.agents.research_schema import ResearchVerdict
-
 
 # ── helpers ────────────────────────────────────────────────────────────────
 

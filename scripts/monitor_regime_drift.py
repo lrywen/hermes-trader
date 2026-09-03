@@ -55,14 +55,15 @@ if _env.is_file():
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from hermes_trader.agents.market_regime import (  # noqa: E402
+from compare_regime_architectures import backtest_label
+
+from hermes_trader.agents.market_regime import (
     CRYPTO_PROXY,
     EQUITY_PROXY,
     _classify_candles,
     classify_asset,
 )
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from compare_regime_architectures import backtest_label  # noqa: E402
+from hermes_trader.client.hl_client import fetch_hl_candles
 
 WINDOW = 100  # same count=100 the live detector fetches
 

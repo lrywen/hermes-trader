@@ -33,12 +33,12 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config import get_config  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
+from hermes_trader.agents.config import get_config
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from backtest_ab_compare import (  # noqa: E402
+from backtest_ab_compare import (
     Trade,
     _simulate,
 )
@@ -170,13 +170,13 @@ def main() -> int:
     removed_s_pnl = sum(t.pnl_usd for t in removed_s)
     removed_s_wins = sum(1 for t in removed_s if t.pnl_usd > 0)
 
-    print(f"\n  Baseline (CHOP+NEUTRAL):")
+    print("\n  Baseline (CHOP+NEUTRAL):")
     print(f"    trades : {baseline_n}")
     print(f"    PnL    : ${baseline_pnl:+.2f}")
     print(f"    WR     : {sum(1 for t in baseline if t.pnl_usd>0)/baseline_n*100:.1f}%"
           if baseline_n else "    WR     : n/a")
 
-    print(f"\n  Filter A: reject LONG when RSI<25")
+    print("\n  Filter A: reject LONG when RSI<25")
     print(f"    removed: {len(removed)} trades, "
           f"WR={removed_wins/len(removed)*100:.1f}%" if removed else "    removed: 0")
     print(f"    PnL of removed: ${removed_pnl:+.2f}")
@@ -185,7 +185,7 @@ def main() -> int:
               f"(delta ${-removed_pnl:+.2f})")
         print(f"    -> After filter trades: {baseline_n - len(removed)}")
 
-    print(f"\n  Filter B: reject SHORT when RSI>=75")
+    print("\n  Filter B: reject SHORT when RSI>=75")
     print(f"    removed: {len(removed_s)} trades, "
           f"WR={removed_s_wins/len(removed_s)*100:.1f}%" if removed_s else "    removed: 0")
     print(f"    PnL of removed: ${removed_s_pnl:+.2f}")
@@ -197,14 +197,14 @@ def main() -> int:
     if removed or removed_s:
         combined_removed = len(removed) + len(removed_s)
         combined_pnl = removed_pnl + removed_s_pnl
-        print(f"\n  Combined (A+B): reject LONG RSI<25 AND SHORT RSI>=75")
+        print("\n  Combined (A+B): reject LONG RSI<25 AND SHORT RSI>=75")
         print(f"    removed: {combined_removed} trades")
         print(f"    PnL of removed: ${combined_pnl:+.2f}")
         print(f"    -> After filter PnL: ${baseline_pnl - combined_pnl:+.2f} "
               f"(delta ${-combined_pnl:+.2f})")
 
     # Per-regime breakdown of the RSI<25 longs
-    print(f"\n  RSI<25 LONG trades by regime:")
+    print("\n  RSI<25 LONG trades by regime:")
     for regime in ("CHOP", "NEUTRAL"):
         sub = [t for t in removed if t.regime_label == regime]
         if not sub:
@@ -218,7 +218,7 @@ def main() -> int:
 
     # Exit reason breakdown for removed trades
     if removed:
-        print(f"\n  Exit reasons of RSI<25 LONG trades (CHOP+NEUTRAL):")
+        print("\n  Exit reasons of RSI<25 LONG trades (CHOP+NEUTRAL):")
         reasons: dict = defaultdict(lambda: {"n": 0, "pnl": 0.0})
         for t in removed:
             r = reasons[t.exit_reason]

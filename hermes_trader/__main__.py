@@ -84,8 +84,8 @@ def cmd_scan() -> None:
 
 def cmd_research(coin: str) -> None:
     """Run AI research on a coin."""
-    from hermes_trader.agents.research import research
     from hermes_trader.agents.memory import memory
+    from hermes_trader.agents.research import research
     from hermes_trader.client.hl_client import fetch_all_mids
 
     print_banner()

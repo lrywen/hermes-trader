@@ -38,8 +38,8 @@ def _ctx(**kw):
 def _isolated_memory(monkeypatch, tmp_path):
     """AgentMemory pointed at tmp paths and installed as the module singleton
     (eval_all_gates reads memory via the gates module)."""
-    from hermes_trader.agents import memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import memory as memory_mod
     mem_path = str(tmp_path / ".agent-memory.json")
     monkeypatch.setattr(memory_mod, "MEMORY_FILE", mem_path)
     monkeypatch.setattr(memory_mod, "MEMORY_LOCK_FILE", mem_path + ".lock")
@@ -315,8 +315,9 @@ def test_h4_executor_passes_leverage_and_stop_estimate(monkeypatch, tmp_path):
     We capture the GateContext handed to eval_all_gates and assert the H4
     fields are populated; a fatal combo must make the proposal return
     blocked without any order being placed."""
-    from hermes_trader.agents import executor, risk_gates, memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import executor, risk_gates
+    from hermes_trader.agents import memory as memory_mod
 
     # Isolated memory.
     mem_path = str(tmp_path / ".agent-memory.json")
@@ -417,8 +418,9 @@ def test_h4_executor_estimate_failure_leaves_zero_pass_open(monkeypatch, tmp_pat
     the gate passes open — the pre-trade estimate is best-effort and must
     never block on a missing data feed (the pipeline later aborts cleanly via
     the no-ATR/no-stop rule before any order is placed)."""
-    from hermes_trader.agents import executor, risk_gates, memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import executor, risk_gates
+    from hermes_trader.agents import memory as memory_mod
 
     mem_path = str(tmp_path / ".agent-memory.json")
     monkeypatch.setattr(memory_mod, "MEMORY_FILE", mem_path)

@@ -12,11 +12,11 @@ Uses a fresh AgentMemory instance with flush() stubbed so neither the live
 
 import pytest
 
-from hermes_trader.agents.memory import AgentMemory
 from hermes_trader.agents.config_store import (
     read_agent_config,
     write_agent_config,
 )
+from hermes_trader.agents.memory import AgentMemory
 
 
 def _mem():
@@ -146,6 +146,7 @@ def _close_mem(monkeypatch):
     """A memory instance with flush and the authoritative 'close' event feed
     stubbed, and _day_start_ts pinned to today's UTC midnight (seconds)."""
     from datetime import datetime, timezone
+
     from hermes_trader import event_log
     monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
     m = _mem()

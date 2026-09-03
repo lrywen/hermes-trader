@@ -6,13 +6,11 @@ checks (frontend availability).  Every assertion is self-contained and
 reports a clear PASS/FAIL result.
 """
 
-import importlib.util
 import os
 import subprocess
 import sys
-import time
-import urllib.request
 import urllib.error
+import urllib.request
 
 # ── Path resolution (portable, no hardcoded absolute paths) ──────────────
 

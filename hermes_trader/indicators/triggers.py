@@ -9,7 +9,7 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-from hermes_trader.indicators.math import adx, atr, ema, sma, candle_val
+from hermes_trader.indicators.math import adx, atr, candle_val, ema, sma
 from hermes_trader.models.types import Candle, TriggerHit
 
 

@@ -6,8 +6,8 @@ Integrates the DSL exit engine for two-phase trailing stops
 
 from __future__ import annotations
 
-import logging
 import json
+import logging
 import math
 import os
 import re
@@ -16,14 +16,15 @@ import time
 import uuid
 from typing import Any, Callable, Optional
 
-from hermes_trader.agents.config_store import read_agent_config, cfg_get, apply_coin_override
+from hyperliquid.utils.types import Cloid
+
+from hermes_trader.agents.config_store import apply_coin_override, cfg_get, read_agent_config
 from hermes_trader.agents.dsl_exit import (
     ExitPolicy,
     RetraceTier,
     active_position_coins,
     check_all_positions,
     deregister_position,
-    get_tracker,
     register_position,
     set_bracket,
 )
@@ -45,7 +46,6 @@ from hermes_trader.client.exchange import (
     place_hl_trigger_order,
     set_leverage,
 )
-from hyperliquid.utils.types import Cloid
 from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 
 logger = logging.getLogger(__name__)
@@ -2155,7 +2155,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             if _h4_mult > 0 and _h4_ceiling > 0:
                 _h4_width = min(max((_h4_atr / _h4_mid) * _h4_mult * 100.0, _h4_floor), _h4_ceiling)
                 _h4_stop_distance_pct = min(_h4_width + _h4_ceiling * 0.5, _h4_ceiling * 1.5)
-    except Exception as _h4_e:  # noqa: BLE001 — pre-trade estimate is best-effort
+    except Exception as _h4_e:
         logger.debug(f"[executor] H4 stop-distance estimate failed for {coin}: {_h4_e}")
 
     ctx = GateContext(
@@ -2302,7 +2302,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
                     analysis_id=analysis["id"],
                 )
-        except Exception as _shadow_e:  # noqa: BLE001 — paper book never blocks the loop
+        except Exception as _shadow_e:
             logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
         return {
             "executed": False, "mode": mode,
@@ -3981,7 +3981,7 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                 try:
                     from hermes_trader import metrics
                     metrics.TRADE_CIRCUIT_TRIPS.labels(scope="coin").inc()
-                except Exception:  # noqa: BLE001
+                except Exception:
                     pass
                 logger.warning(
                     f"[executor] COIN CIRCUIT on {coin}: spot loss {_spot_loss_pct:.2f}% "
@@ -4015,7 +4015,7 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                         try:
                             from hermes_trader import metrics
                             metrics.TRADE_CIRCUIT_TRIPS.labels(scope="global").inc()
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             pass
                         logger.critical(
                             f"[executor] GLOBAL CIRCUIT: daily loss {_daily_loss_pct:.2f}% "

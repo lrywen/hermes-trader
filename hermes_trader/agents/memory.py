@@ -640,7 +640,7 @@ class AgentMemory:
             ).observe(max(0.0, time.monotonic() - t0))
             if not ok:
                 metrics.MEMORY_FLUSH_ERRORS.inc()
-        except Exception:  # noqa: BLE001 — metrics must never mask I/O errors
+        except Exception:
             pass
 
     def flush(self, force: bool = False) -> None:
@@ -1323,7 +1323,7 @@ class AgentMemory:
             window = float(cfg_get("circuit_breaker.drawdown_peak_window_days", 14.0) or 0.0)
             cooldown = float(cfg_get("circuit_breaker.drawdown_cooldown_hours", 24.0) or 0.0)
             out["drawdown"] = self.drawdown_freeze_status(max_dd, window, cooldown)
-        except Exception:  # noqa: BLE001
+        except Exception:
             out["drawdown"] = None
         return out
 

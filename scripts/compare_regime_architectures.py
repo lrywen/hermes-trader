@@ -43,24 +43,24 @@ if _env.is_file():
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.market_regime import (  # noqa: E402
-    CRYPTO_PROXY,
-    EQUITY_PROXY,
-    _classify_candles,
-    classify_asset,
-)
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
-
 # Reuse the backtest's exact regime-score implementation + indicator helpers so
 # the "backtest" column here is byte-for-byte the production-candidate logic.
-from backtest_ab_compare import (  # noqa: E402
+from backtest_ab_compare import (
     _adx_val,
     _atr_val,
     _ema_val,
     _obv_slope,
     _regime_score,
 )
+
+from hermes_trader.agents.market_regime import (
+    CRYPTO_PROXY,
+    EQUITY_PROXY,
+    _classify_candles,
+    classify_asset,
+)
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
 
 WARMUP = 120  # match backtest_ab_compare._simulate warmup
 
@@ -240,9 +240,9 @@ def main() -> None:
     coins = _pick_coins(args.coins, args.coin_list)
 
     print(f"Comparing regime architectures on {len(coins)} coins, {args.days}d 1h")
-    print(f"  backtest: 5-component weighted score (ADX0.25/ATR0.225/EMA0.175/"
-          f"EXT0.175/OBV0.175) -> STRONG_TREND/TREND/NEUTRAL/CHOP, dir=EMA8/21")
-    print(f"  production: EMA20/50 + 8-bar slope -> up/down; ADX(14)<20 -> chop")
+    print("  backtest: 5-component weighted score (ADX0.25/ATR0.225/EMA0.175/"
+          "EXT0.175/OBV0.175) -> STRONG_TREND/TREND/NEUTRAL/CHOP, dir=EMA8/21")
+    print("  production: EMA20/50 + 8-bar slope -> up/down; ADX(14)<20 -> chop")
 
     # Pre-fetch proxy candles once (crypto proxy = BTC). Equity/commodity coins
     # resolve their own proxy per coin; the per-coin proxy fetch is done below.

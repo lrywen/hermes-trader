@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """E2b: Drill into the 'with-crowd LONG_CROWDED' veto and other post-fresh gates."""
 from __future__ import annotations
-import json, os
+
+import json
+import os
 from collections import Counter
 
 SESSION_LOG = os.environ.get("SESSION_LOG_PATH", "/data/session-log.jsonl")

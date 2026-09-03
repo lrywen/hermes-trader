@@ -18,6 +18,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from hermes_trader import session_log
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     backup_config,
@@ -27,7 +28,6 @@ from hermes_trader.agents.config_store import (
     restore_backup,
     restore_snapshot,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.dashboard import (
     _client_ip,
     _config_apply,
@@ -62,7 +62,7 @@ def register_config_routes(app: FastAPI) -> None:
         _require_operator(request, write=True)
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 — any decode failure maps to 422
+        except Exception:
             raise HTTPException(422, "invalid JSON body")
         updates = body.get("updates") if isinstance(body, dict) else None
         if not isinstance(updates, dict) or not updates:
@@ -88,7 +88,7 @@ def register_config_routes(app: FastAPI) -> None:
         # F7: a malformed JSON body must return 422, not a 500.
         try:
             body = await request.json()
-        except Exception:  # noqa: BLE001 — any decode failure maps to 422
+        except Exception:
             raise HTTPException(422, "invalid JSON body")
         updates = body.get("updates")
         if not isinstance(updates, dict) or not updates:

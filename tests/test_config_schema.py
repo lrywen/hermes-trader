@@ -159,7 +159,7 @@ def test_agent_config_endpoint_none_deletes_key(server_client):
     assert r.status_code == 200, r.text
     # None is a deep-merge deletion marker: the key is dropped from the raw
     # file and read_agent_config falls back to the canonical default (30).
-    from hermes_trader.agents.config_store import _read_raw_config, CANONICAL_DEFAULTS
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, _read_raw_config
     assert "cooldown_min" not in _read_raw_config()
     assert read_agent_config()["cooldown_min"] == CANONICAL_DEFAULTS["cooldown_min"]
 

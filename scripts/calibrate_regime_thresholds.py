@@ -46,7 +46,7 @@ import itertools
 import json
 import os
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -63,9 +63,11 @@ if _env.is_file():
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "scripts"))
 
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.indicators.math import adx as _adx_ind, ema as _ema  # noqa: E402
-from compare_regime_architectures import backtest_label  # noqa: E402
+from compare_regime_architectures import backtest_label
+
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.indicators.math import adx as _adx_ind
+from hermes_trader.indicators.math import ema as _ema
 
 # Live detector fetches count=100 1h candles; calibrate on the same window so
 # results transfer directly (ema/closes indexing assumes this length).

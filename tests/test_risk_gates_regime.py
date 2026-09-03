@@ -19,7 +19,6 @@ from hermes_trader.agents import risk_gates
 from hermes_trader.agents.memory import AgentMemory
 from hermes_trader.agents.risk_gates import GateContext, market_regime_gate
 
-
 # ── helpers ──────────────────────────────────────────────────────────────
 
 def _ctx(**over) -> GateContext:

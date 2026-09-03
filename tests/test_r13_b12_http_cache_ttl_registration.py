@@ -50,12 +50,9 @@ import json
 import os
 import time
 
-import pytest
-
 import hermes_trader.agents.dsl_exit as dsl_mod
 import hermes_trader.dashboard as dashboard_mod
 import hermes_trader.server as server_mod
-from hermes_trader.dashboard_routes import public as public_mod
 from hermes_trader.agents import config_store
 from hermes_trader.agents.config_schema import _ConfigPatch, validate_config_updates
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get, read_agent_config
@@ -65,6 +62,7 @@ from hermes_trader.dashboard import (
     _http_cache_params,
     _ttl_cached,
 )
+from hermes_trader.dashboard_routes import public as public_mod
 
 HC_BLOCK = "http_cache"
 DS_BLOCK = "dsl_state_io"

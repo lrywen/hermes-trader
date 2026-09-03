@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import logging
 import os
-import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -251,7 +250,7 @@ def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
         if remaining > 0:
             return {"pass": False,
                     "reason": f"coin circuit breaker active on {ctx.coin} ({int(remaining)}min remaining)"}
-    except Exception as e:  # noqa: BLE001 — a state-read failure must NOT block trading
+    except Exception as e:
         logger.debug(f"[risk] coin-circuit gate state read failed for {ctx.coin}: {e}")
     return {"pass": True}
 
@@ -270,7 +269,7 @@ def global_halt_gate(ctx: GateContext) -> GateResult:
         if remaining > 0:
             return {"pass": False,
                     "reason": f"global daily-loss halt active ({int(remaining)}min remaining)"}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[risk] global-halt gate state read failed: {e}")
     return {"pass": True}
 
@@ -297,7 +296,7 @@ def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
                     "reason": f"consecutive-loss halt: {ctx.coin} has {streak} "
                               f"losing closes in a row (>= {limit}) — no entries "
                               f"until a winning close or UTC roll"}
-    except Exception as e:  # noqa: BLE001 — same fail-open-on-read-error convention as the breakers
+    except Exception as e:
         logger.debug(f"[risk] consecutive-loss gate state read failed for {ctx.coin}: {e}")
     return {"pass": True}
 
@@ -326,7 +325,7 @@ def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResul
                     "reason": f"per-coin daily loss halt: {ctx.coin} realized "
                               f"{pnl_pct:.2f}% today (<= -{max_loss_pct:.1f}% of "
                               f"SOD equity) — no more entries on this coin today"}
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[risk] per-coin daily-loss gate state read failed for {ctx.coin}: {e}")
     return {"pass": True}
 
@@ -372,7 +371,7 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
         # re-baseline to current equity once so the deadlock lifts immediately
         # on deploy instead of waiting a full cooldown / window.
         legacy_peak = memory.peak_equity()
-        trail_len = len(memory._equity_trail)  # noqa: SLF001 (same package; read-only)
+        trail_len = len(memory._equity_trail)
         if trail_len == 0 and legacy_peak > 0:
             legacy_dd = (legacy_peak - equity) / legacy_peak * 100.0
             if legacy_dd >= max_drawdown_pct:
@@ -411,7 +410,7 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
                               f"for {frozen_min / 60:.1f}h (re-arm in {remain_min / 60:.1f}h)"}
         # Below threshold: ensure a stale freeze episode clears on recovery.
         memory.clear_drawdown_freeze()
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         logger.debug(f"[risk] drawdown gate state read failed: {e}")
     return {"pass": True}
 
@@ -983,7 +982,7 @@ def _record_late_entry_shadow(rec: dict[str, Any], path: str) -> None:
             os.makedirs(parent, exist_ok=True)
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:  # noqa: BLE001
+    except OSError as e:
         logger.warning(f"[risk][gates] late-entry shadow write failed: {e}")
 
 
@@ -998,7 +997,7 @@ def ta_late_entry_gate(
         try:
             from hermes_trader import metrics
             metrics.RISK_GATE_DURATION.labels(gate="ta_late_entry", outcome=outcome).observe(dt)
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         if dt > 0.025:
             logger.warning(
@@ -1019,10 +1018,12 @@ def ta_late_entry_gate(
 
     try:
         from concurrent.futures import ThreadPoolExecutor
-        from hermes_trader.agents.ta_filter import (
-            late_entry_check, forming_readings_4h,
-        )
+
         from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.agents.ta_filter import (
+            forming_readings_4h,
+            late_entry_check,
+        )
         from hermes_trader.client.hl_client import fetch_hl_candles
         n = int(le_cfg.get("fetch_bars", 100) or 100)
         mtf_enabled = bool(le_cfg.get("mtf_enabled", False))
@@ -1049,7 +1050,7 @@ def ta_late_entry_gate(
         if candles_15m is not None:
             candles_15m, _ = _drop_forming_bar(candles_15m, "15m")
         verdict = late_entry_check(candles_4h, candles_15m, side, le_cfg)
-    except Exception as e:  # noqa: BLE001 — fail OPEN, never stall orders
+    except Exception as e:
         logger.warning(
             "[risk][gates] ta_late_entry fetch/compute failed for %s: %s",
             ctx.coin, e,
@@ -1058,7 +1059,7 @@ def ta_late_entry_gate(
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
                 mode=mode, side=side, verdict="data_missing").inc()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return _done("data_missing", {
             "pass": True,
@@ -1071,7 +1072,7 @@ def ta_late_entry_gate(
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
                 mode=mode, side=side, verdict="data_missing").inc()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return _done("data_missing", {
             "pass": True,
@@ -1118,7 +1119,7 @@ def ta_late_entry_gate(
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
                 mode=mode, side=side, verdict="pass").inc()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return _done("pass", {
             "pass": True,
@@ -1144,7 +1145,7 @@ def ta_late_entry_gate(
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
                 mode=mode, side=side, verdict="would_block").inc()
-        except Exception:  # noqa: BLE001
+        except Exception:
             pass
         return _done("shadow_block", {
             "pass": True,  # shadow never blocks
@@ -1168,7 +1169,7 @@ def ta_late_entry_gate(
         from hermes_trader import metrics
         metrics.TA_LATE_ENTRY_VERDICTS.labels(
             mode=mode, side=side, verdict="block").inc()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
     return _done("enforce_block", {
         "pass": False,
@@ -1328,7 +1329,7 @@ def eval_all_gates(
                 from hermes_trader import metrics
                 metrics.RISK_GATE_BLOCKS.labels(
                     gate=key if key in _GATE_KEYS else "other").inc()
-            except Exception:  # noqa: BLE001
+            except Exception:
                 pass
     # P3-1: market-regime verdict code (trigger:* variants collapse to
     # "trigger"; anything outside the known via codes falls to "other").
@@ -1344,7 +1345,7 @@ def eval_all_gates(
         }
         metrics.RISK_GATE_REGIME_VERDICTS.labels(
             via=_via if _via in _REGIME_VIAS else "other").inc()
-    except Exception:  # noqa: BLE001
+    except Exception:
         pass
 
     # ── DEBUG: per-gate pass/fail summary + final verdict ────────────────

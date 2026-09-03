@@ -6,6 +6,7 @@ Usage: python3 scripts/gex.py NVDA          # any equity/index
        python3 scripts/gex.py SP500 GOLD NVDA   # several at once
 """
 import sys
+
 from hermes_trader.agents.options_gex import gex_signal
 
 

@@ -22,9 +22,8 @@ SHADOW 模式回测 / 验证脚本
 """
 import argparse
 import re
-import sys
 import time
-from collections import Counter, defaultdict
+from collections import Counter
 
 DEFAULT_LOG = "/data/trading-loop.log"
 

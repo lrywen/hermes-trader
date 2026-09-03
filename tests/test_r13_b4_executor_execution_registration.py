@@ -41,19 +41,16 @@
 """
 
 import json
-import os
-from copy import deepcopy
 
 import pytest
 
 from hermes_trader.agents import config_store, executor
+from hermes_trader.agents.config_schema import _ConfigPatch
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents.config_schema import _ConfigPatch
-
 
 # ── 1. canonical 登记断言 ──────────────────────────────────────────────
 

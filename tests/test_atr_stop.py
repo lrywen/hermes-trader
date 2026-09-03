@@ -208,6 +208,7 @@ def test_parse_verdict_flags_unparseable_response():
 def test_analysis_record_carries_parse_flags():
     """research.analyze must not drop the flags in its field whitelist."""
     import inspect
+
     from hermes_trader.agents import research
     src = inspect.getsource(research)
     assert '"nlp_parsed": bool(parsed.get("nlp_parsed"))' in src
@@ -277,8 +278,9 @@ def test_override_blocked_when_ai_down(monkeypatch):
 
 def test_loss_cooldown_blocks_reentry(monkeypatch):
     """A coin with an active loss cooldown must be refused before any order."""
-    from hermes_trader.agents import executor as ex
     import time as _t
+
+    from hermes_trader.agents import executor as ex
     monkeypatch.setattr(
         ex, "read_agent_config",
         lambda: {"mode": "LIVE", "enable_crypto": True, "loss_cooldown_min": 180},

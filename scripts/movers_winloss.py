@@ -5,9 +5,11 @@ For each big mover: 24h %, whether WE traded it, and if not, WHERE in the funnel
 it died (no-trigger / TA-rejected / AI-pass / gate-blocked). This is the
 strategy-learning loop: see what ripped, see why we caught or missed it.
 """
-import json, os, sys
-from collections import defaultdict
+import json
+import os
+
 from hermes_trader.client.universe import get_universe
+
 
 def _pct24(m):
     mid = m.get("midPx", 0) or 0; prev = m.get("prevDayPx", 0) or 0

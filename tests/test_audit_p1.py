@@ -32,19 +32,17 @@ Covers four P1 items:
 
 import ast
 import logging
-import os
 import time
 from pathlib import Path
 
 import pytest
 
-
 # ── shared helpers ────────────────────────────────────────────────────────
 
 def _isolated_memory(monkeypatch, tmp_path):
     """AgentMemory pointed at tmp paths and installed as the module singleton."""
-    from hermes_trader.agents import memory as memory_mod
     import hermes_trader.event_log as event_log
+    from hermes_trader.agents import memory as memory_mod
     mem_path = str(tmp_path / ".agent-memory.json")
     monkeypatch.setattr(memory_mod, "MEMORY_FILE", mem_path)
     monkeypatch.setattr(memory_mod, "MEMORY_LOCK_FILE", mem_path + ".lock")
@@ -104,7 +102,7 @@ def _clean_p1_state(monkeypatch):
     """Reset every process-wide marker / cache the P1 code touches, and set
     the env a LIVE deep-path run needs (private key; liq buffer gate off so
     its extra fetch never enters the A-F4 fake dispatch)."""
-    from hermes_trader.agents import executor, dsl_exit
+    from hermes_trader.agents import dsl_exit, executor
     from hermes_trader.client import exchange
     executor._IN_FLIGHT_ANALYSES.clear()
     executor._IN_FLIGHT_COINS.clear()
@@ -300,8 +298,8 @@ def test_p02a_malformed_asset_position_rows_are_skipped(monkeypatch, tmp_path):
 def test_af5_breach_confirm_sec_defaults_to_4s():
     """The wick confirmation window defaults to 4.0s everywhere: dataclass,
     canonical config block, and cfg_get with no user config."""
-    from hermes_trader.agents.dsl_exit import ExitPolicy
     from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
+    from hermes_trader.agents.dsl_exit import ExitPolicy
     assert ExitPolicy().breach_confirm_sec == 4.0
     assert CANONICAL_DEFAULTS["dsl_exit"]["breach_confirm_sec"] == 4.0
     assert cfg_get("dsl_exit.breach_confirm_sec", config={}) == 4.0
