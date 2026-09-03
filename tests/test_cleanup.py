@@ -2507,6 +2507,13 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
     # executor.memory), so stub the peak it reads too — the no-op track above
     # means no peak is ever recorded in this fixture's world.
     monkeypatch.setattr(executor.memory, "peak_equity", lambda: 0.0)
+    # Audit 2026-09-03: the fixed gate now reads the rolling-window peak via
+    # rolling_peak_equity() instead of only the all-time peak_equity(); stub
+    # it too so a polluted singleton from another test cannot latch this
+    # fixture's entries on a drawdown block. peak_equity() staying 0.0 also
+    # keeps the legacy one-shot rebase path inert (its legacy_peak > 0 guard).
+    monkeypatch.setattr(executor.memory, "rolling_peak_equity",
+                        lambda window_days=14.0: 0.0)
     # B-F2/B-F6: same direct-import pattern for the streak / per-coin daily
     # loss readers — no closes happen in the fixture, so all read zero/empty.
     monkeypatch.setattr(executor.memory, "consecutive_losses", lambda coin: 0)

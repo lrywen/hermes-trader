@@ -87,12 +87,37 @@ def test_risk_status_snapshot_quiet_defaults(monkeypatch):
     from hermes_trader.agents.memory import memory as mem
     monkeypatch.setattr(mem, "_coin_circuit", {})
     monkeypatch.setattr(mem, "_global_halt_until_ms", 0)
+    # Audit 2026-09-03: the snapshot refreshes breaker state from the shared
+    # tmp memory file first; stub it so the drawdown fields below are
+    # deterministic instead of reloaded from another test's flushed state.
+    monkeypatch.setattr(mem, "refresh_risk_state_from_disk", lambda: None)
+    monkeypatch.setattr(mem, "_peak_equity", 0.0)
+    monkeypatch.setattr(mem, "_equity", 0.0)
+    mem._equity_trail.clear()
+    monkeypatch.setattr(mem, "_dd_frozen_since_ms", 0)
+    monkeypatch.setattr(mem, "_dd_last_baseline_ms", 0)
     snap = mem.risk_status_snapshot()
     assert snap == {
         "global_halt": False,
         "global_halt_remaining_min": 0.0,
         "coin_circuits": {},
         "armed_coins": 0,
+        # Audit 2026-09-03: B-F7 drawdown breaker card (quiet defaults).
+        "drawdown": {
+            "frozen": False,
+            "dd_pct": 0.0,
+            "threshold_pct": 15.0,
+            "peak_equity": 0.0,
+            "all_time_peak_equity": 0.0,
+            "equity": 0.0,
+            "window_days": 14.0,
+            "frozen_since_ms": 0,
+            "frozen_for_min": 0.0,
+            "cooldown_hours": 24.0,
+            "cooldown_remaining_min": 0.0,
+            "last_baseline_ms": 0,
+            "trail_samples": 0,
+        },
     }
 
 

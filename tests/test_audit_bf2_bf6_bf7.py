@@ -10,8 +10,13 @@ B-F6: per_coin_daily_loss_gate — block a coin whose CUMULATIVE realized loss
       today reaches X% of start-of-day equity (memory.coin_daily_realized_
       pnl_pct() existed; no caller).
 B-F7: drawdown_gate — block ALL new entries when equity falls more than Y%
-      from its all-time high-water mark (memory._peak_equity is newly tracked
-      and persisted as peakEquity; no multi-day drawdown control existed).
+      below its high-water mark (memory._peak_equity / the rolling equity
+      trail are tracked and persisted as peakEquity / equityTrail; no
+      multi-day drawdown control existed). Fixed 2026-09-03: the reference
+      peak is a ROLLING window (drawdown_peak_window_days, default 14d) with
+      a cooldown re-arm (drawdown_cooldown_hours, default 24h) and a
+      one-shot legacy-memory rebase, so a permanently lower balance can no
+      longer latch the gate forever; window_days=0 keeps the all-time peak.
 
 Convention (shared with coin_circuit_breaker_gate / global_halt_gate): a
 memory state-read failure fails OPEN (the independent breakers still apply);
@@ -56,6 +61,38 @@ def _isolated_memory(monkeypatch, tmp_path):
 
 def _boom(*_a, **_k):
     raise RuntimeError("simulated memory read failure")
+
+
+# Audit 2026-09-03: drawdown_gate now measures against a ROLLING peak
+# (circuit_breaker.drawdown_peak_window_days, default 14d) and re-arms after
+# drawdown_cooldown_hours (default 24h) instead of latching to the all-time
+# peak forever. The original B-F7 cases below encode the all-time-peak
+# semantics; pin the window to 0 (rolling_peak_equity(0) falls back to the
+# all-time peak — the legacy path) and cooldown to 0 (re-arm only on recovery,
+# never on a wall-clock timer) so those cases keep exercising the original
+# fail-closed HWM behavior. The new rolling/cooldown/legacy-rebase behavior is
+# covered by dedicated cases further down.
+def _patch_drawdown_cfg(monkeypatch, *, window_days, cooldown_hours):
+    """Force the gate's two drawdown config knobs; every other key delegates
+    to the real cfg_get so the rest of eval_all_gates is unaffected."""
+    from hermes_trader.agents import risk_gates
+    real_cfg_get = risk_gates.cfg_get
+    forced = {
+        "circuit_breaker.drawdown_peak_window_days": float(window_days),
+        "circuit_breaker.drawdown_cooldown_hours": float(cooldown_hours),
+    }
+
+    def _cfg(key, default=None, *, config=None):
+        if key in forced:
+            return forced[key]
+        return real_cfg_get(key, default, config=config)
+
+    monkeypatch.setattr(risk_gates, "cfg_get", _cfg)
+
+
+def _legacy_drawdown_cfg(monkeypatch):
+    """All-time peak + no timer re-arm (the original pre-fix B-F7 semantics)."""
+    _patch_drawdown_cfg(monkeypatch, window_days=0.0, cooldown_hours=0.0)
 
 
 # ── B-F2: consecutive-loss gate ───────────────────────────────────────────
@@ -217,6 +254,7 @@ def test_bf6_read_failure_fails_open(monkeypatch, tmp_path):
 def test_bf7_blocks_when_drawdown_exceeds_cap(monkeypatch, tmp_path):
     from hermes_trader.agents.risk_gates import drawdown_gate
     m, _ = _isolated_memory(monkeypatch, tmp_path)
+    _legacy_drawdown_cfg(monkeypatch)  # Audit 2026-09-03: all-time-peak semantics
     m.track_daily_pnl(1000.0)   # peak seeded at $1000
     m.track_daily_pnl(840.0)    # -16% from peak
     assert m.peak_equity() == 1000.0
@@ -238,6 +276,7 @@ def test_bf7_new_high_resets_the_baseline(monkeypatch, tmp_path):
     peak→current, so at the peak drawdown is 0%)."""
     from hermes_trader.agents.risk_gates import drawdown_gate
     m, _ = _isolated_memory(monkeypatch, tmp_path)
+    _legacy_drawdown_cfg(monkeypatch)  # Audit 2026-09-03: all-time-peak semantics
     m.track_daily_pnl(1000.0)
     m.track_daily_pnl(800.0)    # -20% → would halt at 15%
     assert drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)["pass"] is False
@@ -255,6 +294,7 @@ def test_bf7_peak_survives_day_roll(monkeypatch, tmp_path):
     grind that trips no single-day limit must still trip drawdown."""
     from hermes_trader.agents.risk_gates import drawdown_gate
     m, _ = _isolated_memory(monkeypatch, tmp_path)
+    _legacy_drawdown_cfg(monkeypatch)  # Audit 2026-09-03: all-time-peak semantics
     m.track_daily_pnl(1000.0)   # day 1 peak
     m._day_start_ts = 0         # force UTC re-baseline on next tick
     m.track_daily_pnl(990.0)    # day 2 start
@@ -302,6 +342,7 @@ def test_bf7_peak_not_inflated_by_rejected_partial_dex_blip(monkeypatch, tmp_pat
     partial-dex spike (+50%) must not become the HWM (which would otherwise
     make every subsequent healthy reading look like a fake drawdown)."""
     m, _ = _isolated_memory(monkeypatch, tmp_path)
+    _legacy_drawdown_cfg(monkeypatch)  # Audit 2026-09-03: all-time-peak semantics
     m.track_daily_pnl(1000.0)
     m.track_daily_pnl(1500.0)   # +50% in one tick → rejected as implausible
     assert m.peak_equity() == 1000.0
@@ -323,6 +364,94 @@ def test_bf7_peak_equity_persists_across_restart(monkeypatch, tmp_path):
     m2 = memory_mod.AgentMemory()
     m2.load()
     assert m2.peak_equity() == 1234.0
+
+
+# ── B-F7 rolling-peak recovery (fix Audit 2026-09-03) ───────────────────
+
+def test_bf7_rolling_window_ages_out_old_peak(monkeypatch, tmp_path):
+    """A peak OLDER than the rolling window no longer counts: a permanently
+    lower balance stops looking like a fresh drawdown once the high ages out
+    of the window (the production latched-forever bug)."""
+    from hermes_trader.agents.risk_gates import drawdown_gate
+    m, _ = _isolated_memory(monkeypatch, tmp_path)
+    now_s = time.time()
+    # Seed the trail directly (production cadence is one sample ~per 600s, so
+    # same-second ticks collapse; aged timestamps need explicit samples):
+    # a 20d-old $1000 peak and a current $840 level (-16% from the old peak).
+    m._equity = 840.0
+    m._peak_equity = 1000.0  # all-time HWM stays $1000
+    m._equity_trail.clear()
+    m._equity_trail.append((now_s - 20 * 86400.0, 1000.0))
+    m._equity_trail.append((now_s - 100.0, 840.0))
+    # 14d window: the $1000 peak aged out → the in-window peak is $840 → 0%
+    # drawdown → pass even though the all-time HWM is still $1000.
+    _patch_drawdown_cfg(monkeypatch, window_days=14.0, cooldown_hours=24.0)
+    assert drawdown_gate(_ctx(equity=840.0), max_drawdown_pct=15.0)["pass"] is True
+    assert m.peak_equity() == 1000.0  # all-time HWM untouched
+    # A 30d window still covers the old peak → the same state must block.
+    _patch_drawdown_cfg(monkeypatch, window_days=30.0, cooldown_hours=24.0)
+    assert drawdown_gate(_ctx(equity=840.0), max_drawdown_pct=15.0)["pass"] is False
+
+
+def test_bf7_cooldown_rebases_after_frozen_window(monkeypatch, tmp_path):
+    """A freeze held continuously for drawdown_cooldown_hours re-baselines the
+    peak to current equity and lets entries resume — bounded recovery so a
+    permanent equity drop can never latch the gate past the cooldown."""
+    from hermes_trader.agents.risk_gates import drawdown_gate
+    m, _ = _isolated_memory(monkeypatch, tmp_path)
+    # Audit 2026-09-03: seed the rolling trail directly with spaced,
+    # timestamped samples. Same-second track_daily_pnl() ticks collapse into
+    # one sample via the 600s min-spacing rule, which would hide the peak.
+    now_s = time.time()
+    m._peak_equity = 1000.0
+    m._equity_trail.clear()
+    m._equity_trail.append((now_s - 3600.0, 1000.0))  # in-window peak, >600s old
+    m._equity_trail.append((now_s, 800.0))            # -20% → trips the 15% cap
+    _patch_drawdown_cfg(monkeypatch, window_days=14.0, cooldown_hours=24.0)
+    r = drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)
+    assert r["pass"] is False
+    assert m._dd_frozen_since_ms > 0
+    # Backdate the freeze stamp to just past the 24h cooldown.
+    m._dd_frozen_since_ms = int(time.time() * 1000) - 25 * 3600 * 1000
+    # Cooldown recovery: gate re-arms at $800 and passes.
+    r = drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)
+    assert r["pass"] is True
+    assert m.peak_equity() == 800.0       # baseline re-armed to current equity
+    assert len(m._equity_trail) == 1      # trail reseeded at the new baseline
+    assert m._dd_frozen_since_ms == 0     # freeze episode cleared
+    # And a subsequent healthy evaluation stays open.
+    assert drawdown_gate(_ctx(equity=810.0), max_drawdown_pct=15.0)["pass"] is True
+
+
+def test_bf7_legacy_memory_oneshot_rebase(monkeypatch, tmp_path):
+    """Pre-upgrade memory has an all-time peak but NO rolling trail (the
+    persisted equityTrail did not exist). On the FIRST gate evaluation after
+    the upgrade an over-threshold drawdown against that legacy peak is
+    re-baselined once immediately, lifting the latched deadlock on deploy
+    instead of waiting a full cooldown/window."""
+    from hermes_trader.agents.risk_gates import drawdown_gate
+    m, _ = _isolated_memory(monkeypatch, tmp_path)
+    # Simulate a legacy store: all-time HWM $1000, equity now $800 (-20%),
+    # and an empty rolling trail (feature did not exist pre-upgrade).
+    m._peak_equity = 1000.0
+    m._equity = 800.0
+    m._equity_trail.clear()
+    assert len(m._equity_trail) == 0
+    _patch_drawdown_cfg(monkeypatch, window_days=14.0, cooldown_hours=24.0)
+    # First evaluation: the latched legacy drawdown is rebased once → pass.
+    assert drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)["pass"] is True
+    assert m.peak_equity() == 800.0
+    assert len(m._equity_trail) == 1  # reseeded at the rebased baseline
+    # Once the rolling trail exists (post-upgrade steady state), the one-shot
+    # legacy path is skipped even for an over-threshold drawdown: a genuine
+    # fresh drawdown must still fail closed and must NOT be rebased.
+    m2, _ = _isolated_memory(monkeypatch, tmp_path)
+    m2._peak_equity = 1000.0
+    m2._equity_trail.clear()
+    m2._equity_trail.append((time.time() - 60.0, 1000.0))  # fresh in-window peak
+    assert len(m2._equity_trail) == 1
+    assert drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)["pass"] is False
+    assert m2.peak_equity() == 1000.0  # fresh drawdown fails closed, no rebase
 
 
 # ── eval_all_gates wiring ────────────────────────────────────────────────
@@ -383,6 +512,7 @@ def test_bf_wiring_consecutive_loss_blocks_through_eval(monkeypatch, tmp_path):
 def test_bf_wiring_drawdown_blocks_through_eval(monkeypatch, tmp_path):
     from hermes_trader.agents.risk_gates import eval_all_gates
     m, _ = _isolated_memory(monkeypatch, tmp_path)
+    _legacy_drawdown_cfg(monkeypatch)  # Audit 2026-09-03: all-time-peak semantics
     m.track_daily_pnl(1000.0)
     m.track_daily_pnl(800.0)  # -20% > 15%
     report = eval_all_gates(_ctx(coin="ETH", equity=800.0), dict(_WIRING_CONFIG))
