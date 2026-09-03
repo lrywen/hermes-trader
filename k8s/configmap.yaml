@@ -10,3 +10,8 @@ metadata:
 data:
   HERMES_PORT: "8000"
   HERMES_SCAN_INTERVAL: "15"
+  # P3-14: egress IP drift watchdog. Flip HERMES_IP_DRIFT_WATCH to "1" to
+  # enable the ipdrift sidecar container in statefulset.yaml.
+  HERMES_IP_DRIFT_WATCH: "0"
+  HERMES_IP_DRIFT_CHECK_S: "300"
+  HERMES_EVENTS_FILE: "/data/events.jsonl"

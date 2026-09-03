@@ -7,17 +7,21 @@ primary_region = "iad"  # change to a region near you
 [build]
   dockerfile = "Dockerfile"
 
-# Two processes share the image:
-#   web  — FastAPI server (dashboard + JSON API + SSE feed)
-#   loop — autonomous trading loop (scan → research → execute → DSL monitor)
+# Three processes share the image:
+#   web     — FastAPI server (dashboard + JSON API + SSE feed)
+#   loop    — autonomous trading loop (scan → research → execute → DSL monitor)
+#   ipdrift — P3-14 egress IP drift watchdog (observability sidecar; it never
+#             imports trading code and never blocks trading). Opt-in: it exits
+#             immediately unless HERMES_IP_DRIFT_WATCH=1, set in [env] below.
 [processes]
-  web  = "python3 -m hermes_trader.server"
-  loop = "python3 scripts/trading_loop.py"
+  web     = "python3 -m hermes_trader.server"
+  loop    = "python3 scripts/trading_loop.py"
+  ipdrift = "python3 scripts/ip_drift_watch.py"
 
 [[mounts]]
   source = "hermes_data"   # `fly volumes create hermes_data --size 1`
   destination = "/data"
-  processes = ["web", "loop"]
+  processes = ["web", "loop", "ipdrift"]
 
 [http_service]
   internal_port = 8000
@@ -49,6 +53,19 @@ primary_region = "iad"  # change to a region near you
   memory = "512mb"
   processes = ["loop"]
 
+# P3-14: the watchdog does almost nothing (one HTTP fetch + a tiny file write
+# every 5 min) — the smallest machine size is plenty.
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"
+  processes = ["ipdrift"]
+
 [env]
   HERMES_PORT = "8000"
   HERMES_SCAN_INTERVAL = "15"
+  # P3-14: enable the egress IP drift watchdog. It defaults OFF in code; set
+  # HERMES_IP_DRIFT_WATCH=0 (or remove this line) to disable — the ipdrift
+  # process then logs one line and exits cleanly.
+  HERMES_IP_DRIFT_WATCH = "1"
+  HERMES_IP_DRIFT_CHECK_S = "300"
+  HERMES_EVENTS_FILE = "/data/events.jsonl"

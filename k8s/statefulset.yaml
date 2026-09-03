@@ -110,6 +110,32 @@ spec:
             limits:
               cpu: "500m"
               memory: "512Mi"
+        # ── ipdrift: P3-14 egress IP drift watchdog (observability only) ────
+        # Stdlib-only sidecar on the shared /data volume. It NEVER imports
+        # trading code and NEVER blocks trading; an IP change only produces a
+        # warning + an `ip_drift` event in events.jsonl. Disabled by default —
+        # set HERMES_IP_DRIFT_WATCH=1 in k8s/configmap.yaml (hermes-config) to
+        # enable; while off the process logs one line and exits 0, so a
+        # non-restarting policy is advisable if you ship it turned off.
+        - name: ipdrift
+          image: hermes-trader:local
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "scripts/ip_drift_watch.py"]
+          envFrom:
+            - configMapRef:
+                name: hermes-config
+            - secretRef:
+                name: hermes-secrets
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: "10m"
+              memory: "64Mi"
+            limits:
+              cpu: "100m"
+              memory: "128Mi"
   volumeClaimTemplates:
     - metadata:
         name: data
