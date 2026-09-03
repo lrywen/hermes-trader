@@ -1527,14 +1527,21 @@ while True:
         # Per-cycle heartbeat — proof of life even when nothing triggers.
         # `coin_scores` carries the composite score for each trigger so the
         # feed can show *why* a coin was picked, not just that it was.
-        log_event({"event": "scan", "triggers": len(results),
+        # P0-2b: the canonical count key is `perceptions` (the domain term used
+        # by memory/server; the HTTP /scan endpoint already logs it). `triggers`
+        # is kept as an alias for logs written before this fix — dashboard
+        # readers fall back to it so pre-upgrade events still show counts.
+        log_event({"event": "scan",
+                   "perceptions": len(results),
+                   "triggers": len(results),
                    "start_ts_ms": _scan_started_ms,
                    "scan_duration_ms": max(0, _scan_done_ms - _scan_started_ms),
-                   "coins": [p['coin'] for p in results],
-                   "coin_scores": [{"coin": p['coin'],
-                                    "score": round(p.get('composite_score', 0), 1),
-                                    "triggers": [t['name'] for t in p.get('triggers', []) if t.get('fired')]}
-                                   for p in results]})
+                   "coins": [p.get("coin") for p in results if p.get("coin")],
+                   "coin_scores": [{"coin": p.get("coin"),
+                                    "score": round(p.get("composite_score", 0) or 0, 1),
+                                    "triggers": [t.get("name") for t in (p.get("triggers") or [])
+                                                 if t.get("fired") and t.get("name")]}
+                                   for p in results if p.get("coin")]})
 
         # Surge detection: feed every trigger result (score >= gate) to the
         # postmortem watcher. It compares against the previous cycle and fires

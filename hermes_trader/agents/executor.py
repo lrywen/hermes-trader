@@ -1822,14 +1822,28 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     memory.track_daily_pnl(agg_equity)
     daily_pnl = memory.get_daily_pnl()
 
-    positions = [
-        {
-            "coin": p["position"]["coin"],
-            "side": "long" if float(p["position"]["szi"]) > 0 else "short",
-            "size_usd": abs(float(p["position"]["szi"])) * (analysis.get("entry_px") or 0),
-        }
-        for p in state["asset_positions"]
-    ]
+    # P0-2a: defensive read of the live account state — a single malformed
+    # position row (missing coin/szi, non-dict payload from a partial read) is
+    # skipped, not allowed to raise and abort the whole placement pipeline.
+    positions = []
+    _entry_px = analysis.get("entry_px") or 0
+    for p in (state.get("asset_positions") or []):
+        try:
+            pos = p.get("position") if isinstance(p, dict) else None
+            if not isinstance(pos, dict):
+                continue
+            coin = pos.get("coin")
+            szi = float(pos.get("szi") or 0)
+            if not coin:
+                continue
+            positions.append({
+                "coin": coin,
+                "side": "long" if szi > 0 else "short",
+                "size_usd": abs(szi) * _entry_px,
+            })
+        except (AttributeError, TypeError, ValueError):
+            logger.warning(f"[executor] skipping malformed asset_position row: {p!r}")
+            continue
 
     # Restart-safe re-entry backstop: a flaky/empty live account read can drop a
     # held position from asset_positions, letting opposite_direction_guard fail

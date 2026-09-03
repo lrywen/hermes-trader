@@ -13,6 +13,7 @@ import math
 import pathlib
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -681,6 +682,53 @@ def test_memory_flush_writes_atomically(monkeypatch, tmp_path):
 
     assert json.loads(path.read_text())["trades"][0]["coin"] == "BTC"
     assert not pathlib.Path(str(path) + ".tmp").exists()
+
+
+def test_memory_load_tolerates_corrupt_rows(monkeypatch, tmp_path):
+    """P0-2a: a single malformed entry in any persisted memory field must NOT
+    abort hydration — pre-fix the direct cooldown subscript / dict
+    comprehensions raised and were swallowed by the broad except, losing ALL
+    history. Valid entries survive; bad ones degrade to defaults."""
+    from hermes_trader.agents import memory as memory_mod
+    import hermes_trader.event_log as event_log
+    mem_path = tmp_path / "agent-memory.json"
+    monkeypatch.setattr(memory_mod, "MEMORY_FILE", str(mem_path))
+    monkeypatch.setattr(memory_mod, "MEMORY_LOCK_FILE", str(mem_path) + ".lock")
+    monkeypatch.setattr(memory_mod, "_EVENTS_FILE", str(tmp_path / "events.jsonl"))
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+    future = int(time.time() * 1000) + 3_600_000
+    mem_path.write_text(json.dumps({
+        "equity": "not-a-number",
+        "dayStartTs": "junk",
+        "cooldowns": [
+            {"coin": "BTC", "expires": future},   # valid
+            {"expires": future},                  # missing coin → skip
+            {"coin": "ETH", "expires": "soonish"},# bad expires → skip
+            "scandal",                            # non-dict row → skip
+        ],
+        "coinCircuit": {"DOGE": future, "XRP": "garbage"},
+        "consecutiveLosses": {"SOL": 2, "AVAX": {}},
+        "perceptions": {"p": 1},                  # dict, not list → []
+        "trades": [{"id": "t1", "coin": "BTC"}],  # valid
+        "equityTrail": [(1700000000.0, 900.0), "bad", [1700000001.0, 850.0]],
+        "openPositions": "flatten-me",
+    }))
+
+    m = memory_mod.AgentMemory()
+    m.load()  # must not raise; hydrates everything recoverable
+
+    assert m._cooldowns.get("BTC") == future
+    assert "ETH" not in m._cooldowns
+    assert m._coin_circuit.get("DOGE") == future
+    assert "XRP" not in m._coin_circuit
+    assert m._consecutive_losses.get("SOL") == 2
+    assert "AVAX" not in m._consecutive_losses
+    assert m._trades[0]["coin"] == "BTC"
+    assert m._perceptions == []
+    assert m._open_positions == []
+    assert len(m._equity_trail) == 2
+    assert m._equity == 0.0
+    assert m._day_start_ts == 0
 
 
 def test_open_position_coins_filters_zero_size():
@@ -3185,6 +3233,29 @@ def test_summary_payload_scanning_and_pnl_pct(monkeypatch):
     assert out["last_scan_triggers"] == 7
 
 
+def test_summary_scan_count_prefers_perceptions_falls_back_to_triggers(monkeypatch):
+    """P0-2b: the HTTP /scan endpoint logs the count as `perceptions` while the
+    loop used `triggers`; summary must read `perceptions` (new canonical key)
+    but fall back to `triggers` for pre-fix log events."""
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    hb = {"event": "loop_heartbeat", "ts": now_ms, "equity": 100.0,
+          "daily_pnl": 0.0, "available": 0.0, "open_positions": 0}
+    # Latest scan uses the HTTP-style key: pre-fix this count displayed 0.
+    events = [hb, {"event": "scan", "ts": now_ms, "perceptions": 5}]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    assert dashboard._summary_payload()["last_scan_triggers"] == 5
+    # Legacy loop-style key still works via the alias.
+    events = [hb, {"event": "scan", "ts": now_ms, "triggers": 9}]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    assert dashboard._summary_payload()["last_scan_triggers"] == 9
+    # Canonical key wins when both are present.
+    events = [hb, {"event": "scan", "ts": now_ms,
+                   "perceptions": 3, "triggers": 99}]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    assert dashboard._summary_payload()["last_scan_triggers"] == 3
+
+
 def test_summary_payload_stale_when_heartbeat_old(monkeypatch):
     from hermes_trader import dashboard
     old_ms = int(dashboard.time.time() * 1000) - 600_000  # 10 min ago
@@ -3206,6 +3277,51 @@ def test_equity_curve_payload_filters_by_range_and_zero(monkeypatch):
     monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
     out = dashboard._equity_curve_payload(range_s=3600)  # last hour only
     assert [p["equity"] for p in out] == [240.0]
+
+
+def test_equity_curve_cashflow_neutral_adjustment(monkeypatch):
+    """P0-1: a deposit bumps raw equity but must NOT read as trading profit.
+
+    equity_adj subtracts the cumulative external flow; the window-relative
+    return_pct is cash-flow-neutral, so a $100 deposit with zero trading leaves
+    the adjusted level (and return) unchanged while raw equity rises.
+    """
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    events = [
+        {"event": "loop_heartbeat", "ts": now_ms - 120_000, "equity": 200.0,
+         "cum_contrib": 0.0},
+        {"event": "loop_heartbeat", "ts": now_ms - 60_000, "equity": 300.0,
+         "cum_contrib": 100.0},   # $100 deposited, zero trading
+        {"event": "loop_heartbeat", "ts": now_ms, "equity": 330.0,
+         "cum_contrib": 100.0},   # +$30 of genuine trading gain
+    ]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    out = dashboard._equity_curve_payload(range_s=3600)
+    # Raw equity rises across the deposit...
+    assert [p["equity"] for p in out] == [200.0, 300.0, 330.0]
+    # ...but adjusted equity strips the deposit: 200, 200, 230.
+    assert [p["equity_adj"] for p in out] == [200.0, 200.0, 230.0]
+    # Cash-neutral return counts only the genuine +$30 on a $200 base = 15%.
+    assert out[0]["return_pct"] == 0.0
+    assert out[1]["return_pct"] == 0.0
+    assert out[2]["return_pct"] == 15.0
+
+
+def test_equity_curve_legacy_heartbeat_without_cum_contrib(monkeypatch):
+    """P0-1: pre-upgrade heartbeats lack cum_contrib → degrade to no adjustment
+    (equity_adj == raw equity) rather than crashing."""
+    from hermes_trader import dashboard
+    now_ms = int(dashboard.time.time() * 1000)
+    events = [
+        {"event": "loop_heartbeat", "ts": now_ms - 60_000, "equity": 240.0},
+        {"event": "loop_heartbeat", "ts": now_ms, "equity": 250.0},
+    ]
+    monkeypatch.setattr(dashboard, "_read_log_lines", lambda: events)
+    out = dashboard._equity_curve_payload(range_s=3600)
+    assert [p["equity_adj"] for p in out] == [240.0, 250.0]
+    # return_pct falls back to raw-equity change: (250-240)/240 ≈ 4.1667%.
+    assert abs(out[-1]["return_pct"] - (10.0 / 240.0 * 100)) < 1e-3
 
 
 def _hb_equities(now_ms, equities):
@@ -3276,6 +3392,94 @@ def test_positions_snapshot_stale_returns_none(tmp_path, monkeypatch):
     f.write_text(_json.dumps({"saved_at": 0, "asset_positions": [{"x": 1}]}))
     monkeypatch.setattr(ps, "SNAPSHOT_FILE", str(f))
     assert ps.read_snapshot(max_age_s=60.0) is None  # saved_at=epoch 0 → ancient
+
+
+def test_positions_snapshot_legacy_unversioned_file_still_reads(tmp_path, monkeypatch):
+    """P0-2c: a snapshot written before versioning (no ``version`` field) is a
+    v0 legacy file with the same layout — it must still be accepted."""
+    from hermes_trader import positions_snapshot as ps
+    import json as _json
+    import time as _time
+    f = tmp_path / "snap.json"
+    rows = [{"position": {"coin": "BTC", "szi": "1.0"}}]
+    f.write_text(_json.dumps({"saved_at": int(_time.time() * 1000),
+                              "asset_positions": rows}))
+    monkeypatch.setattr(ps, "SNAPSHOT_FILE", str(f))
+    out = ps.read_snapshot(max_age_s=120.0)
+    assert out == {"asset_positions": rows}
+
+
+def test_positions_snapshot_future_version_returns_none(tmp_path, monkeypatch):
+    """P0-2c: a version newer than this binary is rejected (downgrade guard) →
+    caller falls back to a live fetch instead of mis-parsing."""
+    from hermes_trader import positions_snapshot as ps
+    import json as _json
+    import time as _time
+    f = tmp_path / "snap.json"
+    f.write_text(_json.dumps({"version": 999,
+                              "saved_at": int(_time.time() * 1000),
+                              "asset_positions": []}))
+    monkeypatch.setattr(ps, "SNAPSHOT_FILE", str(f))
+    assert ps.read_snapshot(max_age_s=600.0) is None
+
+
+def test_positions_snapshot_wrong_typed_fields_return_none(tmp_path, monkeypatch):
+    """P0-2c: a non-list asset_positions (corrupt/hand-edited file) is ignored
+    rather than returned as an unusable value."""
+    from hermes_trader import positions_snapshot as ps
+    import json as _json
+    import time as _time
+    f = tmp_path / "snap.json"
+    f.write_text(_json.dumps({"version": 1,
+                              "saved_at": int(_time.time() * 1000),
+                              "asset_positions": "not-a-list"}))
+    monkeypatch.setattr(ps, "SNAPSHOT_FILE", str(f))
+    assert ps.read_snapshot(max_age_s=600.0) is None
+
+
+def test_shadow_book_load_tolerates_malformed_rows(tmp_path):
+    """P0-2c: one malformed position row must not abort tracker rehydration for
+    the whole book — valid rows rehydrate, bad rows are evicted, wrong-typed
+    list fields degrade to empty."""
+    import json as _json
+    import time as _time
+    from hermes_trader.agents import shadow_book as sb
+
+    path = tmp_path / "shadow.json"
+    now_ms = int(_time.time() * 1000)
+    good_btc = {"coin": "BTC", "side": "long", "entry_px": 50000.0,
+                "leverage": 2, "opened_at": now_ms, "size_usd": 1000.0}
+    good_eth = {"coin": "ETH", "side": "short", "entry_px": 2500.0,
+                "leverage": 1, "opened_at": now_ms, "size_usd": 500.0}
+    state = {
+        "version": 1,
+        "created_at": now_ms,
+        "starting_balance": 10000.0,
+        "wallet_balance": 10000.0,
+        "positions": [
+            good_btc,
+            {"side": "long", "entry_px": 100.0},          # missing coin
+            {"coin": "SOL", "side": "long"},               # missing entry_px
+            "not-a-dict",                                  # malformed row
+            good_eth,
+        ],
+        "fills": "junk",        # wrong type → degrades to []
+        "equity_curve": [{"t": now_ms, "equity": 10001.0}],
+        "closed_count": 3,
+    }
+    path.write_text(_json.dumps(state))
+
+    book = sb.ShadowBook(path=str(path))
+    # Both good positions survived; the three bad rows were evicted.
+    coins_sides = {(p["coin"], p["side"]) for p in book.state["positions"]}
+    assert coins_sides == {("BTC", "long"), ("ETH", "short")}
+    # Both trackers rehydrated (previously one bad row killed ALL trackers).
+    assert book._key("BTC", "long") in book._trackers
+    assert book._key("ETH", "short") in book._trackers
+    # Wrong-typed list field degraded, equity curve preserved.
+    assert book.state["fills"] == []
+    assert len(book.state["equity_curve"]) == 1
+    assert book.state["closed_count"] == 3
 
 
 def test_dashboard_positions_prefers_snapshot_no_hl_call(monkeypatch):

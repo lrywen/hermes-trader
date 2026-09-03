@@ -249,6 +249,52 @@ def test_af4_pre_place_recheck_fail_open_then_order_failed(monkeypatch, tmp_path
     assert "af4-failopen" not in executor._IN_FLIGHT_ANALYSES
 
 
+# ── P0-2a: defensive asset_positions read ────────────────────────────────
+
+def test_p02a_malformed_asset_position_rows_are_skipped(monkeypatch, tmp_path):
+    """A malformed row in the live account-state read (non-dict payload,
+    missing position/coin/szi, non-numeric size) must be skipped instead of
+    raising and aborting the whole placement pipeline. Pre-fix the direct
+    subscripts in the positions list-comprehension blew up on any such row."""
+    from hermes_trader.agents import executor
+    _isolated_memory(monkeypatch, tmp_path)
+
+    def fetch_fake(*_a, **kwargs):
+        # Initial include_hip3 read: one valid unrelated position plus a mix of
+        # corrupt rows. Pre-fix any single corrupt row raised KeyError/TypeError
+        # /ValueError out of maybe_execute.
+        if kwargs.get("include_hip3"):
+            return {
+                "equity": 1000.0, "available": 900.0, "total_ntl": 0.0,
+                "asset_positions": [
+                    {"position": {"coin": "BTC", "szi": "0.5"}},  # valid
+                    "not-a-dict",
+                    {"no_position": True},
+                    {"position": {"szi": "1.0"}},                # no coin
+                    {"position": {"coin": "SOL", "szi": "abc"}}, # bad szi
+                    {"position": {"coin": "ETH", "szi": 0.5}},   # target — pre-place
+                ],
+            }
+        # A-F4 pre-place re-check: return only the valid unrelated position so
+        # placement proceeds (proves the pipeline survived the corrupt initial
+        # read rather than failing to even reach this point).
+        return {"equity": 1000.0, "asset_positions": [
+            {"position": {"coin": "BTC", "szi": 0.5}}]}
+
+    place_calls = _stub_deep_path(monkeypatch, fetch_fake=fetch_fake)
+
+    analysis = dict(_ANALYSIS, id="p02a-corrupt-pos")
+    result = executor.maybe_execute(analysis)
+
+    # The corrupt rows did not abort the pipeline: placement was reached (the
+    # fake order call returns a definite failure), and the valid BTC position
+    # was carried through the merge without an exception.
+    assert len(place_calls) == 1
+    assert result.get("reason") == "order_failed: forced"
+    assert "ETH" not in executor._IN_FLIGHT_COINS
+    assert "p02a-corrupt-pos" not in executor._IN_FLIGHT_ANALYSES
+
+
 # ── A-F5: breach time gate default + index wick confirmation ─────────────
 
 def test_af5_breach_confirm_sec_defaults_to_4s():

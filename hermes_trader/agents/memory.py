@@ -397,23 +397,59 @@ class AgentMemory:
                 with open(MEMORY_FILE, "r") as f:
                     data = json.load(f)
 
-                self._perceptions = (data.get("perceptions") or [])[:limits["perceptions"]]
-                self._analyses = (data.get("analyses") or [])[:limits["analyses"]]
-                self._trades = (data.get("trades") or [])[:limits["trades"]]
-                self._closes = (data.get("closes") or [])[:limits["closes"]]
-                self._entry_ctx = data.get("entryCtx") or {}
+                # P0-2a: isinstance guards — a single top-level field of the
+                # wrong type (corrupt/hand-edited file) must not abort the whole
+                # hydration; drop that field and keep everything else.
+                def _list_field(key):
+                    val = data.get(key)
+                    return val if isinstance(val, list) else []
+                self._perceptions = _list_field("perceptions")[:limits["perceptions"]]
+                self._analyses = _list_field("analyses")[:limits["analyses"]]
+                self._trades = _list_field("trades")[:limits["trades"]]
+                self._closes = _list_field("closes")[:limits["closes"]]
+                _entry_ctx = data.get("entryCtx")
+                self._entry_ctx = _entry_ctx if isinstance(_entry_ctx, dict) else {}
 
-                # Rebuild cooldowns
+                # Rebuild cooldowns. P0-2a: per-row tolerance — one malformed
+                # entry (missing coin, non-numeric expires, non-dict row) is
+                # skipped instead of aborting the load and losing ALL history.
                 self._cooldowns.clear()
                 now = int(time.time() * 1000)
-                for c in (data.get("cooldowns") or []):
-                    if c.get("expires", 0) > now:
-                        self._cooldowns[c["coin"]] = c["expires"]
+                _cooldown_rows = data.get("cooldowns")
+                if isinstance(_cooldown_rows, list):
+                    for c in _cooldown_rows:
+                        try:
+                            coin = c.get("coin")
+                            exp = int(c.get("expires", 0) or 0)
+                            if coin and exp > now:
+                                self._cooldowns[str(coin)] = exp
+                        except (AttributeError, TypeError, ValueError):
+                            continue
 
-                self._equity = data.get("equity", 0)
-                self._daily_pnl = data.get("dailyPnl", 0)
-                self._start_of_day_equity = data.get("startOfDayEquity", 0)
-                self._day_start_ts = data.get("dayStartTs", 0)
+                # P0-2a: coerce scalar fields; a non-numeric value in one field
+                # degrades that field to its zero default instead of aborting the
+                # whole hydration (the first accepted tick re-seeds equity/pnl).
+                def _num(key, cast, default):
+                    try:
+                        return cast(data.get(key, default) or default)
+                    except (TypeError, ValueError):
+                        return default
+                self._equity = _num("equity", float, 0.0)
+                self._daily_pnl = _num("dailyPnl", float, 0.0)
+                self._start_of_day_equity = _num("startOfDayEquity", float, 0.0)
+                self._day_start_ts = _num("dayStartTs", int, 0)
+                # P0-1: restore cumulative external-flow state (absent in files
+                # written before this feature → 0.0, seeds from the ledger on the
+                # first accepted ticks). Coerce defensively; these feed only the
+                # dashboard curve, never the risk path.
+                try:
+                    self._contrib_folded_total = float(data.get("cumContribFolded", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    self._contrib_folded_total = 0.0
+                try:
+                    self._contrib_today = float(data.get("cumContribToday", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    self._contrib_today = 0.0
                 # B-F7: all-time equity high-water mark (absent in old files →
                 # 0.0, re-seeds itself on the first accepted equity tick).
                 try:
@@ -426,33 +462,48 @@ class AgentMemory:
                 # a pre-existing latched freeze immediately rather than after a
                 # full cooldown window).
                 trail = []
-                for row in (data.get("equityTrail") or []):
-                    try:
-                        ts_s = float(row[0])
-                        eq = float(row[1])
-                        if ts_s > 0 and eq > 0:
-                            trail.append((ts_s, eq))
-                    except (TypeError, ValueError, IndexError):
-                        continue
+                _trail_rows = data.get("equityTrail")
+                if isinstance(_trail_rows, list):
+                    for row in _trail_rows:
+                        try:
+                            ts_s = float(row[0])
+                            eq = float(row[1])
+                            if ts_s > 0 and eq > 0:
+                                trail.append((ts_s, eq))
+                        except (TypeError, ValueError, IndexError):
+                            continue
                 trail.sort(key=lambda r: r[0])
                 self._equity_trail = deque(trail[-4320:])  # ≤ ~30d at 10-min cadence
-                self._dd_frozen_since_ms = int(data.get("ddFrozenSinceMs", 0) or 0)
-                self._dd_last_baseline_ms = int(data.get("ddLastBaselineMs", 0) or 0)
-                self._open_positions = data.get("openPositions", [])
+                self._dd_frozen_since_ms = _num("ddFrozenSinceMs", int, 0)
+                self._dd_last_baseline_ms = _num("ddLastBaselineMs", int, 0)
+                _open_positions = data.get("openPositions", [])
+                self._open_positions = _open_positions if isinstance(_open_positions, list) else []
 
                 # Tiered circuit-breaker state (best-effort restore; a stale/
                 # expired entry is harmless — the remaining-minutes accessor
-                # purges it).
-                self._coin_circuit = {
-                    str(k): int(v) for k, v in (data.get("coinCircuit") or {}).items()
-                    if int(v) > now
-                }
-                self._global_halt_until_ms = int(data.get("globalHaltUntilMs", 0) or 0)
+                # purges it). P0-2a: per-entry tolerance so one bad value can't
+                # abort the load.
+                self._coin_circuit = {}
+                _coin_circuit = data.get("coinCircuit")
+                if isinstance(_coin_circuit, dict):
+                    for k, v in _coin_circuit.items():
+                        try:
+                            iv = int(v)
+                            if iv > now:
+                                self._coin_circuit[str(k)] = iv
+                        except (TypeError, ValueError):
+                            continue
+                self._global_halt_until_ms = _num("globalHaltUntilMs", int, 0)
                 if self._global_halt_until_ms < now:
                     self._global_halt_until_ms = 0
-                self._consecutive_losses = {
-                    str(k): int(v) for k, v in (data.get("consecutiveLosses") or {}).items()
-                }
+                self._consecutive_losses = {}
+                _consec = data.get("consecutiveLosses")
+                if isinstance(_consec, dict):
+                    for k, v in _consec.items():
+                        try:
+                            self._consecutive_losses[str(k)] = int(v)
+                        except (TypeError, ValueError):
+                            continue
 
                 logger.info(
                     f"[memory] loaded {len(self._perceptions)} perceptions, "

@@ -1188,21 +1188,12 @@ async def place_order(request: Request) -> JSONResponse:
                 type(e).__name__, e,
             )
             acct = {}
-        total_open_notional = 0.0
-        try:
-            for _p in (acct.get("assetPositions") or []):
-                _szi = abs(float((_p.get("position") or {}).get("szi") or 0.0))
-                _px = float((_p.get("position") or {}).get("entryPx") or _p.get("position", {}).get("markPx") or 0.0)
-                total_open_notional += _szi * _px
-        except Exception as e:
-            # R12-A1: parsing a single malformed position entry should
-            # NOT zero the whole total. Surface the schema mismatch
-            # so we can fix the upstream shape, and keep whatever
-            # notional we accumulated up to the failure point.
-            logger.warning(
-                "[gates] position notional sum failed, partial=%s: %s: %s",
-                total_open_notional, type(e).__name__, e,
-            )
+        # P0-2c: fetch_account_state() normalizes positions to the snake_case
+        # ``asset_positions`` key; this block used to read the raw HL envelope
+        # key ``assetPositions``, which never exists on the normalized dict —
+        # so total_open_notional was silently always 0.0 for manual orders.
+        # _sum_open_notional reads the correct key and tolerates bad rows.
+        total_open_notional = _sum_open_notional(acct)
 
         market_vol_24h = 0.0
         try:
@@ -1251,12 +1242,14 @@ async def place_order(request: Request) -> JSONResponse:
             live_equity=locals().get("live_equity_for_gates", 0.0) or 0.0,
             total_open_notional=locals().get("total_open_notional", 0.0) or 0.0,
             market_vol_24h=float(market_vol_24h),
-            # G-1: flatten the nested camelCase assetPositions shape into the
-            # coin/side/size_usd list the gates consume — otherwise every gate
-            # reading current_positions (max_concurrent, opposite_direction_guard,
+            # G-1: flatten the nested position shape into the coin/side/
+            # size_usd list the gates consume — otherwise every gate reading
+            # current_positions (max_concurrent, opposite_direction_guard,
             # correlation_cap) sees zero entries and fails open.
+            # P0-2c: fetch_account_state() normalizes to snake_case
+            # ``asset_positions``; the old ``assetPositions`` read never hit.
             positions=_flatten_asset_positions(
-                locals().get("acct", {}).get("assetPositions") or []
+                locals().get("acct", {}).get("asset_positions") or []
             ),
             entry_px=float(mid_price),
             leverage=float(leverage),

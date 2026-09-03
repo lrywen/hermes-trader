@@ -60,6 +60,7 @@ from hermes_trader.client.hl_client import (
     fetch_account_state,
     resolve_user_address,
 )
+from hermes_trader.contracts import parse_heartbeat
 from hermes_trader.positions_snapshot import read_snapshot as read_position_snapshot
 
 logger = logging.getLogger("hermes-dashboard")
@@ -380,7 +381,10 @@ def _summary_payload() -> dict[str, Any]:
     """Equity, daily PnL, open count, last-tick — derived from the session log so
     the dashboard works even if the live HL fetch is rate-limited."""
     events = _read_log_lines()
-    heartbeat = _last_event(events, "loop_heartbeat") or {}
+    # P0-2d: validate the heartbeat at the read boundary — a malformed field
+    # (a string where a number belongs) degrades to "no heartbeat yet" exactly
+    # like an empty feed, so the summary card never 500s on a corrupt line.
+    heartbeat = parse_heartbeat(_last_event(events, "loop_heartbeat")) or {}
     last_scan = _last_event(events, "scan")
     # F6: defensive .get('ts', 0) — a trailing parseable dict missing 'ts'
     # must not KeyError this public summary endpoint into a 500.
@@ -422,7 +426,11 @@ def _summary_payload() -> dict[str, Any]:
         "daily_pnl_pct": round(daily_pnl_pct, 2),
         "open_positions": int(heartbeat.get("open_positions", 0) or 0),
         "last_tick_age_s": last_tick_age_s,
-        "last_scan_triggers": int((last_scan or {}).get("triggers", 0) or 0),
+        # P0-2b: `perceptions` is the canonical scan-count key (HTTP /scan logs
+        # it); `triggers` is the pre-fix alias kept for older log events.
+        "last_scan_triggers": int(
+            (last_scan or {}).get("perceptions",
+                                  (last_scan or {}).get("triggers", 0)) or 0),
         "status": status,
         "ts": now_ms,
     }
@@ -482,7 +490,9 @@ def _risk_status_payload() -> dict[str, Any]:
     # Mode / daily-PnL-vs-kill / feed liveness from the latest heartbeat.
     try:
         events = _read_log_lines()
-        hb = _last_event(events, "loop_heartbeat") or {}
+        # P0-2d: schema-validated at the read boundary; a malformed event
+        # degrades to "no heartbeat" (feed=offline) rather than 500ing.
+        hb = parse_heartbeat(_last_event(events, "loop_heartbeat")) or {}
     except Exception:  # an unreadable log must not 500 the card
         logger.warning("[risk-status] session-log read failed; feed=offline", exc_info=True)
         hb = {}
@@ -2013,7 +2023,7 @@ async def _h_status(parts: list[str], cmd: str) -> JSONResponse:
                f"daily {last_hb.get('daily_pnl', 0):+.2f}  "
                f"open {last_hb.get('open_positions', 0)}  "
                f"tick {age_s}s ago  "
-               f"last scan: {last_scan.get('triggers', 0)} triggers")
+               f"last scan: {last_scan.get('perceptions', last_scan.get('triggers', 0))} triggers")
         return JSONResponse({"response": msg, "kind": "status"})
     except Exception as e:
         return JSONResponse({"response": f"status read failed: {e}", "kind": "error"})

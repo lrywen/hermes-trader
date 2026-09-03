@@ -22,6 +22,7 @@ import time
 from typing import Any, Optional
 
 from hermes_trader.agents import atomic_io
+from hermes_trader.contracts import parse_snapshot
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,19 @@ SNAPSHOT_FILE = os.environ.get(
     os.path.join(_REPO_ROOT, ".positions-snapshot.json"),
 )
 
+# P0-2c: payload schema version. Files written before this field existed have
+# no ``version`` and are treated as v0 (identical layout: saved_at +
+# asset_positions). A version newer than this binary is rejected on read so a
+# downgraded daemon never mis-parses a newer schema — the caller then falls
+# back to a live fetch.
+_SNAPSHOT_VERSION = 1
+
 
 def write_snapshot(asset_positions: list[dict[str, Any]]) -> None:
     """Atomically persist the raw HL position list. Best-effort, never raises."""
     try:
         payload = {
+            "version": _SNAPSHOT_VERSION,
             "saved_at": int(time.time() * 1000),
             "asset_positions": asset_positions or [],
         }
@@ -62,8 +71,26 @@ def read_snapshot(max_age_s: float = 120.0) -> Optional[dict[str, Any]]:
         logger.warning(f"[snapshot] file unreadable, ignoring: {e}")
         return None
 
-    saved_at = payload.get("saved_at", 0)
+    # P0-2d: schema validation at the read boundary. parse_snapshot rejects a
+    # non-object payload / mistyped scalars / a non-list asset_positions
+    # (→ None → live fetch fallback) and skips individual malformed rows
+    # instead of letting them poison downstream readers.
+    parsed = parse_snapshot(payload)
+    if parsed is None:
+        return None
+    # P0-2c: version gate. Missing version = v0 legacy file (same layout);
+    # a future version this binary doesn't understand → None so the caller
+    # re-fetches live instead of mis-parsing.
+    version = parsed["version"]
+    if version > _SNAPSHOT_VERSION:
+        logger.warning(
+            f"[snapshot] file version {version} newer than this binary "
+            f"(expects v{_SNAPSHOT_VERSION}); ignoring — live fetch fallback"
+        )
+        return None
+
+    saved_at = parsed["saved_at"]
     age_s = (time.time() * 1000 - saved_at) / 1000.0
     if age_s > max_age_s:
         return None
-    return {"asset_positions": payload.get("asset_positions", [])}
+    return {"asset_positions": parsed["asset_positions"]}

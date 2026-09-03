@@ -168,6 +168,42 @@ def _read_state(path: str) -> Optional[dict[str, Any]]:
             pass
 
 
+def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bring an on-disk state payload up to ``_STATE_VERSION`` (mirrors the
+    version/migration discipline in dsl_exit.py).
+
+    Each migration is a pure structural transform that adds fields the newer
+    schema needs with safe defaults. An unknown FUTURE version is left
+    untouched and warned about so a downgraded daemon never rewrites a newer
+    file. Idempotent: re-running on an already-current payload is a no-op.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("shadow_book payload is not a JSON object")
+    raw_version = payload.get("version")
+    try:
+        version = int(raw_version) if raw_version is not None else 1
+    except (TypeError, ValueError):
+        logger.warning(
+            f"[shadow_book] state file has unparseable version {raw_version!r}; "
+            f"treating as v{_STATE_VERSION}"
+        )
+        version = _STATE_VERSION
+
+    if version > _STATE_VERSION:
+        logger.warning(
+            f"[shadow_book] state file version {version} is newer than this "
+            f"binary (expects v{_STATE_VERSION}); loading without migration — "
+            f"a daemon downgrade may be in progress"
+        )
+        return payload
+
+    # Future migrations chain here:
+    # if version < 2:
+    #     payload = _migrate_v1_to_v2(payload); version = 2
+    payload["version"] = _STATE_VERSION
+    return payload
+
+
 # ---------------------------------------------------------------------------
 # the book
 # ---------------------------------------------------------------------------
@@ -235,36 +271,60 @@ class ShadowBook:
         if not data:
             return
         try:
+            data = _migrate_payload(data)
+            # P0-2c: isinstance guards — a wrong-typed field (corrupt or
+            # hand-edited file) degrades that field to empty instead of
+            # aborting the whole load and losing the entire virtual book.
+            def _list_field(key):
+                val = data.get(key)
+                return val if isinstance(val, list) else []
             self.state = {
                 "version": _STATE_VERSION,
                 "created_at": data.get("created_at", _now_ms()),
                 "starting_balance": float(data.get("starting_balance", _starting_balance())),
                 "wallet_balance": float(data.get("wallet_balance", data.get("starting_balance", _starting_balance()))),
-                "positions": list(data.get("positions", [])),
-                "fills": list(data.get("fills", [])),
-                "equity_curve": list(data.get("equity_curve", [])),
-                "closed_count": int(data.get("closed_count", 0)),
+                "positions": _list_field("positions"),
+                "fills": _list_field("fills"),
+                "equity_curve": _list_field("equity_curve"),
+                "closed_count": int(data.get("closed_count", 0) or 0),
             }
         except Exception as e:
             logger.error(f"[shadow_book] corrupt state, starting fresh: {e}")
             self.state = self._fresh_state()
             return
         # Rehydrate a DSLTracker per open position so peak/floor state resumes.
+        # P0-2c: per-row tolerance — a single malformed position row (missing
+        # coin/side/entry_px, non-numeric value) is evicted with a warning
+        # instead of aborting the loop and losing ALL trackers.
+        valid_positions: list[dict[str, Any]] = []
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
             policy = _build_policy()
             for p in self.state["positions"]:
-                entry_time = float(p.get("opened_at", _now_ms())) / 1000.0
-                t = DSLTracker(
-                    p["coin"], p["side"], float(p["entry_px"]), entry_time,
-                    policy=policy, leverage=int(p.get("leverage", 1)),
-                    entry_atr_pct=float(p.get("entry_atr_pct", 0.0) or 0.0),
-                    entry_regime=p.get("entry_regime", "") or "",
-                )
-                if p.get("peak_px"):
-                    t.peak_px = float(p["peak_px"])
-                self._trackers[self._key(p["coin"], p["side"])] = t
+                try:
+                    coin = p["coin"]
+                    side = p["side"]
+                    entry_px = float(p["entry_px"])
+                    entry_time = float(p.get("opened_at", _now_ms())) / 1000.0
+                    t = DSLTracker(
+                        coin, side, entry_px, entry_time,
+                        policy=policy, leverage=int(p.get("leverage", 1) or 1),
+                        entry_atr_pct=float(p.get("entry_atr_pct", 0.0) or 0.0),
+                        entry_regime=p.get("entry_regime", "") or "",
+                    )
+                    if p.get("peak_px"):
+                        t.peak_px = float(p["peak_px"])
+                    self._trackers[self._key(coin, side)] = t
+                    valid_positions.append(p)
+                except (AttributeError, TypeError, ValueError, KeyError) as e:
+                    logger.warning(
+                        f"[shadow_book] skipping malformed position row {p!r}: {e}"
+                    )
+                    continue
+            self.state["positions"] = valid_positions
         except Exception as e:
+            # Import/policy-build failure: keep the rows as-is; trackers are
+            # rebuilt lazily by open_position() on the trading path.
             logger.warning(f"[shadow_book] tracker rehydrate failed (non-fatal): {e}")
         logger.info(
             f"[shadow_book] loaded: {len(self.state['positions'])} open, "

@@ -272,3 +272,53 @@ def test_route_uses_blocked_key(monkeypatch):
         "place_order must branch on report['blocked'] (eval_all_gates "
         "contract), not on a non-existent 'pass' key."
     )
+
+
+# ── P0-2c: normalized state key (asset_positions, not assetPositions) ──────
+
+
+def _norm_state():
+    """The shape fetch_account_state() actually returns: snake_case key with
+    nested HL envelope rows."""
+    return {
+        "equity": 100_000.0,
+        "asset_positions": [
+            {"position": {"coin": "BTC", "szi": "1.0", "entryPx": "50000"}},
+            {"position": {"coin": "ETH", "szi": "-2.0", "entryPx": "2500"}},
+        ],
+    }
+
+
+def test_sum_open_notional_reads_normalized_asset_positions_key():
+    """P0-2c regression: the manual-order route summed ``acct['assetPositions']``
+    (the raw HL envelope key), which never exists on fetch_account_state()'s
+    normalized dict — total_open_notional was silently always 0.0."""
+    import hermes_trader.server as srv
+    assert srv._sum_open_notional(_norm_state()) == 50000.0 + 5000.0
+
+
+def test_flatten_asset_positions_reads_normalized_key():
+    """P0-2c regression: _flatten_asset_positions must see the live positions
+    when handed the normalized fetch_account_state() payload."""
+    import hermes_trader.server as srv
+    flat = srv._flatten_asset_positions(_norm_state()["asset_positions"])
+    by_coin = {p["coin"]: p for p in flat}
+    assert set(by_coin) == {"BTC", "ETH"}
+    assert by_coin["BTC"]["side"] == "long"
+    assert by_coin["ETH"]["side"] == "short"
+
+
+def test_place_order_route_reads_normalized_asset_positions_key():
+    """Regression guard at the call site: the route must pass
+    ``acct['asset_positions']`` (normalized) into the gates, never the raw
+    ``assetPositions`` envelope key."""
+    import hermes_trader.server as srv
+    import inspect
+    src = inspect.getsource(srv.place_order)
+    assert '"asset_positions"' in src or "'asset_positions'" in src, (
+        "place_order must read the normalized acct['asset_positions'] key"
+    )
+    assert '"assetPositions"' not in src and "'assetPositions'" not in src, (
+        "place_order must not read the raw HL 'assetPositions' envelope key "
+        "from the normalized fetch_account_state() dict"
+    )
