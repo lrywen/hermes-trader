@@ -55,6 +55,143 @@ def _get_data_gaps() -> int:
     with _data_gap_lock:
         return _data_gap_count
 
+# ── Setup-age decay (roadmap §2 time-decay factor) ───────────────────────────
+# Composite score is recomputed from the latest CLOSED bar every scan cycle
+# and has no memory. A *formation* trigger (breakout / trend-strength / higher-
+# lows …) keeps firing at high score on every bar after the breakout matures,
+# so a coin that broke out bars ago — the FARTCOIN top-tick late-chase — still
+# surfaces with a fresh high score. We track each trigger's FIRST-fire bar per
+# coin across cycles and decay its weight by exp(-onset_age/halflife). Pulse
+# triggers (momentumBurst / pctMoveSpike / volumeSpike) already self-extinguish
+# when velocity falls, so their halflife is infinite (no decay) — an extra age
+# factor would double-penalize them. The half-life defaults live here (config
+# block `signal_age_decay`, seconds; 0 = never decay) and are overridable via
+# the merged agent-config; canonical schema/CANONICAL_DEFAULTS registration is a
+# follow-up once the parallel config refactor lands.
+#
+# Modes (mirrors market_circuit gray-release):
+#   off     — no state, no score change (default).
+#   shadow  — onset is tracked, the decayed score is computed and logged to a
+#             dedicated JSONL (+ a would_block flag when decay would drop the
+#             coin below the surfacing gate), but the surfaced score is raw.
+#   enforce — the surfaced score is the decayed one.
+_AGE_DECAY_DEFAULT_HALFLIFE_S = {
+    # 5m formation triggers: edge is the breakout bar itself — fade fast.
+    "breakout": 900.0,
+    "trendStrength": 1800.0,
+    "rangeCompression": 0.0,        # only feeds the breakout-coupling boost
+    "trendFlip1h": 7200.0,          # 1h formation setup
+    "higherLows1h": 7200.0,         # 1h formation setup
+    "volumeBuildup1h": 7200.0,      # 1h formation setup
+    "momentumContinuation1h": 7200.0,
+    # Pulse triggers self-extinguish as velocity normalizes — never decay.
+    "pctMoveSpike": 0.0,
+    "volumeSpike": 0.0,
+    "momentumBurst": 0.0,
+}
+_AGE_DECAY_MODES = ("off", "shadow", "enforce")
+
+_age_decay_lock = threading.Lock()
+# (coin, trigger_name) -> bar_close_ms (ms) of the first bar the trigger fired
+_age_decay_onset: dict[tuple[str, str], int] = {}
+
+
+def _reset_age_decay() -> None:
+    """Clear onset-tracking state (tests / explicit reset)."""
+    with _age_decay_lock:
+        _age_decay_onset.clear()
+
+
+def _age_decay_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the signal_age_decay block: merged agent-config, then an env
+    override for the mode (gray-release flip without a file write). Invalid
+    values fall back to safe defaults."""
+    blk = config.get("signal_age_decay") or {}
+    mode = str(blk.get("mode") or "").strip().lower()
+    env_mode = str(os.environ.get("HERMES_SIGNAL_AGE_DECAY_MODE") or "").strip().lower()
+    if env_mode:
+        mode = env_mode
+    if mode not in _AGE_DECAY_MODES:
+        mode = "off"
+    return {"mode": mode, "block": blk}
+
+
+def _age_decay_halflives_ms(blk: dict[str, Any]) -> dict[str, float]:
+    """Per-trigger halflife in ms. Defaults from the constant, overridable via
+    the config block's `halflife_s` map (camelCase trigger names, seconds;
+    0 = never decay). Non-numeric / negative entries are ignored."""
+    out: dict[str, float] = {}
+    for name, default_s in _AGE_DECAY_DEFAULT_HALFLIFE_S.items():
+        try:
+            val = float(blk.get("halflife_s", {}).get(name, default_s))
+        except (TypeError, ValueError):
+            val = float(default_s)
+        out[name] = max(0.0, val) * 1000.0
+    return out
+
+
+def _age_decay_observe(
+    coin: str,
+    fired_names: list[str],
+    bar_close_ms: int,
+    halflife_ms: dict[str, float],
+    onset_ttl_ms: int,
+) -> dict[str, int]:
+    """Record first-fire bar for each fired trigger and return the onset map
+    ({trigger_name: first-fire bar_close_ms}) to score THIS bar.
+
+    Called once per scanned market per cycle, under the module lock (scan fans
+    out over a ThreadPoolExecutor). A trigger firing for the first time (or
+    re-firing after its setup went quiet past the TTL) is stamped with the
+    current bar, so on its breakout bar age == 0 and it scores at full weight;
+    continuously-firing triggers keep their original (older) onset and age.
+    An empty `fired_names` clears the coin's stale entries (setup ended).
+    """
+    fired = set(fired_names)
+    with _age_decay_lock:
+        # Prune this coin's expired entries (scan gap / restart / long quiet).
+        stale = [
+            k for k in _age_decay_onset
+            if k[0] == coin and (bar_close_ms - _age_decay_onset[k]) > onset_ttl_ms
+        ]
+        for k in stale:
+            del _age_decay_onset[k]
+        # Drop entries for triggers that are no longer firing (setup ended).
+        gone = [k for k in _age_decay_onset if k[0] == coin and k[1] not in fired]
+        for k in gone:
+            del _age_decay_onset[k]
+        # Stamp first fires.
+        for name in fired:
+            key = (coin, name)
+            if key not in _age_decay_onset:
+                _age_decay_onset[key] = int(bar_close_ms)
+        return {
+            name: _age_decay_onset[(coin, name)]
+            for name in fired
+            if (coin, name) in _age_decay_onset and name in halflife_ms
+        }
+
+
+def _age_decay_shadow_path(blk: dict[str, Any]) -> str:
+    """Resolve the age-decay shadow JSONL path (config → env → default)."""
+    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_SIGNAL_AGE_DECAY_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/signal_age_decay_shadow.jsonl"),
+    )
+
+
+def _age_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
+    """Best-effort append an age-decay shadow record to the JSONL."""
+    import json
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("[age-decay] shadow write failed: %s", e)
+
 # ── Candle cache (module-level, shared across ticks) ──────────────────────────
 # Per-coin TTL cache backed by the shared _Cache abstraction (LRU + TTL). The
 # 5m interval uses the short scan TTL; the 1h interval uses a longer TTL so
@@ -423,12 +560,84 @@ def _scan_single_market(
             "fired": daily_mover_fired,
         })
 
+        # Stable bar identity for the scored CLOSED bar (see O-2 note below).
+        # Computed before the early returns so setup-age decay can key on it.
+        scored_bar_close_ms = int(candles[-1].t) + int(bar_dur_ms)
+
         # At least one trigger must fire.
         fired_count = sum(1 for h in hits if h.get("fired"))
-        if fired_count < 1:
-            return (True, None)
 
-        score = trigger_mod.composite_score(hits, _score_weights)
+        # ── Setup-age decay (roadmap §2) ──
+        # OFF by default: no state is touched and the surfaced score is the raw
+        # composite. In shadow/enforce we first record each fired trigger's
+        # first-fire bar (empty fired list clears the coin's stale onsets),
+        # then compute the age-decayed score. Shadow surfaces the RAW score and
+        # only records the what-if; enforce surfaces the DECAYED score.
+        _dec = _age_decay_config(config)
+        _dec_mode = _dec["mode"]
+        _fired_names = [h["name"] for h in hits if h.get("fired")]
+        if _dec_mode != "off":
+            _halflife_ms = _age_decay_halflives_ms(_dec["block"])
+            try:
+                _onset_ttl_ms = float(_dec["block"].get("onset_ttl_s", 21600)) * 1000.0
+            except (TypeError, ValueError):
+                _onset_ttl_ms = 21_600_000.0
+            _onset_ms = _age_decay_observe(
+                market["coin"], _fired_names, scored_bar_close_ms,
+                _halflife_ms, _onset_ttl_ms,
+            )
+            if fired_count < 1:
+                return (True, None)
+            raw_score = trigger_mod.composite_score(hits, _score_weights)
+            decayed_score = trigger_mod.composite_score_aged(
+                hits, _score_weights, scored_bar_close_ms, _onset_ms, _halflife_ms,
+            )
+            would_block = raw_score >= min_score and decayed_score < min_score
+            # Gray-release record: emit when decay actually bites (factor < 1 on
+            # some fired trigger) so the JSONL stays compact and signal-rich.
+            try:
+                aged = [
+                    {
+                        "trigger": name,
+                        "onset_age_min": round((scored_bar_close_ms - _onset_ms[name]) / 60000.0, 2),
+                        "halflife_min": round(_halflife_ms.get(name, 0.0) / 60000.0, 2),
+                        "factor": round(trigger_mod.decay_factor(
+                            scored_bar_close_ms - _onset_ms[name],
+                            _halflife_ms.get(name)), 4),
+                    }
+                    for name in _fired_names
+                    if name in _onset_ms
+                    and trigger_mod.decay_factor(
+                        scored_bar_close_ms - _onset_ms[name], _halflife_ms.get(name)) < 0.999
+                ]
+                if aged or would_block:
+                    _age_decay_record_shadow({
+                        "ts": int(now_ms),
+                        "mode": _dec_mode,
+                        "coin": market["coin"],
+                        "bar_close_ms": scored_bar_close_ms,
+                        "raw_score": round(float(raw_score), 2),
+                        "decayed_score": round(float(decayed_score), 2),
+                        "gate": float(min_score),
+                        "would_block": bool(would_block),
+                        "fired_triggers": _fired_names,
+                        "aged_triggers": aged,
+                    }, _age_decay_shadow_path(_dec["block"]))
+                    if would_block:
+                        logger.info(
+                            "[age-decay] %s %s raw %.1f -> decayed %.1f would drop below "
+                            "gate %.1f (fired=%s)",
+                            _dec_mode, market["coin"], raw_score, decayed_score,
+                            min_score, _fired_names,
+                        )
+            except Exception as _e:
+                # Observability only — never let decay logging affect a scan.
+                logger.debug(f"[age-decay] shadow record failed for {market['coin']}: {_e}")
+            score = decayed_score if _dec_mode == "enforce" else raw_score
+        else:
+            if fired_count < 1:
+                return (True, None)
+            score = trigger_mod.composite_score(hits, _score_weights)
         # A confirmed momentum burst is always surfaced — a large, fast move is
         # exactly the signal the composite gate must never filter out.
         burst_fired = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
@@ -523,7 +732,7 @@ def _scan_single_market(
         # this is the stable bar identity downstream content dedup keys on —
         # unlike fired_at (scan wall-clock, different every cycle) or id
         # (random per scan). No extra network fetch: the data is in hand.
-        scored_bar_close_ms = int(candles[-1].t) + int(bar_dur_ms)
+        # (scored_bar_close_ms is computed before the decay block above.)
         return (True, {
             "id": f"{market['coin']}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
             "coin": market["coin"],

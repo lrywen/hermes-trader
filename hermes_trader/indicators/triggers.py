@@ -656,3 +656,68 @@ def composite_score(hits: list[TriggerHit], weights: dict[str, float]) -> float:
     weighted_sum = sum(h["score"] * weights.get(h["name"], 0) for h in fired_hits)
     raw = (weighted_sum / total_weight) * 10
     return max(0, min(100, raw))
+
+
+def decay_factor(age_ms: float, halflife_ms: Optional[float]) -> float:
+    """Exponential setup-age decay factor (roadmap §2).
+
+    Uses true half-life semantics: ``factor = 2 ** (-age / halflife)``, i.e.
+    at ``age == halflife`` the weight is halved (0.5), at two half-lives it
+    is 0.25, and so on. (The roadmap's literal ``exp(-age/halflife)`` would
+    halve the weight at age ``ln(2) * halflife`` rather than at the named
+    half-life; using 2^(-age/halflife) makes the configured ``halflife``
+    parameter mean exactly what it says.)
+
+    Returns 1.0 (no decay) when the setup has no age yet (``age_ms <= 0``) or
+    the trigger is configured not to decay (``halflife_ms`` missing / <= 0 —
+    the pulse-style triggers already self-extinguish when velocity falls, so
+    an extra age factor would double-penalize them). ``age_ms`` is clamped at
+    >= 0 so a slightly out-of-order clock can never inflate weight above 1.
+    """
+    if halflife_ms is None or halflife_ms <= 0:
+        return 1.0
+    if age_ms <= 0:
+        return 1.0
+    return 2.0 ** (-float(age_ms) / float(halflife_ms))
+
+
+def composite_score_aged(
+    hits: list[TriggerHit],
+    weights: dict[str, float],
+    current_bar_ms: int,
+    onset_ms: dict[str, int],
+    halflife_ms: dict[str, float],
+) -> float:
+    """Age-decayed weighted composite score (roadmap §2 "time-decay factor").
+
+    Identical normalization to :func:`composite_score`: the denominator stays
+    the sum of ALL nominal trigger weights, so the surfacing-gate calibration
+    is unchanged. Only each FIRED hit's numerator contribution is multiplied
+    by its setup-age factor ``2 ** (-onset_age / halflife)``. A trigger that has
+    been continuously firing since bars ago — a mature breakout / established
+    trend, i.e. the stale-high-score late-chase setup — contributes less and
+    less the older its FIRST fire is, while a trigger firing on this bar
+    (age 0) contributes at full weight exactly as before.
+
+    ``onset_ms`` maps a fired trigger name to the bar_close_ms of the first
+    bar on which it fired (maintained by the perception layer across cycles);
+    a missing onset means it is new this bar (age 0 → no decay).
+    ``halflife_ms`` maps a trigger name to its half-life in ms; a missing or
+    <=0 entry means "never decay" for that trigger.
+    """
+    fired_hits = [h for h in hits if h.get("fired")]
+    if not fired_hits:
+        return 0
+    total_weight = sum(weights.values()) or 1
+
+    def _factor(name: str) -> float:
+        start = onset_ms.get(name)
+        if start is None:
+            return 1.0
+        return decay_factor(current_bar_ms - start, halflife_ms.get(name))
+
+    weighted_sum = 0.0
+    for h in fired_hits:
+        weighted_sum += h["score"] * weights.get(h["name"], 0) * _factor(h["name"])
+    raw = (weighted_sum / total_weight) * 10
+    return max(0, min(100, raw))
