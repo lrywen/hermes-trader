@@ -47,6 +47,7 @@ from hermes_trader.client.exchange import (
     set_leverage,
 )
 from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
+from hermes_trader.indicators.triggers import decay_factor
 
 logger = logging.getLogger(__name__)
 
@@ -157,6 +158,36 @@ _DEFAULT_SL_FLOOR_PCT = 1.0
 # limit band is operator opt-in (see place_hl_trigger_order docstring).
 _DEFAULT_SL_LIMIT_BAND_PCT = 0.0
 TP_ATR_MULT = 1.0
+
+
+# Audit 2026-09-04 P0-4: equity tier at/below which the absolute USD per-trade
+# cap (max_trade_notional_usd) stays binding as a hard floor for micro accounts.
+_NOTIONAL_CAP_TIER_EQUITY_USD = 50.0
+# Above the tier the effective cap scales with equity (1.5x) so ATR equal-risk
+# sizing can express itself instead of every trade collapsing to the fixed $30.
+_NOTIONAL_CAP_TIER_MULTIPLE = 1.5
+
+
+def _tiered_notional_cap(base_cap_usd: float, equity_usd: float) -> float:
+    """Effective per-trade notional cap, tiered by account equity.
+
+    A single absolute ``max_trade_notional_usd`` cap (e.g. $30) crushes ATR
+    equal-risk sizing on micro accounts: ``risk_pct*equity/stop_frac`` often far
+    exceeds $30, so every trade clamps to a fixed $30 and ``risk_per_trade_pct``
+    stops binding (risk granularity lost). Tiering keeps the absolute floor for
+    tiny accounts but lets the risk-based sizing breathe as equity grows:
+
+      * ``base <= 0``                      -> 0 (cap disabled)
+      * ``equity < 50``                    -> base (hard floor, e.g. $30)
+      * ``equity >= 50``                   -> max(base, equity * 1.5)
+
+    Pure function so the tier behaviour is offline-testable.
+    """
+    if base_cap_usd <= 0:
+        return 0.0
+    if equity_usd < _NOTIONAL_CAP_TIER_EQUITY_USD:
+        return base_cap_usd
+    return max(base_cap_usd, equity_usd * _NOTIONAL_CAP_TIER_MULTIPLE)
 
 
 def _shared_atr_stop_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -1053,6 +1084,181 @@ def _sizing_v2_record_shadow(rec: dict[str, Any], path: str) -> None:
         logger.warning("[sizing-v2] shadow write failed: %s", e)
 
 
+# ── AI-confidence freshness decay (roadmap §2, off / shadow / enforce) ────
+# Research conclusions, news catalysts and whale flow are at their most
+# informative minutes after they are produced; the same conviction re-routed
+# cycles later — most concretely via the debate verdict cache (TTL ~300s),
+# which hands back a stale high confidence without a fresh LLM call — is a
+# "stale high-score entry". This wrapper exponentially decays the AI
+# confidence by the age of the verdict CONTENT (first time this exact
+# verdict/side/confidence was seen for the coin): factor = 2 ** (-age/hl),
+# so a half-life-old verdict is worth half. The technical-trigger half of
+# roadmap §2 already lives in perception (composite_score_aged); this covers
+# the AI conviction that drives the confidence gate / conviction sizing.
+#
+#   off     — confidence is never touched; behaviour is byte-identical.
+#   shadow  — the decayed confidence is computed on every entry candidate and
+#             logged to a dedicated JSONL, but the analysis keeps the raw
+#             confidence. No trading behaviour changes.
+#   enforce — the analysis confidence is multiplied by the decay factor before
+#             any gate/sizer reads it (the raw value stays in
+#             ai_confidence_pre_decay for audit).
+_CONFIDENCE_DECAY_MODES = ("off", "shadow", "enforce")
+# Default verdict half-life: 15 min (900s) — same order as the breakout
+# trigger half-life and well beyond a fresh 1-3 min entry window. Tunable via
+# the confidence_decay block; calibrated from shadow data.
+_CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S = 900.0
+# Prune onset state older than 24h (defensive; cache TTL bounds the real age).
+_CONFIDENCE_DECAY_ONSET_TTL_S = 24 * 3600.0
+
+_confidence_decay_lock = threading.Lock()
+# coin -> {"sig": verdict signature, "first_ts": epoch seconds}
+_confidence_decay_onset: dict[str, dict[str, Any]] = {}
+
+
+def _reset_confidence_decay() -> None:
+    """Clear verdict-onset state (tests / explicit reset)."""
+    with _confidence_decay_lock:
+        _confidence_decay_onset.clear()
+
+
+def _confidence_decay_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the AI-confidence freshness-decay block.
+
+    Sources in priority order: env ``HERMES_CONFIDENCE_DECAY_MODE`` (gray-
+    release flip without a file write), then ``confidence_decay.mode`` in the
+    merged agent config. Invalid values fall back to off (safe default).
+    """
+    blk = config.get("confidence_decay") or {}
+    mode = str(blk.get("mode") or "").strip().lower()
+    env_mode = str(os.environ.get("HERMES_CONFIDENCE_DECAY_MODE") or "").strip().lower()
+    if env_mode:
+        mode = env_mode
+    if mode not in _CONFIDENCE_DECAY_MODES:
+        mode = "off"
+    try:
+        halflife_s = max(0.0, float(blk.get("halflife_s", _CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S)))
+    except (TypeError, ValueError):
+        halflife_s = _CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S
+    return {"mode": mode, "halflife_s": halflife_s, "block": blk}
+
+
+def _verdict_signature(analysis: dict[str, Any]) -> str:
+    """Content signature of the AI verdict whose age we track.
+
+    Keys on verdict + side + rounded confidence: the debate cache returns the
+    same verdict tuple on a hit (genuinely stale), while a fresh LLM call that
+    changed its mind or its confidence produces a new signature and thus
+    restarts age at 0. News/whale catalysts feed the LLM prompt, so a changed
+    catalyst moves the confidence/verdict and naturally resets the clock.
+    """
+    verdict = str(analysis.get("verdict") or "").upper()
+    side = str(analysis.get("side") or "").lower()
+    try:
+        conf = round(float(analysis.get("confidence", 0) or 0), 2)
+    except (TypeError, ValueError):
+        conf = 0.0
+    return f"{verdict}|{side}|{conf:.2f}"
+
+
+def _confidence_decay_age_s(coin: str, sig: str, now: float) -> float:
+    """Return the age in seconds of this (coin, verdict-signature) content.
+
+    First sighting (or a changed signature) stamps the current time → age 0.
+    """
+    with _confidence_decay_lock:
+        # Defensive prune of ancient entries (long gap / restart).
+        stale = [c for c, v in _confidence_decay_onset.items()
+                 if (now - float(v.get("first_ts", now))) > _CONFIDENCE_DECAY_ONSET_TTL_S]
+        for c in stale:
+            del _confidence_decay_onset[c]
+        entry = _confidence_decay_onset.get(coin)
+        if entry is None or entry.get("sig") != sig:
+            _confidence_decay_onset[coin] = {"sig": sig, "first_ts": now}
+            return 0.0
+        return max(0.0, now - float(entry["first_ts"]))
+
+
+def _confidence_decay_shadow_path(blk: dict[str, Any]) -> str:
+    """Resolve the confidence-decay shadow JSONL path (config → env → default)."""
+    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_CONFIDENCE_DECAY_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/confidence_decay_shadow.jsonl"),
+    )
+
+
+def _confidence_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
+    """Best-effort append a confidence-decay shadow record to the JSONL."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("[confidence-decay] shadow write failed: %s", e)
+
+
+def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) -> None:
+    """Apply the AI-confidence freshness decay in place (roadmap §2).
+
+    Mutates ``analysis["confidence"]`` only in enforce mode; shadow mode only
+    observes and writes the JSONL. Structural-override (PASS → LONG) verdicts
+    are skipped: those entries are driven by live technical/whale structure
+    (already covered by the perception trigger age-decay), not by the AI's
+    conviction, so decaying them would launder nothing but could block a
+    fresh structural setup. Only the model's own directional LONG/SHORT
+    convictions are aged.
+    """
+    cfg = _confidence_decay_config(config)
+    mode = cfg["mode"]
+    if mode == "off":
+        return
+    verdict = str(analysis.get("verdict") or "").upper()
+    if verdict not in ("LONG", "SHORT"):
+        return
+    coin = str(analysis.get("coin") or "")
+    raw = float(analysis.get("confidence", 0) or 0)
+    sig = _verdict_signature(analysis)
+    age_s = _confidence_decay_age_s(coin, sig, time.time())
+    factor = decay_factor(age_s * 1000.0, cfg["halflife_s"] * 1000.0)
+    decayed = raw * factor
+    # Confidence gate threshold for the counterfactual "would this entry have
+    # been blocked?" tag (aligned with risk_gates' min_ai_confidence read).
+    try:
+        min_conf = float(config.get("min_ai_confidence", 0.70) or 0.70)
+    except (TypeError, ValueError):
+        min_conf = 0.70
+    if mode == "enforce":
+        # Keep the pre-decay conviction for audit; override/runner code that
+        # wants the model's raw opinion reads ai_confidence_raw (set later by
+        # the override path on its own terms).
+        analysis["ai_confidence_pre_decay"] = raw
+        analysis["confidence_decay"] = {
+            "age_s": round(age_s, 1), "halflife_s": round(cfg["halflife_s"], 1),
+            "factor": round(factor, 4),
+        }
+        analysis["confidence"] = decayed
+    try:
+        _confidence_decay_record_shadow({
+            "ts": int(time.time() * 1000),
+            "mode": mode,
+            "coin": coin,
+            "verdict": verdict,
+            "side": str(analysis.get("side") or "").lower(),
+            "confidence_raw": round(raw, 4),
+            "confidence_decayed": round(decayed, 4),
+            "age_s": round(age_s, 1),
+            "halflife_s": round(cfg["halflife_s"], 1),
+            "decay_factor": round(factor, 4),
+            "min_confidence": round(min_conf, 4),
+            "would_block_gate": bool(raw >= min_conf and decayed < min_conf),
+            "debate_used": bool(analysis.get("debate_used", False)),
+        }, _confidence_decay_shadow_path(cfg["block"]))
+    except Exception as e:
+        logger.debug(f"[confidence-decay] shadow record failed for {coin}: {e}")
+
+
 # Plan B regime-strength score uses the same 5-component weights as
 # market_regime.REGIME_WEIGHTS (byte-aligned with
 # scripts/backtest_ab_compare._regime_score). Imported above — do not
@@ -1593,6 +1799,13 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         }
     shadow_mode = mode == "SHADOW"
 
+    # Roadmap §2: freshness-decay the AI confidence before any gate/sizer
+    # reads it. Off by default; shadow observes + logs, enforce multiplies.
+    # Runs while verdict is still the model's own LONG/SHORT — a PASS that the
+    # structural override below upgrades to LONG is skipped inside the helper,
+    # so override entries keep their configured floor semantics.
+    _apply_confidence_decay(analysis, config)
+
     # Asset-class gate. Mirrors the perception-time filter so a stale
     # perception (e.g. one re-evaluated from memory after the operator
     # flips the flag) can't sneak through to a real trade. Crypto =
@@ -2077,17 +2290,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     _coin_max_lev = get_max_leverage(analysis["coin"])
     leverage = min(int(config.get("leverage", HL_LEVERAGE)), _coin_max_lev)
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
-    # Audit 2026-09-04 P0-4: a single absolute USD `max_trade_notional_usd`
-    # cap crushes ATR equal-risk sizing on micro accounts — risk_pct*equity/
-    # stop_frac often far exceeds $30, so every trade collapses to a fixed
-    # $30 and risk_per_trade_pct stops binding (risk granularity lost). Tier
-    # the effective cap by equity: keep the absolute floor for tiny accounts,
-    # but let the risk-based sizing express itself as equity grows.
-    #   equity < 50        -> cap = base (hard floor, e.g. $30)
-    #   50 <= equity < 200 -> cap = max(base, equity * 1.5)
-    #   equity >= 200      -> cap = max(base, equity * 1.5)
-    if _notional_cap > 0 and agg_equity >= 50.0:
-        _notional_cap = max(_notional_cap, agg_equity * 1.5)
+    # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
+    # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
+    # every trade a fixed $30 and losing risk granularity. Tier the effective
+    # cap by equity (see _tiered_notional_cap): hard $30 floor below $50 equity,
+    # then scale with equity so risk_per_trade_pct binds again.
+    _notional_cap = _tiered_notional_cap(_notional_cap, agg_equity)
     _atr_sizing = config.get("atr_risk_sizing", {}) or {}
     _atr_sizing_enabled = bool(_atr_sizing.get("enabled", False))
     mid_price = 0.0
