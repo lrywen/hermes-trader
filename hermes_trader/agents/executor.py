@@ -720,6 +720,7 @@ def compute_effective_stop_pct(
     atr_pct: float,
     avg_exit_slip_pct: float = 0.0,
     atr_hist_mean_pct: float = 0.0,
+    atr_spike_enabled: bool = True,
 ) -> dict[str, Any]:
     """Replicate the DSL's three-layer effective-stop calculation at SIZING time.
 
@@ -738,7 +739,10 @@ def compute_effective_stop_pct(
     Sizing-only adjustments (NOT applied to the live DSL stop — they only size
     the position more conservatively; the DSL retains its real stop):
       * ATR spike breaker: if atr_pct > 2x atr_hist_mean_pct, tighten the stop
-        used for sizing by 30% (size smaller in pinball conditions).
+        used for sizing by 30% (size smaller in pinball conditions). Disabled
+        by ``atr_spike_enabled=False`` — when the §1 ATR-regime calibration is
+        in enforce mode the continuous regime factor supersedes this binary
+        clamp, so the two are never stacked.
       * Slippage compensation: add the 30d mean adverse exit slip so a widened
         stop budget absorbs the observed gap-through overrun.
 
@@ -765,9 +769,15 @@ def compute_effective_stop_pct(
 
     # Sizing-only ATR-spike breaker: tighten by 30% when current ATR is more
     # than 2x its recent mean. We size smaller (tighter stop = smaller
-    # notional) rather than moving the actual DSL stop.
+    # notional) rather than moving the actual DSL stop. Suppressed when the
+    # §1 ATR-regime calibration is enforcing (its continuous factor replaces
+    # this binary clamp).
     atr_spike = False
-    if atr_hist_mean_pct > 0 and atr_pct > 2.0 * atr_hist_mean_pct:
+    if (
+        atr_spike_enabled
+        and atr_hist_mean_pct > 0
+        and atr_pct > 2.0 * atr_hist_mean_pct
+    ):
         atr_spike = True
         effective = effective * 0.70
 
@@ -844,6 +854,139 @@ def get_atr_hist_mean_pct(coin: str, interval: str = "4h", lookback_candles: int
         logger.warning(f"[sizing] atr_hist_mean unavailable for {coin}: {e}")
         return 0.0
 
+
+# ── ATR regime calibration (roadmap §1) ─────────────────────────────────────
+# The legacy ATR-spike breaker is a binary, implicit clamp (current ATR > 2x
+# mean → tighten the sizing stop by 30%). This replaces/augments it with an
+# explicit three-regime mapping of (current ATR% / mean ATR%) → sizing stop
+# width factor, resolved by a pure function in agents.sizing. It is a
+# SIZING-ONLY adjustment on the same layer as the spike/slip tweaks: it scales
+# the stop budget used to divide risk into notional, never the byte-aligned
+# core_stop, so the live DSL stop and the post-fill 5% drift assertion are
+# untouched. The pure mapping + safe defaults live in agents.sizing; the
+# config block / shadow JSONL wiring here mirrors the §2 signal_age_decay
+# pattern (self-contained: module defaults + config.get block + env override;
+# canonical CANONICAL_DEFAULTS/schema/metrics registration is a follow-up once
+# the parallel config refactor lands).
+#
+# Modes:
+#   off     — behavior identical to before this change; the legacy binary
+#             spike breaker still applies (default).
+#   shadow  — the calibrated factor is computed and logged to a dedicated
+#             JSONL (raw vs calibrated width + would_change) but the sizing
+#             stop stays raw; the legacy spike breaker still applies.
+#   enforce — the calibrated factor is applied; the legacy binary spike
+#             breaker is suppressed (the continuous regime factor supersedes
+#             it). The shadow JSONL records the applied values.
+_ATR_CALIB_MODES = ("off", "shadow", "enforce")
+
+
+def _atr_calib_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the atr_regime_calibration block: merged agent-config, then an
+    env override for the mode (gray-release flip without a file write).
+    Invalid modes fall back to off."""
+    blk = config.get("atr_regime_calibration") or {}
+    mode = str(blk.get("mode") or "").strip().lower()
+    env_mode = str(os.environ.get("HERMES_ATR_REGIME_CALIB_MODE") or "").strip().lower()
+    if env_mode:
+        mode = env_mode
+    if mode not in _ATR_CALIB_MODES:
+        mode = "off"
+    return {"mode": mode, "block": blk}
+
+
+def _atr_calib_shadow_path(blk: dict[str, Any]) -> str:
+    """Resolve the ATR calibration shadow JSONL path (config → env → default)."""
+    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_ATR_REGIME_CALIB_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/atr_regime_calib_shadow.jsonl"),
+    )
+
+
+def _atr_calib_record_shadow(rec: dict[str, Any], path: str) -> None:
+    """Best-effort append an ATR calibration record to the JSONL."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("[atr-calib] shadow write failed: %s", e)
+
+
+def _atr_calib_apply(
+    *,
+    effective_stop_pct: float,
+    atr_pct: float,
+    atr_hist_mean_pct: float,
+    config: dict[str, Any],
+    coin: str,
+    core_stop: float,
+    regime_label: str,
+) -> dict[str, Any]:
+    """Apply (enforce) or observe (shadow) the ATR-regime stop-width factor.
+
+    Sizing-only: ``effective_stop_pct`` already excludes core_stop alignment.
+    Returns the adjusted effective stop pct plus a breakdown (regime/ratio/
+    factor/raw/calibrated). In off mode this is a pure pass-through and never
+    touches the JSONL; in shadow/enforce the calibrated width is logged; only
+    enforce actually changes the returned stop pct.
+    """
+    raw = float(effective_stop_pct)
+    cfg = _atr_calib_config(config)
+    mode = cfg["mode"]
+    if mode == "off":
+        return {
+            "mode": mode,
+            "regime": "normal",
+            "ratio": 0.0,
+            "factor": 1.0,
+            "raw_stop_pct": raw,
+            "calibrated_stop_pct": raw,
+            "would_change": False,
+            "effective_stop_pct": raw,
+        }
+
+    from hermes_trader.agents.sizing import atr_regime_calibration
+
+    cal = atr_regime_calibration(
+        atr_pct=atr_pct,
+        atr_hist_mean_pct=atr_hist_mean_pct,
+        params=cfg["block"],
+    )
+    factor = float(cal["factor"])
+    calibrated = raw * factor
+    would_change = abs(factor - 1.0) > 1e-9
+    try:
+        _atr_calib_record_shadow({
+            "ts": int(time.time() * 1000),
+            "mode": mode,
+            "coin": coin,
+            "atr_pct": round(float(atr_pct), 4),
+            "atr_hist_mean_pct": round(float(atr_hist_mean_pct), 4),
+            "ratio": round(float(cal["ratio"]), 4),
+            "vol_regime": cal["regime"],
+            "factor": round(factor, 4),
+            "core_stop_pct": round(float(core_stop), 4),
+            "trend_regime": str(regime_label),
+            "raw_stop_pct": round(raw, 4),
+            "calibrated_stop_pct": round(calibrated, 4),
+            "would_change": bool(would_change),
+        }, _atr_calib_shadow_path(cfg["block"]))
+    except Exception as e:
+        logger.debug(f"[atr-calib] shadow record failed for {coin}: {e}")
+
+    return {
+        "mode": mode,
+        "regime": cal["regime"],
+        "ratio": float(cal["ratio"]),
+        "factor": factor,
+        "raw_stop_pct": raw,
+        "calibrated_stop_pct": calibrated,
+        "would_change": would_change,
+        "effective_stop_pct": calibrated if mode == "enforce" else raw,
+    }
 
 
 # Plan B regime-strength score uses the same 5-component weights as
@@ -1921,18 +2064,39 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 _slip_bps = memory.avg_exit_slip_bps(coin, days=30.0)
                 _slip_pct = _slip_bps / 100.0
                 _atr_mean_pct = get_atr_hist_mean_pct(coin, "4h", 180)
+                # §1 ATR-regime calibration (default off; see _atr_calib_*).
+                # In enforce mode the continuous regime factor supersedes the
+                # legacy binary spike breaker, so suppress the latter to avoid
+                # double-scaling. Shadow/off keep the legacy breaker.
+                _calib_cfg = _atr_calib_config(config)
+                _calib_enforce = _calib_cfg["mode"] == "enforce"
                 _eff = compute_effective_stop_pct(
                     _dsl, _regime, leverage, _atr_pct,
                     avg_exit_slip_pct=_slip_pct,
                     atr_hist_mean_pct=_atr_mean_pct,
+                    atr_spike_enabled=not _calib_enforce,
                 )
-                _stop_pct = float(_eff["effective_stop_pct"])
+                # Sizing-only regime factor: observe (shadow) or apply (enforce).
+                # Never touches core_stop, so the post-fill drift assertion is
+                # unaffected.
+                _calib = _atr_calib_apply(
+                    effective_stop_pct=float(_eff["effective_stop_pct"]),
+                    atr_pct=_atr_pct,
+                    atr_hist_mean_pct=_atr_mean_pct,
+                    config=config,
+                    coin=coin,
+                    core_stop=float(_eff["core_stop"]),
+                    regime_label=str(_eff["regime_label"]),
+                )
+                _eff["atr_calib"] = _calib
+                _stop_pct = float(_calib["effective_stop_pct"])
                 _stop_frac = _stop_pct / 100.0
                 logger.info(
                     f"[sizing-v2] {coin} regime={_regime}({_eff['regime_label']}) "
                     f"atr_pct={_atr_pct:.3f} mean={_atr_mean_pct:.3f} "
                     f"spot_cap={_eff['spot_cap']:.3f} roe_cap={_eff['roe_cap']:.3f} "
                     f"slip+={_eff['slip_adj_pct']:.3f}% spike={_eff['atr_spike']} "
+                    f"calib={_calib['mode']}:{_calib['regime']}x{_calib['factor']:.3f} "
                     f"→ effective_stop={_stop_pct:.3f}%")
             else:
                 _max_loss = float(_dsl.get("max_loss_pct", 0.4) or 0.4)

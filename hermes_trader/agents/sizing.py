@@ -119,3 +119,80 @@ def risk_of_ruin(
     base = (1.0 - a) / (1.0 + a)
     ror = base ** units_to_ruin
     return max(0.0, min(1.0, ror))
+
+
+# ── ATR regime calibration (roadmap §1) ──────────────────────────────────────
+# The absolute ATR clamp (atr_pct * mult between floor/ceiling) scales stop
+# width with a coin's absolute volatility but cannot see whether that coin is
+# CALMER or WILDER than its own recent self. This factor compares current ATR%
+# to the ~30d mean ATR% and maps the ratio to three volatility regimes:
+#   low    — current ATR far below its mean: a wider stop is wasted (the coin
+#            rarely moves that far), so the sizing budget tightens (<1.0).
+#   normal — within a neutral band: factor 1.0, no change.
+#   high   — current ATR far above its mean: noise/stop-out risk is elevated,
+#            so the sizing budget widens (>1.0).
+# Under equal-dollar-risk sizing the notional = risk_usd / stop_frac, so a
+# wider budget (factor >1) sizes SMALLER and a tighter budget (<1) sizes
+# LARGER — this is a sizing-only multiplier (the live DSL stop is untouched),
+# applied on the same layer as the slippage adjustment, so it never touches
+# the byte-aligned core_stop used by the post-fill drift assertion.
+ATR_REGIME_DEFAULTS: dict[str, float] = {
+    "low_ratio": 0.6,          # ratio <= 0.6 of the mean → low-vol regime
+    "high_ratio": 1.6,         # ratio >= 1.6 of the mean → high-vol regime
+    "low_mult": 0.85,          # tighten sizing stop budget by 15% in low vol
+    "high_mult": 1.20,         # widen sizing stop budget by 20% in high vol
+    "min_mult": 0.75,          # safety clamp on any configured multiplier
+    "max_mult": 1.35,
+}
+
+
+def atr_regime_calibration(
+    *,
+    atr_pct: float,
+    atr_hist_mean_pct: float,
+    params: dict | None = None,
+) -> dict:
+    """Map (current ATR%, historical mean ATR%) to a sizing stop-width factor.
+
+    Returns a dict with the regime label ("low"/"normal"/"high"), the raw
+    ratio, and the multiplier to apply to the sizing stop budget. Returns
+    factor 1.0 / regime "normal" whenever there is no usable baseline
+    (mean <= 0 or atr <= 0) so the caller behaves exactly as without
+    calibration. Multipliers are hard-clamped to [min_mult, max_mult] and
+    the thresholds must form a valid positive band (low_ratio > 0 and
+    low_ratio < high_ratio, otherwise the regime resolves neutral); any
+    invalid parameter falls back to ``ATR_REGIME_DEFAULTS`` rather than
+    raising.
+    """
+    p = dict(ATR_REGIME_DEFAULTS)
+    if params:
+        for k in ATR_REGIME_DEFAULTS:
+            try:
+                v = params.get(k)
+                if v is not None:
+                    p[k] = float(v)
+            except (TypeError, ValueError):
+                pass
+    min_m, max_m = p["min_mult"], p["max_mult"]
+    if min_m > max_m:
+        min_m, max_m = max_m, min_m
+
+    def clamp(m: float) -> float:
+        return max(min_m, min(max_m, float(m)))
+
+    # No baseline / degenerate thresholds (non-positive or inverted band) →
+    # neutral. The band should straddle 1.0 (current == mean is "normal").
+    thresholds_ok = (
+        p["low_ratio"] > 0
+        and p["high_ratio"] > 0
+        and p["low_ratio"] < p["high_ratio"]
+    )
+    if atr_hist_mean_pct <= 0 or atr_pct <= 0 or not thresholds_ok:
+        return {"regime": "normal", "ratio": 0.0, "factor": 1.0}
+
+    ratio = atr_pct / atr_hist_mean_pct
+    if ratio <= p["low_ratio"]:
+        return {"regime": "low", "ratio": ratio, "factor": clamp(p["low_mult"])}
+    if ratio >= p["high_ratio"]:
+        return {"regime": "high", "ratio": ratio, "factor": clamp(p["high_mult"])}
+    return {"regime": "normal", "ratio": ratio, "factor": 1.0}
