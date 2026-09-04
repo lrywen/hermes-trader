@@ -989,6 +989,70 @@ def _atr_calib_apply(
     }
 
 
+# ── Sizing v2 gray-release (off / shadow / enforce) ─────────────────────
+# Sizing v2 mirrors the DSL three-layer stop (regime → ATR clamp → ROE/lev
+# cap) for equal-risk notional, replacing the legacy top-level max_loss_pct
+# assumption that under-risks trades 2.5-5x. Historically a pure boolean
+# (atr_risk_sizing.sizing_v2_enabled, on = enforce immediately), with no
+# code-level observe-only path. This wrapper adds the standard three-state
+# gray release, defaulting off and matching existing behavior exactly:
+#
+#   off     — v2 math never runs; sizing uses the legacy stop width. The
+#             legacy sizing_v2_enabled=true still flips to enforce (env
+#             override and the boolean both count as "on" below).
+#   shadow  — v2 math runs on every primary_stop sizing and is logged to a
+#             dedicated JSONL (v1 vs v2 stop width + notional, plus the ATR
+#             calibration observation), but the order keeps sizing on the
+#             legacy v1 width. No trading behavior changes.
+#   enforce — v2 width/notional are applied (equivalent to the legacy
+#             sizing_v2_enabled=true behavior).
+_SIZING_V2_MODES = ("off", "shadow", "enforce")
+
+
+def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the sizing v2 gray-release mode.
+
+    Sources in priority order: env ``HERMES_SIZING_V2_MODE`` (gray-release
+    flip without a file write), then ``atr_risk_sizing.sizing_v2_mode`` in
+    the merged agent config, then the legacy boolean
+    ``atr_risk_sizing.sizing_v2_enabled`` (true → enforce, for backward
+    compatibility). Invalid values fall back to off."""
+    blk = config.get("atr_risk_sizing") or {}
+    mode = ""
+    env_mode = str(os.environ.get("HERMES_SIZING_V2_MODE") or "").strip().lower()
+    if env_mode:
+        mode = env_mode
+    else:
+        blk_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
+        if blk_mode:
+            mode = blk_mode
+        elif bool(blk.get("sizing_v2_enabled", False)):
+            mode = "enforce"
+    if mode not in _SIZING_V2_MODES:
+        mode = "off"
+    return {"mode": mode, "block": blk}
+
+
+def _sizing_v2_shadow_path(blk: dict[str, Any]) -> str:
+    """Resolve the sizing v2 shadow JSONL path (config → env → default)."""
+    return str(blk.get("sizing_v2_shadow_log_path") or "").strip() or os.environ.get(
+        "HERMES_SIZING_V2_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/sizing_v2_shadow.jsonl"),
+    )
+
+
+def _sizing_v2_record_shadow(rec: dict[str, Any], path: str) -> None:
+    """Best-effort append a sizing v2 shadow record to the JSONL."""
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        logger.warning("[sizing-v2] shadow write failed: %s", e)
+
+
 # Plan B regime-strength score uses the same 5-component weights as
 # market_regime.REGIME_WEIGHTS (byte-aligned with
 # scripts/backtest_ab_compare._regime_score). Imported above — do not
@@ -2013,6 +2077,17 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     _coin_max_lev = get_max_leverage(analysis["coin"])
     leverage = min(int(config.get("leverage", HL_LEVERAGE)), _coin_max_lev)
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
+    # Audit 2026-09-04 P0-4: a single absolute USD `max_trade_notional_usd`
+    # cap crushes ATR equal-risk sizing on micro accounts — risk_pct*equity/
+    # stop_frac often far exceeds $30, so every trade collapses to a fixed
+    # $30 and risk_per_trade_pct stops binding (risk granularity lost). Tier
+    # the effective cap by equity: keep the absolute floor for tiny accounts,
+    # but let the risk-based sizing express itself as equity grows.
+    #   equity < 50        -> cap = base (hard floor, e.g. $30)
+    #   50 <= equity < 200 -> cap = max(base, equity * 1.5)
+    #   equity >= 200      -> cap = max(base, equity * 1.5)
+    if _notional_cap > 0 and agg_equity >= 50.0:
+        _notional_cap = max(_notional_cap, agg_equity * 1.5)
     _atr_sizing = config.get("atr_risk_sizing", {}) or {}
     _atr_sizing_enabled = bool(_atr_sizing.get("enabled", False))
     mid_price = 0.0
@@ -2042,14 +2117,25 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         _sizing_basis = str(_atr_sizing.get("sizing_basis", "atr_stop") or "atr_stop").lower()
         if _sizing_basis in ("primary_stop", "dsl_stop"):
             _dsl = config.get("dsl_exit", {}) or {}
+            # Legacy v1 stop width: top-level max_loss_pct/max_loss_roe
+            # (2.5%/25 at 10x → 2.5% stop). Computed up front so v2 shadow can
+            # log the v1-vs-v2 comparison while still sizing on v1.
+            _max_loss = float(_dsl.get("max_loss_pct", 0.4) or 0.4)
+            _max_roe = float(_dsl.get("max_loss_roe_pct", 5.0) or 5.0)
+            _lev = max(1, leverage)
+            _v1_stop_frac = min(_max_loss, _max_roe / _lev) / 100.0
+            _stop_frac = _v1_stop_frac
             # ── Sizing v2: regime-aware + full DSL three-layer stop ───────
-            # The legacy path read the top-level max_loss_pct/max_loss_roe
-            # (2.5%/25 at 10x → 2.5% stop) while the DSL actually applied a
-            # regime+atr_stop+ROE clamp (0.5% scalp / 1.0% trend), under-risking
-            # every trade 2.5-5x. When sizing_v2_enabled is true we mirror the
-            # DSL math exactly, plus ATR-spike and slippage adjustments, behind
-            # a gray-release cap.
-            _sizing_v2 = bool(_atr_sizing.get("sizing_v2_enabled", False))
+            # The legacy path under-risks every trade 2.5-5x (it assumes the
+            # 2.5% top-level stop while the DSL actually applies a
+            # regime+atr_stop+ROE clamp: 0.5% scalp / 1.0% trend). v2 mirrors
+            # the DSL math exactly, plus ATR-spike/slippage adjustments and
+            # the §1 ATR-regime calibration. Gray-released via three states
+            # (see _sizing_v2_config): off (default, v1 sizing), shadow
+            # (compute + log v1-vs-v2, keep sizing on v1), enforce (apply).
+            _sv2 = _sizing_v2_config(config)
+            _sizing_v2_mode = _sv2["mode"]
+            _sizing_v2 = _sizing_v2_mode in ("shadow", "enforce")
             if _sizing_v2:
                 # Regime is cached by detect_regime (market_regime_gate also
                 # populates it later, but sizing runs first; the call is a safe
@@ -2089,20 +2175,52 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     regime_label=str(_eff["regime_label"]),
                 )
                 _eff["atr_calib"] = _calib
-                _stop_pct = float(_calib["effective_stop_pct"])
-                _stop_frac = _stop_pct / 100.0
+                _v2_stop_pct = float(_calib["effective_stop_pct"])
                 logger.info(
-                    f"[sizing-v2] {coin} regime={_regime}({_eff['regime_label']}) "
+                    f"[sizing-v2:{_sizing_v2_mode}] {coin} regime={_regime}({_eff['regime_label']}) "
                     f"atr_pct={_atr_pct:.3f} mean={_atr_mean_pct:.3f} "
                     f"spot_cap={_eff['spot_cap']:.3f} roe_cap={_eff['roe_cap']:.3f} "
                     f"slip+={_eff['slip_adj_pct']:.3f}% spike={_eff['atr_spike']} "
                     f"calib={_calib['mode']}:{_calib['regime']}x{_calib['factor']:.3f} "
-                    f"→ effective_stop={_stop_pct:.3f}%")
-            else:
-                _max_loss = float(_dsl.get("max_loss_pct", 0.4) or 0.4)
-                _max_roe = float(_dsl.get("max_loss_roe_pct", 5.0) or 5.0)
-                _lev = max(1, leverage)
-                _stop_frac = min(_max_loss, _max_roe / _lev) / 100.0
+                    f"→ effective_stop={_v2_stop_pct:.3f}% (v1={_v1_stop_frac*100:.3f}%)")
+                if _sizing_v2_mode == "enforce":
+                    _stop_frac = _v2_stop_pct / 100.0
+                    analysis["_sizing_v2_stop_pct"] = _v2_stop_pct
+                    analysis["_sizing_v2_breakdown"] = _eff
+                else:
+                    # Shadow: record the v1-vs-v2 comparison (width + notional)
+                    # but keep sizing on the legacy v1 width. Best-effort.
+                    try:
+                        _v2_notional = ((_risk_pct * agg_equity) / (_v2_stop_pct / 100.0)
+                                        if _v2_stop_pct > 0 else 0.0)
+                        _v1_notional = ((_risk_pct * agg_equity) / _v1_stop_frac
+                                        if _v1_stop_frac > 0 else 0.0)
+                        _sizing_v2_record_shadow({
+                            "ts": int(time.time() * 1000),
+                            "mode": _sizing_v2_mode,
+                            "coin": coin,
+                            "regime": str(_regime),
+                            "trend_regime": str(_eff["regime_label"]),
+                            "leverage": int(leverage),
+                            "equity": round(float(agg_equity), 2),
+                            "risk_per_trade_pct": round(float(_risk_pct), 5),
+                            "v1_stop_pct": round(_v1_stop_frac * 100.0, 4),
+                            "v2_stop_pct": round(_v2_stop_pct, 4),
+                            "v2_core_stop_pct": round(float(_eff["core_stop"]), 4),
+                            "v1_notional_usd": round(_v1_notional, 2),
+                            "v2_notional_usd": round(_v2_notional, 2),
+                            "notional_ratio": round(_v2_notional / _v1_notional, 4)
+                                            if _v1_notional > 0 else 0.0,
+                            "atr_pct": round(_atr_pct, 4),
+                            "atr_hist_mean_pct": round(_atr_mean_pct, 4),
+                            "atr_spike": bool(_eff["atr_spike"]),
+                            "slip_adj_pct": round(float(_eff["slip_adj_pct"]), 4),
+                            "atr_calib_mode": _calib["mode"],
+                            "atr_calib_regime": _calib["regime"],
+                            "atr_calib_factor": round(float(_calib["factor"]), 4),
+                        }, _sizing_v2_shadow_path(_sv2["block"]))
+                    except Exception as _se:
+                        logger.debug(f"[sizing-v2] shadow record failed for {coin}: {_se}")
             if agg_equity <= 0 or _risk_pct <= 0 or _stop_frac <= 0:
                 return {
                     "executed": False, "mode": mode, "analysis_id": analysis["id"],
@@ -2119,8 +2237,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 trade_notional = _cap
                 _clamped.append("notional_cap")
             # Gray-release cap: sizing_v2_cap_pct (0-1) scales the v2 notional
-            # so the fix can roll out at 10%/20% before full size.
-            if _sizing_v2:
+            # so the fix can roll out at 10%/20% before full size. Enforce only
+            # — shadow keeps the unmodified v1 notional for a clean comparison.
+            if _sizing_v2_mode == "enforce":
                 _v2_cap_pct = float(_atr_sizing.get("sizing_v2_cap_pct", 1.0) or 1.0)
                 _v2_cap_pct = min(1.0, max(0.0, _v2_cap_pct))
                 if _v2_cap_pct < 1.0:
@@ -2134,11 +2253,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 _record_sizing_clamped(
                     "gray_pct" if _c.startswith("gray_") else _c
                 )
-            # Stash the v2 stop breakdown for the post-fill 5% drift assertion
-            # (compared against the DSL registration's actual effective stop).
-            if _sizing_v2:
-                analysis["_sizing_v2_stop_pct"] = _stop_pct
-                analysis["_sizing_v2_breakdown"] = _eff
+            # Note: the v2 stop breakdown for the post-fill 5% drift assertion
+            # is stashed in the enforce branch above (shadow must not stash it:
+            # the assertion compares the actually-applied stop).
         else:
             _sz = atr_equal_risk_notional(
                 equity=agg_equity,
