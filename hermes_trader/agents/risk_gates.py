@@ -65,6 +65,13 @@ class GateContext:
     entry_px: float = 0.0
     leverage: float = 0.0
     stop_distance_pct: float = 0.0
+    # S3 (RCA FARTCOIN 2026-08-26, observation 2): provenance of the research
+    # verdict — True only when the native multi-LLM debate (bull/bear/synth)
+    # produced it; False for a single-LLM fallback verdict and for manual
+    # orders (which have no research verdict). debate_gate reads this so a
+    # fallback verdict is never mislabelled "debate_consensus" in the gate
+    # result / execute event. Observability only — it never changes pass/fail.
+    debate_used: bool = False
 
     def __post_init__(self) -> None:
         def _num(v: Any) -> float:
@@ -102,6 +109,8 @@ class GateContext:
         # Same gate-bypass role as slow_burn_fired; orthogonal signal.
         self.whale_signal_fired = bool(self.whale_signal_fired)
         self.has_binary_news_risk = bool(self.has_binary_news_risk)
+        # S3: coerce research-verdict provenance to a strict bool.
+        self.debate_used = bool(self.debate_used)
         # The headline + matched term that tripped the binary-news gate, for
         # log visibility ("which article blocked this?").
         self.binary_news_match = str(self.binary_news_match or "")
@@ -918,9 +927,17 @@ def debate_gate(
     agreement_ratio = agree_count / len(analyst_votes)
 
     if agreement_ratio >= min_agreement and agree_count >= min_agree_count:
+        # S3 (RCA FARTCOIN 2026-08-26, observation 2): tag the provenance of
+        # the verdict this gate is vetting. "debate_consensus" only when the
+        # native multi-LLM debate actually produced the research verdict; a
+        # single-LLM fallback verdict (debate disabled, bull/bear failed, or
+        # synth failed/empty) that still clears the analyst vote is tagged
+        # "single_fallback", so the gate result / execute event never claims a
+        # debate consensus that did not happen. Pass/fail logic is unchanged —
+        # this is the via-tag observability fix only.
         return {
             "pass": True,
-            "via": "debate_consensus",
+            "via": "debate_consensus" if ctx.debate_used else "single_fallback",
             "agree_count": agree_count,
             "total_analysts": len(analyst_votes),
             "agreement_ratio": agreement_ratio,

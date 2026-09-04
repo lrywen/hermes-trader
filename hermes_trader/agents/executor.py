@@ -2187,6 +2187,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         entry_px=mid_price if mid_price > 0 else 0.0,
         leverage=float(leverage),
         stop_distance_pct=_h4_stop_distance_pct,
+        # S3 (RCA observation 2): carry research-verdict provenance so the
+        # debate gate tags a single-LLM fallback verdict "single_fallback"
+        # instead of mislabelling it "debate_consensus". Observability only.
+        debate_used=bool(analysis.get("debate_used", False)),
     )
     # H3: an armed whale_regime_bypass is about to be consulted with a live
     # whale signal (it changes the counter-regime gate input) — audit it.
