@@ -16,7 +16,7 @@ long / short / all separately.
 
 Only signals replayable from candles alone are evaluated. Whale/news/LLM
 verdicts are not reproducible offline — their PF census is the S2 phase
-(logged-verdict replay, e.g. strategy_grid_search.py).
+(logged-verdict replay; see scripts/signal_pf_census.py).
 
 Matching convention (no look-ahead): a signal is evaluated on bars [:i+1]
 (bar i is the last CLOSED bar); entry fills at bar i+1 OPEN; exit at bar
@@ -184,6 +184,17 @@ def _breakout_side(hit: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def _momentum_burst_side(hit: Dict[str, Any]) -> Optional[str]:
+    """momentum_burst() reason is '... bars up' / '... bars down'."""
+    tokens = str(hit.get("reason", "")).strip().split()
+    direction = tokens[-1] if tokens else ""
+    if direction == "up":
+        return "long"
+    if direction == "down":
+        return "short"
+    return None
+
+
 @dataclass
 class SignalSpec:
     source: str
@@ -206,6 +217,8 @@ SIGNAL_SPECS: List[SignalSpec] = [
     SignalSpec("bullish_reversal", tg.bullish_reversal_candle, lambda h: "long" if h.get("fired") else None),
     SignalSpec("bearish_reversal", tg.bearish_reversal_candle, lambda h: "short" if h.get("fired") else None),
     SignalSpec("breakout", tg.breakout, lambda h: _breakout_side(h) if h.get("fired") else None),
+    SignalSpec("momentum_burst", tg.momentum_burst,
+               lambda h: _momentum_burst_side(h) if h.get("fired") else None),
     SignalSpec("trend_flip_1h", tg.trend_flip_1h, lambda h: "long" if h.get("fired") else None),
     SignalSpec("higher_lows_1h", tg.higher_lows_1h, lambda h: "long" if h.get("fired") else None),
     SignalSpec("momentum_continuation_1h", tg.momentum_continuation_1h,
