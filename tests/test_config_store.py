@@ -40,16 +40,18 @@ def test_canonical_defaults_contain_all_production_keys():
     correct production value."""
     expected = {
         "leverage": 10,
-        "max_trade_notional_usd": 800,
-        "max_concurrent": 10,
-        "max_total_notional_pct": 10.0,
-        "max_daily_loss_usd": -30,
+        # Audit 2026-09-04: canonical re-aligned to production values
+        # (30/2/4/-2/0.62 per config audit cross-check).
+        "max_trade_notional_usd": 30,
+        "max_concurrent": 2,
+        "max_total_notional_pct": 4.0,
+        "max_daily_loss_usd": -2,
         "daily_giveback_halt_pct": 0.35,
         "daily_giveback_min_peak_usd": 25.0,
         "min_short_volume_usd": 50_000_000,
         "min_market_volume_usd": 5_000_000,
         "counter_regime_min_conf": 0.8,
-        "min_ai_confidence": 0.7,
+        "min_ai_confidence": 0.62,
         "cooldown_min": 30,
         "loss_cooldown_min": 180,
         "min_ai_close_hold_min": 25,
@@ -199,7 +201,7 @@ def test_cfg_get_production_values_no_drift():
     """The exact set of values that previously drifted between modules must
     all resolve to their canonical production values when config is empty."""
     cfg = {}
-    assert cfg_get("max_daily_loss_usd", config=cfg) == -30
+    assert cfg_get("max_daily_loss_usd", config=cfg) == -2
     assert cfg_get("daily_giveback_halt_pct", config=cfg) == 0.35
     assert cfg_get("daily_giveback_min_peak_usd", config=cfg) == 25.0
     assert cfg_get("min_short_volume_usd", config=cfg) == 50_000_000
@@ -236,7 +238,7 @@ def test_read_agent_config_deep_merges_disk_values(tmp_path, monkeypatch):
     assert result["dsl_exit"]["protect_pct"] == 4.0
     # Canonical values still present (not clobbered by shallow merge)
     assert result["dsl_exit"]["retrace_threshold"] == 0.2
-    assert result["max_concurrent"] == 10
+    assert result["max_concurrent"] == 2
 
 
 def test_read_agent_config_corrupt_file_falls_back(tmp_path, monkeypatch):
@@ -262,7 +264,7 @@ def test_write_and_read_roundtrip(tmp_path, monkeypatch):
     assert result["mode"] == "TEST"
     assert result["leverage"] == 5
     # New keys still merged in
-    assert result["max_concurrent"] == 10
+    assert result["max_concurrent"] == 2
 
 
 def test_backup_created_on_write(tmp_path, monkeypatch):

@@ -8,7 +8,7 @@
       (0.7, 40)  →  conf >= 0.7 且 score >= 40  视为同意
       (0.5, 60)  →  conf >= 0.5 且 score >= 60  视为同意
       (0.8, 20)  →  conf >= 0.8 且 score >= 20  视为同意
-  * debate_gate L645 analyst5 阈值 ``0.75`` — conf >= 0.75 视为同意
+  * debate_gate L645 analyst5 阈值 — conf >= 阈值视为同意
     (即使没有 whale_signal)
 
 这些字面量既不在 CANONICAL_DEFAULTS，也不能 env 覆盖，也不出现在
@@ -22,7 +22,7 @@ hot-path 隐式字段（紧贴 cfg_get 已接线的 chop_min_score / min_trend_s
     counter_trend_min_score=50.0 / analyst2_high_conf=0.7 /
     analyst2_high_score=40 / analyst2_mid_conf=0.5 / analyst2_mid_score=60
     / analyst2_very_high_conf=0.8 / analyst2_very_high_score=20 /
-    analyst5_whale_or_conf=0.75，默认值与原 literals 严格一致）
+    analyst5_whale_or_conf，默认值与原 literals 严格一致）
   * _ConfigPatch 声明 ``analyst_scoring`` 字段（drift sentinel）
   * risk_gates.py hot-path 全部走 ``cfg_get("analyst_scoring.*", config={})``
     重解析（env / .agent-config.json 编辑无需重启即可生效）
@@ -30,7 +30,13 @@ hot-path 隐式字段（紧贴 cfg_get 已接线的 chop_min_score / min_trend_s
     config 参数；模块级 cfg_get 默认走 read_agent_config() 拿 .agent-config
     视图，env override 由 cfg_get 顶部第一优先级处理
 
-零行为变化约束：默认值 = 旧字面量，运行时闸值不变。
+Audit 2026-09-04 P1-9（有意的默认值变更）：
+  analyst5_whale_or_conf 0.75 → 0.62，与入场门 min_ai_confidence=0.62
+  对齐。旧值 0.75 使置信度落在 [0.62, 0.75) 的交易通过入场门却在辩论门
+  系统性少一票；0.62 后"0.62 即可入场"在辩论门一致。本文件 sentinel
+  随之锁定 0.62；端到端投票测试的 min_agree_count 提高到 4，把
+  analyst2 那一票隔离成决定性票（否则 conf=0.71 在新阈值下也能通过
+  analyst5，baseline 票型改变会掩盖 analyst2 阈值的效果）。
 """
 
 import os
@@ -52,7 +58,11 @@ def test_r13_b3_analyst_scoring_block_registered():
 
 
 def test_r13_b3_analyst_scoring_defaults_match_historical_literals():
-    """默认值严格等于 risk_gates.py 旧硬编码字面量；零行为变化。"""
+    """默认值等于 risk_gates.py 注册字面量。
+
+    注：analyst5_whale_or_conf 经 Audit 2026-09-04 P1-9 有意从 0.75
+    调整为 0.62（与入场门 min_ai_confidence 对齐），此处锁定变更后的值。
+    """
     block = CANONICAL_DEFAULTS["analyst_scoring"]
     # market_regime_gate / _counter_trend_decision 普通 counter-trend bar
     assert block["counter_trend_min_score"] == 50.0
@@ -63,8 +73,8 @@ def test_r13_b3_analyst_scoring_defaults_match_historical_literals():
     assert block["analyst2_mid_score"] == 60
     assert block["analyst2_very_high_conf"] == 0.8
     assert block["analyst2_very_high_score"] == 20
-    # debate_gate analyst5 置信度下限
-    assert block["analyst5_whale_or_conf"] == 0.75
+    # debate_gate analyst5 置信度下限（P1-9: 0.75 → 0.62）
+    assert block["analyst5_whale_or_conf"] == 0.62
 
 
 def test_r13_b3_analyst_scoring_block_has_exactly_eight_keys():
@@ -98,14 +108,14 @@ def test_r13_b3_cfg_get_analyst2_mid_and_vhigh_pair():
 
 
 def test_r13_b3_cfg_get_analyst5_whale_or_conf():
-    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}) == 0.75
+    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}) == 0.62
 
 
 def test_r13_b3_cfg_get_full_block():
     block = cfg_get("analyst_scoring", config={})
     assert isinstance(block, dict)
     assert block["counter_trend_min_score"] == 50.0
-    assert block["analyst5_whale_or_conf"] == 0.75
+    assert block["analyst5_whale_or_conf"] == 0.62
 
 
 # ── 3. env 覆盖：canonical env 路由（HERMES_CFG_ANALYST_SCORING__*） ───
@@ -132,7 +142,7 @@ def test_r13_b3_config_dict_partial_overlay():
     assert cfg_get("analyst_scoring.counter_trend_min_score", config=cfg) == 88.0
     # 未覆盖的 key 仍回退到 canonical 默认
     assert cfg_get("analyst_scoring.analyst2_high_conf", config=cfg) == 0.7
-    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config=cfg) == 0.75
+    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config=cfg) == 0.62
 
 
 # ── 5. read_agent_config 完整可见 + 深合并（实际 .agent-config.json 路径） ─
@@ -164,7 +174,7 @@ def test_r13_b3_read_agent_config_deep_merges_partial_overlay(monkeypatch, tmp_p
     assert cfg["analyst_scoring"]["counter_trend_min_score"] == 99.0
     # 未在 on-disk 出现的 key 仍是 canonical 默认
     assert cfg["analyst_scoring"]["analyst2_high_conf"] == 0.7
-    assert cfg["analyst_scoring"]["analyst5_whale_or_conf"] == 0.75
+    assert cfg["analyst_scoring"]["analyst5_whale_or_conf"] == 0.62
 
 
 # ── 6. schema 接受 + drift sentinel ──────────────────────────────────
@@ -226,8 +236,8 @@ def test_r13_b3_debate_gate_analyst2_branches_observable(monkeypatch):
 
 
 def test_r13_b3_debate_gate_analyst5_observable(monkeypatch):
-    """analyst5 阈值 0.75 可通过 env 改写。"""
-    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}) == 0.75
+    """analyst5 阈值 0.62（P1-9 后与入场门对齐）可通过 env 改写。"""
+    assert cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}) == 0.62
     monkeypatch.setenv(
         "HERMES_CFG_ANALYST_SCORING__ANALYST5_WHALE_OR_CONF", "0.6"
     )
@@ -259,72 +269,88 @@ def _ctx(**kw):
 
 
 def test_r13_b3_debate_gate_analyst2_threshold_actually_changes_vote(monkeypatch):
-    """端到端 sentinel：把 analyst2_high_score 拉低到 10，conf=0.71 + score=39
-    应当通过 analyst2（之前会因 score=39 < 40 失败）。"""
-    # 关键前提：triggers / news / analyst5 都过，analyst3 默认 False 失败；
-    # 只看 analyst2 的 high 段：conf >= 0.7 且 score >= 40
+    """端到端 sentinel：把 analyst2_high_score 拉低到 30，conf=0.71 + score=39
+    应当通过 analyst2（之前会因 score=39 < 40 失败）。
+
+    min_agree_count=4 把 analyst2 那一票隔离成决定性票：P1-9 后
+    analyst5 阈值 0.62，conf=0.71 已能通过 analyst5（旧 0.75 下不能），
+    baseline 票型为 [T,F,F,T,T]=3/5；若门槛仍设 3，baseline 会意外通过、
+    掩盖 analyst2 阈值的效果。门槛 4 下 baseline 3 票 block、analyst2
+    翻 True 后 4 票 pass，阈值-投票因果链保持可观测。
+    """
     cfg = {"debate_gate": {"enabled": True, "min_agreement": 0.6,
-                            "min_agree_count": 3, "analyst3_default": False}}
-    # baseline：score=39 拿不到 high 段（需 >= 40），但 conf=0.71 + score=39
-    # 也不满足 mid 段（conf<0.5 不对——0.71 >= 0.5 但 score=39 < 60），也不
-    # 满足 vhigh 段（conf=0.71 < 0.8）。所以 analyst2 = False。
+                            "min_agree_count": 4, "analyst3_default": False}}
+    # baseline：score=39 拿不到 high 段（需 >= 40）；conf=0.71 + score=39
+    # 也不满足 mid 段（score=39 < 60），也不满足 vhigh 段（conf=0.71 < 0.8）
+    # → analyst2 = False。
     ctx = _ctx(confidence=0.71, composite_score=39,
                momentum_burst_fired=True)  # trigger 1 = True
-    # 注：analyst1 需要 active_triggers>=1；analyst2 = False; analyst3 = False;
-    # analyst4 = True (no news); analyst5 = False (conf=0.71<0.75, no whale).
-    # votes = [T, F, F, T, F] = 2/5 < 0.6 → block.
+    # analyst1 = True (active_triggers>=1)；analyst2 = False;
+    # analyst3 = False; analyst4 = True (no news);
+    # analyst5 = True (conf=0.71 >= 0.62 P1-9 阈值，no whale 也同意)。
+    # votes = [T, F, F, T, T] = 3/5 < 4 票 → block.
     r = risk_gates.debate_gate(ctx, cfg)
     assert r["pass"] is False
+    assert r["agree_count"] == 3
 
     # 把 analyst2_high_score 降到 30：conf=0.71 (>=0.7) 且 score=39 (>=30) → True
     monkeypatch.setenv("HERMES_CFG_ANALYST_SCORING__ANALYST2_HIGH_SCORE", "30")
     r2 = risk_gates.debate_gate(ctx, cfg)
-    # votes = [T, T, F, T, F] = 3/5 = 0.6 ≥ 0.6 → pass
+    # votes = [T, T, F, T, T] = 4/5 = 0.8 ≥ 0.6 且 4 ≥ 4 → pass
     assert r2["pass"] is True
+    assert r2["agree_count"] == 4
 
 
 def test_r13_b3_debate_gate_analyst5_threshold_actually_changes_vote(monkeypatch):
-    """端到端 sentinel：把 analyst5 阈值拉低到 0.5，conf=0.6 + 无 whale 应当通过
-    analyst5（之前会因 conf<0.75 失败）。"""
+    """端到端 sentinel：把 analyst5 阈值拉高到 0.8，conf=0.6 + 无 whale 应当
+    被 analyst5 否决（0.6 < 0.8 baseline 0.62 下本可通过）；再降回 0.5
+    后通过。
+
+    P1-9 后 analyst5 默认阈值 0.62：conf=0.6 < 0.62，baseline 下
+    analyst5 仍为 False，与旧 0.75 行为一致，故 baseline 语义不变。
+    """
     cfg = {"debate_gate": {"enabled": True, "min_agreement": 0.5,
                             "min_agree_count": 2, "analyst3_default": True}}
     # analyst3 = True (legacy); analyst1 = False (no triggers);
-    # analyst2：conf=0.6 < 0.7 不进 high；conf=0.6 >= 0.5 但 score=20 < 60 不进 mid；
-    #          conf=0.6 < 0.8 不进 vhigh → False
-    # analyst4 = True; analyst5 = False (0.6 < 0.75 baseline)
+    # analyst2：conf=0.6 < 0.7 不进 high；conf=0.6 >= 0.5 但 score=20 < 60
+    #          不进 mid；conf=0.6 < 0.8 不进 vhigh → False
+    # analyst4 = True; analyst5 = False (0.6 < 0.62 P1-9 阈值)
     # votes = [F, F, T, T, F] = 2/5 = 0.4 < 0.5 → block
     ctx = _ctx(confidence=0.6, composite_score=20)
     r = risk_gates.debate_gate(ctx, cfg)
     assert r["pass"] is False
 
-    # 把 analyst5 阈值降到 0.5：analyst5 = True
+    # 把 analyst5 阈值降到 0.5：analyst5 = True (0.6 >= 0.5)
     monkeypatch.setenv("HERMES_CFG_ANALYST_SCORING__ANALYST5_WHALE_OR_CONF", "0.5")
     r2 = risk_gates.debate_gate(ctx, cfg)
     # votes = [F, F, T, T, T] = 3/5 = 0.6 ≥ 0.5 → pass
     assert r2["pass"] is True
 
 
-# ── 9. 零行为变化：未设置 env 时 debate_gate 投票结果与原硬编码一致 ─
+# ── 9. 默认值下 debate_gate 投票结果锁定 ─────────────────────────────
 
 def test_r13_b3_debate_gate_default_analyst2_vote_unchanged():
-    """canonical 默认下，conf=0.71, score=39 的 analyst2 投票结果与原硬编码
-    完全一致（False）—— 验证零行为变化。"""
+    """canonical 默认下，conf=0.71, score=39 的 analyst2 投票为 False。
+
+    min_agree_count=4 隔离 analyst2 票（与 threshold_changes_vote 测试
+    同一夹具）：默认阈值下 analyst2=False → 3 票 block。
+    """
     # 清掉可能干扰的 env
     for k in list(os.environ):
         if k.startswith("HERMES_CFG_ANALYST_SCORING__"):
             del os.environ[k]
     ctx = _ctx(confidence=0.71, composite_score=39, momentum_burst_fired=True)
     cfg = {"debate_gate": {"enabled": True, "min_agreement": 0.6,
-                            "min_agree_count": 3, "analyst3_default": False}}
+                            "min_agree_count": 4, "analyst3_default": False}}
     r = risk_gates.debate_gate(ctx, cfg)
-    # 与 test_r13_b3_debate_gate_analyst2_threshold_actually_changes_vote
-    # baseline 分支完全一致：block
+    # votes = [T, F, F, T, T] = 3/5 < 4 → block
     assert r["pass"] is False
+    assert r["agree_count"] == 3
 
 
 def test_r13_b3_debate_gate_default_analyst5_vote_unchanged():
-    """canonical 默认下，conf=0.6, no whale, score=20 的 analyst5 投票结果与
-    原硬编码完全一致（False）—— 验证零行为变化。"""
+    """canonical 默认下，conf=0.6, no whale, score=20 的 analyst5 投票为
+    False（0.6 < 0.62 P1-9 阈值，与旧 0.75 下行为一致）。"""
     for k in list(os.environ):
         if k.startswith("HERMES_CFG_ANALYST_SCORING__"):
             del os.environ[k]

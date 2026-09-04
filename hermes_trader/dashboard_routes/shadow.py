@@ -7,6 +7,7 @@ Serves the isolated shadow_book paper account over the dashboard API:
   * GET  /api/dashboard/shadow/equity-curve — equity/wallet curve points
   * GET  /api/dashboard/shadow/stats        — win rate / PnL / hold analytics
   * POST /api/dashboard/shadow/reset        — wipe back to a fresh bankroll (operator write)
+  * POST /api/dashboard/shadow/deposit      — add virtual funds, keep positions (operator write)
   * POST /api/dashboard/shadow/close        — force-close a paper position (operator write)
 
 Reads are anonymous-safe like summary/positions/closed-trades (the paper book
@@ -99,6 +100,38 @@ def register_shadow_routes(app: FastAPI) -> None:
         })
         logger.warning("shadow paper-ledger RESET via dashboard: %s", result)
         return JSONResponse({"ok": True, **result})
+
+    @app.post("/api/dashboard/shadow/deposit")
+    async def shadow_deposit(request: Request) -> JSONResponse:
+        """Add virtual funds to the paper account without touching open
+        positions or trade history (operator write). Use this to raise the
+        available balance while the book is live, instead of reset()."""
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        try:
+            amount = float((body or {}).get("amount"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "amount must be a positive number")
+        if amount <= 0:
+            raise HTTPException(400, "amount must be positive")
+
+        result = await asyncio.to_thread(shadow_book.deposit, amount)
+        if result is None:
+            raise HTTPException(400, "deposit failed: invalid amount")
+        session_log.append({
+            "event": "shadow_deposit",
+            "ts": int(time.time() * 1000),
+            "amount": result.get("deposited"),
+            "wallet_balance": result.get("wallet_balance"),
+            "open_positions": result.get("open_positions"),
+            "via": "web",
+        })
+        logger.warning("shadow paper-ledger DEPOSIT via dashboard: +%s -> wallet=%s",
+                       result.get("deposited"), result.get("wallet_balance"))
+        return JSONResponse(result)
 
     @app.post("/api/dashboard/shadow/close")
     async def shadow_close(request: Request) -> JSONResponse:

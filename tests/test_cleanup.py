@@ -1221,15 +1221,18 @@ def test_compute_funding_regime_includes_hip3(monkeypatch):
     def fake_get_universe(*, include_hip3=False, **kw):
         captured["include_hip3"] = include_hip3
         # Mixed universe: crypto with negative funding + commodity with positive funding.
+        # Funding magnitudes use ±0.0006: P1-11 raised crowded_funding_threshold
+        # 0.0001 → 0.0004 (0.0001 == HL perp baseline 0.01%/8h flagged the whole
+        # market), so the old ±0.0002 fixtures no longer cross the threshold.
         return [
-            {"coin": "BTC",    "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 1e9},
-            {"coin": "ETH",    "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 5e8},
-            {"coin": "SOL",    "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 3e8},
-            {"coin": "DOGE",   "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 2e8},
-            {"coin": "AVAX",   "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 1e8},
-            {"coin": "XRP",    "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 1e8},
-            {"coin": "LINK",   "funding": -0.0002, "openInterest": 5e7, "dayNtlVlm": 1e8},
-            {"coin": "xyz:CL", "funding":  0.0002, "openInterest": 5e6, "dayNtlVlm": 1e7},
+            {"coin": "BTC",    "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 1e9},
+            {"coin": "ETH",    "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 5e8},
+            {"coin": "SOL",    "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 3e8},
+            {"coin": "DOGE",   "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 2e8},
+            {"coin": "AVAX",   "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 1e8},
+            {"coin": "XRP",    "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 1e8},
+            {"coin": "LINK",   "funding": -0.0006, "openInterest": 5e7, "dayNtlVlm": 1e8},
+            {"coin": "xyz:CL", "funding":  0.0006, "openInterest": 5e6, "dayNtlVlm": 1e7},
         ]
 
     monkeypatch.setattr(hyperfeed, "get_universe", fake_get_universe)
@@ -2937,8 +2940,10 @@ def test_compute_funding_regime_long_crowded_margin(monkeypatch):
     """A class needs a >5 long-over-short margin to be LONG_CROWDED."""
     from hermes_trader.agents import hyperfeed
     # 7 crypto longs (funding>0, oi high), 0 shorts → margin 7 > 5.
+    # funding=0.0006 clears the P1-11 threshold (0.0004); see the HIP-3
+    # fixture above for why the old 0.0002 no longer counts as crowded.
     universe = [
-        {"coin": c, "funding": 0.0002, "openInterest": 5e7, "dayNtlVlm": 1e8}
+        {"coin": c, "funding": 0.0006, "openInterest": 5e7, "dayNtlVlm": 1e8}
         for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX", "XRP", "LINK")
     ]
     monkeypatch.setattr(hyperfeed, "get_universe",
@@ -3856,7 +3861,7 @@ def test_late_entry_pure_short_side_mirrors():
 
 # ── ta_late_entry_gate: order-time hard gate (deep audit 高危项) ────────────
 
-def _le_config(mode="shadow", **over):
+def _le_config(mode="enforce", **over):
     cfg = {"mode": mode, "min_bars_4h": 30, "trend_relax_enabled": True,
            "adx_trend_threshold": 35, "rsi_ob": 75, "rsi_os": 25,
            "ext_ob": 2.5, "ext_os": -2.5, "rsi_ob_relaxed": 82,
@@ -3893,8 +3898,11 @@ def test_ta_late_entry_gate_mode_off():
     assert r["pass"] is True and r["via"] == "ta_late_entry_off"
 
 
-def test_ta_late_entry_gate_shadow_records_but_never_blocks(monkeypatch, tmp_path):
-    """Shadow mode: would_block verdict, order still passes, JSONL appended."""
+def test_ta_late_entry_gate_legacy_shadow_value_still_blocks(monkeypatch, tmp_path):
+    """SHADOW/LIVE PARITY: the legacy ``mode="shadow"`` value (record but
+    never block) was removed. A stale "shadow" config is normalised to
+    "enforce" — the order is HARD-blocked exactly as in LIVE — while the
+    verdict JSONL is still appended as the additive audit record."""
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     bull = _trend_candles(100, start=100.0, step=0.6)
     hot15 = _trend_candles(60, start=100.0, step=0.6)
@@ -3902,12 +3910,14 @@ def test_ta_late_entry_gate_shadow_records_but_never_blocks(monkeypatch, tmp_pat
     log = tmp_path / "le_shadow.jsonl"
     r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
                            _le_config(mode="shadow", shadow_log_path=str(log)))
-    assert r["pass"] is True
-    assert r["via"] == "ta_late_entry_shadow" and r["would_block"] is True
+    assert r["pass"] is False
+    assert r["via"] == "ta_late_entry_block"
     assert "late-entry gate" in r["reason"]
     lines = log.read_text().splitlines()
     assert len(lines) == 1 and '"blocked": true' in lines[0]
     assert '"coin": "TEST"' in lines[0]
+    rec = json.loads(lines[0])
+    assert rec["mode"] == "enforce" and rec["layer"] == "gate"
 
 
 def test_ta_late_entry_gate_enforce_blocks(monkeypatch):
@@ -3974,7 +3984,10 @@ def test_ta_late_entry_registered_in_eval_all_gates(monkeypatch):
     assert out["blocked"] is True
     assert any("late-entry" in r for r in out["block_reasons"])
     # A plain dict WITHOUT the block still evaluates (disabled path, no fetch).
-    out2 = risk_gates.eval_all_gates(_ctx(), {"debate_gate": {"enabled": False}})
+    # trade_notional_usd=10 stays under the P1-14 canonical per-trade cap ($30)
+    # so the chain isn't blocked by an unrelated gate.
+    out2 = risk_gates.eval_all_gates(
+        _ctx(trade_notional_usd=10), {"debate_gate": {"enabled": False}})
     assert out2["results"]["ta_late_entry"]["via"] == "ta_late_entry_disabled"
     assert out2["blocked"] is False
 
@@ -3984,7 +3997,8 @@ def test_ta_late_entry_registered_in_eval_all_gates(monkeypatch):
 def test_ta_late_entry_canonical_config_present():
     from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
     block = CANONICAL_DEFAULTS["ta_late_entry"]
-    assert block["mode"] == "shadow"  # gray release by default
+    # SHADOW/LIVE PARITY: gate is enforcing by default in every mode.
+    assert block["mode"] == "enforce"
     assert block["rsi_ob"] == 75 and block["rsi_os"] == 25
     assert block["adx_trend_threshold"] == 35
     # Phase 0 (audit R3): the 15m continuation override DEFAULTED OFF — its
@@ -3998,8 +4012,14 @@ def test_ta_late_entry_schema_rejects_bad_values():
     errs = validate_config_updates({"ta_late_entry": {"mode": "bogus", "rsi_ob": 999}})
     assert any("mode" in e for e in errs)
     assert any("rsi_ob" in e for e in errs)
+    # Legacy "shadow" gray-release value is no longer accepted by NEW updates
+    # (the gate normalises a stale on-disk "shadow" to "enforce" at runtime).
+    errs2 = validate_config_updates({"ta_late_entry": {"mode": "shadow"}})
+    assert any("mode" in e for e in errs2)
     ok = validate_config_updates({"ta_late_entry": {"mode": "enforce", "rsi_ob": 70}})
     assert ok == []
+    ok_off = validate_config_updates({"ta_late_entry": {"mode": "off"}})
+    assert ok_off == []
 
 
 # ── Phase 0 (deep audit R1/R3/R4/R7): mtf default-off, forming bar, layers ──
@@ -4038,12 +4058,14 @@ def test_ta_late_entry_gate_mtf_disabled_fetches_no_15m(monkeypatch, tmp_path):
 
     def fake(coin, interval, count, *a, **k):
         calls.append(interval)
-        return _trend_candles(100, start=100.0, step=0.6)
+        # Healthy trend so the gate verdict passes (this test only asserts
+        # fetch behaviour — parabolic candles would now block under enforce).
+        return _healthy_trend_candles(100)
 
     monkeypatch.setattr(hl, "fetch_hl_candles", fake)
     monkeypatch.setattr(tf, "fetch_hl_candles", fake)
     # Explicitly mtf_enabled=False (mirrors the canonical default).
-    cfg = _le_config(mode="shadow", mtf_enabled=False,
+    cfg = _le_config(mode="enforce", mtf_enabled=False,
                      shadow_log_path=str(tmp_path / "le.jsonl"))
     r = ta_late_entry_gate(_ctx(trade_side="long"), cfg)
     assert r["pass"] is True
@@ -4059,11 +4081,11 @@ def test_ta_late_entry_gate_mtf_enabled_still_fetches_15m(monkeypatch, tmp_path)
 
     def fake(coin, interval, count, *a, **k):
         calls.append(interval)
-        return _trend_candles(100, start=100.0, step=0.6)
+        return _healthy_trend_candles(100)
 
     monkeypatch.setattr(hl, "fetch_hl_candles", fake)
     monkeypatch.setattr(tf, "fetch_hl_candles", fake)
-    cfg = _le_config(mode="shadow", mtf_enabled=True,
+    cfg = _le_config(mode="enforce", mtf_enabled=True,
                      shadow_log_path=str(tmp_path / "le.jsonl"))
     ta_late_entry_gate(_ctx(trade_side="long"), cfg)
     assert "15m" in calls and "4h" in calls, calls
@@ -4084,9 +4106,10 @@ def test_forming_readings_4h_detects_dropped_bar():
     assert forming_readings_4h([])["forming_bar_dropped"] is False
 
 
-def test_ta_late_entry_gate_shadow_records_forming_and_layer(monkeypatch, tmp_path):
+def test_ta_late_entry_gate_records_forming_and_layer(monkeypatch, tmp_path):
     """Gate JSONL rows carry layer="gate" and the forming-bar shadow fields;
-    the verdict itself scores the closed series (forming bar dropped)."""
+    the verdict itself scores the closed series (forming bar dropped). Under
+    SHADOW/LIVE parity a late-entry veto also HARD-blocks the order."""
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     snap = _ms_trend_4h(99, forming=True)
     _patch_candles(monkeypatch, snap, snap)
@@ -4094,7 +4117,8 @@ def test_ta_late_entry_gate_shadow_records_forming_and_layer(monkeypatch, tmp_pa
     r = ta_late_entry_gate(
         _ctx(trade_side="long", coin="TEST", entry_px=105.0),
         _le_config(mode="shadow", mtf_enabled=False, shadow_log_path=str(log)))
-    assert r["pass"] is True and r["via"] == "ta_late_entry_shadow"
+    # Parabolic 4h → vetoed; legacy "shadow" is normalised to enforce → blocked.
+    assert r["pass"] is False and r["via"] == "ta_late_entry_block"
     rows = [json.loads(l) for l in log.read_text().splitlines() if l.strip()]
     assert len(rows) == 1
     rec = rows[0]

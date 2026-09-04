@@ -85,9 +85,11 @@ def test_r12_c1_debate_gate_analyst3_default_registered():
     assert CANONICAL_DEFAULTS["debate_gate"]["analyst3_default"] is False
 
 
-def test_r12_c1_aligned_min_conf_registered_as_none():
-    """None = 功能关闭（risk_gates 对 None 有显式 is-not-None 守卫）。"""
-    assert CANONICAL_DEFAULTS["aligned_min_conf"] is None
+def test_r12_c1_aligned_min_conf_registered_enabled():
+    """Audit 2026-09-04 P0-5: 原 None 默认使顺势放宽静默关闭；现默认 0.60
+    （低于 min_ai_confidence=0.62），顺势入场获得真实更低门槛。显式设 null
+    仍可关闭（risk_gates 对 None 有 is-not-None 守卫）。"""
+    assert CANONICAL_DEFAULTS["aligned_min_conf"] == 0.60
 
 
 # ── cfg_get 解析：空 config 时返回 canonical 默认 ───────────────────────────
@@ -128,8 +130,15 @@ def test_r12_c1_cfg_get_conviction_tiers_shape():
 
 
 def test_r12_c1_cfg_get_aligned_min_conf_none_disables_feature():
-    # risk_gates 用 `config.get("aligned_min_conf")` + `is not None` 守卫
-    assert cfg_get("aligned_min_conf", config={}) is None
+    # P0-5 (audit 2026-09-04): production had aligned_min_conf=null which
+    # silently disabled the with-trend confidence relaxation with no warning.
+    # Canonical now pins 0.60 (below min_ai_confidence=0.62, LONG-side
+    # relaxation live by default). An explicit null in an operator config
+    # still disables the feature: risk_gates guards with
+    # `config.get("aligned_min_conf")` + `is not None`, and cfg_get returns a
+    # present-but-null config value rather than falling through to canonical.
+    assert cfg_get("aligned_min_conf", config={}) == 0.60
+    assert cfg_get("aligned_min_conf", config={"aligned_min_conf": None}) is None
 
 
 # ── env 覆盖：新登记键支持 HERMES_CFG_ 覆盖（含嵌套双下划线）────────────────
@@ -212,24 +221,45 @@ def test_r12_c1_read_agent_config_deep_merges_partial_overlay(tmp_path, monkeypa
 
 
 def test_r12_c1_none_default_key_survives_full_view_round_trip(tmp_path, monkeypatch):
-    """写路径把全量 merged 视图落盘（含 aligned_min_conf: null）后再读，
-    null 虽被 _deep_merge 当作删除标记，但回填守卫保证该键仍可见
-    （行为零变化：值依旧是 None，审计/dump 可见性不丢失）。"""
+    """全量 merged 视图落盘 → 重读 round-trip。
+
+    P0-5 后 aligned_min_conf 的 canonical 值为 0.60（不再是 None），正常
+    round-trip 保持 0.60；显式 null 是 _deep_merge 的删除标记，落盘的
+    null 重读后从 merged 视图中消失（键不存在 → risk_gates
+    `config.get(...) is None` 判定特性关闭，这是有意的 opt-out 路径）；
+    read_agent_config 末尾的回填守卫仅重生物料 canonical 默认就是 None
+    的键（当前无此键，守卫面向未来保留），非 None 键不受影响。"""
     import json
     cfg_file = tmp_path / ".agent-config.json"
     monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
     monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
     monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
 
-    full_view = read_agent_config()          # 纯 canonical 视图，含 None 键
-    assert full_view["aligned_min_conf"] is None
+    full_view = read_agent_config()          # 纯 canonical 视图
+    assert full_view["aligned_min_conf"] == 0.60
     write_agent_config(dict(full_view))       # 模拟 dashboard 全量落盘
-    assert json.loads(cfg_file.read_text())["aligned_min_conf"] is None
+    assert json.loads(cfg_file.read_text())["aligned_min_conf"] == 0.60
 
     reloaded = read_agent_config()
-    assert "aligned_min_conf" in reloaded     # 回填守卫生效
-    assert reloaded["aligned_min_conf"] is None
-    assert reloaded["sl_floor_pct"] == 1.2   # 非 None 键不受影响
+    assert reloaded["aligned_min_conf"] == 0.60  # 数值键 round-trip 不变
+    assert reloaded["sl_floor_pct"] == 1.2       # 非 None 键不受影响
+
+    # 显式 null opt-out：落盘 null 经 _deep_merge 当删除标记，重读后键消失。
+    view = dict(full_view)
+    view["aligned_min_conf"] = None
+    write_agent_config(view)
+    opt_out = read_agent_config()
+    assert "aligned_min_conf" not in opt_out     # 删除标记生效 → 特性关闭
+    assert opt_out["sl_floor_pct"] == 1.2        # 其余键完好
+
+    # 回填守卫：canonical 默认 None 的键在 deep-merge 删除后仍被重生物料
+    # （当前无生产 None 键，用合成键锁定该防御行为）。
+    monkeypatch.setitem(config_store.CANONICAL_DEFAULTS, "_r12c1_sentinel_none", None)
+    try:
+        backfilled = read_agent_config()
+        assert backfilled["_r12c1_sentinel_none"] is None
+    finally:
+        config_store.CANONICAL_DEFAULTS.pop("_r12c1_sentinel_none", None)
 
 
 # ── schema 兼容：新键不被 validate_config_updates 拒绝 ──────────────────────

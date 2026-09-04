@@ -61,6 +61,11 @@ _LEGACY_ENV_SPEC: dict[str, tuple[Optional[str], str]] = {
     "ws_status_fresh_s": ("HERMES_WS_STATUS_FRESH_S", "float"),
     "research_parallel": ("HERMES_RESEARCH_PARALLEL", "bool"),
     "research_parallel_workers": ("HERMES_RESEARCH_PARALLEL_WORKERS", "int"),
+    # 2026-09-04 P-NEW: per-scan jobs backpressure cap. When 5m-candle-coincident
+    # or fast-vol spike pumps jobs beyond this watermark, the lowest-score tail
+    # is dropped (cycle_outcomes reason "jobs_backpressure_cap") to keep the
+    # parallel pool saturated and avoid e2e back-up. 0 disables the cap.
+    "research_max_jobs_per_scan": ("HERMES_RESEARCH_MAX_JOBS_PER_SCAN", "int"),
 }
 
 # Inline-literal defaults — the exact values trading_loop.py used in its
@@ -86,6 +91,7 @@ LOOP_RUNTIME_DEFAULTS: dict[str, Any] = {
     "ws_status_fresh_s": 10.0,
     "research_parallel": True,
     "research_parallel_workers": 4,
+    "research_max_jobs_per_scan": 8,
 }
 
 

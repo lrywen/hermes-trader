@@ -59,6 +59,7 @@ LEAVES = (
     "ws_status_fresh_s",
     "research_parallel",
     "research_parallel_workers",
+    "research_max_jobs_per_scan",
 )
 LEGACY_ENVS = tuple(spec[0] for spec in _LEGACY_ENV_SPEC.values())
 
@@ -72,13 +73,13 @@ def _clear_legacy_envs(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-# ── canonical 登记：块存在、18 叶、与 resolver 字面量表逐字一致 ────────────
+# ── canonical 登记：块存在、19 叶、与 resolver 字面量表逐字一致 ────────────
 
 def test_p1_6_block_registered():
-    """loop_runtime 嵌套块必须在 CANONICAL_DEFAULTS 中且恰为 18 叶。"""
+    """loop_runtime 嵌套块必须在 CANONICAL_DEFAULTS 中且恰为 19 叶。"""
     assert BLOCK in CANONICAL_DEFAULTS
     assert isinstance(CANONICAL_DEFAULTS[BLOCK], dict)
-    assert len(CANONICAL_DEFAULTS[BLOCK]) == 18
+    assert len(CANONICAL_DEFAULTS[BLOCK]) == 19
     assert set(CANONICAL_DEFAULTS[BLOCK]) == set(LEAVES)
 
 
@@ -109,6 +110,7 @@ def test_p1_6_individual_leaf_values_sentinel():
     assert b["ws_status_fresh_s"] == 10.0
     assert b["research_parallel"] is True          # 默认开（P1-4 审计结论）
     assert b["research_parallel_workers"] == 4
+    assert b["research_max_jobs_per_scan"] == 8
 
 
 def test_p1_6_leaf_types_match_literals():
@@ -137,7 +139,7 @@ def test_p1_6_cfg_get_all_leaves():
 
 def test_p1_6_cfg_get_full_block():
     blk = cfg_get(BLOCK, config={})
-    assert isinstance(blk, dict) and len(blk) == 18
+    assert isinstance(blk, dict) and len(blk) == 19
     assert blk["scan_interval"] == 15
     assert blk["research_parallel"] is True
 
@@ -179,6 +181,7 @@ def test_p1_6_read_agent_config_exposes_block():
     assert BLOCK in cfg
     assert cfg[BLOCK]["scan_interval"] == 15
     assert cfg[BLOCK]["research_parallel_workers"] == 4
+    assert cfg[BLOCK]["research_max_jobs_per_scan"] == 8
 
 
 def test_p1_6_read_agent_config_deep_merges_partial(tmp_path, monkeypatch):
@@ -213,7 +216,7 @@ def test_p1_6_config_patch_knows_block():
     blk = fields[BLOCK].default_factory()
     assert blk["scan_interval"] == 15
     assert blk["research_parallel_workers"] == 4
-    assert len(blk) == 18
+    assert len(blk) == 19
 
 
 # ── helper：默认 18 叶 == 字面量、SPEC 映射正确 ───────────────────────────
@@ -225,9 +228,9 @@ def test_p1_6_helper_defaults_equal_literals(monkeypatch):
     assert set(p) == set(LEAVES)
 
 
-def test_p1_6_spec_maps_eighteen_legacy_envs():
-    """18 个 leaf 全部映射到 legacy HERMES_* env（无一纯硬编码）。"""
-    assert len(_LEGACY_ENV_SPEC) == 18
+def test_p1_6_spec_maps_nineteen_legacy_envs():
+    """19 个 leaf 全部映射到 legacy HERMES_* env（无一纯硬编码）。"""
+    assert len(_LEGACY_ENV_SPEC) == 19
     assert _LEGACY_ENV_SPEC["loop_log_path"] == ("HERMES_LOOP_LOG_FILE", "str")
     assert _LEGACY_ENV_SPEC["surge_min_score"] == ("HERMES_SURGE_MIN_SCORE", "float")
     assert _LEGACY_ENV_SPEC["watchdog_timeout_s"] == ("HERMES_WATCHDOG_TIMEOUT_S", "int")
@@ -249,6 +252,8 @@ def test_p1_6_spec_maps_eighteen_legacy_envs():
     assert _LEGACY_ENV_SPEC["research_parallel"] == ("HERMES_RESEARCH_PARALLEL", "bool")
     assert _LEGACY_ENV_SPEC["research_parallel_workers"] == (
         "HERMES_RESEARCH_PARALLEL_WORKERS", "int")
+    assert _LEGACY_ENV_SPEC["research_max_jobs_per_scan"] == (
+        "HERMES_RESEARCH_MAX_JOBS_PER_SCAN", "int")
 
 
 # ── legacy env 兼容（硬约束）：仍生效且优先于 canonical 通道 ──────────────

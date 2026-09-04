@@ -213,15 +213,15 @@ RISK_GATE_DURATION = Histogram(
     ["gate", "outcome"],
     buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0),
 )
-# Shadow/enforce verdicts of the late-entry gate. In shadow mode (the
-# gray-release default) would_block=1 verdicts are recorded but never stop
-# the order; compare against post-entry price action for 3-7 days before
-# flipping mode=enforce. Bounded labels: mode (off/shadow/enforce), side
-# (long/short), verdict (pass/would_block/block/data_missing).
+# Late-entry gate verdicts. SHADOW/LIVE PARITY (2026-09-04): the gate is
+# mode-independent once active and ALWAYS enforces, so the gray-release
+# would_block verdict no longer exists — a veto blocks in both modes. Labels:
+# mode (off/enforce; "shadow" legacy value is normalised to enforce), side
+# (long/short), verdict (pass/block/data_missing).
 TA_LATE_ENTRY_VERDICTS = Counter(
     "hermes_ta_late_entry_verdicts_total",
     "ta_late_entry_gate verdicts, labelled by mode, side and bounded "
-    "verdict (pass/would_block/block/data_missing).",
+    "verdict (pass/block/data_missing).",
     ["mode", "side", "verdict"],
 )
 # Candle cache outcome for fetch_hl_candles (deep audit ta_late_entry R7 /

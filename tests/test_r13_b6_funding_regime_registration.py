@@ -7,7 +7,7 @@
      ``REGIME_TTL_S=300`` 在 R13-B5 已接线为 ``regime_classifier.ttl_sec``；
      hyperfeed 的 funding regime 缓存 ``_FUNDING_REGIME_TTL_S=300`` 是同一
      语义的"5 分钟市场状态缓存"，却仍是硬编码——两个 300 一个可调一个不可调。
-  2. **未登记 (纯硬编码)** — funding 拥挤阈值 ±0.0001、OI 地板
+  2. **未登记 (纯硬编码)** — funding 拥挤阈值、OI 地板
      1e7(crypto)/1e6(HIP-3 equity/commodity)、类别多空计数优势 margin=5，
      全部内联在 ``_compute_funding_regime()`` 里，运维不可调、dashboard
      不可见；hyperfeed.py 全文件零 cfg_get / 零 config_store import。
@@ -15,7 +15,7 @@
 修复方式（零行为变化）：
 
   * CANONICAL_DEFAULTS 新增嵌套块 ``funding_regime``（5 键：ttl_sec=300、
-    crowded_funding_threshold=0.0001、oi_floor_crypto=1e7、
+    crowded_funding_threshold、oi_floor_crypto=1e7、
     oi_floor_other=1e6、class_dominance_margin=5）。
   * hyperfeed 新增公共 helper ``funding_regime_params()``（per-leaf
     cfg_get，每个键可独立 env override；整体 try/except + 阈值/OI floor
@@ -24,9 +24,12 @@
     改走 helper。
   * 模块常量 ``_FUNDING_REGIME_TTL_S`` 保留为 fallback 与外部符号。
 
-零行为变化约束：canonical 默认值严格等于旧硬编码字面量；未设 env/config
-时 market_get_funding_regime() / _compute_funding_regime() 输出与改前
-完全一致。
+Audit 2026-09-04 P1-11（有意的默认值变更，非零行为变化）：
+  crowded_funding_threshold 0.0001 → 0.0004。旧值 0.0001 等于 HL perp
+  资金费率基线（0.01% / 8h），几乎把所有币都判成 crowded；0.0004
+  （0.04%）只标记真正极端的币。模块字面量 ``_FUNDING_REGIME_DEFAULTS``
+  与 canonical 块同步为 0.0004；本文件 sentinel 与 hot-path fixture
+  （funding=0.0006 / -0.0006，高于新阈值）随之更新。
 """
 
 import json
@@ -83,10 +86,15 @@ def test_r13_b6_funding_regime_block_has_exactly_5_keys():
 
 
 def test_r13_b6_defaults_match_historical_literals():
-    """5 键默认值严格等于 hyperfeed 旧字面量（零行为变化）。"""
+    """5 键默认值 == 注册字面量。
+
+    注：crowded_funding_threshold 经 Audit 2026-09-04 P1-11 有意从
+    0.0001 调整为 0.0004（旧值等于 HL perp 基线导致误判），此处锁定
+    的是变更后的保守值。
+    """
     block = CANONICAL_DEFAULTS["funding_regime"]
     assert block["ttl_sec"] == 300
-    assert block["crowded_funding_threshold"] == 0.0001
+    assert block["crowded_funding_threshold"] == 0.0004
     assert block["oi_floor_crypto"] == 10000000.0
     assert block["oi_floor_other"] == 1000000.0
     assert block["class_dominance_margin"] == 5
@@ -114,7 +122,7 @@ def test_r13_b6_module_defaults_align_with_canonical():
 def test_r13_b6_cfg_get_dotted_paths_empty_config():
     """空 config 下所有 dotted 路径回退 canonical 默认。"""
     assert cfg_get("funding_regime.ttl_sec", config={}) == 300
-    assert cfg_get("funding_regime.crowded_funding_threshold", config={}) == 0.0001
+    assert cfg_get("funding_regime.crowded_funding_threshold", config={}) == 0.0004
     assert cfg_get("funding_regime.oi_floor_crypto", config={}) == 10000000.0
     assert cfg_get("funding_regime.oi_floor_other", config={}) == 1000000.0
     assert cfg_get("funding_regime.class_dominance_margin", config={}) == 5
@@ -132,7 +140,7 @@ def test_r13_b6_cfg_get_block_returns_dict():
 def test_r13_b6_env_override_threshold(monkeypatch):
     """单个阈值可经 HERMES_CFG_FUNDING_REGIME__CROWDED_FUNDING_THRESHOLD
     独立覆盖。"""
-    assert cfg_get("funding_regime.crowded_funding_threshold", config={}) == 0.0001
+    assert cfg_get("funding_regime.crowded_funding_threshold", config={}) == 0.0004
     monkeypatch.setenv("HERMES_CFG_FUNDING_REGIME__CROWDED_FUNDING_THRESHOLD", "0.0005")
     assert cfg_get("funding_regime.crowded_funding_threshold", config={}) == 0.0005
     # 其余键不受影响
@@ -160,7 +168,7 @@ def test_r13_b6_config_dict_partial_overlay():
     cfg = {"funding_regime": {"ttl_sec": 120, "class_dominance_margin": 3}}
     assert cfg_get("funding_regime.ttl_sec", config=cfg) == 120
     assert cfg_get("funding_regime.class_dominance_margin", config=cfg) == 3
-    assert cfg_get("funding_regime.crowded_funding_threshold", config=cfg) == 0.0001
+    assert cfg_get("funding_regime.crowded_funding_threshold", config=cfg) == 0.0004
     assert cfg_get("funding_regime.oi_floor_crypto", config=cfg) == 10000000.0
 
 
@@ -175,7 +183,7 @@ def test_r13_b6_read_agent_config_exposes_block(monkeypatch, tmp_path):
     cfg = read_agent_config()
     fr = cfg["funding_regime"]
     assert fr["ttl_sec"] == 300
-    assert fr["crowded_funding_threshold"] == 0.0001
+    assert fr["crowded_funding_threshold"] == 0.0004
     assert fr["oi_floor_crypto"] == 10000000.0
     assert fr["oi_floor_other"] == 1000000.0
     assert fr["class_dominance_margin"] == 5
@@ -193,7 +201,7 @@ def test_r13_b6_read_agent_config_deep_merges_overlay(monkeypatch, tmp_path):
     assert cfg["funding_regime"]["ttl_sec"] == 900
     assert cfg["funding_regime"]["oi_floor_other"] == 2000000.0
     # 未覆盖键仍为 canonical
-    assert cfg["funding_regime"]["crowded_funding_threshold"] == 0.0001
+    assert cfg["funding_regime"]["crowded_funding_threshold"] == 0.0004
     assert cfg["funding_regime"]["class_dominance_margin"] == 5
 
 
@@ -225,10 +233,10 @@ def test_r13_b6_validate_config_updates_accepts_block():
 # ── 7. funding_regime_params() helper：默认 / 覆盖 / guard ────────────
 
 def test_r13_b6_params_defaults_equal_literals():
-    """无 env/config 时 helper 返回的全部值 == 模块字面量（零行为变化）。"""
+    """无 env/config 时 helper 返回的全部值 == 模块字面量。"""
     p = funding_regime_params(config={})
     assert p["ttl_sec"] == 300.0
-    assert p["crowded_funding_threshold"] == 0.0001
+    assert p["crowded_funding_threshold"] == 0.0004
     assert p["oi_floor_crypto"] == 1e7
     assert p["oi_floor_other"] == 1e6
     assert p["class_dominance_margin"] == 5.0
@@ -258,10 +266,10 @@ def test_r13_b6_params_guard_nonpositive_threshold_falls_back():
     """funding 阈值 <=0 时回退字面量（0 阈值会把全市场判成拥挤）。"""
     cfg = {"funding_regime": {"crowded_funding_threshold": 0}}
     p = funding_regime_params(config=cfg)
-    assert p["crowded_funding_threshold"] == 0.0001
+    assert p["crowded_funding_threshold"] == 0.0004
     cfg = {"funding_regime": {"crowded_funding_threshold": -0.001}}
     p = funding_regime_params(config=cfg)
-    assert p["crowded_funding_threshold"] == 0.0001
+    assert p["crowded_funding_threshold"] == 0.0004
 
 
 def test_r13_b6_params_guard_nonpositive_oi_floors_fall_back():
@@ -308,7 +316,7 @@ def test_r13_b6_params_malformed_config_never_raises():
     }}
     p = funding_regime_params(config=cfg)
     assert p["ttl_sec"] == 300.0
-    assert p["crowded_funding_threshold"] == 0.0001
+    assert p["crowded_funding_threshold"] == 0.0004
     assert p["oi_floor_crypto"] == 1e7
     assert p["oi_floor_other"] == 1e6
     assert p["class_dominance_margin"] == 5.0
@@ -320,16 +328,19 @@ def test_r13_b6_params_returns_independent_copy():
     p1["crowded_funding_threshold"] = 9.99
     p1["oi_floor_crypto"] = 1.0
     p2 = funding_regime_params(config={})
-    assert p2["crowded_funding_threshold"] == 0.0001
+    assert p2["crowded_funding_threshold"] == 0.0004
     assert p2["oi_floor_crypto"] == 1e7
 
 
 # ── 8. hot-path 接线：_compute_funding_regime 行为 ────────────────────
+#
+# P1-11 后默认阈值 0.0004：hot-path fixture 用 funding=0.0006 /
+# -0.0006（高于新阈值，确保 counted）；0.0002 这类基线级 funding 现在
+# 正确地落在阈值之下（不再误判拥挤）。
 
 def test_r13_b6_compute_default_matches_old_literals(monkeypatch):
-    """默认参数下：7 多 0 空（margin 7 > 5）→ LONG_CROWDED，与旧字面量
-    路径完全一致（零行为变化）。"""
-    universe = [_mk_market(c, 0.0002)
+    """默认参数下：7 多 0 空（margin 7 > 5）→ LONG_CROWDED。"""
+    universe = [_mk_market(c, 0.0006)
                 for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX", "XRP", "LINK")]
     _patch_universe(monkeypatch, universe)
     out = hyperfeed._compute_funding_regime()
@@ -339,29 +350,29 @@ def test_r13_b6_compute_default_matches_old_literals(monkeypatch):
 
 def test_r13_b6_compute_default_margin_boundary_neutral(monkeypatch):
     """默认 margin=5：5 多 0 空（差 5，不满足 >5）→ NEUTRAL。"""
-    universe = [_mk_market(c, 0.0002) for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX")]
+    universe = [_mk_market(c, 0.0006) for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX")]
     _patch_universe(monkeypatch, universe)
     out = hyperfeed._compute_funding_regime()
     assert out["regimes_by_class"]["crypto"] == "NEUTRAL"
 
 
 def test_r13_b6_compute_threshold_env_takes_effect(monkeypatch):
-    """hot-path 接线验证：收紧 funding 阈值到 0.0005 后，funding=0.0002
-    的市场不再计入拥挤。"""
-    # 7 个 funding=0.0002 的市场：默认阈值 0.0001 下全 counted → LONG_CROWDED
-    universe = [_mk_market(c, 0.0002)
+    """hot-path 接线验证：默认阈值 0.0004 下 funding=0.0006 的 7 个市场
+    全 counted → LONG_CROWDED；阈值收紧到 0.0008 后 0.0006 不再超阈值
+    → 0 多 0 空 → NEUTRAL。"""
+    universe = [_mk_market(c, 0.0006)
                 for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX", "XRP", "LINK")]
     _patch_universe(monkeypatch, universe)
     assert hyperfeed._compute_funding_regime()["regimes_by_class"]["crypto"] == "LONG_CROWDED"
-    # 阈值提高到 0.0005 → 0.0002 不超阈值 → 0 多 0 空 → NEUTRAL
-    monkeypatch.setenv("HERMES_CFG_FUNDING_REGIME__CROWDED_FUNDING_THRESHOLD", "0.0005")
+    # 阈值提高到 0.0008 → 0.0006 不超阈值 → NEUTRAL
+    monkeypatch.setenv("HERMES_CFG_FUNDING_REGIME__CROWDED_FUNDING_THRESHOLD", "0.0008")
     assert hyperfeed._compute_funding_regime()["regimes_by_class"]["crypto"] == "NEUTRAL"
 
 
 def test_r13_b6_compute_margin_env_takes_effect(monkeypatch):
     """hot-path 接线验证：margin 降到 2 后，3 多 0 空即 LONG_CROWDED
     （默认 margin=5 下 3 多是 NEUTRAL）。"""
-    universe = [_mk_market(c, 0.0002) for c in ("BTC", "ETH", "SOL")]
+    universe = [_mk_market(c, 0.0006) for c in ("BTC", "ETH", "SOL")]
     _patch_universe(monkeypatch, universe)
     assert hyperfeed._compute_funding_regime()["regimes_by_class"]["crypto"] == "NEUTRAL"
     monkeypatch.setenv("HERMES_CFG_FUNDING_REGIME__CLASS_DOMINANCE_MARGIN", "2")
@@ -371,7 +382,7 @@ def test_r13_b6_compute_margin_env_takes_effect(monkeypatch):
 def test_r13_b6_compute_oi_floor_crypto_env_takes_effect(monkeypatch):
     """hot-path 接线验证：crypto OI floor 提到 8e7 后，OI=5e7 的多头市场
     被地板过滤 → NEUTRAL。"""
-    universe = [_mk_market(c, 0.0002, oi=5e7)
+    universe = [_mk_market(c, 0.0006, oi=5e7)
                 for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX", "XRP", "LINK")]
     _patch_universe(monkeypatch, universe)
     assert hyperfeed._compute_funding_regime()["regimes_by_class"]["crypto"] == "LONG_CROWDED"
@@ -387,7 +398,7 @@ def test_r13_b6_compute_oi_floor_other_class_scaling(monkeypatch):
     commodity/equity/native 白名单的 bare ticker 一律归 equity，保证 7 个
     多头落在同一类（margin 7 > 5）。
     """
-    universe = [_mk_market(c, 0.0002, oi=5e6)
+    universe = [_mk_market(c, 0.0006, oi=5e6)
                 for c in ("xyz:ZZA", "xyz:ZZB", "xyz:ZZC", "xyz:ZZD",
                           "xyz:ZZE", "xyz:ZZF", "xyz:ZZG")]
     _patch_universe(monkeypatch, universe)
@@ -401,8 +412,8 @@ def test_r13_b6_compute_oi_floor_other_class_scaling(monkeypatch):
 
 
 def test_r13_b6_compute_short_crowded_symmetric(monkeypatch):
-    """负 funding 对称：7 个 funding=-0.0002 → SHORT_CROWDED。"""
-    universe = [_mk_market(c, -0.0002)
+    """负 funding 对称：7 个 funding=-0.0006 → SHORT_CROWDED。"""
+    universe = [_mk_market(c, -0.0006)
                 for c in ("BTC", "ETH", "SOL", "DOGE", "AVAX", "XRP", "LINK")]
     _patch_universe(monkeypatch, universe)
     out = hyperfeed._compute_funding_regime()
@@ -476,23 +487,28 @@ def test_r13_b6_canonical_visible_for_dashboard_dump():
     assert isinstance(block["class_dominance_margin"], int)
 
 
-# ── 11. 零行为变化：默认参数下输出确定性 ──────────────────────────────
+# ── 11. 默认参数下输出确定性 ──────────────────────────────────────────
 
 def test_r13_b6_zero_behavior_change_deterministic(monkeypatch):
-    """同一 universe 两次计算完全一致（确定性），且默认 params == 旧字面量。"""
+    """同一 universe 两次计算完全一致（确定性）。
+
+    P1-11 后阈值 0.0004：BTC/ETH funding 0.0006/0.00055 超阈值 counted
+    long，SOL -0.0006 counted short，DOGE 0.00005 在阈值之下、XRP 被
+    OI 地板过滤 → long=2, short=1 → margin 1, not > 5 → NEUTRAL。
+    """
     universe = [
-        _mk_market("BTC", 0.0003, oi=8e7),
-        _mk_market("ETH", 0.0002, oi=6e7),
-        _mk_market("SOL", -0.0002, oi=3e7),
+        _mk_market("BTC", 0.0006, oi=8e7),
+        _mk_market("ETH", 0.00055, oi=6e7),
+        _mk_market("SOL", -0.0006, oi=3e7),
         _mk_market("DOGE", 0.00005, oi=2e7),   # below funding bar → NEUTRAL
-        _mk_market("XRP", 0.0002, oi=500.0),    # below OI floor → NEUTRAL
+        _mk_market("XRP", 0.0006, oi=500.0),    # below OI floor → NEUTRAL
     ]
     _patch_universe(monkeypatch, universe)
     out1 = hyperfeed._compute_funding_regime()
     out2 = hyperfeed._compute_funding_regime()
     assert out1 == out2
-    # 3 counted longs (BTC/ETH + ...), 1 short: BTC/ETH long, SOL short,
-    # DOGE/XRP neutral → long=2, short=1 → margin 1, not > 5 → NEUTRAL
+    # BTC/ETH long, SOL short, DOGE/XRP neutral → long=2, short=1 →
+    # margin 1, not > 5 → NEUTRAL
     assert out1["regimes_by_class"]["crypto"] == "NEUTRAL"
     # assets sorted by funding rate desc
     rates = [a["funding_rate"] for a in out1["assets"]]

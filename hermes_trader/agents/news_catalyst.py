@@ -108,6 +108,13 @@ def parse_gdelt_artlist(payload: dict) -> list[Article]:
 # The legacy HERMES_NEWS_HTTP_TIMEOUT_S env read was removed (no deployment
 # referenced it); its default lives on as canonical http_timeout_s and remains
 # env-overridable via HERMES_CFG_NEWS_CATALYST__HTTP_TIMEOUT_S.
+#
+# Audit 2026-09-04 P2-19 note: _cache below (ttl_sec, default 300s) caches
+# GDELT/RSS catalyst articles for the trade-SIGNAL path. It is a deliberately
+# SEPARATE cache from research._NEWS_CACHE (news_cache_ttl_s, default 120s),
+# which caches Brave Search headlines for the debate/LLM PROMPT path. Different
+# source, key space and consumer — the two TTLs are not a conflict and must
+# not be unified.
 _NEWS_CATALYST_DEFAULTS: dict[str, Any] = {
     "ttl_sec": 300.0,
     "http_timeout_s": 3.0,

@@ -58,6 +58,7 @@ def _import_memory() -> Any:
 
 def cmd_scan() -> None:
     """Scan all markets for triggers."""
+    from hermes_trader.agents.config_store import read_agent_config
     from hermes_trader.agents.perception import scan_once
     from hermes_trader.client.universe import get_universe
 
@@ -65,10 +66,17 @@ def cmd_scan() -> None:
     print("  Scanning all markets for trigger signals...\n")
 
     universe = get_universe()
-    perceptions = scan_once(universe=universe, min_score=75)
+    # Audit 2026-09-04 P1-8: do NOT hard-code 75 here. scan_once with its
+    # default threshold reads the same scan.minCompositeScore (54 in
+    # production) that the live trade loop uses, so the interactive CLI scan
+    # matches what the loop actually trades on. Passing an explicit higher
+    # value used to print "no triggers (>=75)" while the loop was filling at
+    # 54 — misleading during incident triage.
+    perceptions = scan_once(universe=universe)
+    _scan_gate = read_agent_config().get("scan", {}).get("minCompositeScore", 54)
 
     if not perceptions:
-        print("  No triggers fired above threshold (score >= 75).\n")
+        print(f"  No triggers fired above threshold (score >= {_scan_gate}).\n")
         return
 
     print(f"  {len(perceptions)} trigger(s) detected:\n")

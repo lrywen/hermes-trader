@@ -146,10 +146,72 @@ def per_trade_notional_cap_gate(ctx: GateContext, cap_usd: float) -> GateResult:
     return {"pass": False, "reason": f"trade notional ${ctx.trade_notional_usd:.2f} exceeds cap ${cap:.2f}"}
 
 
-def daily_loss_kill_switch(ctx: GateContext, max_daily_loss: float) -> GateResult:
-    if ctx.daily_pnl > max_daily_loss:
+def effective_daily_loss_cutoff(
+    equity_usd: float,
+    max_daily_loss_usd: float,
+    daily_loss_pct: float,
+) -> tuple[float, str]:
+    """Unified daily-loss cutoff (audit 2026-09-04 P1-15).
+
+    Two historically-silent mechanisms expressed in different units are
+    collapsed into ONE cutoff:
+
+      * PRIMARY: equity percentage — ``max_daily_loss_usd <= 0`` style PnL
+        cutoff derived as ``-daily_loss_pct% of equity`` (scales with the
+        account). ``daily_loss_pct <= 0`` disables this leg.
+      * BACKSTOP: absolute USD floor — ``max_daily_loss_usd`` (<= 0). A
+        misconfiguration guard for big accounts where a pure-% cutoff could
+        otherwise permit a huge absolute daily loss.
+
+    The EFFECTIVE cutoff is the TIGHTER (less negative, i.e. fires first) of
+    the two. Returns ``(cutoff_usd, source)`` where source is "pct", "usd",
+    "both_equal" or "disabled". Positive equity / a configured cutoff is
+    required; nothing-usable yields (0.0, "disabled") which the gate treats
+    as pass-through. Pure function for offline tests.
+    """
+    cutoffs: list[tuple[float, str]] = []
+    try:
+        if daily_loss_pct > 0 and equity_usd > 0:
+            cutoffs.append((-daily_loss_pct / 100.0 * equity_usd, "pct"))
+    except (TypeError, ValueError):
+        pass
+    try:
+        if max_daily_loss_usd < 0:
+            cutoffs.append((float(max_daily_loss_usd), "usd"))
+    except (TypeError, ValueError):
+        pass
+    if not cutoffs:
+        return 0.0, "disabled"
+    cutoffs.sort(key=lambda x: x[0])
+    # Largest (least negative) value = fires first = tighter.
+    cutoff, source = cutoffs[-1]
+    if len(cutoffs) == 2 and abs(cutoffs[0][0] - cutoffs[1][0]) < 1e-9:
+        source = "both_equal"
+    return cutoff, source
+
+
+def daily_loss_kill_switch(
+    ctx: GateContext,
+    max_daily_loss: float,
+    daily_loss_pct: float = 0.0,
+) -> GateResult:
+    """Halt NEW entries once today's PnL crosses the unified daily-loss cutoff.
+
+    P1-15: the USD switch (``max_daily_loss``, negative) is combined with the
+    equity-% breaker (``daily_loss_pct``) via effective_daily_loss_cutoff —
+    the tighter of the two binds, so neither leg is silently dead as equity
+    drifts. The executor's close-time GLOBAL CIRCUIT (circuit_breaker.
+    daily_loss_pct) remains a separate halt-arm; this gate shares the same
+    percentage so the two read consistently.
+    """
+    cutoff, source = effective_daily_loss_cutoff(
+        ctx.equity, max_daily_loss, daily_loss_pct)
+    if source == "disabled" or ctx.daily_pnl > cutoff:
         return {"pass": True}
-    return {"pass": False, "reason": f"daily loss killswitch triggered (PnL ${ctx.daily_pnl:.0f} <= ${max_daily_loss})"}
+    return {"pass": False, "reason": (
+        f"daily loss killswitch triggered (PnL ${ctx.daily_pnl:.2f} <= "
+        f"cutoff ${cutoff:.2f} via {source}: {daily_loss_pct:.1f}% of "
+        f"equity ${ctx.equity:.2f} / USD floor ${max_daily_loss:.2f})")}
 
 
 def daily_giveback_gate(ctx: GateContext, halt_pct: float, min_peak_usd: float) -> GateResult:
@@ -968,11 +1030,16 @@ def debate_gate(
 # Activation: a ``ta_late_entry`` config block must be present (production
 # configs always have it via CANONICAL_DEFAULTS; plain-dict test configs
 # without the block take the zero-fetch disabled path). mode:
-#   off     → gate disabled
-#   shadow → verdict + metrics + JSONL recorded, order NEVER blocked
-#             (gray-release; run 3–7 days, reconcile would_block vs the
-#              subsequent move before flipping)
-#   enforce → late entries are blocked (hard gate)
+#   off      → gate disabled (explicit kill switch)
+#   enforce  → late entries are blocked (hard gate) — the DEFAULT.
+# SHADOW/LIVE PARITY (2026-09-04): the gate is mode-INDEPENDENT. When active
+# it ALWAYS enforces — a late-entry veto blocks the order identically in
+# SHADOW and LIVE, so shadow backtest results reflect live behaviour 1:1.
+# The legacy ``mode="shadow"`` gray-release value (record-but-never-block)
+# was REMOVED because it made SHADOW silently skip the gate; an old config
+# carrying "shadow" is normalised to "enforce" (fail-safe). The verdict
+# JSONL / metrics are still written on every evaluation as additive audit
+# output — recording never affects the block decision.
 # Fail-OPEN: any fetch / data / compute failure (or too little 4h data)
 # passes the order — a risk gate must not stall the exchange path — and is
 # surfaced via the data_missing verdict label.
@@ -1028,10 +1095,23 @@ def ta_late_entry_gate(
     # network entirely).
     if not isinstance(le_cfg, dict):
         return {"pass": True, "via": "ta_late_entry_disabled"}
-    mode = str(le_cfg.get("mode", "shadow") or "shadow").lower()
-    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
-    if mode == "off":
+    # SHADOW/LIVE PARITY: the gate is mode-independent once active. The only
+    # values are "off" (explicit kill switch) and "enforce" (hard block, the
+    # default). The legacy gray-release "shadow" value (record but never
+    # block) was removed — it made SHADOW silently skip the gate while LIVE
+    # blocked, breaking 1:1 parity. Any value other than "off" (including a
+    # stale "shadow") is normalised to "enforce" so the gate is fail-safe.
+    raw_mode = str(le_cfg.get("mode", "enforce") or "enforce").lower()
+    if raw_mode == "off":
         return _done("disabled", {"pass": True, "via": "ta_late_entry_off"})
+    if raw_mode != "enforce":
+        logger.warning(
+            "[risk][gates] ta_late_entry mode=%r is no longer supported "
+            "(shadow gray-release removed) — enforcing",
+            raw_mode,
+        )
+    mode = "enforce"
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
 
     try:
         from concurrent.futures import ThreadPoolExecutor
@@ -1151,33 +1231,10 @@ def ta_late_entry_gate(
         })
 
     reason = f"late-entry gate: {verdict.get('reason', '')}".rstrip()
-    if mode == "shadow":
-        # Gray release: record the would-block verdict but do NOT stop the
-        # order. Warning level so it survives into container logs.
-        logger.warning(
-            "[risk][gates] ta_late_entry SHADOW would-block coin=%s side=%s: %s",
-            ctx.coin, side, reason,
-        )
-        try:
-            from hermes_trader import metrics
-            metrics.TA_LATE_ENTRY_VERDICTS.labels(
-                mode=mode, side=side, verdict="would_block").inc()
-        except Exception:
-            pass
-        return _done("shadow_block", {
-            "pass": True,  # shadow never blocks
-            "via": "ta_late_entry_shadow",
-            "would_block": True,
-            "data_ok": True,
-            "reason": reason,
-            "rsi4h": verdict.get("rsi4h"),
-            "adx4h": verdict.get("adx4h"),
-            "extension": verdict.get("extension"),
-            "rsi15m": verdict.get("rsi15m"),
-            "mtf_passed": verdict.get("mtf_passed"),
-        })
-
-    # enforce: hard block.
+    # SHADOW/LIVE PARITY: a late-entry veto ALWAYS blocks, in SHADOW and LIVE
+    # alike. The verdict JSONL above is the additive audit record; it never
+    # weakens the block. (The old ``mode == "shadow"`` record-but-pass branch
+    # was removed — it made SHADOW skip the gate entirely.)
     logger.info(
         "[risk][gates] ta_late_entry BLOCK coin=%s side=%s: %s",
         ctx.coin, side, reason,
@@ -1264,8 +1321,12 @@ def eval_all_gates(
         ctx, int(cfg_get("max_concurrent", config=config)))
     results["notional_cap"] = per_trade_notional_cap_gate(
         ctx, float(cfg_get("max_trade_notional_usd", config=config)))
+    # P1-15: unified daily-loss cutoff — equity-% primary, USD absolute floor
+    # as backstop; the tighter binds (see effective_daily_loss_cutoff).
     results["daily_loss"] = daily_loss_kill_switch(
-        ctx, float(cfg_get("max_daily_loss_usd", config=config)))
+        ctx,
+        float(cfg_get("max_daily_loss_usd", config=config)),
+        float(cfg_get("circuit_breaker.daily_loss_pct", config=config) or 0.0))
     results["daily_giveback"] = daily_giveback_gate(
         ctx,
         float(cfg_get("daily_giveback_halt_pct", config=config)),
@@ -1322,7 +1383,8 @@ def eval_all_gates(
     # ta_late_entry (deep audit 高危项, 2026-08-30): hard late-entry veto
     # re-checked at order time with FRESH candles (the pre-filter TA is
     # minutes stale). Runs the same late_entry_check() pure function as the
-    # ta_filter pre-filter and the backtest; mode off/shadow/enforce.
+    # ta_filter pre-filter and the backtest. Mode-independent: once active it
+    # enforces identically in SHADOW and LIVE (mode off/enforce only).
     results["ta_late_entry"] = ta_late_entry_gate(ctx, config)
 
     block_reasons = []

@@ -15,7 +15,7 @@ def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
     if normalized_mode == "LIVE":
         mode_desc = "You are in LIVE mode — your verdict auto-executes against real funds. Be precise but DECISIVE."
     elif normalized_mode == "SHADOW":
-        mode_desc = "You are in SHADOW mode — output your verdict for validation only. No new entry order will be placed."
+        mode_desc = "You are in SHADOW mode — your verdict is recorded and evaluated against LIVE-identical risk gates. Decide with the SAME conviction and rigor as if real funds were at stake."
     else:
         mode_desc = "You are in OFF mode — output your verdict for analysis only. No execution will occur."
 

@@ -107,10 +107,40 @@ def _round_trip_fills() -> int:
 
 
 def _max_positions() -> int:
+    """Concurrent-position cap for the paper book.
+
+    SHADOW/LIVE PARITY: this MUST equal the global ``max_concurrent`` so the
+    paper book admits exactly as many concurrent positions as the live gate
+    permits — otherwise SHADOW could book entries the live ``max_concurrent``
+    gate blocks (or vice-versa), skewing 1:1 backtest parity. The two are
+    pinned to the same value in CANONICAL_DEFAULTS (2). Here we (a) fall back
+    to the live ``max_concurrent`` when the shadow key is unset, and (b) log a
+    loud warning on any mismatch so a future config drift cannot silently
+    diverge the two modes.
+    """
     try:
-        return max(1, int(_shadow_cfg().get("max_positions", 10)))
+        from hermes_trader.agents.config_store import cfg_get
+        live_cap = max(1, int(cfg_get("max_concurrent", 2) or 2))
+    except Exception:
+        live_cap = 2
+    c = _shadow_cfg()
+    raw = c.get("max_positions", None)
+    if raw is None:
+        # Unset → track the live cap exactly (never hard-code a divergent
+        # fallback).
+        return live_cap
+    try:
+        cap = max(1, int(raw))
     except (TypeError, ValueError):
-        return 10
+        return live_cap
+    if cap != live_cap:
+        logger.warning(
+            "[shadow_book] DRIFT: shadow_book.max_positions=%d != global "
+            "max_concurrent=%d — SHADOW/LIVE position caps differ; backtest "
+            "parity compromised. Set shadow_book.max_positions=%d.",
+            cap, live_cap, live_cap,
+        )
+    return cap
 
 
 def _build_policy():
@@ -421,6 +451,10 @@ class ShadowBook:
             return None
         if not coin or side not in ("long", "short") or entry_px <= 0 or size_usd <= 0:
             return None
+        # Hot-reload: the dashboard/API runs in a separate process and may have
+        # reset/deposited since our last write; pick that up before mutating so
+        # we never overwrite it with stale in-memory state.
+        self.reload_if_changed()
         with self._lock:
             if self._find_position(coin, side) is not None:
                 logger.debug(f"[shadow_book] skip open {coin} {side}: already open")
@@ -573,6 +607,10 @@ class ShadowBook:
         """
         if not mids:
             return []
+        # Hot-reload cross-process writes (web deposit/reset/close) before we
+        # mark and save, so the trading loop never clobbers them with its own
+        # possibly-stale in-memory state.
+        self.reload_if_changed()
         closed: list[dict[str, Any]] = []
         with self._lock:
             if not self.state["positions"]:
@@ -644,6 +682,7 @@ class ShadowBook:
     def close_now(self, coin: str, side: Optional[str] = None,
                   exit_px: Optional[float] = None, reason: str = "manual_close") -> Optional[dict[str, Any]]:
         """Force-close a paper position (operator / manual). Used by the API."""
+        self.reload_if_changed()
         with self._lock:
             for p in list(self.state["positions"]):
                 if p["coin"] != coin:
@@ -677,6 +716,43 @@ class ShadowBook:
                            f"fresh bankroll={self.state['starting_balance']:.2f}")
             return {"ok": True, "closed_wiped": old_closed,
                     "starting_balance": self.state["starting_balance"]}
+
+    def deposit(self, amount: float) -> Optional[dict[str, Any]]:
+        """Add virtual funds to the paper account WITHOUT touching positions
+        or fills (operator action). Unlike reset(), open positions, trade
+        history and the equity curve are all preserved.
+
+        The bankroll baseline (``starting_balance``) and the wallet are both
+        raised by ``amount`` so the injected cash is never counted as trading
+        profit: ``realized_pnl = wallet - starting_balance`` is unchanged, and
+        ``available`` (equity - used_margin) grows by the deposited amount.
+        """
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError):
+            return None
+        if amt <= 0:
+            return None
+        self.reload_if_changed()
+        with self._lock:
+            self.state["starting_balance"] = float(self.state["starting_balance"]) + amt
+            self.state["wallet_balance"] = float(self.state["wallet_balance"]) + amt
+            snap = self._account_metrics()
+            self._last_snapshot = snap
+            self._append_equity(_now_ms(), snap, force=True)
+            self._save(force=True)
+            logger.warning(
+                f"[shadow_book] DEPOSIT +{amt:.2f} (paper) — wallet="
+                f"{self.state['wallet_balance']:.2f}, available={snap['available']:.2f}, "
+                f"positions held={snap['open_positions']}")
+            return {
+                "ok": True,
+                "deposited": round(amt, 4),
+                "wallet_balance": snap["wallet_balance"],
+                "equity": snap["equity"],
+                "available": snap["available"],
+                "open_positions": snap["open_positions"],
+            }
 
     # -- read views ---------------------------------------------------------
 
@@ -801,6 +877,11 @@ def get_stats() -> dict[str, Any]:
 
 def reset(starting_balance: Optional[float] = None) -> dict[str, Any]:
     return get_book().reset(starting_balance=starting_balance)
+
+
+def deposit(amount: float) -> Optional[dict[str, Any]]:
+    """Add virtual funds without wiping positions/fills (operator action)."""
+    return get_book().deposit(amount)
 
 
 def close_now(coin: str, side: Optional[str] = None,

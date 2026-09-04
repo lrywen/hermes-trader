@@ -76,6 +76,9 @@ def _enable_debate(monkeypatch):
             "cache_ttl_s": 300.0,
             "parallel": True,
             "use_structured_output": True,
+            # Audit 2026-09-04 P0-1: per-leg optional timeouts (None = off).
+            "bull_timeout_s": None,
+            "synth_timeout_s": None,
         },
     )
     monkeypatch.setattr(R, "cfg_get", lambda key, *a, **k: 1.5)
@@ -191,6 +194,8 @@ def test_debate_serial_mode(monkeypatch, _enable_debate):
             "cache_ttl_s": 0.0,
             "parallel": False,
             "use_structured_output": True,
+            "bull_timeout_s": None,
+            "synth_timeout_s": None,
         },
         raising=False,
     )

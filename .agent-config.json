@@ -3,20 +3,21 @@
   "enable_crypto": true,
   "enable_hip3": true,
   "equity_fraction_per_trade": 0.2,
-  "leverage": 12,
-  "max_trade_notional_usd": 800,
+  "leverage": 10,
+  "max_trade_notional_usd": 30,
   "tp_scale_fraction": 0.5,
-  "max_concurrent": 10,
-  "max_total_notional_pct": 10.0,
-  "max_daily_loss_usd": -30,
+  "max_concurrent": 2,
+  "max_total_notional_pct": 4.0,
+  "max_daily_loss_usd": -2,
   "daily_giveback_halt_pct": 0.35,
   "daily_giveback_min_peak_usd": 25.0,
   "crowded_with_min_conf": 0.8,
   "min_available_margin_pct": 0.1,
   "cooldown_min": 30,
-  "research_cooldown_min": 15,
+  "research_cooldown_min": 3,
   "held_research_interval_min": 10,
-  "min_ai_confidence": 0.7,
+  "min_ai_confidence": 0.62,
+  "aligned_min_conf": 0.60,
   "counter_regime_min_conf": 0.8,
   "max_crypto_long_correlated": 3,
   "min_market_volume_usd": 5000000,
@@ -191,14 +192,23 @@
   },
   "debate_gate": {
     "enabled": true,
-    "min_agreement": 0.6,
-    "min_agree_count": 3
+    "min_agreement": 0.4,
+    "min_agree_count": 2
   },
   "debate_research": {
     "enabled": true,
-    "max_latency_s": 20,
+    "max_latency_s": 25,
     "cache_ttl_s": 30,
     "parallel": true,
     "use_structured_output": true
+  },
+  "llm_circuit_breaker": {
+    "fail_threshold": 3,
+    "cooldown_s": 300
+  },
+  "research_llm": {
+    "timeout_sec": 25.0,
+    "continuations": 1,
+    "fallback_timeout_sec": 25.0
   }
 }

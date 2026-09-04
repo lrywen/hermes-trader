@@ -563,6 +563,33 @@ config = get_config()
 startup_agent_config = read_agent_config()
 startup_mode = str(startup_agent_config.get("mode", "OFF")).upper()
 logger.info(f"Mode: {startup_mode}  env={_args.env}  daemon={_args.daemon}")
+# P1-14 (audit 2026-09-04): refuse to TRADE when a risk-critical key is
+# outside the conservative startup safety envelope — a hand-edited config or
+# a loosened default must not silently run with ballooned exposure. This is
+# stricter than the read-time schema warnings (which fall back to canonical).
+# An explicit operator ack (HERMES_SKIP_STARTUP_SAFETY=1) bypasses for the
+# deliberate risk-on case; the breach is still logged at CRITICAL.
+from hermes_trader.agents.config_store import (
+    startup_config_integrity_errors,
+    startup_safety_bypass_acked,
+)
+
+_safety_errors = startup_config_integrity_errors(startup_agent_config)
+if _safety_errors:
+    for _e in _safety_errors:
+        logger.critical(f"[startup safety] {_e}")
+    if startup_safety_bypass_acked():
+        logger.warning(
+            "[startup safety] %d envelope breach(es) but "
+            "HERMES_SKIP_STARTUP_SAFETY=1 — continuing at operator's risk",
+            len(_safety_errors))
+    else:
+        logger.critical(
+            "[startup safety] refusing to start: %d risk envelope breach(es). "
+            "Fix the config, or set HERMES_SKIP_STARTUP_SAFETY=1 to override.",
+            len(_safety_errors))
+        sys.exit(78)  # EX_CONFIG
+logger.info("[startup safety] envelope check passed (0 breaches)")
 # HIP-3 toggle: read once at startup so the prefetched universe includes
 # tokenized-equity / commodity perps if enabled. The agent config is
 # hot-reloaded per cycle inside the executor / perception layer for other
@@ -1880,6 +1907,49 @@ while True:
             if _sig_fp is not None:
                 _researched_signal_fps.add(_sig_fp)
             _research_jobs.append((coin, perception, float(score), gate))
+
+        # ---- B-1 (2026-09-04 P-NEW): jobs queue backpressure cap ----
+        # When 5m-candle-coincident or fast-vol spike pumps jobs beyond the
+        # watermark, drop the lowest-score tail so the parallel pool stays
+        # saturated at <= WORKERS * 1.5 and the worst-case e2e doesn't back up.
+        # Empirical: current P95 0.49 jobs/scan; cap default 8 (=2*pool) covers
+        # 16× headroom over normal load and bounds worst-case e2e to ~60s with
+        # pool=4 + per-call clamp 35/60. Set HERMES_RESEARCH_MAX_JOBS_PER_SCAN=0
+        # to disable (then back to pre-change behaviour: unbounded, pool queue).
+        _jobs_cap = int(_rt["research_max_jobs_per_scan"] or 0)
+        if _jobs_cap > 0 and len(_research_jobs) > _jobs_cap:
+            _before = len(_research_jobs)
+            # Sort by score desc; keep top-N by composite score (most actionable).
+            _research_jobs.sort(key=lambda j: j[2], reverse=True)
+            _dropped_jobs = _research_jobs[_jobs_cap:]
+            _research_jobs = _research_jobs[:_jobs_cap]
+            for _dj in _dropped_jobs:
+                _dj_coin = _dj[0]
+                _dj_score = _dj[2]
+                _cycle_outcomes.append(
+                    (_dj_coin, "skip", False, "jobs_backpressure_cap")
+                )
+                # Roll back the stamps we wrote above so the dropped coin
+                # stays eligible next cycle (otherwise the 15min cooldown we
+                # stamped would silently suppress it for the whole window).
+                _last_research_by_coin.pop(_dj_coin, None)
+                _last_research_score_by_coin.pop(_dj_coin, None)
+                # P-NEW fix (2026-09-04 16:00): also drop the 5m-bar content
+                # fingerprint. _researched_signal_fps is cycle-persistent
+                # (initialised L1127, never cleared) and the enqueue path
+                # added this coin's fingerprint at L1881. Without this
+                # discard a dropped coin would be re-skipped as
+                # "signal content dedup" for the rest of the current 5m bar
+                # (up to ~50 scan cycles) - a silent suppression window we
+                # did not intend.
+                _dj_fp = signal_fingerprint(_dj[1])
+                if _dj_fp is not None:
+                    _researched_signal_fps.discard(_dj_fp)
+            logger.warning(
+                f"[p0-4] jobs backpressure cap: dropped {len(_dropped_jobs)} "
+                f"low-score job(s) (top-score kept); cap={_jobs_cap} "
+                f"jobs_before={_before} low_score_thr={_dropped_jobs[0][2]:.1f}"
+            )
 
         # ---- Phase 2: paid research (read-only), parallel if enabled ----
         def _run_research(_j_coin, _j_perception, _j_score, _j_gate):

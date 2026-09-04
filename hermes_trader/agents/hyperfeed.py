@@ -33,7 +33,10 @@ _funding_regime_cache: Optional[tuple[dict[str, Any], float]] = None
 # per-class long-vs-short count dominance margin used by _decide().
 _FUNDING_REGIME_DEFAULTS: dict[str, float] = {
     "ttl_sec": float(_FUNDING_REGIME_TTL_S),
-    "crowded_funding_threshold": 0.0001,
+    # Audit 2026-09-04 P1-11: 0.0001 equals the HL perp baseline (0.01% per 8h),
+    # which flagged nearly every coin as crowded. 0.0004 (0.04%) marks only
+    # genuinely extreme funding. Mirrors the canonical funding_regime block.
+    "crowded_funding_threshold": 0.0004,
     "oi_floor_crypto": 1e7,
     "oi_floor_other": 1e6,
     "class_dominance_margin": 5.0,

@@ -90,11 +90,27 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # expect int while the on-disk/pydantic value is float, spamming
     # "expected int, got float" schema warnings on every config read. The float
     # branch accepts both int and float; the literals just must be float-typed.
-    "max_trade_notional_usd": 800.0,
+    "max_trade_notional_usd": 30.0,
     "tp_scale_fraction": 0.5,
-    "max_concurrent": 10,
-    "max_total_notional_pct": 10.0,
-    "max_daily_loss_usd": -30.0,  # F4: float default aligns with schema (supplemental audit 2026-08-31)
+    "max_concurrent": 2,
+    "max_total_notional_pct": 4.0,
+    # Audit 2026-09-04 P0-3 (dimensional clarity): `max_total_notional_pct` is
+    # read as a MULTIPLE of aggregated equity (e.g. 4 → 400% of equity), NOT a
+    # percentage fraction. The `_pct` suffix is historical and misleading; the
+    # runtime and schema both treat it as an equity multiple. Production pins
+    # 4.0 (= 4× equity total-open-notional ceiling, within the 10x leverage
+    # band). 0 disables the cap. Do NOT set it to 0.04 expecting 4% — that
+    # would cap total notional at 4% of equity and freeze the account.
+    # Daily-loss kill-switch — P1-15 unified semantics (see
+    # risk_gates.effective_daily_loss_cutoff): the ENTRY gate halts new entries
+    # at the TIGHTER of (a) circuit_breaker.daily_loss_pct × equity [PRIMARY,
+    # scales with the account] and (b) this absolute USD floor [BACKSTOP for
+    # large accounts / misconfiguration]. Crossover is equity = $2 / 5% = $40:
+    # BELOW ~$40 the 5% leg is tighter (e.g. at the current ~$21 micro account
+    # 5% = -$1.05, which fires before the -$2 floor); ABOVE ~$40 the -$2 USD
+    # floor binds (at $200 the 5% leg would allow -$10). Neither leg is
+    # silently dead — the tighter (least negative) cutoff always fires first.
+    "max_daily_loss_usd": -2.0,  # F4: float default aligns with schema (supplemental audit 2026-08-31)
     # B-M11 (deep audit 2026-08-28): the global-halt and per-coin circuit
     # breakers only block NEW entries — positions already open keep bleeding
     # to their DSL stops during the halt window. These switches make them
@@ -112,18 +128,21 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # (default -50%, i.e. half the margin gone), flip the bot to mode=OFF and
     # fire a risk alert. This is the nuclear kill-switch that the tiered breakers
     # (time-windowed, open-blocking only) and the daily-loss USD switch do not
-    # cover: a single catastrophic gap-through (HYPE: -252% ROE). Default OFF —
-    # switching OFF is a deliberate operator action; the alert/audit still help.
-    "roe_halt_enabled": False,
+    # cover: a single catastrophic gap-through (HYPE: -252% ROE). Audit
+    # 2026-09-04 P1-16: dsl_exit.max_loss_roe_pct (3-5% ROE) is a PLANNED stop
+    # ORDER, not a realized-fill kill switch — a gap-through that fills at
+    # -50% ROE would never arm it, so the two are NOT redundant. Enabled by
+    # default; set false explicitly to opt out.
+    "roe_halt_enabled": True,
     "roe_halt_threshold_pct": -50.0,
     "daily_giveback_halt_pct": 0.35,
     "daily_giveback_min_peak_usd": 25.0,
     "crowded_with_min_conf": 0.8,
     "min_available_margin_pct": 0.1,
     "cooldown_min": 30,
-    "research_cooldown_min": 15,
+    "research_cooldown_min": 3,
     "held_research_interval_min": 10,
-    "min_ai_confidence": 0.7,
+    "min_ai_confidence": 0.62,
     "counter_regime_min_conf": 0.8,
     "max_crypto_long_correlated": 3,
     "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
@@ -321,15 +340,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # / 1e6 (HIP-3 equity+commodity), per-class long-vs-short count margin 5.
     "funding_regime": {
         "ttl_sec": 300,
-        "crowded_funding_threshold": 0.0001,
+        # Audit 2026-09-04 P1-11: HL perp funding routinely sits ~0.01% per 8h
+        # (0.0001), so a threshold AT the baseline flagged nearly every coin as
+        # "crowded" and tripped the crowded-trade protection when nothing was
+        # actually crowded. Raised to 0.04% (0.0004) — only genuinely abnormal
+        # funding (3-5x baseline) now marks a coin crowded.
+        "crowded_funding_threshold": 0.0004,
         "oi_floor_crypto": 10000000.0,
         "oi_floor_other": 1000000.0,
         "class_dominance_margin": 5,
     },
     "debate_gate": {
         "enabled": True,
-        "min_agreement": 0.6,
-        "min_agree_count": 3,
+        # Audit 2026-09-04 P1-21 note: min_agreement=0.4 and min_agree_count=2
+        # are numerically equivalent under the 5-role debate (2/5 == 0.4); the
+        # effective rule is "the stricter of the two wins". Pinned to match
+        # production (0.4 / 2).
+        "min_agreement": 0.4,
+        "min_agree_count": 2,
         # R12-C1: when true, a bull/bear split defaults to a third-analyst
         # tiebreak instead of fail-closed disagreement. Was implicit via
         # debate_cfg.get("analyst3_default", False) in risk_gates.
@@ -341,7 +369,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # any failure.
     "debate_research": {
         "enabled": False,
-        "max_latency_s": 15.0,
+        # Audit 2026-09-04 P0-7: unified with research_llm.timeout_sec=25 so
+        # the debate's overall latency budget and the LLM per-call timeout
+        # agree — when the debate gives up, the LLM call has already timed
+        # out (no residual 12s burning of quota after a debate abort).
+        "max_latency_s": 25.0,
+        # Audit 2026-09-04 P0-1: optional per-leg timeouts. When set they win
+        # over the max_latency_s fractions; when unset the legs scale directly
+        # off max_latency_s (bull 0.7×, synth 0.92×) with no hard cap, so a
+        # raised max_latency actually lengthens the debate legs. Added because
+        # the former hard 18/24s clamps made max_latency_s>25.7s a no-op.
+        "bull_timeout_s": None,
+        "synth_timeout_s": None,
         "cache_ttl_s": 300.0,
         # P2-2: max entries in the in-process verdict cache (composite key of
         # coin + score bucket + trigger hash); oldest-expiry evicted past cap.
@@ -672,6 +711,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # halt_n <= 0 disables the halt (rehydrate still runs each time).
         "resp_unknown_halt_n": 3,
         "resp_unknown_halt_min": 60.0,
+        # Audit 2026-09-04 P1-10: drawdown-freeze rolling window & cooldown were
+        # read via caller-default literals (14 days / 24 hours) in memory.py and
+        # never registered here, so they couldn't be tuned via config/panel/CLI
+        # and were invisible to config diffs. Registered now (hot-reloadable).
+        "drawdown_peak_window_days": 14.0,
+        "drawdown_cooldown_hours": 24.0,
     },
     # market_circuit (roadmap §3, 2026-09-04): MARKET-level tail-risk breaker.
     # circuit_breaker above halts after THIS bot loses money (per-coin/daily
@@ -681,13 +726,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # index funding. A trip arms the EXISTING global halt (set_global_halt),
     # which global_halt_gate enforces and bm11_breaker_flatten turns into a
     # hard flatten when auto_flatten_on_global_halt is on (default on).
-    # mode mirrors ta_late_entry's gray-release: "off" = absent (DEFAULT —
-    # roadmap: explicitly arm after shadow review); "shadow" = verdict/metrics/
-    # JSONL recorded but halt NEVER armed; "enforce" = arms the global halt.
-    # False trips flatten a healthy book, so the defaults are deliberately
-    # conservative and every trigger is independently disable-able.
+    # mode mirrors ta_late_entry's gray-release: "off" = absent;
+    # "shadow" = verdict/metrics/JSONL recorded but halt NEVER armed (DEFAULT —
+    # audit 2026-09-04 P1-12: was "off", leaving index-crash/stop-cluster/
+    # funding tail protection completely inert; shadow first to observe trip
+    # frequency, then arm to "enforce" after review); "enforce" = arms the
+    # global halt. False trips flatten a healthy book, so the defaults are
+    # deliberately conservative and every trigger is independently
+    # disable-able.
     "market_circuit": {
-        "mode": "off",
+        "mode": "shadow",
         # --- Trigger 1: index short-window crash (BTC/ETH) ---
         "index_crash_enabled": True,
         # Candle timeframe for the crash leg ("1m"/"5m"/"15m"). The watched
@@ -726,8 +774,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     #   2. ta_late_entry_gate() — hard pre-trade gate in eval_all_gates()
     #   3. scripts/backtest.py — backtest entry path (rule parity)
     # mode controls the pre-trade GATE only (the pre-filter veto is always
-    # active): "off" = gate absent; "shadow" = verdict recorded + metrics but
-    # never blocks (gray-release, run 3-7 days); "enforce" = blocks orders.
+    # active): "off" = gate absent; "enforce" = blocks orders (the DEFAULT).
+    # SHADOW/LIVE PARITY (2026-09-04): the former "shadow" gray-release value
+    # (record but never block) was removed — it made SHADOW silently skip the
+    # gate while LIVE blocked, breaking 1:1 parity. The gate now enforces
+    # identically in both modes; a stale "shadow" value is normalised to
+    # "enforce" at read time. The verdict JSONL/metrics remain additive audit
+    # output.
     # Thresholds: 4h RSI / extension-in-ATR veto is OR semantics; when 4h ADX
     # >= adx_trend_threshold and the EMA trend aligns with the trade side the
     # relaxed limits apply (trend exception); on a 4h veto with 15m RSI not
@@ -735,7 +788,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # Per-trader tuning is via env HERMES_CFG_TA_LATE_ENTRY__<KEY>; no global
     # hard-coded numbers outside this block.
     "ta_late_entry": {
-        "mode": "shadow",
+        "mode": "enforce",
         # --- 4h hard veto thresholds (normal regime) ---
         "rsi_ob": 75,
         "rsi_os": 25,
@@ -885,16 +938,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "temperature": 0.1,
         "max_tokens": 500,
         "debate_max_tokens": 350,
-        "timeout_sec": 60.0,
+        # Audit 2026-09-04 P0-7: unified with debate_research.max_latency_s=25
+        # so a debate abort and the LLM per-call timeout line up — no residual
+        # 12s of quota burn after the debate gives up.
+        "timeout_sec": 25.0,
         "connect_timeout_sec": 5.0,
         "retries": 2,
         "backoff_base_sec": 1.0,
         "backoff_cap_sec": 15.0,
-        "continuations": 2,
+        # Audit 2026-09-04 P1-13: continuations=2 meant an incomplete LLM reply
+        # auto-continued up to twice → worst case 25s×3 = 75s per call, well
+        # beyond the debate latency budget. Capped at 1.
+        "continuations": 1,
         # Audit 2026-09-03 P0-2: hard per-call cap for the single-LLM
         # fallback path (debate failed -> _call_ai). 0 disables the cap
         # (legacy 60s inheritance). Mirrors research.py literal verbatim.
-        "fallback_timeout_sec": 30.0,
+        # Audit 2026-09-04 P0-7: aligned to 25s in sync with research_llm
+        # timeout_sec and debate max_latency_s.
+        "fallback_timeout_sec": 25.0,
     },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
@@ -970,7 +1031,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "analyst2_very_high_score": 20,
         # debate_gate analyst5 (whale boost): confidence floor that lets a
         # non-whale trade still earn the vote at risk_gates L645.
-        "analyst5_whale_or_conf": 0.75,
+        # Audit 2026-09-04 P1-9: was 0.75, ABOVE the min_ai_confidence entry
+        # gate (0.62). A trade in [0.62, 0.75) cleared the entry gate but
+        # systematically lost this 5th vote, slashing debate-gate pass rate —
+        # inconsistent with the "0.62 is enough to enter" intent. Aligned to
+        # 0.62 so a confidence that can enter can also earn this vote.
+        "analyst5_whale_or_conf": 0.62,
     },
     # R13-B4: executor execution-path constants (executor.py). Three gaps:
     #   * tp_atr_mult DRIFT FIX — the key was already registered (above) and
@@ -1019,15 +1085,25 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "taker_fee_pct": 0.025,
         # Number of fills per round trip (entry + exit = 2).
         "round_trip_fills": 2,
-        # Cap on concurrent virtual positions (defensive; live max_concurrent
-        # already gates entries, this bounds the paper book).
-        "max_positions": 10,
+        # Cap on concurrent virtual positions. SHADOW/LIVE PARITY: the paper
+        # book MUST admit exactly the same number of concurrent positions a
+        # live book would — a higher cap would let SHADOW book entries the
+        # live max_concurrent gate blocks, skewing backtest stats. This key is
+        # therefore OMITTED from the canonical default: shadow_book
+        # _max_positions() falls back to the global ``max_concurrent`` when
+        # unset, so the two caps can never drift apart. Operators may set it
+        # explicitly (production pins both to 2); a mismatch DRIFT-warns.
     },
     # R12-C1: optional lower confidence floor for regime-aligned entries
     # (LONG in up-trend / SHORT in down-trend). None = feature off (the
     # global min_ai_confidence applies uniformly). Was implicit via
     # config.get("aligned_min_conf") in risk_gates.
-    "aligned_min_conf": None,
+    # Audit 2026-09-04 P0-5: production set this to null (feature off), which
+    # silently disabled the aligned-trend relaxation with no warning. The code
+    # comment documents 0.78 as the LONG-side calibration. Enable it at 0.60 —
+    # below the production min_ai_confidence=0.62 — so a WITH-TREND entry gets
+    # a genuine lower bar while neutral/counter-trend keep the default 0.62.
+    "aligned_min_conf": 0.60,
     # P1-6: trading_loop runtime knobs (scripts/trading_loop.py). Eighteen
     # leaves covering the loop log file path, the surge-postmortem notify
     # threshold, the self-heal watchdog timeout, the intra-cycle exit
@@ -1067,6 +1143,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "ws_status_fresh_s": 10.0,
         "research_parallel": True,
         "research_parallel_workers": 4,
+        # 2026-09-04: per-scan jobs backpressure cap (mirrors
+        # loop_runtime.LOOP_RUNTIME_DEFAULTS); 0 disables the cap.
+        "research_max_jobs_per_scan": 8,
     },
     # 配置文件注释字段（不参与交易逻辑）
     "_comment": "",
@@ -1269,6 +1348,85 @@ def validate_config_dict(cfg: dict[str, Any], *, strict_keys: bool = True) -> li
             seen.add(ce)
 
     return errors
+
+
+# P1-14 (audit 2026-09-04): startup SAFETY ENVELOPE. Canonical defaults now
+# match production, but a hand-edited config (or a future code regression that
+# loosens a default) can still set a risk-critical key to an out-of-envelope
+# value — e.g. max_concurrent=20 or max_trade_notional_usd=10_000 on a $20
+# account. Schema range checks only catch TYPE/absurd errors, not "this value
+# is 5–27× looser than the production risk posture". These bounds are the
+# conservative envelope; BREACHING them refuses to trade rather than silently
+# running with ballooned exposure. Pure function for offline tests.
+#   (dotted_key, operator, bound, human) — operator in {">", ">=", "<", "<="};
+#   the check FAILS if cfg value compares past the bound away from safety.
+_STARTUP_SAFETY_CHECKS: list[tuple[str, str, float, str]] = [
+    ("max_trade_notional_usd", ">", 500.0,
+     "per-trade notional cap > $500 is far beyond the production micro-book"),
+    ("max_concurrent", ">", 6,
+     "more than 6 concurrent positions is beyond the production book (live: 2)"),
+    ("max_total_notional_pct", ">", 10.0,
+     "total-open-notional > 10× equity exceeds the leverage band"),
+    ("leverage", ">", 20,
+     "leverage > 20x far exceeds production sizing (live: 10)"),
+    ("risk_per_trade_pct", ">", 0.10,
+     "risk_per_trade_pct > 10% risks >10% equity on one stop"),
+    ("min_ai_confidence", "<", 0.50,
+     "min_ai_confidence < 0.50 admits coin-flip verdicts as entries"),
+    ("max_daily_loss_usd", "<", -50.0,
+     "daily USD loss floor looser than -$50 on the production book"),
+]
+
+
+def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
+    """Check the MERGED config *cfg* against the P1-14 startup safety envelope.
+
+    Returns a list of human-readable error strings (empty when the config is
+    safe to run with). Called by the trading loop BEFORE the first scan; a
+    non-empty result must stop the loop (refuse to trade) rather than fall
+    back to defaults mid-run. Uses the same dotted-key lookup as cfg_get so
+    nested keys are resolved against the merged view.
+    """
+    errors: list[str] = []
+    for dotted, op, bound, human in _STARTUP_SAFETY_CHECKS:
+        try:
+            val = _lookup_in_dict(cfg, dotted)
+        except Exception:
+            val = None
+        if val is None:
+            # Missing keys resolve to canonical defaults via cfg_get at use
+            # sites, and the canonical values are within envelope — not a
+            # startup error here.
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            errors.append(f"startup safety: {dotted}={val!r} is not numeric ({human})")
+            continue
+        breach = (
+            (op == ">" and num > bound)
+            or (op == ">=" and num >= bound)
+            or (op == "<" and num < bound)
+            or (op == "<=" and num <= bound)
+        )
+        if breach:
+            errors.append(
+                f"startup safety: {dotted}={num} {op} {bound} — {human}")
+    return errors
+
+
+def startup_safety_bypass_acked() -> bool:
+    """True when the operator has explicitly acked a startup safety breach.
+
+    The loop MUST NOT read HERMES_SKIP_STARTUP_SAFETY directly (all HERMES_*
+    knobs resolve through helpers so the env surface stays registered in one
+    place). Set HERMES_SKIP_STARTUP_SAFETY=1 to deliberately run a config that
+    breaches the conservative envelope; the breaches are still logged at
+    CRITICAL.
+    """
+    import os
+
+    return os.environ.get("HERMES_SKIP_STARTUP_SAFETY") == "1"
 
 
 def _validate_or_raise(

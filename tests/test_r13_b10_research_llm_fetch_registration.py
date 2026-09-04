@@ -130,14 +130,17 @@ def test_r13_b10_individual_llm_leaf_values_sentinel():
     assert b["temperature"] == 0.1
     assert b["max_tokens"] == 500
     assert b["debate_max_tokens"] == 350
-    assert b["timeout_sec"] == 60.0
+    # Audit 2026-09-04 P0-7: unified with debate_research.max_latency_s=25.
+    assert b["timeout_sec"] == 25.0
     assert b["connect_timeout_sec"] == 5.0
     assert b["retries"] == 2
     assert b["backoff_base_sec"] == 1.0
     assert b["backoff_cap_sec"] == 15.0
-    assert b["continuations"] == 2
+    # Audit 2026-09-04 P1-13: continuations capped to 1 (was 2 → 75s worst case).
+    assert b["continuations"] == 1
     # Audit 2026-09-03 P0-2: fallback path per-call cap; 0 disables.
-    assert b["fallback_timeout_sec"] == 30.0
+    # Audit 2026-09-04 P0-7: aligned to 25s.
+    assert b["fallback_timeout_sec"] == 25.0
 
 
 def test_r13_b10_individual_fetch_leaf_values_sentinel():

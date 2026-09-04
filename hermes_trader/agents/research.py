@@ -204,18 +204,25 @@ _RESEARCH_LLM_DEFAULTS: dict[str, Any] = {
     "temperature": 0.1,
     "max_tokens": 500,
     "debate_max_tokens": 350,
-    "timeout_sec": 60.0,
+    # Audit 2026-09-04 P0-7: kept in sync with canonical
+    # research_llm.timeout_sec=25 and debate_research.max_latency_s=25 so a
+    # debate abort and the LLM per-call timeout line up (no residual quota
+    # burn after the debate gives up).
+    "timeout_sec": 25.0,
     "connect_timeout_sec": 5.0,
     "retries": 2,
     "backoff_base_sec": 1.0,
     "backoff_cap_sec": 15.0,
-    "continuations": 2,
+    # Audit 2026-09-04 P1-13: continuations=2 → worst case 25s×3=75s per call,
+    # beyond the debate latency budget. Kept in sync with canonical; capped at 1.
+    "continuations": 1,
     # Audit 2026-09-03 P0-2: hard per-call cap for the SINGLE-LLM FALLBACK
     # path (debate timed out/failed → _call_ai). The debate path has its own
     # 18s/24s caps, but the fallback used to inherit the full 60s timeout ×
     # (retries+1) ≈ 180s worst case, which produced the 30-46s slow-scan
     # cluster. 0 disables the cap (legacy behaviour).
-    "fallback_timeout_sec": 30.0,
+    # Audit 2026-09-04 P0-7: kept at 25s in sync with research_llm.timeout_sec.
+    "fallback_timeout_sec": 25.0,
 }
 # leaf -> (legacy env var or None, kind "i"/"f"/"s", minimum guard).
 _RESEARCH_LLM_SPEC: dict[str, tuple[Optional[str], str, float]] = {
@@ -458,6 +465,18 @@ _NEWS_FRESHNESS_DAYS_DEFAULT = 2
 # 2-min cache avoids duplicate API calls when research fires for multiple coins
 # in quick succession (e.g. a 3-trigger scan cycle). TTL is config-driven
 # (news_cache_ttl_s); this is the fallback default.
+#
+# Audit 2026-09-04 P2-19 note: this is ONE of two independent news caches and
+# they must NOT be merged — they sit on different data sources for different
+# consumers:
+#   * _NEWS_CACHE (here): Brave Search API headlines (text prompts), consumed
+#     by the debate/LLM research path. Keyed per coin; TTL news_cache_ttl_s
+#     (default 120s).
+#   * news_catalyst._cache (news_catalyst.py): GDELT/RSS articles + coverage
+#     surge, consumed by the trade-signal catalyst path. Keyed per
+#     (source, query, timespan); TTL news_catalyst.ttl_sec (default 300s).
+# The shorter LLM TTL keeps the debate prompt current; the longer signal TTL
+# is fine because a breaking-surge read is deliberately lagged.
 _NEWS_CACHE: dict[str, tuple] = {}
 _NEWS_CACHE_TTL_S_DEFAULT = 120
 _NEWS_CACHE_LOCK = threading.Lock()
@@ -760,7 +779,19 @@ def _build_user_message(
         f"Recent news: {news}",
         position_block,
         "",
-        f"Mode: {mode} — {'your verdict will execute against real funds' if mode == 'LIVE' else 'analysis only, no execution'}",
+        f"Mode: {mode} — "
+        + (
+            "your verdict will execute against real funds"
+            if mode == "LIVE"
+            else (
+                # SHADOW: do NOT hint "no execution" — that biases the AI
+                # toward looser calls it wouldn't take live. Frame it as
+                # evaluated under LIVE-identical gates (SHADOW/LIVE parity).
+                "your verdict is recorded and evaluated against LIVE-identical risk gates; decide with the SAME conviction and rigor as if real funds were at stake"
+                if mode == "SHADOW"
+                else "analysis only, no execution"
+            )
+        ),
         "",
         'Respond with 2-3 bullet points of reasoning, then output your decision as VALID JSON on the very last line:',
         '{"verdict":"PASS"|"LONG"|"SHORT"|"CLOSE","confidence":0.0-1.0,"side":"long"|"short"|"null","entryPx":number,"stopPx":number,"tpPx":number,"reasoning":"brief"}',
@@ -1484,6 +1515,13 @@ def _debate_cfg() -> dict[str, Any]:
         "cache_ttl_s": float(d.get("cache_ttl_s", 300)),
         "parallel": bool(d.get("parallel", True)),
         "use_structured_output": bool(d.get("use_structured_output", True)),
+        # Audit 2026-09-04 P0-1: optional per-leg timeouts. When set they win
+        # over the max_latency_s fractions below (no hard-coded 18/24 caps);
+        # when unset the timeouts scale directly off max_latency_s so a
+        # raised max_latency actually lengthens the debate legs (previously a
+        # hard clamp at 18/24 made max_latency_s>25.7s a no-op).
+        "bull_timeout_s": d.get("bull_timeout_s"),
+        "synth_timeout_s": d.get("synth_timeout_s"),
     }
 
 
@@ -1503,10 +1541,19 @@ def _debate_per_call_timeout() -> float:
     """Per-LLM-call timeout (seconds) for bull/bear (parallel, ~1900 char prompts).
 
     Bull/bear run in parallel (~5-10s each on Ark, but two simultaneous
-    requests can push P95 to ~15s). 18s gives enough headroom for P95.
+    requests can push P95 to ~15s). The timeout scales directly off
+    ``debate_research.max_latency_s`` (0.7×) unless an explicit
+    ``bull_timeout_s`` is configured — the historical hard 18s clamp was
+    removed so a raised max_latency actually lengthens the leg (P0-1).
+    A floor of 8s guards against a degenerate max_latency config.
     """
     dcfg = _debate_cfg()
-    return max(8.0, min(18.0, dcfg["max_latency_s"] * 0.7))
+    if dcfg["bull_timeout_s"] is not None:
+        try:
+            return max(8.0, float(dcfg["bull_timeout_s"]))
+        except (TypeError, ValueError):
+            pass
+    return max(8.0, dcfg["max_latency_s"] * 0.7)
 
 
 def _debate_synth_timeout() -> float:
@@ -1514,10 +1561,19 @@ def _debate_synth_timeout() -> float:
 
     Synth runs serially after bull/bear and its prompt is ~3300 chars (bull +
     bear + market data), so P95 latency is higher than the individual bull/bear
-    calls. Give it up to 24s while staying under the overall max_latency cap.
+    calls. The timeout scales directly off ``debate_research.max_latency_s``
+    (0.92×) unless an explicit ``synth_timeout_s`` is configured — the
+    historical hard 24s clamp was removed so a raised max_latency actually
+    lengthens the leg (P0-1). A floor of 12s guards against a degenerate
+    max_latency config.
     """
     dcfg = _debate_cfg()
-    return max(12.0, min(24.0, dcfg["max_latency_s"] * 0.92))
+    if dcfg["synth_timeout_s"] is not None:
+        try:
+            return max(12.0, float(dcfg["synth_timeout_s"]))
+        except (TypeError, ValueError):
+            pass
+    return max(12.0, dcfg["max_latency_s"] * 0.92)
 
 
 def _debate_direct(

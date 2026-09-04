@@ -90,6 +90,10 @@ class _ConfigPatch(BaseModel):
     equity_fraction_per_trade: float = Field(default=CANONICAL_DEFAULTS["equity_fraction_per_trade"], gt=0, le=1)
     min_ai_confidence: float = Field(default=CANONICAL_DEFAULTS["min_ai_confidence"], ge=0, le=1)
     max_trade_notional_usd: float = Field(default=CANONICAL_DEFAULTS["max_trade_notional_usd"], ge=0.0)
+    # Audit 2026-09-04 P0-3: `max_total_notional_pct` is an EQUITY MULTIPLE
+    # (4 → 400% of aggregated equity), NOT a percentage fraction. The `_pct`
+    # suffix is historical; the runtime treats it as a multiple. Do NOT set
+    # 0.04 expecting 4% — that freezes the account.
     max_total_notional_pct: float = Field(default=CANONICAL_DEFAULTS["max_total_notional_pct"], ge=0.0, le=50.0)
     max_daily_loss_usd: float = Field(default=CANONICAL_DEFAULTS["max_daily_loss_usd"], le=0.0)
     # C3 (HYPE RCA item 5): leveraged ROE loss (%) on a SINGLE closing trade
@@ -434,9 +438,12 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
     "ta_late_entry": {
-        # off = gate absent; shadow = record/metrics only (gray release);
-        # enforce = late entries are actually blocked.
-        "mode": ("enum", ("off", "shadow", "enforce")),
+        # off = gate absent; enforce = late entries are blocked (DEFAULT, and
+        # mode-independent — it enforces identically in SHADOW and LIVE). The
+        # legacy gray-release "shadow" (record/never block) was removed for
+        # SHADOW/LIVE parity; a stale "shadow" on disk is normalised to
+        # "enforce" by the gate, not accepted on new updates.
+        "mode": ("enum", ("off", "enforce")),
         # 4h hard veto: RSI extremes OR price extension in ATR units.
         "rsi_ob": _num_leaf(50.0, 100.0),
         "rsi_os": _num_leaf(0.0, 50.0),

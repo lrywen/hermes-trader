@@ -96,9 +96,10 @@ def test_mc_block_registered_with_14_leaves():
 
 
 def test_mc_default_values_sentinel():
-    """锁死默认值：mode 默认 off（roadmap 硬约束），funding 默认关。"""
+    """锁死默认值：mode 默认 shadow（P1-12 2026-09-04：原 off 使指数暴跌/止损
+    聚集/资金费率极端三保护全部静默；shadow 先记录不武装 halt，观察后再 enforce）。"""
     b = CANONICAL_DEFAULTS[BLOCK]
-    assert b["mode"] == "off"                    # 必须显式武装
+    assert b["mode"] == "shadow"                 # 记录不武装，非 off
     assert b["index_crash_enabled"] is True
     assert b["index_crash_interval"] == "5m"
     assert b["index_crash_pct"] == 2.0
@@ -180,7 +181,11 @@ def test_mc_config_patch_drift_sentinel():
     assert field is not None
     blk = field.default_factory()
     assert len(blk) == 14
-    assert blk["mode"] == "off"
+    # P1-12 (audit 2026-09-04): default was "off" — the breaker's full
+    # parameter set was shipped but inert, leaving index-crash / stop-cluster
+    # / funding-extreme events unprotected. Default is now "shadow" (records
+    # trips without blocking until trigger frequency is observed).
+    assert blk["mode"] == "shadow"
     assert blk["index_crash_pct"] == 2.0
 
 
