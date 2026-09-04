@@ -280,6 +280,29 @@ def test_record_stop_feeds_module_window():
     assert any(e["coin"] == "TESTCOIN-MC" for e in mc._stop_window.events())
 
 
+def test_record_stop_uses_explicit_ts_and_filters_in_decide():
+    # External/exchange-side backfills pass the actual fill timestamp (ms),
+    # not detection time: three in-window distinct coins trip the cluster,
+    # while a stale fill (e.g. detected after a restart) is excluded.
+    now = 2_000_000
+    # three coins filled within the 180s window, fed with real fill times
+    mc._stop_window._events.clear()
+    mc.record_stop("BTC", now - 5_000)
+    mc.record_stop("ETH", now - 6_000)
+    mc.record_stop("SOL", now - 7_000)
+    v = mc.decide({}, index_drawdowns={},
+                  stop_events=mc._stop_window.events(), now_ms=now)
+    assert v["tripped"] and v["trigger"] == "stop_cluster"
+    # a fourth coin's stale fill (older than the window) must NOT count
+    mc._stop_window._events.clear()
+    mc.record_stop("BTC", now - 1_000)
+    mc.record_stop("ETH", now - 2_000)
+    mc.record_stop("SOL", now - 200_000)
+    v2 = mc.decide({}, index_drawdowns={},
+                   stop_events=mc._stop_window.events(), now_ms=now)
+    assert not v2["tripped"]
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # C. evaluate —— off/shadow/enforce、冷却、fail-open、shadow JSONL
 # ══════════════════════════════════════════════════════════════════════════
@@ -525,5 +548,16 @@ def test_trading_loop_source_wiring():
             "import record_stop as market_circuit_record_stop") in TRADING_LOOP_SRC
     # DSL close path feeds the stop-cluster window
     assert "market_circuit_record_stop(coin)" in TRADING_LOOP_SRC
+    # external/exchange-side close backfill (server-side SL / liquidation)
+    # also feeds the window, using the actual exchange fill timestamp; and the
+    # feed comes AFTER a confirmed fill is recorded — the unattributed no-fill
+    # branch logs and `continue`s earlier and must not feed the window. Scope
+    # the search to the backfill region (the event name is also listed in an
+    # event registry earlier in the file).
+    _region = TRADING_LOOP_SRC[
+        TRADING_LOOP_SRC.index("external_close_unattributed"):]
+    _recorded = _region.index('log_event({"event": "external_close_recorded"')
+    _feed = _region.index("market_circuit_record_stop(_tr.coin, _closed_at)")
+    assert _recorded < _feed
     # main loop runs one tick per cycle after the exit pass
     assert "market_circuit_tick(_cfg, memory, equity, positions)" in TRADING_LOOP_SRC

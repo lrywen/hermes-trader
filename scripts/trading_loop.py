@@ -1398,6 +1398,17 @@ while True:
                                        "realized_pnl_usd": _net_usd,
                                        "leverage": _lev,
                                        "oid": _fill.get("oid")})
+                            # Feed the market-circuit stop-cluster window
+                            # (roadmap §3 trigger 2) for exchange-side closes
+                            # too: in a correlated on-venue crash many positions
+                            # get stopped/liquidated server-side and bypass the
+                            # DSL close path, so without this the cluster
+                            # trigger would never see them. Pass the actual
+                            # exchange fill time (_closed_at, ms) rather than
+                            # detection time so the 180s window filters by real
+                            # event time and stale backfills after a restart
+                            # don't pollute the current window.
+                            market_circuit_record_stop(_tr.coin, _closed_at)
                             # Arm the loss cooldown on a losing external fill
                             # so an exchange-side stop also enforces the
                             # anti-revenge re-entry block (normally done by
