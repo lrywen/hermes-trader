@@ -105,6 +105,7 @@ target/
 # Local backtest output
 backtest-trades.csv
 .oi-history.json
+.backtest_cache.json
 
 # Local timestamped backups (config edits, etc.)
 *.bak-*
