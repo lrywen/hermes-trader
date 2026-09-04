@@ -946,6 +946,15 @@ def _atr_calib_record_shadow(rec: dict[str, Any], path: str) -> None:
         logger.warning("[atr-calib] shadow write failed: %s", e)
 
 
+def _atr_calib_metric(mode: str, outcome: str) -> None:
+    """Best-effort Prometheus counter (roadmap R7 registration)."""
+    try:
+        from hermes_trader import metrics
+        metrics.ATR_REGIME_CALIB_OBSERVATIONS.labels(mode=mode, outcome=outcome).inc()
+    except Exception:
+        pass
+
+
 def _atr_calib_apply(
     *,
     effective_stop_pct: float,
@@ -1007,6 +1016,7 @@ def _atr_calib_apply(
         }, _atr_calib_shadow_path(cfg["block"]))
     except Exception as e:
         logger.debug(f"[atr-calib] shadow record failed for {coin}: {e}")
+    _atr_calib_metric(mode, "applied" if would_change else "no_change")
 
     return {
         "mode": mode,
@@ -1199,6 +1209,15 @@ def _confidence_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
         logger.warning("[confidence-decay] shadow write failed: %s", e)
 
 
+def _confidence_decay_metric(mode: str, outcome: str) -> None:
+    """Best-effort Prometheus counter (roadmap R7 registration)."""
+    try:
+        from hermes_trader import metrics
+        metrics.CONFIDENCE_DECAY_OBSERVATIONS.labels(mode=mode, outcome=outcome).inc()
+    except Exception:
+        pass
+
+
 def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) -> None:
     """Apply the AI-confidence freshness decay in place (roadmap §2).
 
@@ -1223,6 +1242,9 @@ def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) ->
     age_s = _confidence_decay_age_s(coin, sig, time.time())
     factor = decay_factor(age_s * 1000.0, cfg["halflife_s"] * 1000.0)
     decayed = raw * factor
+    # Outcome label: would_block (shadow counterfactual) / applied (factor
+    # actually bites) / no_change (fresh verdict, factor ≈ 1).
+    _outcome = "applied" if factor < 0.999 else "no_change"
     # Confidence gate threshold for the counterfactual "would this entry have
     # been blocked?" tag (aligned with risk_gates' min_ai_confidence read).
     try:
@@ -1257,6 +1279,8 @@ def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) ->
         }, _confidence_decay_shadow_path(cfg["block"]))
     except Exception as e:
         logger.debug(f"[confidence-decay] shadow record failed for {coin}: {e}")
+    _confidence_decay_metric(
+        mode, "would_block" if bool(raw >= min_conf and decayed < min_conf) else _outcome)
 
 
 # Plan B regime-strength score uses the same 5-component weights as

@@ -64,10 +64,10 @@ def _get_data_gaps() -> int:
 # coin across cycles and decay its weight by exp(-onset_age/halflife). Pulse
 # triggers (momentumBurst / pctMoveSpike / volumeSpike) already self-extinguish
 # when velocity falls, so their halflife is infinite (no decay) — an extra age
-# factor would double-penalize them. The half-life defaults live here (config
-# block `signal_age_decay`, seconds; 0 = never decay) and are overridable via
-# the merged agent-config; canonical schema/CANONICAL_DEFAULTS registration is a
-# follow-up once the parallel config refactor lands.
+# factor would double-penalize them. The half-life defaults live in the
+# canonical config block `signal_age_decay` (registered in
+# CANONICAL_DEFAULTS / config_schema, seconds; 0 = never decay) and are
+# overridable via the merged agent-config.
 #
 # Modes (mirrors market_circuit gray-release):
 #   off     — no state, no score change (default).
@@ -191,6 +191,15 @@ def _age_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except OSError as e:
         logger.warning("[age-decay] shadow write failed: %s", e)
+
+
+def _age_decay_metric(mode: str, outcome: str) -> None:
+    """Best-effort Prometheus counter (roadmap R7 registration)."""
+    try:
+        from hermes_trader import metrics
+        metrics.SIGNAL_AGE_DECAY_OBSERVATIONS.labels(mode=mode, outcome=outcome).inc()
+    except Exception:
+        pass
 
 # ── Candle cache (module-level, shared across ticks) ──────────────────────────
 # Per-coin TTL cache backed by the shared _Cache abstraction (LRU + TTL). The
@@ -630,6 +639,14 @@ def _scan_single_market(
                             _dec_mode, market["coin"], raw_score, decayed_score,
                             min_score, _fired_names,
                         )
+                    # Outcome label: would_block (raw passed / decayed below
+                    # gate) / applied (decay bit at least one fired trigger) /
+                    # no_change.
+                    _age_decay_metric(
+                        _dec_mode,
+                        "would_block" if would_block
+                        else ("applied" if aged else "no_change"),
+                    )
             except Exception as _e:
                 # Observability only — never let decay logging affect a scan.
                 logger.debug(f"[age-decay] shadow record failed for {market['coin']}: {_e}")

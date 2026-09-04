@@ -261,6 +261,31 @@ MARKET_CIRCUIT_VERDICTS = Counter(
     ["mode", "verdict"],
 )
 
+# ── Gray-release decay / regime factors (roadmap §1/§2, 2026-09-04) ────
+# One observation per evaluation while mode != off. Bounded labels:
+# mode (shadow/enforce), outcome (applied/no_change/would_block). A
+# `would_block` outcome means the raw value passed the gate but the
+# decayed/calibrated one would not — shadow-only counterfactual.
+CONFIDENCE_DECAY_OBSERVATIONS = Counter(
+    "hermes_confidence_decay_observations_total",
+    "AI-confidence freshness-decay evaluations (executor.py), labelled by "
+    "mode and bounded outcome (applied/no_change/would_block).",
+    ["mode", "outcome"],
+)
+SIGNAL_AGE_DECAY_OBSERVATIONS = Counter(
+    "hermes_signal_age_decay_observations_total",
+    "Perception setup-age decay evaluations (perception.py), labelled by "
+    "mode and bounded outcome (applied/no_change/would_block).",
+    ["mode", "outcome"],
+)
+ATR_REGIME_CALIB_OBSERVATIONS = Counter(
+    "hermes_atr_regime_calib_observations_total",
+    "ATR volatility-regime stop-width factor evaluations (sizing.py via "
+    "executor.py), labelled by mode and bounded outcome "
+    "(applied/no_change).",
+    ["mode", "outcome"],
+)
+
 # ── State persistence (dsl_exit.py / memory.py) ────────────────────────
 # Alert when save/flush p95 > 0.5s (disk contention) or FLUSH_ERRORS /
 # save outcome=failed increments (a sick disk risks lost state).

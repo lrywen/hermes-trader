@@ -277,6 +277,14 @@ class _ConfigPatch(BaseModel):
     # ws_status switches + windows, and research-parallel switch + width.
     # Legacy HERMES_* env vars remain the top-priority channel.
     loop_runtime: dict[str, Any] = Field(default_factory=lambda: _dict_default("loop_runtime"))
+    # roadmap §1/§2 (2026-09-04): gray-release blocks. confidence_decay ages
+    # the AI verdict confidence; signal_age_decay ages the perception
+    # composite per trigger (nested halflife_s map); atr_regime_calibration
+    # scales stop width by the ATR volatility regime. Each carries the
+    # off|shadow|enforce mode switch and a shadow_log_path leaf.
+    confidence_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("confidence_decay"))
+    signal_age_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_age_decay"))
+    atr_regime_calibration: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_regime_calibration"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
@@ -486,6 +494,45 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "halt_minutes": _num_leaf(1.0, 1440.0),
         "cooldown_minutes": _num_leaf(0.0, 1440.0),
         "fetch_bars": ("int", 5, 500),
+        "shadow_log_path": ("str",),
+    },
+    # roadmap §2 (2026-09-04): AI-confidence freshness decay (executor.py).
+    # Scalar leaves only; halflife_s is the verdict half-life in seconds.
+    "confidence_decay": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "halflife_s": _num_leaf(1.0, 86_400.0),
+        "shadow_log_path": ("str",),
+    },
+    # roadmap §2 (2026-09-04): perception setup-age decay (perception.py).
+    # halflife_s is a nested trigger-name → seconds map (0 = never decay);
+    # onset_ttl_s prunes stale onset state.
+    "signal_age_decay": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "halflife_s": {
+            "breakout": _num_leaf(0.0, 86_400.0),
+            "trendStrength": _num_leaf(0.0, 86_400.0),
+            "rangeCompression": _num_leaf(0.0, 86_400.0),
+            "trendFlip1h": _num_leaf(0.0, 86_400.0),
+            "higherLows1h": _num_leaf(0.0, 86_400.0),
+            "volumeBuildup1h": _num_leaf(0.0, 86_400.0),
+            "momentumContinuation1h": _num_leaf(0.0, 86_400.0),
+            "pctMoveSpike": _num_leaf(0.0, 86_400.0),
+            "volumeSpike": _num_leaf(0.0, 86_400.0),
+            "momentumBurst": _num_leaf(0.0, 86_400.0),
+        },
+        "onset_ttl_s": _num_leaf(60.0, 7 * 86_400.0),
+        "shadow_log_path": ("str",),
+    },
+    # roadmap §1 (2026-09-04): ATR volatility-regime stop-width factor
+    # (sizing.atr_regime_calibration, called from executor.py).
+    "atr_regime_calibration": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "low_ratio": _num_leaf(0.1, 1.5),
+        "high_ratio": _num_leaf(1.0, 5.0),
+        "low_mult": _num_leaf(0.1, 1.0),
+        "high_mult": _num_leaf(1.0, 5.0),
+        "min_mult": _num_leaf(0.1, 1.0),
+        "max_mult": _num_leaf(1.0, 5.0),
         "shadow_log_path": ("str",),
     },
 }

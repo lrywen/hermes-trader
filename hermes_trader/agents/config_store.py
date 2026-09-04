@@ -767,6 +767,73 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
     },
+    # confidence_decay (roadmap §2, 2026-09-04): AI-conviction freshness
+    # decay. The debate cache replays the same LONG/SHORT verdict for minutes
+    # after the entry window has passed, so an aged conviction is multiplied
+    # by exp(-age/halflife) — the same time-decay math as the trigger
+    # age-decay below, applied to the AI's confidence instead of the TA
+    # composite score. mode off|shadow|enforce; off = absent (DEFAULT —
+    # production flips to shadow via HERMES_CONFIDENCE_DECAY_MODE; no env →
+    # zero behavior change). halflife_s is the verdict half-life in seconds
+    # (900 = 15 min). Structural PASS→LONG overrides are never decayed.
+    "confidence_decay": {
+        "mode": "off",
+        "halflife_s": 900.0,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # signal_age_decay (roadmap §2, 2026-09-04): setup-age decay for the
+    # perception composite score. Formation triggers keep firing at high
+    # score on every bar after the breakout matures (the FARTCOIN top-tick
+    # late-chase); each trigger's FIRST-fire bar per coin is tracked across
+    # cycles and its weight decayed by exp(-onset_age/halflife). Pulse
+    # triggers self-extinguish as velocity normalizes, so their halflife is
+    # 0 = never decay (an extra age factor would double-penalize them).
+    # halflife_s maps camelCase trigger names → seconds; onset_ttl_s prunes
+    # stale onset state (6h). mode off|shadow|enforce, default off.
+    "signal_age_decay": {
+        "mode": "off",
+        "halflife_s": {
+            # 5m formation triggers: edge is the breakout bar itself.
+            "breakout": 900.0,
+            "trendStrength": 1800.0,
+            "rangeCompression": 0.0,        # only feeds breakout coupling
+            "trendFlip1h": 7200.0,          # 1h formation setups
+            "higherLows1h": 7200.0,
+            "volumeBuildup1h": 7200.0,
+            "momentumContinuation1h": 7200.0,
+            # Pulse triggers self-extinguish — never decay.
+            "pctMoveSpike": 0.0,
+            "volumeSpike": 0.0,
+            "momentumBurst": 0.0,
+        },
+        # Stale-onset prune window, seconds (a setup quiet past this age
+        # restarts its clock on the next fire).
+        "onset_ttl_s": 21600.0,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # atr_regime_calibration (roadmap §1, 2026-09-04): continuous ATR-volatility
+    # regime factor for stop WIDTH sizing (sizing.atr_regime_calibration).
+    # When current ATR% is far below its recent mean (compressed vol, ratio <
+    # low_ratio), stops are tightened (factor down to min_mult); when far
+    # above (expansion, ratio > high_ratio), stops are widened (up to
+    # max_mult). Replaces the binary legacy ATR spike breaker in enforce mode.
+    # mode off|shadow|enforce, default off (shadow via
+    # HERMES_ATR_REGIME_CALIB_MODE in production).
+    "atr_regime_calibration": {
+        "mode": "off",
+        # Regime thresholds: ratio = current ATR% / historical mean ATR%.
+        "low_ratio": 0.6,
+        "high_ratio": 1.6,
+        # Factor at / beyond each threshold (clamped to [min_mult, max_mult]).
+        "low_mult": 0.85,
+        "high_mult": 1.20,
+        "min_mult": 0.75,
+        "max_mult": 1.35,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
     # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard gate.
     # The same late_entry_check() pure function (agents/ta_filter.py) runs in
     # three places with ONE source of truth for thresholds:
