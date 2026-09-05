@@ -101,6 +101,19 @@ EXECUTOR_SIZING_CLAMPED = Counter(
     "(max_notional/leverage/gray_pct/min_notional/other).",
     ["clamp"],
 )
+# P3 (2026-09-05): business-level liveness signal. Incremented by
+# notify_dispatch on an execute event whose ``executed`` flag is True
+# (an actual fill delivered to the exchange), labelled by side. A flat 6h
+# window with hermes_live_mode==1 and zero increase is the "no trades"
+# silent-failure alert (HermesNoFill in k8s/prometheusrule.yaml). In
+# SHADOW/mode_off no fills occur, so the alert gates on live mode to
+# avoid false positives.
+FILLS_TOTAL = Counter(
+    "hermes_position_fills_total",
+    "Actual position fills delivered to the exchange, labelled by side "
+    "(long/short). Incremented by notify_dispatch on execute.executed=True.",
+    ["side"],
+)
 
 # ── P3-1: full-chain instrumentation (2026-08-27) ──────────────────────
 # Every hot-path metric follows the existing contract:

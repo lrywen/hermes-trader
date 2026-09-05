@@ -75,9 +75,52 @@ def dispatch(record: dict[str, Any]) -> None:
             pass
 
 
+def _mirror_secondary(title: str, fields: dict[str, Any], level: str) -> None:
+    """Best-effort mirror of a critical card to a second push channel.
+
+    P3 (2026-09-05): the primary Feishu channel has no redundancy. If Feishu
+    is unreachable the operator is blind. When ``HERMES_NOTIFY_SECONDARY_WEBHOOK``
+    is set (a second Feishu custom-bot webhook — any webhook that accepts the
+    Feishu text-card JSON shape), we POST a compact text copy there. The call is
+    fire-and-forget: any failure is swallowed so it can never break the primary
+    notify path or the trading loop. No-op when the env var is unset, so it is
+    safe to leave this wired into every critical handler.
+    """
+    url = os.environ.get("HERMES_NOTIFY_SECONDARY_WEBHOOK")
+    if not url:
+        return
+    try:
+        import json
+        import urllib.request
+
+        lines = [f"[{level}] {title}"]
+        for k, v in (fields or {}).items():
+            lines.append(f"{k}: {v}")
+        payload = {"msg_type": "text", "content": {"text": "\n".join(lines)}}
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as _resp:  # noqa: S310
+            _ = _resp.status
+    except Exception as exc:  # never bubble up into the trading loop
+        logger.debug("secondary notify failed: %r", exc)
+
+
 def _on_execute(r: dict[str, Any]) -> None:
     coin = r.get("coin", "?")
     if r.get("executed"):
+        side = str(r.get("side") or "long").lower()
+        try:
+            from hermes_trader import metrics
+
+            metrics.FILLS_TOTAL.labels(
+                side=side if side in ("long", "short") else "other"
+            ).inc()
+        except Exception:
+            pass
         fields = {
             "币种": coin,
             "方向": r.get("side"),
@@ -89,6 +132,7 @@ def _on_execute(r: dict[str, Any]) -> None:
         }
         notify.send_card(f"开仓成交 — {coin}", fields=fields,
                          category="trade", level="success")
+        _mirror_secondary(f"开仓成交 — {coin}", fields, "success")
     else:
         blocked = r.get("blocked_by")
         reason = r.get("detail")
@@ -146,6 +190,7 @@ def _on_killswitch(r: dict[str, Any]) -> None:
     }
     notify.send_card("硬日亏熔断触发 — 已全仓平仓",
                      fields=fields, category="risk", level="danger")
+    _mirror_secondary("硬日亏熔断触发 — 已全仓平仓", fields, "danger")
 
 
 def _on_manual_order(r: dict[str, Any]) -> None:
@@ -196,6 +241,8 @@ def _on_error(r: dict[str, Any]) -> None:
     notify.send_card(f"系统错误 — {scope}", fields=fields,
                      category="system", level=level,
                      dedup_key=f"error:{scope}")
+    if level == "danger":
+        _mirror_secondary(f"系统错误 — {scope}", fields, "danger")
 
 
 def _on_loop_start(r: dict[str, Any]) -> None:
@@ -252,3 +299,5 @@ def _on_ws_status(r: dict[str, Any]) -> None:
     notify.send_card(title, fields=fields, markdown=f"**说明**\n{detail}",
                      category="system", level=level,
                      dedup_key=f"ws_status:{previous}->{status}")
+    if status == "down":
+        _mirror_secondary(title, fields, "danger")

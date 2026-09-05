@@ -298,3 +298,32 @@ spec:
               gap is widening — the loop's view of the order book
               is drifting. Investigate the WS transport (TCP MSS,
               any recent deploy that changed the SDK).
+
+    # ── Group 5: business-level liveness (P3, 2026-09-05) ───────────
+    - name: hermes.business
+      interval: 60s
+      rules:
+        - alert: HermesNoFill
+          # hermes_position_fills_total counts actual fills delivered to the
+          # exchange (notify_dispatch increments it on execute.executed=True,
+          # labelled by side). In LIVE mode a flat 6h window with zero new
+          # fills means the bot is alive (no circuit/open) but generating NO
+          # trades — a silent strategy failure, a mis-tuned gate, or a stuck
+          # research/LLM path. SHADOW/mode_off correctly show zero fills, so we
+          # gate on hermes_live_mode == 1 to avoid false positives.
+          expr: (hermes_live_mode == 1) and (increase(hermes_position_fills_total[6h]) == 0)
+          for: 0m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: business_liveness
+          annotations:
+            summary: "LIVE mode but no fills in the last 6h"
+            description: |
+              ``hermes_live_mode == 1`` yet
+              ``increase(hermes_position_fills_total[6h]) == 0``. The bot is in
+              LIVE mode and not erroring, but has executed zero positions in 6h.
+              This is a silent-failure signal: a mis-tuned gate, a stuck
+              research/LLM path, or a market regime with no qualifying setups.
+              Confirm via ``hermes_executor_decisions_total`` and the per-coin
+              cooldown/circuit counters before assuming "no signal".
