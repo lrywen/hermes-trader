@@ -821,8 +821,9 @@ def test_detect_regime_caches_and_uses_proxy(monkeypatch):
     assert calls == ["BTC"]
     # Equity coin uses its OWN trend now (audit fix #3, 2026-06-02): each equity is
     # gated by its own chart, not the single xyz:SP500 proxy. SP500 is only the
-    # fallback when the name's own trend reads neutral/thin. _detect_for_proxy is
-    # stubbed to "up", so the own-trend ("TSLA") resolves and is used directly.
+    # fallback when the name's own trend reads neutral/thin.
+    # _detect_for_proxy_with_score is stubbed to "up", so the own-trend
+    # ("TSLA") resolves and is used directly.
     assert market_regime.detect_regime("TSLA") == "up"
     assert calls == ["BTC", "TSLA"]
     # Commodity uses its own ticker
@@ -3945,6 +3946,486 @@ def test_ta_late_entry_gate_mtf_override_passes_in_enforce(monkeypatch):
     _patch_candles(monkeypatch, bull4h, healthy15m)
     r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
     assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+
+
+def _relax_pass_tight_block_candles(n, start=100.0, vol=1000.0):
+    """Strong uptrend (ADX ~54, bullish-aligned) with regular pullbacks that
+    lands 4h RSI ~79 / extension ~2.5xATR — INSIDE the relaxed chase band
+    (RSI<82, ext<3.5) but OUTSIDE the tight band (RSI>75, ext>2.5). Pullbacks
+    fall on i%4==0 so the final bar (i=n-1) is an up impulse; these t=i candles
+    read as long-closed so the gate scores the FULL series (no forming bar to
+    drop). Offline verification (probe_candle_search2): production verdict
+    relaxes & passes, a no-relax verdict blocks, and a hot 15m (RSI ~100)
+    denies the MTF override."""
+    out = []
+    price = start
+    for i in range(n):
+        price += -0.5 if i % 4 == 0 else 0.55
+        out.append(_mk_candle(i, price, price + 0.8, price - 0.2, price, vol + i))
+    return out
+
+
+def test_ta_late_entry_gate_records_tight_counterfactual_on_relaxed_pass(monkeypatch, tmp_path):
+    """SHADOW-ONLY entry-quality probe (2026-09-05): a pass admitted by the ADX
+    trend-relax exception must record that a no-relax rule would have blocked
+    it. The LIVE decision is unchanged (relaxed pass → order goes through);
+    the counterfactual is audit-only.
+
+    Shape: 4h RSI ~79 / ext ~2.5xATR (between tight 75/2.5 and relaxed
+    82/3.5), ADX ~54 bullish, 15m parabolic so the MTF override cannot rescue
+    the tight block."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    c4h = _relax_pass_tight_block_candles(100)
+    hot15m = _trend_candles(60, start=100.0, step=0.6)
+    _patch_candles(monkeypatch, c4h, hot15m)
+    log = tmp_path / "le_tight.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    # LIVE verdict: relaxed band → PASS (decision untouched by the probe).
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["relaxed_by_trend"] is True
+    # Counterfactual: with the relaxation OFF this pass would be a BLOCK.
+    assert rec["tight_would_block"] is True
+    assert rec["tight_relaxed_by_trend"] is False
+    assert "late long" in rec["tight_reason"]
+    assert "RSI" in rec["tight_reason"]
+
+
+def test_ta_late_entry_gate_tight_fields_null_when_not_relaxed(monkeypatch, tmp_path):
+    """Counter-example: a healthy (non-relaxed) pass never triggers the probe,
+    so the tight_* audit fields are all null."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    healthy = _healthy_trend_candles(100)
+    _patch_candles(monkeypatch, healthy, healthy)
+    log = tmp_path / "le_healthy.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["relaxed_by_trend"] is False
+    assert rec["blocked"] is False
+    assert rec["tight_would_block"] is None
+    assert rec["tight_relaxed_by_trend"] is None
+    assert rec["tight_reason"] == ""
+
+
+def test_ta_late_entry_gate_tight_probe_failure_never_blocks_order(monkeypatch, tmp_path):
+    """Fail-safe: if the counterfactual re-run itself raises, the live gate is
+    unaffected — the relaxed pass still goes through and tight_* stay null."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    real = tf.late_entry_check
+    calls = {"n": 0}
+
+    def flaky(c4, c15, side, params):
+        calls["n"] += 1
+        # 1st call = production verdict; 2nd call = tight counterfactual.
+        if calls["n"] >= 2:
+            raise RuntimeError("probe boom")
+        return real(c4, c15, side, params)
+
+    monkeypatch.setattr(tf, "late_entry_check", flaky)
+    c4h = _relax_pass_tight_block_candles(100)
+    hot15m = _trend_candles(60, start=100.0, step=0.6)
+    _patch_candles(monkeypatch, c4h, hot15m)
+    log = tmp_path / "le_flaky.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["tight_would_block"] is None
+    assert rec["tight_reason"] == ""
+
+
+# ── F1 counter-regime / F2 chase-exhaustion SHADOW probes (2026-09-05) ──────
+
+def _patch_regime(monkeypatch, label):
+    """detect_regime is imported lazily inside the gate; patch the source
+    module so the local from-import re-reads the attribute."""
+    import hermes_trader.agents.market_regime as mr
+    monkeypatch.setattr(mr, "detect_regime", lambda coin: label)
+
+
+def test_chase_exhaustion_pure_function():
+    """F2 pure rule, shared by gate/prefilter/backtest: strong ADX trend
+    (>=35) plus over-extended RSI or extension flags a late chase; a healthy
+    trend (low ADX) or a LONG on non-stretched readings does NOT. Mirrors for
+    shorts."""
+    from hermes_trader.agents.ta_filter import chase_exhaustion_check
+    cfg = {"chase_adx_min": 35, "chase_rsi_long": 60, "chase_ext_long": 1.0,
+           "chase_rsi_short": 40, "chase_ext_short": -1.0}
+
+    # Strong parabolic uptrend (reuse the relaxed-pass fixture): long chase.
+    hot_long = _relax_pass_tight_block_candles(100)
+    r = chase_exhaustion_check(hot_long, "long", cfg)
+    assert r["block"] is True and r["data_ok"] is True
+    assert "chase-exhaustion long" in r["reason"]
+    assert r["adx4h"] >= 35 and (r["rsi4h"] >= 60 or r["extension"] >= 1.0)
+
+    # Healthy uptrend (ADX < 35) must NOT flag even though RSI ~62.
+    healthy = _healthy_trend_candles(100)
+    rh = chase_exhaustion_check(healthy, "long", cfg)
+    assert rh["block"] is False and rh["data_ok"] is True
+    assert rh["adx4h"] < 35
+
+    # Insufficient data → data_ok False, no block (callers fail OPEN).
+    assert chase_exhaustion_check(_trend_candles(8), "long", cfg)["block"] is False
+    bad = chase_exhaustion_check(_trend_candles(8), "long", cfg)
+    assert bad["data_ok"] is False and bad["reason"]
+
+    # Unknown side → no block, no crash.
+    assert chase_exhaustion_check(hot_long, " sideways", cfg)["block"] is False
+
+
+def test_ta_late_entry_gate_records_chase_and_counter_probes(monkeypatch, tmp_path):
+    """F1+F2 SHADOW-ONLY probes on a relaxed long pass: the live decision is
+    untouched (relaxed band → PASS), while the audit record flags BOTH that a
+    chase-exhaustion veto would block (F2) and the market-regime label at
+    order time (F1). Longs are never counter-regime flagged."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    c4h = _relax_pass_tight_block_candles(100)
+    healthy15m = _healthy_trend_candles(60)
+    _patch_candles(monkeypatch, c4h, healthy15m)
+    _patch_regime(monkeypatch, "up")
+    log = tmp_path / "le_probe.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    # LIVE verdict unchanged: relaxed band passes the order through.
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    # F2 chase-exhaustion counterfactual WOULD block this parabolic long.
+    assert rec["chase_would_block"] is True
+    assert "chase-exhaustion long" in rec["chase_reason"]
+    # F1: regime label recorded; a LONG is never flagged counter-regime.
+    assert rec["market_regime_label"] == "up"
+    assert rec["counter_regime_would_block"] is False
+    assert rec["counter_regime_reason"] == ""
+
+
+def test_ta_late_entry_gate_counter_regime_short_rule(monkeypatch, tmp_path):
+    """F1 validated rule: a SHORT outside a down regime is counter-regime and
+    would be vetoed; a short in a down regime (and any long) is not flagged.
+    Observation only — the live gate still passes the order."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    # Downtrend candles that PASS the live gate as a short (strong bearish
+    # trend, relaxed band) but are entered against a non-down market regime.
+    bear = []
+    price = 200.0
+    for i in range(100):
+        price += 0.4 if i % 3 == 2 else -0.55
+        bear.append(_mk_candle(i, price, price + 0.1, price - 0.3, price, 1000 + i))
+    healthy15m = _healthy_trend_candles(60)
+
+    _patch_candles(monkeypatch, bear, healthy15m)
+
+    # (a) short in an "up" regime → counter-regime WOULD block.
+    _patch_regime(monkeypatch, "up")
+    log = tmp_path / "le_cr_up.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="short", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False  # live decision untouched
+    assert rec["market_regime_label"] == "up"
+    assert rec["counter_regime_would_block"] is True
+    assert "down" in rec["counter_regime_reason"]
+    # F2 also fires on this strong bearish chase.
+    assert rec["chase_would_block"] is True
+
+    # (b) short in a "down" regime → NOT counter-regime (regime aligned).
+    _patch_regime(monkeypatch, "down")
+    log2 = tmp_path / "le_cr_down.jsonl"
+    ta_late_entry_gate(_ctx(trade_side="short", coin="TEST"),
+                       _le_config(mode="enforce", shadow_log_path=str(log2)))
+    rec2 = json.loads(log2.read_text().splitlines()[0])
+    assert rec2["market_regime_label"] == "down"
+    assert rec2["counter_regime_would_block"] is False
+    assert rec2["counter_regime_reason"] == ""
+
+
+def test_ta_late_entry_gate_probe_fields_null_when_no_signal(monkeypatch, tmp_path):
+    """Counter-example: a healthy (low-ADX) long pass triggers neither probe
+    — chase is False (recorded, since the probe always runs), and the counter
+    field is False (longs are never flagged)."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    healthy = _healthy_trend_candles(100)
+    _patch_candles(monkeypatch, healthy, healthy)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_probe_quiet.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["chase_would_block"] is False
+    assert rec["chase_reason"] == ""
+    assert rec["market_regime_label"] == "neutral"
+    assert rec["counter_regime_would_block"] is False
+
+
+def test_ta_late_entry_gate_chase_probe_failure_never_blocks_order(monkeypatch, tmp_path):
+    """Fail-safe F2: if chase_exhaustion_check raises, the live gate is
+    unaffected — the pass still goes through and chase_* stay null."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    def boom(candles_4h, side, params=None):
+        raise RuntimeError("chase probe boom")
+
+    monkeypatch.setattr(tf, "chase_exhaustion_check", boom)
+    c4h = _relax_pass_tight_block_candles(100)
+    healthy15m = _healthy_trend_candles(60)
+    _patch_candles(monkeypatch, c4h, healthy15m)
+    _patch_regime(monkeypatch, "up")
+    log = tmp_path / "le_chase_flaky.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["chase_would_block"] is None
+    assert rec["chase_reason"] == ""
+    # F1 regime probe still records independently.
+    assert rec["market_regime_label"] == "up"
+    assert rec["counter_regime_would_block"] is False
+
+
+def test_ta_late_entry_gate_counter_regime_probe_failure_never_blocks_order(monkeypatch, tmp_path):
+    """Fail-safe F1: if detect_regime raises, the live gate is unaffected and
+    the regime fields are null; the F2 chase probe still records."""
+    import hermes_trader.agents.market_regime as mr
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    def boom(coin):
+        raise RuntimeError("regime down")
+
+    monkeypatch.setattr(mr, "detect_regime", boom)
+    c4h = _relax_pass_tight_block_candles(100)
+    healthy15m = _healthy_trend_candles(60)
+    _patch_candles(monkeypatch, c4h, healthy15m)
+    log = tmp_path / "le_regime_flaky.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["market_regime_label"] is None
+    assert rec["counter_regime_would_block"] is None
+    assert rec["counter_regime_reason"] == ""
+    # F2 chase probe still records independently.
+    assert rec["chase_would_block"] is True
+
+
+def test_ta_late_entry_gate_counter_regime_probe_disabled(monkeypatch, tmp_path):
+    """When counter_regime_probe_enabled is False the F1 probe is skipped:
+    regime label/counter fields stay null and the order still passes."""
+    import hermes_trader.agents.market_regime as mr
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    calls = {"n": 0}
+
+    def spy(coin):
+        calls["n"] += 1
+        return "up"
+
+    monkeypatch.setattr(mr, "detect_regime", spy)
+    c4h = _relax_pass_tight_block_candles(100)
+    healthy15m = _healthy_trend_candles(60)
+    _patch_candles(monkeypatch, c4h, healthy15m)
+    log = tmp_path / "le_cr_off.jsonl"
+    r = ta_late_entry_gate(
+        _ctx(trade_side="short", coin="TEST"),
+        _le_config(mode="enforce", shadow_log_path=str(log),
+                   counter_regime_probe_enabled=False))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert calls["n"] == 0  # detect_regime never consulted
+    assert rec["market_regime_label"] is None
+    assert rec["counter_regime_would_block"] is None
+    assert rec["counter_regime_reason"] == ""
+
+
+def test_weak_trend_noise_pure_function():
+    """Weak-trend noise probe (shadow-only): low ADX (< weak_adx_max) AND 4h
+    EMA trend not supporting the side flags a noise-zone entry; a strong-ADX
+    trend is never a noise zone regardless of side; insufficient data and
+    unknown sides fail safe (data_ok False / no block, no crash)."""
+    from hermes_trader.agents.ta_filter import weak_trend_noise_check
+    cfg = {"weak_adx_max": 25, "weak_flat_blocks": True}
+
+    # Choppy flat candles: ADX ~4, EMA trend resolves bullish (slow drift).
+    flat = _flat_candles(100)
+    rf = weak_trend_noise_check(flat, "short", cfg)
+    assert rf["block"] is True and rf["data_ok"] is True
+    assert "weak-trend noise short" in rf["reason"]
+    assert rf["adx4h"] < 25
+    # Trend supports longs here → a long is NOT noise.
+    assert weak_trend_noise_check(flat, "long", cfg)["block"] is False
+
+    # Healthy trend (ADX ~23) bullish: short against it is noise, long is not.
+    healthy = _healthy_trend_candles(100)
+    rs = weak_trend_noise_check(healthy, "short", cfg)
+    assert rs["block"] is True and rs["adx4h"] < 25
+    assert weak_trend_noise_check(healthy, "long", cfg)["block"] is False
+
+    # Strong ADX trend (>= ceiling) is never a noise zone, even against side.
+    hot = _trend_candles(100)
+    assert weak_trend_noise_check(hot, "short", cfg)["block"] is False
+    assert weak_trend_noise_check(hot, "short", cfg)["adx4h"] >= 25
+
+    # Raising the ceiling above the strong-trend ADX still keeps it quiet when
+    # the trend supports the side (long in a bullish ADX-100 move).
+    assert weak_trend_noise_check(hot, "long", {"weak_adx_max": 999})["block"] is False
+
+    # Insufficient data → data_ok False, no block (callers fail OPEN).
+    bad = weak_trend_noise_check(_trend_candles(8), "long", cfg)
+    assert bad["block"] is False and bad["data_ok"] is False and bad["reason"]
+
+    # Unknown side → no block, no crash.
+    assert weak_trend_noise_check(flat, "sideways", cfg)["block"] is False
+
+
+def test_ta_late_entry_gate_counter_regime_long_rule(monkeypatch, tmp_path):
+    """F1 made symmetric: a LONG in a down regime is counter-regime and would
+    be vetoed (new branch); a long in up/neutral is not. Observation only —
+    the live gate still passes the order."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    healthy = _healthy_trend_candles(100)
+    _patch_candles(monkeypatch, healthy, healthy)
+
+    # (a) long in a "down" regime → counter-regime WOULD block.
+    _patch_regime(monkeypatch, "down")
+    log = tmp_path / "le_cr_long_down.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False  # live decision untouched
+    assert rec["market_regime_label"] == "down"
+    assert rec["counter_regime_would_block"] is True
+    assert "non-down" in rec["counter_regime_reason"]
+
+    # (b) long in an "up" regime → aligned, NOT flagged.
+    _patch_regime(monkeypatch, "up")
+    log2 = tmp_path / "le_cr_long_up.jsonl"
+    ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                       _le_config(mode="enforce", shadow_log_path=str(log2)))
+    rec2 = json.loads(log2.read_text().splitlines()[0])
+    assert rec2["counter_regime_would_block"] is False
+    assert rec2["counter_regime_reason"] == ""
+
+    # (c) long in a "neutral" regime → not counter-regime (only down is).
+    _patch_regime(monkeypatch, "neutral")
+    log3 = tmp_path / "le_cr_long_neutral.jsonl"
+    ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                       _le_config(mode="enforce", shadow_log_path=str(log3)))
+    rec3 = json.loads(log3.read_text().splitlines()[0])
+    assert rec3["counter_regime_would_block"] is False
+
+
+def test_ta_late_entry_gate_weak_trend_probe_fires_and_exempts_aligned(monkeypatch, tmp_path):
+    """Weak-trend noise probe (shadow-only): a low-ADX short against a non-down
+    regime WOULD be blocked, but the SAME candles in a down regime are exempt
+    (regime-aligned). Separately, a down-regime LONG with a bullish 4h trend
+    fires F1 but NOT the weak probe (the LTC-vs-TAO separation). Live gate
+    always passes."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    flat = _flat_candles(100)  # ADX ~4, trend resolves bullish
+    _patch_candles(monkeypatch, flat, flat)
+
+    # (a) low-ADX short in a non-aligned (neutral) regime → weak WOULD block.
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_weak_neutral.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="short", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False  # live decision untouched
+    assert rec["weak_trend_would_block"] is True
+    assert "weak-trend noise short" in rec["weak_trend_reason"]
+
+    # (b) identical candles but regime aligned (down for a short) → exempt.
+    _patch_regime(monkeypatch, "down")
+    log2 = tmp_path / "le_weak_down.jsonl"
+    ta_late_entry_gate(_ctx(trade_side="short", coin="TEST"),
+                       _le_config(mode="enforce", shadow_log_path=str(log2)))
+    rec2 = json.loads(log2.read_text().splitlines()[0])
+    assert rec2["weak_trend_would_block"] is False
+    assert rec2["weak_trend_reason"] == ""
+
+    # (c) down-regime LONG on a bullish 4h trend → F1 fires but weak does NOT
+    # (trend supports the long; this is the LTC +$0.09 winner shape, not TAO).
+    healthy = _healthy_trend_candles(100)  # ADX ~23, trend bullish
+    _patch_candles(monkeypatch, healthy, healthy)
+    log3 = tmp_path / "le_weak_long_down.jsonl"
+    ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                       _le_config(mode="enforce", shadow_log_path=str(log3)))
+    rec3 = json.loads(log3.read_text().splitlines()[0])
+    assert rec3["counter_regime_would_block"] is True
+    assert rec3["weak_trend_would_block"] is False
+    assert rec3["weak_trend_reason"] == ""
+
+
+def test_ta_late_entry_gate_weak_probe_failure_never_blocks_order(monkeypatch, tmp_path):
+    """Fail-safe: if weak_trend_noise_check raises, the live gate is unaffected
+    (order passes) and the weak_* fields stay null; the other probes still
+    record independently."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    def boom(candles_4h, side, params=None):
+        raise RuntimeError("weak probe boom")
+
+    monkeypatch.setattr(tf, "weak_trend_noise_check", boom)
+    c4h = _flat_candles(100)
+    _patch_candles(monkeypatch, c4h, c4h)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_weak_flaky.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="short", coin="TEST"),
+                           _le_config(mode="enforce", shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["weak_trend_would_block"] is None
+    assert rec["weak_trend_reason"] == ""
+    # F1 regime probe still records independently (short in neutral).
+    assert rec["market_regime_label"] == "neutral"
+    assert rec["counter_regime_would_block"] is True
+
+
+def test_ta_late_entry_gate_weak_probe_disabled(monkeypatch, tmp_path):
+    """When weak_trend_probe_enabled is False the weak probe is skipped (the
+    pure function is never called) and weak_* fields stay null; the order
+    still passes and F1 still records."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    calls = {"n": 0}
+
+    def spy(candles_4h, side, params=None):
+        calls["n"] += 1
+        return {"block": True, "reason": "should-not-run", "data_ok": True}
+
+    monkeypatch.setattr(tf, "weak_trend_noise_check", spy)
+    c4h = _flat_candles(100)
+    _patch_candles(monkeypatch, c4h, c4h)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_weak_off.jsonl"
+    r = ta_late_entry_gate(
+        _ctx(trade_side="short", coin="TEST"),
+        _le_config(mode="enforce", shadow_log_path=str(log),
+                   weak_trend_probe_enabled=False))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert calls["n"] == 0  # weak probe never consulted
+    assert rec["weak_trend_would_block"] is None
+    assert rec["weak_trend_reason"] == ""
+    # F1 still records independently.
+    assert rec["counter_regime_would_block"] is True
 
 
 def test_ta_late_entry_gate_fail_open_on_fetch_error(monkeypatch):

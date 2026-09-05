@@ -457,25 +457,10 @@ def _classify_candles(candles: list) -> Regime:
     return classify_candles(candles)
 
 
-def _detect_for_proxy(proxy: str) -> Regime:
-    """Network path — fetch candles for `proxy`, compute regime.
-    Wrapped by `detect_regime` for caching."""
-    try:
-        raw = fetch_hl_candles(proxy, interval="1h", count=100)
-        # H-8: classify CLOSED bars only — the forming bar's partial range
-        # biases EMA slope / ADX / RSI.
-        candles, _ = closed_candles_only(raw, "1h")
-        if not candles:
-            return "neutral"
-        return _classify_candles(candles)
-    except Exception as e:
-        logger.warning(f"[regime] candle fetch failed for {proxy}: {e}")
-        return "neutral"
-
-
 def _detect_for_proxy_with_score(proxy: str) -> tuple[Regime, float]:
-    """Same candle fetch as _detect_for_proxy but returns (regime, score).
-    Populates _score_cache so a subsequent detect_regime() reuses it."""
+    """Fetch 1h candles for a proxy coin and return (regime, strength score).
+    Callers cache the result in _score_cache so a subsequent detect_regime()
+    reuses it."""
     try:
         raw = fetch_hl_candles(proxy, interval="1h", count=100)
         # H-8: score CLOSED bars only (same forming-bar bias as classify).

@@ -247,11 +247,6 @@ def _hip3_on() -> bool:
 # unchanged.
 
 
-class _BoomForTest(RuntimeError):
-    """Helper exception so test patches can raise a distinguishable error
-    without colliding with production exception types."""
-
-
 def _parse_request_body_safe(request: Any, coin: str) -> dict[str, Any]:
     """Synchronous variant of the body-parse path. Production calls
     ``await request.json()`` directly; the test helper expects a

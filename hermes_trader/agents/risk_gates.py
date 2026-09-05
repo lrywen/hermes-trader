@@ -1118,8 +1118,10 @@ def ta_late_entry_gate(
 
         from hermes_trader.agents.perception import _drop_forming_bar
         from hermes_trader.agents.ta_filter import (
+            chase_exhaustion_check,
             forming_readings_4h,
             late_entry_check,
+            weak_trend_noise_check,
         )
         from hermes_trader.client.hl_client import fetch_hl_candles
         n = int(le_cfg.get("fetch_bars", 100) or 100)
@@ -1178,6 +1180,130 @@ def ta_late_entry_gate(
         })
 
     blocked = bool(verdict.get("block"))
+
+    # ── SHADOW-ONLY COUNTERFACTUAL (entry-quality probe, 2026-09-05) ──────────
+    # Offline analysis of 52 closed shadow trades found the ADX trend-relax
+    # exception (late_entry_check: when 4h ADX>=35 and trend-aligned, widen
+    # RSI/extension chase limits from 75/2.5 to 82/3.5) is where the worst
+    # max_loss entries cluster: relaxed_by_trend=True trades netted -$2.37
+    # (win 14%, max_loss 71%) vs +$0.98 for non-relaxed — the exception admits
+    # blowoff-top continuations (HEMI/UNI ADX 48-63) that reverse immediately.
+    # Re-run the SAME pure function on the SAME candles with the relaxation
+    # DISABLED, purely to record "would a tight (no-relax) rule have blocked
+    # this pass?". This NEVER feeds the live decision below — `blocked` is
+    # computed from the production verdict; these fields are audit-only.
+    tight = None
+    if bool(verdict.get("relaxed_by_trend")):
+        try:
+            tight_cfg = dict(le_cfg)
+            tight_cfg["trend_relax_enabled"] = False
+            tight = late_entry_check(candles_4h, candles_15m, side, tight_cfg)
+        except Exception as e:  # never let the probe touch the order path
+            logger.warning(
+                "[risk][gates] ta_late_entry tight-counterfactual failed for "
+                "%s (observation only): %s", ctx.coin, e,
+            )
+            tight = None
+
+    # ── SHADOW-ONLY COUNTERFACTUALS (F1 counter-regime / F2 chase-exhaustion,
+    # 2026-09-05) ─────────────────────────────────────────────────────────────
+    # Offline replay of 52 closed shadow trades (read-only analysis, rules NOT
+    # enforced) found:
+    #   F1 — shorts entered outside a down "market regime" (the per-coin
+    #        detect_regime up/down/neutral/chop label, same cached proxy call
+    #        market_regime_gate uses) netted -$1.52 over 4 trades with ZERO
+    #        winning short harmed (the only winning short, CASHCAT +$0.71, was
+    #        regime=down and kept). The originally-hypothesized 4h
+    #        trend_direction counter-trend rule was REJECTED: it nets +$0.58
+    #        and blocks the ENA +$1.05 winner.
+    #   F2 — late parabolic LONG chases (4h ADX>=35 AND (RSI>=60 OR
+    #        extension>=1.0)) are the separable "buy the top" cluster:
+    #        5 trades, all losers, -$3.79, zero winners harmed (stable across
+    #        an ADX 35-45 / RSI 60-65 grid). See chase_exhaustion_check.
+    # These two probes are OBSERVATION ONLY: `blocked` above is computed
+    # purely from the production verdict; these fields never feed it. Each is
+    # independently wrapped so a failure can never touch the order path.
+    chase = None
+    try:
+        chase = chase_exhaustion_check(candles_4h, side, le_cfg)
+    except Exception as e:  # never let the probe touch the order path
+        logger.warning(
+            "[risk][gates] ta_late_entry chase-exhaustion counterfactual "
+            "failed for %s (observation only): %s", ctx.coin, e,
+        )
+        chase = None
+
+    market_regime_label = None
+    counter_regime_would_block = None
+    counter_regime_reason = ""
+    try:
+        if bool(le_cfg.get("counter_regime_probe_enabled", True)):
+            from hermes_trader.agents.market_regime import detect_regime
+            market_regime_label = str(detect_regime(ctx.coin) or "neutral")
+            # Validated F1 rule, made SYMMETRIC (2026-09-05): shorts require a
+            # down regime and longs require an up regime. The original
+            # short-only rule (offline 52-trade replay) caught 4 shorts all
+            # losers (-$1.52, zero winners harmed). Today's session produced
+            # the down-regime LONGS the earlier sample lacked (56-trade replay):
+            # long in regime "down" = 2 trades, TAO -$0.34 (trend flat) and
+            # LTC +$0.09 (trend bullish) — the weak-trend noise probe below
+            # separates them (it flags TAO's flat trend but not LTC's bullish
+            # trend), so the two probes are recorded independently.
+            if side == "short" and market_regime_label != "down":
+                counter_regime_would_block = True
+                counter_regime_reason = (
+                    f"counter-regime short in market regime "
+                    f"{market_regime_label!r} (shorts need 'down')"
+                )
+            elif side == "long" and market_regime_label == "down":
+                counter_regime_would_block = True
+                counter_regime_reason = (
+                    f"counter-regime long in market regime "
+                    f"{market_regime_label!r} (longs need non-down)"
+                )
+            else:
+                counter_regime_would_block = False
+    except Exception as e:  # never let the probe touch the order path
+        logger.warning(
+            "[risk][gates] ta_late_entry counter-regime counterfactual "
+            "failed for %s (observation only): %s", ctx.coin, e,
+        )
+        market_regime_label = None
+        counter_regime_would_block = None
+        counter_regime_reason = ""
+
+    # SHADOW-ONLY weak-trend noise probe (2026-09-05): flag entries in a 4h
+    # noise zone — ADX below the weak-trend ceiling AND EMA8/21 trend not
+    # supporting the side (flat counts as non-support) — but only when the
+    # market regime is NOT already aligned with the side (that alignment
+    # exemption is what keeps low-ADX/flat aligned winners — ENA regime=up
+    # +$1.05, CASHCAT short regime=down +$0.71 — from being harmed). The pure
+    # candle scoring is in weak_trend_noise_check; the regime label below
+    # reuses the counter-regime probe's cached detect_regime value. Observation
+    # only — never feeds the live `blocked` above; independently wrapped.
+    weak_trend_would_block = None
+    weak_trend_reason = ""
+    try:
+        if bool(le_cfg.get("weak_trend_probe_enabled", True)):
+            weak = weak_trend_noise_check(candles_4h, side, le_cfg)
+            if weak.get("data_ok"):
+                aligned = (
+                    (side == "long" and market_regime_label == "up")
+                    or (side == "short" and market_regime_label == "down")
+                )
+                if aligned:
+                    weak_trend_would_block = False
+                else:
+                    weak_trend_would_block = bool(weak.get("block"))
+                    weak_trend_reason = weak.get("reason", "") if weak.get("block") else ""
+    except Exception as e:  # never let the probe touch the order path
+        logger.warning(
+            "[risk][gates] ta_late_entry weak-trend noise counterfactual "
+            "failed for %s (observation only): %s", ctx.coin, e,
+        )
+        weak_trend_would_block = None
+        weak_trend_reason = ""
+
     rec = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "coin": ctx.coin,
@@ -1187,6 +1313,31 @@ def ta_late_entry_gate(
         # "gate" = order-time hard gate; "prefilter" = pre-AI ta_filter veto.
         "layer": "gate",
         "blocked": blocked,
+        # SHADOW-ONLY probe: verdict if the ADX trend-relax exception were
+        # turned OFF (identical candles/MTF). Observation only — not used by
+        # the live gate. tight_would_block=True + blocked=False flags a pass
+        # that a no-relax rule would have vetoed (the candidate filter).
+        "tight_would_block": (bool(tight.get("block")) if tight else None),
+        "tight_relaxed_by_trend": (bool(tight.get("relaxed_by_trend")) if tight else None),
+        "tight_reason": (tight.get("reason", "") if tight else ""),
+        # F2 SHADOW-ONLY probe: verdict if a chase-exhaustion veto (strong
+        # ADX trend + over-extended RSI/extension) were enforced. Observation
+        # only — never feeds the live `blocked` above.
+        "chase_would_block": (bool(chase.get("block")) if chase else None),
+        "chase_reason": (chase.get("reason", "") if chase else ""),
+        # F1 SHADOW-ONLY probe: per-coin market-regime label at order time and
+        # whether a counter-regime rule (shorts require regime=="down", longs
+        # require non-"down") would have vetoed. None on probe failure/disabled.
+        # Observation only.
+        "market_regime_label": market_regime_label,
+        "counter_regime_would_block": counter_regime_would_block,
+        "counter_regime_reason": counter_regime_reason,
+        # SHADOW-ONLY weak-trend noise probe: verdict if a low-ADX noise-zone
+        # veto (ADX<weak_adx_max AND 4h trend not supporting the side, flat
+        # counts as non-support, regime-aligned exempt) were enforced. None on
+        # probe failure/disabled. Observation only — never feeds live `blocked`.
+        "weak_trend_would_block": weak_trend_would_block,
+        "weak_trend_reason": weak_trend_reason,
         "reason": verdict.get("reason", ""),
         "rsi4h": verdict.get("rsi4h"),
         "adx4h": verdict.get("adx4h"),

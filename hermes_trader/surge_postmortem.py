@@ -363,18 +363,6 @@ class SurgeDetector:
         except Exception as e:
             logger.warning(f"[SURGE_POSTMORTEM] report build failed for {coin}: {e!r}")
 
-    def drain(self, timeout: float = 30.0) -> bool:
-        """Wait for in-flight async reports. Returns True if all finished.
-
-        For tests/CLI that assert on the written markdown right after observe().
-        """
-        with self._workers_lock:
-            workers = list(self._workers)
-        deadline = time.monotonic() + timeout
-        for w in workers:
-            w.join(max(0.0, deadline - time.monotonic()))
-        return not any(w.is_alive() for w in workers)
-
     def _is_surge(
         self,
         score: float,

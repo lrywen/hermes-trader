@@ -788,10 +788,15 @@ def compute_effective_stop_pct(
     atr_ceiling = float(atr_cfg.get("ceiling_pct", 4.0))
 
     lev = max(1.0, float(leverage))
-    # Layer 1+2: spot cap (regime max_loss, then ATR clamp overrides it).
-    spot_cap = float(ml_pct)
+    # Layer 1+2: spot cap = min(regime max_loss, ATR cap). The ATR stop may
+    # only widen up to the regime cap — it must never OVERRIDE a tighter regime
+    # stop (F1 sync, byte-aligned with dsl_exit._effective_max_loss L632-641).
+    regime_cap = float(ml_pct) if float(ml_pct) > 0 else float("inf")
     if atr_enabled and atr_pct > 0:
-        spot_cap = min(max(atr_pct * atr_mult, atr_floor), atr_ceiling)
+        atr_cap = min(max(atr_pct * atr_mult, atr_floor), atr_ceiling)
+        spot_cap = min(regime_cap, atr_cap)
+    else:
+        spot_cap = regime_cap
     # Layer 3: ROE/margin cap.
     roe_cap = (float(ml_roe) / lev) if float(ml_roe) > 0 else float("inf")
     spot_cap = spot_cap if spot_cap > 0 else float("inf")
@@ -1785,6 +1790,581 @@ def _evaluate_force_override(
     }
 
 
+def _hip3_dex_preflight(user: str, coin: str, mode: str,
+                        analysis_id: str) -> dict[str, Any] | None:
+    """HIP-3 dex-balance preflight: refuse cleanly when the target dex has no
+    funds. Distinguishes "API returned $0" (underfunded → rejection dict) from
+    "API call failed / no marginSummary" (transient lookup failure → one retry,
+    then fall through and let HL adjudicate). Returns a rejection result dict,
+    or None when the trade may proceed (non-HIP-3 coin, lookup failure, or the
+    dex holds funds)."""
+    if ":" not in coin:
+        return None
+    dex_name = coin.split(":", 1)[0]
+    from hermes_trader.client.hl_client import _http_post
+
+    def _read_dex_value() -> tuple[bool, float]:
+        try:
+            state_resp = _http_post("/info", {
+                "type": "clearinghouseState", "user": user, "dex": dex_name,
+            })
+        except Exception as e:
+            logger.warning(f"[executor] HIP-3 dex query raised for {dex_name}: {e}")
+            return (False, 0.0)
+        ms = (state_resp or {}).get("marginSummary")
+        if not ms:
+            return (False, 0.0)  # No marginSummary → response missing/malformed
+        return (True, float(ms.get("accountValue", 0) or 0))
+
+    ok, dex_value = _read_dex_value()
+    if not ok:
+        time.sleep(0.3)
+        ok, dex_value = _read_dex_value()
+
+    if not ok:
+        logger.warning(f"[executor] HIP-3 dex-balance lookup failed twice for {dex_name}; letting HL adjudicate")
+        # Fall through and let HL reject if it has to — better than
+        # falsely claiming the dex is empty when we couldn't verify.
+        return None
+    if dex_value < 1.0:
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis_id,
+            "reason": (
+                f"hip3_dex_underfunded ({dex_name}: ${dex_value:.2f}). "
+                f"Transfer USDC to '{dex_name}' via the HL frontend."
+            ),
+        }
+    return None
+
+
+def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
+                                    is_buy: bool, size_in_coin: float,
+                                    mid_price: float, cloid: Any,
+                                    config: dict[str, Any], user: str,
+                                    mode: str, aid: str,
+                                    gate_results: Any) -> dict[str, Any] | None:
+    """Handle a failed order placement. A DEFINITE failure (HL envelope
+    rejection, slippage cap, local validation) clears the in-flight marker and
+    returns an order_failed result. error_code="response_unknown" (408 / read
+    timeout / SSL drop after submit) is ambiguous: reconcile against userFills
+    by Cloid — a confirmed fill backfills order_res in-place (returns None so
+    the caller falls through to the normal success path); a confirmed
+    not-fill or an unresolvable lookup clears the marker (rehydrate + circuit
+    breaker on the latter) and returns a rejection result dict."""
+    if order_res.get("ok"):
+        return None
+    if order_res.get("error_code") != "response_unknown" or cloid is None:
+        # Definite rejection / envelope error — no order on the exchange.
+        _reset_resp_unknown_streak()
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(aid)
+            _IN_FLIGHT_COINS.discard(coin)
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": f"order_failed: {order_res.get('error', 'unknown')}",
+            "gate_results": gate_results,
+        }
+    try:
+        from hermes_trader.client.exchange import reconcile_order_fill
+        _rc = reconcile_order_fill(
+            coin=coin, cloid=cloid,
+            is_buy=is_buy, expect_size=float(size_in_coin or 0.0) or None,
+        )
+    except Exception as _rc_e:
+        _rc = {"status": "unknown", "reason": f"reconcile_exception: {_rc_e!r}"}
+        logger.warning(f"[executor] H6 reconcile raised for {coin}: {_rc_e!r}")
+
+    if _rc.get("status") == "filled":
+        # The order DID fill despite the lost response. Backfill the result
+        # with the REAL fill economics so the caller falls through into the
+        # normal success path (register_position / record_trade / backup-SL
+        # run exactly once with true avgPx/total_sz — no duplicated logic).
+        _reset_resp_unknown_streak()
+        logger.warning(
+            f"[executor] H6 RECONCILED {coin} fill after response loss: "
+            f"avg_px={_rc.get('avg_px')} total_sz={_rc.get('total_sz')} "
+            f"n={_rc.get('n_fills')} oid={_rc.get('oid')} — registering "
+            f"from userFills (no orphan)."
+        )
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"⚠️ H6 下单响应丢失但已成交，已补登: {coin} "
+                f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
+                f"oid={_rc.get('oid')}", category="risk")
+        except Exception:
+            pass
+        order_res.clear()
+        order_res.update({
+            "ok": True,
+            "order_id": _rc.get("oid"),
+            "cloid": str(cloid),
+            "avg_px": float(_rc.get("avg_px") or 0.0),
+            "total_sz": float(_rc.get("total_sz") or 0.0),
+            "filled_at_ms": _rc.get("filled_at_ms"),
+            "reconciled_after_response_unknown": True,
+        })
+        return None
+    if _rc.get("status") == "not_filled":
+        # Exchange answered cleanly and has no fill → the order truly did not
+        # execute. Safe to clear + retry later.
+        _reset_resp_unknown_streak()
+        logger.info(f"[executor] H6 reconcile {coin}: confirmed NOT filled "
+                    f"after response loss ({_rc.get('reason')}); safe to retry.")
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(aid)
+            _IN_FLIGHT_COINS.discard(coin)
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": f"order_failed_response_unknown_not_filled: {order_res.get('error', 'unknown')}",
+            "gate_results": gate_results,
+        }
+    # The LOOKUP itself failed — we cannot tell filled from unfilled. Shrink
+    # the orphan window immediately via rehydrate (a real fill gets a synthetic
+    # tracker on this same tick), count the deaf-exchange streak, and halt auto
+    # entries at the configured threshold so we don't keep spraying orders.
+    _streak = _bump_resp_unknown_streak()
+    logger.error(
+        f"[executor] H6 reconcile UNRESOLVED for {coin} "
+        f"(streak={_streak}): {_rc.get('reason')} — fill state "
+        f"unknown; running immediate rehydrate."
+    )
+    try:
+        from hermes_trader.agents.dsl_exit import rehydrate_from_exchange
+        _rstate = fetch_account_state(user)
+        _rpositions = _rstate.get("asset_positions", []) or []
+        rehydrate_from_exchange(
+            _rpositions,
+            default_leverage=int(config.get("leverage", 1) or 1),
+            queried_dexes={""},
+            user=user,
+        )
+    except Exception as _rh_e:
+        logger.error(f"[executor] H6 immediate rehydrate failed: {_rh_e}")
+    try:
+        _halt_n = int(cfg_get(
+            "circuit_breaker.resp_unknown_halt_n",
+            config=config, default=3) or 0)
+    except Exception:
+        _halt_n = 3
+    if _halt_n > 0 and _streak >= _halt_n:
+        try:
+            _halt_min = float(cfg_get(
+                "circuit_breaker.resp_unknown_halt_min",
+                config=config, default=60.0) or 60.0)
+        except Exception:
+            _halt_min = 60.0
+        try:
+            _until = int(time.time() * 1000 + _halt_min * 60_000)
+            memory.set_global_halt(_until)
+            logger.critical(
+                f"[executor] C-M3: {_streak} consecutive response-unknown "
+                f"order outcomes → GLOBAL HALT {_halt_min:.0f}min "
+                f"(exchange unreachable / not answering).")
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"🛑 C-M3 连续 {_streak} 次下单响应未知且无法核对，"
+                    f"暂停自动开仓 {_halt_min:.0f} 分钟（交易所连接异常）",
+                    category="risk")
+            except Exception:
+                pass
+        except Exception as _h_e:
+            logger.error(f"[executor] C-M3 halt arm failed: {_h_e}")
+    with _EXEC_LOCK:
+        _IN_FLIGHT_ANALYSES.discard(aid)
+        _IN_FLIGHT_COINS.discard(coin)
+    return {
+        "executed": False, "mode": mode, "analysis_id": aid,
+        "reason": f"order_response_unknown_unresolved: {order_res.get('error', 'unknown')}",
+        "reconcile": _rc,
+        "gate_results": gate_results,
+    }
+
+
+def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any],
+                              order_res: dict[str, Any], coin: str,
+                              trade_side: str, mid_price: float,
+                              size_in_coin: float, atr: float, leverage: int,
+                              user: str, override_composite: float,
+                              enf: Any, aid: str) -> dict[str, float]:
+    """Post-fill LOCAL STATE persistence (Phase-1): settle fill economics,
+    register the DSL exit tracker + sizing-v2 drift assertion, record the
+    trade and the entry-context snapshot. On failure the exchange fill is
+    ORPHANED — log critical and attempt an immediate rehydrate to shrink the
+    orphan window. The in-flight marker is cleared in `finally` on every
+    path. Returns {entry_px, position_notional, size_in_coin, filled_px,
+    arrival_mid, regime}."""
+    try:
+        arrival_mid = float(mid_price or 0)
+        try:
+            filled_px = float(order_res.get("avg_px") or 0)
+        except (TypeError, ValueError):
+            filled_px = 0.0
+        try:
+            filled_size = float(order_res.get("total_sz") or 0)
+        except (TypeError, ValueError):
+            filled_size = 0.0
+        entry_px = filled_px if filled_px > 0 else mid_price
+        if filled_size > 0:
+            size_in_coin = filled_size
+        position_notional = abs(size_in_coin) * entry_px
+
+        # Register the position with the DSL tracker; it re-evaluates the exit
+        # floor on every scan tick (loss protection -> profit locking).
+        dsl_config = config.get("dsl_exit", {})
+        # Regime-aware exits: scalp (base) in chop/down to bank fast; trend-ride
+        # params when regime=='up' to ride rippers. detect_regime is cached
+        # (TTL) and already computed by the market_regime gate in this same
+        # execute flow — no extra fetch.
+        _regime = "neutral"
+        try:
+            from hermes_trader.agents.market_regime import detect_regime
+            _regime = detect_regime(analysis["coin"])
+        except Exception as _re_e:
+            logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
+        _ex_protect, _ex_retrace, _tiers_raw, _ex_ml_pct, _ex_ml_roe, _ex_label = \
+            select_exit_params(dsl_config, _regime)
+        # phase2_tiers is optional in config; when present it OVERRIDES the class
+        # default ladder so profit-locking tightness is tunable without code edits.
+        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        _atr_cfg = dsl_config.get("atr_stop", {}) or {}
+        _noise_cfg = dsl_config.get("noise_band", {}) or {}
+        logger.info(f"[executor] exit policy = {_ex_label} (regime={_regime}) "
+                    f"protect={_ex_protect} retrace={_ex_retrace} "
+                    f"max_loss={_ex_ml_pct}% max_loss_roe={_ex_ml_roe}%")
+        policy = ExitPolicy(
+            max_loss_pct=_ex_ml_pct,
+            max_loss_roe_pct=_ex_ml_roe,
+            protect_pct=_ex_protect,
+            retrace_threshold=_ex_retrace,
+            hard_timeout_minutes=dsl_config.get("hard_timeout_minutes", cfg_get("dsl_exit.hard_timeout_minutes")),
+            breakeven_trigger_pct=dsl_config.get("breakeven_trigger_pct", 0.0),
+            breakeven_lock_pct=dsl_config.get("breakeven_lock_pct", 0.0),
+            atr_stop_enabled=bool(_atr_cfg.get("enabled", False)),
+            atr_stop_mult=float(_atr_cfg.get("atr_mult", 1.5)),
+            atr_stop_floor_pct=float(_atr_cfg.get("floor_pct", 1.0)),
+            atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
+            stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
+            consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
+            # A-F5: persist-confirmed (4s default) floor breach; config key
+            # dsl_exit.breach_confirm_sec drives both this and policy_from_config.
+            breach_confirm_sec=float(dsl_config.get("breach_confirm_sec", cfg_get("dsl_exit.breach_confirm_sec", default=4.0)) or 0.0),
+            noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
+            noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
+            phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
+        )
+        # ATR as % of entry — captured once here so the DSL stop width is stable
+        # for the life of the trade (the atr_stop feature scales off this).
+        entry_atr_pct = (atr / entry_px * 100) if entry_px > 0 else 0.0
+        # Use actual fill time from the exchange response when available;
+        # this gives the DSL hard_timeout an accurate baseline instead of
+        # counting from "now" (which would be early for slow fills).
+        _fill_ms = order_res.get("filled_at_ms")
+        _entry_time_sec = (_fill_ms / 1000.0) if _fill_ms else time.time()
+        register_position(coin, trade_side, entry_px, entry_time=_entry_time_sec,
+                          policy=policy, leverage=leverage,
+                          entry_atr_pct=entry_atr_pct, entry_regime=_regime)
+        logger.info(f"[executor] Registered DSL exit for {coin} {trade_side} @ {entry_px} ({leverage}x)")
+
+        # ── Sizing-v2 drift guard: assert the stop the sizer assumed matches
+        # the stop the DSL actually registered, within 5%. This catches any
+        # future silent divergence between compute_effective_stop_pct (sizing
+        # mirror) and dsl_exit._evaluate (the live floor). The two use
+        # different price bases (sizing: mid; DSL: fill) so atr_pct differs
+        # by slippage-scale bps — we compare the PURE three-layer core_stop
+        # (spike/slip adjustments are sizing-only and intentionally excluded).
+        _sizing_bd = analysis.get("_sizing_v2_breakdown")
+        if _sizing_bd:
+            try:
+                _sizing_core = float(_sizing_bd.get("core_stop", -1.0))
+                _lev = max(1.0, float(leverage))
+                # F1 sync (byte-aligned with dsl_exit._effective_max_loss
+                # L632-641): spot = min(regime cap, ATR cap). The ATR stop may
+                # only widen up to the regime cap — it must never override a
+                # tighter regime max_loss, else this guard mirrors the sizer's
+                # stale value and false-negatives a real divergence (dev=0).
+                _dsl_regime = (float(policy.max_loss_pct)
+                               if float(policy.max_loss_pct) > 0 else float("inf"))
+                if policy.atr_stop_enabled and entry_atr_pct > 0:
+                    _dsl_atr = min(
+                        max(entry_atr_pct * policy.atr_stop_mult,
+                            policy.atr_stop_floor_pct),
+                        policy.atr_stop_ceiling_pct)
+                    _dsl_spot = min(_dsl_regime, _dsl_atr)
+                else:
+                    _dsl_spot = _dsl_regime
+                _dsl_roe = (float(policy.max_loss_roe_pct) / _lev
+                            if float(policy.max_loss_roe_pct) > 0 else float("inf"))
+                _dsl_spot = _dsl_spot if _dsl_spot > 0 else float("inf")
+                _dsl_core = min(_dsl_spot, _dsl_roe)
+                _dsl_core = _dsl_core if _dsl_core != float("inf") else -1.0
+                _dev_pct = (abs(_dsl_core - _sizing_core) / _sizing_core * 100.0
+                            if _sizing_core > 0 else 0.0)
+                try:
+                    from hermes_trader.metrics import SIZING_DSL_DEVIATION
+                    SIZING_DSL_DEVIATION.set(_dev_pct)
+                except Exception:
+                    pass
+                if _sizing_core > 0 and _dev_pct > 5.0:
+                    logger.warning(
+                        f"[sizing-v2] STOP DRIFT {coin}: sizing_core={_sizing_core:.4f}% "
+                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.1f}% (>5%) — "
+                        f"sizing/DSL logic desynced, investigate")
+                    try:
+                        from hermes_trader import notify
+                        notify.send_card(
+                            title="⚠️ 仓位止损偏差告警 (STOP DRIFT)",
+                            level="danger",
+                            category="risk",
+                            fields={
+                                "币种": coin,
+                                "Sizing核心止损": f"{_sizing_core:.4f}%",
+                                "DSL核心止损": f"{_dsl_core:.4f}%",
+                                "偏差": f"{_dev_pct:.1f}% (阈值 5%)",
+                            },
+                            markdown="仓位 sizing 与 DSL 三层风控止损偏差超 5%，"
+                                     "存在风控逻辑漂移脱钩风险，请核查。",
+                            dedup_key=f"stop_drift:{coin}",
+                        )
+                    except Exception as _ne:
+                        logger.warning(f"[sizing-v2] drift notify failed for {coin}: {_ne}")
+                else:
+                    logger.info(
+                        f"[sizing-v2] drift check {coin}: sizing_core={_sizing_core:.4f}% "
+                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.2f}% OK")
+            except Exception as _dv_e:
+                logger.warning(f"[sizing-v2] drift assertion failed for {coin}: {_dv_e}")
+
+        _entry_ts = int(time.time() * 1000)
+        memory.record_trade({
+            "id": str(uuid.uuid4()),
+            "analysis_id": analysis["id"],
+            "coin": coin,
+            "side": trade_side,
+            "entry_px": entry_px,
+            "size_usd": position_notional,
+            "order_id": order_res.get("order_id"),
+            "executed_at": _entry_ts,
+        })
+
+        # Entry-context snapshot for the forward signal backtest: record WHEN we
+        # opened and WHAT the free signals said at entry (cache-only — no network
+        # on the hot path) plus the enforcement decision. The matching close
+        # pulls this so each outcome row carries (entry_time, signals_at_entry).
+        try:
+            from hermes_trader.agents.shadow_signals import gather_shadow_signals
+            _entry_sig = gather_shadow_signals(coin, trade_side,
+                                               config.get("shadow_signals") or {}, allow_fetch=False,
+                                               config=config)
+            # Execution-quality capture: arrival mid vs actual fill = real entry
+            # slippage (the # the backtests don't model). Signed as adverse cost
+            # bps (long paying above mid / short selling below = positive cost).
+            _arr_mid = arrival_mid
+            _fill = filled_px
+            _slip_bps = None
+            if _arr_mid > 0 and _fill > 0:
+                raw = (_fill - _arr_mid) / _arr_mid * 1e4
+                _slip_bps = round(raw if trade_side == "long" else -raw, 1)
+            # Funding carry: capture the latest hourly funding rate at entry (one
+            # call; entries are rare so this isn't the rate-sensitive scan path).
+            # Realized funding cost is estimated at close from rate × hold_hrs ×
+            # notional × side.
+            _funding_hr = None
+            try:
+                from hermes_trader.client.hl_client import fetch_funding_history
+                # P2-3: same config-driven lookback window as research._fetch_funding_rate.
+                try:
+                    _lb_h = int(cfg_get("funding_lookback_hours", 24))
+                    if _lb_h <= 0:
+                        _lb_h = 24
+                except (TypeError, ValueError):
+                    _lb_h = 24
+                _fh = fetch_funding_history(coin, int(time.time() * 1000) - _lb_h * 3_600_000)
+                if _fh:
+                    _r = float(_fh[-1].get("fundingRate", 0) or 0)
+                    _funding_hr = _r if _r == _r else None  # NaN guard
+            except Exception:
+                _funding_hr = None
+            memory.record_entry_context(coin, trade_side, {
+                "entry_time": _entry_ts,
+                "arrival_mid": _arr_mid,
+                "entry_fill": _fill,
+                "entry_slip_bps": _slip_bps,
+                "funding_rate_hr": _funding_hr,
+                "regime": _regime,          # market_regime at entry (already computed above)
+                "signals": _entry_sig,
+                "enforcement": ({"veto": enf.veto, "veto_reason": enf.veto_reason,
+                                 "boost": enf.boost, "boost_reason": enf.boost_reason}
+                                if enf is not None else {}),
+                "override_bar": override_composite,
+                "forced_override": analysis.get("verdict") == "LONG"
+                                   and "[structural override]" in (analysis.get("reasoning") or ""),
+            })
+        except Exception as _ec_e:
+            logger.debug(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
+    except Exception as _state_e:
+        logger.critical(f"[executor] LOCAL STATE WRITE FAILED after {coin} order "
+                        f"placed on exchange — position is ORPHANED: {_state_e}")
+        # The order FILLED on the exchange but register_position/record_trade
+        # failed, so the local tracker is missing until the next trading_loop
+        # rehydrate cycle (up to ~60s away). During that window the DSL loop
+        # won't monitor/manage this position (no stop trail, no exit). Shrink
+        # the orphan window to near-zero by reconciling immediately against a
+        # fresh account snapshot. Best-effort: a rehydrate failure must not
+        # mask the original state-write error or abort the backup-SL path.
+        try:
+            from hermes_trader.agents.dsl_exit import rehydrate_from_exchange
+            _rstate = fetch_account_state(user)
+            _rpositions = _rstate.get("asset_positions", []) or []
+            _rdropped = rehydrate_from_exchange(
+                _rpositions,
+                default_leverage=int(config.get("leverage", 1) or 1),
+                queried_dexes={""},
+                user=user,
+            )
+            if _rdropped:
+                logger.warning(f"[executor] immediate rehydrate dropped "
+                               f"{len(_rdropped)} tracker(s): "
+                               f"{[getattr(t, 'coin', '?') for t in _rdropped]}")
+            logger.info(f"[executor] immediate rehydrate completed for orphan "
+                        f"recovery after {coin} state-write failure")
+        except Exception as _rh_e:
+            logger.error(f"[executor] immediate rehydrate after state-write "
+                         f"failure failed: {_rh_e} — position will be picked "
+                         f"up on the next scheduled reconciliation cycle")
+    finally:
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(aid)
+            _IN_FLIGHT_COINS.discard(coin)
+
+    return {
+        "entry_px": entry_px,
+        "position_notional": position_notional,
+        "size_in_coin": size_in_coin,
+        "filled_px": filled_px,
+        "arrival_mid": arrival_mid,
+        "regime": _regime,
+    }
+
+
+def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
+                              is_buy: bool, trade_side: str, atr: float,
+                              entry_px: float, size_in_coin: float,
+                              stop_px: Any, tp_px: Any) -> dict[str, float]:
+    """Place the post-fill server-side bracket: the backup exchange stop-loss
+    (fast safety net under the DSL floor, with the post-HYPE ceiling clamp) and
+    the take-profit scale-out. Returns {sl_missing, final_sl, final_tp} — the
+    bracket prices mirroring the orders actually on the exchange."""
+    # Backup exchange stop-loss bracket — fires server-side (instantly, between
+    # our DSL checks) to cap the gap-throughs the DSL loop misses. DSL is still
+    # the primary/normal exit; this is the fast safety net.
+    #
+    # CEILING CLAMP (post-HYPE postmortem 2026-08-21): previously the backup SL
+    # used a raw `entry - atr*mult` with no upper bound, so on high-volatility
+    # coins (HYPE ATR=28.75% at entry) the server-side stop landed 43% away from
+    # entry while the DSL floor sat at -3% — a 40pp unprotected gap. HYPE
+    # flash-crashed through the DSL floor between two 60s polls, the backup SL
+    # never fired (price never reached -43%), and the position realized -252%
+    # ROE. The clamp keeps the backup SL within `sl_ceiling_pct` of entry so it
+    # always overlaps the DSL floor's blast radius.
+    # H3: validate config-derived SL widths. A zero/negative sl_ceiling_pct
+    # would place the backup stop AT or on the WRONG SIDE of entry (immediate
+    # / inverted trigger); a giant ceiling recreates the HYPE 43% gap. Clamp
+    # to sane bounds and fall back to defaults on non-finite / non-positive
+    # values rather than trusting arbitrary config.
+    # C4-2: multiplier and floor resolve from the SHARED dsl_exit.atr_stop
+    # block (canonical for both the DSL floor and the exchange backup SL);
+    # top-level sl_* keys remain explicit backup-layer overrides. The ceiling
+    # stays backup-specific (outer-net post-HYPE cap) and does NOT inherit the
+    # shared atr_stop ceiling.
+    _sl_widths = _resolve_sl_width_config(config, coin)
+    sl_atr_mult = _sl_widths["sl_atr_mult"]
+    sl_ceiling_pct = _sl_widths["sl_ceiling_pct"]
+    sl_floor_pct = _sl_widths["sl_floor_pct"]
+    sl_limit_band_pct = _sl_widths["sl_limit_band_pct"]
+    if not (math.isfinite(sl_atr_mult) and sl_atr_mult > 0):
+        logger.warning(f"[executor] invalid sl_atr_mult={sl_atr_mult} — falling back to {_DEFAULT_SL_ATR_MULT}")
+        sl_atr_mult = _DEFAULT_SL_ATR_MULT
+    if not (math.isfinite(sl_ceiling_pct) and sl_ceiling_pct > 0):
+        logger.warning(f"[executor] invalid sl_ceiling_pct={sl_ceiling_pct} — falling back to {_DEFAULT_SL_CEILING_PCT}")
+        sl_ceiling_pct = _DEFAULT_SL_CEILING_PCT
+    if not (math.isfinite(sl_floor_pct) and sl_floor_pct > 0):
+        logger.warning(f"[executor] invalid sl_floor_pct={sl_floor_pct} — falling back to {_DEFAULT_SL_FLOOR_PCT}")
+        sl_floor_pct = _DEFAULT_SL_FLOOR_PCT
+    # Hard upper bound: a backup stop wider than 15% from entry leaves the same
+    # unprotected gap class as the HYPE incident regardless of config.
+    # R13-B4: now driven by canonical key `sl_ceiling_hard_max_pct`
+    # (default 15.0); module constant 15.0 retained as the import-time
+    # fallback so any direct-import caller still resolves to the same number.
+    _SL_CEILING_HARD_MAX_PCT = 15.0
+    _live_hard_max_pct = _resolve_live_float(
+        "sl_ceiling_hard_max_pct", _SL_CEILING_HARD_MAX_PCT, config=config
+    )
+    if not (math.isfinite(_live_hard_max_pct) and _live_hard_max_pct > 0):
+        logger.warning(
+            f"[executor] invalid sl_ceiling_hard_max_pct={_live_hard_max_pct} — "
+            f"falling back to {_SL_CEILING_HARD_MAX_PCT}"
+        )
+        _live_hard_max_pct = _SL_CEILING_HARD_MAX_PCT
+    if sl_ceiling_pct > _live_hard_max_pct:
+        logger.warning(f"[executor] sl_ceiling_pct={sl_ceiling_pct}% exceeds hard max "
+                       f"{_live_hard_max_pct}% — clamping")
+        sl_ceiling_pct = _live_hard_max_pct
+    # Floor must never exceed ceiling (would invert the clamp and place a stop
+    # on the wrong side); pin it to ceiling if misconfigured.
+    if sl_floor_pct > sl_ceiling_pct:
+        sl_floor_pct = sl_ceiling_pct
+    # C4-3: band must never exceed the ceiling (the worst-case limit fill would
+    # otherwise print past the post-HYPE outer-net cap); pin it to ceiling.
+    if sl_limit_band_pct > sl_ceiling_pct:
+        logger.warning(f"[executor] sl_limit_band_pct={sl_limit_band_pct}% exceeds "
+                       f"ceiling {sl_ceiling_pct}% — clamping band to ceiling")
+        sl_limit_band_pct = sl_ceiling_pct
+    sl_missing = _place_backup_sl(
+        atr, entry_px, sl_atr_mult, sl_floor_pct, sl_ceiling_pct,
+        size_in_coin, is_buy, coin, trade_side, memory,
+        sl_limit_band_pct=sl_limit_band_pct)
+
+    # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
+    # fraction of the position SERVER-SIDE at the TP target so a winner is
+    # CAPTURED at target (instantly, between 60s DSL checks) instead of running
+    # to a peak and round-tripping back into the trailing stop — the documented
+    # "we had it all and gave it back" leak. The remainder rides the DSL trail,
+    # so we lock realized profit AND keep upside. Disable with tp_scale_fraction<=0.
+    _place_tp_scale_out(config, atr, size_in_coin, entry_px, is_buy, coin, trade_side)
+
+    if atr > 0 and size_in_coin > 0:
+        atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100
+        # Mirror the placed backup SL width (floor/ceiling clamp) so the
+        # returned stop_px matches the order actually on the exchange.
+        sl_width_pct = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
+        final_sl = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
+    else:
+        final_sl = stop_px
+    # R13-B4: tp_atr_mult DRIFT FIX — same fix as _place_tp_scale_out above;
+    # the canonical key was registered but the main placement path used the
+    # module constant TP_ATR_MULT=1.0 and never read cfg, so an operator tuning
+    # it (1.2 / 1.5) made AI advice / backtest / live order disagree. Fall back
+    # to the module constant when the config value is missing / non-finite.
+    live_tp_atr_mult = _resolve_live_float("tp_atr_mult", TP_ATR_MULT, config=config)
+    if not (math.isfinite(live_tp_atr_mult) and live_tp_atr_mult > 0):
+        logger.warning(
+            f"[executor] invalid tp_atr_mult={live_tp_atr_mult} — "
+            f"falling back to {TP_ATR_MULT}"
+        )
+        live_tp_atr_mult = TP_ATR_MULT
+    if is_buy:
+        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, True)
+    elif atr > 0:
+        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, False)
+    else:
+        final_tp = tp_px
+
+    return {"sl_missing": sl_missing, "final_sl": final_sl, "final_tp": final_tp}
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -2160,42 +2740,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # intermittently) and shouldn't be reported as "underfunded" when funds
     # are sitting on the dex. One retry, then back off rather than block
     # falsely with a wire-USDC-to-dex error.
-    coin_for_dex_check = analysis["coin"]
-    if ":" in coin_for_dex_check:
-        dex_name = coin_for_dex_check.split(":", 1)[0]
-        from hermes_trader.client.hl_client import _http_post
-
-        def _read_dex_value() -> tuple[bool, float]:
-            try:
-                state_resp = _http_post("/info", {
-                    "type": "clearinghouseState", "user": user, "dex": dex_name,
-                })
-            except Exception as e:
-                logger.warning(f"[executor] HIP-3 dex query raised for {dex_name}: {e}")
-                return (False, 0.0)
-            ms = (state_resp or {}).get("marginSummary")
-            if not ms:
-                return (False, 0.0)  # No marginSummary → response missing/malformed
-            return (True, float(ms.get("accountValue", 0) or 0))
-
-        ok, dex_value = _read_dex_value()
-        if not ok:
-            time.sleep(0.3)
-            ok, dex_value = _read_dex_value()
-
-        if not ok:
-            logger.warning(f"[executor] HIP-3 dex-balance lookup failed twice for {dex_name}; letting HL adjudicate")
-            # Fall through and let HL reject if it has to — better than
-            # falsely claiming the dex is empty when we couldn't verify.
-        elif dex_value < 1.0:
-            return {
-                "executed": False, "mode": mode,
-                "analysis_id": analysis["id"],
-                "reason": (
-                    f"hip3_dex_underfunded ({dex_name}: ${dex_value:.2f}). "
-                    f"Transfer USDC to '{dex_name}' via the HL frontend."
-                ),
-            }
+    _dex_reject = _hip3_dex_preflight(user, analysis["coin"], mode, analysis["id"])
+    if _dex_reject is not None:
+        return _dex_reject
 
     # include_hip3=True so the concurrency + exposure gates COUNT every open
     # position, including tokenized-equity (xyz:) HIP-3 perps. The old main-only
@@ -3098,144 +3645,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
-    if not order_res.get("ok"):
-        # H6: a DEFINITE failure (HL envelope rejection, slippage cap, local
-        # validation) means no order exists on the exchange → clear the marker
-        # and allow a later retry. But error_code="response_unknown" (408 /
-        # read timeout / SSL drop after submit) is ambiguous: the order MAY
-        # have reached HL and FILLED before the response was lost, and the
-        # cloid idempotency key means HL would reject a blind retry as a dup
-        # only if it HAS the order — giving us no signal. Reconcile against
-        # userFills by Cloid before deciding.
-        if order_res.get("error_code") == "response_unknown" and _cloid is not None:
-            try:
-                from hermes_trader.client.exchange import reconcile_order_fill
-                _rc = reconcile_order_fill(
-                    coin=coin, cloid=_cloid,
-                    is_buy=is_buy, expect_size=float(size_in_coin or 0.0) or None,
-                )
-            except Exception as _rc_e:
-                _rc = {"status": "unknown", "reason": f"reconcile_exception: {_rc_e!r}"}
-                logger.warning(f"[executor] H6 reconcile raised for {coin}: {_rc_e!r}")
-
-            if _rc.get("status") == "filled":
-                # The order DID fill despite the lost response. Backfill the
-                # result with the REAL fill economics and FALL THROUGH into
-                # the normal success path below so register_position /
-                # record_trade / backup-SL all run exactly once with true
-                # avgPx/total_sz — no duplicated registration logic.
-                _reset_resp_unknown_streak()
-                logger.warning(
-                    f"[executor] H6 RECONCILED {coin} fill after response loss: "
-                    f"avg_px={_rc.get('avg_px')} total_sz={_rc.get('total_sz')} "
-                    f"n={_rc.get('n_fills')} oid={_rc.get('oid')} — registering "
-                    f"from userFills (no orphan)."
-                )
-                try:
-                    from hermes_trader import notify
-                    notify.send_text(
-                        f"⚠️ H6 下单响应丢失但已成交，已补登: {coin} "
-                        f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
-                        f"oid={_rc.get('oid')}", category="risk")
-                except Exception:
-                    pass
-                order_res = {
-                    "ok": True,
-                    "order_id": _rc.get("oid"),
-                    "cloid": str(_cloid),
-                    "avg_px": float(_rc.get("avg_px") or 0.0),
-                    "total_sz": float(_rc.get("total_sz") or 0.0),
-                    "filled_at_ms": _rc.get("filled_at_ms"),
-                    "reconciled_after_response_unknown": True,
-                }
-            elif _rc.get("status") == "not_filled":
-                # Exchange answered cleanly and has no fill → the order truly
-                # did not execute. Safe to clear + retry later.
-                _reset_resp_unknown_streak()
-                logger.info(f"[executor] H6 reconcile {coin}: confirmed NOT filled "
-                            f"after response loss ({_rc.get('reason')}); safe to retry.")
-                with _EXEC_LOCK:
-                    _IN_FLIGHT_ANALYSES.discard(_aid)
-                    _IN_FLIGHT_COINS.discard(coin)
-                return {
-                    "executed": False, "mode": mode, "analysis_id": analysis["id"],
-                    "reason": f"order_failed_response_unknown_not_filled: {order_res.get('error', 'unknown')}",
-                    "gate_results": gate_output["results"],
-                }
-            else:
-                # The LOOKUP itself failed — we cannot tell filled from
-                # unfilled. Shrink the orphan window immediately via rehydrate
-                # (a real fill gets a synthetic tracker on this same tick),
-                # count the deaf-exchange streak, and halt auto entries at the
-                # configured threshold so we don't keep spraying orders.
-                _streak = _bump_resp_unknown_streak()
-                logger.error(
-                    f"[executor] H6 reconcile UNRESOLVED for {coin} "
-                    f"(streak={_streak}): {_rc.get('reason')} — fill state "
-                    f"unknown; running immediate rehydrate."
-                )
-                try:
-                    from hermes_trader.agents.dsl_exit import rehydrate_from_exchange
-                    _rstate = fetch_account_state(user)
-                    _rpositions = _rstate.get("asset_positions", []) or []
-                    rehydrate_from_exchange(
-                        _rpositions,
-                        default_leverage=int(config.get("leverage", 1) or 1),
-                        queried_dexes={""},
-                        user=user,
-                    )
-                except Exception as _rh_e:
-                    logger.error(f"[executor] H6 immediate rehydrate failed: {_rh_e}")
-                try:
-                    _halt_n = int(cfg_get(
-                        "circuit_breaker.resp_unknown_halt_n",
-                        config=config, default=3) or 0)
-                except Exception:
-                    _halt_n = 3
-                if _halt_n > 0 and _streak >= _halt_n:
-                    try:
-                        _halt_min = float(cfg_get(
-                            "circuit_breaker.resp_unknown_halt_min",
-                            config=config, default=60.0) or 60.0)
-                    except Exception:
-                        _halt_min = 60.0
-                    try:
-                        _until = int(time.time() * 1000 + _halt_min * 60_000)
-                        memory.set_global_halt(_until)
-                        logger.critical(
-                            f"[executor] C-M3: {_streak} consecutive response-unknown "
-                            f"order outcomes → GLOBAL HALT {_halt_min:.0f}min "
-                            f"(exchange unreachable / not answering).")
-                        try:
-                            from hermes_trader import notify
-                            notify.send_text(
-                                f"🛑 C-M3 连续 {_streak} 次下单响应未知且无法核对，"
-                                f"暂停自动开仓 {_halt_min:.0f} 分钟（交易所连接异常）",
-                                category="risk")
-                        except Exception:
-                            pass
-                    except Exception as _h_e:
-                        logger.error(f"[executor] C-M3 halt arm failed: {_h_e}")
-                with _EXEC_LOCK:
-                    _IN_FLIGHT_ANALYSES.discard(_aid)
-                    _IN_FLIGHT_COINS.discard(coin)
-                return {
-                    "executed": False, "mode": mode, "analysis_id": analysis["id"],
-                    "reason": f"order_response_unknown_unresolved: {order_res.get('error', 'unknown')}",
-                    "reconcile": _rc,
-                    "gate_results": gate_output["results"],
-                }
-        else:
-            # Definite rejection / envelope error — no order on the exchange.
-            _reset_resp_unknown_streak()
-            with _EXEC_LOCK:
-                _IN_FLIGHT_ANALYSES.discard(_aid)
-                _IN_FLIGHT_COINS.discard(coin)
-            return {
-                "executed": False, "mode": mode, "analysis_id": analysis["id"],
-                "reason": f"order_failed: {order_res.get('error', 'unknown')}",
-                "gate_results": gate_output["results"],
-            }
+    _order_fail = _reconcile_unknown_order_result(
+        order_res, coin=coin, is_buy=is_buy, size_in_coin=size_in_coin,
+        mid_price=mid_price, cloid=_cloid, config=config, user=user,
+        mode=mode, aid=_aid, gate_results=gate_output["results"])
+    if _order_fail is not None:
+        return _order_fail
 
     # Phase-1: local state persistence — wrap in try/except to prevent
     # orphaned positions (exchange has position but local state doesn't).
@@ -3280,345 +3695,23 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # verify failure must never block placement
         logger.warning(f"[executor] verify_order_exists best-effort failed: {_verify_e!r}")
 
-    try:
-        arrival_mid = float(mid_price or 0)
-        try:
-            filled_px = float(order_res.get("avg_px") or 0)
-        except (TypeError, ValueError):
-            filled_px = 0.0
-        try:
-            filled_size = float(order_res.get("total_sz") or 0)
-        except (TypeError, ValueError):
-            filled_size = 0.0
-        entry_px = filled_px if filled_px > 0 else mid_price
-        if filled_size > 0:
-            size_in_coin = filled_size
-        position_notional = abs(size_in_coin) * entry_px
+    _fill = _register_filled_position(
+        analysis=analysis, config=config, order_res=order_res, coin=coin,
+        trade_side=trade_side, mid_price=mid_price, size_in_coin=size_in_coin,
+        atr=atr, leverage=leverage, user=user,
+        override_composite=override_composite, enf=_enf, aid=_aid)
+    entry_px = _fill["entry_px"]
+    position_notional = _fill["position_notional"]
+    size_in_coin = _fill["size_in_coin"]
+    arrival_mid = _fill["arrival_mid"]
 
-        # Register the position with the DSL tracker; it re-evaluates the exit
-        # floor on every scan tick (loss protection -> profit locking).
-        dsl_config = config.get("dsl_exit", {})
-        # Regime-aware exits: scalp (base) in chop/down to bank fast; trend-ride params
-        # when regime=='up' to ride rippers. detect_regime is cached (TTL) and already
-        # computed by the market_regime gate in this same execute flow — no extra fetch.
-        _regime = "neutral"
-        try:
-            from hermes_trader.agents.market_regime import detect_regime
-            _regime = detect_regime(analysis["coin"])
-        except Exception as _re_e:
-            logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
-        _ex_protect, _ex_retrace, _tiers_raw, _ex_ml_pct, _ex_ml_roe, _ex_label = \
-            select_exit_params(dsl_config, _regime)
-        # phase2_tiers is optional in config; when present it OVERRIDES the class
-        # default ladder so profit-locking tightness is tunable without code edits.
-        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
-        _atr_cfg = dsl_config.get("atr_stop", {}) or {}
-        _noise_cfg = dsl_config.get("noise_band", {}) or {}
-        logger.info(f"[executor] exit policy = {_ex_label} (regime={_regime}) "
-                    f"protect={_ex_protect} retrace={_ex_retrace} "
-                    f"max_loss={_ex_ml_pct}% max_loss_roe={_ex_ml_roe}%")
-        policy = ExitPolicy(
-            max_loss_pct=_ex_ml_pct,
-            max_loss_roe_pct=_ex_ml_roe,
-            protect_pct=_ex_protect,
-            retrace_threshold=_ex_retrace,
-            hard_timeout_minutes=dsl_config.get("hard_timeout_minutes", cfg_get("dsl_exit.hard_timeout_minutes")),
-            breakeven_trigger_pct=dsl_config.get("breakeven_trigger_pct", 0.0),
-            breakeven_lock_pct=dsl_config.get("breakeven_lock_pct", 0.0),
-            atr_stop_enabled=bool(_atr_cfg.get("enabled", False)),
-            atr_stop_mult=float(_atr_cfg.get("atr_mult", 1.5)),
-            atr_stop_floor_pct=float(_atr_cfg.get("floor_pct", 1.0)),
-            atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
-            stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
-            consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
-            # A-F5: persist-confirmed (4s default) floor breach; config key
-            # dsl_exit.breach_confirm_sec drives both this and policy_from_config.
-            breach_confirm_sec=float(dsl_config.get("breach_confirm_sec", cfg_get("dsl_exit.breach_confirm_sec", default=4.0)) or 0.0),
-            noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
-            noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
-            phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
-        )
-        # ATR as % of entry — captured once here so the DSL stop width is stable
-        # for the life of the trade (the atr_stop feature scales off this).
-        entry_atr_pct = (atr / entry_px * 100) if entry_px > 0 else 0.0
-        # Use actual fill time from the exchange response when available;
-        # this gives the DSL hard_timeout an accurate baseline instead of
-        # counting from "now" (which would be early for slow fills).
-        _fill_ms = order_res.get("filled_at_ms")
-        _entry_time_sec = (_fill_ms / 1000.0) if _fill_ms else time.time()
-        register_position(coin, trade_side, entry_px, entry_time=_entry_time_sec,
-                          policy=policy, leverage=leverage,
-                          entry_atr_pct=entry_atr_pct, entry_regime=_regime)
-        logger.info(f"[executor] Registered DSL exit for {coin} {trade_side} @ {entry_px} ({leverage}x)")
-
-        # ── Sizing-v2 drift guard: assert the stop the sizer assumed matches
-        # the stop the DSL actually registered, within 5%. This catches any
-        # future silent divergence between compute_effective_stop_pct (sizing
-        # mirror) and dsl_exit._evaluate (the live floor). The two use
-        # different price bases (sizing: mid; DSL: fill) so atr_pct differs
-        # by slippage-scale bps — we compare the PURE three-layer core_stop
-        # (spike/slip adjustments are sizing-only and intentionally excluded).
-        _sizing_bd = analysis.get("_sizing_v2_breakdown")
-        if _sizing_bd:
-            try:
-                _sizing_core = float(_sizing_bd.get("core_stop", -1.0))
-                _lev = max(1.0, float(leverage))
-                _dsl_spot = float(policy.max_loss_pct)
-                if policy.atr_stop_enabled and entry_atr_pct > 0:
-                    _dsl_spot = min(
-                        max(entry_atr_pct * policy.atr_stop_mult,
-                            policy.atr_stop_floor_pct),
-                        policy.atr_stop_ceiling_pct)
-                _dsl_roe = (float(policy.max_loss_roe_pct) / _lev
-                            if float(policy.max_loss_roe_pct) > 0 else float("inf"))
-                _dsl_spot = _dsl_spot if _dsl_spot > 0 else float("inf")
-                _dsl_core = min(_dsl_spot, _dsl_roe)
-                _dsl_core = _dsl_core if _dsl_core != float("inf") else -1.0
-                _dev_pct = (abs(_dsl_core - _sizing_core) / _sizing_core * 100.0
-                            if _sizing_core > 0 else 0.0)
-                try:
-                    from hermes_trader.metrics import SIZING_DSL_DEVIATION
-                    SIZING_DSL_DEVIATION.set(_dev_pct)
-                except Exception:
-                    pass
-                if _sizing_core > 0 and _dev_pct > 5.0:
-                    logger.warning(
-                        f"[sizing-v2] STOP DRIFT {coin}: sizing_core={_sizing_core:.4f}% "
-                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.1f}% (>5%) — "
-                        f"sizing/DSL logic desynced, investigate")
-                    try:
-                        from hermes_trader import notify
-                        notify.send_card(
-                            title="⚠️ 仓位止损偏差告警 (STOP DRIFT)",
-                            level="danger",
-                            category="risk",
-                            fields={
-                                "币种": coin,
-                                "Sizing核心止损": f"{_sizing_core:.4f}%",
-                                "DSL核心止损": f"{_dsl_core:.4f}%",
-                                "偏差": f"{_dev_pct:.1f}% (阈值 5%)",
-                            },
-                            markdown="仓位 sizing 与 DSL 三层风控止损偏差超 5%，"
-                                     "存在风控逻辑漂移脱钩风险，请核查。",
-                            dedup_key=f"stop_drift:{coin}",
-                        )
-                    except Exception as _ne:
-                        logger.warning(f"[sizing-v2] drift notify failed for {coin}: {_ne}")
-                else:
-                    logger.info(
-                        f"[sizing-v2] drift check {coin}: sizing_core={_sizing_core:.4f}% "
-                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.2f}% OK")
-            except Exception as _dv_e:
-                logger.warning(f"[sizing-v2] drift assertion failed for {coin}: {_dv_e}")
-
-        _entry_ts = int(time.time() * 1000)
-        memory.record_trade({
-            "id": str(uuid.uuid4()),
-            "analysis_id": analysis["id"],
-            "coin": coin,
-            "side": trade_side,
-            "entry_px": entry_px,
-            "size_usd": position_notional,
-            "order_id": order_res.get("order_id"),
-            "executed_at": _entry_ts,
-        })
-
-        # Entry-context snapshot for the forward signal backtest: record WHEN we opened
-        # and WHAT the free signals said at entry (cache-only — no network on the hot
-        # path) plus the enforcement decision. The matching close pulls this so each
-        # outcome row carries (entry_time, signals_at_entry) — the join the backtest
-        # needs and that the outcome store previously lacked.
-        try:
-            from hermes_trader.agents.shadow_signals import gather_shadow_signals
-            _entry_sig = gather_shadow_signals(coin, trade_side,
-                                               config.get("shadow_signals") or {}, allow_fetch=False,
-                                               config=config)
-            # Execution-quality capture: arrival mid vs actual fill = real entry
-            # slippage (the # the backtests don't model). Signed as adverse cost bps
-            # (long paying above mid / short selling below = positive cost).
-            _arr_mid = arrival_mid
-            _fill = filled_px
-            _slip_bps = None
-            if _arr_mid > 0 and _fill > 0:
-                raw = (_fill - _arr_mid) / _arr_mid * 1e4
-                _slip_bps = round(raw if trade_side == "long" else -raw, 1)
-            # Funding carry: capture the latest hourly funding rate at entry (one call;
-            # entries are rare so this isn't the rate-sensitive scan path). Realized
-            # funding cost is estimated at close from rate × hold_hrs × notional × side.
-            _funding_hr = None
-            try:
-                from hermes_trader.client.hl_client import fetch_funding_history
-                # P2-3: same config-driven lookback window as research._fetch_funding_rate.
-                try:
-                    _lb_h = int(cfg_get("funding_lookback_hours", 24))
-                    if _lb_h <= 0:
-                        _lb_h = 24
-                except (TypeError, ValueError):
-                    _lb_h = 24
-                _fh = fetch_funding_history(coin, int(time.time() * 1000) - _lb_h * 3_600_000)
-                if _fh:
-                    _r = float(_fh[-1].get("fundingRate", 0) or 0)
-                    _funding_hr = _r if _r == _r else None  # NaN guard
-            except Exception:
-                _funding_hr = None
-            memory.record_entry_context(coin, trade_side, {
-                "entry_time": _entry_ts,
-                "arrival_mid": _arr_mid,
-                "entry_fill": _fill,
-                "entry_slip_bps": _slip_bps,
-                "funding_rate_hr": _funding_hr,
-                "regime": _regime,          # market_regime at entry (already computed above)
-                "signals": _entry_sig,
-                "enforcement": ({"veto": _enf.veto, "veto_reason": _enf.veto_reason,
-                                 "boost": _enf.boost, "boost_reason": _enf.boost_reason}
-                                if _enf is not None else {}),
-                "override_bar": override_composite,
-                "forced_override": analysis.get("verdict") == "LONG"
-                                   and "[structural override]" in (analysis.get("reasoning") or ""),
-            })
-        except Exception as _ec_e:
-            logger.debug(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
-    except Exception as _state_e:
-        logger.critical(f"[executor] LOCAL STATE WRITE FAILED after {coin} order "
-                        f"placed on exchange — position is ORPHANED: {_state_e}")
-        # The order FILLED on the exchange but register_position/record_trade
-        # failed, so the local tracker is missing until the next trading_loop
-        # rehydrate cycle (up to ~60s away). During that window the DSL loop
-        # won't monitor/manage this position (no stop trail, no exit). Shrink
-        # the orphan window to near-zero by reconciling immediately against a
-        # fresh account snapshot. Best-effort: a rehydrate failure must not
-        # mask the original state-write error or abort the backup-SL path.
-        try:
-            from hermes_trader.agents.dsl_exit import rehydrate_from_exchange
-            _rstate = fetch_account_state(user)
-            _rpositions = _rstate.get("asset_positions", []) or []
-            _rdropped = rehydrate_from_exchange(
-                _rpositions,
-                default_leverage=int(config.get("leverage", 1) or 1),
-                queried_dexes={""},
-                user=user,
-            )
-            if _rdropped:
-                logger.warning(f"[executor] immediate rehydrate dropped "
-                               f"{len(_rdropped)} tracker(s): "
-                               f"{[getattr(t, 'coin', '?') for t in _rdropped]}")
-            logger.info(f"[executor] immediate rehydrate completed for orphan "
-                        f"recovery after {coin} state-write failure")
-        except Exception as _rh_e:
-            logger.error(f"[executor] immediate rehydrate after state-write "
-                         f"failure failed: {_rh_e} — position will be picked "
-                         f"up on the next scheduled reconciliation cycle")
-    finally:
-        with _EXEC_LOCK:
-            _IN_FLIGHT_ANALYSES.discard(_aid)
-            _IN_FLIGHT_COINS.discard(coin)
-
-    # Backup exchange stop-loss bracket — fires server-side (instantly, between our
-    # DSL checks) to cap the gap-throughs the DSL loop misses. DSL is still the
-    # primary/normal exit; this is the fast safety net.
-    #
-    # CEILING CLAMP (post-HYPE postmortem 2026-08-21): previously the backup SL
-    # used a raw `entry - atr*mult` with no upper bound, so on high-volatility
-    # coins (HYPE ATR=28.75% at entry) the server-side stop landed 43% away from
-    # entry while the DSL floor sat at -3% — a 40pp unprotected gap. HYPE flash-
-    # crashed through the DSL floor between two 60s polls, the backup SL never
-    # fired (price never reached -43%), and the position realized -252% ROE.
-    # The clamp keeps the backup SL within `sl_ceiling_pct` of entry so it always
-    # overlaps the DSL floor's blast radius.
-    # H3: validate config-derived SL widths. A zero/negative sl_ceiling_pct
-    # would place the backup stop AT or on the WRONG SIDE of entry (immediate
-    # / inverted trigger); a giant ceiling recreates the HYPE 43% gap. Clamp
-    # to sane bounds and fall back to defaults on non-finite / non-positive
-    # values rather than trusting arbitrary config.
-    # C4-2: multiplier and floor resolve from the SHARED dsl_exit.atr_stop
-    # block (canonical for both the DSL floor and the exchange backup SL);
-    # top-level sl_* keys remain explicit backup-layer overrides. The ceiling
-    # stays backup-specific (outer-net post-HYPE cap) and does NOT inherit the
-    # shared atr_stop ceiling.
-    _sl_widths = _resolve_sl_width_config(config, coin)
-    sl_atr_mult = _sl_widths["sl_atr_mult"]
-    sl_ceiling_pct = _sl_widths["sl_ceiling_pct"]
-    sl_floor_pct = _sl_widths["sl_floor_pct"]
-    sl_limit_band_pct = _sl_widths["sl_limit_band_pct"]
-    if not (math.isfinite(sl_atr_mult) and sl_atr_mult > 0):
-        logger.warning(f"[executor] invalid sl_atr_mult={sl_atr_mult} — falling back to {_DEFAULT_SL_ATR_MULT}")
-        sl_atr_mult = _DEFAULT_SL_ATR_MULT
-    if not (math.isfinite(sl_ceiling_pct) and sl_ceiling_pct > 0):
-        logger.warning(f"[executor] invalid sl_ceiling_pct={sl_ceiling_pct} — falling back to {_DEFAULT_SL_CEILING_PCT}")
-        sl_ceiling_pct = _DEFAULT_SL_CEILING_PCT
-    if not (math.isfinite(sl_floor_pct) and sl_floor_pct > 0):
-        logger.warning(f"[executor] invalid sl_floor_pct={sl_floor_pct} — falling back to {_DEFAULT_SL_FLOOR_PCT}")
-        sl_floor_pct = _DEFAULT_SL_FLOOR_PCT
-    # Hard upper bound: a backup stop wider than 15% from entry leaves the same
-    # unprotected gap class as the HYPE incident regardless of config.
-    # R13-B4: now driven by canonical key `sl_ceiling_hard_max_pct`
-    # (default 15.0); module constant 15.0 retained as the import-time
-    # fallback so any direct-import caller still resolves to the same
-    # number.
-    _SL_CEILING_HARD_MAX_PCT = 15.0
-    _live_hard_max_pct = _resolve_live_float(
-        "sl_ceiling_hard_max_pct", _SL_CEILING_HARD_MAX_PCT, config=config
-    )
-    if not (math.isfinite(_live_hard_max_pct) and _live_hard_max_pct > 0):
-        logger.warning(
-            f"[executor] invalid sl_ceiling_hard_max_pct={_live_hard_max_pct} — "
-            f"falling back to {_SL_CEILING_HARD_MAX_PCT}"
-        )
-        _live_hard_max_pct = _SL_CEILING_HARD_MAX_PCT
-    if sl_ceiling_pct > _live_hard_max_pct:
-        logger.warning(f"[executor] sl_ceiling_pct={sl_ceiling_pct}% exceeds hard max "
-                       f"{_live_hard_max_pct}% — clamping")
-        sl_ceiling_pct = _live_hard_max_pct
-    # Floor must never exceed ceiling (would invert the clamp and place a stop
-    # on the wrong side); pin it to ceiling if misconfigured.
-    if sl_floor_pct > sl_ceiling_pct:
-        sl_floor_pct = sl_ceiling_pct
-    # C4-3: band must never exceed the ceiling (the worst-case limit fill would
-    # otherwise print past the post-HYPE outer-net cap); pin it to ceiling.
-    if sl_limit_band_pct > sl_ceiling_pct:
-        logger.warning(f"[executor] sl_limit_band_pct={sl_limit_band_pct}% exceeds "
-                       f"ceiling {sl_ceiling_pct}% — clamping band to ceiling")
-        sl_limit_band_pct = sl_ceiling_pct
-    sl_missing = _place_backup_sl(
-        atr, entry_px, sl_atr_mult, sl_floor_pct, sl_ceiling_pct,
-        size_in_coin, is_buy, coin, trade_side, memory,
-        sl_limit_band_pct=sl_limit_band_pct)
-
-    # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
-    # fraction of the position SERVER-SIDE at the TP target so a winner is
-    # CAPTURED at target (instantly, between 60s DSL checks) instead of running
-    # to a peak and round-tripping back into the trailing stop — the documented
-    # "we had it all and gave it back" leak. The remainder rides the DSL trail,
-    # so we lock realized profit AND keep upside. Disable with tp_scale_fraction<=0.
-    _place_tp_scale_out(config, atr, size_in_coin, entry_px, is_buy, coin, trade_side)
-
-    if atr > 0 and size_in_coin > 0:
-        atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100
-        # Mirror the placed backup SL width (floor/ceiling clamp) so the
-        # returned stop_px matches the order actually on the exchange.
-        sl_width_pct = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
-        final_sl = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
-    else:
-        final_sl = stop_px
-    # R13-B4: tp_atr_mult DRIFT FIX — same fix as _place_tp_scale_out above;
-    # the canonical key was registered but the main placement path used
-    # the module constant TP_ATR_MULT=1.0 and never read cfg, so an
-    # operator tuning it (1.2 / 1.5) made AI advice / backtest / live
-    # order disagree. Fall back to the module constant when the config
-    # value is missing / non-finite.
-    live_tp_atr_mult = _resolve_live_float("tp_atr_mult", TP_ATR_MULT, config=config)
-    if not (math.isfinite(live_tp_atr_mult) and live_tp_atr_mult > 0):
-        logger.warning(
-            f"[executor] invalid tp_atr_mult={live_tp_atr_mult} — "
-            f"falling back to {TP_ATR_MULT}"
-        )
-        live_tp_atr_mult = TP_ATR_MULT
-    if is_buy:
-        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, True)
-    elif atr > 0:
-        final_tp = _signed_price(entry_px, atr * live_tp_atr_mult, False)
-    else:
-        final_tp = tp_px
+    _brackets = _place_post_fill_brackets(
+        config=config, coin=coin, is_buy=is_buy, trade_side=trade_side,
+        atr=atr, entry_px=entry_px, size_in_coin=size_in_coin,
+        stop_px=stop_px, tp_px=tp_px)
+    sl_missing = _brackets["sl_missing"]
+    final_sl = _brackets["final_sl"]
+    final_tp = _brackets["final_tp"]
 
     _record_decision("executed")
     _record_entry(trade_side)
@@ -4451,12 +4544,18 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                 if tracker is not None and _spot_loss_pct > 0:
                     _pol = tracker.policy
                     _lev = max(1.0, float(tracker.leverage or leverage))
-                    _cap_spot = float(_pol.max_loss_pct)
+                    _cap_regime = (float(_pol.max_loss_pct)
+                                   if float(_pol.max_loss_pct) > 0 else float("inf"))
                     if getattr(_pol, "atr_stop_enabled", False) and getattr(tracker, "entry_atr_pct", 0) > 0:
-                        _cap_spot = min(
+                        # F1 sync: ATR may only widen up to the regime cap;
+                        # byte-aligned with dsl_exit._effective_max_loss L632-641.
+                        _cap_atr = min(
                             max(float(tracker.entry_atr_pct) * float(_pol.atr_stop_mult),
                                 float(_pol.atr_stop_floor_pct)),
                             float(_pol.atr_stop_ceiling_pct))
+                        _cap_spot = min(_cap_regime, _cap_atr)
+                    else:
+                        _cap_spot = _cap_regime
                     _cap_roe = (float(_pol.max_loss_roe_pct) / _lev
                                 if float(_pol.max_loss_roe_pct) > 0 else float("inf"))
                     _cap_spot = _cap_spot if _cap_spot > 0 else float("inf")

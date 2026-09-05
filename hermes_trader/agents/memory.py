@@ -1758,10 +1758,6 @@ class AgentMemory:
     def get_daily_pnl(self) -> float:
         return self._daily_pnl
 
-    def get_day_start_ts(self) -> int:
-        """UTC-midnight unix-seconds timestamp for the in-progress trading day."""
-        return self._day_start_ts
-
     def get_start_of_day_equity(self) -> float:
         """Equity baseline at the current UTC day start (daily loss % denominator)."""
         return self._start_of_day_equity

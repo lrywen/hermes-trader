@@ -1556,11 +1556,6 @@ def deregister_position(coin: str, side: str) -> bool:
     return False
 
 
-def get_tracker(coin: str, side: str) -> Optional[DSLTracker]:
-    """Return the active tracker for a coin+side, or None."""
-    return _active_positions.get(f"{coin}_{side}")
-
-
 def set_bracket(coin: str, side: str, **fields: Any) -> bool:
     """Atomically update one or more exchange-bracket fields on a tracker and persist.
 
@@ -1649,6 +1644,44 @@ def _build_policy_from_config() -> ExitPolicy:
         return ExitPolicy()
 
 
+def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
+    """Build the SAME regime-aware ExitPolicy a fresh live entry would get, so
+    a SYNTHESIZED tracker (post-blackout / orphan rehydrate) inherits the
+    regime-specific stops instead of the regime-BLIND ``_policy_from_config()``
+    (top-level max_loss_pct / max_loss_roe_pct).
+
+    The live entry path (executor.register) calls ``select_exit_params(dsl,
+    regime)`` and builds the policy from those params: trend regimes (up/down)
+    get the trend-ride 0.8% / 10%-ROE cap, non-trend (neutral/chop) the scalp
+    0.4% / 5%-ROE cap. We start from the full config policy (every other knob)
+    and overlay exactly those regime params. Fail-open: any resolution error
+    (missing regime_aware block, import error, select failure) returns the base
+    config policy — never a crash, never the bare ExitPolicy() default.
+    """
+    base = _policy_from_config()
+    try:
+        import dataclasses
+        from hermes_trader.agents.config_store import read_agent_config
+        from hermes_trader.agents.executor import select_exit_params
+        dsl = read_agent_config().get("dsl_exit", {}) or {}
+        _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
+            select_exit_params(dsl, regime or "neutral")
+        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        return dataclasses.replace(
+            base,
+            max_loss_pct=float(_ml_pct),
+            max_loss_roe_pct=float(_ml_roe),
+            protect_pct=float(_prot),
+            retrace_threshold=float(_retrace),
+            phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[dsl] regime-aware synth policy build failed (regime={regime!r}); "
+            f"falling back to base config policy: {e}")
+        return base
+
+
 def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
                             policy: Optional[ExitPolicy] = None,
                             default_leverage: int = 1,
@@ -1696,9 +1729,30 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
             # default. A synthesize happens after a blackout-induced drop (the
             # exchange momentarily reported the position gone), and the default
             # is LOOSER (2.5%/50% ROE vs config 2.0%/30%) — re-synthesizing with
-            # the default silently widened live stops ("policy drift"). Pull
-            # config when the caller didn't pass an explicit policy.
-            synth_policy = policy if policy is not None else _policy_from_config()
+            # the default silently widened live stops ("policy drift").
+            #
+            # Regime parity: when the caller didn't pass an explicit policy,
+            # build the SAME regime-aware policy a fresh live entry would get
+            # (trend up/down → 0.8%/10%ROE trend-ride; neutral/chop →
+            # 0.4%/5%ROE scalp). The position's true entry regime is gone after
+            # a state wipe, so we use the CURRENT regime (TTL-cached) as the best
+            # available proxy — and it is already what the live entry path used
+            # for this coin's most recent gate evaluation. detect_regime fails
+            # open to "neutral"; the policy builder fails open to the base
+            # config policy, so regime I/O can never block rehydrate.
+            synth_regime = ""
+            if policy is None:
+                try:
+                    from hermes_trader.agents.market_regime import detect_regime
+                    synth_regime = str(detect_regime(coin) or "neutral")
+                except Exception as _rg_e:
+                    logger.debug(
+                        f"[dsl] synth regime lookup failed for {key} "
+                        f"(non-fatal, neutral/scalp): {_rg_e}")
+                    synth_regime = "neutral"
+                synth_policy = _regime_aware_policy_for(synth_regime)
+            else:
+                synth_policy = policy
             # Try to resolve the actual fill time so the hard_timeout is
             # accurate. Match on coin/side/price/size so a prior round-trip
             # on the same coin isn't mis-attributed as the current entry.
@@ -1719,8 +1773,9 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
                         f"reset — verify this position is not stale."
                     )
                 _entry_time = time.time()
-            _active_positions[key] = DSLTracker(coin, side, entry, _entry_time, synth_policy,
-                                                leverage=lev)
+            _active_positions[key] = DSLTracker(
+                coin, side, entry, _entry_time, synth_policy,
+                leverage=lev, entry_regime=synth_regime if policy is None else "")
             added += 1
             logger.info(f"[dsl] Synthesized tracker for existing {key} @ {entry} ({lev}x)")
             # Record the open in the outcome store so rehydrated positions

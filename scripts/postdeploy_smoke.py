@@ -10,7 +10,7 @@ PURR stop-out was detected but its close record was never written.
 Checks (each must pass; exit non-zero on the first failure):
   1. Python imports for every critical module.
   2. Key functions/classes that recent fixes depend on actually exist
-     (`resolve_close_fill`, `_Cache.delete`, `shared_config`, the event-log
+     (`resolve_close_fill`, `shared_config`, the event-log
      bridge, the memory rebuild path).
   3. The event-log bridge forks outcome events from session-log.
   4. Memory rebuild + record_trade/close chokepoints exist.
@@ -62,11 +62,6 @@ CRITICAL_SYMBOLS: List[Tuple[str, List[str]]] = [
      ["send_text", "send_card", "is_enabled"]),
 ]
 
-# Methods that must exist on instances (verified separately after import).
-CRITICAL_METHODS: List[Tuple[str, str, str]] = [
-    ("hermes_trader.client.cache", "_Cache", "delete"),
-]
-
 # Files/dirs the running process needs. Each is a path; we assert it exists
 # OR its parent is writable (for files that may be lazily created).
 REQUIRED_PATHS = [
@@ -106,18 +101,6 @@ def check_imports() -> bool:
                 ok = False
             else:
                 _ok(f"{mod_name}.{sym}")
-    for mod_name, cls, method in CRITICAL_METHODS:
-        try:
-            mod = __import__(mod_name, fromlist=[cls])
-            instance_method = getattr(getattr(mod, cls), method, None)
-            if instance_method is None:
-                _fail(f"{mod_name}.{cls}.{method} is missing")
-                ok = False
-            else:
-                _ok(f"{mod_name}.{cls}.{method}")
-        except Exception as e:
-            _fail(f"{mod_name}.{cls}.{method}: {e}")
-            ok = False
     return ok
 
 

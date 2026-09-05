@@ -30,8 +30,7 @@ import fcntl
 import json
 import os
 import tempfile
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from typing import Any
 
 PathLike = str | os.PathLike[str]
@@ -135,17 +134,6 @@ def write_json_atomic(
         raise
 
 
-def read_json(path: PathLike, default: Any = None) -> Any:
-    """Read JSON from ``path``; return ``default`` if missing/unreadable."""
-    try:
-        with open(os.fspath(path), "r") as f:
-            return json.load(f)
-    except FileNotFoundError:
-        return default
-    except (OSError, json.JSONDecodeError):
-        return default
-
-
 def _lock_path(path: PathLike) -> str:
     return os.fspath(path) + ".lock"
 
@@ -173,26 +161,6 @@ def locked_write_json_atomic(
             indent=indent, fsync=fsync, ebusy_fallback=ebusy_fallback,
             default=default,
         )
-    finally:
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        except OSError:
-            pass
-        os.close(lock_fd)
-
-
-@contextmanager
-def flock_context(path: PathLike, *, exclusive: bool = True) -> Iterator[None]:
-    """Yield while holding a cross-process flock on ``<path>.lock``.
-
-    For read-modify-write callers that already manage their own lock file
-    (e.g. config_store.update_agent_config) so they can wrap read + write under
-    a single LOCK_EX without adopting locked_write_json_atomic.
-    """
-    lock_fd = os.open(_lock_path(path), os.O_CREAT | os.O_RDWR, 0o644)
-    try:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
-        yield
     finally:
         try:
             fcntl.flock(lock_fd, fcntl.LOCK_UN)

@@ -143,18 +143,56 @@ def _max_positions() -> int:
     return cap
 
 
-def _build_policy():
+def _build_policy(regime: str = ""):
     """Build the SAME DSL ExitPolicy a fresh live entry would get, so paper
-    positions exit under identical stops. Lazy import avoids cycles."""
+    positions exit under identical stops. Lazy import avoids cycles.
+
+    Regime-aware parity: the live executor (executor.py register path) calls
+    ``select_exit_params(dsl_config, regime)`` and registers the resulting
+    per-regime max_loss_pct / max_loss_roe_pct / protect / retrace / tiers
+    (trend=0.8%/10%ROE trend-ride in up/down; scalp=0.4%/5%ROE in
+    neutral/chop). Previously the paper book built the regime-BLIND
+    ``_policy_from_config()`` (top-level max_loss_pct=1.0 / max_loss_roe_pct=15)
+    for every paper position, so shadow stops were systematically LOOSER than
+    live — 57/57 historical shadow closes exited beyond the live cap. We start
+    from the full config policy (every other knob) and overlay the regime-aware
+    exit params exactly as the live executor does, so paper/live stops match.
+    Fail-open: any resolution error falls back to the base config policy (never
+    a crash, never the bare ExitPolicy() default).
+    """
+    base = None
     try:
         from hermes_trader.agents.dsl_exit import _policy_from_config
-        return _policy_from_config()
+        base = _policy_from_config()
     except Exception:
         try:
             from hermes_trader.agents.dsl_exit import ExitPolicy
-            return ExitPolicy()
+            base = ExitPolicy()
         except Exception:
             return None
+    try:
+        import dataclasses
+        from hermes_trader.agents.config_store import read_agent_config
+        from hermes_trader.agents.executor import select_exit_params
+        from hermes_trader.agents.dsl_exit import RetraceTier
+        dsl = read_agent_config().get("dsl_exit", {}) or {}
+        _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
+            select_exit_params(dsl, regime or "neutral")
+        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        from hermes_trader.agents.dsl_exit import ExitPolicy as _EP
+        return dataclasses.replace(
+            base,
+            max_loss_pct=float(_ml_pct),
+            max_loss_roe_pct=float(_ml_roe),
+            protect_pct=float(_prot),
+            retrace_threshold=float(_retrace),
+            phase2_tiers=_tiers if _tiers else _EP().phase2_tiers,
+        )
+    except Exception as e:
+        logger.warning(
+            f"[shadow_book] regime-aware policy build failed "
+            f"(regime={regime!r}); falling back to base config policy: {e}")
+        return base
 
 
 # Live exchange BACKUP stop-loss (the disaster net) defaults. Mirrors executor
@@ -380,13 +418,16 @@ class ShadowBook:
         valid_positions: list[dict[str, Any]] = []
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
-            policy = _build_policy()
             for p in self.state["positions"]:
                 try:
                     coin = p["coin"]
                     side = p["side"]
                     entry_px = float(p["entry_px"])
                     entry_time = float(p.get("opened_at", _now_ms())) / 1000.0
+                    # Per-position regime-aware policy (parity with live):
+                    # each paper position exits under its own entry regime's
+                    # stops, never one shared regime-blind policy.
+                    policy = _build_policy(p.get("entry_regime", "") or "")
                     t = DSLTracker(
                         coin, side, entry_px, entry_time,
                         policy=policy, leverage=int(p.get("leverage", 1) or 1),
@@ -551,7 +592,7 @@ class ShadowBook:
                 from hermes_trader.agents.dsl_exit import DSLTracker
                 self._trackers[self._key(coin, side)] = DSLTracker(
                     coin, side, float(entry_px), opened_at / 1000.0,
-                    policy=_build_policy(), leverage=lev,
+                    policy=_build_policy(entry_regime), leverage=lev,
                     entry_atr_pct=float(entry_atr_pct or 0.0),
                     entry_regime=entry_regime or "",
                 )

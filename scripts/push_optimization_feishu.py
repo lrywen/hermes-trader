@@ -128,10 +128,6 @@ def _fmt_pct(v: float) -> str:
     return f"{v:+.1f}%"
 
 
-def _color_for_pnl(v: float) -> str:
-    return "green" if v >= 0 else "red"
-
-
 def build_card() -> Dict[str, Any]:
     elements: List[Dict[str, Any]] = []
 

@@ -304,6 +304,184 @@ def late_entry_check(
     return result
 
 
+def chase_exhaustion_check(
+    candles_4h: Optional[list[Candle]],
+    side: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Strong-trend chase / late-stage exhaustion counterfactual (F2).
+
+    SHADOW-ONLY PROBE — observation only, never wired into a live veto.
+
+    Offline replay of 52 closed shadow trades (2026-09-05) found the worst
+    "buy the top" max_loss entries are NOT raw overbought ticks (those are
+    already caught by late_entry_check's RSI/extension limits) but LONG chases
+    entered late in a parabolic move: high ADX (strong one-sided trend) with
+    RSI still moderately elevated but extension already stretched. These pass
+    late_entry_check because RSI ~65-69 sits under the 75 hard limit (and the
+    trend-relax exception widens it to 82), yet price reverses almost
+    immediately (MFE < 0.5%). The separable cluster was ADX>=35 & (RSI>=60 OR
+    extension>=1.0) for longs: 5 trades, all losers, -$3.79, ZERO winning
+    trades harmed — stable across an ADX 35-45 / RSI 60-65 grid (not a
+    threshold-edge fit). Shorts mirror symmetrically.
+
+    Readings are taken from the last CLOSED 4h bar (the same series the gate
+    scores after dropping the forming bar), keeping the rule backtest-aligned.
+
+    Returns dict: ``block`` (would this rule veto?), ``reason``, the measured
+    ``rsi4h``/``adx4h``/``extension``, and ``data_ok`` (False → callers fail
+    open and skip the observation).
+    """
+    p: dict[str, Any] = params or {}
+
+    def _p(key: str, default: Any) -> Any:
+        v = p.get(key, default)
+        return default if v is None else v
+
+    result: dict[str, Any] = {
+        "block": False,
+        "reason": "",
+        "rsi4h": None,
+        "adx4h": None,
+        "extension": None,
+        "data_ok": False,
+    }
+    if side not in ("long", "short"):
+        result["reason"] = f"unknown side {side!r}"
+        return result
+
+    min_bars_4h = int(_p("min_bars_4h", 30))
+    if not candles_4h or len(candles_4h) < min_bars_4h:
+        result["reason"] = "insufficient 4h candle data"
+        return result
+    result["data_ok"] = True
+
+    rsi4h = _compute_rsi(candles_4h)
+    adx4h = _compute_adx(candles_4h)
+    extension = _extension_atr(candles_4h)
+    result["rsi4h"] = rsi4h
+    result["adx4h"] = adx4h
+    result["extension"] = extension
+
+    adx_floor = float(_p("chase_adx_min", 35))
+    is_long = side == "long"
+    if is_long:
+        rsi_floor = float(_p("chase_rsi_long", 60))
+        ext_floor = float(_p("chase_ext_long", 1.0))
+    else:
+        rsi_floor = float(_p("chase_rsi_short", 40))
+        ext_floor = float(_p("chase_ext_short", -1.0))
+
+    strong = adx4h is not None and adx4h >= adx_floor
+    if is_long:
+        rsi_hit = rsi4h is not None and rsi4h >= rsi_floor
+        ext_hit = extension is not None and extension >= ext_floor
+    else:
+        rsi_hit = rsi4h is not None and rsi4h <= rsi_floor
+        ext_hit = extension is not None and extension <= ext_floor
+
+    if strong and (rsi_hit or ext_hit):
+        result["block"] = True
+        tags = [f"ADX {adx4h:.0f}>={adx_floor:.0f}"]
+        if rsi_hit:
+            tags.append(f"RSI {rsi4h:.0f}{'>=' if is_long else '<='}{rsi_floor:.0f}")
+        if ext_hit:
+            tags.append(
+                f"ext {extension:+.1f}{'>=' if is_long else '<='}{ext_floor:+.1f}xATR"
+            )
+        result["reason"] = f"chase-exhaustion {side} ({', '.join(tags)})"
+    return result
+
+
+def weak_trend_noise_check(
+    candles_4h: Optional[list[Candle]],
+    side: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Weak-trend noise-zone entry counterfactual.
+
+    SHADOW-ONLY PROBE — observation only, never wired into a live veto.
+
+    Offline replay of 56 closed shadow trades (2026-09-05) found the dominant
+    "open and immediately stop out" cluster (6 trades, MFE < 0.3%, ~87% of
+    today's losses) is NOT overbought chase — those entries already pass
+    late_entry_check — but entries taken in a 4h NOISE ZONE: ADX 14-23 (no
+    directional trend) with EMA8/21 trend_direction flat or turned against the
+    side, in a non-aligned market regime. late_entry_check only guards the
+    OTHER end (its trend-relax exception widens limits when ADX>=35); nothing
+    guards the choppy low-ADX end, and market_regime_gate free-passes regime
+    "neutral".
+
+    Validated separable rule (stable across an ADX ceiling of 22/25/28, i.e.
+    not a threshold-edge fit): flag when ADX < weak_adx_max AND the 4h
+    EMA8/21 trend does NOT support the side — a "flat" trend counts as
+    non-support (strict-against-trend alone misses the flat noise losers).
+    Flagging flat is only safe WITH the caller-side market-regime alignment
+    exemption (long in an up regime / short in a down regime is never noise):
+    without it the rule wrongly harms winners (ENA +$1.05 in regime=up,
+    CASHCAT short +$0.71 in regime=down) that ride a low-ADX/flat 4h trend
+    inside an aligned regime. That exemption is applied by the caller (which
+    owns the market-regime label); this pure function scores only the candles.
+
+    Readings use the last CLOSED 4h bar (the same series the gate scores
+    after dropping the forming bar), keeping the rule backtest-aligned.
+
+    Returns dict: ``block``, ``reason``, measured ``adx4h``/``trend_direction``
+    and ``data_ok`` (False → callers fail open and skip the observation).
+    """
+    p: dict[str, Any] = params or {}
+
+    def _p(key: str, default: Any) -> Any:
+        v = p.get(key, default)
+        return default if v is None else v
+
+    result: dict[str, Any] = {
+        "block": False,
+        "reason": "",
+        "adx4h": None,
+        "trend_direction": None,
+        "data_ok": False,
+    }
+    if side not in ("long", "short"):
+        result["reason"] = f"unknown side {side!r}"
+        return result
+
+    min_bars_4h = int(_p("min_bars_4h", 30))
+    if not candles_4h or len(candles_4h) < min_bars_4h:
+        result["reason"] = "insufficient 4h candle data"
+        return result
+    result["data_ok"] = True
+
+    adx4h = _compute_adx(candles_4h)
+    trend = _assess_trend(candles_4h)
+    result["adx4h"] = adx4h
+    result["trend_direction"] = trend
+
+    adx_ceiling = float(_p("weak_adx_max", 25))
+    flat_blocks = bool(_p("weak_flat_blocks", True))
+    is_long = side == "long"
+
+    if adx4h is None:
+        return result
+    if adx4h >= adx_ceiling:
+        return result
+
+    if is_long:
+        supports = trend == "bullish" or (not flat_blocks and trend == "flat")
+        against_tag = "trend flat" if trend == "flat" else "trend bearish"
+    else:
+        supports = trend == "bearish" or (not flat_blocks and trend == "flat")
+        against_tag = "trend flat" if trend == "flat" else "trend bullish"
+
+    if not supports:
+        result["block"] = True
+        result["reason"] = (
+            f"weak-trend noise {side} (ADX {adx4h:.0f}<{adx_ceiling:.0f}, "
+            f"{against_tag})"
+        )
+    return result
+
+
 def _late_entry_params() -> dict[str, Any]:
     """ta_late_entry config block for the shared late-entry veto.
 

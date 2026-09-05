@@ -119,19 +119,6 @@ def _merge_scores(agg: Dict[str, List[float]],
         agg[k].extend(vals)
 
 
-def _false_trend(cross: Dict[str, Counter], trend_cols) -> Tuple[int, int]:
-    """Return (false-trend bars, total non-trend bars) over bt NEUTRAL/CHOP."""
-    ft = 0
-    tot = 0
-    for bt in ("NEUTRAL", "CHOP"):
-        row = cross.get(bt, Counter())
-        trend_n = sum(row.get(s, 0) for s in trend_cols)
-        all_n = sum(row.values())
-        ft += trend_n
-        tot += all_n
-    return ft, tot
-
-
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--days", type=int, default=30)

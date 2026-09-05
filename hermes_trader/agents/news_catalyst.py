@@ -238,6 +238,50 @@ _inflight_lock = threading.Lock()
 # (canonical news_catalyst.http_timeout_s, env-overridable).
 _HTTP_TIMEOUT_S = 3.0
 
+# Per-host fetch-failure log throttle. GDELT's free tier fails/stalls often;
+# logging a WARNING on every request flooded the loop log (thousands of lines
+# per hour) with no new signal. Collapse repeated failures for the same host
+# into one WARNING per window (with a running count); log once when it recovers.
+_FAIL_LOG_WINDOW_S = 300.0
+_fail_state: dict[str, list] = {}   # host -> [consecutive_failures, total_suppressed, last_log_ts]
+_fail_state_lock = threading.Lock()
+
+
+def _fetch_host(url: str) -> str:
+    try:
+        return urllib.parse.urlsplit(url).netloc or "?"
+    except Exception:
+        return "?"
+
+
+def _log_fetch_failure(url: str, elapsed: float, exc: BaseException) -> None:
+    host = _fetch_host(url)
+    now = time.monotonic()
+    with _fail_state_lock:
+        st = _fail_state.setdefault(host, [0, 0, 0.0])
+        st[0] += 1
+        st[1] += 1
+        if now - st[2] < _FAIL_LOG_WINDOW_S:
+            return  # within throttle window — collapse into the running count
+        fails, suppressed, _ = st
+        st[1] = 0
+        st[2] = now
+    logger.warning(
+        f"[news] GET failed for {host} after {elapsed:.2f}s: "
+        f"{type(exc).__name__}: {exc} (consecutive failures: {fails}"
+        + (f"; {suppressed} similar failures in last {_FAIL_LOG_WINDOW_S:.0f}s"
+           if suppressed else "")
+        + ")"
+    )
+
+
+def _log_fetch_recovery(url: str) -> None:
+    host = _fetch_host(url)
+    with _fail_state_lock:
+        st = _fail_state.pop(host, None)
+    if st is not None and st[0] > 0:
+        logger.info(f"[news] fetch to {host} recovered after {st[0]} consecutive failure(s)")
+
 
 # M-9 (supplemental audit 2026-08-30): only plain http/https URLs may be
 # fetched. Without an explicit scheme allowlist a manipulated URL could use
@@ -261,12 +305,13 @@ def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict]:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:  # nosec B310 (supplemental audit 2026-08-30): scheme allowlisted by _is_safe_web_url above
             data = json.loads(r.read().decode("utf-8", "replace"))
             _elapsed = time.monotonic() - _t0
+            _log_fetch_recovery(url)
             if _elapsed > 2.0:
                 logger.info(f"[news] GET json {url[:80]}... in {_elapsed:.2f}s")
             return data
     except Exception as _e:
         _elapsed = time.monotonic() - _t0
-        logger.warning(f"[news] GET json failed after {_elapsed:.2f}s: {type(_e).__name__}: {_e}")
+        _log_fetch_failure(url, _elapsed, _e)
         return None
 
 
@@ -282,12 +327,13 @@ def _get_text(url: str, timeout: Optional[float] = None) -> Optional[str]:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:  # nosec B310 (supplemental audit 2026-08-30): scheme allowlisted by _is_safe_web_url above
             data = r.read().decode("utf-8", "replace")
             _elapsed = time.monotonic() - _t0
+            _log_fetch_recovery(url)
             if _elapsed > 2.0:
                 logger.info(f"[news] GET text {url[:80]}... in {_elapsed:.2f}s")
             return data
     except Exception as _e:
         _elapsed = time.monotonic() - _t0
-        logger.warning(f"[news] GET text failed after {_elapsed:.2f}s: {type(_e).__name__}: {_e}")
+        _log_fetch_failure(url, _elapsed, _e)
         return None
 
 

@@ -1108,7 +1108,7 @@ def _sync_account_state():
     # up as trading PnL in the equity-diff calculation.
     # (supplemental audit 2026-09-02) Use the CURRENT UTC day boundary, not the
     # memory's stored day_start_ts: on the FIRST tick after a UTC midnight roll
-    # memory.get_day_start_ts() still returns YESTERDAY's epoch (track_daily_pnl
+    # memory._day_start_ts still holds YESTERDAY's epoch (track_daily_pnl
     # below is what re-baselines it forward). Querying contributions over that
     # stale window double-counts yesterday's perp->spot transfer: e.g. a $30
     # transfer made yesterday re-appears as net_contributions=-30 on today's

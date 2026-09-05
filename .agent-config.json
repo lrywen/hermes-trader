@@ -1,5 +1,5 @@
 {
-  "mode": "LIVE",
+  "mode": "SHADOW",
   "enable_crypto": true,
   "enable_hip3": true,
   "equity_fraction_per_trade": 0.2,

@@ -352,9 +352,6 @@ class _Canvas:
     def hline(self, x0, x1, y, c):
         self.fill_rect(x0, y, x1, y+1, c)
 
-    def vline(self, x, y0, y1, c):
-        self.fill_rect(x, y0, x+1, y1, c)
-
     def text(self, s, x, y, c=(0, 0, 0), scale: int = 1, anchor: str = "lt"):
         s = s.upper()
         width_px = sum((6) for _ in s) * scale
