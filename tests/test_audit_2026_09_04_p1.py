@@ -93,16 +93,20 @@ def test_p1_14_safe_production_config_passes_envelope():
         ("max_concurrent", 20),               # was the old 10-style drift
         ("max_total_notional_pct", 25.0),     # past leverage band
         ("leverage", 50),
-        ("risk_per_trade_pct", 0.25),
+        ("atr_risk_sizing.risk_per_trade_pct", 0.06),  # tightened envelope: >5% breaches
         ("min_ai_confidence", 0.30),
         ("max_daily_loss_usd", -500.0),
     ],
 )
 def test_p1_14_loosened_key_breaches_envelope(key, bad_value):
     cfg = dict(CANONICAL_DEFAULTS)
-    cfg[key] = bad_value
+    leaf = key.split(".")[-1]
+    if "." in key:
+        cfg[key.split(".")[0]] = {**CANONICAL_DEFAULTS[key.split(".")[0]], leaf: bad_value}
+    else:
+        cfg[key] = bad_value
     errors = startup_config_integrity_errors(cfg)
-    assert any(key in e for e in errors), f"{key}={bad_value} should breach"
+    assert any(leaf in e for e in errors), f"{key}={bad_value} should breach"
 
 
 def test_p1_14_non_numeric_value_reported():
@@ -116,6 +120,36 @@ def test_p1_14_missing_key_is_not_an_error():
     # Keys absent from the cfg resolve to canonical at use sites (in envelope).
     cfg = dict(CANONICAL_DEFAULTS)
     del cfg["leverage"]
+    assert startup_config_integrity_errors(cfg) == []
+
+
+# ── P2-20: SHADOW/LIVE position-cap parity (startup refusal on drift) ─────
+
+def test_p2_20_shadow_position_cap_drift_is_startup_error():
+    # The production drift this guards against: max_concurrent=4 vs an
+    # explicit shadow_book.max_positions=2 → paper book and live gate admit
+    # different concurrency, breaking 1:1 shadow parity.
+    cfg = dict(CANONICAL_DEFAULTS)
+    cfg["max_concurrent"] = 4
+    cfg["shadow_book"] = {**CANONICAL_DEFAULTS["shadow_book"], "max_positions": 2}
+    errors = startup_config_integrity_errors(cfg)
+    assert any("shadow_book.max_positions" in e and "max_concurrent" in e
+               for e in errors), errors
+
+
+def test_p2_20_shadow_position_cap_matching_is_ok():
+    cfg = dict(CANONICAL_DEFAULTS)
+    cfg["max_concurrent"] = 4
+    cfg["shadow_book"] = {**CANONICAL_DEFAULTS["shadow_book"], "max_positions": 4}
+    assert startup_config_integrity_errors(cfg) == []
+
+
+def test_p2_20_absent_shadow_position_cap_is_ok():
+    # No explicit max_positions → shadow_book tracks max_concurrent at run
+    # time; nothing to drift.
+    cfg = dict(CANONICAL_DEFAULTS)
+    assert "max_positions" not in cfg["shadow_book"]
+    cfg["max_concurrent"] = 4
     assert startup_config_integrity_errors(cfg) == []
 
 

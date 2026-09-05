@@ -157,6 +157,57 @@ def _build_policy():
             return None
 
 
+# Live exchange BACKUP stop-loss (the disaster net) defaults. Mirrors executor
+# _DEFAULT_SL_*. Parity note: in Phase 1 the exchange trigger order rests at
+# this width and never moves (sync_exchange_sl only trails once profit reaches
+# protect_pct), so it is the worst-case price a live max_loss can fill at on a
+# gap that trades THROUGH the DSL floor between two polls.
+_BACKUP_SL_ATR_MULT = 1.5
+_BACKUP_SL_FLOOR_PCT = 1.0
+_BACKUP_SL_CEILING_PCT = 3.0
+
+
+def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
+                          entry_atr_pct: float) -> Optional[float]:
+    """Price at which the live exchange backup SL fires on a gap-through.
+
+    width_pct = min(max(entry_atr_pct*mult, floor), ceiling), mirroring
+    executor._place_backup_sl / _resolve_sl_width_config (mult/floor resolve
+    from the shared dsl_exit.atr_stop block, with top-level sl_* overrides and
+    the per-coin atr_risk_sizing floor). Returns None when inputs are unusable.
+    Slip-widening is omitted (it needs live avg_exit_slip_bps the paper book
+    cannot observe); it only widens the net sub-floor and is second-order.
+    """
+    try:
+        if entry_px <= 0:
+            return None
+        from hermes_trader.agents.config_store import cfg_get
+        mult = float(cfg_get("sl_atr_mult",
+                             cfg_get("dsl_exit.atr_stop.atr_mult",
+                                     _BACKUP_SL_ATR_MULT)))
+        floor = float(cfg_get("sl_floor_pct",
+                              cfg_get("dsl_exit.atr_stop.floor_pct",
+                                      _BACKUP_SL_FLOOR_PCT)))
+        ceiling = float(cfg_get("sl_ceiling_pct", _BACKUP_SL_CEILING_PCT))
+        coin_floor = cfg_get(
+            f"atr_risk_sizing.coin_overrides.{coin}.sl_floor_pct", None)
+        if coin_floor is not None:
+            floor = float(coin_floor)
+        if not (mult > 0 and floor > 0 and ceiling > 0):
+            return None
+        if floor > ceiling:
+            floor = ceiling
+        atr_pct = float(entry_atr_pct or 0.0)
+        width = min(max(atr_pct * mult, floor), ceiling)
+        if side == "long":
+            return float(entry_px) * (1.0 - width / 100.0)
+        if side == "short":
+            return float(entry_px) * (1.0 + width / 100.0)
+    except Exception as e:
+        logger.warning(f"[shadow_book] backup SL trigger calc failed {coin}: {e}")
+    return None
+
+
 # ---------------------------------------------------------------------------
 # persistence
 # ---------------------------------------------------------------------------
@@ -640,8 +691,32 @@ class ShadowBook:
                     except Exception as e:
                         logger.warning(f"[shadow_book] dsl check failed {coin}: {e}")
                 if exit_now:
+                    # F6 (shadow/live fill parity): a normal live exit — hard
+                    # max_loss OR trailing floor_breach — is a software IOC
+                    # market fill at the price present when the DSL signal is
+                    # confirmed. That is exactly THIS mark, so the paper book
+                    # fills at mark. The ONLY divergence is a gap-through: when
+                    # the confirming mark has traded PAST the live exchange
+                    # backup-SL trigger (the wider disaster net resting server-
+                    # side), live fills at that trigger instead of the post-gap
+                    # mark. Cap the paper fill there too — otherwise the paper
+                    # book invents a tail loss the live net actually caps (e.g.
+                    # HEMI -7.8% where live would have been stopped at ~-3%).
+                    # (F2's blanket "fill max_loss at its DSL floor" was wrong:
+                    # it filled EVERY stop at the tighter DSL floor, giving the
+                    # paper book a better price than live gets on normal exits.)
+                    fill_px = float(mark)
+                    if reason.startswith("max_loss"):
+                        trig = _backup_sl_trigger_px(
+                            coin=coin, side=side,
+                            entry_px=float(pos["entry_px"]),
+                            entry_atr_pct=float(pos.get("entry_atr_pct", 0.0) or 0.0))
+                        if trig is not None:
+                            gapped = (mark < trig) if side == "long" else (mark > trig)
+                            if gapped:
+                                fill_px = float(trig)
                     closed.append(self._close_position(
-                        pos, float(mark), reason or "dsl_exit",
+                        pos, fill_px, reason or "dsl_exit",
                         hold_min=hold_min, mfe_pct=mfe))
                 else:
                     # Refresh stored mark/unrealized for dashboard reads.

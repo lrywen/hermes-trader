@@ -99,8 +99,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # percentage fraction. The `_pct` suffix is historical and misleading; the
     # runtime and schema both treat it as an equity multiple. Production pins
     # 4.0 (= 4× equity total-open-notional ceiling, within the 10x leverage
-    # band). 0 disables the cap. Do NOT set it to 0.04 expecting 4% — that
-    # would cap total notional at 4% of equity and freeze the account.
+    # band).
+    # H1 [2026-09-05] semantic clarification: 0 is REJECTED at the schema
+    # layer (config_schema.py L716-726 enforces >= 0.5) because the runtime
+    # gate `equity_risk_cap` (risk_gates.py:590) interprets pct=0 as
+    # max_notional=$0, which would silently neuter a layer of defence. The
+    # earlier "0 disables the cap" comment is INCORRECT — the gate never
+    # short-circuits on 0, it caps everything to $0. To actually disable
+    # the cap, set a large positive value (e.g. 10.0 for 10× equity) and
+    # rely on max_daily_loss_usd as the real circuit breaker. Do NOT set
+    # it to 0.04 expecting 4% — that would cap total notional at 4% of
+    # equity and freeze the account.
     # Daily-loss kill-switch — P1-15 unified semantics (see
     # risk_gates.effective_daily_loss_cutoff): the ENTRY gate halts new entries
     # at the TIGHTER of (a) circuit_breaker.daily_loss_pct × equity [PRIMARY,
@@ -1436,8 +1445,8 @@ _STARTUP_SAFETY_CHECKS: list[tuple[str, str, float, str]] = [
      "total-open-notional > 10× equity exceeds the leverage band"),
     ("leverage", ">", 20,
      "leverage > 20x far exceeds production sizing (live: 10)"),
-    ("risk_per_trade_pct", ">", 0.10,
-     "risk_per_trade_pct > 10% risks >10% equity on one stop"),
+    ("atr_risk_sizing.risk_per_trade_pct", ">", 0.05,
+     "atr_risk_sizing.risk_per_trade_pct > 5% risks >5% equity on one stop"),
     ("min_ai_confidence", "<", 0.50,
      "min_ai_confidence < 0.50 admits coin-flip verdicts as entries"),
     ("max_daily_loss_usd", "<", -50.0,
@@ -1458,7 +1467,10 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
     for dotted, op, bound, human in _STARTUP_SAFETY_CHECKS:
         try:
             val = _lookup_in_dict(cfg, dotted)
-        except Exception:
+        except Exception as e:
+            # H4 [2026-09-05]: 键路径缺失/无法解析时显式告警，避免静默跳过
+            # 安全检查（静默跳过会让 P1-14 防御层形同虚设）
+            logger.error("startup_safety_check key path unresolvable: %s err=%s", dotted, e)
             val = None
         if val is None:
             # Missing keys resolve to canonical defaults via cfg_get at use
@@ -1479,6 +1491,34 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
         if breach:
             errors.append(
                 f"startup safety: {dotted}={num} {op} {bound} — {human}")
+
+    # P2-20 (audit 2026-09-04): SHADOW/LIVE position-cap PARITY. An explicit
+    # shadow_book.max_positions that diverges from max_concurrent makes the
+    # paper book admit a different number of concurrent positions than the
+    # live gate allows — shadow results then stop tracking live 1:1 (the
+    # production config once shipped max_concurrent=4 vs max_positions=2).
+    # The fix is to DELETE shadow_book.max_positions (it then tracks the
+    # live cap automatically); an explicit mismatch is a startup refusal.
+    shadow_cap = None
+    try:
+        shadow_cap = _lookup_in_dict(cfg, "shadow_book.max_positions")
+    except Exception:
+        shadow_cap = None
+    if shadow_cap is not None:
+        try:
+            live_cap = int(float(_lookup_in_dict(cfg, "max_concurrent")))
+            shadow_cap_i = int(float(shadow_cap))
+        except Exception:
+            errors.append(
+                "startup safety: shadow_book.max_positions/max_concurrent "
+                "are not numeric — cannot verify SHADOW/LIVE position parity")
+        else:
+            if shadow_cap_i != live_cap:
+                errors.append(
+                    f"startup safety: shadow_book.max_positions={shadow_cap_i} "
+                    f"!= max_concurrent={live_cap} — SHADOW/LIVE position caps "
+                    "diverge; delete shadow_book.max_positions so it tracks the "
+                    "live cap (shadow_book.py:_max_positions)")
     return errors
 
 

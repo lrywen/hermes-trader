@@ -60,10 +60,35 @@ def test_different_atr_different_stop_same_mult():
 def test_clamps_bind():
     tiny = DSLTracker("TINY", "long", 100.0, time.time(), _policy(),
                       leverage=1, entry_atr_pct=0.2)    # 0.3% -> floor 1.0%
-    huge = DSLTracker("HUGE", "long", 100.0, time.time(), _policy(),
+    # ATR ceiling can only bind when it is TIGHTER than the fixed max_loss cap;
+    # give this one a loose fixed cap (10%) so the 4.0% ATR ceiling is the limit.
+    huge = DSLTracker("HUGE", "long", 100.0, time.time(),
+                      _policy(max_loss_pct=10.0),
                       leverage=1, entry_atr_pct=10.0)   # 15% -> ceiling 4.0%
     assert abs(_stop_pct(tiny) - 1.0) < 0.06
     assert abs(_stop_pct(huge) - 4.0) < 0.06
+
+
+def test_atr_cannot_widen_past_fixed_max_loss():
+    """F1 regression: the ATR-derived stop may tighten but must NEVER widen past
+    the configured fixed/regime max_loss_pct. Pre-fix the ATR branch overwrote
+    the fixed cap, so a wild coin's 4% ATR ceiling silently replaced a 3.5% (or a
+    0.4% live regime) stop — the 'tight regime stop never fires' bug."""
+    # Wild coin: raw ATR stop = 15%, clamped to the 4.0% ATR ceiling. With a
+    # fixed cap of 3.5% the effective stop must be 3.5%, NOT 4.0%.
+    wild_fixed = DSLTracker("WF", "long", 100.0, time.time(), _policy(),
+                            leverage=1, entry_atr_pct=10.0)
+    assert abs(_stop_pct(wild_fixed) - 3.5) < 0.06
+    # Live non-trend regime cap (0.4%) must win over ANY ATR widening.
+    regime = DSLTracker("REG", "long", 100.0, time.time(),
+                        _policy(max_loss_pct=0.4),
+                        leverage=1, entry_atr_pct=10.0)
+    assert abs(_stop_pct(regime) - 0.4) < 0.06
+    # ATR still tightens a QUIET coin below the fixed cap (min is two-way):
+    # 1.5x1.0 = 1.5% < fixed 3.5% -> 1.5% stop.
+    quiet = DSLTracker("Q", "long", 100.0, time.time(), _policy(),
+                       leverage=1, entry_atr_pct=1.0)
+    assert abs(_stop_pct(quiet) - 1.5) < 0.06
 
 
 def test_roe_cap_still_applies_on_top():

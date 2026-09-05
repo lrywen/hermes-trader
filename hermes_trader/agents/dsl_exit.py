@@ -612,17 +612,33 @@ class DSLTracker:
         return active
 
     def _effective_max_loss(self) -> float:
-        """Effective SPOT-% stop: min(ATR-or-fixed spot cap, ROE/lev cap).
+        """Effective SPOT-% stop: min(regime/fixed cap, ATR cap, ROE/lev cap).
 
         Pure computation — no state mutation. Shared by check() and status().
+
+        The ATR stop may only WIDEN the stop up to the configured
+        ``atr_stop_ceiling_pct``; it must never OVERRIDE a tighter regime
+        ``max_loss_pct`` (live sets trend=0.8% / non-trend=0.4% via
+        ``select_exit_params``). Previously the ATR branch replaced
+        ``spot_cap`` wholesale, so an ATR value above the regime cap clamped at
+        the 3% ceiling meant the tight regime stop never bound. Taking the min
+        with ``pol.max_loss_pct`` keeps the regime stop as the hard upper
+        bound while still letting a calm regime benefit from the ATR floor.
         """
         pol = self.policy
         lev = max(1, self.leverage)
-        spot_cap = pol.max_loss_pct
+        # Regime/fixed spot cap (live passes a per-regime value; default is the
+        # config max_loss_pct). This is the hard upper bound on loss width.
+        regime_cap = pol.max_loss_pct if pol.max_loss_pct > 0 else float("inf")
         if pol.atr_stop_enabled and self.entry_atr_pct > 0:
-            spot_cap = min(max(self.entry_atr_pct * pol.atr_stop_mult,
-                               pol.atr_stop_floor_pct),
-                           pol.atr_stop_ceiling_pct)
+            atr_cap = min(max(self.entry_atr_pct * pol.atr_stop_mult,
+                              pol.atr_stop_floor_pct),
+                          pol.atr_stop_ceiling_pct)
+            # ATR can only widen up to the regime cap, never override a tighter
+            # regime stop: the binding spot cap is the smaller of the two.
+            spot_cap = min(regime_cap, atr_cap)
+        else:
+            spot_cap = regime_cap
         roe_cap = (pol.max_loss_roe_pct / lev) if pol.max_loss_roe_pct > 0 else float("inf")
         spot_cap = spot_cap if spot_cap > 0 else float("inf")
         return min(spot_cap, roe_cap)

@@ -1926,6 +1926,14 @@ while True:
             for _dj in _dropped_jobs:
                 _dj_coin = _dj[0]
                 _dj_score = _dj[2]
+                # Audit hash-chain: record each dropped coin like every other
+                # pre-research skip (ta_skip) so backpressure drops are
+                # observable in the event log/feed, not just the stdout summary.
+                log_event({"event": "ta_skip", "coin": _dj_coin,
+                           "signal": "JOBS_BACKPRESSURE",
+                           "score": round(float(_dj_score), 1),
+                           "trigger_score": round(float(_dj_score), 1),
+                           "reason": "jobs_backpressure_cap"})
                 _cycle_outcomes.append(
                     (_dj_coin, "skip", False, "jobs_backpressure_cap")
                 )
@@ -1983,13 +1991,17 @@ while True:
                 with ThreadPoolExecutor(max_workers=_workers,
                                         thread_name_prefix="research-coin") as _pool:
                     _futures = [_pool.submit(_run_research, *_job) for _job in _research_jobs]
-                    # Futures are appended in trigger order, so iterating them
-                    # re-serializes results deterministically for phase 3.
+                    # Futures mirror _research_jobs order (score-desc when the
+                    # backpressure cap trimmed a batch, otherwise scan/trigger
+                    # order); iterating them re-serializes results
+                    # deterministically for phase 3.
                     for _fut in _futures:
                         _research_results.append(_fut.result())
                 _beat("research_batch_done")
             else:
-                # Serial path — identical ordering/behavior to the original loop.
+                # Serial path — same behaviour as the original loop; ordering
+                # follows _research_jobs (score-desc after a backpressure trim,
+                # otherwise scan/trigger order).
                 for _job in _research_jobs:
                     _j_coin = _job[0]
                     _beat(f"research_start:{_j_coin}")
@@ -1997,7 +2009,9 @@ while True:
 
         # ---- Phase 3: route verdicts on the MAIN thread (order side-effects) ----
         # executor.route_verdict may place/close orders, so it never runs in a
-        # worker. Results are iterated in the original trigger order.
+        # worker. Results are routed by coin (each row carries its coin), so the
+        # iteration order — score-desc after a backpressure trim, otherwise
+        # trigger order — is irrelevant to correctness.
         for _r_coin, _r_score, _r_gate, analysis, _r_err in _research_results:
             if _r_err is not None:
                 logger.error(f"Error processing {_r_coin}: {_r_err}")
