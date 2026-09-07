@@ -49,6 +49,12 @@ from typing import Any, Dict, List
 
 HL_API = os.environ.get("HYPERLIQUID_API_URL", "https://api.hyperliquid.xyz")
 
+# Audit 2026-09-07 (M4): the dashboard reconcile-status card reads this file.
+# Written best-effort by the cron path only; failures never affect the exit
+# code or the Feishu alert (a broken status file must not mask discrepancies).
+STATUS_FILE = os.environ.get("HERMES_RECONCILE_STATUS_FILE",
+                             "/data/reconcile_status.json")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s",
@@ -325,6 +331,78 @@ def send_alert(r: Dict[str, Any]) -> bool:
         return False
 
 
+# ── Status file for the dashboard (Audit 2026-09-07, M4) ────────────────
+
+def _slim_fill(f: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only identifying/display fields of an exchange fill in the
+    status file — raw fills carry nothing sensitive, but the dashboard does
+    not need the full payload."""
+    return {
+        "coin": f.get("coin"),
+        "side": f.get("side"),
+        "px": f.get("px"),
+        "sz": f.get("sz"),
+        "oid": f.get("oid"),
+        "time": f.get("time"),
+        "closedPnl": f.get("closedPnl"),
+    }
+
+
+def _slim_local_close(c: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "coin": c.get("coin"),
+        "side": c.get("side"),
+        "exit_px": c.get("exit_px"),
+        "close_source": c.get("close_source"),
+        "closed_at": c.get("closed_at"),
+        "close_oid": c.get("close_oid"),
+    }
+
+
+def build_status(r: Dict[str, Any], backfilled: int = 0) -> Dict[str, Any]:
+    """Slim dashboard-facing status payload: counts + identifying rows only."""
+    n_issues = (len(r["orphan_opens"]) + len(r["orphan_closes"])
+                + len(r["phantom_closes"]))
+    return {
+        "generated_at": datetime.now(timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"),
+        "window_hours": r["window_hours"],
+        "status": "clean" if n_issues == 0 else "discrepancies",
+        "exchange_fills_total": r["exchange_fills_total"],
+        "exchange_fills_in_window": r["exchange_fills_in_window"],
+        "exchange_opens": r["exchange_opens"],
+        "exchange_closes": r["exchange_closes"],
+        "local_trades": r["local_trades"],
+        "local_closes": r["local_closes"],
+        "orphan_opens_count": len(r["orphan_opens"]),
+        "orphan_closes_count": len(r["orphan_closes"]),
+        "phantom_closes_count": len(r["phantom_closes"]),
+        "issues_total": n_issues,
+        "backfilled_closes": backfilled,
+        "orphan_opens": [_slim_fill(f) for f in r["orphan_opens"]],
+        "orphan_closes": [_slim_fill(f) for f in r["orphan_closes"]],
+        "phantom_closes": [_slim_local_close(c) for c in r["phantom_closes"]],
+    }
+
+
+def write_status(r: Dict[str, Any], backfilled: int = 0) -> bool:
+    """Atomically persist the reconcile status for the dashboard card.
+
+    Best-effort: any failure is logged and swallowed — the cron exit code and
+    the discrepancy alert must never be affected by an unwritable status."""
+    try:
+        payload = build_status(r, backfilled=backfilled)
+        tmp = f"{STATUS_FILE}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, STATUS_FILE)
+        logger.info(f"[reconcile] status written to {STATUS_FILE}")
+        return True
+    except Exception as e:
+        logger.warning(f"[reconcile] status write failed (non-fatal): {e}")
+        return False
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--window-hours", type=float, default=26.0,
@@ -343,12 +421,18 @@ def main() -> int:
 
     print_report(r)
 
+    backfilled = 0
     if args.auto_backfill and r["orphan_closes"]:
         for f in r["orphan_closes"]:
             try:
                 backfill_orphan_close(f)
+                backfilled += 1
             except Exception as e:
                 logger.error(f"backfill failed for oid={f.get('oid')}: {e}")
+
+    # Audit 2026-09-07 (M4): persist status for the dashboard card, after
+    # backfill so the counts reflect the post-backfill state. Best-effort.
+    write_status(r, backfilled=backfilled)
 
     n_issues = (len(r["orphan_opens"]) + len(r["orphan_closes"])
                 + len(r["phantom_closes"]))

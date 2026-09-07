@@ -2490,6 +2490,7 @@ def register_routes(app: FastAPI) -> None:
     (including the SPA history-mode catch-all) register last so their
     ``/{full_path:path}`` route never shadows the config/operator APIs.
     """
+    from hermes_trader.dashboard_routes.audit import register_audit_routes
     from hermes_trader.dashboard_routes.config import register_config_routes
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
@@ -2506,5 +2507,9 @@ def register_routes(app: FastAPI) -> None:
     # reports over read-only endpoints + operator-gated refresh. Same
     # before-public ordering so /api/dashboard/shadow-arms/* is not swallowed.
     register_shadow_arms_routes(app)
+    # Audit 2026-09-07 (M4): hash-chain verification + reconcile status read
+    # endpoints. Read-only/anonymous-safe at the trader boundary; the portal
+    # BFF tightens RBAC. Same before-public ordering as the other API groups.
+    register_audit_routes(app)
     register_public_routes(app)
 

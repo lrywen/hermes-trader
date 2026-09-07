@@ -92,8 +92,8 @@
 | **M1 后端 API 铺路** ✅ **已落地 2026-09-07** | trader 侧 grades/refresh/history 3 端点 + shadow_grade 落历史快照；blind 事件补发 SSE；py_compile + 全量 pytest 只增不减 | 出口：curl 取到分级 JSON；blind 时 feed 有事件 — **已达成**（容器 6b029550aced 冒烟全通，2997 passed，详见文末附录 A） |
 | **M2 BFF 接线** ✅ **已落地 2026-09-07** | proxy.py `_PATH_RULES` 登记新路径（读/写权限）；nginx 无需改（走 `/api/dashboard/` 已通） | 出口：门户带 token 经 BFF 取数；无 token 写被拒 — **已达成**（容器 5b8beae9d8b9 冒烟全通，门户 pytest 13 passed，详见附录 B） |
 | **M3 影子臂评级中心页** ✅ **已落地 2026-09-07** | 新建 `/risk-arms` 页 + 路由/菜单/Store；blind 事件接 AlertPopup | 出口：12 臂评级、三窗统计、DATA_GAP 红横幅、PROMOTE 跳 Config 全可用 — **已达成**（容器 382797cfa3e3 冒烟全通，门户 pytest 14 passed，type-check/build 0 错，详见附录 C） |
-| **M4 审计/对账（可并行）** | 台账哈希链卡片、reconcile 状态卡片 | 出口：链校验状态、对账差异可见 |
-| **M5 数据积累后复盘** | grade-history 趋势图、Config 页臂 mode 联动；待 shadow 臂积够样本（PROMOTE/REVIEW）供人工拍板 | 依赖真实影子数据积累，非开发量 |
+| **M4 审计/对账（可并行）** ✅ **已落地 2026-09-07** | trader 侧 ledger/reconcile 只读端点 + cron 对账状态落盘；BFF RBAC（ledger=admin:audit、reconcile=operator:mode）；台账哈希链卡片（AuditLog 页）、reconcile 状态卡片（Operator 页） | 出口：链校验状态、对账差异可见 — **已达成**（双栈容器冒烟全通，trader 3011 passed、门户 14 passed，详见附录 D） |
+| **M5 数据积累后复盘** ✅ **已落地 2026-09-07** | grade-history 双趋势图（RiskArms 页 ECharts 堆叠面积 + 命中率走势）；Config 页臂 mode/夜间评级联动只读卡（INERT，PROMOTE 仅跳转） | 出口：趋势与姿态联动可见、卡内无任何改 mode/下单控件 — **已达成**（type-check/build 0 错，详见附录 D；评级样本仍随夜间 cron 持续积累，供人工拍板） |
 
 顺序强依赖 M1→M2→M3；M4 可与 M3 并行；M5 等数据。**M1/M2 是关键路径**。
 
@@ -231,3 +231,65 @@
 
 - #1 12 臂 mode+verdict 与 shadow_grade 输出一致（冒烟逐条核对）；#2 DATA_GAP 红横幅+整行红底（本轮无 DATA_GAP 臂，渲染逻辑按 verdict=DATA_GAP 触发，blind SSE danger 弹窗链路已通）；#3 PROMOTE 跳 /config 且页内无改闸门控件（C3）；#4 viewer 403/菜单不可见、operator 可读可重评（MATRIX+菜单测试）；#5 grades 走 60s 快照缓存读路径；#6 closes=0 时显"无真钱对照"warn（当前 closes=15 显对照正常）；#7 blind → danger 弹窗需手动关闭（复用 alerts 既有去重/新鲜度机制）。
 - 历史趋势图（grade-history 折线）按计划留待 **M5**（数据积累后），页面历史区已注明"趋势图在 M5 补齐"。
+
+---
+
+## 附录 D：M4 / M5 落地记录（2026-09-07 完成）
+
+> M4（审计哈希链 + 成交对账）与 M5（评级趋势图 + Config 联动卡）已交付并上线双栈容器：trader **hermes-trader**（hermes-deploy compose，容器内 dashboard 8000）、门户 **hermes-portal**（8443 HTTPS），均 healthy。
+
+**D1. M4 trader 侧（只读端点 + 状态落盘）**
+
+- 新建 [audit.py](file:///home/ldy/hermes-trader/hermes_trader/dashboard_routes/audit.py)，注册于 [dashboard.py](file:///home/ldy/hermes-trader/hermes_trader/dashboard.py)（shadow_arms 路由之后、public SPA catch-all 之前），三端点全部只读：
+  | 端点 | 说明 |
+  |---|---|
+  | `GET /api/dashboard/ledger/verify` | 调 event_log 哈希链校验，返回 `{ok, chained_records, legacy_records, corrupt_lines, errors:[{file,line,reason,detail}], last_seq, checked_at}` |
+  | `GET /api/dashboard/ledger/events?limit=N` | 链式事件查询，limit 1..500 路由层切片、剥离内部 `_dt`，升序返回 |
+  | `GET /api/dashboard/reconcile/status` | 读 `/data/reconcile_status.json`；**文件不存在返回 404（cron 从未运行的正常态）**，读取异常 503 |
+- [reconcile_fills.py](file:///home/ldy/hermes-trader/scripts/reconcile_fills.py) 新增 `build_status`/`write_status`：cron 对账完成后把结果（status clean/discrepancies、窗口成交对照四格、orphan_opens/orphan_closes/phantom_closes 三计数、backfilled_closes、三个 slim 列表、generated_at ISO Z）**tmp + os.replace 原子写**，全包 try/except 不阻断 cron；状态文件路径由 env `HERMES_RECONCILE_STATUS_FILE` 覆盖，默认 `/data/reconcile_status.json`。
+- 新增 tests/test_audit_routes_api.py **14 例**；trader 全量 pytest **3011 passed / 14 deselected**（基线 2997 净增 14，只增不减）。
+
+**D2. M4 BFF RBAC**（portal 仓 `app/routers/proxy.py` `_PATH_RULES`）
+
+```python
+("/api/dashboard/ledger", "admin:audit", _DENY),
+("/api/dashboard/reconcile", "operator:mode", _DENY),
+```
+
+- 哈希链/台账事件属审计面 → 读 **admin:audit**（仅 admin 角色持有，operator 不含）；对账状态含成交/风控姿态 → 读 **operator:mode**；**写方法全角色 `_DENY` 403**（端点本身只读，双保险）。
+- `tests/test_proxy_rbac.py` MATRIX 增 5 行 + 单元断言锁定前缀匹配与写拒绝；门户全量 pytest **14 passed**。
+
+**D3. M4 前端两张卡片**
+
+- [AuditLog.vue](file:///home/ldy/hermes-portal/src/modules/system/AuditLog.vue)（F5）："交易台账哈希链完整性"卡——链完整绿徽/失败红徽；`chained_records`/`last_seq`/`legacy_records`/`corrupt_lines`（非 0 红）统计 + checked_at；链断裂时 errors 列表（reason 经 `CHAIN_REASON` 映射中文：哈希不匹配/序号断链/前序哈希不匹配等 + file:line + detail）；最近 20 条链式事件小表（seq/时间/event 紫徽/载荷摘要，升序返回倒序展示）；「重新校验」按钮。
+- [Operator.vue](file:///home/ldy/hermes-portal/src/modules/operations/Operator.vue)（F6）："成交对账（交易所 vs 本地台账）"卡——generated_at + 窗口时长；**404 降级为"对账任务尚未运行"占位**（非错误）、加载失败显"暂不可用"；clean 绿徽/discrepancies 红徽（issues_total）、backfilled_closes 非 0 黄徽；成交对照四格（窗口内交易所成交/本地 trades/交易所平仓/本地平仓）；orphan/phantom 三计数 0 绿非 0 红；随页内既有 10s 轮询自动刷新。
+- 两卡均 best-effort 独立 try/catch，辅助面数据失败不阻断主页面、不弹 toast.err。
+
+**D4. M5 评级双趋势图**（[RiskArms.vue](file:///home/ldy/hermes-portal/src/modules/operations/RiskArms.vue)）
+
+- 引入 vue-echarts（照 Overview.vue 范式：`use([CanvasRenderer, LineChart, GridComponent, TooltipComponent, LegendComponent])`，option 用 `shallowRef`），数据全部复用 loadAll 已取的 grade-history（?days=30&limit=400），**无新增请求**；历史明细表之前新增趋势卡（近 30 天快照数），两图并排：
+  1. **每晚评级分布（堆叠面积）**：五 verdict 序列（DATA_GAP 红 / REVIEW 黄 / PROMOTE_CANDIDATE 绿 / COLLECTING 靛 / OFF 灰），INSUFFICIENT_DATA 并入"采集中"序列，与历史明细表口径一致；y 轴 minInterval:1。
+  2. **各臂命中率走势**：按"当前非 off 臂"动态生成序列，0 决策的快照点置 `null` + `connectNulls:false`（避免假连线），y 轴 0–100%、tooltip 百分比格式化，legend type:scroll。
+- 暗色主题常量与 Overview 统一（背景 transparent、tooltip #0B0E14/#232A3B、轴线 #232A3B、splitLine #1E2433）；原历史表"趋势图在 M5 补齐"占位文案移除。
+
+**D5. M5 Config 联动卡**（[Config.vue](file:///home/ldy/hermes-portal/src/modules/operations/Config.vue)，F7）
+
+- 配置页顶部新增"🛡️ 风控臂姿态与夜间评级"只读卡：GET shadow-arms/grades（windows=24,72,168），表格 5 列（臂名 font-mono / 当前 mode 徽章 enforce 绿·shadow 紫·off 灰 / 类型 block→拦截·change→调整 / 夜间评级徽章 verdict_cn / 评级说明 reason），右上显评级时间 + 「前往评级中心 →」按钮（`router.push('/risk-arms')`）；加载失败显占位文案。
+- **INERT 红线**：卡内**无任何改 mode/下拉/下单控件**，底部固定声明"夜间评级器仅产出建议（飞书推送），不自动修改任何臂 mode；调整姿态请先在评级中心核对采数与命中表现，再由人工改配置"。生产配置改动仍只能走 Config 页既有 config_store 权威写路径，本卡不触碰。
+
+**D6. 闸门与冒烟证据**
+
+- 前端：`npm run type-check`（vue-tsc --noEmit）**0 错**；`npm run build` 成功（两次全过）。
+- 后端：trader **3011 passed / 14 deselected**；门户 **14 passed**（.venv pytest）。
+- trader 容器内（8000）冒烟：ledger/verify ok=true、chained=4876、last_seq=4876、errors=0；ledger/events?limit=5 count=5/total_scanned=9285/limited=true/has_dt=false；reconcile/status 初始 404；手动 `python scripts/reconcile_fills.py --window-hours 26` → clean（orphan/phantom 全 0），日志 `[reconcile] status written to /data/reconcile_status.json`，重读 status=clean/issues=0/generated_at=2026-09-07T17:00:02Z。
+- 经门户 BFF（https 8443，admin token）端到端冒烟全通：
+  - `GET .../ledger/verify` 200：ok=true、chained_records=4876、legacy_records=4409、corrupt_lines=0、last_seq=4876、errors=0、checked_at=2026-09-07T17:03:37Z；
+  - `GET .../ledger/events?limit=20` 200：count=20、total_scanned=9285、limited=true、has_dt=false、seq 4857→4876 升序；
+  - `GET .../reconcile/status` 200：status=clean、window_hours=26、issues_total=0、fills_in_window=0、local_trades=14、三计数全 0、generated_at=2026-09-07T17:00:02Z；
+  - 匿名 GET verify/reconcile 均 **401**；admin POST verify / DELETE reconcile 均 **403**（写方法 fail-closed）。
+  - viewer/trader 的 403 由 RBAC MATRIX 锁定（生产库仅 admin，未造临时账号）。
+
+**D7. 验收对照**（第 5 节 #8-10）
+
+- #8 哈希链：正常台账显"链完整 + 4876 条链式事件"，errors 中文映射 + file:line 定位断裂位置（篡改场景由 trader verify_chain 单测覆盖）；#9 对账：cron 跑完显时间戳与 orphan/phantom 计数，未跑显"尚未运行"而非报错（404 降级）；#10 新端点全只读、写操作 fail-closed（POST/DELETE 403 实测）、pytest 基线只增不减（trader +14、门户持平 14）。
+- M5 趋势图/联动卡为纯增量展示，不改任何写路径；评级器 INERT 红线在 RiskArms（附录 C3）与 Config 联动卡（D5）双重落实。
