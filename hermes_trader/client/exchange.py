@@ -23,7 +23,33 @@ from typing import Any, Optional
 
 # Hyperliquid rejects any order below $10 notional. Target a small buffer above
 # it so the IOC price offset and mark-vs-limit rounding can't dip under.
+# Audit 2026-09-06 (C12): now config-tunable via canonical key min_order_usd
+# (default 10.5); the constant stays as the offline/default value and the
+# resolver fallback. Never configure below HL's hard $10 floor.
 MIN_ORDER_USD = 10.5
+# HL hard-rejects any order under $10 notional; config must never go below it.
+_HL_MIN_ORDER_FLOOR_USD = 10.0
+
+
+def _resolve_min_order_usd() -> float:
+    """Effective minimum order notional (USD), config-tunable (C12).
+
+    Reads canonical key ``min_order_usd`` on every call (read_agent_config is
+    mtime-cached, so a live config edit is picked up cheaply). Never raises and
+    never honours a value under HL's hard $10 floor: on any resolution/parse
+    failure — or a sub-$10 config — it degrades to the module constant.
+    """
+    try:
+        # Lazy import: keeps exchange importable even if the config layer is
+        # unavailable and breaks any potential import cycle (see rate_limit).
+        from hermes_trader.agents.config_store import cfg_get
+
+        val = float(cfg_get("min_order_usd", MIN_ORDER_USD))
+        if val < _HL_MIN_ORDER_FLOOR_USD:
+            return MIN_ORDER_USD
+        return val
+    except Exception:
+        return MIN_ORDER_USD
 
 from eth_account import Account
 from hyperliquid.api import API
@@ -310,6 +336,49 @@ def _get_info() -> Info:
         if _info_instance is None:
             raise last_err  # type: ignore[misc]
     return _info_instance
+
+
+# Audit 2026-09-06 (F6, engineering hygiene): explicit per-call timeout +
+# short cache for L2 order-book snapshots. The SDK's l2_snapshot() has no
+# per-call timeout argument — it uses the session-wide `timeout` attribute at
+# post() time — so a hung l2Book request used to block up to sdk_timeout_s
+# (30s) inside the pre-trade spread gate. We temporarily narrow the shared
+# Info client's timeout under a lock (l2Book is weight-2 and called serially
+# from the trade path), then restore it in finally. Successful snapshots are
+# cached per coin for l2_cache_ttl_s so the forced-trade diagnostic fetch and
+# the pre-trade gate in the same cycle share one HTTP call; failures are NOT
+# cached (never reuse a stale "no book" to skip a trade). Knobs resolve from
+# canonical hl_client_io at import time, like the rest of this block.
+_L2_TIMEOUT_S = float(_HL_CLIENT_IO["l2_timeout_s"])
+_L2_CACHE_TTL_S = float(_HL_CLIENT_IO["l2_cache_ttl_s"])
+_L2_CACHE: dict[str, tuple[float, Any]] = {}
+_L2_TIMEOUT_LOCK = threading.Lock()
+
+
+def _l2_snapshot_bounded(coin: str) -> Any:
+    """l2_snapshot with an explicit per-call timeout and a short positive-
+    result cache. Raises on failure (callers treat any exception as "no book"
+    and degrade fail-closed)."""
+    now = _time.monotonic()
+    cached = _L2_CACHE.get(coin)
+    if cached is not None and now - cached[0] < _L2_CACHE_TTL_S:
+        return cached[1]
+    info = _get_info()
+    with _L2_TIMEOUT_LOCK:
+        # The SDK reads `self.timeout` inside API.post() on the calling
+        # thread, so narrowing it while we hold this lock (and restoring in
+        # finally) gives this call an effective per-call timeout without
+        # forking the SDK. Bounded at min(sdk, configured) so a misconfigured
+        # l2_timeout_s above the session timeout is a no-op rather than a
+        # longer hang.
+        _prev_timeout = info.timeout
+        try:
+            info.timeout = min(_prev_timeout, _L2_TIMEOUT_S)
+            snap = info.l2_snapshot(coin)
+        finally:
+            info.timeout = _prev_timeout
+    _L2_CACHE[coin] = (_time.monotonic(), snap)
+    return snap
 
 
 # Per-dex meta cache. szDecimals / pxDecimals / maxLeverage are static, but
@@ -777,14 +846,16 @@ def _parse_order_result(result: Any, accept_resting: bool = False) -> dict[str, 
 
 
 def _min_order_size(price: float, sz_decimals: int) -> float:
-    """Smallest size at the coin's precision worth at least MIN_ORDER_USD.
+    """Smallest size at the coin's precision worth at least the min order USD.
 
     Rounded UP to the size tick (10^-sz_decimals): for integer-size coins
     (sz_decimals=0) a plain round-to-precision would drop a near-$10 size
     under HL's floor. e.g. MEGA at $0.084 needs ~125 coins, not 100.
+
+    The floor comes from config (min_order_usd, C12) via _resolve_min_order_usd.
     """
     tick = 10.0 ** (-sz_decimals)
-    return math.ceil((MIN_ORDER_USD / price) / tick) * tick
+    return math.ceil((_resolve_min_order_usd() / price) / tick) * tick
 
 
 def min_entry_notional_usd(coin: str, mid_price: float) -> float:
@@ -825,7 +896,10 @@ def get_orderbook_spread(coin: str) -> dict[str, Any]:
       - ok: True if data was fetched successfully
     """
     try:
-        levels = _get_info().l2_snapshot(coin).get("levels", [])
+        # Audit 2026-09-06 (F6): bounded fetch (per-call l2_timeout_s + short
+        # positive-result cache), same as _ioc_cross_price — a hung l2Book must
+        # not block the pre-trade spread gate for the full SDK session timeout.
+        levels = _l2_snapshot_bounded(coin).get("levels", [])
         bids_raw = levels[0] if len(levels) > 0 else []
         asks_raw = levels[1] if len(levels) > 1 else []
         if not bids_raw or not asks_raw:
@@ -873,7 +947,8 @@ def _ioc_cross_price(coin: str, is_buy: bool, mid_price: float) -> float:
     immediately match"). Falls back to mid +/- 1% if the L2 fetch fails.
     """
     try:
-        levels = _get_info().l2_snapshot(coin).get("levels", [])
+        # Audit 2026-09-06 (F6): same bounded fetch as get_orderbook_spread.
+        levels = _l2_snapshot_bounded(coin).get("levels", [])
         bids, asks = levels[0], levels[1]
         if is_buy and asks:
             return float(asks[0]["px"]) * 1.01
@@ -1117,18 +1192,20 @@ def place_hl_trigger_order(
         # or skip, so this is defense-in-depth against any path that slips a
         # sub-min order through. Set HERMES_ENFORCE_TRIGGER_MIN=0 to revert to
         # the old log-and-submit behavior.
-        if order_notional < MIN_ORDER_USD and os.environ.get(
+        # Audit 2026-09-06 (C12): the floor is config-tunable (min_order_usd).
+        _hl_min = _resolve_min_order_usd()
+        if order_notional < _hl_min and os.environ.get(
             "HERMES_ENFORCE_TRIGGER_MIN", "1"
         ) not in ("0", "false", "False"):
             logger.error(
                 f"[place_hl_trigger_order] REJECT {coin} kind={kind} "
                 f"size={size_str} trigger={trigger_str} notional=${order_notional:.2f} "
-                f"< HL min ${MIN_ORDER_USD:.2f} — not submitting (would be "
+                f"< HL min ${_hl_min:.2f} — not submitting (would be "
                 f"asynchronously rejected on trigger, leaving position unprotected)"
             )
             return {
                 "ok": False,
-                "error": f"trigger_notional_below_min: ${order_notional:.2f} < ${MIN_ORDER_USD:.2f}",
+                "error": f"trigger_notional_below_min: ${order_notional:.2f} < ${_hl_min:.2f}",
                 "error_code": "trigger_notional_below_min",
             }
 
@@ -1146,8 +1223,8 @@ def place_hl_trigger_order(
             f"trigger={trigger_str} notional=${order_notional:.2f} "
             f"reduce_only=true "
             f"{'LIMIT band=' + format(limit_f, '.6g') + ' (worst fill capped)' if use_limit else 'MARKET on trigger'} "
-            f"(hl_min=${MIN_ORDER_USD:.2f}, "
-            f"{'ABOVE min' if order_notional >= MIN_ORDER_USD else 'BELOW min — will be rejected on trigger!'})"
+            f"(hl_min=${_hl_min:.2f}, "
+            f"{'ABOVE min' if order_notional >= _hl_min else 'BELOW min — will be rejected on trigger!'})"
         )
 
         # isMarket=True fills at market on trigger and limit_px is only a

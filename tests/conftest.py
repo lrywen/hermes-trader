@@ -38,3 +38,24 @@ os.environ["HERMES_TA_LATE_ENTRY_SHADOW_FILE"] = os.path.join(
 # tests never append to the developer's real market_circuit_shadow.jsonl.
 os.environ["HERMES_MARKET_CIRCUIT_SHADOW_FILE"] = os.path.join(
     _tmp, "market_circuit_shadow.jsonl")
+# Audit 2026-09-07 (test isolation): the remaining ten shadow arms were NOT
+# redirected here, so a gate/shadow test that omitted an explicit path
+# appended synthetic rows (e.g. coin "TESTCOIN") to the developer's REAL
+# ~/.hermes-trading/<arm>_shadow.jsonl when pytest ran on the host (the
+# container mounts that path read-only, so it only bit host runs; the leaked
+# files even rotated to .1). Redirect every remaining arm's *_SHADOW_FILE env
+# to the throwaway dir the same way. Tests that assert on file contents still
+# pass an explicit shadow_log_path or monkeypatch.setenv to their own tmp_path.
+for _arm_env, _arm_file in (
+    ("HERMES_PULLBACK_SHADOW_FILE", "pullback_shadow.jsonl"),
+    ("HERMES_ATR_REGIME_CALIB_SHADOW_FILE", "atr_regime_calib_shadow.jsonl"),
+    ("HERMES_SIZING_V2_SHADOW_FILE", "sizing_v2_shadow.jsonl"),
+    ("HERMES_CONFIDENCE_DECAY_SHADOW_FILE", "confidence_decay_shadow.jsonl"),
+    ("HERMES_SIGNAL_AGE_DECAY_SHADOW_FILE", "signal_age_decay_shadow.jsonl"),
+    ("HERMES_TREND_FILTER_SHADOW_FILE", "trend_filter_shadow.jsonl"),
+    ("HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE", "daily_extension_cap_shadow.jsonl"),
+    ("HERMES_REENTRY_CAP_SHADOW_FILE", "reentry_cap_shadow.jsonl"),
+    ("HERMES_XS_REVERSAL_SHADOW_FILE", "xs_reversal_shadow.jsonl"),
+    ("HERMES_REGIME_OVERLAY_SHADOW_FILE", "regime_overlay_shadow.jsonl"),
+):
+    os.environ[_arm_env] = os.path.join(_tmp, _arm_file)

@@ -94,6 +94,10 @@ _HL_CLIENT_IO_DEFAULTS: dict[str, Any] = {
     # to admit genuine crypto volatility, narrow enough to reject a fat-finger
     # / corrupt tick (H-6 already cross-checks entry pricing against Binance).
     "ws_max_tick_jump_frac": 0.25,
+    # Audit 2026-09-06 (F6): explicit per-call timeout + short positive-result
+    # cache for L2 order-book snapshots (canonical-only leaves, no legacy env).
+    "l2_timeout_s": 5.0,
+    "l2_cache_ttl_s": 2.0,
 }
 
 # leaf -> (legacy env or None, kind "i"/"f"/"b", min guard value).
@@ -111,6 +115,9 @@ _HL_CLIENT_IO_SPEC: dict[str, tuple[Optional[str], str, float]] = {
     "ws_heartbeat_s": ("HERMES_WS_HEARTBEAT_S", "f", 0.0),
     "ws_seq_max_backward": ("HERMES_WS_SEQ_MAX_BACKWARD", "i", 1.0),
     "ws_max_tick_jump_frac": ("HERMES_WS_MAX_TICK_JUMP_FRAC", "f", 0.0),
+    # Audit 2026-09-06 (F6): canonical-only leaves, no legacy env channel.
+    "l2_timeout_s": (None, "f", 0.0),
+    "l2_cache_ttl_s": (None, "f", 0.0),
 }
 
 _HL_RATE_LIMIT_DEFAULTS: dict[str, Any] = {

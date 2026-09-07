@@ -191,6 +191,10 @@ def compute_max_pain(rows: list[OptRow], nearest_expiry_only: bool = True) -> Op
 _OPTIONS_GEX_DEFAULTS: dict[str, float] = {
     "ttl_sec": 900.0,
     "http_timeout_s": 12.0,
+    # Audit 2026-09-06 (F6, engineering hygiene): short TTL for fetch failures
+    # / empty feeds so a transient CBOE outage is retried within ~90s instead of
+    # being cached blind for the full 15-min positive TTL.
+    "negative_ttl_sec": 90.0,
 }
 
 
@@ -203,7 +207,7 @@ def options_gex_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, 
     on a bad config)."""
     p = dict(_OPTIONS_GEX_DEFAULTS)
     try:
-        for key in ("ttl_sec", "http_timeout_s"):
+        for key in ("ttl_sec", "http_timeout_s", "negative_ttl_sec"):
             v = cfg_get(f"options_gex.{key}", config=config)
             if v is not None:
                 fv = float(v)
@@ -228,7 +232,12 @@ def fetch_cboe(ticker: str, timeout: Optional[float] = None) -> Optional[dict[st
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
         return json.load(urllib.request.urlopen(req, timeout=timeout, context=_SSL))
-    except Exception:
+    except Exception as e:
+        # Audit 2026-09-06 (F6): a silently-swallowed CBOE outage used to look
+        # identical to "no GEX signal" — log it at warning so a persistent feed
+        # failure is diagnosable. Signal path still degrades to None.
+        logger.warning(f"[gex] CBOE options fetch failed for {ticker} "
+                       f"(timeout={timeout}s): {e}")
         return None
 
 
@@ -269,14 +278,21 @@ def gex_signal_cached(coin_or_ticker: str, ttl: Optional[float] = None,
 
     allow_fetch=False = CACHE-ONLY: return the last cached value (or None) WITHOUT
     any network call — for the execute hot path, which must never fetch."""
+    _params = options_gex_params()
     if ttl is None:
-        ttl = options_gex_params()["ttl_sec"]
+        ttl = _params["ttl_sec"]
+    # Audit 2026-09-06 (F6): misses (fetch failure / empty feed) get a short
+    # TTL so a transient CBOE outage is retried within ~90s instead of pinning
+    # "no GEX data" for the full 15-min positive TTL.
+    neg_ttl = float(_params.get("negative_ttl_sec") or 90.0)
     ticker = underlying_for(coin_or_ticker)
     now = time.time()
     with _gex_lock:
         hit = _gex_cache.get(ticker)
-        if hit and (now - hit[0]) < ttl:
-            return hit[1]
+        if hit:
+            _hit_ttl = ttl if hit[1] is not None else neg_ttl
+            if (now - hit[0]) < _hit_ttl:
+                return hit[1]
     if not allow_fetch:
         return hit[1] if hit else None
     rep = None

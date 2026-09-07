@@ -10,7 +10,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Collection, Optional
 
 from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.shared_config import load_shared_config
@@ -305,6 +305,42 @@ def cooldown_gate(ctx: GateContext, last_trade_time: Optional[int], cooldown_min
     return {"pass": False, "reason": f"cooldown active ({int(cooldown_min - elapsed)}min remaining)"}
 
 
+def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseException) -> None:
+    """Audit 2026-09-07 (C1): push a Feishu card when a memory-backed breaker
+    cannot read its state and FAILS OPEN (pass=True) — i.e. the gate is blind.
+
+    The metrics counter alone was not observable in this deployment (no
+    Prometheus alert rule scrapes hermes-trader), so a blind gate was silent
+    apart from one container log line. This routes the same event through the
+    existing Feishu channel (category "risk"). Hard rules:
+      * NEVER raises and never blocks the hot path — notify is imported lazily
+        and the whole call is wrapped (notify.send_card itself never raises,
+        but the import/lookup must be bulletproof too);
+      * dedup_key throttles to one card per (gate) per 10 minutes
+        (notify._THROTTLE_S), so a persistently failing read on every tick
+        cannot flood the chat;
+      * does NOT change the fail-open posture — the caller still returns
+        pass=True regardless of the alert outcome.
+    """
+    try:
+        from hermes_trader import notify
+        coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
+        notify.send_card(
+            "风控熔断门读状态失败 — 门变盲（fail-open 放行中）",
+            fields={
+                "熔断门": gate,
+                "币种": coin,
+                "姿态": "fail-open（pass=True，保护暂时失效）",
+                "错误": f"{type(exc).__name__}: {exc}"[:300],
+            },
+            category="risk",
+            level="danger",
+            dedup_key=f"mem_gate_blind:{gate}",
+        )
+    except Exception:
+        pass
+
+
 def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
     """Block re-entry on a single coin while its per-trade loss breaker is armed.
 
@@ -322,7 +358,26 @@ def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
             return {"pass": False,
                     "reason": f"coin circuit breaker active on {ctx.coin} ({int(remaining)}min remaining)"}
     except Exception as e:
-        logger.debug(f"[risk] coin-circuit gate state read failed for {ctx.coin}: {e}")
+        # Convention (shared with the B-F2/F6/F7 gates): a memory state-read
+        # failure FAILS OPEN — the independent circuit breakers still apply and
+        # the spread/opposite-direction entry checks are unaffected. Failing
+        # closed here would turn a transient memory read hiccup into a total
+        # (and silent) trading DoS, which on a shared-state helper could
+        # disarm ALL gates at once. Audit 2026-09-06 (C1) initially flipped
+        # this to fail-closed; reverted to the documented/tested fail-open
+        # convention (test_audit_bf2_bf6_bf7 gates + docstring contract).
+        # Audit 2026-09-06 (C1): keep fail-open but make it LOUD — error log +
+        # metric so a persistently blind breaker is alertable instead of silent.
+        logger.error("[risk] coin-circuit state read failed for %s — breaker "
+                     "BLIND, failing open (pass=True): %s", ctx.coin, e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="coin_circuit").inc()
+        except Exception:
+            pass
+        # Audit 2026-09-07 (C1): make the blind gate visible via Feishu too
+        # (the metric has no alert rule in this deployment). Never blocks.
+        _alert_memory_gate_blind("coin_circuit", ctx, e)
     return {"pass": True}
 
 
@@ -341,7 +396,21 @@ def global_halt_gate(ctx: GateContext) -> GateResult:
             return {"pass": False,
                     "reason": f"global daily-loss halt active ({int(remaining)}min remaining)"}
     except Exception as e:
-        logger.debug(f"[risk] global-halt gate state read failed: {e}")
+        # Fail-open on a memory state-read failure (shared convention with the
+        # coin-circuit / B-F2/F6/F7 gates): the independent breakers and the
+        # USD daily-loss kill switch still protect the book. Failing closed
+        # would convert a transient memory read error into a total DoS.
+        # Audit 2026-09-06 (C1) briefly set fail-closed; reverted to the
+        # documented/tested convention. C1: fail-open but LOUD (error + metric).
+        logger.error("[risk] global-halt state read failed — breaker BLIND, "
+                     "failing open (pass=True): %s", e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="global_halt").inc()
+        except Exception:
+            pass
+        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
+        _alert_memory_gate_blind("global_halt", ctx, e)
     return {"pass": True}
 
 
@@ -353,9 +422,9 @@ def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
     (memory.record_loss_outcome → _consecutive_losses[coin]); it resets on any
     winning close and at UTC day roll. Before this gate the counter was
     recorded but NOTHING read it, so the "consecutive-loss halt" of the 16
-    defined risk controls was dead. A state-read failure fails OPEN (the
-    existing cooldown/circuit breakers still apply); the streak itself is a
-    pure non-negative int. Disabled when limit <= 0.
+    defined risk controls was dead. Like the other memory-backed breakers, a
+    state-read failure FAILS OPEN (the independent breakers still apply); a
+    threshold (limit) <= 0 disables the gate.
     """
     if limit <= 0:
         return {"pass": True}
@@ -368,7 +437,18 @@ def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
                               f"losing closes in a row (>= {limit}) — no entries "
                               f"until a winning close or UTC roll"}
     except Exception as e:
-        logger.debug(f"[risk] consecutive-loss gate state read failed for {ctx.coin}: {e}")
+        # Fail-open on a memory read failure (shared breaker convention);
+        # Audit 2026-09-06 (C1) briefly flipped this to fail-closed, reverted.
+        # C1: fail-open but LOUD (error + metric).
+        logger.error("[risk] consecutive-loss state read failed for %s — "
+                     "breaker BLIND, failing open (pass=True): %s", ctx.coin, e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="consecutive_loss").inc()
+        except Exception:
+            pass
+        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
+        _alert_memory_gate_blind("consecutive_loss", ctx, e)
     return {"pass": True}
 
 
@@ -381,7 +461,10 @@ def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResul
     accumulation that the per-trade single_coin_loss_pct breaker misses (no
     single stop hits 3%, but ten -0.4% stops on the same name add up).
     Disabled when max_loss_pct <= 0 or there is no usable baseline equity yet.
-    Read failure fails open (coin_circuit remains the independent backstop).
+    A state-read failure FAILS OPEN (shared breaker convention); the
+    "no baseline equity yet" case (sod_equity <= 0) is also a legitimate pass.
+    Audit 2026-09-06 (C1) briefly flipped the read-failure path to
+    fail-closed; reverted to the documented/tested fail-open convention.
     """
     if max_loss_pct <= 0:
         return {"pass": True}
@@ -397,7 +480,17 @@ def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResul
                               f"{pnl_pct:.2f}% today (<= -{max_loss_pct:.1f}% of "
                               f"SOD equity) — no more entries on this coin today"}
     except Exception as e:
-        logger.debug(f"[risk] per-coin daily-loss gate state read failed for {ctx.coin}: {e}")
+        # Fail-open on a memory read failure (shared breaker convention).
+        # Audit 2026-09-06 (C1): fail-open but LOUD (error + metric).
+        logger.error("[risk] per-coin daily-loss state read failed for %s — "
+                     "breaker BLIND, failing open (pass=True): %s", ctx.coin, e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="per_coin_daily_loss").inc()
+        except Exception:
+            pass
+        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
+        _alert_memory_gate_blind("per_coin_daily_loss", ctx, e)
     return {"pass": True}
 
 
@@ -423,8 +516,12 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
         immediately, releasing the pre-existing latched deadlock.
 
     Disabled when max_drawdown_pct <= 0 or no reference peak exists yet (fail
-    open on missing reference; fail closed once a real peak exists). Read
-    failure fails open.
+    open on missing reference; fail closed once a real peak exists). A
+    state-read failure FAILS OPEN (shared breaker convention) until a real
+    peak is recorded; the legitimate "no baseline / no reference peak yet"
+    passes (equity <= 0, peak <= 0) are unchanged. Audit 2026-09-06 (C1)
+    briefly flipped the read-failure path to fail-closed; reverted to the
+    documented/tested fail-open convention.
     """
     if max_drawdown_pct <= 0:
         return {"pass": True}
@@ -482,7 +579,19 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
         # Below threshold: ensure a stale freeze episode clears on recovery.
         memory.clear_drawdown_freeze()
     except Exception as e:
-        logger.debug(f"[risk] drawdown gate state read failed: {e}")
+        # Fail-open on a memory read failure (shared breaker convention); the
+        # equity<=0 / peak<=0 "no baseline" passes above are also legitimate.
+        # Audit 2026-09-06 (C1) briefly set fail-closed here; reverted.
+        # C1: fail-open but LOUD (error + metric).
+        logger.error("[risk] drawdown state read failed — breaker BLIND, "
+                     "failing open (pass=True): %s", e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="drawdown").inc()
+        except Exception:
+            pass
+        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
+        _alert_memory_gate_blind("drawdown", ctx, e)
     return {"pass": True}
 
 
@@ -565,7 +674,10 @@ def opposite_direction_guard(ctx: GateContext) -> GateResult:
     return {"pass": False, "reason": f"already holding {ctx.coin} {held_side} — no pyramid/re-entry"}
 
 
-# Major crypto coins for correlation cap
+# Major crypto coins for correlation cap.
+# Audit 2026-09-06 (C12): default coin pool only — the effective pool is config
+# (canonical key correlation_crypto_coins); eval_all_gates resolves it and passes
+# it in. An empty/missing config pool falls back to this built-in set.
 _CRYPTO_COINS = frozenset([
     "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "LINK",
     "DOT", "UNI", "ATOM", "NEAR", "FTM", "APT", "ARB", "OP", "INJ", "TIA",
@@ -574,13 +686,17 @@ _CRYPTO_COINS = frozenset([
 ])
 
 
-def correlation_cap(ctx: GateContext, max_crypto_correlated: int) -> GateResult:
+def correlation_cap(ctx: GateContext, max_crypto_correlated: int,
+                    coins: Optional[Collection[str]] = None) -> GateResult:
     # Only cap long correlation
     if ctx.trade_side != "long":
         return {"pass": True}
+    # Audit 2026-09-06 (C12): config-tunable coin pool; empty/None falls back to
+    # the built-in frozenset so the gate never silently disables on a bad config.
+    pool = frozenset(coins) if coins else _CRYPTO_COINS
     existing_crypto_long = sum(
         1 for p in ctx.current_positions
-        if p.get("coin") in _CRYPTO_COINS and p.get("side") == "long"
+        if p.get("coin") in pool and p.get("side") == "long"
     )
     if existing_crypto_long < max_crypto_correlated:
         return {"pass": True}
@@ -588,6 +704,14 @@ def correlation_cap(ctx: GateContext, max_crypto_correlated: int) -> GateResult:
 
 
 def equity_risk_cap(ctx: GateContext, max_total_notional_pct: float) -> GateResult:
+    # Audit 2026-09-06 (C6): max_total_notional_pct is an EQUITY MULTIPLE
+    # (4.0 = 4x), not a fraction (see config_store note). A non-positive value
+    # must disable the cap explicitly (the gate never treats pct=0 as
+    # "cap=$0/reject-everything"); schema already rejects <0.5 but this guard
+    # covers a missing/None config read at runtime instead of capping to $0 and
+    # freezing every entry or raising on float(None).
+    if max_total_notional_pct is None or max_total_notional_pct <= 0:
+        return {"pass": True}
     max_notional = ctx.equity * max_total_notional_pct
     projected_notional = ctx.total_open_notional + ctx.trade_notional_usd
     if projected_notional <= max_notional:
@@ -630,7 +754,8 @@ def _funding_regime_for(coin: str) -> str:
 
 def _chop_decision(ctx: GateContext, base: dict[str, Any],
                    counter_regime_min_conf: float,
-                   block_counter_trend_bypass: bool) -> GateResult:
+                   block_counter_trend_bypass: bool,
+                   config: Optional[dict[str, Any]] = None) -> GateResult:
     """Gate call for a chop tape (ADX<20, EMA-neutral).
 
     Unlike 'neutral' (which free-passes), chop RAISES the bar — both long
@@ -639,17 +764,22 @@ def _chop_decision(ctx: GateContext, base: dict[str, Any],
     (conf/score) OR a momentum burst (a genuine impulse out of the range);
     a lone slow_burn / whale ping does NOT clear it (those fire constantly
     in chop).
+
+    Audit 2026-09-06 (C5): the three chop thresholds were read via cfg_get()
+    WITHOUT the per-coin config, so per-coin overrides were ignored here even
+    though every other gate in the orchestrator passed config=config. Thread
+    the live config through so hot-reloaded/per-coin values actually apply.
     """
     chop_min_conf = max(counter_regime_min_conf,
-                        float(cfg_get("chop_min_conf")))
-    chop_min_score = float(cfg_get("chop_min_score"))
+                        float(cfg_get("chop_min_conf", config=config)))
+    chop_min_score = float(cfg_get("chop_min_score", config=config))
     if ctx.confidence >= chop_min_conf or ctx.composite_score >= chop_min_score:
         return {"pass": True, "via": "chop_conviction",
                 **{**base, "chop": True}}
     # P1-4: a lone momentum burst in chop is a classic wick-fakeout; require
     # a minimum composite score as confirmation (config: chop_burst_min_score,
     # default 20) so the bypass only fires for a genuine impulse out of range.
-    chop_burst_min_score = float(cfg_get("chop_burst_min_score"))
+    chop_burst_min_score = float(cfg_get("chop_burst_min_score", config=config))
     if (ctx.momentum_burst_fired and not block_counter_trend_bypass
             and ctx.composite_score >= chop_burst_min_score):
         return {"pass": True, "via": "trigger:momentum_burst",
@@ -716,7 +846,8 @@ def _counter_trend_decision(ctx: GateContext, base: dict[str, Any],
 def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
                        block_counter_trend_bypass: bool = False,
                        crowded_with_min_conf: float = 0.0,
-                       min_trend_score: float = 0.0) -> GateResult:
+                       min_trend_score: float = 0.0,
+                       config: Optional[dict[str, Any]] = None) -> GateResult:
     """Block counter-regime trades unless conviction OR own-coin signal clears the bar.
 
       - aligned with regime → pass, BUT if min_trend_score>0 the 5-component
@@ -788,8 +919,11 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     # runtime bar is unchanged. Hot-path cfg_get picks up env overrides
     # (HERMES_CFG_ANALYST_SCORING__COUNTER_TREND_MIN_SCORE) and
     # .agent-config.json edits on the next gate call.
+    # Audit 2026-09-06 (C5): was config={}, which forced the canonical default
+    # and silently ignored .agent-config.json + env overrides. Omit config so
+    # cfg_get reads the live (hot-reloaded) config like the gates around it.
     effective_min_score = float(
-        cfg_get("analyst_scoring.counter_trend_min_score", config={})
+        cfg_get("analyst_scoring.counter_trend_min_score")
     )
     if against_funding:
         # P3 defense: an empty-string env override (HERMES_CFG_...='') makes
@@ -846,7 +980,7 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     # whale ping does NOT clear it (those fire constantly in chop).
     if regime == "chop" and not against_funding:
         return _chop_decision(ctx, base, counter_regime_min_conf,
-                              block_counter_trend_bypass)
+                              block_counter_trend_bypass, config)
 
     # Past here the trade is counter-trend and/or against the funding crowd —
     # the (possibly elevated) conviction/own-signal bar lives in the helper.
@@ -923,6 +1057,15 @@ def debate_gate(
         _warn_debate_defaults()
     analyst3_default = bool(debate_cfg.get("analyst3_default", False))
 
+    # Audit 2026-09-06 (C7): these inline fallbacks are the IMPLICIT defaults
+    # used ONLY when the debate_gate section is entirely absent (the
+    # _warn_debate_defaults() path). They are intentionally the STRICTER
+    # 0.6 / 3 (requires 3 of 5 votes), NOT the CANONICAL_DEFAULTS 0.4 / 2.
+    # An operator who ships no explicit debate_gate block must get the most
+    # conservative fail-closed posture; production's explicit config block
+    # supplies the tuned 0.4/2 (2/5). Earlier in this audit these were briefly
+    # pinned to 0.4/2, which let a bare high-confidence ctx (2/5 votes) pass
+    # and broke test_debate_gate_fail_closed_defaults — reverted to 0.6/3.
     min_agreement = float(debate_cfg.get("min_agreement", 0.6))
     min_agree_count = int(debate_cfg.get("min_agree_count", 3))
 
@@ -947,12 +1090,14 @@ def debate_gate(
     # cfg_get picks up env overrides
     # (HERMES_CFG_ANALYST_SCORING__ANALYST2_*)
     # and .agent-config.json edits on the next gate call.
-    a2_high_conf = float(cfg_get("analyst_scoring.analyst2_high_conf", config={}))
-    a2_high_score = float(cfg_get("analyst_scoring.analyst2_high_score", config={}))
-    a2_mid_conf = float(cfg_get("analyst_scoring.analyst2_mid_conf", config={}))
-    a2_mid_score = float(cfg_get("analyst_scoring.analyst2_mid_score", config={}))
-    a2_vhigh_conf = float(cfg_get("analyst_scoring.analyst2_very_high_conf", config={}))
-    a2_vhigh_score = float(cfg_get("analyst_scoring.analyst2_very_high_score", config={}))
+    # Audit 2026-09-06 (C5): drop config={} (forced canonical default, ignored
+    # live config + env); read live hot-reloaded config instead.
+    a2_high_conf = float(cfg_get("analyst_scoring.analyst2_high_conf"))
+    a2_high_score = float(cfg_get("analyst_scoring.analyst2_high_score"))
+    a2_mid_conf = float(cfg_get("analyst_scoring.analyst2_mid_conf"))
+    a2_mid_score = float(cfg_get("analyst_scoring.analyst2_mid_score"))
+    a2_vhigh_conf = float(cfg_get("analyst_scoring.analyst2_very_high_conf"))
+    a2_vhigh_score = float(cfg_get("analyst_scoring.analyst2_very_high_score"))
     if ctx.confidence >= a2_high_conf and ctx.composite_score >= a2_high_score:
         analyst2_agree = True
     elif ctx.confidence >= a2_mid_conf and ctx.composite_score >= a2_mid_score:
@@ -979,7 +1124,8 @@ def debate_gate(
     # resolves through cfg_get(analyst_scoring.analyst5_whale_or_conf).
     # The canonical default is 0.75, so the existing vote behaviour is
     # preserved; env / config edits take effect on the next gate call.
-    a5_conf_floor = float(cfg_get("analyst_scoring.analyst5_whale_or_conf", config={}))
+    # Audit 2026-09-06 (C5): drop config={} for live hot-reloaded config.
+    a5_conf_floor = float(cfg_get("analyst_scoring.analyst5_whale_or_conf"))
     analyst5_agree = ctx.whale_signal_fired or ctx.confidence >= a5_conf_floor
 
     # --- Consensus ---
@@ -1057,17 +1203,15 @@ def late_entry_shadow_path(le_cfg: dict[str, Any]) -> str:
 
 
 def _record_late_entry_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append a late-entry shadow verdict to the audit JSONL."""
-    import json
-    import os
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning(f"[risk][gates] late-entry shadow write failed: {e}")
+    """Best-effort append a late-entry shadow verdict to the audit JSONL.
+
+    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    (size-based rotation + write-failure metric) instead of an open-coded
+    append.
+    """
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="late_entry")
 
 
 def ta_late_entry_gate(
@@ -1403,6 +1547,411 @@ def ta_late_entry_gate(
     })
 
 
+# ── Wave D (Audit 2026-09-06): Pathia-ported gates ──────────────────────────
+# D1 trend_filter_200ma (daily-200SMA long-only trend gate), D2 hard 24h
+# extension cap for longs (anti-chase), D3 per-coin rolling reentry cap. All
+# three ship as SHADOW probes first: mode is off/shadow/enforce (gray-release
+# via env, no config write needed), the shadow JSONL is additive audit output,
+# and the counterfactual `*_would_block` fields NEVER feed the live decision.
+_GATE_MODES = ("off", "shadow", "enforce")
+
+
+def _gate_mode(blk: dict[str, Any], env_var: str) -> str:
+    """Resolve an off/shadow/enforce gate mode (config block → env → off).
+
+    Env override lets production flip a gate into shadow/enforce without a
+    config rewrite. Anything unrecognised falls back to ``off`` (safe default:
+    an unparsable mode never arms a block)."""
+    mode = str(blk.get("mode", "off") or "off").strip().lower()
+    env_mode = str(os.environ.get(env_var) or "").strip().lower()
+    if env_mode:
+        mode = env_mode
+    return mode if mode in _GATE_MODES else "off"
+
+
+def _gate_shadow_path(blk: dict[str, Any], env_file: str, default_name: str) -> str:
+    """Resolve a gate shadow JSONL path (config → env → ~/.hermes-trading)."""
+    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
+        env_file,
+        os.path.expanduser(f"~/.hermes-trading/{default_name}"),
+    )
+
+
+def _record_gate_shadow(rec: dict[str, Any], path: str, label: str) -> None:
+    """Best-effort append a gate shadow verdict to its audit JSONL.
+
+    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    (size-based rotation + write-failure metric); ``label`` is the stream tag.
+    """
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream=label.replace(" ", "_"))
+
+
+def _daily_change_pct(ctx_coin: str, entry_px: float) -> Optional[float]:
+    """Best-effort 24h price-change % for a coin from the cached universe
+    snapshot (``prevDayPx`` → current mid/fill). Returns None when the snapshot
+    or a positive previous price is unavailable — callers treat None as
+    "unknown" and must NOT grant a mover/bypass decision from it."""
+    try:
+        from hermes_trader.client.universe import get_market_by_coin
+        mkt = get_market_by_coin(ctx_coin)
+        if not mkt:
+            return None
+        prev = float(mkt.get("prevDayPx") or 0.0)
+        cur = float(entry_px or mkt.get("midPx") or mkt.get("markPx") or 0.0)
+        if prev <= 0 or cur <= 0:
+            return None
+        return (cur - prev) / prev * 100.0
+    except Exception:
+        return None
+
+
+def trend_filter_200ma_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
+    """D1 (ported from Pathia trend_filter_200ma): LONGS only — block a long
+    when price is BELOW the daily 200SMA. Shorts are never filtered.
+
+    Data policy (Pathia block_unknown=false):
+      * an ESTABLISHED coin whose daily candles fail to fetch/compute FAILS
+        OPEN with a WARNING (a risk gate must not stall the order path);
+      * a genuinely NEW listing (closed daily bars below the history floor)
+        fails CLOSED only when min_history_bars>0 arms it — with the Pathia
+        default min_history_bars=0 the floor is inactive and insufficient
+        history degrades to the unknown/fail-open path.
+    Daily-mover long bypass: a strong 24h mover may override the below-SMA
+    block, but only inside [daily_mover_min_ext_pct, daily_mover_max_ext_pct]
+    (Pathia 10%..30%) — too-soft moves don't qualify and a parabolic >30%
+    extension may NOT bypass (no chasing a blowoff). The 24h % comes from the
+    cached universe snapshot; an unknown % never grants the bypass.
+    SHADOW first: mode off/shadow/enforce (env HERMES_TREND_FILTER_MODE)."""
+    blk = config.get("trend_filter_200ma")
+    if not isinstance(blk, dict):
+        return {"pass": True, "via": "trend_filter_disabled"}
+    mode = _gate_mode(blk, "HERMES_TREND_FILTER_MODE")
+    if mode == "off":
+        return {"pass": True, "via": "trend_filter_off"}
+
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
+    # LONG-ONLY trend filter: shorts are never gated by the 200MA.
+    if side != "long":
+        return {"pass": True, "via": "trend_filter_short_skip"}
+
+    try:
+        period = int(blk.get("period", 200) or 200)
+        fetch_bars = int(blk.get("fetch_bars", period + 10) or (period + 10))
+    except (TypeError, ValueError):
+        period, fetch_bars = 200, 210
+    block_unknown = bool(blk.get("block_unknown", False))
+    try:
+        min_history = int(cfg_get("min_history_bars", config=config) or 0)
+    except (TypeError, ValueError):
+        min_history = 0
+    history_floor = min(period, max(0, min_history))
+
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rec: dict[str, Any] = {
+        "timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
+        "period": period, "block_unknown": block_unknown,
+        "min_history_bars": min_history,
+    }
+    path = _gate_shadow_path(blk, "HERMES_TREND_FILTER_SHADOW_FILE",
+                             "trend_filter_shadow.jsonl")
+
+    # ── Fetch + compute (wrapped; any failure is a data-availability branch) ──
+    closed_bars: list[Any] = []
+    sma_val: Optional[float] = None
+    fetch_error: Optional[str] = None
+    try:
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        from hermes_trader.indicators.math import sma
+        raw = fetch_hl_candles(ctx.coin, "1d", max(fetch_bars, period + 5))
+        daily, _ = _drop_forming_bar(raw, "1d")
+        closes = [float(c["c"]) for c in daily]
+        closed_bars = daily
+        if closes:
+            sma_series = sma(closes, period)
+            last_sma = sma_series[-1] if sma_series else float("nan")
+            if last_sma == last_sma:  # NaN guard
+                sma_val = float(last_sma)
+    except Exception as e:  # never let fetch/compute touch the order path
+        fetch_error = f"{type(e).__name__}: {e}"
+        logger.warning(
+            "[risk][gates] trend_filter_200ma fetch/compute failed for %s: %s",
+            ctx.coin, fetch_error,
+        )
+
+    price = float(ctx.entry_px or 0.0)
+    if price <= 0:
+        ext = _daily_change_pct(ctx.coin, 0.0)
+        # No fill price supplied; fall back to the snapshot mid for positioning.
+        try:
+            from hermes_trader.client.universe import get_market_by_coin
+            _m = get_market_by_coin(ctx.coin) or {}
+            price = float(_m.get("midPx") or _m.get("markPx") or 0.0)
+        except Exception:
+            price = 0.0
+    else:
+        ext = _daily_change_pct(ctx.coin, price)
+
+    # ── Data-availability branches ───────────────────────────────────────────
+    if fetch_error is not None or not closed_bars:
+        # Fetch/compute failed OR no daily bars at all → "unknown".
+        rec.update({"state": "data_missing", "error": fetch_error,
+                    "daily_bars": len(closed_bars),
+                    "trend_would_block": None})
+        _record_gate_shadow(rec, path, "trend_filter")
+        if block_unknown:
+            logger.warning(
+                "[risk][gates] trend_filter_200ma BLOCK (block_unknown) %s: "
+                "daily data unavailable", ctx.coin)
+            return {"pass": False, "via": "trend_filter_unknown_block",
+                    "reason": f"trend filter: daily data unavailable for {ctx.coin}"}
+        logger.warning(
+            "[risk][gates] trend_filter_200ma fail-OPEN (block_unknown=false) "
+            "%s: daily data unavailable", ctx.coin)
+        return {"pass": True, "via": "trend_filter_data_missing",
+                "reason": "trend filter unavailable (daily fetch failed)"}
+
+    n_bars = len(closed_bars)
+    rec["daily_bars"] = n_bars
+    if sma_val is None:
+        # Bars returned but not enough to form the 200SMA. New-coin floor only
+        # arms when min_history_bars>0; Pathia default 0 → treat as unknown.
+        if history_floor > 0 and n_bars < history_floor:
+            rec.update({"state": "new_coin", "history_floor": history_floor,
+                        "trend_would_block": True})
+            _record_gate_shadow(rec, path, "trend_filter")
+            if mode == "shadow":
+                logger.warning(
+                    "[risk][gates] trend_filter_200ma SHADOW would-block (new "
+                    "listing) %s: %d daily bars < floor %d",
+                    ctx.coin, n_bars, history_floor)
+                return {"pass": True, "via": "trend_filter_shadow_new_coin",
+                        "reason": f"SHADOW: would block new coin {ctx.coin} "
+                                  f"({n_bars}<{history_floor} daily bars)"}
+            logger.warning(
+                "[risk][gates] trend_filter_200ma BLOCK (new listing) %s: "
+                "%d daily bars < floor %d", ctx.coin, n_bars, history_floor)
+            return {"pass": False, "via": "trend_filter_new_coin",
+                    "reason": f"trend filter: {ctx.coin} has only {n_bars} daily "
+                              f"bars (< {history_floor}); insufficient trend history"}
+        rec.update({"state": "insufficient_history", "history_floor": history_floor,
+                    "trend_would_block": None})
+        _record_gate_shadow(rec, path, "trend_filter")
+        if block_unknown:
+            return {"pass": False, "via": "trend_filter_unknown_block",
+                    "reason": f"trend filter: insufficient daily history for {ctx.coin}"}
+        logger.warning(
+            "[risk][gates] trend_filter_200ma fail-OPEN %s: only %d daily bars "
+            "(SMA not established, min_history_bars=%d)",
+            ctx.coin, n_bars, min_history)
+        return {"pass": True, "via": "trend_filter_insufficient_history",
+                "reason": f"trend filter not established ({n_bars} daily bars)"}
+
+    # ── Trend verdict (SMA established) ───────────────────────────────────────
+    rec.update({"state": "ok", "sma200": sma_val, "price": price or None,
+                "daily_change_pct": ext})
+    if price <= 0:
+        # No usable reference price → cannot position vs SMA; fail open.
+        rec.update({"trend_would_block": None})
+        _record_gate_shadow(rec, path, "trend_filter")
+        logger.warning(
+            "[risk][gates] trend_filter_200ma fail-OPEN %s: no reference price",
+            ctx.coin)
+        return {"pass": True, "via": "trend_filter_no_price",
+                "reason": "trend filter: no reference price"}
+
+    above_sma = price >= sma_val
+    rec["above_sma"] = above_sma
+    if above_sma:
+        rec.update({"trend_would_block": False, "bypass_used": False})
+        _record_gate_shadow(rec, path, "trend_filter")
+        return {"pass": True, "via": "trend_filter_above_sma",
+                "sma200": sma_val, "price": price}
+
+    # Price below the daily 200SMA: check the qualified daily-mover bypass.
+    allow_bypass = bool(blk.get("allow_daily_mover_long_bypass", True))
+    try:
+        mover_min = float(blk.get("daily_mover_min_ext_pct", 10.0))
+        mover_max = float(blk.get("daily_mover_max_ext_pct", 30.0))
+    except (TypeError, ValueError):
+        mover_min, mover_max = 10.0, 30.0
+    bypass_ok = False
+    bypass_reason = "mover bypass disabled"
+    if allow_bypass and ext is not None:
+        if mover_min <= ext <= mover_max:
+            bypass_ok = True
+            bypass_reason = f"daily mover {ext:.1f}% in [{mover_min},{mover_max}]"
+        elif ext > mover_max:
+            bypass_reason = f"parabolic {ext:.1f}% > {mover_max}% (no chase bypass)"
+        else:
+            bypass_reason = f"move {ext:.1f}% < {mover_min}% (too soft)"
+    elif allow_bypass and ext is None:
+        bypass_reason = "24h change unknown (bypass not granted)"
+    rec.update({"bypass_used": bypass_ok, "bypass_reason": bypass_reason,
+                "mover_min_pct": mover_min, "mover_max_pct": mover_max})
+
+    if bypass_ok:
+        rec.update({"trend_would_block": False})
+        _record_gate_shadow(rec, path, "trend_filter")
+        return {"pass": True, "via": "trend_filter_mover_bypass",
+                "reason": f"below 200SMA but {bypass_reason}",
+                "sma200": sma_val, "daily_change_pct": ext}
+
+    reason = (f"price {price:.6g} below daily {period}SMA {sma_val:.6g}; "
+              f"{bypass_reason}")
+    rec.update({"trend_would_block": True, "reason": reason})
+    _record_gate_shadow(rec, path, "trend_filter")
+    if mode == "shadow":
+        logger.info(
+            "[risk][gates] trend_filter_200ma SHADOW would-block LONG %s: %s",
+            ctx.coin, reason)
+        return {"pass": True, "via": "trend_filter_shadow_block",
+                "reason": f"SHADOW: {reason}", "sma200": sma_val}
+    logger.info(
+        "[risk][gates] trend_filter_200ma BLOCK LONG %s: %s", ctx.coin, reason)
+    return {"pass": False, "via": "trend_filter_below_sma",
+            "reason": f"trend filter: {reason}", "sma200": sma_val}
+
+
+def daily_extension_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
+    """D2 (ported from Pathia override_max_daily_extension_pct=30.0): hard 24h
+    price-extension ceiling for LONGS (anti-chase). A long whose 24h gain
+    exceeds the cap is blocked — never chase a parabolic blowoff. Shorts are
+    not gated (a 24h crash is not a long-chase risk).
+
+    Data policy: the 24h % comes from the cached universe snapshot; an
+    unavailable/unknown % FAILS OPEN (a risk gate must not stall the order
+    path), matching ta_late_entry's data_missing behaviour. Threshold <= 0
+    disables. SHADOW first: mode off/shadow/enforce via
+    HERMES_DAILY_EXTENSION_CAP_MODE (env; Pathia ships the threshold as a root
+    scalar with no mode block, so the gray-release switch is env-only and the
+    gate defaults to shadow while the probe collects data)."""
+    try:
+        cap = float(cfg_get("override_max_daily_extension_pct", config=config) or 0.0)
+    except (TypeError, ValueError):
+        cap = 0.0
+    if cap <= 0:
+        return {"pass": True, "via": "daily_ext_cap_disabled"}
+    # Pathia ships a scalar threshold (no mode block); read the block if present
+    # but default the gray-release switch to SHADOW so a new gate probes first.
+    blk = config.get("daily_extension_cap")
+    blk = blk if isinstance(blk, dict) else {"mode": "shadow"}
+    mode = _gate_mode(blk, "HERMES_DAILY_EXTENSION_CAP_MODE")
+    if mode == "off":
+        return {"pass": True, "via": "daily_ext_cap_off"}
+
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
+    if side != "long":
+        return {"pass": True, "via": "daily_ext_cap_short_skip"}
+
+    ext = _daily_change_pct(ctx.coin, ctx.entry_px)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = _gate_shadow_path(blk, "HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE",
+                             "daily_extension_cap_shadow.jsonl")
+    if ext is None:
+        rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
+               "cap_pct": cap, "state": "data_missing",
+               "daily_change_pct": None, "ext_would_block": None}
+        _record_gate_shadow(rec, path, "daily_ext_cap")
+        logger.warning(
+            "[risk][gates] daily_extension_cap fail-OPEN %s: 24h change unknown",
+            ctx.coin)
+        return {"pass": True, "via": "daily_ext_cap_data_missing",
+                "reason": "daily extension cap unavailable (24h change unknown)"}
+
+    over = ext > cap
+    rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
+           "cap_pct": cap, "state": "ok", "daily_change_pct": ext,
+           "ext_would_block": bool(over)}
+    _record_gate_shadow(rec, path, "daily_ext_cap")
+    if not over:
+        return {"pass": True, "via": "daily_ext_cap_ok",
+                "daily_change_pct": ext, "cap_pct": cap}
+    reason = f"24h extension {ext:.1f}% > hard cap {cap:.1f}% (no long chase)"
+    if mode == "shadow":
+        logger.info(
+            "[risk][gates] daily_extension_cap SHADOW would-block LONG %s: %s",
+            ctx.coin, reason)
+        return {"pass": True, "via": "daily_ext_cap_shadow_block",
+                "reason": f"SHADOW: {reason}", "daily_change_pct": ext}
+    logger.info(
+        "[risk][gates] daily_extension_cap BLOCK LONG %s: %s", ctx.coin, reason)
+    return {"pass": False, "via": "daily_ext_cap_block",
+            "reason": f"daily extension cap: {reason}",
+            "daily_change_pct": ext, "cap_pct": cap}
+
+
+def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
+    """D3 (ported from Pathia reentry_cap): per-coin rolling-window OPENING
+    cap. Blocks a new entry for a coin that already has ``max_per_coin``
+    opening fills within the last ``window_hours`` (both longs and shorts —
+    reentry pacing is side-agnostic). max_per_coin<=0 disables.
+
+    Counts openings from the memory trade log (record_trade only records
+    entries), via memory.count_openings_since. A memory read failure FAILS
+    OPEN (shared circuit-breaker convention: a transient state-read hiccup
+    must not become a total trading DoS). SHADOW first: mode
+    off/shadow/enforce (env HERMES_REENTRY_CAP_MODE)."""
+    blk = config.get("reentry_cap")
+    if not isinstance(blk, dict):
+        return {"pass": True, "via": "reentry_cap_disabled"}
+    mode = _gate_mode(blk, "HERMES_REENTRY_CAP_MODE")
+    if mode == "off":
+        return {"pass": True, "via": "reentry_cap_off"}
+    try:
+        max_per_coin = int(blk.get("max_per_coin", 2) or 0)
+        window_hours = float(blk.get("window_hours", 24.0) or 0.0)
+    except (TypeError, ValueError):
+        max_per_coin, window_hours = 2, 24.0
+    if max_per_coin <= 0 or window_hours <= 0:
+        return {"pass": True, "via": "reentry_cap_disabled"}
+
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
+    ts_now = int(time.time() * 1000)
+    since_ms = ts_now - int(window_hours * 3600.0 * 1000.0)
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    path = _gate_shadow_path(blk, "HERMES_REENTRY_CAP_SHADOW_FILE",
+                             "reentry_cap_shadow.jsonl")
+    try:
+        from hermes_trader.agents.memory import memory
+        openings = int(memory.count_openings_since(ctx.coin, since_ms))
+    except Exception as e:
+        rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
+               "max_per_coin": max_per_coin, "window_hours": window_hours,
+               "state": "data_missing", "openings": None,
+               "reentry_would_block": None}
+        _record_gate_shadow(rec, path, "reentry_cap")
+        logger.debug(
+            "[risk][gates] reentry_cap state read failed for %s — fail-open: %s",
+            ctx.coin, e)
+        return {"pass": True, "via": "reentry_cap_data_missing",
+                "reason": f"reentry cap unavailable ({type(e).__name__})"}
+
+    over = openings >= max_per_coin
+    rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
+           "max_per_coin": max_per_coin, "window_hours": window_hours,
+           "state": "ok", "openings": openings,
+           "reentry_would_block": bool(over)}
+    _record_gate_shadow(rec, path, "reentry_cap")
+    if not over:
+        return {"pass": True, "via": "reentry_cap_ok",
+                "openings": openings, "max_per_coin": max_per_coin}
+    reason = (f"{openings} openings on {ctx.coin} within {window_hours:.0f}h "
+              f"(>= cap {max_per_coin})")
+    if mode == "shadow":
+        logger.info(
+            "[risk][gates] reentry_cap SHADOW would-block %s: %s",
+            ctx.coin, reason)
+        return {"pass": True, "via": "reentry_cap_shadow_block",
+                "reason": f"SHADOW: {reason}", "openings": openings}
+    logger.info(
+        "[risk][gates] reentry_cap BLOCK %s: %s", ctx.coin, reason)
+    return {"pass": False, "via": "reentry_cap_block",
+            "reason": f"reentry cap: {reason}", "openings": openings}
+
+
 # Load cross-component shared config (~/.hermes-trading/config.yaml).
 # Canonical implementation lives in hermes_trader.shared_config.
 _load_shared_config = load_shared_config
@@ -1468,8 +2017,26 @@ def eval_all_gates(
         ctx.coin, ctx.trade_side, min_conf, aligned_min_conf,
     )
     results["confidence"] = confidence_gate(ctx, min_conf)
-    results["max_concurrent"] = max_concurrent_positions_gate(
-        ctx, int(cfg_get("max_concurrent", config=config)))
+    # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. The book
+    # posture is evaluated from the TTL-cached MACRO regime (BTC / equity
+    # proxy); when in the de-risked posture AND enforce (shadow logs the
+    # counterfactual but changes nothing), the max_concurrent cap is tightened
+    # to the chop profile (min, never raised). Sample rate is throttled inside
+    # the overlay, so repeated per-coin calls in one scan do not advance its
+    # hysteresis counter multiple times on the same cached reading.
+    _mc_base = int(cfg_get("max_concurrent", config=config))
+    try:
+        from hermes_trader.agents.regime_overlay import (
+            evaluate_risk_overlay, resolve_applied_knobs)
+        _ov_snap = evaluate_risk_overlay(config)
+        _ov_knobs = resolve_applied_knobs(
+            {"max_concurrent": _mc_base}, config, _ov_snap)
+        _mc_eff = int(_ov_knobs.get("max_concurrent", _mc_base))
+    except Exception as _ov_e:
+        logger.warning(f"[risk][gates] regime overlay resolve failed, "
+                       f"keeping max_concurrent={_mc_base}: {_ov_e}")
+        _mc_eff = _mc_base
+    results["max_concurrent"] = max_concurrent_positions_gate(ctx, _mc_eff)
     results["notional_cap"] = per_trade_notional_cap_gate(
         ctx, float(cfg_get("max_trade_notional_usd", config=config)))
     # P1-15: unified daily-loss cutoff — equity-% primary, USD absolute floor
@@ -1519,15 +2086,26 @@ def eval_all_gates(
         float(cfg_get("sl_buffer_bps", config=config) or 0.0) / 100.0,
     )
     results["opposite_guard"] = opposite_direction_guard(ctx)
+    # Audit 2026-09-06 (C12): coin pool is config-tunable (correlation_crypto_coins).
+    # An empty/non-list config resolves to None so correlation_cap falls back to
+    # the built-in pool (never silently disables the gate).
+    try:
+        _corr_coins = cfg_get("correlation_crypto_coins", config=config)
+    except Exception:
+        _corr_coins = None
+    if not isinstance(_corr_coins, (list, tuple, set, frozenset)):
+        _corr_coins = None
     results["correlation"] = correlation_cap(
-        ctx, int(cfg_get("max_crypto_long_correlated", config=config)))
+        ctx, int(cfg_get("max_crypto_long_correlated", config=config)),
+        coins=_corr_coins)
     results["equity_risk"] = equity_risk_cap(
-        ctx, float(cfg_get("max_total_notional_pct", config=config)))
+        ctx, float(cfg_get("max_total_notional_pct", config=config) or 0.0))
     results["market_regime"] = market_regime_gate(
         ctx, float(cfg_get("counter_regime_min_conf", config=config)),
         bool(cfg_get("block_counter_trend_bypass", config=config)),
         float(cfg_get("crowded_with_min_conf", config=config) or 0.0),
         float(cfg_get("min_trend_score", config=config) or 0.0),
+        config=config,
     )
     results["news"] = news_blackout_gate(ctx)
     results["debate"] = debate_gate(ctx, config)
@@ -1537,6 +2115,12 @@ def eval_all_gates(
     # ta_filter pre-filter and the backtest. Mode-independent: once active it
     # enforces identically in SHADOW and LIVE (mode off/enforce only).
     results["ta_late_entry"] = ta_late_entry_gate(ctx, config)
+    # Wave D (Audit 2026-09-06), ported from Pathia. All three ship as SHADOW
+    # probes first (mode off/shadow/enforce; shadow records would-block but
+    # passes the order, so adding them here is non-blocking by default).
+    results["trend_filter_200ma"] = trend_filter_200ma_gate(ctx, config)
+    results["daily_extension_cap"] = daily_extension_cap_gate(ctx, config)
+    results["reentry_cap"] = reentry_cap_gate(ctx, config)
 
     block_reasons = []
     blocked = False
@@ -1550,6 +2134,8 @@ def eval_all_gates(
         "opposite_guard",
         "correlation", "equity_risk", "market_regime", "news", "debate",
         "ta_late_entry",
+        # Wave D (Audit 2026-09-06): Pathia-ported gates.
+        "trend_filter_200ma", "daily_extension_cap", "reentry_cap",
     }
     for key, result in results.items():
         if not result.get("pass"):

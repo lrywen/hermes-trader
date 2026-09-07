@@ -590,11 +590,13 @@ if _safety_errors:
             len(_safety_errors))
         sys.exit(78)  # EX_CONFIG
 logger.info("[startup safety] envelope check passed (0 breaches)")
-# HIP-3 toggle: read once at startup so the prefetched universe includes
-# tokenized-equity / commodity perps if enabled. The agent config is
-# hot-reloaded per cycle inside the executor / perception layer for other
-# fields; the universe itself is fetched once at startup, so flipping
-# enable_hip3 mid-run requires a loop restart to pick up new markets.
+# HIP-3 toggle: this startup value only seeds the initial prefetched universe.
+# Audit 2026-09-06 (F4, engineering hygiene): the agent config is hot-reloaded
+# per cycle, and flipping enable_hip3 mid-run is detected in the per-cycle
+# hot-toggle block below (see "_hip3_now") which rebuilds the universe
+# immediately via get_universe(force_refresh=True) — no restart required.
+# config_store.STARTUP_ONLY_KEYS is the single source of truth documenting
+# which keys (currently none) actually need a restart.
 try:
     _enable_hip3 = bool(startup_agent_config.get("enable_hip3", False))
 except Exception:
@@ -761,8 +763,10 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
 
     Mirrors the daily-loss kill-switch guards: ``equity > 0`` (a degraded read
     returns equity=0 and can never trigger a flatten) and non-empty positions.
-    Both switches DEFAULT OFF (config_store) — flattening on a halt is a
-    deliberate operator choice.
+    Audit 2026-09-06 (C2): both switches are fully IMPLEMENTED here (real
+    close_position_market flatten) and DEFAULT ON (config_store H-1); the old
+    "DEFAULT OFF" wording was stale comment drift. Set either key to false to
+    restore open-blocking-only behavior.
 
       * auto_flatten_on_global_halt: global halt armed → close EVERY coin.
       * auto_flatten_on_coin_circuit: coin circuit armed → close that coin
@@ -1271,7 +1275,8 @@ while True:
         # global_halt_gate / coin_circuit_breaker_gate only block NEW entries
         # (risk_gates) — a position already open when the breaker trips keeps
         # running to its DSL stop through the whole halt window. With these
-        # opt-in switches armed (default OFF — config_store defaults), the
+        # opt-in switches armed (Audit 2026-09-06 C2: default ON per
+        # config_store H-1, not OFF; fully implemented hard flatten), the
         # breaker becomes a hard flatten: global halt closes EVERY open
         # position; a coin circuit closes that coin's position. The flatten
         # is idempotent (close_position_market re-fetches live state and

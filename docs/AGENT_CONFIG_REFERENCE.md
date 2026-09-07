@@ -394,4 +394,4 @@ fresh_impulse = breakout
 | `_MAJOR_VOLUMES` | BTC/ETH/SOL/... | 静态成交量兜底 |
 | `REGIME_TTL_S` | **300** | 市场制度缓存（5 分钟） |
 | `_SLOPE_LOOKBACK` | **8** | 制度趋势回看（8 根 1h bar） |
-| `_SLOPE_UP` / `_SLOPE_DOWN` | **+0.001 / -0.001** | 制度斜率阈值 |
+| `_SLOPE_UP` | **0.002** | 制度上涨斜率阈值（下跌分支取 `-slope_up`，无独立常量） |

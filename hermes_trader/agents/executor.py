@@ -29,6 +29,9 @@ from hermes_trader.agents.dsl_exit import (
     set_bracket,
 )
 from hermes_trader.agents.market_regime import regime_score_params
+# Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. regime_overlay
+# only imports market_regime (no cycle back to executor/risk_gates).
+from hermes_trader.agents.regime_overlay import evaluate_risk_overlay, resolve_applied_knobs
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.risk_gates import GateContext, eval_all_gates
 from hermes_trader.client.exchange import (
@@ -41,6 +44,7 @@ from hermes_trader.client.exchange import (
     get_max_leverage,
     get_orderbook_spread,
     min_entry_notional_usd,
+    _resolve_min_order_usd,
     modify_sl_trigger,
     place_hl_order,
     place_hl_trigger_order,
@@ -162,13 +166,18 @@ TP_ATR_MULT = 1.0
 
 # Audit 2026-09-04 P0-4: equity tier at/below which the absolute USD per-trade
 # cap (max_trade_notional_usd) stays binding as a hard floor for micro accounts.
+# Audit 2026-09-06 (C11): defaults only — both are now config-tunable via
+# notional_cap_tier_equity_usd / notional_cap_tier_multiple (cfg_get), and the
+# call site passes the resolved values in.
 _NOTIONAL_CAP_TIER_EQUITY_USD = 50.0
 # Above the tier the effective cap scales with equity (1.5x) so ATR equal-risk
 # sizing can express itself instead of every trade collapsing to the fixed $30.
 _NOTIONAL_CAP_TIER_MULTIPLE = 1.5
 
 
-def _tiered_notional_cap(base_cap_usd: float, equity_usd: float) -> float:
+def _tiered_notional_cap(base_cap_usd: float, equity_usd: float,
+                         tier_equity_usd: float = _NOTIONAL_CAP_TIER_EQUITY_USD,
+                         tier_multiple: float = _NOTIONAL_CAP_TIER_MULTIPLE) -> float:
     """Effective per-trade notional cap, tiered by account equity.
 
     A single absolute ``max_trade_notional_usd`` cap (e.g. $30) crushes ATR
@@ -178,16 +187,18 @@ def _tiered_notional_cap(base_cap_usd: float, equity_usd: float) -> float:
     tiny accounts but lets the risk-based sizing breathe as equity grows:
 
       * ``base <= 0``                      -> 0 (cap disabled)
-      * ``equity < 50``                    -> base (hard floor, e.g. $30)
-      * ``equity >= 50``                   -> max(base, equity * 1.5)
+      * ``equity < tier_equity``           -> base (hard floor, e.g. $30)
+      * ``equity >= tier_equity``          -> max(base, equity * tier_multiple)
 
-    Pure function so the tier behaviour is offline-testable.
+    The tier threshold/multiple default to the historical constants but are
+    overridable via config (C11). Pure function so the tier behaviour is
+    offline-testable.
     """
     if base_cap_usd <= 0:
         return 0.0
-    if equity_usd < _NOTIONAL_CAP_TIER_EQUITY_USD:
+    if equity_usd < tier_equity_usd:
         return base_cap_usd
-    return max(base_cap_usd, equity_usd * _NOTIONAL_CAP_TIER_MULTIPLE)
+    return max(base_cap_usd, equity_usd * tier_multiple)
 
 
 def _shared_atr_stop_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -585,7 +596,8 @@ _PULLBACK_SHADOW_FILE = os.environ.get(
 def _record_pullback_shadow(*, coin: str, side: str, score: float,
                             conf: float, slow_count: int,
                             rsi4h: Any, extension_atr: Any,
-                            entry_px: float, trace_id: str = "") -> None:
+                            entry_px: float, trace_id: str = "",
+                            macro_regime: str = "") -> None:
     """Best-effort append a pullback-long shadow signal to the audit JSONL."""
     from datetime import datetime, timezone
     rec = {
@@ -599,20 +611,20 @@ def _record_pullback_shadow(*, coin: str, side: str, score: float,
         "slow_burn_count": int(slow_count),
         "rsi4h": (float(rsi4h) if rsi4h is not None else None),
         "extension_atr": (float(extension_atr) if extension_atr is not None else None),
+        # Audit 2026-09-06 (E2): macro regime (up/chop/neutral/down) recorded so
+        # reconciliation can split outcomes by macro regime.
+        "macro_regime": macro_regime or "",
         "outcome": None,  # filled by reconciliation script
         "exit_px": None,
         "pnl_usd": None,
     }
-    try:
-        parent = os.path.dirname(_PULLBACK_SHADOW_FILE)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(_PULLBACK_SHADOW_FILE, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    # (size-based rotation + write-failure metric).
+    from hermes_trader.shadow_log import append_jsonl
+
+    if append_jsonl(_PULLBACK_SHADOW_FILE, rec, stream="pullback"):
         logger.info(f"[executor] pullback-long SHADOW recorded for {coin} "
                     f"-> {_PULLBACK_SHADOW_FILE}")
-    except OSError as e:
-        logger.warning(f"[executor] pullback shadow write failed: {e}")
 
 # ── Dynamic exchange-SL mover (Phase 2 trailing coordination) ───────────────
 # When the DSL floor ratchets tighter in Phase 2, move the exchange backup SL
@@ -742,6 +754,38 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
             float(nt_ml.get("max_loss_pct", base_max_loss)),
             float(nt_ml.get("max_loss_roe_pct", base_max_loss_roe)),
             "scalp")
+
+
+def resolve_regime_clocks(dsl_config: dict[str, Any], regime: str) -> dict[str, float]:
+    """Audit 2026-09-06 (E3, P2): regime-split position-lifetime clocks.
+
+    Returns the hard / stale-flat timeouts (minutes) to use for a position
+    entered under ``regime``. Behind ``regime_aware.clocks.enabled`` which
+    ships DEFAULT False: when off (or the block is absent) every trade keeps
+    the single global clock, so this is inert in the default config. When on,
+    directional regimes ('up'/'down') get LONGER clocks (let rippers ride
+    instead of being hard-timed-out) and non-trend regimes ('neutral'/'chop')
+    get SHORTER clocks (prune chop drifters faster).
+
+    Deliberately a separate helper rather than extending
+    ``select_exit_params``: that tuple is de-structured by the sizing mirror
+    (``compute_effective_stop_pct``), which cares about stop WIDTH, not clocks.
+    """
+    hard = float(dsl_config.get("hard_timeout_minutes",
+                                cfg_get("dsl_exit.hard_timeout_minutes")))
+    stale = float(dsl_config.get("stale_flat_timeout_minutes",
+                                 cfg_get("dsl_exit.stale_flat_timeout_minutes")))
+    ra = dsl_config.get("regime_aware") or {}
+    clocks = ra.get("clocks") or {}
+    if not clocks.get("enabled", False):
+        return {"hard_timeout_minutes": hard, "stale_flat_timeout_minutes": stale}
+    bucket = (clocks.get("trend") if regime in ("up", "down")
+              else clocks.get("non_trend")) or {}
+    return {
+        "hard_timeout_minutes": float(bucket.get("hard_timeout_minutes", hard)),
+        "stale_flat_timeout_minutes": float(
+            bucket.get("stale_flat_timeout_minutes", stale)),
+    }
 
 
 def compute_effective_stop_pct(
@@ -941,14 +985,12 @@ def _atr_calib_shadow_path(blk: dict[str, Any]) -> str:
 
 def _atr_calib_record_shadow(rec: dict[str, Any], path: str) -> None:
     """Best-effort append an ATR calibration record to the JSONL."""
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning("[atr-calib] shadow write failed: %s", e)
+    # Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    # (daily + size-based rotation, write-failure metric). The helper never
+    # raises, so the trade hot path is unaffected.
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="atr_calib")
 
 
 def _atr_calib_metric(mode: str, outcome: str) -> None:
@@ -1089,14 +1131,12 @@ def _sizing_v2_shadow_path(blk: dict[str, Any]) -> str:
 
 def _sizing_v2_record_shadow(rec: dict[str, Any], path: str) -> None:
     """Best-effort append a sizing v2 shadow record to the JSONL."""
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning("[sizing-v2] shadow write failed: %s", e)
+    # Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    # (daily + size-based rotation, write-failure metric). The helper never
+    # raises, so the trade hot path is unaffected.
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="sizing_v2")
 
 
 # ── AI-confidence freshness decay (roadmap §2, off / shadow / enforce) ────
@@ -1203,15 +1243,14 @@ def _confidence_decay_shadow_path(blk: dict[str, Any]) -> str:
 
 
 def _confidence_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append a confidence-decay shadow record to the JSONL."""
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning("[confidence-decay] shadow write failed: %s", e)
+    """Best-effort append a confidence-decay shadow record to the JSONL.
+
+    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    (size-based rotation + write-failure metric).
+    """
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="confidence_decay")
 
 
 def _confidence_decay_metric(mode: str, outcome: str) -> None:
@@ -1589,6 +1628,9 @@ def _place_tp_scale_out(
     # the DSL trail handle the entire exit.
     tp_min_size = entry_size_for_notional(coin, tp_size * tp_px_trig, tp_px_trig)
     tp_min_notional = tp_min_size * tp_px_trig
+    # Audit 2026-09-06 (C12): use the effective config-tunable minimum (matches
+    # the exchange's trigger-floor check) rather than the hard-coded constant.
+    _min_order = _resolve_min_order_usd()
 
     # O-9 (supplemental audit 2026-08-30): micro accounts (e.g. a $10 equity
     # tier on this venue, MIN_ORDER_USD=$10.5) cannot scale out faithfully.
@@ -1604,13 +1646,13 @@ def _place_tp_scale_out(
     # itself be a near-total close (>=90% of the position, the same threshold
     # enforced by the min-size clamp below); otherwise fall through to the
     # tp_size < tp_min_size upsize branch and bank the minimum-size leg.
-    if tp_intended_notional < MIN_ORDER_USD:
+    if tp_intended_notional < _min_order:
         upsized_frac = (tp_min_size / size_in_coin) if size_in_coin > 0 else 0.0
         if upsized_frac >= 0.9:
             logger.warning(
                 f"[executor:tp] SKIP {coin} — intended TP slice ${tp_intended_notional:.2f} "
                 f"({tp_scale_fraction:.0%} of ${full_notional:.2f}) is below the HL "
-                f"minimum (${MIN_ORDER_USD:.2f}); upsizing would fill "
+                f"minimum (${_min_order:.2f}); upsizing would fill "
                 f"{upsized_frac:.0%} of the position (near-total close), so scale-out "
                 f"is disabled for this micro position. The DSL trailing floor handles "
                 f"the full exit. "
@@ -1657,7 +1699,7 @@ def _place_tp_scale_out(
                 f"(${tp_min_notional:.2f}) would consume {tp_pct_of_position:.1f}% "
                 f"of full position {size_in_coin} (>=90% threshold). "
                 f"Intended TP size {tp_size} (${tp_intended_notional:.2f}) is "
-                f"below HL minimum (${MIN_ORDER_USD:.2f}). The DSL trailing "
+                f"below HL minimum (${_min_order:.2f}). The DSL trailing "
                 f"floor will handle the full exit. "
                 f"[skip_reason=min_size_ge_90pct, tp_px={tp_px_trig:.6g}]"
             )
@@ -2031,6 +2073,13 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
         _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
         _atr_cfg = dsl_config.get("atr_stop", {}) or {}
         _noise_cfg = dsl_config.get("noise_band", {}) or {}
+        # Audit 2026-09-06 (E4, P2): wire smooth-transition (was a dead knob;
+        # default OFF/inert). Kept in lockstep with dsl_exit._build_policy_from_config.
+        _smooth_cfg = dsl_config.get("smooth_transition", {}) or {}
+        # Audit 2026-09-06 (E3, P2): regime-split clocks (inert → global clock
+        # unless regime_aware.clocks.enabled) and the time-scratch knob block.
+        _clocks = resolve_regime_clocks(dsl_config, _regime)
+        _scratch_cfg = dsl_config.get("time_scratch", {}) or {}
         logger.info(f"[executor] exit policy = {_ex_label} (regime={_regime}) "
                     f"protect={_ex_protect} retrace={_ex_retrace} "
                     f"max_loss={_ex_ml_pct}% max_loss_roe={_ex_ml_roe}%")
@@ -2039,20 +2088,33 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
             max_loss_roe_pct=_ex_ml_roe,
             protect_pct=_ex_protect,
             retrace_threshold=_ex_retrace,
-            hard_timeout_minutes=dsl_config.get("hard_timeout_minutes", cfg_get("dsl_exit.hard_timeout_minutes")),
+            # Audit 2026-09-06 (E3, P2): regime-split clocks when enabled.
+            hard_timeout_minutes=_clocks["hard_timeout_minutes"],
             breakeven_trigger_pct=dsl_config.get("breakeven_trigger_pct", 0.0),
             breakeven_lock_pct=dsl_config.get("breakeven_lock_pct", 0.0),
             atr_stop_enabled=bool(_atr_cfg.get("enabled", False)),
             atr_stop_mult=float(_atr_cfg.get("atr_mult", 1.5)),
             atr_stop_floor_pct=float(_atr_cfg.get("floor_pct", 1.0)),
             atr_stop_ceiling_pct=float(_atr_cfg.get("ceiling_pct", 4.0)),
-            stale_flat_timeout_minutes=float(dsl_config.get("stale_flat_timeout_minutes", 0.0) or 0.0),
+            stale_flat_timeout_minutes=float(_clocks["stale_flat_timeout_minutes"] or 0.0),
             consecutive_breaches_required=int(dsl_config.get("consecutive_breaches_required", 1) or 1),
             # A-F5: persist-confirmed (4s default) floor breach; config key
             # dsl_exit.breach_confirm_sec drives both this and policy_from_config.
             breach_confirm_sec=float(dsl_config.get("breach_confirm_sec", cfg_get("dsl_exit.breach_confirm_sec", default=4.0)) or 0.0),
+            # Audit 2026-09-06 (E5, P2): propagate hard_stop_confirm_sec the same
+            # way breach_confirm_sec is wired; previously the dataclass default
+            # (1.0s) was always used here even when config overrode it.
+            hard_stop_confirm_sec=float(dsl_config.get("hard_stop_confirm_sec", cfg_get("dsl_exit.hard_stop_confirm_sec", default=1.0)) or 0.0),
             noise_band_enabled=bool(_noise_cfg.get("enabled", False)),
             noise_band_atr_mult=float(_noise_cfg.get("atr_mult", 1.0)),
+            # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 ramp (default OFF).
+            smooth_transition_enabled=bool(_smooth_cfg.get("enabled", False)),
+            smooth_band_pct=float(_smooth_cfg.get("band_pct", 1.0)),
+            # Audit 2026-09-06 (E3, P2): time scratch exit (default OFF/inert).
+            time_scratch_enabled=bool(_scratch_cfg.get("enabled", False)),
+            time_scratch_minutes=float(_scratch_cfg.get("minutes", 60.0)),
+            time_scratch_min_peak_pct=float(_scratch_cfg.get("min_peak_pct", 0.3)),
+            time_scratch_giveback_pct=float(_scratch_cfg.get("giveback_pct", 0.3)),
             phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
         )
         # ATR as % of entry — captured once here so the DSL stop width is stable
@@ -2441,6 +2503,19 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         except Exception as _sh_e:
             logger.debug(f"[shadow-signals] dispatch failed (non-fatal): {_sh_e}")
 
+    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow probe.
+    # Fire-and-forget on a daemon thread (the evaluation fetches ~2300 1h
+    # candles — never on the hot path). The probe self-gates on its
+    # off|shadow|enforce mode (default off = no thread, no network; env
+    # HERMES_XS_REVERSAL_MODE can flip it without a config rewrite) and is
+    # LONG-only. enforce is record-only in M2 (no order effect from this arm).
+    try:
+        from hermes_trader.agents.xs_reversal import run_xs_reversal_async
+        run_xs_reversal_async(analysis["coin"], analysis.get("side", "long"),
+                              config=config)
+    except Exception as _xs_e:
+        logger.debug(f"[xs_reversal] dispatch failed (non-fatal): {_xs_e}")
+
     # AI zero-confidence guard.
     #
     # confidence=0 can mean two very different things:
@@ -2794,6 +2869,24 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "reason": "equity_unavailable (live account state returned 0 after retries)",
         }
 
+    # Audit 2026-09-06 (C11): hard equity floor. Below this there is not enough
+    # book to size any trade above exchange min-notional with meaningful stop
+    # room (Pathia carries an equivalent $12 floor; Hermes lacked it). Fail
+    # CLOSED. Threshold 0 (or absent) disables the gate (inert by default for
+    # existing deployments; canonical default pins a conservative $10 floor).
+    try:
+        _min_tradable_equity = float(
+            cfg_get("min_tradable_equity_usd", 10.0, config=config) or 0.0)
+    except (TypeError, ValueError):
+        _min_tradable_equity = 10.0
+    if _min_tradable_equity > 0 and agg_equity > 0 and agg_equity < _min_tradable_equity:
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"],
+            "reason": (f"below_min_tradable_equity (aggregate equity ${agg_equity:.2f} "
+                       f"< floor ${_min_tradable_equity:.2f}) — fail-closed, no new entries"),
+        }
+
     # Free-margin floor: leave headroom for maintenance + slippage so HL
     # doesn't reject mid-pipeline with "Insufficient margin".
     min_avail_pct = float(config.get("min_available_margin_pct", 0.10))
@@ -2858,7 +2951,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
 
     # Exchange max leverage is stable for the session; read it once and reuse
     # across sizing so we don't hit the meta endpoint 3-4 times per candidate.
-    _coin_max_lev = get_max_leverage(analysis["coin"])
+    # Audit 2026-09-06 (C3): get_max_leverage raises ValueError for a coin
+    # absent from the (cached) universe metadata. Left uncaught it would abort
+    # the execute path mid-sizing; an unknown exchange max leverage must FAIL
+    # CLOSED by refusing the trade (skipping costs $0) rather than sizing at
+    # the configured leverage and risking an over-leveraged/rejected order.
+    try:
+        _coin_max_lev = get_max_leverage(analysis["coin"])
+    except Exception as _le:
+        logger.error(f"[executor] max-leverage lookup failed for {analysis['coin']} "
+                     f"— fail-closed, no order: {_le}")
+        return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
+                "reason": f"unknown_max_leverage_{analysis['coin']}"}
     leverage = min(int(config.get("leverage", HL_LEVERAGE)), _coin_max_lev)
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
     # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
@@ -2866,7 +2970,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # every trade a fixed $30 and losing risk granularity. Tier the effective
     # cap by equity (see _tiered_notional_cap): hard $30 floor below $50 equity,
     # then scale with equity so risk_per_trade_pct binds again.
-    _notional_cap = _tiered_notional_cap(_notional_cap, agg_equity)
+    # Audit 2026-09-06 (C11): tier threshold/multiple are config-tunable; fall
+    # back to the historical constants on any resolution failure.
+    try:
+        _tier_equity = float(
+            cfg_get("notional_cap_tier_equity_usd", _NOTIONAL_CAP_TIER_EQUITY_USD, config=config))
+        _tier_mult = float(
+            cfg_get("notional_cap_tier_multiple", _NOTIONAL_CAP_TIER_MULTIPLE, config=config))
+    except Exception:
+        _tier_equity, _tier_mult = _NOTIONAL_CAP_TIER_EQUITY_USD, _NOTIONAL_CAP_TIER_MULTIPLE
+    _notional_cap = _tiered_notional_cap(_notional_cap, agg_equity, _tier_equity, _tier_mult)
     _atr_sizing = config.get("atr_risk_sizing", {}) or {}
     _atr_sizing_enabled = bool(_atr_sizing.get("enabled", False))
     mid_price = 0.0
@@ -3084,6 +3197,27 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             logger.info(f"[executor] notional ${trade_notional:.0f} > cap "
                         f"${_notional_cap:.0f} — clamping to cap")
             trade_notional = _notional_cap
+
+    # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. Applies to
+    # BOTH sizing paths (ATR equal-risk and legacy fraction) at this single
+    # choke point, scaling the final notional by equity_fraction_mult (clamped
+    # to (0,1], so it can only SIZE DOWN). In shadow mode the multiplier is
+    # resolved as 1.0 (snapshot.applied is False), so live size is unchanged;
+    # any resolve error fails safe by skipping the scale.
+    try:
+        _ov_snap_sz = evaluate_risk_overlay(config)
+        _ov_sz = resolve_applied_knobs({"equity_fraction_mult": 1.0}, config, _ov_snap_sz)
+        _ov_mult = float(_ov_sz.get("equity_fraction_mult", 1.0) or 1.0)
+        _ov_mult = max(0.0, min(1.0, _ov_mult))
+        if _ov_mult < 1.0:
+            logger.info(
+                f"[executor] E1 de-risk overlay scaling notional for {analysis.get('coin')} "
+                f"by x{_ov_mult:.2f} (regime={_ov_snap_sz.regime or 'n/a'}, "
+                f"shadow={_ov_snap_sz.shadow}, applied={_ov_snap_sz.applied})")
+            trade_notional = trade_notional * _ov_mult
+    except Exception as _ov_e:
+        logger.warning(f"[executor] E1 overlay sizing resolve failed for "
+                       f"{analysis.get('coin')} — no scale applied: {_ov_e}")
 
     # Plan B: halve size in mid-strength TREND with RSI4h in [40, 60). The
     # backtest (backtest_ab_compare L613-618) shows this regime band loses on
@@ -3703,7 +3837,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     entry_px = _fill["entry_px"]
     position_notional = _fill["position_notional"]
     size_in_coin = _fill["size_in_coin"]
-    arrival_mid = _fill["arrival_mid"]
+    # Audit 2026-09-06 (F5, engineering hygiene): dropped unused local
+    # `arrival_mid` (F841); the _fill key is still written by the registrar.
 
     _brackets = _place_post_fill_brackets(
         config=config, coin=coin, is_buy=is_buy, trade_side=trade_side,
@@ -3963,6 +4098,28 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     if not bool(gate.get("enabled", False)):
         return ""
 
+    # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. Resolved
+    # ONCE per gate evaluation (sample-rate throttled internally). In shadow
+    # mode applied is False so the effective knobs equal the base (no live
+    # effect); in enforce + de-risk posture, shorts are disabled and the
+    # pullback-long bypass is switched off. Fail-safe: any resolve error keeps
+    # the operator's base switches (the overlay only ever tightens).
+    try:
+        _ov_snap_runner = evaluate_risk_overlay(config)
+        _ov_runner = resolve_applied_knobs(
+            {
+                "allow_shorts": bool(gate.get("allow_shorts", False)),
+                "pullback_long_enabled": bool((gate.get("pullback_long") or {}).get("enabled", False)),
+            },
+            config, _ov_snap_runner)
+        _ov_allow_shorts = bool(_ov_runner["allow_shorts"])
+        _ov_pullback_enabled = bool(_ov_runner["pullback_long_enabled"])
+    except Exception as _ov_e:
+        logger.warning(f"[runner_gate] E1 overlay resolve failed for "
+                       f"{analysis.get('coin')} — base switches kept: {_ov_e}")
+        _ov_allow_shorts = bool(gate.get("allow_shorts", False))
+        _ov_pullback_enabled = bool((gate.get("pullback_long") or {}).get("enabled", False))
+
     coin = analysis.get("coin") or ""
     is_hip3 = ":" in coin
     side = (analysis.get("side") or "").lower()
@@ -4057,8 +4214,15 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             pass
 
     if side == "short":
-        if not bool(gate.get("allow_shorts", False)):
-            logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
+        # E1 (Audit 2026-09-06): allow_shorts may be force-disabled by the
+        # choppy-market overlay in enforce+de-risk posture (shadow never does).
+        if not _ov_allow_shorts:
+            if bool(gate.get("allow_shorts", False)):
+                # Base config allows shorts but the overlay turned them off.
+                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
+                            f"(E1 choppy-market de-risk overlay)")
+            else:
+                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
             return "runner_gate_blocked (shorts disabled)"
         short_min_score = float(gate.get("min_short_composite", min_score))
         short_min_conf = float(gate.get("min_short_confidence", min_conf))
@@ -4132,7 +4296,12 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     # still blocked, so 48h of real outcomes can be paper-reconciled before
     # live enablement.
     pb_cfg = gate.get("pullback_long") or {}
-    if bool(pb_cfg.get("enabled", False)) and not (structured_runner or structured_daily_mover):
+    # E1 (Audit 2026-09-06): the pullback-long bypass is disabled in enforce +
+    # de-risk posture (choppy macro). _ov_pullback_enabled is base AND overlay,
+    # so a chop overlay switches the bypass off and the trade falls through to
+    # the late-chase veto; shadow keeps the base switch (no live change).
+    if bool(pb_cfg.get("enabled", False)) and _ov_pullback_enabled \
+            and not (structured_runner or structured_daily_mover):
         pb_min_score = float(pb_cfg.get("min_composite", 20.0))
         pb_max_rsi = float(pb_cfg.get("max_rsi", 70.0))
         pb_max_ext = float(pb_cfg.get("max_extension_atr", 2.0))
@@ -4145,9 +4314,33 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     pb_extension = (_c - _e) / _a
             except (TypeError, ValueError):
                 pb_extension = None
+        # Audit 2026-09-06 (E2, Q3): the bypass must also align with the MACRO
+        # regime (BTC / SP500 proxy), not only the per-coin 4h uptrendMomentum
+        # flag. In a choppy macro the 4h flag fires on false golden crosses and
+        # the bypass buys the range top. detect_regime_with_score is cached (the
+        # market_regime gate computes it in the same scan) and does NOT raise;
+        # any non-"up" regime or a lookup error withholds the bypass so the trade
+        # falls through to the late-chase veto below (fail-closed).
+        pb_macro_regime = ""
+        pb_macro_up = True
+        if bool(pb_cfg.get("require_macro_uptrend", True)):
+            try:
+                from hermes_trader.agents.market_regime import detect_regime_with_score
+                pb_macro_regime, _pb_macro_score = detect_regime_with_score(coin)
+            except Exception as _pb_e:
+                logger.warning(f"[executor] pullback-long macro regime lookup "
+                               f"failed for {coin}: {_pb_e} — withholding bypass")
+                pb_macro_regime, pb_macro_up = "", False
+            else:
+                pb_macro_up = (pb_macro_regime == "up")
+                if not pb_macro_up:
+                    logger.info(f"[executor] pullback-long bypass withheld for "
+                                f"{coin}: 4h uptrend but macro regime="
+                                f"{pb_macro_regime or 'unknown'} != up")
         pullback_long = (
             side == "long"
             and uptrend
+            and pb_macro_up
             and slow_count >= pb_min_slow
             and score >= pb_min_score
             and not fresh_impulse
@@ -4162,6 +4355,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     extension_atr=pb_extension,
                     entry_px=analysis.get("mid") or analysis.get("price") or 0.0,
                     trace_id=str(analysis.get("trace_id", "") or ""),
+                    macro_regime=pb_macro_regime,
                 )
                 return (f"runner_gate_blocked (pullback-long SHADOW - "
                         f"recorded, not traded; score={score:.0f}, slow={slow_count})")

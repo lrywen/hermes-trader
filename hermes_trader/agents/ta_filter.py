@@ -75,14 +75,48 @@ def _compute_adx(candles: list[Candle]) -> Optional[float]:
     return last if math.isfinite(last) else None
 
 
-def _check_volume_confirm(candles: list[Candle], mult: float = 1.2) -> bool:
-    if len(candles) < 21:
+# Audit 2026-09-06 (D4): fallback literals for the volume-surge confirmation;
+# the live values resolve from the canonical volume_confirm block.
+_VOLUME_CONFIRM_MIN_RATIO_DEFAULT = 1.2
+_VOLUME_CONFIRM_LOOKBACK_DEFAULT = 20
+
+
+def _volume_confirm_params() -> tuple[float, int]:
+    """(min_ratio, lookback) for the volume-surge gate, from the canonical
+    ``volume_confirm`` block. Late import keeps ta_filter importable without
+    the config layer (unit tests hit the pure function directly). Any bad or
+    missing value falls back to the historical literals, so behaviour is
+    identical with no config file. Never raises."""
+    ratio = _VOLUME_CONFIRM_MIN_RATIO_DEFAULT
+    lookback = _VOLUME_CONFIRM_LOOKBACK_DEFAULT
+    try:
+        from hermes_trader.agents.config_store import cfg_get
+
+        block = cfg_get("volume_confirm", default={}) or {}
+        if isinstance(block, dict):
+            r = block.get("min_ratio")
+            if r is not None and float(r) > 0:
+                ratio = float(r)
+            lb = block.get("lookback")
+            if lb is not None and int(lb) >= 1:
+                lookback = int(lb)
+    except Exception:
+        pass
+    return ratio, lookback
+
+
+def _check_volume_confirm(candles: list[Candle],
+                          mult: float = _VOLUME_CONFIRM_MIN_RATIO_DEFAULT,
+                          lookback: int = _VOLUME_CONFIRM_LOOKBACK_DEFAULT) -> bool:
+    if len(candles) < lookback + 1:
         return False
     last_vol = candle_val(candles[-1], "v")
-    avg_vol = sum(candle_val(c, "v") for c in candles[-21:-1]) / 20
-    # Volume confirmation requires a real surge: last bar >= 1.2x the prior
-    # 20-bar average. The old 0.8x threshold rubber-stamped below-average bars
-    # as "confirmed", which let weak breakouts through.
+    avg_vol = sum(candle_val(c, "v") for c in candles[-(lookback + 1):-1]) / lookback
+    # Volume confirmation requires a real surge: last bar >= mult x the prior
+    # `lookback`-bar average. The old 0.8x threshold rubber-stamped below-
+    # average bars as "confirmed", which let weak breakouts through. The mult
+    # (min_ratio) and window (lookback) resolve from the canonical
+    # volume_confirm block (Audit 2026-09-06, D4); defaults 1.2 / 20.
     return avg_vol == 0 or last_vol >= avg_vol * mult
 
 
@@ -554,7 +588,12 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
         atr4pct = _compute_atr4pct(c4h)
         adx4h = _compute_adx(c4h)
         ema_cross = _check_ema_cross_recent(c4h)
-        volume_confirm = _check_volume_confirm(c4h)
+        # Audit 2026-09-06 (D4): min_ratio / lookback resolve from the
+        # canonical volume_confirm block (defaults 1.2 / 20 — byte-identical
+        # behaviour when unconfigured).
+        vol_ratio, vol_lookback = _volume_confirm_params()
+        volume_confirm = _check_volume_confirm(c4h, mult=vol_ratio,
+                                               lookback=vol_lookback)
         extension = _extension_atr(c4h)
         obv_slope = _obv_slope(c4h, lookback=10)
 
@@ -567,8 +606,9 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
             "trendFlip1h", "higherLows1h", "volumeBuildup1h", "dailyMover",
         }
         # momentumBurst is direction-agnostic by name; disambiguate using the
-        # extension sign (price above EMA21 => the burst was up).
-        burst_up = "momentumBurst" in fired_names and (extension or 0) > 0  # noqa: F841  (P1-2 baseline: symmetric with burst_down; trading logic untouched)
+        # extension sign (price below EMA21 => the burst was down). Audit
+        # 2026-09-06 (F5): dropped the dead `burst_up` binding — intent only
+        # consumes burst_down below (trading logic unchanged).
         burst_down = "momentumBurst" in fired_names and (extension or 0) < 0
         intend_long = bool(bullish_triggers) and not burst_down
         intend_short = bool(fired_names & {"downtrendMomentum"}) or burst_down

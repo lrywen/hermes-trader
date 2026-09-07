@@ -113,16 +113,18 @@ def test_r13_b7_five_blocks_registered():
 
 def test_r13_b7_options_gex_block_keys_and_values():
     block = CANONICAL_DEFAULTS["options_gex"]
-    assert set(block.keys()) == {"ttl_sec", "http_timeout_s"}
+    # Audit 2026-09-06 (F6): negative_ttl_sec — short TTL for fetch failures.
+    assert set(block.keys()) == {"ttl_sec", "http_timeout_s", "negative_ttl_sec"}
     assert block["ttl_sec"] == 900
     assert block["http_timeout_s"] == 12.0
+    assert block["negative_ttl_sec"] == 90
 
 
 def test_r13_b7_short_volume_block_keys_and_values():
     block = CANONICAL_DEFAULTS["short_volume"]
     assert set(block.keys()) == {
         "ttl_sec", "http_timeout_s", "crowded_ratio", "light_ratio",
-        "trend_delta", "lookback_days",
+        "trend_delta", "lookback_days", "negative_ttl_sec",
     }
     assert block["ttl_sec"] == 3600
     assert block["http_timeout_s"] == 12.0
@@ -130,6 +132,7 @@ def test_r13_b7_short_volume_block_keys_and_values():
     assert block["light_ratio"] == 0.35
     assert block["trend_delta"] == 0.03
     assert block["lookback_days"] == 5
+    assert block["negative_ttl_sec"] == 120
 
 
 def test_r13_b7_crypto_whale_block_keys_and_values():
@@ -350,7 +353,7 @@ def test_r13_b7_validate_config_updates_accepts_blocks():
 
 def test_r13_b7_helpers_defaults_equal_literals():
     """空 config 下五个 helper 返回值 == 模块字面量（零行为变化）。"""
-    assert options_gex_params(config={}) == {"ttl_sec": 900.0, "http_timeout_s": 12.0}
+    assert options_gex_params(config={}) == {"ttl_sec": 900.0, "http_timeout_s": 12.0, "negative_ttl_sec": 90.0}
     sp = short_volume_params(config={})
     assert sp["ttl_sec"] == 3600.0 and sp["crowded_ratio"] == 0.60
     assert sp["lookback_days"] == 5
@@ -454,7 +457,7 @@ def test_r13_b7_helpers_malformed_config_never_raises():
            "max_pages": "z", "crowded_ratio": object(), "lookback_days": None,
            "min_volume_usd": "bad"}
     op = options_gex_params(config={"options_gex": bad})
-    assert op == {"ttl_sec": 900.0, "http_timeout_s": 12.0}
+    assert op == {"ttl_sec": 900.0, "http_timeout_s": 12.0, "negative_ttl_sec": 90.0}
     sp = short_volume_params(config={"short_volume": bad})
     assert sp["crowded_ratio"] == 0.60 and sp["lookback_days"] == 5
     cp = crypto_whale_params(config={"crypto_whale": bad})
@@ -736,9 +739,14 @@ def test_r13_b7_crypto_whale_cache_ttl_default_120(monkeypatch):
 
 
 def test_r13_b7_short_volume_cache_ttl_env_takes_effect(monkeypatch):
-    """shortvol TTL env=60：61s 后即重新 fetch（默认 3600 下仍新鲜）。"""
+    """shortvol TTL env=60：61s 后即重新 fetch（默认 3600 下仍新鲜）。
+
+    Audit 2026-09-06 (F6): the fake fetch returns None (a miss), which is now
+    cached under negative_ttl_sec rather than ttl_sec, so both TTLs are pinned
+    to 60 to keep exercising the positive-TTL expiry path."""
     _reset_module_cache(short_volume)
     monkeypatch.setenv("HERMES_CFG_SHORT_VOLUME__TTL_SEC", "60")
+    monkeypatch.setenv("HERMES_CFG_SHORT_VOLUME__NEGATIVE_TTL_SEC", "60")
     calls = {"n": 0}
 
     def _fake_fetch_day(date, timeout=None):
@@ -791,8 +799,10 @@ def test_r13_b7_canonical_visible_for_dashboard_dump():
     """CANONICAL_DEFAULTS 是 dashboard/MCP dump 的 source of truth——新登记
     块必须出现且叶子类型可 JSON 渲染（避免 dashboard crash）。"""
     type_map = {
-        "options_gex": {"ttl_sec": int, "http_timeout_s": (int, float)},
-        "short_volume": {"crowded_ratio": float, "lookback_days": int},
+        "options_gex": {"ttl_sec": int, "http_timeout_s": (int, float),
+                        "negative_ttl_sec": int},
+        "short_volume": {"crowded_ratio": float, "lookback_days": int,
+                         "negative_ttl_sec": int},
         "crypto_whale": {"cache_max": int, "window_minutes": int,
                          "bias_threshold": float, "min_usd": int},
         "news_catalyst": {"timespan": str, "max_records": int,

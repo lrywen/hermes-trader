@@ -332,7 +332,8 @@ def main() -> int:
     print("\n  Suggested constants block "
           "(hermes_trader/agents/market_regime.py):")
     print(f"    _SLOPE_UP = {best['slope']:.4f}")
-    print(f"    _SLOPE_DOWN = -{best['slope']:.4f}")
+    # Audit 2026-09-06 (F5, engineering hygiene): no _SLOPE_DOWN line — the
+    # 'down' branch derives its threshold as `-slope_up` (see market_regime).
     print(f"    _CHOP_ADX_MAX = {best['adx']:.1f}")
     print(f"    # EMA periods in _trend_from_closes: fast={best['fast']}, "
           f"slow={best['slow']}")

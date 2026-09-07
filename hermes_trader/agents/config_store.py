@@ -76,7 +76,10 @@ def _invalidate_raw_cache() -> None:
 # These are the fallback values used when a key is missing from the config
 # file. They replace the dozens of scattered ``.get(key, <random number>)``
 # calls whose defaults had drifted from production (e.g. max_daily_loss_usd
-# fell back to -100 in one place while production uses -30).
+# fell back to -100 in one place while the canonical/production value is
+# -2.0 — see the kill-switch crossover note below).
+# Audit 2026-09-07 (tail-1): corrected the stale "production uses -30"
+# statement — canonical and production both pin -2.0.
 # ---------------------------------------------------------------------------
 CANONICAL_DEFAULTS: dict[str, Any] = {
     "mode": "OFF",
@@ -100,16 +103,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # runtime and schema both treat it as an equity multiple. Production pins
     # 4.0 (= 4× equity total-open-notional ceiling, within the 10x leverage
     # band).
-    # H1 [2026-09-05] semantic clarification: 0 is REJECTED at the schema
-    # layer (config_schema.py L716-726 enforces >= 0.5) because the runtime
-    # gate `equity_risk_cap` (risk_gates.py:590) interprets pct=0 as
-    # max_notional=$0, which would silently neuter a layer of defence. The
-    # earlier "0 disables the cap" comment is INCORRECT — the gate never
-    # short-circuits on 0, it caps everything to $0. To actually disable
-    # the cap, set a large positive value (e.g. 10.0 for 10× equity) and
-    # rely on max_daily_loss_usd as the real circuit breaker. Do NOT set
-    # it to 0.04 expecting 4% — that would cap total notional at 4% of
-    # equity and freeze the account.
+    # Audit 2026-09-06 (C6): zero / tiny-value semantics. The pydantic field
+    # (config_schema.py) accepts ge=0.0, and a SEPARATE sane-floor validator
+    # (test_config_safety_floors) rejects the DANGER ZONE 0 < x < 0.5 (one
+    # trade would fill the cap and freeze the rest of the day), while:
+    #   * 0 is the EXPLICIT "cap disabled" signal — equity_risk_cap
+    #     (risk_gates.py) short-circuits pass=True for None/<=0 (it must
+    #     never read pct=0 as "cap at $0", which would reject every entry);
+    #   * x >= 0.5 is a normal working multiple (production pins 4.0).
+    # So "set it to 0 to disable" is CORRECT, and there is no need to use a
+    # huge positive value for that purpose. Do NOT set 0.04 expecting 4% —
+    # the unit is an equity MULTIPLE, so 0.04 means 4% of equity (rejected
+    # by the sane-floor) and 4.0 means 400%.
     # Daily-loss kill-switch — P1-15 unified semantics (see
     # risk_gates.effective_daily_loss_cutoff): the ENTRY gate halts new entries
     # at the TIGHTER of (a) circuit_breaker.daily_loss_pct × equity [PRIMARY,
@@ -183,6 +188,27 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "enabled": False,
             "atr_mult": 1.0,
         },
+        # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor transition.
+        # Ramps the phase-2 floor from the hard stop up to the full trailing
+        # floor across a peak-profit band of width band_pct instead of snapping
+        # in one tick at the arm instant. Tick A/B replay (scripts/
+        # p2_smooth_replay.py) showed it net-negative, so it ships DEFAULT OFF
+        # (inert) — an operator opts in via this block. Was a dead knob:
+        # ExitPolicy fields existed but no construction path fed them.
+        "smooth_transition": {
+            "enabled": False,
+            "band_pct": 1.0,
+        },
+        # Audit 2026-09-06 (E3, P2): time-based scratch exit. Closes a choppy
+        # position that has aged past `minutes`, never armed phase-2, printed a
+        # small favorable pop (>= min_peak_pct) but has since given back
+        # giveback_pct from peak while still green. Default OFF (inert).
+        "time_scratch": {
+            "enabled": False,
+            "minutes": 60.0,
+            "min_peak_pct": 0.3,
+            "giveback_pct": 0.3,
+        },
         # R12-C1: floor-breach confirmation. Was implicit: executor built
         # ExitPolicy with hardcoded defaults (1 / 0.0).
         # A-F5 (deep audit 2026-08-28): breach_confirm_sec default 0.0 → 4.0
@@ -210,6 +236,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
                 "trend": {"max_loss_pct": 0.8, "max_loss_roe_pct": 10.0},
                 "non_trend": {"max_loss_pct": 0.4, "max_loss_roe_pct": 5.0},
             },
+            # Audit 2026-09-06 (E3, P2): regime-split position-lifetime clocks
+            # (minutes). Trend regimes get LONGER hard/stale timeouts (let
+            # rippers ride); non-trend get SHORTER (prune chop faster). Separate
+            # `enabled` gate (orthogonal to regime_aware.enabled) so the default
+            # keeps the single global hard_timeout/stale_flat (inert).
+            "clocks": {
+                "enabled": False,
+                "trend": {"hard_timeout_minutes": 2880.0,
+                          "stale_flat_timeout_minutes": 720.0},
+                "non_trend": {"hard_timeout_minutes": 960.0,
+                              "stale_flat_timeout_minutes": 240.0},
+            },
         },
     },
     "force_execute_composite": 30,
@@ -231,6 +269,45 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "whale_size_multiplier": 1.0,
     "block_counter_trend_bypass": True,
     "trend_surface_enabled": True,
+    # Audit 2026-09-06 (D1): minimum number of DAILY candles a coin must have
+    # for the 200MA trend filter to be considered "established". Pathia ships
+    # min_history_bars=0 (a fetch that returns <period daily bars is treated as
+    # a genuinely new listing and the gate's new-coin branch decides); hermes
+    # keeps 0 as the default so the gate is a no-op until an operator arms it.
+    "min_history_bars": 0,
+    # Audit 2026-09-06 (D2): hard 24h price-extension ceiling for LONGS. A coin
+    # up more than this percent over the last 24h is a blow-off chase and is
+    # refused regardless of mover/score. 0 disables. Ported from Pathia
+    # override_max_daily_extension_pct=30.0. Distinct from the ta_late_entry
+    # "extension" (which is a 4h ATR-multiple) — this is a raw 24h percent.
+    "override_max_daily_extension_pct": 30.0,
+    # Audit 2026-09-06 (C11/C12): previously hard-coded module constants now
+    # tunable via config. Each keeps the exact historical value as its default
+    # so behaviour is unchanged until an operator overrides it.
+    #   notional_cap_tier_* — _tiered_notional_cap (executor): below this equity
+    #     the absolute max_trade_notional_usd stays a hard floor for micro
+    #     accounts; at/above it the effective cap scales with equity*multiple.
+    "notional_cap_tier_equity_usd": 50.0,
+    "notional_cap_tier_multiple": 1.5,
+    # Audit 2026-09-06 (C11): hard account-equity floor for new entries.
+    #   Below this aggregate equity the executor fail-closes (no trade sized
+    #   above exchange min-notional with real stop room). Pathia uses ~$12;
+    #   $10 mirrors the HL min-order floor. Set 0 to disable.
+    "min_tradable_equity_usd": 10.0,
+    #   min_order_usd — Hyperliquid rejects orders below $10 notional; 10.5 is
+    #     the buffered hard floor used by exchange sizing (_min_order_size /
+    #     min_entry_notional_usd / entry_size_for_notional). Must stay >= 10.
+    "min_order_usd": 10.5,
+    #   correlation_crypto_coins — the major-crypto pool the correlation cap
+    #     counts long exposure against (was risk_gates._CRYPTO_COINS frozenset).
+    #     Empty/None falls back to the built-in 40-coin list.
+    "correlation_crypto_coins": [
+        "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC",
+        "LINK", "DOT", "UNI", "ATOM", "NEAR", "FTM", "APT", "ARB", "OP",
+        "INJ", "TIA", "SUI", "SEI", "WIF", "PEPE", "BONK", "FLOKI", "TRX",
+        "LTC", "BCH", "ETC", "XLM", "ALGO", "AAVE", "MKR", "SNX", "CRV",
+        "COMP", "YFI", "SUSHI", "1INCH",
+    ],
     "loss_cooldown_min": 180,
     "min_ai_close_hold_min": 25,
     "breakout_force_execute": False,
@@ -279,6 +356,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "max_extension_atr": 2.0,
             "min_slow_burn": 1,
             "shadow_mode": False,
+            # Audit 2026-09-06 (E2, Q3): require the MACRO regime (BTC / SP500
+            # proxy EMA20/30 + ADX via detect_regime_with_score) to be "up"
+            # before the bypass fires. The 4h per-coin uptrendMomentum flag
+            # alone fires on false golden crosses in a choppy macro and buys
+            # the range top. fail-closed: any non-"up" macro (chop/neutral/
+            # down) or a lookup error withholds the bypass so the trade falls
+            # through to the normal late-chase veto. Set false to restore the
+            # pre-E2 behaviour (4h uptrend only).
+            "require_macro_uptrend": True,
         },
     },
     "plan_b": {
@@ -459,10 +545,19 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # drift fixed here: canonical said 10.0 while three fallbacks said 1.0).
     "options_gex": {
         "ttl_sec": 900,              # CBOE delayed feed; 15-min structural cache
+        # Audit 2026-09-06 (F6, engineering hygiene): a fetch FAILURE / empty
+        # feed used to be cached for the full positive TTL (15 min), so a
+        # transient CBOE outage made GEX cautions blind for a quarter hour.
+        # Misses get a short TTL so recovery is picked up promptly while still
+        # shielding the hot path from re-hammering a down source.
+        "negative_ttl_sec": 90,
         "http_timeout_s": 12.0,      # per-request CBOE fetch bound
     },
     "short_volume": {
         "ttl_sec": 3600,             # FINRA file is daily; an hour is plenty
+        # Audit 2026-09-06 (F6): same short negative TTL for FINRA misses
+        # (was 3600s — an hour blind after a transient FINRA failure).
+        "negative_ttl_sec": 120,
         "http_timeout_s": 12.0,      # per-day FINRA fetch bound
         "crowded_ratio": 0.60,       # >= → squeeze fuel
         "light_ratio": 0.35,         # <= → little short pressure
@@ -619,6 +714,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "ws_heartbeat_s": 10.0,
         "ws_seq_max_backward": 1024,
         "ws_max_tick_jump_frac": 0.25,
+        # Audit 2026-09-06 (F6, engineering hygiene): explicit per-call timeout
+        # for L2 order-book snapshots (the pre-trade spread gate) and a short
+        # positive-result cache. l2_timeout_s bounds a hung l2Book request
+        # independently of sdk_timeout_s; l2_cache_ttl_s lets the diagnostic
+        # fetch and the pre-trade gate share one snapshot within a cycle.
+        "l2_timeout_s": 5.0,
+        "l2_cache_ttl_s": 2.0,
     },
     # R13-B13: Hyperliquid rate-limiter knobs (client/rate_limit.py +
     # hl_client.py call sites). Seven leaves cover token-bucket refill /
@@ -640,6 +742,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "rate_opportunistic_wait_s": 2.0,
         "rate_shared": True,
         "rate_per_endpoint_gate": True,
+    },
+    # Audit 2026-09-06 (F6, engineering hygiene): Binance second-source price
+    # crosscheck knobs (client/price_crosscheck.py). The timeout was a hardcoded
+    # 2.5s module literal and the other three leaves were env-only
+    # (HERMES_PRICE_CROSSCHECK_*); they now resolve through the canonical block
+    # with the legacy env vars kept as the top-priority channel in the module.
+    "price_crosscheck": {
+        "http_timeout_s": 2.5,       # Binance ticker GET per-call bound
+        "ttl_s": 10.0,               # short per-symbol price cache
+        "warn_bps": 30.0,            # 0.30% divergence -> alert
+        "block_bps": 100.0,          # 1.00% divergence -> block entry
     },
     # P2-3: bps the exchange backup stop sits behind the DSL floor (executor
     # SL ratchet coordination); and the funding-rate history lookback window
@@ -673,6 +786,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # headline cache (seconds). Were hardcoded module constants in research.py.
     "news_freshness_days": 2,
     "news_cache_ttl_s": 120,
+    # Audit 2026-09-06 (F6, engineering hygiene): per-request bound for the
+    # Brave Search news call in research.py. Was a hardcoded timeout=10.0
+    # literal invisible to the config dump / dashboard overrides.
+    "news_http_timeout_s": 10.0,
     # P3-2: research-path LLM circuit breaker. After fail_threshold consecutive
     # hard failures (non-success HTTP / network error) the breaker opens for
     # cooldown_s and _call_openrouter short-circuits to "" so a dead upstream
@@ -776,6 +893,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
     },
+    # Audit 2026-09-06 (D4): TA pre-filter volume-surge confirmation
+    # (ta_filter._check_volume_confirm). Previously the 1.2x / 20-bar numbers
+    # were hardcoded literals in the pure function; registering them here makes
+    # the confirmation gate configurable / env-overridable without touching
+    # code. Defaults mirror the literals verbatim (last closed bar must be >=
+    # min_ratio x the prior lookback-bar average volume), so behaviour is
+    # unchanged with no config file.
+    "volume_confirm": {
+        "min_ratio": 1.2,
+        "lookback": 20,
+    },
     # confidence_decay (roadmap §2, 2026-09-04): AI-conviction freshness
     # decay. The debate cache replays the same LONG/SHORT verdict for minutes
     # after the entry window has passed, so an aged conviction is multiplied
@@ -841,6 +969,126 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_mult": 0.75,
         "max_mult": 1.35,
         # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # trend_filter_200ma (Wave D, 2026-09-06, ported from Pathia): daily-200
+    # SMA trend filter for LONGS. A long is only allowed when the latest daily
+    # close is at/above the daily SMA(`period`); shorts are never filtered (the
+    # filter is a long-only macro-trend gate, matching Pathia). Fail semantics:
+    #   * an ESTABLISHED coin whose daily candles cannot be fetched / computed
+    #     FAILS OPEN with a WARNING when block_unknown=false (Pathia default) —
+    #     a transient API error must not veto every long on the book;
+    #   * a genuinely NEW listing (daily bars < min(period, min_history_bars
+    #     floor)) FAILS CLOSED — a coin with no 200d history has no established
+    #     trend and longing it is the unfilterable chase this gate exists to
+    #     stop. block_unknown=true would also make the fetch-failure fail
+    #     closed (opt-in hardening).
+    # Bypass: a daily-mover long may bypass the filter ONLY when its 24h move
+    # sits inside [daily_mover_min_ext_pct, daily_mover_max_ext_pct] — a strong
+    # but not parabolic breakout may legitimately start above the 200MA before
+    # price has reverted to it; a move past daily_mover_max_ext_pct is too
+    # extended to bypass (the D2 extension ceiling independently refuses it).
+    # mode off|shadow|enforce, default off (gray-release; shadow via
+    # HERMES_TREND_FILTER_MODE).
+    "trend_filter_200ma": {
+        "mode": "off",
+        "period": 200,
+        # Fetch slightly more than `period` daily bars so the forming bar / a
+        # short shortfall does not starve the SMA.
+        "fetch_bars": 210,
+        "block_unknown": False,
+        "allow_daily_mover_long_bypass": True,
+        "daily_mover_min_ext_pct": 10.0,
+        "daily_mover_max_ext_pct": 30.0,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # daily_extension_cap (Wave D / D2, Audit 2026-09-06, ported from Pathia
+    # override_max_daily_extension_pct=30.0): hard 24h price-extension ceiling
+    # for LONGS (anti-chase). The threshold itself is the root scalar
+    # override_max_daily_extension_pct; this block only carries the gray-release
+    # switch and the shadow-log path. Default mode SHADOW (unlike D1/D3 which
+    # default off): Pathia ships the cap live, so Hermes probes would-blocks
+    # while the shadow log collects data before flipping to enforce. env
+    # override: HERMES_DAILY_EXTENSION_CAP_MODE.
+    "daily_extension_cap": {
+        "mode": "shadow",
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # reentry_cap (Wave D, 2026-09-06, ported from Pathia): per-coin rolling
+    # ENTRY counter. Blocks a new entry on a coin that has already had
+    # `max_per_coin` entries (opens) within the last `window_hours`. This caps
+    # stop-out-and-rebuy churn on a single name (the coin_circuit breaker only
+    # arms on a large realized loss; this caps raw frequency regardless of PnL).
+    # Counts OPENINGS only (record_trade), both sides. A memory read failure
+    # FAILS OPEN (shared breaker convention). max_per_coin <= 0 disables.
+    # mode off|shadow|enforce, default off (gray-release; shadow via
+    # HERMES_REENTRY_CAP_MODE).
+    "reentry_cap": {
+        "mode": "off",
+        "max_per_coin": 2,
+        "window_hours": 24.0,
+        # --- shadow verdict log (JSONL); empty = container default path ---
+        "shadow_log_path": "",
+    },
+    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm.
+    # The M1 offline backtest (archive/scripts/backtest_xs_reversal.py)
+    # falsified the original chop/neutral gate: regime_strength_score is
+    # direction-agnostic and ~90% of extreme 3d drawdowns score TREND. The
+    # validated edge is a downtrend oversold bounce (EMA8<EMA21 +
+    # RSI[15,35)); the probe records every xs+awake trigger with the full
+    # snapshot and flags is_candidate for that cell. Default off (inert);
+    # shadow via HERMES_XS_REVERSAL_MODE. enforce is record-only in M2.
+    "xs_reversal": {
+        "mode": "off",             # off | shadow | enforce (enforce=record-only)
+        "shadow_log_path": "",     # empty = ~/.hermes-trading/xs_reversal_shadow.jsonl
+        "lookback_d": 3,           # rolling highest-high window (days of 1h bars)
+        "top_pct": 85,             # ext_pct bottom-tail percentile (M1: 90+ halves sample)
+        "awake_bars": 7,           # activity window length
+        "awake_min_frac": 0.67,    # min active-bar fraction (5 of 7)
+        "rsi_long": 35.0,          # oversold confirmation ceiling (M1 sweet spot)
+        "rsi_floor": 15.0,         # free-fall guardrail (non-binding in M1 sample)
+    },
+    # regime_risk_overlay (Wave E / E1, Audit 2026-09-06, Q2): book-level
+    # AUTO DE-RISK switch for choppy/range markets. The macro regime comes
+    # from detect_regime_with_score (BTC / equity proxy, EMA20/30 + ADX,
+    # TTL-cached). After `hysteresis_bars` CONSECUTIVE non-trending samples
+    # (chop/neutral) the book drops to the `chop` profile; after the same run
+    # of trending samples (up/down) it restores to the `trend` profile. The
+    # overlay can only TIGHTEN the operator's base knobs (min/AND), never
+    # loosen them. Disabled by default (ships SHADOW-first: set enabled=true
+    # while shadow_mode=true to record counterfactuals before enforcing).
+    "regime_risk_overlay": {
+        "enabled": False,
+        # shadow_mode: posture flips and would-derisk is logged, but no knob
+        # is actually changed (applied stays False). Set false to enforce.
+        "shadow_mode": True,
+        # Consecutive same-class macro samples required to flip posture
+        # (debounces ADX wobbling around its chop threshold).
+        "hysteresis_bars": 3,
+        # Minimum seconds between state-machine steps (one step per fresh
+        # macro sample; defaults to ~ the regime cache TTL so a single scan
+        # over many coins does not advance the counter N times). 0 = step on
+        # every call (tests).
+        "sample_interval_s": 300.0,
+        # De-risk profile (applied while in a confirmed chop/non-trend run).
+        "chop": {
+            "max_concurrent": 1,
+            "allow_shorts": False,
+            "equity_fraction_mult": 0.5,
+            "pullback_long_enabled": False,
+        },
+        # Restored posture reference values (only the tightening direction
+        # vs the operator base ever binds).
+        "trend": {
+            "max_concurrent": 4,
+            "allow_shorts": True,
+            "equity_fraction_mult": 1.0,
+        },
+        # --- shadow/transition verdict log (JSONL); empty = container default
+        # path (~/.hermes-trading/regime_overlay_shadow.jsonl); env override
+        # HERMES_REGIME_OVERLAY_SHADOW_FILE ---
         "shadow_log_path": "",
     },
     # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard gate.
@@ -1229,6 +1477,25 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
 
 # Legacy alias — code that imports DEFAULT_CONFIG gets the full canonical set.
 DEFAULT_CONFIG: dict[str, Any] = CANONICAL_DEFAULTS
+
+# Audit 2026-09-06 (F4, engineering hygiene): single source of truth for
+# .agent-config.json keys that are read ONCE at process start and need a loop
+# restart to take effect. This set is intentionally EMPTY today: every
+# agent-config key is hot-reloaded — `mode` is re-read per cycle, `enable_crypto`
+# is re-read per perception scan (perception.py asset-class toggle block), and
+# flipping `enable_hip3` is detected per cycle and triggers an immediate
+# universe rebuild (trading_loop.py hot-toggle block). CLI / MCP hint surfaces
+# MUST import this instead of hardcoding "restart required" key lists, so the
+# hints can never drift ahead of the actual hot-reload behaviour again.
+#
+# Process-lifetime settings that are NOT agent-config keys live in environment
+# variables instead and are documented here so the hint text stays accurate:
+#   * HERMES_OPERATOR_TOKEN      — read per HTTP request (rotating it needs no
+#                                  restart; see dashboard.py request-time check)
+#   * HERMES_MCP_ALLOW_WRITE     — read once at MCP server process start
+#   * HYPERLIQUID_PRIVATE_KEY    — read once at loop / executor process start
+#   * HERMES_SKIP_STARTUP_SAFETY — read once at loop startup
+STARTUP_ONLY_KEYS: frozenset[str] = frozenset()
 
 
 # ---------------------------------------------------------------------------

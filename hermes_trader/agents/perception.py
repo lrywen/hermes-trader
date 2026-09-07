@@ -15,7 +15,8 @@ import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from contextlib import contextmanager
+from typing import Any, Callable, Iterator, Optional
 
 from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
 from hermes_trader.agents.config_store import cfg_get
@@ -181,16 +182,14 @@ def _age_decay_shadow_path(blk: dict[str, Any]) -> str:
 
 
 def _age_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append an age-decay shadow record to the JSONL."""
-    import json
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning("[age-decay] shadow write failed: %s", e)
+    """Best-effort append an age-decay shadow record to the JSONL.
+
+    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    (size-based rotation + write-failure metric).
+    """
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="signal_age_decay")
 
 
 def _age_decay_metric(mode: str, outcome: str) -> None:
@@ -852,6 +851,73 @@ def scan_budget_params(*, config: Optional[dict[str, Any]] = None) -> dict[str, 
     return p
 
 
+# Audit 2026-09-06 (C8): eligibility used to fall back to the meta snapshot's
+# cached midPx/markPx whenever the live WS mid was missing. That snapshot can be
+# as old as the universe cache TTL; trading on a stale/zero/halted price is how
+# bad fills happen. We KEEP the fallback (forcing a live mid shrank the HIP-3
+# scan pool to ~3 names — see the note in scan_once) but only accept the cached
+# price when its snapshot age (_meta_age_s, stamped by get_universe) is within
+# this bound. Live mids are always accepted (they are this cycle's). 0 disables
+# the age check (accept any cached price — legacy behavior).
+_CACHED_PRICE_MAX_AGE_S = float(os.environ.get("HERMES_CACHED_PRICE_MAX_AGE_S", "600"))
+
+
+def _eligible_price(mids: dict[str, Any], m: dict[str, Any]) -> float:
+    """Return a usable price for market ``m`` or 0.0 if none.
+
+    Prefers this cycle's live WS mid; falls back to the universe meta snapshot's
+    midPx/markPx only when that snapshot is fresh enough (C8)."""
+    live = float(mids.get(m["coin"], 0) or 0)
+    if live > 0:
+        return live
+    cached = float(m.get("midPx") or m.get("markPx") or 0)
+    if cached <= 0:
+        return 0.0
+    age = m.get("_meta_age_s")
+    if age is None:
+        # No age stamp (pre-C8 cache): accept — the disk-cache TTL bounds staleness.
+        return cached
+    if _CACHED_PRICE_MAX_AGE_S > 0 and float(age) > _CACHED_PRICE_MAX_AGE_S:
+        return 0.0
+    return cached
+
+
+class ScanStageError(RuntimeError):
+    """A scan-pipeline failure tagged with the stage that raised it.
+
+    Audit 2026-09-06 (C13): the operator console's POST /api/agent/scan used
+    to return a bare 500 with ``detail="scan failed: {e}"`` — an unstructured
+    string with no indication of WHICH part of the sweep failed (universe
+    prefetch vs. mid fetch vs. per-market scan). The HTTP layer reads
+    ``stage`` from this exception (or from the ``scan_stage`` attribute set
+    on whatever exception type the underlying code raised) and returns it in
+    the error payload so the UI/alerts can see the failing stage.
+    """
+
+    def __init__(self, stage: str, message: str):
+        self.stage = stage
+        super().__init__(message)
+
+
+@contextmanager
+def _scan_stage(stage: str) -> Iterator[None]:
+    """Tag any exception raised inside the block with a scan ``stage`` label.
+
+    Re-raises the original exception unchanged (strategy/scan logic is
+    untouched); only an attribute is attached so the HTTP error handler can
+    report which sweep stage failed.
+    """
+    try:
+        yield
+    except Exception as _e:
+        if not getattr(_e, "scan_stage", None):
+            try:
+                _e.scan_stage = stage  # type: ignore[attr-defined]
+            except Exception:
+                raise ScanStageError(stage, str(_e)) from _e
+        raise
+
+
 def scan_once(
     universe: Optional[list[dict[str, Any]]] = None,
     min_score: float = 20,
@@ -940,7 +1006,10 @@ def scan_once(
         return []
 
     # ── Step 1: Fetch mids (HTTP POST, ~150ms; +~8 per-dex POSTs if HIP-3 on) ─
-    raw_mids = fetch_all_mids(include_hip3=include_hip3)
+    # Audit 2026-09-06 (C13): stage-tagged so an HTTP failure surfaces as
+    # stage="prefetch.mids" in the /api/agent/scan error payload.
+    with _scan_stage("prefetch.mids"):
+        raw_mids = fetch_all_mids(include_hip3=include_hip3)
     mids: dict[str, float] = {}
     # 注意：循环变量不能用 `coin`，否则会遮蔽函数参数 `coin`（单币扫描目标），
     # Python 循环变量在循环结束后仍保留，导致下方 `if coin:` 恒为真。
@@ -961,7 +1030,10 @@ def scan_once(
     # Fetching all 500+ markets would need 10,000+ weight → instant 429.
     # Pre-filter to top-N markets by 24h notional volume to stay under limit.
     if universe is None:
-        universe = get_universe(include_hip3=include_hip3)
+        # Audit 2026-09-06 (C13): stage-tagged (stage="universe") — same
+        # rationale as the mids prefetch above.
+        with _scan_stage("universe"):
+            universe = get_universe(include_hip3=include_hip3)
 
     # Filter: must have valid mid, exclude spot (@ or type=spot), then apply
     # asset-class gates + budget split.
@@ -970,10 +1042,12 @@ def scan_once(
     # it silently shrank the HIP-3 scan pool to ~3 names against a 25-slot
     # budget (xyz:QNT +9.0% / xyz:NBIS +8.2% / xyz:PURRDAT +10.3% / xyz:ARM
     # +9.3% all absent from perceptions on 2026-06-12 while only CBRS/SKHX/SMSN
-    # scanned). _abs_pct_24h already uses this exact fallback for ranking.
+    # scanned). Audit 2026-09-06 (C8): the cached fallback is now age-gated via
+    # _eligible_price (a snapshot older than _CACHED_PRICE_MAX_AGE_S is rejected)
+    # so a halted/long-stale price can no longer qualify a market; live mids are
+    # always accepted. _abs_pct_24h already uses this exact fallback for ranking.
     eligible = [m for m in universe
-                if (mids.get(m["coin"], 0)
-                    or float(m.get("midPx") or m.get("markPx") or 0)) > 0
+                if _eligible_price(mids, m) > 0
                 and not m["coin"].startswith("@")
                 and m.get("type") != "spot"]
     if not include_crypto:
@@ -1007,10 +1081,8 @@ def scan_once(
             logger.warning(f"[scan] coin={target!r} not found in eligible universe "
                            f"({len(eligible)} markets)")
             return []
-        # Ensure a live (or cached) mid exists before scanning.
-        markets = [m for m in single
-                   if (mids.get(m["coin"], 0)
-                       or float(m.get("midPx") or m.get("markPx") or 0)) > 0]
+        # Ensure a live (or fresh-enough cached) mid exists before scanning.
+        markets = [m for m in single if _eligible_price(mids, m) > 0]
         logger.info(f"[scan] single-coin mode: {markets[0]['coin'] if markets else target}")
     if not coin:
         # Bucketed budget so HIP-3 markets and low-volume big-movers each get
@@ -1039,9 +1111,15 @@ def scan_once(
             # Current price MUST come from this cycle's fresh mids — the universe
             # dict's midPx is from the (up-to-24h-cached) metaAndAssetCtxs snapshot
             # and freezes at loop-start, so ranking off it selects YESTERDAY's
-            # movers and misses a coin ripping right now. Fall back to the cached
-            # mid/mark only if the live mid is missing.
-            cur = float(mids.get(m["coin"]) or m.get("midPx") or m.get("markPx") or 0)
+            # movers and misses a coin ripping right now.
+            # Audit 2026-09-07 (C8 tail-3): reuse the SAME age-gated pricing as
+            # _eligible_price — the raw cached mid/mark fallback above let a
+            # stale (>600s) snapshot win a movers slot off a frozen price.
+            # _eligible_price returns 0.0 when the only price available is a
+            # stale cache, so that coin simply drops out of the movers RANKING
+            # (it remains scan-eligible via the by-volume/sweep paths; the pool
+            # is not shrunk).
+            cur = _eligible_price(mids, m)
             if prev <= 0 or cur <= 0:
                 return 0.0
             return abs((cur - prev) / prev * 100)

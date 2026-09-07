@@ -87,6 +87,11 @@ _OI_HISTORY_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))),
     ".oi-history.json",
 )
+# Audit 2026-09-06 (C8): max age (seconds) of a prior OI snapshot used for the
+# surge comparison. Adjacent scans are ~8s apart; after a long downtime the OI
+# delta reflects the whole gap, not smart-money loading, so the comparison is
+# skipped (a fresh baseline is still saved). 0 disables the age gate.
+_OI_SNAPSHOT_MAX_AGE_S = float(os.environ.get("HERMES_OI_SNAPSHOT_MAX_AGE_S", "1800"))
 
 def smart_money_concentration(
     lookback_days: Optional[int] = None,
@@ -260,13 +265,33 @@ def oi_surge_accumulation(
     now = time.time()
     # load prior snapshot
     prev = {}
+    prev_ts = 0.0
     try:
         with open(_OI_HISTORY_FILE) as f:
             blob = json.load(f)
             prev = blob.get("oi", {})
-            prev_ts = blob.get("ts", 0)
+            prev_ts = float(blob.get("ts", 0) or 0)
     except (OSError, json.JSONDecodeError):
-        prev_ts = 0  # noqa: F841  (P1-2 baseline: legacy unused; trading logic untouched)
+        prev_ts = 0.0
+    # Audit 2026-09-06 (C8, F5): the OI-surge signal compares current OI vs the
+    # LAST snapshot, so it is only meaningful over adjacent scans (~8s apart).
+    # After a downtime/restart the prior snapshot can be hours/days old, and an
+    # OI "growth" computed across that gap is not smart-money loading — it is
+    # just the accumulated drift since the loop died. Skip the comparison when
+    # the snapshot is too old (the current snapshot is still persisted below, so
+    # the next scan compares against a fresh baseline). 0/absent disables.
+    prev_age_s = now - prev_ts if prev_ts > 0 else None
+    prev_stale = (
+        prev_age_s is not None
+        and _OI_SNAPSHOT_MAX_AGE_S > 0
+        and prev_age_s > _OI_SNAPSHOT_MAX_AGE_S
+    )
+    if prev_stale:
+        logger.info(
+            "[whale] prior OI snapshot age %.0fs > max %.0fs — skipping OI-growth "
+            "comparison this scan (fresh baseline will be saved)",
+            prev_age_s, _OI_SNAPSHOT_MAX_AGE_S,
+        )
 
     cur = {}
     results = []
@@ -283,7 +308,7 @@ def oi_surge_accumulation(
         oi_usd = oi_coins * mid
         cur[coin] = {"oi_coins": oi_coins, "oi": oi_usd, "px": mid}
         p = prev.get(coin)
-        if oi_usd < min_oi_usd or not p:
+        if oi_usd < min_oi_usd or not p or prev_stale:
             continue
         # back-compat: older snapshots only stored "oi" (was raw coins pre-fix);
         # prefer oi_coins, fall back to oi.

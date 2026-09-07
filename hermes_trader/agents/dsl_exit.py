@@ -32,6 +32,7 @@ import json
 import logging
 import math
 import os
+import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Iterable, Optional
@@ -115,6 +116,7 @@ def _record_exit(reason: str) -> None:
         from hermes_trader.metrics import DSL_EXITS
         known = {
             "max_loss", "floor_breach", "hard_timeout", "stale_flat_timeout",
+            "time_scratch",  # Audit 2026-09-06 (E3, P2)
         }
         label = "other"
         if reason:
@@ -369,6 +371,18 @@ def backfill_brackets_from_exchange(user: Optional[str]) -> int:
                 tracker.sl_px = tpx
                 if sz:
                     tracker.sl_size = sz
+                # Audit 2026-09-06 (E5, P2): seed a CONSERVATIVE trailing floor
+                # from the resting bracket SL for synth trackers that have none
+                # (state wiped / restarted). Without this, _monotonic_clamp
+                # treats prev_floor=None as unconstrained and the ratchet can
+                # snap back to its loosest value (the "ratchet reset to zero"
+                # defect). The exchange bracket SL is the exchange-enforced
+                # stop, so using its trigger as the initial floor can never
+                # widen risk beyond what the bracket already guarantees, and
+                # is always on the correct side (long: sl < entry, short:
+                # sl > entry, established by is_sl_side above).
+                if tracker._last_floor is None:
+                    tracker._last_floor = tpx
                 updated += 1
             elif not is_sl_side and tracker.tp_oid is None:
                 tracker.tp_oid = oid
@@ -523,6 +537,20 @@ class ExitPolicy:
     # validation gate as the noise band above.
     smooth_transition_enabled: bool = False
     smooth_band_pct: float = 1.0  # peak-profit % over which the floor ramps hard→trail
+
+    # Audit 2026-09-06 (E3, P2): time-based scratch exit. A chop-market leak:
+    # a position that never arms phase-2 (peak never reached protect_pct) but
+    # printed a small favorable pulse can sit until hard_timeout while that
+    # pulse fades back to flat. When enabled, check() exits once the position
+    # has aged past `time_scratch_minutes`, is still green (never masks a
+    # loss), had peaked at least `time_scratch_min_peak_pct`, remains below
+    # the protect arm threshold (phase-2 trail keeps sovereignty once armed),
+    # and has given back `time_scratch_giveback_pct` from its peak. DEFAULT
+    # OFF (inert); opt in via dsl_exit.time_scratch config block.
+    time_scratch_enabled: bool = False
+    time_scratch_minutes: float = 60.0
+    time_scratch_min_peak_pct: float = 0.3
+    time_scratch_giveback_pct: float = 0.3
 
 
 class DSLTracker:
@@ -785,6 +813,30 @@ class DSLTracker:
                     exit=True,
                     reason=(f"stale_flat_timeout ({elapsed_min:.0f}min below protect; "
                             f"peak {peak_profit:.2f}% < {pol.protect_pct}%)"),
+                    floor_price=None, peak_price=self.peak_px, phase="timeout",
+                    unrealized_pct=upct,
+                )
+
+        # ── Time-based scratch exit (E3, P2) ──────────────────────────
+        # Prunes a chop position that never armed phase-2 but printed a small
+        # favorable pulse now fading back to flat. Profit-only path: never
+        # masks a loss (upct must be > 0), the pulse must have reached
+        # time_scratch_min_peak_pct, the giveback from peak must be material,
+        # and phase-2 must be un-armed (once peak >= protect the trailing
+        # floor owns the exit). DEFAULT OFF (inert).
+        if (pol.time_scratch_enabled
+                and elapsed_min >= pol.time_scratch_minutes):
+            peak_profit = self._peak_profit_pct()
+            if (peak_profit < pol.protect_pct
+                    and peak_profit >= pol.time_scratch_min_peak_pct
+                    and upct > 0
+                    and (peak_profit - upct) >= pol.time_scratch_giveback_pct):
+                _record_exit("time_scratch")
+                _request_save(force=True)
+                return self._verdict(
+                    exit=True,
+                    reason=(f"time_scratch ({elapsed_min:.0f}min; peak {peak_profit:.2f}% "
+                            f"gave back to {upct:.2f}%)"),
                     floor_price=None, peak_price=self.peak_px, phase="timeout",
                     unrealized_pct=upct,
                 )
@@ -1202,12 +1254,29 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
         breakeven_trigger_pct=pol_raw.get("breakeven_trigger_pct", ExitPolicy.breakeven_trigger_pct),
         breakeven_lock_pct=pol_raw.get("breakeven_lock_pct", ExitPolicy.breakeven_lock_pct),
         atr_stop_enabled=pol_raw.get("atr_stop_enabled", ExitPolicy.atr_stop_enabled),
-        stale_flat_timeout_minutes=pol_raw.get("stale_flat_timeout_minutes", 0.0),
+        # Audit 2026-09-06 (E5, P2): a persisted policy missing
+        # stale_flat_timeout_minutes must hydrate to the canonical ExitPolicy
+        # default (480), not 0 which silently DISABLES the stale-flat guard
+        # after a restart. `or 0.0` still honours an explicit 0 (disabled).
+        stale_flat_timeout_minutes=float(
+            pol_raw.get("stale_flat_timeout_minutes", ExitPolicy.stale_flat_timeout_minutes)
+            or 0.0),
         atr_stop_mult=pol_raw.get("atr_stop_mult", ExitPolicy.atr_stop_mult),
         atr_stop_floor_pct=pol_raw.get("atr_stop_floor_pct", ExitPolicy.atr_stop_floor_pct),
         atr_stop_ceiling_pct=pol_raw.get("atr_stop_ceiling_pct", ExitPolicy.atr_stop_ceiling_pct),
         noise_band_enabled=pol_raw.get("noise_band_enabled", ExitPolicy.noise_band_enabled),
         noise_band_atr_mult=pol_raw.get("noise_band_atr_mult", ExitPolicy.noise_band_atr_mult),
+        # Audit 2026-09-06 (E4, P2): preserve the smooth-transition knob across
+        # rehydrate (previously dropped → an enabled ramp silently reset to OFF
+        # after a restart). Absent in old state files → inert default.
+        smooth_transition_enabled=pol_raw.get("smooth_transition_enabled", ExitPolicy.smooth_transition_enabled),
+        smooth_band_pct=pol_raw.get("smooth_band_pct", ExitPolicy.smooth_band_pct),
+        # Audit 2026-09-06 (E3, P2): preserve the time-scratch knob across
+        # rehydrate; absent in old state files → inert default.
+        time_scratch_enabled=pol_raw.get("time_scratch_enabled", ExitPolicy.time_scratch_enabled),
+        time_scratch_minutes=pol_raw.get("time_scratch_minutes", ExitPolicy.time_scratch_minutes),
+        time_scratch_min_peak_pct=pol_raw.get("time_scratch_min_peak_pct", ExitPolicy.time_scratch_min_peak_pct),
+        time_scratch_giveback_pct=pol_raw.get("time_scratch_giveback_pct", ExitPolicy.time_scratch_giveback_pct),
     )
     t = DSLTracker(d["coin"], d["side"], float(d["entry_px"]),
                    float(d.get("entry_time") or time.time()), policy,
@@ -1216,8 +1285,23 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
                    entry_regime=str(d.get("entry_regime") or ""))
     t.peak_px = float(d.get("peak_px", d["entry_px"]))
     t.consecutive_breaches = int(d.get("consecutive_breaches", 0))
+    # Audit 2026-09-06 (E5, P2): validate a persisted last_floor before
+    # trusting it as the ratchet anchor. The floor is always a positive PRICE
+    # (long: a stop below entry that ratchets up; short: a stop above entry
+    # that ratchets down). A 0/negative/non-finite value is corrupt or hand-
+    # edited and means "no stop at all" — the loosest, most dangerous state
+    # (the ratchet would never fire a floor-breach exit). Drop it to None so
+    # the floor re-seeds conservatively from the bracket SL / next check().
     lf = d.get("last_floor")
-    t._last_floor = float(lf) if lf is not None else None
+    if lf is not None:
+        try:
+            lf = float(lf)
+        except (TypeError, ValueError):
+            lf = None
+        else:
+            if not math.isfinite(lf) or lf <= 0.0:
+                lf = None
+    t._last_floor = lf
     # v2 fields (absent in v1 state files -> None, backfilled on next rehydrate).
     t.sl_oid = _opt_int(d.get("sl_oid"))
     t.sl_px = _opt_float(d.get("sl_px"))
@@ -1267,6 +1351,101 @@ _SAVE_BACKOFF_BASE_SEC = float(
 _SAVE_BACKOFF_FACTOR = int(cfg_get("dsl_state_io.save_backoff_factor", 3, config={}))
 
 
+# Audit 2026-09-06 (E5, P2): state-file resilience. A corrupt .dsl-state.json
+# used to be swallowed with a warning and the registry silently reset to empty
+# on restart (ratchet floors lost → stop loss could ratchet to zero). A
+# single-generation .bak (the last-known-good live file) plus quarantine of
+# the corrupt byte-for-byte copy now gives a deterministic recovery path.
+# Everything in this block is best-effort: quarantine/alert/metric failures
+# must never break the load/save hot path. The .bak path is derived from the
+# live DSL_STATE_FILE at call time (not cached) so test monkeypatching of
+# DSL_STATE_FILE redirects the backup alongside it.
+
+
+def _quarantine_corrupt_state(path: str) -> None:
+    """Move a corrupt state file aside to ``<path>.corrupt-<ms>``. Best-effort.
+
+    Audit 2026-09-06 (E5, P2). Also bumps the corrupt-isolation counter and
+    pushes a risk-category Feishu card; all three effects are individually
+    guarded so a notify/metrics hiccup cannot break the load path.
+    """
+    try:
+        quar = f"{path}.corrupt-{int(time.time() * 1000)}"
+        shutil.move(path, quar)
+        logger.error(f"[dsl] corrupt state file quarantined: {path} -> {quar}")
+    except OSError as qe:
+        logger.error(f"[dsl] failed to quarantine corrupt state file {path}: {qe}")
+        quar = None
+    try:
+        from hermes_trader.metrics import DSL_STATE_CORRUPT_ISOLATIONS
+
+        DSL_STATE_CORRUPT_ISOLATIONS.inc()
+    except Exception:
+        pass
+    try:
+        from hermes_trader import notify
+
+        notify.send_card(
+            "DSL 状态文件损坏已隔离",
+            fields={
+                "文件": path,
+                "隔离副本": str(quar),
+                "后续动作": "已尝试回退 .bak；若无 .bak 则以空注册表启动",
+            },
+            category="risk",
+            level="danger",
+            dedup_key="dsl-state-corrupt",
+        )
+    except Exception:
+        pass
+
+
+def _read_state_candidate(path: str) -> Optional[dict[str, Any]]:
+    """Read+json.load one state-file candidate; quarantine and return None on
+    failure (FileNotFoundError → None silently). Best-effort, never raises.
+
+    Audit 2026-09-06 (E5, P2).
+    """
+    try:
+        with open(path) as f:
+            payload = json.load(f)
+        if not isinstance(payload, dict):
+            raise ValueError("top-level JSON is not an object")
+        return payload
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.error(f"[dsl] state candidate unreadable ({path}): {e}")
+        _quarantine_corrupt_state(path)
+        return None
+
+
+def _rotate_state_bak_pre() -> None:
+    """Before overwriting the live file, copy it to .bak (previous generation).
+
+    Audit 2026-09-06 (E5, P2). Best-effort, never raises. Called under the
+    LOCK_EX so no writer can replace the live file mid-copy.
+    """
+    try:
+        if os.path.exists(DSL_STATE_FILE):
+            shutil.copy2(DSL_STATE_FILE, DSL_STATE_FILE + ".bak")
+    except OSError as e:
+        logger.warning(f"[dsl] pre-write .bak rotation failed: {e}")
+
+
+def _seed_state_bak_post() -> None:
+    """After the first successful write, seed .bak from the fresh live file if
+    no .bak exists yet (first-ever save has no predecessor to rotate).
+
+    Audit 2026-09-06 (E5, P2). Best-effort, never raises.
+    """
+    try:
+        if not os.path.exists(DSL_STATE_FILE + ".bak") and os.path.exists(DSL_STATE_FILE):
+            shutil.copy2(DSL_STATE_FILE, DSL_STATE_FILE + ".bak")
+    except OSError as e:
+        logger.warning(f"[dsl] post-write .bak seed failed: {e}")
+
+
 def _save_state() -> None:
     """Atomically write the tracker registry to disk. Best-effort — never raises.
 
@@ -1292,6 +1471,10 @@ def _save_state() -> None:
         # would let another process interleave a stale write.
         lock_fd = os.open(DSL_STATE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        # Audit 2026-09-06 (E5, P2): rotate the current live file to .bak
+        # before it is replaced, so a corrupt later write never destroys the
+        # last-known-good copy. Held under LOCK_EX.
+        _rotate_state_bak_pre()
         for attempt in range(_SAVE_MAX_ATTEMPTS):
             try:
                 # atomic_io gives the durability contract the bare
@@ -1302,6 +1485,10 @@ def _save_state() -> None:
                     DSL_STATE_FILE, payload, indent=None, fsync=True
                 )
                 last_err = None
+                # Audit 2026-09-06 (E5, P2): first-ever save has no
+                # predecessor to rotate — seed .bak from the fresh live file
+                # so the very first save already leaves a recovery copy.
+                _seed_state_bak_post()
                 break
             except OSError as e:
                 last_err = e
@@ -1408,18 +1595,31 @@ def load_state(force: bool = False) -> None:
             return
     _loaded_from_disk = True
     lock_fd = None
+    payload = None
     try:
         # Shared lock pairs with the exclusive lock in _save_state so a
         # force-reload never observes a torn write.
         lock_fd = os.open(DSL_STATE_LOCK_FILE, os.O_CREAT | os.O_RDWR, 0o644)
         fcntl.flock(lock_fd, fcntl.LOCK_SH)
-        with open(DSL_STATE_FILE) as f:
-            payload = json.load(f)
-    except FileNotFoundError:
-        return
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning(f"[dsl] state file unreadable, ignoring: {e}")
-        return
+        # Audit 2026-09-06 (E5, P2): recovery chain live -> .bak. A corrupt
+        # live file is quarantined (moved aside, alerted, counted) inside
+        # _read_state_candidate and the single-generation .bak is tried in the
+        # SAME load call — _loaded_from_disk is already latched True, so this
+        # is the only point a fallback read can happen in this process.
+        for candidate in (DSL_STATE_FILE, DSL_STATE_FILE + ".bak"):
+            raw = _read_state_candidate(candidate)
+            if raw is None:
+                continue
+            try:
+                payload = _migrate_payload(raw)
+                break
+            except (ValueError, TypeError) as e:
+                logger.warning(
+                    f"[dsl] state migration failed for {candidate}: {e}"
+                )
+                _quarantine_corrupt_state(candidate)
+                payload = None
+                continue
     finally:
         if lock_fd is not None:
             try:
@@ -1427,10 +1627,13 @@ def load_state(force: bool = False) -> None:
                 os.close(lock_fd)
             except OSError:
                 pass
-    try:
-        payload = _migrate_payload(payload)
-    except (ValueError, TypeError) as e:
-        logger.warning(f"[dsl] state migration failed, ignoring file: {e}")
+    if payload is None:
+        # Neither live nor .bak was readable/migratable (or neither exists).
+        # Corrupt copies were already quarantined and alerted above; start
+        # from an empty registry instead of crashing the trading loop or
+        # running on stale in-memory trackers whose disk state is gone.
+        _active_positions.clear()
+        _refresh_positions_gauge()
         return
     # Record the successful reload time only AFTER reading the file so a
     # missing/empty file doesn't block the next attempt for a full TTL.
@@ -1618,6 +1821,11 @@ def _build_policy_from_config() -> ExitPolicy:
         tiers = [RetraceTier(**t) for t in tiers_raw] if tiers_raw else None
         atr_cfg = dsl.get("atr_stop", {}) or {}
         noise_cfg = dsl.get("noise_band", {}) or {}
+        # Audit 2026-09-06 (E4, P2): wire the smooth-transition knob (was a
+        # dead field — no construction path fed it). Default OFF (inert).
+        smooth_cfg = dsl.get("smooth_transition", {}) or {}
+        # Audit 2026-09-06 (E3, P2): time-based scratch exit. Default OFF.
+        scratch_cfg = dsl.get("time_scratch", {}) or {}
         return ExitPolicy(
             max_loss_pct=dsl.get("max_loss_pct", ExitPolicy.max_loss_pct),
             max_loss_roe_pct=dsl.get("max_loss_roe_pct", ExitPolicy.max_loss_roe_pct),
@@ -1638,6 +1846,14 @@ def _build_policy_from_config() -> ExitPolicy:
             hard_stop_confirm_sec=float(dsl.get("hard_stop_confirm_sec", 1.0) or 0.0),
             noise_band_enabled=bool(noise_cfg.get("enabled", False)),
             noise_band_atr_mult=float(noise_cfg.get("atr_mult", ExitPolicy.noise_band_atr_mult)),
+            # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 ramp (default OFF).
+            smooth_transition_enabled=bool(smooth_cfg.get("enabled", False)),
+            smooth_band_pct=float(smooth_cfg.get("band_pct", ExitPolicy.smooth_band_pct)),
+            # Audit 2026-09-06 (E3, P2): time scratch exit (default OFF).
+            time_scratch_enabled=bool(scratch_cfg.get("enabled", False)),
+            time_scratch_minutes=float(scratch_cfg.get("minutes", ExitPolicy.time_scratch_minutes)),
+            time_scratch_min_peak_pct=float(scratch_cfg.get("min_peak_pct", ExitPolicy.time_scratch_min_peak_pct)),
+            time_scratch_giveback_pct=float(scratch_cfg.get("giveback_pct", ExitPolicy.time_scratch_giveback_pct)),
             phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,
         )
     except Exception:
@@ -1662,17 +1878,22 @@ def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
     try:
         import dataclasses
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.executor import select_exit_params
+        from hermes_trader.agents.executor import select_exit_params, resolve_regime_clocks
         dsl = read_agent_config().get("dsl_exit", {}) or {}
         _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
             select_exit_params(dsl, regime or "neutral")
         _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        # Audit 2026-09-06 (E3, P2): regime-split lifetime clocks. Returns the
+        # global clock when regime_aware.clocks is disabled (default → inert).
+        _clocks = resolve_regime_clocks(dsl, regime or "neutral")
         return dataclasses.replace(
             base,
             max_loss_pct=float(_ml_pct),
             max_loss_roe_pct=float(_ml_roe),
             protect_pct=float(_prot),
             retrace_threshold=float(_retrace),
+            hard_timeout_minutes=float(_clocks["hard_timeout_minutes"]),
+            stale_flat_timeout_minutes=float(_clocks["stale_flat_timeout_minutes"]),
             phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
         )
     except Exception as e:
@@ -1760,19 +1981,26 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
                 user, coin, side, entry_px=entry, size=abs(szi)
             ) if user else None
             if _entry_time is None:
-                # Resolution failed (API timeout/rate-limit) OR no user was
-                # supplied. Falling back to now() is safe for genuinely new
-                # positions but would RESET the timeout clock for an old
-                # position being re-synthesized after a state wipe. Log loudly
-                # so an operator can verify the position isn't being held past
-                # its hard_timeout; do NOT silently pretend we know the age.
+                # Audit 2026-09-06 (E5, P2): resolution failed (API
+                # timeout/rate-limit) OR no user was supplied. Falling back to
+                # now() would RESET the hard_timeout clock for an old zombie
+                # position being re-synthesized after a state wipe (it could
+                # then sit for another full hard_timeout window past its real
+                # age). Fail-closed instead: age the synth tracker as if it
+                # had ALREADY reached the hard_timeout window (plus a small
+                # margin), so check() treats it as an exit candidate on the
+                # next tick rather than granting fresh time. The conservative
+                # exit is the safe direction for a position of unknown age.
+                _conservative_age_sec = synth_policy.hard_timeout_minutes * 60.0 + 60.0
+                _entry_time = time.time() - _conservative_age_sec
                 if user:
                     logger.error(
                         f"[dsl] fill-time resolution FAILED for {key} @ {entry}; "
-                        f"synthesizing with entry_time=now. hard_timeout clock is "
-                        f"reset — verify this position is not stale."
+                        f"synthesizing with a CONSERVATIVE entry time "
+                        f"(~{synth_policy.hard_timeout_minutes:.0f} min in the "
+                        f"past) so the hard_timeout clock is NOT reset — position "
+                        f"is treated as stale/exit-eligible pending verification."
                     )
-                _entry_time = time.time()
             _active_positions[key] = DSLTracker(
                 coin, side, entry, _entry_time, synth_policy,
                 leverage=lev, entry_regime=synth_regime if policy is None else "")

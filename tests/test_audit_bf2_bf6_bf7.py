@@ -548,3 +548,107 @@ def test_bf_wiring_canonical_defaults_are_sane():
                          config={"circuit_breaker": {}})) == 5.0
     assert float(cfg_get("circuit_breaker.max_drawdown_pct",
                          config={"circuit_breaker": {}})) == 15.0
+
+
+# ── Audit 2026-09-07 (C1): blind-gate Feishu alerting ────────────────────
+# The five memory-backed breakers keep their fail-open posture (pass=True on
+# a memory read failure), but a blind gate must now be VISIBLE: each read
+# failure pushes a Feishu card (category "risk", throttled per gate via
+# dedup_key). The alert path must never raise or block the hot path.
+
+def _patch_notify(monkeypatch):
+    """Replace notify.send_card with a recording stub (the helper does
+    `from hermes_trader import notify; notify.send_card(...)`, so patching the
+    module attribute is seen by the lazy import)."""
+    from hermes_trader import notify
+    calls = []
+
+    def _fake_send_card(title, fields=None, **kwargs):
+        calls.append({"title": title, "fields": fields or {}, **kwargs})
+        return True
+
+    monkeypatch.setattr(notify, "send_card", _fake_send_card)
+    return calls
+
+
+def test_c1_blind_gates_alert_but_still_pass(monkeypatch, tmp_path):
+    """All five memory-backed breakers: a memory read failure fires the
+    Feishu blind-gate card (risk/danger, per-gate dedup_key) yet the gate
+    still returns pass=True (fail-open posture unchanged)."""
+    from hermes_trader.agents import memory as memory_mod
+    from hermes_trader.agents import risk_gates
+    _isolated_memory(monkeypatch, tmp_path)
+    calls = _patch_notify(monkeypatch)
+
+    # (gate callable, kwargs, memory method to blow up, expected gate label)
+    cases = [
+        (risk_gates.coin_circuit_breaker_gate, {},
+         "coin_circuit_remaining_min", "coin_circuit"),
+        (risk_gates.global_halt_gate, {},
+         "global_halt_remaining_min", "global_halt"),
+    ]
+    for gate_fn, gate_kwargs, mem_method, label in cases:
+        monkeypatch.setattr(memory_mod.memory, mem_method, _boom)
+        r = gate_fn(_ctx(coin="ETH"), **gate_kwargs)
+        assert r["pass"] is True, f"{label} must fail open"
+
+    # Gates with threshold args:
+    monkeypatch.setattr(memory_mod.memory, "consecutive_losses", _boom)
+    assert risk_gates.consecutive_loss_gate(_ctx(coin="ETH"), limit=3)["pass"] is True
+    monkeypatch.setattr(memory_mod.memory, "get_start_of_day_equity", _boom)
+    assert risk_gates.per_coin_daily_loss_gate(
+        _ctx(coin="ETH"), max_loss_pct=3.0)["pass"] is True
+    monkeypatch.setattr(memory_mod.memory, "peak_equity", _boom)
+    assert risk_gates.drawdown_gate(
+        _ctx(coin="ETH", equity=800.0), max_drawdown_pct=15.0)["pass"] is True
+
+    # Exactly one card per gate, all risk/danger with per-gate throttle key.
+    labels = [c["fields"].get("熔断门") for c in calls]
+    assert labels == ["coin_circuit", "global_halt", "consecutive_loss",
+                      "per_coin_daily_loss", "drawdown"]
+    for c in calls:
+        assert c["category"] == "risk"
+        assert c["level"] == "danger"
+        assert c["dedup_key"].startswith("mem_gate_blind:")
+
+
+def test_c1_alert_path_never_blocks_gate(monkeypatch, tmp_path):
+    """If the Feishu call itself raises (or notify import breaks), the gate
+    must still fail open silently — alerting is best-effort, never a blocker."""
+    from hermes_trader.agents import memory as memory_mod
+    from hermes_trader.agents import risk_gates
+    from hermes_trader import notify
+    _isolated_memory(monkeypatch, tmp_path)
+
+    def _exploding_send_card(*_a, **_k):
+        raise RuntimeError("feishu webhook down")
+
+    monkeypatch.setattr(notify, "send_card", _exploding_send_card)
+    monkeypatch.setattr(memory_mod.memory, "consecutive_losses", _boom)
+    # Must not propagate: gate still returns pass=True.
+    assert risk_gates.consecutive_loss_gate(_ctx(coin="ETH"), limit=3)["pass"] is True
+
+    # And if the notify module import itself blows up, same outcome.
+    import builtins
+    real_import = builtins.__import__
+
+    def _boom_import(name, *a, **k):
+        if name == "hermes_trader.notify" or name == "hermes_trader":
+            raise ImportError("simulated import failure")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", _boom_import)
+    assert risk_gates.consecutive_loss_gate(_ctx(coin="ETH"), limit=3)["pass"] is True
+
+
+def test_c1_normal_gate_block_does_not_alert(monkeypatch, tmp_path):
+    """A gate that blocks for a REAL reason (streak at limit) must NOT send a
+    blind-gate card — the alert is only for read failures, not normal trips."""
+    from hermes_trader.agents import risk_gates
+    m, _ = _isolated_memory(monkeypatch, tmp_path)
+    calls = _patch_notify(monkeypatch)
+    for _ in range(3):
+        m.record_loss_outcome("ETH", -1.0)
+    r = risk_gates.consecutive_loss_gate(_ctx(coin="ETH"), limit=3)
+    assert r["pass"] is False
+    assert calls == []

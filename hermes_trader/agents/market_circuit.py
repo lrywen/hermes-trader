@@ -206,16 +206,14 @@ def shadow_log_path(cfg: dict[str, Any]) -> str:
 
 
 def _record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append a market-circuit shadow verdict to the JSONL."""
-    import json
-    try:
-        parent = os.path.dirname(path)
-        if parent:
-            os.makedirs(parent, exist_ok=True)
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    except OSError as e:
-        logger.warning("[market_circuit] shadow write failed: %s", e)
+    """Best-effort append a market-circuit shadow verdict to the JSONL.
+
+    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
+    (size-based rotation + write-failure metric).
+    """
+    from hermes_trader.shadow_log import append_jsonl
+
+    append_jsonl(path, rec, stream="market_circuit")
 
 
 # ──────────────────────────────────────────────────────────────────────────

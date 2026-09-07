@@ -78,6 +78,7 @@ def test_r12_c1_pullback_long_block_registered():
         "max_extension_atr": 2.0,
         "min_slow_burn": 1,
         "shadow_mode": False,
+        "require_macro_uptrend": True,
     }
 
 
@@ -113,6 +114,7 @@ def test_r12_c1_aligned_min_conf_registered_enabled():
     ("runner_entry_gate.pullback_long.max_extension_atr", 2.0),
     ("runner_entry_gate.pullback_long.min_slow_burn", 1),
     ("runner_entry_gate.pullback_long.shadow_mode", False),
+    ("runner_entry_gate.pullback_long.require_macro_uptrend", True),
     ("debate_gate.analyst3_default", False),
 ])
 def test_r12_c1_cfg_get_resolves_canonical_default(dotted_key, expected):

@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import threading
 import time
 from collections import deque
@@ -21,6 +22,96 @@ from typing import Any, Deque, Optional
 from hermes_trader.agents import atomic_io
 
 logger = logging.getLogger(__name__)
+
+
+# Audit 2026-09-06 (E5, P2): state-file resilience for .agent-memory.json.
+# A corrupt cache used to be logged and silently replaced by an empty memory
+# (events.jsonl replay still backfills trades, but intraday fields/PnL trail
+# were lost). The corrupt file is now quarantined (.corrupt-<ts>), a risk
+# card + metric fired, and a single-generation .bak (last-known-good) tried
+# first. Best-effort throughout: failures here must never break the hot path.
+def _quarantine_corrupt_memory(path: str) -> None:
+    """Move a corrupt memory file aside to ``<path>.corrupt-<ms>``. Best-effort.
+
+    Audit 2026-09-06 (E5, P2). Also bumps MEMORY_CORRUPT_ISOLATIONS and sends
+    a risk-category Feishu card, each individually guarded.
+    """
+    quar = None
+    try:
+        quar = f"{path}.corrupt-{int(time.time() * 1000)}"
+        shutil.move(path, quar)
+        logger.error(f"[memory] corrupt file quarantined: {path} -> {quar}")
+    except OSError as qe:
+        logger.error(f"[memory] failed to quarantine corrupt file {path}: {qe}")
+    try:
+        from hermes_trader.metrics import MEMORY_CORRUPT_ISOLATIONS
+
+        MEMORY_CORRUPT_ISOLATIONS.inc()
+    except Exception:
+        pass
+    try:
+        from hermes_trader import notify
+
+        notify.send_card(
+            "Agent 记忆文件损坏已隔离",
+            fields={
+                "文件": path,
+                "隔离副本": str(quar),
+                "后续动作": "已尝试回退 .bak，并回放 events.jsonl 兜底重建",
+            },
+            category="risk",
+            level="danger",
+            dedup_key="agent-memory-corrupt",
+        )
+    except Exception:
+        pass
+
+
+def _read_memory_candidate(path: str) -> Optional[dict[str, Any]]:
+    """Read+json.load one memory-file candidate; quarantine + return None on
+    failure (FileNotFoundError → None silently). Best-effort, never raises.
+
+    Audit 2026-09-06 (E5, P2).
+    """
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("top-level JSON is not an object")
+        return data
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        logger.error(f"[memory] candidate unreadable ({path}): {e}")
+        _quarantine_corrupt_memory(path)
+        return None
+
+
+def _rotate_memory_bak_pre() -> None:
+    """Copy the live memory file to .bak before it is overwritten. Best-effort.
+
+    Audit 2026-09-06 (E5, P2). The caller already holds the cross-process
+    flock via atomic_io.locked_write_json_atomic's lock convention; the copy
+    is done before that helper replaces the live file.
+    """
+    try:
+        if os.path.exists(MEMORY_FILE):
+            shutil.copy2(MEMORY_FILE, MEMORY_FILE + ".bak")
+    except OSError as e:
+        logger.warning(f"[memory] pre-write .bak rotation failed: {e}")
+
+
+def _seed_memory_bak_post() -> None:
+    """Seed .bak from the freshly written live file if no .bak exists yet
+    (first-ever flush has no predecessor). Best-effort, never raises.
+
+    Audit 2026-09-06 (E5, P2).
+    """
+    try:
+        if not os.path.exists(MEMORY_FILE + ".bak") and os.path.exists(MEMORY_FILE):
+            shutil.copy2(MEMORY_FILE, MEMORY_FILE + ".bak")
+    except OSError as e:
+        logger.warning(f"[memory] post-write .bak seed failed: {e}")
 
 # P1-6: flush() is invoked on every record_trade/record_close/cooldown/circuit
 # mutation — dozens of times per scan cycle, each doing a full json.dump +
@@ -394,8 +485,16 @@ class AgentMemory:
             rebuilt = False
             limits = _memory_limits()  # P2-3: config-driven retention caps
             try:
-                with open(MEMORY_FILE, "r") as f:
-                    data = json.load(f)
+                # Audit 2026-09-06 (E5, P2): recovery chain live -> .bak.
+                # A corrupt cache is quarantined/alerted/counted inside
+                # _read_memory_candidate; the last-known-good .bak is then
+                # tried. events.jsonl replay below remains the authoritative
+                # backfill regardless of which candidate hydrated.
+                data = _read_memory_candidate(MEMORY_FILE)
+                if data is None:
+                    data = _read_memory_candidate(MEMORY_FILE + ".bak")
+                if data is None:
+                    raise FileNotFoundError(MEMORY_FILE)
 
                 # P0-2a: isinstance guards — a single top-level field of the
                 # wrong type (corrupt/hand-edited file) must not abort the whole
@@ -622,7 +721,13 @@ class AgentMemory:
         # agents.atomic_io.locked_write_json_atomic; MEMORY_LOCK_FILE is
         # MEMORY_FILE + ".lock", matching the helper's lock convention.
         try:
+            # Audit 2026-09-06 (E5, P2): preserve the current live file as the
+            # single-generation .bak before it is replaced (best-effort).
+            _rotate_memory_bak_pre()
             atomic_io.locked_write_json_atomic(MEMORY_FILE, data, indent=2, fsync=True)
+            # First-ever flush has no predecessor to rotate — seed .bak from
+            # the fresh live file so a recovery copy always exists.
+            _seed_memory_bak_post()
             return True
         except Exception as e:
             logger.error(f"[memory] save failed: {e}")
@@ -1695,6 +1800,26 @@ class AgentMemory:
     def get_all_trades(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._trades)
+
+    def count_openings_since(self, coin: str, since_ms: int) -> int:
+        # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: count this
+        # coin's OPENING fills (record_trade only ever records entries; closes
+        # live in _closes) executed at/after ``since_ms``. Backs the per-coin
+        # rolling reentry cap; a pure scan over the trade log so it shares the
+        # existing retention/sweep and needs no extra state to rebuild.
+        with self._lock:
+            trades = list(self._trades)
+        n = 0
+        for t in trades:
+            if t.get("coin") != coin:
+                continue
+            try:
+                ts = int(t.get("executed_at") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ts >= since_ms:
+                n += 1
+        return n
 
     def get_all_analyses(self) -> list[dict[str, Any]]:
         with self._lock:

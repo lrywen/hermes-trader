@@ -173,12 +173,15 @@ def _build_policy(regime: str = ""):
     try:
         import dataclasses
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.executor import select_exit_params
+        from hermes_trader.agents.executor import select_exit_params, resolve_regime_clocks
         from hermes_trader.agents.dsl_exit import RetraceTier
         dsl = read_agent_config().get("dsl_exit", {}) or {}
         _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
             select_exit_params(dsl, regime or "neutral")
         _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
+        # Audit 2026-09-06 (E3, P2): regime-split clocks parity (inert → global
+        # unless regime_aware.clocks.enabled). time_scratch rides the base policy.
+        _clocks = resolve_regime_clocks(dsl, regime or "neutral")
         from hermes_trader.agents.dsl_exit import ExitPolicy as _EP
         return dataclasses.replace(
             base,
@@ -186,6 +189,8 @@ def _build_policy(regime: str = ""):
             max_loss_roe_pct=float(_ml_roe),
             protect_pct=float(_prot),
             retrace_threshold=float(_retrace),
+            hard_timeout_minutes=float(_clocks["hard_timeout_minutes"]),
+            stale_flat_timeout_minutes=float(_clocks["stale_flat_timeout_minutes"]),
             phase2_tiers=_tiers if _tiers else _EP().phase2_tiers,
         )
     except Exception as e:

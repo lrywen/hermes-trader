@@ -21,11 +21,14 @@ SHADOW 模式回测 / 验证脚本
   python3 scripts/shadow_validate.py --log /data/trading-loop.log --since "2026-09-03 01:00"
 """
 import argparse
+import os
 import re
 import time
 from collections import Counter
 
-DEFAULT_LOG = "/data/trading-loop.log"
+# Audit 2026-09-07 (tail-2 / F5): env-overridable default log path so the
+# script works outside the container layout too; CLI --log still wins.
+DEFAULT_LOG = os.environ.get("HERMES_TRADING_LOOP_LOG", "/data/trading-loop.log")
 
 # ---- 正则 ----
 RE_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")

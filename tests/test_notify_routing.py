@@ -72,7 +72,7 @@ def primary_only(monkeypatch):
 def test_sign_matches_feishu_spec():
     """string_to_sign = "{ts}\\n{secret}"; HMAC-SHA256 then base64."""
     ts = 1700000000
-    secret = "AdiNKBg74IdJsOvayOHGzf"
+    secret = "test-fake-secret-not-a-real-credential"  # Audit 2026-09-06 (S0b): dummy for unit test only
     expected = base64.b64encode(
         hmac.new(f"{ts}\n{secret}".encode("utf-8"),
                  digestmod=hashlib.sha256).digest()

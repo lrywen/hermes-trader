@@ -63,6 +63,9 @@ IO_LEAVES = (
     "ws_max_stale_s", "ws_heartbeat_s", "ws_seq_max_backward",
     # M-11 (supplemental audit 2026-08-30): per-coin single-tick jump filter.
     "ws_max_tick_jump_frac",
+    # Audit 2026-09-06 (F6): explicit per-call timeout + short positive-result
+    # cache for L2 order-book snapshots (canonical-only, no legacy env).
+    "l2_timeout_s", "l2_cache_ttl_s",
 )
 RL_LEAVES = (
     "rate_refill_per_sec", "rate_capacity", "rate_max_wait_s",
@@ -110,7 +113,7 @@ def test_r13_b13_blocks_registered():
     assert RL_BLOCK in CANONICAL_DEFAULTS
     assert isinstance(CANONICAL_DEFAULTS[IO_BLOCK], dict)
     assert isinstance(CANONICAL_DEFAULTS[RL_BLOCK], dict)
-    assert len(CANONICAL_DEFAULTS[IO_BLOCK]) == 13
+    assert len(CANONICAL_DEFAULTS[IO_BLOCK]) == 15
     assert len(CANONICAL_DEFAULTS[RL_BLOCK]) == 7
     assert set(CANONICAL_DEFAULTS[IO_BLOCK]) == set(IO_LEAVES)
     assert set(CANONICAL_DEFAULTS[RL_BLOCK]) == set(RL_LEAVES)
@@ -197,7 +200,7 @@ def test_r13_b13_cfg_get_all_rl_leaves():
 def test_r13_b13_cfg_get_full_blocks():
     b_io = cfg_get(IO_BLOCK, config={})
     b_rl = cfg_get(RL_BLOCK, config={})
-    assert isinstance(b_io, dict) and len(b_io) == 13
+    assert isinstance(b_io, dict) and len(b_io) == 15
     assert isinstance(b_rl, dict) and len(b_rl) == 7
     assert b_io["sdk_timeout_s"] == 30.0 and b_io["ws_seq_max_backward"] == 1024
     assert b_rl["rate_capacity"] == 600 and b_rl["rate_shared"] is True
@@ -286,7 +289,7 @@ def test_r13_b13_config_patch_knows_blocks():
     assert RL_BLOCK in fields
     fb_io = fields[IO_BLOCK].default_factory()
     fb_rl = fields[RL_BLOCK].default_factory()
-    assert len(fb_io) == 13 and fb_io["sdk_timeout_s"] == 30.0
+    assert len(fb_io) == 15 and fb_io["sdk_timeout_s"] == 30.0
     assert len(fb_rl) == 7 and fb_rl["rate_capacity"] == 600
     assert fb_rl["rate_per_endpoint_gate"] is True
 
@@ -309,9 +312,15 @@ def test_r13_b13_helper_signatures_take_config():
 
 
 def test_r13_b13_spec_maps_all_legacy_envs():
-    """19 叶全部映射 legacy env（本批没有纯裸字面量叶）。"""
+    """每个 legacy 叶映射 legacy env；F6 新增的 l2_* 两叶是 canonical-only
+    （spec 中 legacy env 通道为 None），单独豁免。"""
+    # Audit 2026-09-06 (F6): canonical-only leaves with no legacy env channel.
+    canonical_only_io = {"l2_timeout_s", "l2_cache_ttl_s"}
     for leaf in IO_LEAVES:
-        assert rl._HL_CLIENT_IO_SPEC[leaf][0] is not None, leaf
+        if leaf in canonical_only_io:
+            assert rl._HL_CLIENT_IO_SPEC[leaf][0] is None, leaf
+        else:
+            assert rl._HL_CLIENT_IO_SPEC[leaf][0] is not None, leaf
     for leaf in RL_LEAVES:
         assert rl._HL_RATE_LIMIT_SPEC[leaf][0] is not None, leaf
     # 抽查几个关键映射
@@ -347,6 +356,7 @@ def test_r13_b13_spec_min_guards():
         "sdk_timeout_s", "max_slippage_pct", "max_slippage_close_pct",
         "meta_ttl_s", "atr_ttl_s", "candle_cache_ttl_s",
         "funding_cache_ttl_s", "ws_heartbeat_s", "ws_max_tick_jump_frac",
+        "l2_timeout_s", "l2_cache_ttl_s",
     }
     for leaf in zero_ok_io:
         assert rl._HL_CLIENT_IO_SPEC[leaf][2] == 0.0, leaf

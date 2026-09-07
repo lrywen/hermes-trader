@@ -43,8 +43,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 FEISHU_BASE = "https://open.feishu.cn/open-apis"
 
-DEFAULT_APP_ID = "cli_aa02713fdaf8dcfd"
-DEFAULT_APP_SECRET = "afbBBwKq3eId3ckB9yrf6bgzUdHDkvYH"
+# Audit 2026-09-06 (S0b): no hardcoded app credentials — env vars or CLI only.
+DEFAULT_APP_ID = os.environ.get("FEISHU_APP_ID", "")
+DEFAULT_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")
 
 DEFAULT_METRICS_PNG = "/tmp/hermes_ab_metrics.png"
 DEFAULT_VETOES_PNG = "/tmp/hermes_ab_vetoes.png"
@@ -354,6 +355,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true",
                         help="Upload images and build card but do not send.")
     args = parser.parse_args()
+
+    if not args.app_id or not args.app_secret:
+        print("ERROR: Feishu app credentials missing. Set FEISHU_APP_ID and "
+              "FEISHU_APP_SECRET env vars or pass --app-id/--app-secret.", file=sys.stderr)
+        return 2
 
     token = get_tenant_access_token(args.app_id, args.app_secret)
 

@@ -549,10 +549,50 @@ async def run_scan(request: Request) -> JSONResponse:
     if coin:
         coin = str(coin).strip().upper() or None
 
-    universe = get_universe()
+    # Audit 2026-09-06 (C13): three fixes here.
+    #  1) Pass include_hip3 from the live config (via _hip3_on()) so the
+    #     universe handed to scan_once matches the enable_hip3 flag scan_once
+    #     itself reads internally (perception.py). Previously get_universe()
+    #     defaulted to include_hip3=False, so when enable_hip3=true the passed
+    #     universe omitted HIP-3 markets — and because universe was non-None,
+    #     scan_once's own `if universe is None: get_universe(include_hip3=...)`
+    #     re-fetch branch never ran, silently dropping HIP-3 from the sweep.
+    #  2) Wrap the sweep in try/except and return a controlled HTTP error
+    #     instead of letting FastAPI emit a bare 500 with no detail (every
+    #     other HL/agent endpoint in this file raises HTTPException explicitly).
+    #  3) Return a STRUCTURED error body ({"error", "stage", "detail"}) with a
+    #     stage label. scan_once tags the failing pipeline stage on the raised
+    #     exception (scan_stage: "universe" / "prefetch.mids" /
+    #     "markets.scan"); the universe prefetch performed HERE is tagged
+    #     "universe.prefetch". The operator UI/alerts can now show exactly
+    #     which part of the sweep failed instead of a bare string.
     _last_scan_at = time.time()
-
-    perceptions = scan_once(universe=universe, min_score=min_score, coin=coin)
+    try:
+        try:
+            universe = get_universe(include_hip3=_hip3_on())
+        except Exception as e:
+            logger.exception("[scan] /api/agent/scan universe prefetch failed: %s", e)
+            raise HTTPException(502, detail={
+                "error": "scan_universe_prefetch_failed",
+                "stage": "universe.prefetch",
+                "detail": str(e),
+            })
+        try:
+            perceptions = scan_once(universe=universe, min_score=min_score, coin=coin)
+        except Exception as e:
+            stage = getattr(e, "scan_stage", None) or "markets.scan"
+            logger.exception("[scan] /api/agent/scan failed at stage=%s: %s", stage, e)
+            raise HTTPException(500, detail={
+                "error": "scan_failed",
+                "stage": stage,
+                "detail": str(e),
+            })
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("[scan] /api/agent/scan failed: %s", e)
+        raise HTTPException(500, detail={"error": "scan_failed",
+                                         "stage": "unknown", "detail": str(e)})
 
     result = {"perceptions": perceptions, "count": len(perceptions),
               "coin": coin or None}
@@ -669,7 +709,23 @@ async def run_research(coin: str, request: Request) -> JSONResponse:
                     perception = p
                     break
 
-    analysis = await _research_cached(coin, perception)
+    # Audit 2026-09-06 (C13): structured error with a stage label. research()
+    # tags the failing pipeline stage on the raised exception (research_stage:
+    # "prefetch.candles" / "prefetch.funding" / "prefetch.news" /
+    # "prefetch.signals" / "signals.finra" / "llm") so the operator UI/alerts
+    # can distinguish a hung data source (e.g. funding/FINRA) from an LLM
+    # failure instead of receiving a bare 500 string.
+    try:
+        analysis = await _research_cached(coin, perception)
+    except Exception as e:
+        stage = getattr(e, "research_stage", None) or "research"
+        logger.exception("[research] /api/agent/research/%s failed at stage=%s: %s",
+                         coin, stage, e)
+        raise HTTPException(500, detail={
+            "error": "research_failed",
+            "stage": stage,
+            "detail": str(e),
+        })
     await _append_session_log({"event": "research", "coin": coin, "verdict": analysis.get("verdict")})
     return JSONResponse(content=analysis)
 

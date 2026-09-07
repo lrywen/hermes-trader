@@ -278,7 +278,9 @@ EQUITY_PROXY = "xyz:SP500"
 # the 4h design.
 _SLOPE_LOOKBACK = 8
 _SLOPE_UP = 0.002       # +0.2% over 8 bars → 'up'  (DEFAULT; overridable via config)
-_SLOPE_DOWN = -0.002    # -0.2% over 8 bars → 'down' (DEFAULT; overridable via config)
+# Audit 2026-09-06 (F5, engineering hygiene): removed dead constant
+# `_SLOPE_DOWN = -0.002` — the 'down' branch tests `slope < -slope_up`, so
+# the negative threshold never had a production reference.
 
 # ADX(14) below this on the proxy 1h series → 'chop' (directionless whipsaw).
 # ADX<20 is the classic Wilder "no trend" threshold; the gate then raises the

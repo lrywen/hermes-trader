@@ -114,3 +114,10 @@ backtest-trades.csv
 .agent-config.json.lock
 .agent-memory.json.lock
 .dsl-state.json.lock
+
+# Shadow book runtime state (Audit 2026-09-07)
+.shadow-book.json
+.shadow-book.json.lock
+
+# Local archive of removed diagnostic/backtest scripts (not part of the app)
+archive/

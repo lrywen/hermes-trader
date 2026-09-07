@@ -11,12 +11,15 @@ Card contents:
   * Link/reference to the generated PNG charts (paths in card footer)
 
 Usage:
-  python3 scripts/push_optimization_feishu.py
-  # or override:
-  python3 scripts/push_optimization_feishu.py \\
-      --webhook-url https://open.feishu.cn/open-apis/bot/v2/hook/XXX \\
-      --secret     jLRhRh5oWiypzOYKpgc1nb \\
-      --dry-run
+  # credentials are read from env (preferred) or CLI flags:
+  export FEISHU_WEBHOOK_URL=https://open.feishu.cn/open-apis/bot/v2/hook/XXX
+  export FEISHU_SECRET=xxxxxxxx
+  python3 scripts/push_optimization_feishu.py --dry-run
+
+Audit 2026-09-06 (S0b): webhook URL + signing secret are no longer hardcoded
+in source. Provide them via the FEISHU_WEBHOOK_URL / FEISHU_SECRET env vars or
+the --webhook-url / --secret flags. The previously committed secret must be
+rotated in the Feishu admin console (S0a).
 """
 from __future__ import annotations
 
@@ -33,8 +36,9 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List
 
-DEFAULT_WEBHOOK = "https://open.feishu.cn/open-apis/bot/v2/hook/55e07104-3211-43a9-9eeb-40bda015f749"
-DEFAULT_SECRET = "jLRhRh5oWiypzOYKpgc1nb"
+# Audit 2026-09-06 (S0b): no hardcoded credentials — env vars or CLI only.
+DEFAULT_WEBHOOK = os.environ.get("FEISHU_WEBHOOK_URL", "")
+DEFAULT_SECRET = os.environ.get("FEISHU_SECRET", "")
 
 P0_P1_P2_RULES: Dict[str, List[str]] = {
     "P0 (hard safety vetoes)": [
@@ -274,6 +278,11 @@ def main() -> int:
     ap.add_argument("--dump-payload", default=None,
                     help="Write payload JSON to this path")
     args = ap.parse_args()
+
+    if not args.webhook_url or not args.secret:
+        print("ERROR: Feishu webhook/secret missing. Set FEISHU_WEBHOOK_URL and "
+              "FEISHU_SECRET env vars or pass --webhook-url/--secret.", file=sys.stderr)
+        return 2
 
     payload = build_card()
 

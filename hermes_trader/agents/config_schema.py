@@ -60,6 +60,9 @@ class _ConfigPatch(BaseModel):
     ta_sidestep_force_execute: bool = Field(default=CANONICAL_DEFAULTS["ta_sidestep_force_execute"])
     whale_force_execute: bool = Field(default=CANONICAL_DEFAULTS["whale_force_execute"])
     trend_surface_enabled: bool = Field(default=CANONICAL_DEFAULTS["trend_surface_enabled"])
+    # Audit 2026-09-06 (D1/D2): daily-candle new-listing floor (int) and the
+    # 24h long-extension ceiling (percent float) ported from Pathia.
+    min_history_bars: int = Field(default=CANONICAL_DEFAULTS["min_history_bars"], ge=0, le=100_000)
     # B-M11 (deep audit 2026-08-28): auto-flatten when the global halt or
     # per-coin circuit breaker trips. H-1 (2026-08-29): default ON — a tripped
     # breaker already means uncontrolled risk; set to false to restore the
@@ -80,6 +83,9 @@ class _ConfigPatch(BaseModel):
     # R9/P2-3: news gate freshness window (days) and Brave headline cache TTL (s).
     news_freshness_days: int = Field(default=CANONICAL_DEFAULTS["news_freshness_days"], ge=1, le=365)
     news_cache_ttl_s: int = Field(default=CANONICAL_DEFAULTS["news_cache_ttl_s"], ge=0, le=86_400)
+    # Audit 2026-09-06 (F6): Brave news API per-call HTTP timeout (was a
+    # hardcoded 10.0s literal in agents/research.py).
+    news_http_timeout_s: float = Field(default=CANONICAL_DEFAULTS["news_http_timeout_s"], ge=0.1, le=120.0)
     research_cooldown_min: int = Field(default=CANONICAL_DEFAULTS["research_cooldown_min"], ge=0, le=100_000)
     held_research_interval_min: int = Field(default=CANONICAL_DEFAULTS["held_research_interval_min"], ge=0, le=100_000)
     force_execute_composite: int = Field(default=CANONICAL_DEFAULTS["force_execute_composite"], ge=0, le=100)
@@ -136,6 +142,26 @@ class _ConfigPatch(BaseModel):
     liq_buffer_usd: float = Field(default=CANONICAL_DEFAULTS["liq_buffer_usd"], ge=0.0)
     aligned_min_conf: Optional[float] = Field(default=CANONICAL_DEFAULTS["aligned_min_conf"], ge=0.0, le=1.0)
     min_trend_score: float = Field(default=CANONICAL_DEFAULTS["min_trend_score"], ge=0.0, le=1.0)
+    # Audit 2026-09-06 (D2): hard 24h long-extension ceiling, percent. 0
+    # disables the gate.
+    override_max_daily_extension_pct: float = Field(
+        default=CANONICAL_DEFAULTS["override_max_daily_extension_pct"], ge=0.0, le=1000.0)
+    # Audit 2026-09-06 (C11/C12): previously hard-coded constants, now tunable.
+    # Tiered per-trade notional cap: equity threshold and above-tier multiple.
+    notional_cap_tier_equity_usd: float = Field(
+        default=CANONICAL_DEFAULTS["notional_cap_tier_equity_usd"], ge=0.0, le=1_000_000.0)
+    notional_cap_tier_multiple: float = Field(
+        default=CANONICAL_DEFAULTS["notional_cap_tier_multiple"], ge=0.0, le=100.0)
+    # Audit 2026-09-06 (C11): hard account-equity floor. New entries are
+    # fail-closed refused when aggregate equity is below this (not enough book
+    # for a trade above exchange min-notional with meaningful stop room). 0
+    # disables the gate. Pathia carries an equivalent ~$12 floor.
+    min_tradable_equity_usd: float = Field(
+        default=CANONICAL_DEFAULTS["min_tradable_equity_usd"], ge=0.0, le=1_000_000.0)
+    # Exchange minimum notional floor (HL rejects <$10); keep >= 10 to avoid
+    # rejected orders.
+    min_order_usd: float = Field(
+        default=CANONICAL_DEFAULTS["min_order_usd"], ge=10.0, le=10_000.0)
     whale_size_multiplier: float = Field(default=CANONICAL_DEFAULTS["whale_size_multiplier"], ge=0.0)
 
     # ── lists (accepted as-is, element type not checked) ──────────────────
@@ -145,6 +171,10 @@ class _ConfigPatch(BaseModel):
     hip3_dex_blocklist: list = Field(default_factory=lambda: _list_default("hip3_dex_blocklist"))
     # R12-C1: conviction-scaled size tiers, [[min_confidence, size_mult], ...].
     conviction_tiers: list = Field(default_factory=lambda: _list_default("conviction_tiers"))
+    # Audit 2026-09-06 (C11/C12): major-crypto pool for the correlation cap
+    # (was a hard-coded frozenset in risk_gates). Empty list → built-in pool.
+    correlation_crypto_coins: list = Field(
+        default_factory=lambda: _list_default("correlation_crypto_coins"))
 
     # ── nested objects (accepted as dicts, not deep-validated) ────────────
     dsl_exit: dict[str, Any] = Field(default_factory=lambda: _dict_default("dsl_exit"))
@@ -260,6 +290,10 @@ class _ConfigPatch(BaseModel):
     # HERMES_FUNDING_CACHE_TTL_S / HERMES_WS_* env vars remain the
     # top-priority channel.
     hl_client_io: dict[str, Any] = Field(default_factory=lambda: _dict_default("hl_client_io"))
+    # Audit 2026-09-06 (F6): Binance second-source price crosscheck knobs
+    # (client/price_crosscheck.py); legacy HERMES_PRICE_CROSSCHECK_* env vars
+    # remain the top-priority channel in the module.
+    price_crosscheck: dict[str, Any] = Field(default_factory=lambda: _dict_default("price_crosscheck"))
     # R13-B13: Hyperliquid rate-limiter knobs (client/rate_limit.py). Seven
     # leaves: bucket refill/capacity, trading-path max wait, 429 retries,
     # opportunistic wait, and the shared-bucket / per-endpoint-gate switches.
@@ -270,6 +304,10 @@ class _ConfigPatch(BaseModel):
     # thresholds shared by the ta_filter pre-filter, the ta_late_entry_gate
     # pre-trade gate and the backtest engine (one source of truth).
     ta_late_entry: dict[str, Any] = Field(default_factory=lambda: _dict_default("ta_late_entry"))
+    # Audit 2026-09-06 (D4): TA pre-filter volume-surge confirmation knobs
+    # (ta_filter._check_volume_confirm); defaults mirror the prior hardcoded
+    # 1.2x / 20-bar literals, so behaviour is unchanged with no config.
+    volume_confirm: dict[str, Any] = Field(default_factory=lambda: _dict_default("volume_confirm"))
     # P1-6: trading_loop startup/runtime knobs (scripts/trading_loop.py).
     # Eighteen keys: loop log path, surge notify threshold, watchdog timeout,
     # exit-checkpoint throttle, meta prewarm bound, universe refresh TTL,
@@ -285,6 +323,18 @@ class _ConfigPatch(BaseModel):
     confidence_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("confidence_decay"))
     signal_age_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_age_decay"))
     atr_regime_calibration: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_regime_calibration"))
+    # Audit 2026-09-06 (D1/D2/D3), ported from Pathia: the daily-200SMA long
+    # trend filter, the 24h long-extension ceiling and the per-coin rolling
+    # reentry cap. Each carries the off|shadow|enforce mode switch and a
+    # shadow_log_path leaf (D2 defaults to shadow, D1/D3 default off).
+    trend_filter_200ma: dict[str, Any] = Field(default_factory=lambda: _dict_default("trend_filter_200ma"))
+    daily_extension_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("daily_extension_cap"))
+    reentry_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("reentry_cap"))
+    # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay.
+    regime_risk_overlay: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_risk_overlay"))
+    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm
+    # (off|shadow|enforce; enforce is record-only in M2).
+    xs_reversal: dict[str, Any] = Field(default_factory=lambda: _dict_default("xs_reversal"))
 
 
 # Keys whose out-of-range message predates the generic bounds table and is
@@ -386,6 +436,22 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "enabled": ("bool",),
         "atr_mult": _num_leaf(0.0, 20.0),
     },
+    # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor ramp. Default OFF
+    # (inert); band_pct is the peak-profit % width over which the floor ramps
+    # hard-stop → full trailing floor.
+    "smooth_transition": {
+        "enabled": ("bool",),
+        "band_pct": _num_leaf(0.0, 50.0),
+    },
+    # Audit 2026-09-06 (E3, P2): time-based scratch exit. Default OFF (inert).
+    # minutes = hold-age gate; min_peak_pct = smallest favorable pulse that
+    # qualifies; giveback_pct = peak-to-current retrace required to fire.
+    "time_scratch": {
+        "enabled": ("bool",),
+        "minutes": _num_leaf(0.0, 100_000.0),
+        "min_peak_pct": _num_leaf(0.0, 50.0),
+        "giveback_pct": _num_leaf(0.0, 50.0),
+    },
     "consecutive_breaches_required": ("int", 1, 100),
     "breach_confirm_sec": _num_leaf(0.0, 600.0),
     "phase2_tiers": ("list", {
@@ -410,6 +476,19 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
             "non_trend": {
                 "max_loss_pct": _num_leaf(0.0, 25.0),
                 "max_loss_roe_pct": _num_leaf(0.0, 200.0),
+            },
+        },
+        # Audit 2026-09-06 (E3, P2): regime-split lifetime clocks. Separate
+        # `enabled` gate; trend = longer timeouts, non_trend = shorter.
+        "clocks": {
+            "enabled": ("bool",),
+            "trend": {
+                "hard_timeout_minutes": _num_leaf(0.0, 100_000.0),
+                "stale_flat_timeout_minutes": _num_leaf(0.0, 100_000.0),
+            },
+            "non_trend": {
+                "hard_timeout_minutes": _num_leaf(0.0, 100_000.0),
+                "stale_flat_timeout_minutes": _num_leaf(0.0, 100_000.0),
             },
         },
     },
@@ -533,6 +612,57 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "high_mult": _num_leaf(1.0, 5.0),
         "min_mult": _num_leaf(0.1, 1.0),
         "max_mult": _num_leaf(1.0, 5.0),
+        "shadow_log_path": ("str",),
+    },
+    # Audit 2026-09-06 (D1), ported from Pathia trend_filter_200ma: daily
+    # 200SMA long-only trend gate. LONGS are blocked below the daily SMA;
+    # shorts are never filtered. block_unknown=false (Pathia default) means
+    # an ESTABLISHED coin whose daily candles fail to fetch fails OPEN with a
+    # WARNING; a genuinely new listing with fewer than the history floor
+    # fails CLOSED only when min_history_bars>0 arms it. The daily-mover long
+    # bypass is valid only inside [daily_mover_min_ext_pct,
+    # daily_mover_max_ext_pct] (10%..30%): too-soft movers don't qualify and
+    # parabolic (>30%) extensions may not bypass the trend gate.
+    "trend_filter_200ma": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "period": ("int", 20, 1000),
+        "fetch_bars": ("int", 30, 2000),
+        "block_unknown": ("bool",),
+        "allow_daily_mover_long_bypass": ("bool",),
+        "daily_mover_min_ext_pct": _num_leaf(0.0, 1000.0),
+        "daily_mover_max_ext_pct": _num_leaf(0.0, 1000.0),
+        "shadow_log_path": ("str",),
+    },
+    # Audit 2026-09-06 (D2), ported from Pathia override_max_daily_extension_pct:
+    # hard 24h long-extension ceiling (anti-chase). The threshold itself is the
+    # root scalar override_max_daily_extension_pct; this block carries only the
+    # gray-release mode switch (default shadow) and the shadow-log path.
+    "daily_extension_cap": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "shadow_log_path": ("str",),
+    },
+    # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: per-coin rolling
+    # window OPENING count. max_per_coin openings (fills, not signals) within
+    # window_hours block further entries for that coin. max_per_coin<=0
+    # disables. Memory read failure fails OPEN (shared-breaker convention).
+    "reentry_cap": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "max_per_coin": ("int", 0, 100),
+        "window_hours": _num_leaf(0.0, 24.0 * 30.0),
+        "shadow_log_path": ("str",),
+    },
+    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm.
+    # xs percentile trigger (top_pct), awake activity filter, downtrend +
+    # RSI oversold candidate gates; mode off|shadow|enforce (enforce is
+    # record-only this phase).
+    "xs_reversal": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "lookback_d": ("int", 1, 30),
+        "top_pct": ("int", 50, 99),
+        "awake_bars": ("int", 1, 48),
+        "awake_min_frac": _num_leaf(0.0, 1.0),
+        "rsi_long": _num_leaf(0.0, 100.0),
+        "rsi_floor": _num_leaf(0.0, 100.0),
         "shadow_log_path": ("str",),
     },
 }

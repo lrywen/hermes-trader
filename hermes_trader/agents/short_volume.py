@@ -110,6 +110,10 @@ _SHORT_VOLUME_DEFAULTS: dict[str, Any] = {
     "light_ratio": 0.35,
     "trend_delta": 0.03,
     "lookback_days": 5,
+    # Audit 2026-09-06 (F6, engineering hygiene): short TTL for fetch failures
+    # / missing FINRA files so a transient outage or weekend gap is retried
+    # within ~120s instead of being cached blind for the full 1-h positive TTL.
+    "negative_ttl_sec": 120.0,
 }
 
 
@@ -122,7 +126,7 @@ def short_volume_params(*, config: Optional[dict[str, Any]] = None) -> dict[str,
     a fresh copy of the literals (signal path must never break on bad config)."""
     p = dict(_SHORT_VOLUME_DEFAULTS)
     try:
-        for key in ("ttl_sec", "http_timeout_s"):
+        for key in ("ttl_sec", "http_timeout_s", "negative_ttl_sec"):
             v = cfg_get(f"short_volume.{key}", config=config)
             if v is not None:
                 fv = float(v)
@@ -208,7 +212,16 @@ def _fetch_day(date: str, timeout: Optional[float] = None) -> Optional[str]:
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:
             return r.read().decode("utf-8", "replace")
-    except Exception:
+    except Exception as e:
+        # Audit 2026-09-06 (F6, engineering hygiene): 404s for weekends/holidays
+        # are expected (the day-walk skips them), but a genuine network/SSL
+        # failure used to vanish silently — log it so a persistent FINRA outage
+        # is visible. 404 stays at debug level to avoid holiday noise.
+        msg = repr(e)
+        if "404" in msg or "Not Found" in msg:
+            logger.debug(f"[shortvol] FINRA file not found for {date}: {msg}")
+        else:
+            logger.warning(f"[shortvol] FINRA fetch failed for {date}: {msg}")
         return None
 
 
@@ -223,6 +236,10 @@ def short_volume_signal(coin_or_ticker: str, lookback_days: Optional[int] = None
     p = short_volume_params()
     if ttl is None:
         ttl = p["ttl_sec"]
+    # Audit 2026-09-06 (F6): misses (no rows / fetch failure) get a short TTL
+    # so a transient FINRA outage is retried within ~2 min instead of pinning
+    # "no short-volume data" for the full hourly positive TTL.
+    neg_ttl = float(p.get("negative_ttl_sec") or 120.0)
     if lookback_days is None:
         lookback_days = int(p["lookback_days"])
     symbol = underlying_for(coin_or_ticker)
@@ -231,8 +248,10 @@ def short_volume_signal(coin_or_ticker: str, lookback_days: Optional[int] = None
     now = time.time()
     with _lock:
         hit = _cache.get(symbol)
-        if hit and (now - hit[0]) < ttl:
-            return hit[1]
+        if hit:
+            _hit_ttl = ttl if hit[1] is not None else neg_ttl
+            if (now - hit[0]) < _hit_ttl:
+                return hit[1]
     if not allow_fetch:
         return hit[1] if hit else None
 

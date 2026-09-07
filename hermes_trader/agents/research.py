@@ -182,6 +182,22 @@ _load_shared_config = load_shared_config
 logger = logging.getLogger(__name__)
 
 
+class ResearchStageError(RuntimeError):
+    """A research-pipeline failure tagged with the stage that raised it.
+
+    Audit 2026-09-06 (C13): the operator console's research endpoint used to
+    surface research failures as an unstructured 500 string with no hint of
+    WHICH part failed — the parallel pre-LLM data gather (candles / funding /
+    news / positioning signals incl. FINRA short-vol) vs. the LLM debate /
+    fallback completion. The HTTP layer reads ``stage`` and returns it in the
+    error payload (e.g. "prefetch.funding", "signals.finra", "llm").
+    """
+
+    def __init__(self, stage: str, message: str):
+        self.stage = stage
+        super().__init__(message)
+
+
 # ── R13-B10: canonical research LLM / fetch knobs ───────────────────────
 # The LLM-call parameters (gateway model/base URL, temperature, token
 # budgets, read/connect timeouts, 429 retry budget with exponential backoff,
@@ -434,8 +450,25 @@ def _compute_indicators(candles: list[Candle]) -> dict[str, Any]:
     }
 
 
+# Audit 2026-09-06 (C10): a hung fundingHistory call (AZTEC — observed to burn
+# the whole per-source budget and trip the 600s watchdog on a 3-trigger cycle)
+# now runs in a dedicated single-worker pool with a hard per-attempt wall-clock
+# cap and ONE retry. Total worst case = 2 attempts x 3.5s, hard-capped at 6s;
+# on exhaustion the prompt receives an explicit "unavailable/degraded" marker
+# (never a bare "N/A" that reads like real data) and the prefetch proceeds.
+_FUNDING_ATTEMPT_TIMEOUT_S = 3.5
+_FUNDING_TOTAL_CAP_S = 6.0
+_FUNDING_MAX_ATTEMPTS = 2
+_funding_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="funding-fetch")
+
+
 def _fetch_funding_rate(coin: str) -> str:
-    """Latest hourly funding rate for a coin, or 'N/A' if unavailable."""
+    """Latest hourly funding rate for a coin, or an explicit degraded marker.
+
+    Bounded by a hard per-attempt timeout + total wall-clock cap (C10). Funding
+    is a prompt hint, NOT an entry gate input, so a timeout degrades to a
+    visible "unavailable" string instead of stalling the whole research cycle.
+    """
     # P2-3: lookback window is config-driven (funding_lookback_hours,
     # default 24h); fetch_funding_history walks back from start_time.
     try:
@@ -445,12 +478,53 @@ def _fetch_funding_rate(coin: str) -> str:
     except (TypeError, ValueError):
         lookback_h = 24
     start_time = int(time.time() * 1000) - lookback_h * 3_600_000
-    history = fetch_funding_history(coin, start_time)
-    if history:
-        rate = float(history[-1].get("fundingRate", "0"))
-        if math.isfinite(rate):
-            return f"{rate * 100:.4f}%/hr"
-    return "N/A"
+
+    _wall_t0 = time.monotonic()
+    _last_err = ""
+    for _attempt in range(1, _FUNDING_MAX_ATTEMPTS + 1):
+        _remaining_cap = _FUNDING_TOTAL_CAP_S - (time.monotonic() - _wall_t0)
+        if _remaining_cap <= 0:
+            break
+        _wait = min(_FUNDING_ATTEMPT_TIMEOUT_S, _remaining_cap)
+        _fut = _funding_pool.submit(fetch_funding_history, coin, start_time)
+        try:
+            history = _fut.result(timeout=_wait)
+        except FuturesTimeoutError:
+            _last_err = f"timeout after {_wait:.1f}s"
+            _fut.cancel()
+            logger.warning(
+                f"[research] {coin}: funding fetch attempt {_attempt}/"
+                f"{_FUNDING_MAX_ATTEMPTS} {_last_err} (C10 budget)")
+            continue
+        except Exception as _fe:
+            _last_err = f"{type(_fe).__name__}: {_fe}"
+            logger.warning(
+                f"[research] {coin}: funding fetch attempt {_attempt}/"
+                f"{_FUNDING_MAX_ATTEMPTS} failed: {_last_err}")
+            continue
+        if history:
+            try:
+                rate = float(history[-1].get("fundingRate", "0"))
+            except (TypeError, ValueError):
+                rate = float("nan")
+            if math.isfinite(rate):
+                return f"{rate * 100:.4f}%/hr"
+            # A successful fetch whose last row is non-numeric is a genuine
+            # exchange anomaly → degrade visibly rather than mask as "N/A".
+            _last_err = "non-numeric funding rate"
+            continue
+        # A CLEAN, successful response that is genuinely empty (no funding
+        # rows for the lookback window) is valid data, not a fetch failure:
+        # preserve the long-standing "N/A" result (test_fetch_funding_rate_na
+        # _when_empty). Only a timeout/exception exhausts the loop below and
+        # degrades to the explicit unavailable marker.
+        return "N/A"
+    # All attempts failed / timed out within the 6s cap — degrade visibly
+    # (never a bare "N/A" that could be misread as a real zero rate).
+    logger.error(
+        f"[research] {coin}: funding UNAVAILABLE after "
+        f"{time.monotonic() - _wall_t0:.1f}s cap ({_last_err}) — degraded marker")
+    return "funding unavailable (fetch timed out/degraded — not 'N/A' zero-rate)"
 
 
 # Only surface news from the last N days. Without this, Brave returned
@@ -479,6 +553,9 @@ _NEWS_FRESHNESS_DAYS_DEFAULT = 2
 # is fine because a breaking-surge read is deliberately lagged.
 _NEWS_CACHE: dict[str, tuple] = {}
 _NEWS_CACHE_TTL_S_DEFAULT = 120
+# Audit 2026-09-06 (F6, engineering hygiene): fallback for the Brave per-request
+# timeout; the live value resolves from the canonical news_http_timeout_s leaf.
+_NEWS_HTTP_TIMEOUT_S_DEFAULT = 10.0
 _NEWS_CACHE_LOCK = threading.Lock()
 
 
@@ -521,12 +598,21 @@ def _fetch_news(coin: str) -> str:
     today = datetime.now(timezone.utc).date()
     start = today - timedelta(days=freshness_days)
     freshness = f"{start.isoformat()}to{today.isoformat()}"
+    # Audit 2026-09-06 (F6): timeout resolves from canonical news_http_timeout_s
+    # (was a hardcoded 10.0 literal).
+    try:
+        news_timeout = float(cfg_get("news_http_timeout_s",
+                                     _NEWS_HTTP_TIMEOUT_S_DEFAULT))
+        if news_timeout <= 0:
+            news_timeout = _NEWS_HTTP_TIMEOUT_S_DEFAULT
+    except (TypeError, ValueError):
+        news_timeout = _NEWS_HTTP_TIMEOUT_S_DEFAULT
     try:
         resp = _http().get(
             "https://api.search.brave.com/res/v1/news/search",
             params={"q": f"{coin} crypto", "count": 5, "freshness": freshness},
             headers={"X-Subscription-Token": key, "Accept": "application/json"},
-            timeout=10.0,
+            timeout=news_timeout,
         )
         if not resp.is_success:
             return "no news"
@@ -1595,7 +1681,9 @@ def _debate_direct(
     is retained so future callers can opt in, but the arbiter path relies on
     :func:`parse_structured` to extract JSON from prose/code-fences.
     """
-    dcfg = _debate_cfg()  # noqa: F841  (P1-2 baseline: legacy unused binding; kept to preserve behavior)
+    # Audit 2026-09-06 (F5): removed dead `dcfg = _debate_cfg()` binding — the
+    # value was never used here (the token budget/timeout resolve through
+    # research_llm_params() / _debate_per_call_timeout() below).
     # R13-B10: the debate path's tighter token budget resolves through
     # research_llm_params (canonical research_llm.debate_max_tokens → the
     # former 350 literal).
@@ -2229,7 +2317,30 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     as_of_date = _compute_as_of_date()
     # Parallel pre-LLM data gather (3 candle TFs + funding + news + signals),
     # extracted to _parallel_prefetch (P2-1).
-    _prefetched = _parallel_prefetch(coin, _should_skip_news())
+    # Audit 2026-09-06 (C13): tag prefetch failures with the specific source so
+    # the HTTP error payload reports stage="prefetch.funding" /
+    # "prefetch.candles" / "prefetch.news" instead of a bare string. FINRA
+    # short-vol is an optional, fail-open source so it never aborts research;
+    # a FINRA-specific reachable failure is still tagged "signals.finra".
+    try:
+        _prefetched = _parallel_prefetch(coin, _should_skip_news())
+    except Exception as _e:
+        if not getattr(_e, "research_stage", None):
+            _msg = str(_e)
+            if "funding" in _msg:
+                _stage = "prefetch.funding"
+            elif "news" in _msg:
+                _stage = "prefetch.news"
+            elif "candles" in _msg or "candle" in _msg:
+                _stage = "prefetch.candles"
+            elif "finra" in _msg.lower() or "short-vol" in _msg or "short" in _msg:
+                _stage = "signals.finra"
+            elif "signals" in _msg:
+                _stage = "prefetch.signals"
+            else:
+                _stage = "prefetch"
+            _e.research_stage = _stage  # type: ignore[attr-defined]
+        raise
     c1h = _prefetched["c1h"]
     c4h = _prefetched["c4h"]
     c1d = _prefetched["c1d"]
@@ -2242,6 +2353,23 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     # an ai_down PASS (no LLM call, no entry).
     if len(c4h) < 30:
         return _thin_history_pass(coin, perception, c4h, news)
+
+    # Audit 2026-09-06 (C9): a CLOSED-bar series that fails the candle quality
+    # gate (gappy / stale / truncated after a 429 storm) yields distorted
+    # EMA/RSI/ATR/ADX and confident-looking but baseless LLM entries. Mirror
+    # the thin-history decline for the primary 4h decision timeframe.
+    from hermes_trader.client.hl_client import assess_candle_quality
+    from hermes_trader.agents.perception import _drop_forming_bar as _drop_bar_q
+    _c4h_for_q, _ = _drop_bar_q(c4h, "4h")
+    if _c4h_for_q:
+        _q = assess_candle_quality(_c4h_for_q, "4h", 100)
+        if not _q.get("ok"):
+            logger.warning(
+                f"[research] {coin} 4h candle quality gate failed "
+                f"({', '.join(_q.get('issues', []))}; bars={len(_c4h_for_q)}, "
+                f"gaps={_q.get('gaps')}, age_ms={_q.get('age_ms')}) — declining "
+                f"(fail-closed, no LLM call)")
+            return _thin_history_pass(coin, perception, c4h, news)
 
     # H-8 (supplemental audit 2026-08-30): score indicators on CLOSED bars
     # only. fetch_hl_candles' candleSnapshot includes the still-forming final
@@ -2297,9 +2425,17 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
             f"parallel={dcfg['parallel']} max_latency_s={dcfg['max_latency_s']} "
             f"structured={dcfg['use_structured_output']}"
         )
-        debate_fields = _debate_research(
-            coin, user_message, perception, atr_abs=_atr_4h, config=config
-        )
+        # Audit 2026-09-06 (C13): tag LLM-stage failures (stage="llm") so the
+        # HTTP error payload distinguishes debate/completion failures from
+        # prefetch (candles/funding/news) failures.
+        try:
+            debate_fields = _debate_research(
+                coin, user_message, perception, atr_abs=_atr_4h, config=config
+            )
+        except Exception as _e:
+            if not getattr(_e, "research_stage", None):
+                _e.research_stage = "llm"  # type: ignore[attr-defined]
+            raise
         if debate_fields is not None:
             parsed = debate_fields
             debate_used = True
@@ -2324,8 +2460,14 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         # preserves the legacy 60s behaviour. This is a latency bound only —
         # no strategy/verdict logic changes.
         _fb_timeout = float(research_llm_params(config=config).get("fallback_timeout_sec", 0) or 0)
-        ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id,
-                           timeout=(_fb_timeout if _fb_timeout > 0 else None))
+        # Audit 2026-09-06 (C13): single-LLM fallback is also an LLM-stage call.
+        try:
+            ai_text = _call_ai(system_prompt, user_message, trace_id=trace_id,
+                               timeout=(_fb_timeout if _fb_timeout > 0 else None))
+        except Exception as _e:
+            if not getattr(_e, "research_stage", None):
+                _e.research_stage = "llm"  # type: ignore[attr-defined]
+            raise
         parsed = parse_verdict(
             ai_text, coin, perception,
             atr_abs=_atr_4h,

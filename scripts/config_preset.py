@@ -15,10 +15,17 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[1]
 CONFIG_FILE = _REPO / ".agent-config.json"
+
+# Audit 2026-09-06 (F4, engineering hygiene): the post-apply restart hint is
+# derived from config_store.STARTUP_ONLY_KEYS so it can never claim a key needs
+# a restart when the loop actually hot-reloads it.
+sys.path.insert(0, str(_REPO))
+from hermes_trader.agents.config_store import STARTUP_ONLY_KEYS  # noqa: E402
 
 
 PRESETS: dict[str, dict] = {
@@ -292,8 +299,19 @@ def cmd_apply(
 
     _save(merged)
     print(f"\n✓ applied to {CONFIG_FILE}")
-    print("Most keys hot-reload on the next trade. Restart the loop only if you changed:")
-    print("  enable_crypto, enable_hip3   (universe is fetched at startup)")
+    # Audit 2026-09-06 (F4): every .agent-config.json key hot-reloads — flipping
+    # enable_hip3 mid-run even triggers an automatic universe rebuild — so no
+    # preset change ever requires a loop restart. Only process-level env vars
+    # do (documented in STARTUP_ONLY_KEYS' block comment in config_store.py).
+    if STARTUP_ONLY_KEYS:
+        print("Hot-reloaded on the next scan. Restart the loop only if you changed:")
+        for _k in sorted(STARTUP_ONLY_KEYS):
+            print(f"  {_k}")
+    else:
+        print("Hot-reloaded automatically on the next scan — no loop restart needed")
+        print("(flipping enable_hip3 triggers an automatic universe rebuild).")
+        print("Restart only for process-level env changes: HYPERLIQUID_PRIVATE_KEY,")
+        print("HERMES_MCP_ALLOW_WRITE, HERMES_SKIP_STARTUP_SAFETY.")
     return 0
 
 

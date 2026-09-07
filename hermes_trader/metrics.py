@@ -78,6 +78,16 @@ DSL_POSITIONS = Gauge(
     "hermes_dsl_positions",
     "Number of trackers currently held in the DSL registry.",
 )
+# Audit 2026-09-06 (E5, P2): state-file corruption was previously swallowed
+# with a warning log and the registry silently reset to empty on restart.
+# Any increment is page-worthy — the corrupt file was quarantined and the
+# process fell back to .bak (or, failing that, an empty registry).
+DSL_STATE_CORRUPT_ISOLATIONS = Counter(
+    "hermes_dsl_state_corrupt_isolations_total",
+    "Number of times the DSL state file failed to parse/migrate on load: "
+    "the corrupt file was quarantined (.corrupt-<ts>) and .bak fallback "
+    "was attempted in the same load call.",
+)
 
 # ── Executor decision counters ─────────────────────────────────────────
 # Incremented on the executor hot path so a blocked/executed ratio and the
@@ -248,6 +258,39 @@ CANDLE_CACHE_LOOKUPS = Counter(
     "(hit/coalesced/miss). Miss rate exposes cold-HTTP frequency per timeframe.",
     ["interval", "result"],
 )
+# Audit 2026-09-06 (C9): the fetch-side quality gate (_fetch_hl_candles_raw)
+# previously only logged when a candleSnapshot was gappy/stale/truncated — a
+# sustained 429-storm feed degradation was invisible to alerts until a trade
+# was silently fail-closed. One increment per issue found on each cold HTTP
+# fetch (cache hits are not re-assessed). Labels are bounded: interval is a
+# fixed timeframe enum; issue ∈ gaps/stale/low_coverage/thin/other.
+CANDLE_QUALITY_ISSUES = Counter(
+    "hermes_candle_quality_issues_total",
+    "Candle quality-gate issues found on cold candleSnapshot fetches "
+    "(fail-closed: the bad series is returned but never cached), labelled by "
+    "interval and bounded issue (gaps/stale/low_coverage/thin/other).",
+    ["interval", "issue"],
+)
+# Audit 2026-09-06 (C9): per-bar parse rejections (malformed payload, NaN/Inf
+# OHLC, out-of-order timestamps). A rising rate means the upstream wire format
+# or feed is degraded. cause ∈ malformed/non_finite/out_of_order.
+CANDLE_PARSE_DROPPED = Counter(
+    "hermes_candle_parse_dropped_total",
+    "Raw candle bars dropped while parsing a candleSnapshot response, "
+    "labelled by interval and bounded cause "
+    "(malformed/non_finite/out_of_order).",
+    ["interval", "cause"],
+)
+# Audit 2026-09-06 (C9): freshness gauge — age of the newest CLOSED bar on the
+# most recent cold fetch per interval. Alert when this approaches 2x the bar
+# duration (the gate's stale threshold), i.e. the feed is lagging before any
+# gate trip. Set on every cold fetch (0 when no closed bar was usable).
+CANDLE_CLOSED_BAR_AGE = Gauge(
+    "hermes_candle_closed_bar_age_seconds",
+    "Age in seconds of the newest closed candle bar on the most recent cold "
+    "candleSnapshot fetch, labelled by interval (feed-lag early warning).",
+    ["interval"],
+)
 
 # ── Trade-side tiered circuit breakers (executor.py / memory.py) ───────
 TRADE_CIRCUIT_TRIPS = Counter(
@@ -298,6 +341,32 @@ ATR_REGIME_CALIB_OBSERVATIONS = Counter(
     "(applied/no_change).",
     ["mode", "outcome"],
 )
+# Audit 2026-09-06 (F2, engineering hygiene): every shadow/audit JSONL goes
+# through shadow_log.append_jsonl(); previously the 8 per-feature writers each
+# swallowed OSError with only a warning log, so a persistently unwritable
+# ~/.hermes-trading silently lost audit data with no metric. One increment per
+# append (or its rotation) that fails. Labelled by stream (logical shadow name).
+SHADOW_LOG_WRITE_ERRORS = Counter(
+    "hermes_shadow_log_write_errors_total",
+    "Shadow/audit JSONL append or rotation attempts that failed after being "
+    "swallowed (best-effort audit logs must never break the trade path).",
+    ["stream"],
+)
+# Audit 2026-09-06 (C1): the five memory-backed circuit gates (coin_circuit,
+# global_halt, consecutive_loss, per_coin_daily_loss, drawdown) deliberately
+# fail-OPEN when their state read raises — a transient memory/state read fault
+# must not become an account-wide trading DoS (locked by
+# test_audit_bf2_bf6_bf7 + the gate docstring contract). That fail-open was
+# previously silent (logger.debug), so a persistently broken memory read that
+# silently disabled the kill-switch was invisible. We keep pass:True but emit
+# an error log + this counter so ops can alert on a breaker that is blind.
+MEMORY_GATE_READ_ERRORS = Counter(
+    "hermes_memory_gate_read_errors_total",
+    "Times a memory-backed circuit breaker's state read raised and the gate "
+    "fell back to fail-open (pass=True). The breaker is BLIND while this "
+    "increments — alert on any sustained rate.",
+    ["gate"],
+)
 
 # ── State persistence (dsl_exit.py / memory.py) ────────────────────────
 # Alert when save/flush p95 > 0.5s (disk contention) or FLUSH_ERRORS /
@@ -326,6 +395,16 @@ MEMORY_FLUSH_ERRORS = Counter(
     "Agent-memory flush() write attempts that raised after retries "
     "(previously uncounted — the dirty flag retries but nothing surfaced "
     "a persistently failing disk).",
+)
+# Audit 2026-09-06 (E5, P2): same corruption-isolation story as the DSL
+# state file, for .agent-memory.json. The append-only events.jsonl replay
+# still runs afterwards, so an increment means memory was rebuilt/recovered
+# rather than silently lost.
+MEMORY_CORRUPT_ISOLATIONS = Counter(
+    "hermes_memory_corrupt_isolations_total",
+    "Number of times .agent-memory.json failed to parse on load: the "
+    "corrupt file was quarantined (.corrupt-<ts>), .bak fallback was "
+    "attempted, and the events.jsonl replay rebuild ran on top.",
 )
 NOTIFY_DISPATCH_ERRORS = Counter(
     "hermes_notify_dispatch_errors_total",

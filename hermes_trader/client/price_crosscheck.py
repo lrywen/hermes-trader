@@ -71,18 +71,48 @@ _SYMBOL_SCALE_OVERRIDE: dict[str, tuple[str, float]] = {
 _DEFAULT_WARN_BPS = 30.0     # 0.30%
 _DEFAULT_BLOCK_BPS = 100.0   # 1.00%
 _DEFAULT_TTL_S = 10.0        # entries are rare; a short cache is plenty
-_HTTP_TIMEOUT_S = 2.5
+_DEFAULT_HTTP_TIMEOUT_S = 2.5
 
 _cache: dict[str, tuple[float, Optional[float]]] = {}
 _cache_lock = threading.Lock()
 
 
-def _env_float(name: str, default: float) -> float:
+# Audit 2026-09-06 (F6, engineering hygiene): the four knobs below used to be
+# a hardcoded 2.5s timeout literal plus three env-only floats — invisible to
+# the dashboard config dump, not validated by validate_config_updates, and not
+# overridable via .agent-config.json. They now register in CANONICAL_DEFAULTS
+# (block ``price_crosscheck``) and resolve through the same client-layer
+# helper as hl_client_io: legacy env (top priority, deployment channel) ->
+# cfg_get("price_crosscheck.*") -> the literals below. The on/off switch stays
+# a plain env read (no canonical leaf), matching the historical semantics.
+_PRICE_CROSSCHECK_DEFAULTS: dict[str, Any] = {
+    "http_timeout_s": _DEFAULT_HTTP_TIMEOUT_S,
+    "ttl_s": _DEFAULT_TTL_S,
+    "warn_bps": _DEFAULT_WARN_BPS,
+    "block_bps": _DEFAULT_BLOCK_BPS,
+}
+
+# leaf -> (legacy env or None, kind "f", min guard value).
+_PRICE_CROSSCHECK_SPEC: dict[str, tuple[Optional[str], str, float]] = {
+    "http_timeout_s": (None, "f", 0.0),
+    "ttl_s": ("HERMES_PRICE_CROSSCHECK_TTL_S", "f", 0.0),
+    "warn_bps": ("HERMES_PRICE_DIVERGENCE_WARN_BPS", "f", 0.0),
+    "block_bps": ("HERMES_PRICE_DIVERGENCE_BLOCK_BPS", "f", 0.0),
+}
+
+
+def _params() -> dict[str, Any]:
+    """Resolved ``price_crosscheck`` block. Never raises — on any error a
+    fresh copy of the literals is returned so the crosscheck path degrades to
+    the old behaviour (and the crosscheck itself is fail-open anyway)."""
     try:
-        v = float(os.environ.get(name, "").strip())
-        return v if v > 0 else default
-    except (TypeError, ValueError):
-        return default
+        from hermes_trader.client.rate_limit import _resolve_hl_block
+
+        return _resolve_hl_block(
+            "price_crosscheck", _PRICE_CROSSCHECK_DEFAULTS, _PRICE_CROSSCHECK_SPEC
+        )
+    except Exception:
+        return dict(_PRICE_CROSSCHECK_DEFAULTS)
 
 
 def binance_spot(coin: str) -> Optional[tuple[str, float]]:
@@ -103,7 +133,11 @@ def _fetch_binance_price(symbol: str) -> Optional[float]:
     url = f"{_TICKER}?symbol={urllib.parse.quote(symbol)}"
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     try:
-        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S, context=_SSL) as r:
+        # Audit 2026-09-06 (F6): timeout resolves from canonical
+        # price_crosscheck.http_timeout_s (was a hardcoded 2.5 literal).
+        with urllib.request.urlopen(
+            req, timeout=float(_params()["http_timeout_s"]), context=_SSL
+        ) as r:
             payload = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
         logger.warning(f"[price-xcheck] Binance ticker GET failed for {symbol}: {e!r}")
@@ -125,9 +159,12 @@ def _binance_price_scaled(coin: str) -> tuple[Optional[float], str]:
         return None, "no_binance_pair"
     symbol, scale = spot
     now = time.time()
+    # Audit 2026-09-06 (F6): TTL resolves from canonical price_crosscheck.ttl_s
+    # (legacy HERMES_PRICE_CROSSCHECK_TTL_S stays top priority inside _params).
+    ttl = float(_params()["ttl_s"])
     with _cache_lock:
         hit = _cache.get(symbol)
-        if hit is not None and (now - hit[0]) < _ttl():
+        if hit is not None and (now - hit[0]) < ttl:
             raw = hit[1]
         else:
             raw = None
@@ -138,10 +175,6 @@ def _binance_price_scaled(coin: str) -> tuple[Optional[float], str]:
     if raw is None:
         return None, "binance_unavailable"
     return raw * scale, ""
-
-
-def _ttl() -> float:
-    return _env_float("HERMES_PRICE_CROSSCHECK_TTL_S", _DEFAULT_TTL_S)
 
 
 def crosscheck_price(coin: str, hl_price: float) -> dict[str, Any]:
@@ -171,8 +204,12 @@ def crosscheck_price(coin: str, hl_price: float) -> dict[str, Any]:
         return {"ok": True, "checked": False, "reason": reason or "unavailable"}
 
     div_bps = abs(hl - ref) / hl * 10_000.0
-    block_bps = _env_float("HERMES_PRICE_DIVERGENCE_BLOCK_BPS", _DEFAULT_BLOCK_BPS)
-    warn_bps = _env_float("HERMES_PRICE_DIVERGENCE_WARN_BPS", _DEFAULT_WARN_BPS)
+    # Audit 2026-09-06 (F6): thresholds resolve from canonical
+    # price_crosscheck.warn_bps / block_bps (legacy HERMES_PRICE_DIVERGENCE_*
+    # env vars stay top priority inside _params).
+    p = _params()
+    block_bps = float(p["block_bps"])
+    warn_bps = float(p["warn_bps"])
     result = {
         "ok": True,
         "checked": True,

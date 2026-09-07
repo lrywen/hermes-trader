@@ -387,6 +387,44 @@ def _candle_cache_metric(interval: str, result: str) -> None:
         pass
 
 
+# Audit 2026-09-06 (C9): bounded label enums for the fetch-side candle
+# quality / parse observability — never pass a coin or free-text issue.
+_CANDLE_QUALITY_ISSUES = ("gaps", "stale", "low_coverage", "thin")
+_CANDLE_PARSE_CAUSES = ("malformed", "non_finite", "out_of_order")
+
+
+def _candle_quality_metric(
+    interval: str,
+    quality: dict[str, Any],
+    dropped: dict[str, int],
+) -> None:
+    """Best-effort Prometheus metrics for a cold candleSnapshot fetch.
+
+    Audit 2026-09-06 (C9): the quality gate previously logged only — a
+    sustained gappy/stale feed (429 storm, upstream outage) was invisible to
+    alerts. Records one counter increment per bounded issue found, per-bar
+    parse-drop counts by cause, and the newest-closed-bar age gauge (feed-lag
+    early warning). Never raises — metrics must not touch the trading path.
+    """
+    try:
+        from hermes_trader import metrics
+
+        for issue in quality.get("issues") or []:
+            label = issue if issue in _CANDLE_QUALITY_ISSUES else "other"
+            metrics.CANDLE_QUALITY_ISSUES.labels(interval=interval,
+                                                 issue=label).inc()
+        for cause, n in dropped.items():
+            if cause in _CANDLE_PARSE_CAUSES and n > 0:
+                metrics.CANDLE_PARSE_DROPPED.labels(
+                    interval=interval, cause=cause).inc(float(n))
+        age_ms = quality.get("age_ms")
+        if isinstance(age_ms, (int, float)) and age_ms >= 0:
+            metrics.CANDLE_CLOSED_BAR_AGE.labels(interval=interval).set(
+                float(age_ms) / 1000.0)
+    except Exception:
+        pass
+
+
 def fetch_hl_candles(
     coin: str,
     interval: str = "5m",
@@ -540,6 +578,11 @@ def _fetch_hl_candles_raw(
 
     # Genuine empty history: HL returns []. Surface as [] (distinct from failure).
     candles: list[Candle] = []
+    # Audit 2026-09-06 (C9): per-cause parse-drop tally for the fetch-side
+    # observability metric (bounded causes; coins never become labels).
+    _dropped: dict[str, int] = {
+        "malformed": 0, "non_finite": 0, "out_of_order": 0,
+    }
     prev_t: Optional[int] = None
     for c in raw:
         try:
@@ -547,13 +590,16 @@ def _fetch_hl_candles_raw(
             v = float(c.get("v", "0")); t = int(c["t"])
         except (KeyError, TypeError, ValueError):
             logger.warning(f"[candles] {coin} {interval}: dropping malformed candle {c!r}")
+            _dropped["malformed"] += 1
             continue
         # Reject NaN/Inf OHLC — one bad bar poisons every indicator downstream.
         if not all(math.isfinite(x) for x in (o, h, l, close, v)):
             logger.warning(f"[candles] {coin} {interval}: dropping non-finite candle t={t}")
+            _dropped["non_finite"] += 1
             continue
         # Drop duplicate / out-of-order timestamps (monotonic ascending required).
         if prev_t is not None and t <= prev_t:
+            _dropped["out_of_order"] += 1
             continue
         prev_t = t
         candles.append(Candle(t=t, o=o, h=h, l=l, c=close, v=v))
@@ -564,16 +610,31 @@ def _fetch_hl_candles_raw(
     # position + stop too tight) and nothing downstream noticed. Annotate the
     # series; the sizing path (get_hl_atr) treats a non-ok gate as 0.0 so the
     # executor's existing ``atr <= 0 → no_atr_no_stop`` rule fails CLOSED.
+    # Audit 2026-09-06 (C9): a series that fails the quality gate must NOT be
+    # cached — the previous code cached any non-empty list, so a gappy/stale
+    # 429-storm series poisoned the cache and kept handing ATR/sizing the bad
+    # bars until natural TTL expiry. Fail-closed: gate-failed series is
+    # returned for the caller (get_hl_atr treats non-ok as 0.0 → no trade) but
+    # is never written to the cache.
+    _quality_ok = True
+    quality: dict[str, Any] = {"issues": [], "age_ms": -1}
     if candles:
         quality = assess_candle_quality(candles, interval, count)
-        if not quality["ok"]:
+        _quality_ok = bool(quality["ok"])
+        if not _quality_ok:
             logger.warning(
                 f"[candles] {coin} {interval}: quality gate failed "
                 f"({', '.join(quality['issues'])}; bars={len(candles)}, "
                 f"gaps={quality['gaps']}, age_ms={quality['age_ms']}) — "
-                f"ATR/sizing consumers must fail-closed")
+                f"ATR/sizing consumers must fail-closed; series NOT cached")
 
-    if _CANDLE_CACHE is not None and candles:
+    # Audit 2026-09-06 (C9): emit fetch-side observability (quality issues,
+    # parse drops, closed-bar age) on every cold HTTP fetch. Best-effort —
+    # never raises into the fetch path. A genuine empty history (raw == [])
+    # reports no issues; assess_candle_quality only runs on non-empty series.
+    _candle_quality_metric(interval, quality, _dropped)
+
+    if _CANDLE_CACHE is not None and candles and _quality_ok:
         _CANDLE_CACHE.set(cache_key, candles)
     return candles
 

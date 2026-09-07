@@ -47,6 +47,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -60,7 +61,39 @@ _CACHE_DIR.mkdir(parents=True, exist_ok=True)
 _UNIVERSE_CACHE_PATH = _CACHE_DIR / "meta.json"
 _SPOT_CACHE_PATH = _CACHE_DIR / "spot_meta.json"
 _PERP_DEXS_CACHE_PATH = _CACHE_DIR / "perp_dexs.json"
-_CACHE_TTL_SECS = 86_400  # 24 hours
+# Audit 2026-09-06 (C8): was 86_400 (24h), then shortened to 4h. Universe meta
+# carries maxLeverage, coin existence and funding; a long-lived stale disk cache
+# hides new listings, delistings and leverage changes (and a delisted coin's
+# get_max_leverage would wrongly resolve). The metaAndAssetCtxs POST is cheap
+# (weight ~20) and rate-limit gated, so refresh aggressively. 120s balances
+# freshness against endpoint pressure across the per-cycle scans. Env-tunable.
+_CACHE_TTL_SECS = int(os.environ.get("HERMES_UNIVERSE_CACHE_TTL_S", "120"))
+# Audit 2026-09-06 (C8): explicit timeout + one network-error retry for the
+# meta fetches (the underlying _http_post only retries HTTP 429, not a
+# timeout/connection reset, and previously used the generic 5s timeout). A
+# failed meta fetch must not leave a coin trading on stale leverage/funding.
+_META_FETCH_TIMEOUT_S = 8.0
+_META_FETCH_RETRIES = 1
+
+
+def _meta_post(payload: dict[str, Any]) -> Any:
+    """POST to /info with an explicit timeout and one network-error retry.
+
+    Returns the decoded JSON body, or None on persistent failure (callers fall
+    back to the on-disk cache / empty dict). 429 retries are already handled
+    inside _http_post; this adds one extra attempt for transient timeouts.
+    """
+    for attempt in range(_META_FETCH_RETRIES + 1):
+        try:
+            data = _http_post("/info", payload, timeout=_META_FETCH_TIMEOUT_S)
+            if data is not None:
+                return data
+        except Exception as e:  # network/timeout — _http_post normally logs & returns None
+            logger.warning(f"[universe] meta POST {payload.get('type')} raised "
+                           f"(attempt {attempt + 1}/{_META_FETCH_RETRIES + 1}): {e}")
+        if attempt < _META_FETCH_RETRIES:
+            time.sleep(0.5)
+    return None
 
 
 def _load_json_cached(path: Path, ttl_secs: int) -> Optional[Any]:
@@ -69,6 +102,26 @@ def _load_json_cached(path: Path, ttl_secs: int) -> Optional[Any]:
         if path.exists() and (time.time() - path.stat().st_mtime) < ttl_secs:
             with open(path, 'r') as f:
                 return json.load(f)
+    except Exception:
+        pass
+    return None
+
+
+# Audit 2026-09-06 (C8): meta caches are written as (meta_dict, ctx_dict,
+# fetched_at) so consumers can tell how old the funding/OI fields are. Caches
+# written before this change are plain 2-tuples; for those we fall back to the
+# file mtime as the fetch timestamp so _meta_age_s stays well-defined on upgrade.
+def _load_meta_cache(path: Path, ttl_secs: int) -> Optional[tuple[dict[str, Any], dict[str, Any], float]]:
+    """Load a cached (meta_dict, ctx_dict[, fetched_at]) tuple if fresh enough."""
+    try:
+        if path.exists():
+            mtime = path.stat().st_mtime
+            if (time.time() - mtime) < ttl_secs:
+                with open(path, 'r') as f:
+                    cache = json.load(f)
+                if isinstance(cache, (list, tuple)) and len(cache) >= 2:
+                    fetched_at = float(cache[2]) if len(cache) >= 3 and cache[2] else mtime
+                    return cache[0], cache[1], fetched_at
     except Exception:
         pass
     return None
@@ -84,35 +137,37 @@ def _save_json_cached(path: Path, data: Any) -> None:
         logger.warning(f"[universe] Failed to cache {path}: {e}")
 
 
-def _fetch_perp_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+def _fetch_perp_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any], float]:
     """Fetch perp metadata with asset context (volume, funding, etc.).
-    
-    Returns (meta_dict, asset_ctx_dict) where:
+
+    Returns (meta_dict, asset_ctx_dict, fetched_at) where:
     - meta_dict: coin -> {name, maxLeverage, szDecimals, ...}
     - asset_ctx_dict: coin -> {dayNtlVlm, openInterest, funding, ...}
+    - fetched_at: unix epoch of the successful fetch (or cache fetch timestamp).
     """
-    cache = _load_json_cached(_UNIVERSE_CACHE_PATH, _CACHE_TTL_SECS) if not force_refresh else None
-    if cache is None:
-        data = _http_post("/info", {"type": "metaAndAssetCtxs"})
-        if data and isinstance(data, list) and len(data) >= 2:
-            meta = data[0]
-            ctx = data[1]
-            meta_dict = {}
-            ctx_dict = {}
-            for i, u in enumerate(meta.get("universe", [])):
-                coin = u["name"]
-                meta_dict[coin] = {
-                    "name": coin,
-                    "maxLeverage": u.get("maxLeverage", 40),
-                    "szDecimals": u.get("szDecimals", 5),
-                    "type": "perp",
-                }
-                if i < len(ctx):
-                    ctx_dict[coin] = ctx[i]
-            _save_json_cached(_UNIVERSE_CACHE_PATH, (meta_dict, ctx_dict))
-            return meta_dict, ctx_dict
-        return {}, {}
-    return cache[0], cache[1]
+    cache = _load_meta_cache(_UNIVERSE_CACHE_PATH, _CACHE_TTL_SECS) if not force_refresh else None
+    if cache is not None:
+        return cache
+    fetched_at = time.time()
+    data = _meta_post({"type": "metaAndAssetCtxs"})
+    if data and isinstance(data, list) and len(data) >= 2:
+        meta = data[0]
+        ctx = data[1]
+        meta_dict = {}
+        ctx_dict = {}
+        for i, u in enumerate(meta.get("universe", [])):
+            coin = u["name"]
+            meta_dict[coin] = {
+                "name": coin,
+                "maxLeverage": u.get("maxLeverage", 40),
+                "szDecimals": u.get("szDecimals", 5),
+                "type": "perp",
+            }
+            if i < len(ctx):
+                ctx_dict[coin] = ctx[i]
+        _save_json_cached(_UNIVERSE_CACHE_PATH, (meta_dict, ctx_dict, fetched_at))
+        return meta_dict, ctx_dict, fetched_at
+    return {}, {}, fetched_at
 
 
 # ── HIP-3 perp dex support ────────────────────────────────────────────────────
@@ -132,21 +187,25 @@ def list_hip3_dexes(force_refresh: bool = False) -> list[str]:
     cache = _load_json_cached(_PERP_DEXS_CACHE_PATH, _CACHE_TTL_SECS) if not force_refresh else None
     if cache is not None:
         return cache
-    raw = _http_post("/info", {"type": "perpDexs"}) or []
+    raw = _meta_post({"type": "perpDexs"}) or []
     dexes = [d["name"] for d in raw if isinstance(d, dict) and d.get("name")]
     _save_json_cached(_PERP_DEXS_CACHE_PATH, dexes)
     return dexes
 
 
-def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
-    """Fetch one HIP-3 perpDex universe + asset contexts, shape-compatible with `_fetch_perp_meta`."""
+def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any], float]:
+    """Fetch one HIP-3 perpDex universe + asset contexts, shape-compatible with `_fetch_perp_meta`.
+
+    Returns (meta_dict, asset_ctx_dict, fetched_at).
+    """
     cache_path = _CACHE_DIR / f"meta_{dex}.json"
-    cache = _load_json_cached(cache_path, _CACHE_TTL_SECS) if not force_refresh else None
+    cache = _load_meta_cache(cache_path, _CACHE_TTL_SECS) if not force_refresh else None
     if cache is not None:
-        return cache[0], cache[1]
-    data = _http_post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+        return cache
+    fetched_at = time.time()
+    data = _meta_post({"type": "metaAndAssetCtxs", "dex": dex})
     if not (data and isinstance(data, list) and len(data) >= 2):
-        return {}, {}
+        return {}, {}, fetched_at
     meta, ctx = data[0], data[1]
     meta_dict: dict[str, Any] = {}
     ctx_dict: dict[str, Any] = {}
@@ -163,39 +222,40 @@ def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> tuple[dict[str, A
         }
         if i < len(ctx):
             ctx_dict[coin] = ctx[i]
-    _save_json_cached(cache_path, (meta_dict, ctx_dict))
-    return meta_dict, ctx_dict
+    _save_json_cached(cache_path, (meta_dict, ctx_dict, fetched_at))
+    return meta_dict, ctx_dict, fetched_at
 
 
-def _fetch_spot_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any]]:
+def _fetch_spot_meta(force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any], float]:
     """Fetch spot metadata with asset context.
     
-    Returns (meta_dict, asset_ctx_dict) for spot assets.
+    Returns (meta_dict, asset_ctx_dict, fetched_at) for spot assets.
     Spot coin names are prefixed with '@' internally — we strip that.
     """
-    cache = _load_json_cached(_SPOT_CACHE_PATH, _CACHE_TTL_SECS) if not force_refresh else None
-    if cache is None:
-        data = _http_post("/info", {"type": "spotMetaAndAssetCtxs"})
-        if data and isinstance(data, list) and len(data) >= 2:
-            meta = data[0]
-            ctx = data[1]
-            meta_dict = {}
-            ctx_dict = {}
-            for i, u in enumerate(meta.get("universe", [])):
-                # Spot names come as "@4", "@5" etc — use "name" if available
-                coin = u.get("name", f"@{i}")
-                if not coin.startswith("@"):
-                    coin = f"@{coin}"  # Normalize spot prefix
-                meta_dict[coin] = {
-                    "name": coin,
-                    "type": "spot",
-                }
-                if i < len(ctx):
-                    ctx_dict[coin] = ctx[i]
-            _save_json_cached(_SPOT_CACHE_PATH, (meta_dict, ctx_dict))
-            return meta_dict, ctx_dict
-        return {}, {}
-    return cache[0], cache[1]
+    cache = _load_meta_cache(_SPOT_CACHE_PATH, _CACHE_TTL_SECS) if not force_refresh else None
+    if cache is not None:
+        return cache
+    fetched_at = time.time()
+    data = _meta_post({"type": "spotMetaAndAssetCtxs"})
+    if data and isinstance(data, list) and len(data) >= 2:
+        meta = data[0]
+        ctx = data[1]
+        meta_dict = {}
+        ctx_dict = {}
+        for i, u in enumerate(meta.get("universe", [])):
+            # Spot names come as "@4", "@5" etc — use "name" if available
+            coin = u.get("name", f"@{i}")
+            if not coin.startswith("@"):
+                coin = f"@{coin}"  # Normalize spot prefix
+            meta_dict[coin] = {
+                "name": coin,
+                "type": "spot",
+            }
+            if i < len(ctx):
+                ctx_dict[coin] = ctx[i]
+        _save_json_cached(_SPOT_CACHE_PATH, (meta_dict, ctx_dict, fetched_at))
+        return meta_dict, ctx_dict, fetched_at
+    return {}, {}, fetched_at
 
 
 def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> list[dict[str, Any]]:
@@ -223,8 +283,8 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> lis
         ...
     ]
     """
-    perp_meta, perp_ctx = _fetch_perp_meta(force_refresh)
-    spot_meta, spot_ctx = _fetch_spot_meta(force_refresh)
+    perp_meta, perp_ctx, perp_fetched_at = _fetch_perp_meta(force_refresh)
+    spot_meta, spot_ctx, spot_fetched_at = _fetch_spot_meta(force_refresh)
 
     # HIP-3: walk every non-null perpDex and merge its markets in.
     # Apply the same allow/blocklist mute as the scanner (perception.py) and
@@ -233,6 +293,7 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> lis
     # metaAndAssetCtxs POSTs behind the rate limiter, stalling loop startup.
     hip3_meta: dict[str, Any] = {}
     hip3_ctx: dict[str, Any] = {}
+    hip3_fetched_at: dict[str, float] = {}
     if include_hip3:
         dexes = list_hip3_dexes(force_refresh)
         try:
@@ -249,18 +310,31 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> lis
         if not dexes:
             logger.info("[universe] HIP-3 loading skipped — no dexes after allow/block filter")
         for dex in dexes:
-            m, c = _fetch_hip3_meta(dex, force_refresh)
+            m, c, fetched_at = _fetch_hip3_meta(dex, force_refresh)
             hip3_meta.update(m)
             hip3_ctx.update(c)
+            for coin in m:
+                hip3_fetched_at[coin] = fetched_at
 
     # Merge into unified list
     results = []
     all_coins = set(list(perp_meta.keys()) + list(spot_meta.keys()) + list(hip3_meta.keys()))
+    now = time.time()
 
     for coin in all_coins:
         m = perp_meta.get(coin) or hip3_meta.get(coin) or spot_meta.get(coin, {})
         c = perp_ctx.get(coin) or hip3_ctx.get(coin) or spot_ctx.get(coin, {})
-        
+        # Audit 2026-09-06 (C8): stamp every asset with the age (seconds) of its
+        # funding/OI/volume snapshot so downstream consumers can de-weight stale
+        # data. Prefer the source that actually supplied this coin's meta.
+        if coin in hip3_meta:
+            _fetched_at = hip3_fetched_at.get(coin, 0.0)
+        elif coin in perp_meta:
+            _fetched_at = perp_fetched_at
+        else:
+            _fetched_at = spot_fetched_at
+        meta_age_s = max(0.0, now - _fetched_at) if _fetched_at else None
+
         def _f(v: Any, d: float = 0) -> float:
             return float(v) if v is not None else d
         
@@ -278,6 +352,8 @@ def get_universe(force_refresh: bool = False, include_hip3: bool = False) -> lis
             "oraclePx": _f(c.get("oraclePx")),
             "markPx": _f(c.get("markPx")),
             "midPx": _f(c.get("midPx")),
+            # Audit 2026-09-06 (C8): age of the ctx snapshot above; None if unknown.
+            "_meta_age_s": meta_age_s,
         }
         results.append(asset)
     
@@ -311,7 +387,7 @@ def get_day_ntl_vlm(coin: str) -> float:
     """
     try:
         if ":" not in coin:
-            _, perp_ctx = _fetch_perp_meta()
+            _, perp_ctx, _ = _fetch_perp_meta()
             ctx = perp_ctx.get(coin)
             if ctx:
                 vol = float(ctx.get("dayNtlVlm", 0) or 0)

@@ -222,7 +222,7 @@ TOOLS = [
             "properties": {
                 "mode": {"type": "string", "enum": ["OFF", "SHADOW", "LIVE"]},
                 "enable_crypto": {"type": "boolean", "description": "Scan/trade native Hyperliquid crypto perps."},
-                "enable_hip3": {"type": "boolean", "description": "Scan/trade HIP-3 tokenized-equity/commodity perps; restart required to refresh universe."},
+                "enable_hip3": {"type": "boolean", "description": "Scan/trade HIP-3 tokenized-equity/commodity perps. Hot-reloads: flipping this mid-run triggers an automatic universe rebuild on the next cycle (no restart). Audit 2026-09-06 (F4)."},
                 # ── Sizing / leverage ────────────────────────────────────
                 "leverage": {"type": "number", "description": "Leverage ceiling per trade (min with coin max)."},
                 "equity_fraction_per_trade": {"type": "number", "description": "Fraction of equity committed as margin per trade."},
@@ -928,6 +928,31 @@ TOOLS = [
 ]
 
 
+def _hermes_trading_agents_path() -> str:
+    """Resolve the sibling HermesTradingAgents checkout (single source of truth).
+
+    deep_research shells out to its LangGraph stack; the MCP server does not
+    vendor it. This mirrors (and is reused by) handle_deep_research's sys.path
+    bootstrap.
+    Audit 2026-09-06 (F1, engineering hygiene).
+    """
+    return os.path.abspath(os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "..", "HermesTradingAgents"))
+
+
+_DEEP_RESEARCH_AVAILABLE = os.path.isdir(_hermes_trading_agents_path())
+
+if not _DEEP_RESEARCH_AVAILABLE:
+    # Audit 2026-09-06 (F1, engineering hygiene): do not advertise a tool that
+    # is guaranteed to fail — the HermesTradingAgents dependency directory is
+    # absent on this host, so deep_research can only ever return its
+    # "not installed" error. Drop it from tools/list at startup so discovery
+    # stays honest. The handler remains registered: a stale client that calls
+    # it anyway still gets the structured error payload rather than a crash.
+    TOOLS = [_t for _t in TOOLS if _t.get("name") != "deep_research"]
+
+
 def handle_scan(params: Dict[str, Any]) -> str:
     from hermes_trader.agents.config import get_config
     from hermes_trader.client.universe import get_universe
@@ -1165,9 +1190,9 @@ def handle_deep_research(params: Dict[str, Any]) -> str:
     max_debate_rounds = min(int(params.get("max_debate_rounds", 1)), 3)
     max_risk_discuss_rounds = min(int(params.get("max_risk_discuss_rounds", 1)), 3)
 
-    # Ensure HermesTradingAgents is on sys.path
-    _hta_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "..", "HermesTradingAgents")
-    _hta_path = os.path.abspath(_hta_path)
+    # Ensure HermesTradingAgents is on sys.path (Audit 2026-09-06 F1: path
+    # resolution shared with the startup tools/list availability check).
+    _hta_path = _hermes_trading_agents_path()
     if os.path.isdir(_hta_path) and _hta_path not in sys.path:
         sys.path.insert(0, _hta_path)
 
