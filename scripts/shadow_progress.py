@@ -40,6 +40,18 @@ from datetime import datetime, timezone
 #    （legacy 布尔 sizing_v2_enabled=true → enforce），路径键是
 #    atr_risk_sizing.sizing_v2_shadow_log_path（executor.py）。此前按
 #    cfg["sizing_v2"] 解析永远读不到，巡检把它误报为 off —— 已显式指定。
+# Audit 2026-09-08 (arm registry fix):
+#  * pullback 不是顶层配置块：开关在 runner_entry_gate.pullback_long 的
+#    enabled + shadow_mode 双布尔（无 mode 键，shadow_mode 默认 False；
+#    executor.py L4298/L4351）。生产配置 enabled=true/shadow_mode=true，
+#    /data/pullback_shadow.jsonl 一直在写，巡检却按不存在的 cfg["pullback"]
+#    恒报 off —— _arm_mode/_arm_path 对该臂特判，精确镜像运行时。
+#  * regime_overlay 块是 regime_risk_overlay 的 enabled + shadow_mode 双布尔
+#    （无 mode 键，shadow_mode 默认 True；regime_overlay.py L159-163）。此前
+#    按 mode 键解析恒得 off（当前 enabled=False 结果碰巧正确，路径/模式键均
+#    不匹配）—— 同型特判。
+#  两臂均无 env mode 覆盖；映射：enabled 假→off；enabled 真 + shadow 真→
+#  shadow；enabled 真 + shadow 假→enforce。
 ARMS = [
     ("pullback",            "pullback",            "HERMES_PULLBACK_SHADOW_FILE",            "pullback_shadow.jsonl",            "mode",      "shadow_log_path"),
     ("ta_late_entry",       "ta_late_entry",       "HERMES_TA_LATE_ENTRY_SHADOW_FILE",       "ta_late_entry_shadow.jsonl",       "mode",      "shadow_log_path"),
@@ -66,6 +78,22 @@ def _arm_mode(cfg: dict, blk_name: str, env_name: str, mode_key: str = "mode") -
     ``mode_key`` lets parasitic arms override the config field (sizing_v2 lives
     under atr_risk_sizing with mode key ``sizing_v2_mode`` and a legacy boolean
     ``sizing_v2_enabled`` that maps to enforce)."""
+    # Audit 2026-09-08 (arm registry fix): dual-boolean arms have no mode key
+    # and no env mode override -- resolve enabled/shadow_mode exactly like the
+    # runtime does.
+    if blk_name == "pullback":
+        gate = cfg.get("runner_entry_gate")
+        pb = gate.get("pullback_long") if isinstance(gate, dict) else None
+        pb = pb if isinstance(pb, dict) else {}
+        if not bool(pb.get("enabled", False)):
+            return "off"
+        return "shadow" if bool(pb.get("shadow_mode", False)) else "enforce"
+    if blk_name == "regime_risk_overlay":
+        ov = cfg.get("regime_risk_overlay")
+        ov = ov if isinstance(ov, dict) else {}
+        if not bool(ov.get("enabled", False)):
+            return "off"
+        return "shadow" if bool(ov.get("shadow_mode", True)) else "enforce"
     env_val = os.environ.get(env_name.replace("_SHADOW_FILE", "_MODE"), "").strip().lower()
     if env_val in ("off", "shadow", "enforce"):
         return env_val
