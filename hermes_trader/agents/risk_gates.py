@@ -321,22 +321,48 @@ def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseExce
         cannot flood the chat;
       * does NOT change the fail-open posture — the caller still returns
         pass=True regardless of the alert outcome.
+
+    Audit 2026-09-07 (M1 / F4): ALSO publish a ``risk_gate_blind`` event to the
+    session-log feed (the SSE stream the portal tails), so the web UI shows the
+    blind-gate alarm in real time instead of only via Feishu. The event is NOT
+    added to _PUBLIC_FEED_EVENTS (operator feed only — a blind gate is an
+    internal risk posture, not public posture). It is outside the
+    notify_dispatch fork whitelist too, so it neither re-cards Feishu nor
+    forks into events.jsonl; the SSE tail is its only extra destination.
     """
+    coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
+    err_msg = f"{type(exc).__name__}: {exc}"[:300]
+    # Feishu card (best-effort; failure must not affect the SSE mirror below).
     try:
         from hermes_trader import notify
-        coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
         notify.send_card(
             "风控熔断门读状态失败 — 门变盲（fail-open 放行中）",
             fields={
                 "熔断门": gate,
                 "币种": coin,
                 "姿态": "fail-open（pass=True，保护暂时失效）",
-                "错误": f"{type(exc).__name__}: {exc}"[:300],
+                "错误": err_msg,
             },
             category="risk",
             level="danger",
             dedup_key=f"mem_gate_blind:{gate}",
         )
+    except Exception:
+        pass
+    # M1: mirror the same blind-gate alarm onto the operator SSE feed. Kept in
+    # its OWN try block (independent of the Feishu card) so a Feishu failure
+    # cannot suppress the web feed event. session_log.append is itself
+    # best-effort; wrapped anyway so a feed failure never touches the gate.
+    try:
+        from hermes_trader import session_log
+        session_log.append({
+            "event": "risk_gate_blind",
+            "ts": int(time.time() * 1000),
+            "gate": gate,
+            "coin": coin,
+            "posture": "fail-open",
+            "error": err_msg,
+        })
     except Exception:
         pass
 

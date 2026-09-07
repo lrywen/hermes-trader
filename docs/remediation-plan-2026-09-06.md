@@ -442,3 +442,35 @@ config_schema.py：Field(default_factory=lambda: _dict_default("xs_reversal")) +
 - 容器内冒烟（真实 /data）：评级器 12 臂全出评级、exit 0、0 缺口；字段映射修复后 sizing_v2 命中率 77.2%、ta_late_entry 99.8%（该 gate 日志范式为"评估为迟到入场"事件，1803 blocked/3 allowed，grader 如实读取）；`--json` 机读正常；`_push_feishu` 代码路径（stub notify）验证不抛异常。生产 closes=0（SHADOW 无真实成交），报告已注明"评级仅基于 shadow 采数，缺真钱对照"。
 - **夜间调度已接（2026-09-07 用户拍板）**：容器内无 cron，仿 cron_reconcile.sh 在宿主机加包装脚本 scripts/cron_shadow_grade.sh（容器名/日志目录/窗口可 env 覆盖；容器不在则记日志 exit 3；调 `docker exec hermes-trader python /app/scripts/shadow_grade.py --push --windows 24 72 168`，best-effort 不阻断），日志落 `~/.local/state/hermes-trader/shadow_grade.log`。宿主机 crontab 已注册 `45 8 * * *`（CRON_TZ=Asia/Shanghai，即每日 08:45 CST / 00:45 UTC，排在 08:15 fills reconcile 之后）。手动冒烟 exit 0、日志正常。
 - **代码改动仍未 commit**（按用户指示）。
+
+## 前端接入 M1：评级中心只读 API + 夜间历史快照 + blind SSE 告警（2026-09-07 落地）
+
+> 依据 docs/frontend-integration-assessment-2026-09-07.md 的 M1 阶段（trader 侧铺路，不动前端）。全部只读/告警镜像，**评级器 INERT 红线不变**：API refresh 不写历史快照（防止人工刷新伪造夜间趋势）、不自动改配置/闸门/下单，PROMOTE 仍仅建议。
+
+### 1. 夜间评级历史快照（scripts/shadow_grade.py，m1a）
+
+- 新增 `HISTORY_FILE`（env `HERMES_SHADOW_GRADE_HISTORY` 可覆盖，默认 `/data/shadow_grade_history.jsonl`）+ `HISTORY_MAX_LINES=400`（每晚 1 条约 13 个月）。
+- 新函数：`append_history(d)`（best-effort：makedirs + 追加 JSONL + 超限时 `_trim_history` 保留最新 400 行，任何失败打 stderr 返回 False，绝不抛）、`read_history(since_ms, limit)`（缺文件/坏行返回 `[]`）、`_slim_snapshot(d)`（投影为 `{ts, generated_at, window_h(最长窗), real_closes, arms[]{arm,mode,kind,verdict,total,hits,decisions,hit_rate,mature_outcomes}}`）。
+- **仅 main()/cron 路径在 `_push_feishu` 之后追加快照**；API refresh 不触发写盘。
+
+### 2. 评级中心三端点（hermes_trader/dashboard_routes/shadow_arms.py 新建，m1b）
+
+- `GET /api/dashboard/shadow-arms/grades?windows=24,72,168`：**匿名可读**（读端点，数据含风控姿态但无密）；包 `shadow_grade.collect_grades()` 经 `asyncio.to_thread` + `_ttl_cached` **60s TTL**（per-key singleflight，防 MB 级 JSONL 实时解析）；windows 参数逗号分隔、范围 1..2160h，非法 422。
+- `POST /api/dashboard/shadow-arms/refresh`：`_require_operator(write=True)`（Bearer/X-Operator-Token，per-IP 限速）；body 解析失败 422；重算后**暖写 TTL 缓存**；追加审计事件 `session_log.append({"event":"shadow_arms_refresh", ..., "via":"web", "counts":{verdict 计数}})`；返回 `{"ok":true, ...report}`。
+- `GET /api/dashboard/shadow-arms/grade-history?days=30&limit=400`：经 `to_thread` 调 `sg.read_history(since_ms, limit)`，返回 `{snapshots, count, days}`。
+- scripts/ 非包导入：`importlib.util.spec_from_file_location("hermes_shadow_grade", path)` 懒加载，候选路径 `$HERMES_SCRIPTS_DIR` → `/app/scripts` → 相对 `../../scripts`，scripts dir 入 sys.path；加载失败缓存异常、三端点统一 503。
+- 路由注册：dashboard.py `register_routes` 在 shadow 之后、public（SPA catch-all）之前调 `register_shadow_arms_routes(app)`，防 `/{full_path:path}` 吞 API。
+
+### 3. blind-gate 告警补发 SSE（hermes_trader/agents/risk_gates.py，m1c/F4）
+
+- `_alert_memory_gate_blind` 在飞书卡片之后**独立 try 块**追加 `session_log.append({"event":"risk_gate_blind", ts, gate, coin, posture:"fail-open", error})`。
+- 事件经 feed = session_log tail 自动进 `/api/feed/stream` 与 `/api/feed/history`；**故意不加入 `_PUBLIC_FEED_EVENTS` 白名单**（operator 认证客户端可见，匿名客户端不泄露风控姿态），也不进 `fork_from_session`/`notify_dispatch` 白名单（不重复发飞书、不写 events.jsonl）。
+- 测试驱动出的结构修正：飞书 send_card 与 SSE 镜像各占独立 try 块——飞书故障不得压制 Web 实时告警（初版嵌套 try 会被测试模拟的 send_card 抛错跳过）。
+
+### 4. 闸门与上线
+
+- 单测 tests/test_shadow_arms_api.py（新增 15 例）：历史快照 6 例（slim 投影取最长窗、append/read 往返、缺文件 []、since_ms 过滤、trim 保留最新、坏路径不抛）；端点 7 例（grades 匿名 200 + 二次命中缓存、bad windows 422、grade-history 200、refresh 无 token 401/带 token 200 暖缓存 + 审计事件 counts、grader 不可用三端点 503）；blind SSE 2 例（send_card 抛 RuntimeError 时仍出 1 条 risk_gate_blind 且字段齐全；append 自身抛异常函数不抛）。
+- py_compile 全绿；全量 pytest 实跑 **2997 passed / 14 deselected**（基线 2982 净增 15，只增不减）。
+- 镜像重建滚动上线，当前容器 **6b029550aced** healthy（替换 f3c52610a973）。
+- 容器内冒烟（真实 /data）全通：grades 返回 12 臂真实评级（pullback OFF、ta_late_entry enforce/COLLECTING、atr_regime_calib 与 sizing_v2 shadow/PROMOTE_CANDIDATE）；grade-history 初始 count=0；refresh 无 token 401、带 Bearer token 200/12 臂；windows=abc 422；容器内跑 `shadow_grade.py --json`（exit 0）后 `/data/shadow_grade_history.jsonl` 生成（2129 字节）、grade-history count=1；手动触发 `_alert_memory_gate_blind('coin_circuit', ...)` 后 operator feed-history 见 1 条 risk_gate_blind（gate/coin/posture/error 齐全），匿名 feed 确认不泄露。
+- **M1 代码改动仍未 commit**（按用户指示，等"提交并推送"指令）。下一步 M2：hermes-portal BFF `_PATH_RULES` 登记 `/api/dashboard/shadow-arms/*`。

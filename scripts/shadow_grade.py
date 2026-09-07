@@ -91,6 +91,15 @@ _BLOCK_FIELDS = ("ext_would_block", "reentry_would_block", "trend_would_block",
 _CHANGE_FIELDS = ("would_change", "would_block_gate", "would_block")
 _SIGNAL_FIELDS = ("is_candidate", "tripped", "would_apply")
 
+# Audit 2026-09-07 (M1 frontend grading center): nightly run persists one slim
+# verdict snapshot per arm so the dashboard can draw verdict/maturity trends.
+# Written ONLY by the nightly cron path (main), never by the API refresh —
+# manual operator refreshes must not fabricate "nightly" history. Best-effort:
+# a write failure is swallowed and never changes the report/exit code.
+HISTORY_FILE = os.environ.get("HERMES_SHADOW_GRADE_HISTORY",
+                              os.path.join(sp.WRITABLE_DATA, "shadow_grade_history.jsonl"))
+HISTORY_MAX_LINES = 400   # ~13 months at one line/night; cap enforced best-effort
+
 
 def _sizing_v2_changed(rec: dict):
     """sizing_v2 logs no boolean flag; it "changes sizing" when the v2 computed
@@ -362,6 +371,96 @@ def _push_feishu(d: dict) -> None:
     )
 
 
+def _slim_snapshot(d: dict) -> dict:
+    """Project a full grade report down to one slim, JSONL-friendly history
+    line: per-arm verdict/mode + the longest-window counts the trend chart
+    needs (total/hits/decisions/hit_rate/mature_outcomes)."""
+    w_long = max(d.get("windows_h") or [168])
+    arms = []
+    for a in d.get("arms", []):
+        longest = next((s for s in a.get("windows", [])
+                        if s.get("window_h") == w_long), {})
+        arms.append({
+            "arm": a.get("arm"),
+            "mode": a.get("mode"),
+            "kind": a.get("kind"),
+            "verdict": a.get("verdict"),
+            "total": longest.get("total", 0),
+            "hits": longest.get("hits", 0),
+            "decisions": longest.get("decisions", 0),
+            "hit_rate": longest.get("hit_rate", 0.0),
+            "mature_outcomes": longest.get("mature_outcomes", 0),
+        })
+    return {
+        "ts": int(time.time() * 1000),
+        "generated_at": d.get("generated_at"),
+        "window_h": w_long,
+        "real_closes": (d.get("real_baseline") or {}).get("real_closes", 0),
+        "arms": arms,
+    }
+
+
+def append_history(d: dict, path: str | None = None) -> bool:
+    """Best-effort: append one slim snapshot line to the nightly grade history.
+    Returns True on success. Never raises — the grader must stay read-only
+    with respect to trading and a history write failure must not affect the
+    report or the cron exit code."""
+    path = path or HISTORY_FILE
+    try:
+        rec = _slim_snapshot(d)
+        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        _trim_history(path)
+        return True
+    except Exception as e:  # pragma: no cover - best-effort side channel
+        print(f"[warn] 评级历史落盘失败（不影响评级）：{e}", file=sys.stderr)
+        return False
+
+
+def _trim_history(path: str) -> None:
+    """Keep at most HISTORY_MAX_LINES lines (one nightly snapshot each).
+    Best-effort; any error leaves the file untouched."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) <= HISTORY_MAX_LINES:
+            return
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.writelines(lines[-HISTORY_MAX_LINES:])
+    except Exception:
+        pass
+
+
+def read_history(path: str | None = None, since_ms: float | None = None,
+                 limit: int = 365) -> list[dict]:
+    """Read nightly grade snapshots (oldest first), newest `limit` kept and an
+    optional `since_ms` lower bound. Best-effort: missing/corrupt file → []."""
+    path = path or HISTORY_FILE
+    out: list[dict] = []
+    if not os.path.exists(path):
+        return out
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                try:
+                    rec = json.loads(ln)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+                if since_ms is not None and isinstance(rec.get("ts"), (int, float)) \
+                        and rec["ts"] < since_ms:
+                    continue
+                out.append(rec)
+    except OSError:
+        return []
+    if limit and len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="SHADOW 风控臂夜间评级 / 建议器（INERT 只读）")
     ap.add_argument("--json", action="store_true", help="机读 JSON 输出")
@@ -373,6 +472,9 @@ def main() -> int:
     d = collect_grades(args.windows)
     if args.push:
         _push_feishu(d)
+    # Audit 2026-09-07 (M1): persist the nightly snapshot for the dashboard
+    # trend view. Best-effort; only the cron/main path writes history.
+    append_history(d)
     if args.json:
         print(json.dumps(d, ensure_ascii=False, indent=2))
     else:

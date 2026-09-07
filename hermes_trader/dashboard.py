@@ -2494,6 +2494,7 @@ def register_routes(app: FastAPI) -> None:
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
+    from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
 
     register_config_routes(app)
     register_operator_routes(app)
@@ -2501,5 +2502,9 @@ def register_routes(app: FastAPI) -> None:
     # operator-gated. Must register before public so the SPA catch-all does not
     # shadow /api/dashboard/shadow/*.
     register_shadow_routes(app)
+    # SHADOW risk-arm grading center (Audit 2026-09-07 M1): nightly grader
+    # reports over read-only endpoints + operator-gated refresh. Same
+    # before-public ordering so /api/dashboard/shadow-arms/* is not swallowed.
+    register_shadow_arms_routes(app)
     register_public_routes(app)
 
