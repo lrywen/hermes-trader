@@ -91,7 +91,7 @@
 |---|---|---|
 | **M1 后端 API 铺路** ✅ **已落地 2026-09-07** | trader 侧 grades/refresh/history 3 端点 + shadow_grade 落历史快照；blind 事件补发 SSE；py_compile + 全量 pytest 只增不减 | 出口：curl 取到分级 JSON；blind 时 feed 有事件 — **已达成**（容器 6b029550aced 冒烟全通，2997 passed，详见文末附录 A） |
 | **M2 BFF 接线** ✅ **已落地 2026-09-07** | proxy.py `_PATH_RULES` 登记新路径（读/写权限）；nginx 无需改（走 `/api/dashboard/` 已通） | 出口：门户带 token 经 BFF 取数；无 token 写被拒 — **已达成**（容器 5b8beae9d8b9 冒烟全通，门户 pytest 13 passed，详见附录 B） |
-| **M3 影子臂评级中心页** | 新建 `/risk-arms` 页 + 路由/菜单/Store；blind 事件接 AlertPopup | 出口：12 臂评级、三窗统计、DATA_GAP 红横幅、PROMOTE 跳 Config 全可用 |
+| **M3 影子臂评级中心页** ✅ **已落地 2026-09-07** | 新建 `/risk-arms` 页 + 路由/菜单/Store；blind 事件接 AlertPopup | 出口：12 臂评级、三窗统计、DATA_GAP 红横幅、PROMOTE 跳 Config 全可用 — **已达成**（容器 382797cfa3e3 冒烟全通，门户 pytest 14 passed，type-check/build 0 错，详见附录 C） |
 | **M4 审计/对账（可并行）** | 台账哈希链卡片、reconcile 状态卡片 | 出口：链校验状态、对账差异可见 |
 | **M5 数据积累后复盘** | grade-history 趋势图、Config 页臂 mode 联动；待 shadow 臂积够样本（PROMOTE/REVIEW）供人工拍板 | 依赖真实影子数据积累，非开发量 |
 
@@ -186,4 +186,48 @@
 - portal 仓 `tests/test_proxy_rbac.py`：MATRIX 增 5 行（grades/grade-history/refresh 三端点 viewer/trader 403、operator/admin 200；影子账本 book 读四角色 200、reset 写 viewer/trader 403 回归）+ 单元断言 8 条（锁死 shadow-arms 读/写 = operator:mode，且不误伤 shadow/ 账本规则）。
 - 门户全量 pytest（.venv）**13 passed** 全绿（假上游 ASGI transport，无真实网络）。
 - 经 BFF（https 8443）生产冒烟：admin 登录后 GET grades 200 返回 12 臂真实评级、grade-history 200 count=1、POST refresh（正确 body）200 ok/12 臂、坏 JSON body 422；匿名 GET/POST 均 401。生产库仅 admin 用户，viewer/trader 的 403 由 RBAC MATRIX 锁定（未在生产造临时账号）。
-- **M2 改动在 portal 仓，尚未 commit**（等用户指令）。下一步 M3：新建 `/risk-arms` 评级中心页 + `mapTraderEvent` 增 `risk_gate_blind → risk_alert` 映射。
+- M2 已提交推送（portal 仓 commit **c319698**，main，2 files/26 insertions：proxy.py `_PATH_RULES` + test_proxy_rbac.py MATRIX；提交前已配置仓库级 git 身份）。M3 落地记录见附录 C。
+
+---
+
+## 附录 C：M3 落地记录（2026-09-07 完成）
+
+> M3 阶段（影子臂评级中心页 + 菜单 + 盲信号弹窗）已交付并上线门户容器 **382797cfa3e3**（healthy，镜像 hermes-portal:latest 重建）。trader 侧零改动。
+
+**C1. 改动文件清单**（hermes-portal 仓）
+
+- 新建 `src/modules/operations/RiskArms.vue`：评级中心页（12 臂主表 + 三窗统计 + 成熟度 n/60 进度条 + DATA_GAP 红横幅/整行红底 + 真实成交基线条 + 每晚评级历史表 + 页尾 INERT 红线声明）。
+- `src/router/index.ts`：operator 路由后新增 `risk-arms` 懒加载路由，`meta.perm = operator:mode`，beforeEach 守卫无权限回退 /overview。
+- `app/routers/proxy.py` `menu()`：运维组 children 新增条件菜单项 `{"id":"risk-arms","label":"影子臂评级","path":"/risk-arms","icon":"ShieldAlert"} if can("operator:mode") else None`（图标复用 Sidebar 已有 ShieldAlert 🛡️，未动 Sidebar）。
+- `src/shared/composables/useTraderEventBridge.ts`：`mapTraderEvent` 新增 `risk_gate_blind → risk_alert`（level=danger，手动关闭）映射，复用 alerts 种子已有 `risk_alert` code，**未改 seed.py**；trader 端该事件 operator-only（不在 `_PUBLIC_FEED_EVENTS`），无权限用户收不到。
+- `tests/test_proxy_rbac.py`：新增菜单可见性测试 `test_menu_risk_arms_visibility`（viewer/trader 菜单不含 /risk-arms，operator/admin 含，/config 对照组不受影响）——补齐 /api/portal/menu 端点此前零测试。
+
+**C2. 对接契约落实**
+
+- 读：`GET /api/portal/trader/api/dashboard/shadow-arms/grades?windows=24,72,168`；历史：`.../grade-history?days=30&limit=400`；重评：`POST .../refresh`，body `{"windows":"24,72,168"}`（逗号分隔字符串，数组会 422），响应解构 `{ok,...payload}` 后直接渲染。
+- 字段严格按 shadow_grade 契约：`arms[].windows[]`（total/hits/decisions/hit_rate/mature_outcomes/outcome_wins/losses/pnl_usd_sum）、verdict 六值（DATA_GAP/REVIEW/PROMOTE_CANDIDATE/INSUFFICIENT_DATA/COLLECTING/OFF）、`real_baseline.real_closes/real_win_rate/note`、slim 历史快照。成熟度 = longest-window total/60（MIN_SAMPLES_PROMOTE）。
+- 页面轮询 30s + SSE 订阅（`risk_gate_blind`、`shadow_arms_refresh`，500ms 防抖刷新）+ onMounted 立即加载；onUnmounted 清理 timer/timeout/unsub。
+
+**C3. INERT 红线四重落实**（评级器只评级 + 建议，绝不自动改配置/闸门/下单）
+
+1. 页内无任何改 mode/闸门/下单控件；
+2. PROMOTE_CANDIDATE 行"去升级 →"、REVIEW 行"去复核"仅 `router.push('/config')`，升级动作在 Config 页人工走 config_store 权威写路径；
+3. operator 可见的"⚡ 立即重评"按钮仅调只读 refresh（重算建议，不写历史快照）；
+4. 页尾固定红线声明卡。
+
+**C4. 闸门证据**
+
+- 前端：`npm run type-check`（vue-tsc --noEmit）**0 错**；`npm run build` 成功（dist/assets/RiskArms-*.js ≈11.9 kB）。
+- 后端：门户全量 pytest **14 passed**（M2 的 13 + 菜单测试 1，只增不减）。
+- 经 BFF（https 8443，admin/token）生产冒烟全通：
+  - 菜单 /api/portal/menu 运维组 children = `['/operator','/risk-arms','/config']`，/risk-arms 对 admin 可见；
+  - grades 200 返回 12 臂真实评级（Counter：OFF 5 / PROMOTE_CANDIDATE 3 / INSUFFICIENT_DATA 3 / COLLECTING 1，generated 2026-09-07 16:09 UTC；本轮无 DATA_GAP/REVIEW）；
+  - **real_baseline.real_closes = 15**（M2 冒烟时为 0，现有真钱对照，基线卡显"有真钱对照"）；
+  - refresh 200 ok=true / 12 臂；grade-history 200 count=1；匿名访问 401；
+  - 静态资源新版本 hash（index-*.js 更新）证明新包已上线。
+- viewer/trader 的 403 与菜单不可见由 RBAC MATRIX（M2）+ 菜单可见性测试（C1）锁定（生产库仅 admin，未造临时账号）。
+
+**C5. 验收对照**（第 5 节 #1-7）
+
+- #1 12 臂 mode+verdict 与 shadow_grade 输出一致（冒烟逐条核对）；#2 DATA_GAP 红横幅+整行红底（本轮无 DATA_GAP 臂，渲染逻辑按 verdict=DATA_GAP 触发，blind SSE danger 弹窗链路已通）；#3 PROMOTE 跳 /config 且页内无改闸门控件（C3）；#4 viewer 403/菜单不可见、operator 可读可重评（MATRIX+菜单测试）；#5 grades 走 60s 快照缓存读路径；#6 closes=0 时显"无真钱对照"warn（当前 closes=15 显对照正常）；#7 blind → danger 弹窗需手动关闭（复用 alerts 既有去重/新鲜度机制）。
+- 历史趋势图（grade-history 折线）按计划留待 **M5**（数据积累后），页面历史区已注明"趋势图在 M5 补齐"。
