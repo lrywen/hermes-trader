@@ -90,7 +90,7 @@
 | 阶段 | 内容 | 进入条件 / 出口标准 |
 |---|---|---|
 | **M1 后端 API 铺路** ✅ **已落地 2026-09-07** | trader 侧 grades/refresh/history 3 端点 + shadow_grade 落历史快照；blind 事件补发 SSE；py_compile + 全量 pytest 只增不减 | 出口：curl 取到分级 JSON；blind 时 feed 有事件 — **已达成**（容器 6b029550aced 冒烟全通，2997 passed，详见文末附录 A） |
-| **M2 BFF 接线** | proxy.py `_PATH_RULES` 登记新路径（读/写权限）；如需新增 `risk:read` 则补 RBAC 种子与 `/menu`；nginx 无需改（走 `/api/dashboard/` 已通） | 出口：门户带 token 经 BFF 取数；无 token 写被拒 |
+| **M2 BFF 接线** ✅ **已落地 2026-09-07** | proxy.py `_PATH_RULES` 登记新路径（读/写权限）；nginx 无需改（走 `/api/dashboard/` 已通） | 出口：门户带 token 经 BFF 取数；无 token 写被拒 — **已达成**（容器 5b8beae9d8b9 冒烟全通，门户 pytest 13 passed，详见附录 B） |
 | **M3 影子臂评级中心页** | 新建 `/risk-arms` 页 + 路由/菜单/Store；blind 事件接 AlertPopup | 出口：12 臂评级、三窗统计、DATA_GAP 红横幅、PROMOTE 跳 Config 全可用 |
 | **M4 审计/对账（可并行）** | 台账哈希链卡片、reconcile 状态卡片 | 出口：链校验状态、对账差异可见 |
 | **M5 数据积累后复盘** | grade-history 趋势图、Config 页臂 mode 联动；待 shadow 臂积够样本（PROMOTE/REVIEW）供人工拍板 | 依赖真实影子数据积累，非开发量 |
@@ -154,4 +154,36 @@
 
 - 新增 tests/test_shadow_arms_api.py **15 例**（快照 6 + 端点 7 + blind SSE 2）；全量 pytest **2997 passed / 14 deselected**（基线 2982 净增 15，只增不减）。
 - 容器内冒烟（真实 /data）：grades 返回 12 臂真实评级（ta_late_entry enforce/COLLECTING、sizing_v2 与 atr_regime_calib shadow/PROMOTE_CANDIDATE、pullback OFF）；refresh 401→200；windows 非法 422；cron 路径跑后 grade-history count=1；blind 事件 operator feed 可见、匿名 feed 不泄露。
-- **M1 改动尚未 commit**（等用户指令）；M2 入口：hermes-portal BFF `proxy.py` `_PATH_RULES` 登记 `/api/dashboard/shadow-arms/*`（读放行/写 operator 权限）。
+- M1 已提交推送（trader 仓 commit **baf9b7a**，分支 feat/optimization-v3）。
+
+---
+
+## 附录 B：M2 落地记录（2026-09-07 完成）
+
+> M2 阶段（hermes-portal BFF 接线）已交付并上线门户容器 **5b8beae9d8b9**（healthy，替换 e04389f2a2ae）。trader 侧零改动。
+
+**B1. 路径规则**（portal 仓 `app/routers/proxy.py` `_PATH_RULES`，置于 risk-status 之后、影子账本 `/api/dashboard/shadow/` 之前）
+
+```python
+("/api/dashboard/shadow-arms", "operator:mode", "operator:mode"),
+```
+
+- **读/写统一 `operator:mode`**（仅 operator/admin 角色持有）：评级含各闸门 mode 姿态（off/shadow/enforce）与 DATA_GAP 盲信号，属敏感风控姿态，与 §3"含风控姿态默认 operator 读"、验收 #4（viewer 403）、blind SSE operator-only 一致。**未新增权限码**（评估第 2 节"可新增 risk:read"为可选，复用现有 operator:mode 更小改动、无需动 RBAC 种子/菜单）。
+- 前缀用连字符 `shadow-arms`，与影子账本 `shadow/`（斜杠）`startswith` 互不误匹配——MATRIX 用 `/api/dashboard/shadow/book` 读回归锁定。
+- BFF 转发时自动剥离客户端伪造凭据并注入 `X-Operator-Token`/`X-Internal-Token`/`X-Portal-User`（既有机制，未改）；trader 侧 refresh 的 operator write 校验因此通过。
+- nginx 无需改动（`/api/portal/` 路由已通），与评估预判一致。
+
+**B2. 前端对接契约（M3 用）**
+
+- 经 BFF 的实际请求路径（浏览器同源）：
+  - 读：`GET /api/portal/trader/api/dashboard/shadow-arms/grades?windows=24,72,168`
+  - 读：`GET /api/portal/trader/api/dashboard/shadow-arms/grade-history?days=30&limit=400`
+  - 写：`POST /api/portal/trader/api/dashboard/shadow-arms/refresh`，**body 为 JSON 且 `windows` 为逗号分隔字符串**（如 `{"windows":"24,72,168"}`，与 grades query 同形；传数组会被 trader 端 422）；空 body/`{}` 用默认窗口。
+- viewer/trader 角色调任一影子臂接口 → BFF 直接 403（不触达 trader）；operator/admin 全通。菜单 `/menu` 本期未加项（M3 加 `/risk-arms` 页时用 `can("operator:mode")` 条件下发，仿"操作员控制台"范式）。
+
+**B3. 闸门证据**
+
+- portal 仓 `tests/test_proxy_rbac.py`：MATRIX 增 5 行（grades/grade-history/refresh 三端点 viewer/trader 403、operator/admin 200；影子账本 book 读四角色 200、reset 写 viewer/trader 403 回归）+ 单元断言 8 条（锁死 shadow-arms 读/写 = operator:mode，且不误伤 shadow/ 账本规则）。
+- 门户全量 pytest（.venv）**13 passed** 全绿（假上游 ASGI transport，无真实网络）。
+- 经 BFF（https 8443）生产冒烟：admin 登录后 GET grades 200 返回 12 臂真实评级、grade-history 200 count=1、POST refresh（正确 body）200 ok/12 臂、坏 JSON body 422；匿名 GET/POST 均 401。生产库仅 admin 用户，viewer/trader 的 403 由 RBAC MATRIX 锁定（未在生产造临时账号）。
+- **M2 改动在 portal 仓，尚未 commit**（等用户指令）。下一步 M3：新建 `/risk-arms` 评级中心页 + `mapTraderEvent` 增 `risk_gate_blind → risk_alert` 映射。
