@@ -219,6 +219,60 @@ def test_promote_when_outcomes_are_healthy(sg):
     assert out["verdict"] == sg.PROMOTE
 
 
+# ── change-arm outcome labels are reported arm-beneficial, NOT raw win-rate ──
+# Audit 2026-09-08 (change-arm label fix): outcome "win" means counterfactual
+# pnl>0 => v1 beats v2 => adopting the CHANGE arm foregoes profit (arm harmful).
+# For a change arm the raw win-rate therefore reads inverted; the report must
+# surface the arm-beneficial rate (outcome=loss) so a healthy arm is not
+# described as a high win-rate for the wrong reason.
+
+def test_change_arm_promote_reason_reports_arm_beneficial_rate(sg):
+    now = 1_700_000_000_000.0
+    recs = []
+    # 25 mature outcomes: 22 beneficial (outcome=loss, v2 outperforms),
+    # 3 harmful (outcome=win, v1 beats v2); pnl_usd sum negative (v2 earns more).
+    for i in range(22):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="loss", pnl_usd=-1.0))
+    for i in range(3):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="win", pnl_usd=0.5))
+    for i in range(40):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0))
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.PROMOTE
+    assert out["kind"] == "change"
+    # The arm-beneficial rate (22/25 = 88%) must be shown, and the misleading
+    # bare "回填胜率" phrasing must NOT appear for a change arm.
+    assert "臂有益率" in out["reason"]
+    assert "88%" in out["reason"]
+    assert "回填胜率" not in out["reason"]
+
+
+def test_change_arm_report_lines_label_outcomes_arm_beneficial(sg):
+    d = {
+        "generated_at": "2026-09-08 00:00 UTC",
+        "windows_h": [168],
+        "arms": [
+            {"arm": "sizing_v2", "mode": "shadow", "kind": "change",
+             "verdict": sg.PROMOTE, "verdict_cn": sg._VERDICT_CN[sg.PROMOTE],
+             "reason": "健康",
+             "windows": [{"window_h": 168, "total": 300, "hits": 236,
+                          "decisions": 300, "hit_rate": 0.787,
+                          "mature_outcomes": 200, "outcome_wins": 134,
+                          "outcome_losses": 66, "pnl_usd_sum": -21.23,
+                          "has_pnl": True}]},
+        ],
+        "real_baseline": {"real_closes": 0, "real_win_rate": None, "note": "n"},
+    }
+    report = sg._fmt_report(d)
+    # change arm: outcome_wins(134) are the HARMFUL cases, outcome_losses(66)
+    # are BENEFICIAL. The labels must be 臂有益/臂有害 (not 胜/负).
+    assert "臂有益66" in report
+    assert "臂有害134" in report
+
+
 # ── signal-kind arm uses is_candidate/tripped, not would_block ────────────────
 
 def test_signal_arm_grades_on_candidate_field(sg):

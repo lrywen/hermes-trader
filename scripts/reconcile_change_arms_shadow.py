@@ -433,7 +433,22 @@ def _report(arm: str, settled: List[Dict[str, Any]]) -> None:
     wins = [r for r in settled if r["outcome"] == "win"]
     losses = [r for r in settled if r["outcome"] == "loss"]
     print(f"\n=== [{arm}] counterfactual: {len(settled)} mature material records ===")
-    print(f"  win rate : {len(wins)}/{len(settled)} = {len(wins)/len(settled)*100:.1f}%")
+    # Audit 2026-09-08 (change-arm label fix): outcome "win" is encoded for
+    # EVERY arm as "counterfactual pnl > 0 => the arm's intervention forgoes
+    # profit / hurts" (see the outcome assignment above). For sizing_v2 /
+    # atr_regime_calib that is "v1 beats v2 => adopting the change costs
+    # return"; for confidence_decay it is "the skipped trade would have
+    # profited => the arm skipped a winner". In every case win = arm-HARMFUL
+    # and loss = arm-BENEFICIAL, so report the arm-beneficial rate (losses),
+    # never a literal "win rate".
+    if arm == "confidence_decay":
+        good = "skipped trade would have lost (arm avoided a loss)"
+    else:
+        good = "v2 outperforms v1"
+    print(f"  arm-beneficial rate ({good}, outcome=loss): "
+          f"{len(losses)}/{len(settled)} = {len(losses)/len(settled)*100:.1f}%")
+    print(f"    (arm-harmful={len(wins)}  arm-beneficial={len(losses)}; "
+          f"outcome 'win' here means the arm forgoes profit / hurts)")
     pnl_usd = [r["pnl_usd"] for r in settled if isinstance(r.get("pnl_usd"), (int, float))]
     if pnl_usd:
         print(f"  sum pnl_usd (v1-v2 profit foregone by adopting the arm; "

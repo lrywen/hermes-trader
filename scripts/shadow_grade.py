@@ -293,8 +293,20 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
                       f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— 拦太宽，疑似误伤")
         else:
             verdict = PROMOTE if mode == "shadow" else COLLECTING
-            reason = (f"{w_long}h {longest['total']} 条、命中率 "
-                      f"{longest['hit_rate']:.1%}、回填胜率 {wr:.0%}，信号健康")
+            if kind == "change":
+                # Audit 2026-09-08 (change-arm label fix): outcome "win" is
+                # encoded for ALL arms as "counterfactual pnl > 0 => the arm
+                # foregoes profit / hurts". For a change arm that means win =
+                # arm-HARMFUL and loss = arm-BENEFICIAL, so the raw win-rate is
+                # inverted vs the plain reading. Report the arm-beneficial rate
+                # (1 - wr) instead to avoid misleading the rollout decision.
+                reason = (f"{w_long}h {longest['total']} 条、命中率 "
+                          f"{longest['hit_rate']:.1%}、反事实臂有益率 "
+                          f"{1 - wr:.0%}（outcome 负={longest['outcome_losses']}/"
+                          f"{longest['mature_outcomes']}），信号健康")
+            else:
+                reason = (f"{w_long}h {longest['total']} 条、命中率 "
+                          f"{longest['hit_rate']:.1%}、回填胜率 {wr:.0%}，信号健康")
     else:
         # Enough records but no backfilled outcomes yet.
         rate = longest["hit_rate"]
@@ -355,11 +367,19 @@ def _fmt_report(d: dict) -> str:
     for a in sorted(d["arms"], key=lambda x: order.get(x["verdict"], 9)):
         lines.append(f"{a['arm']:20s} {a['mode']:8s} {a['kind']:6s} "
                      f"{a['verdict_cn']:28s} {a['reason']}")
+        # Audit 2026-09-08 (change-arm label fix): outcome win/loss is encoded
+        # for all arms as "win = counterfactual pnl>0 => the arm foregoes profit
+        # (arm hurts)". For change arms a "win" therefore means arm-HARMFUL;
+        # relabel so the night report doesn't read as the arm's own win-rate.
+        if a.get("kind") == "change":
+            oc_good, oc_bad = "臂有益", "臂有害"
+        else:
+            oc_good, oc_bad = "胜", "负"
         for s in a["windows"]:
             lines.append(f"{'':36s}{s['window_h']:>4d}h: {s['total']:>5d} 条  "
                          f"命中 {s['hits']:>4d}/{s['decisions']:<4d} "
                          f"({s['hit_rate']:.1%})  回填 outcome {s['mature_outcomes']} "
-                         f"(胜{s['outcome_wins']}/负{s['outcome_losses']})")
+                         f"({oc_good}{s['outcome_losses']}/{oc_bad}{s['outcome_wins']})")
     b = d["real_baseline"]
     lines.append("-" * 100)
     lines.append(f"真实成交基线：closes={b['real_closes']}  "
