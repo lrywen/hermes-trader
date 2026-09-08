@@ -2985,6 +2985,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     mid_price = 0.0
     atr = 0.0
     size_in_coin = 0.0
+    # Audit 2026-09-08 (sizing-v2 gray floor): set True only on the
+    # primary-stop v2 enforce path when sizing_v2_cap_pct scales the notional
+    # down; read by the shared min-order gate below. Defaults False everywhere
+    # else so non-gray undersizing keeps the strict 50% bump-gap rejection.
+    _gray_scaled = False
 
     if _atr_sizing_enabled:
         coin = analysis["coin"]
@@ -3137,6 +3142,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 if _v2_cap_pct < 1.0:
                     trade_notional = trade_notional * _v2_cap_pct
                     _clamped.append(f"gray_{int(_v2_cap_pct*100)}pct")
+                    _gray_scaled = True
             logger.info(
                 f"[executor] primary-stop equal-risk sizing {coin}: notional ${trade_notional:.0f} "
                 f"(risk ${trade_notional*_stop_frac:.2f} @ {_stop_frac*100:.2f}% stop"
@@ -3251,11 +3257,22 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             # stop still caps downside. If the gap is absurd (>50%), reject to
             # avoid unintended oversized risk.
             bump_gap = (min_notional - trade_notional) / trade_notional if trade_notional > 0 else 999
-            if bump_gap <= 0.50:
+            # Audit 2026-09-08 (sizing-v2 gray floor): when the undersize is
+            # caused by the deliberate sizing_v2_cap_pct gray scale-down (a
+            # known, bounded reduction on an account whose size is already
+            # pinned at the notional_cap), bump to the exchange minimum even if
+            # the gap exceeds 50%. The resulting risk is still capped by the
+            # tighter v2 stop and the notional_cap; without this, a small gray
+            # cap (e.g. 0.10) rejects 100% of orders and the gray release
+            # gathers no fills. All other undersizing keeps the strict gate.
+            if _gray_scaled or bump_gap <= 0.50:
+                _bump_tag = " gray-cap floor" if _gray_scaled and bump_gap > 0.50 else ""
                 logger.info(
                     f"[executor] {coin} notional ${trade_notional:.2f} below HL minimum "
-                    f"${min_notional:.2f} — bumping up (+{bump_gap*100:.1f}% risk)"
+                    f"${min_notional:.2f} — bumping up{_bump_tag} (+{bump_gap*100:.1f}% risk)"
                 )
+                if _gray_scaled and bump_gap > 0.50:
+                    _record_sizing_clamped("gray_floor_bump")
                 trade_notional = min_notional
             else:
                 return {

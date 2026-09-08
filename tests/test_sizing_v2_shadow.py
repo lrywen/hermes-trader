@@ -322,3 +322,51 @@ def test_legacy_boolean_enforce_behaves_like_enforce(monkeypatch, tmp_path):
     res = executor.maybe_execute(_analysis())
     assert res.get("reason") == "shadow_mode_would_execute"
     assert abs(captured["ctx"].trade_notional_usd - 100.0) < 1e-6
+
+
+def test_enforce_gray_cap_bumps_sub_min_to_floor(monkeypatch, tmp_path):
+    """ENFORCE gray floor (Audit 2026-09-08): when the gray cap scales the
+    notional below the exchange minimum by MORE than the usual 50% bump-gap,
+    the order is still bumped to the minimum instead of rejected — otherwise a
+    small gray cap (e.g. 0.10 on a micro account) rejects 100% of orders and
+    the gray release gathers no fills. The v2 stop and notional_cap still cap
+    the resulting risk."""
+    monkeypatch.setenv(_ENV_MODE, "enforce")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    captured = _wire_executor(monkeypatch, tmp_path, {}, shadow_file)
+    # Gray-scaled notional is $100 (see test_enforce_applies_v2_width...);
+    # a $200 minimum means a 100% gap — past the strict 50% reject gate.
+    monkeypatch.setattr(executor, "min_entry_notional_usd",
+                        lambda _c, _m: 200.0)
+
+    res = executor.maybe_execute(_analysis())
+    # Not rejected: bumped to the exchange minimum and paper-booked as usual.
+    assert res.get("reason") == "shadow_mode_would_execute"
+    assert abs(captured["ctx"].trade_notional_usd - 200.0) < 1e-6
+    assert abs(captured["shadow_open"]["size_usd"] - 200.0) < 1e-6
+
+
+def test_non_gray_sub_min_still_rejected_past_gap(monkeypatch, tmp_path):
+    """The gray floor must NOT weaken the fail-closed gate for non-gray
+    undersizing: with cap_pct=1.0 (no gray scale-down), a notional that sits
+    >50% under the exchange minimum is still rejected."""
+    monkeypatch.setenv(_ENV_MODE, "enforce")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    captured = _wire_executor(
+        monkeypatch, tmp_path,
+        {"atr_risk_sizing": {"enabled": True, "risk_per_trade_pct": 0.02,
+                             "sizing_basis": "primary_stop",
+                             "sizing_v2_cap_pct": 1.0}},
+        shadow_file)
+    # No gray scale-down: notional is $1000 (1x lev cap); a $2000 minimum is a
+    # 100% gap — the strict 50% gate must reject.
+    monkeypatch.setattr(executor, "min_entry_notional_usd",
+                        lambda _c, _m: 2000.0)
+
+    res = executor.maybe_execute(_analysis())
+    assert res.get("executed") is False
+    assert "below_min_order_notional" in res.get("reason", "")
+    # No order/paper-book reached the gates.
+    assert "ctx" not in captured
