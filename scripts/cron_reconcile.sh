@@ -35,6 +35,18 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --window-hours "$WINDOW_HOURS" --alert-on-orphan
   rc=$?
   echo "$(ts) reconcile exit=$rc"
+
+  # Audit 2026-09-08 (change-arm counterfactual backfill): backfill the three
+  # "change" shadow arms (sizing_v2 / atr_regime_calib / confidence_decay) with
+  # counterfactual outcomes so the 00:45 UTC grader (shadow_grade) has mature
+  # outcomes + pnl to judge instead of the perpetual "no backfill" weak signal.
+  # Pure paper: never places orders or writes config. Best-effort: shadow
+  # backfill must never mask or alter the fills reconcile exit code above.
+  echo "$(ts) change-arm shadow backfill start (window=${HERMES_CHANGE_ARM_WINDOW:-30}h)"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_change_arms_shadow.py \
+    --window-hours "${HERMES_CHANGE_ARM_WINDOW:-30}" --write
+  echo "$(ts) change-arm shadow backfill exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1

@@ -164,23 +164,57 @@ def _record_ts_ms(rec: dict):
     return None
 
 
+def _shadow_files(path: str) -> list[str]:
+    """Active shadow file plus its daily/size-rotated siblings, oldest->newest.
+
+    Audit 2026-09-08 (rotation-aware grading): shadow_log.append_jsonl rotates
+    each local day (and on 10 MiB) through ``<path>.1``..``<path>.5`` (see
+    hermes_trader/shadow_log.py). The active file therefore holds only the
+    current day, but the grader's longest window is 168h. We merge the active
+    file with the numeric rotated siblings so the trailing windows actually see
+    history. ``.bak-*`` manual snapshots are skipped (non-numeric suffix). The
+    grader is strictly INERT: it only ever READS these files, never writes.
+    """
+    import glob as _glob
+    files = []
+    nums = []
+    for p in _glob.glob(f"{path}.*"):
+        suf = p[len(path) + 1:]
+        if suf.isdigit():
+            nums.append((int(suf), p))
+    # .5 is oldest, .1 is newest sibling; read oldest-first so the active file
+    # (appended last) wins if a line ever appears twice.
+    for _, p in sorted(nums, key=lambda x: -x[0]):
+        files.append(p)
+    if os.path.exists(path):
+        files.append(path)
+    return files
+
+
 def _read_jsonl(path: str) -> list[dict]:
-    """Read a shadow JSONL (best-effort; skip blank/non-JSON lines)."""
+    """Read a shadow JSONL and its rotated siblings (best-effort).
+
+    Merges the active file with numeric ``.1``..``.5`` rotations and de-dups by
+    raw line so a record present in two files is counted once. Read-only: the
+    grader never writes back (INERT)."""
     out = []
-    if not path or not os.path.exists(path):
+    if not path:
         return out
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            for ln in fh:
-                ln = ln.strip()
-                if not ln:
-                    continue
-                try:
-                    out.append(json.loads(ln))
-                except (json.JSONDecodeError, ValueError):
-                    continue
-    except OSError:
-        return []
+    seen_lines: set[str] = set()
+    for fpath in _shadow_files(path):
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    ln = ln.strip()
+                    if not ln or ln in seen_lines:
+                        continue
+                    seen_lines.add(ln)
+                    try:
+                        out.append(json.loads(ln))
+                    except (json.JSONDecodeError, ValueError):
+                        continue
+        except OSError:
+            continue
     return out
 
 
