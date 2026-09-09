@@ -2041,7 +2041,7 @@ def _config_apply(updates: dict[str, Any], backup: bool = False) -> dict[str, An
     "new": <key: applied value>}``; an unset key's prior value is reported as
     None (web API) or ``"<unset>"`` by callers that render it as text."""
     with _config_rmw_lock:
-        with update_agent_config(backup=backup) as cfg:
+        with update_agent_config(backup=backup, via="web_api") as cfg:
             old_snapshot = {k: cfg.get(k) for k in updates}
             cfg.update(updates)
         return {"old": old_snapshot, "new": {k: cfg.get(k) for k in updates}}

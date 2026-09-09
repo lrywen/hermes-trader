@@ -1075,7 +1075,9 @@ def handle_config(params: Dict[str, Any]) -> str:
         "runner_mover_surface_enabled",
     }
     if any(k in params for k in _setting_keys):
-        write_agent_config(config)
+        # CS-A: tag the write so the config_write audit event identifies the
+        # MCP path (previously MCP writes left no audit trace at all).
+        write_agent_config(config, via="mcp")
 
     return json.dumps(config)
 

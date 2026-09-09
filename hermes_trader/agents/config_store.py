@@ -2226,13 +2226,101 @@ def _read_raw_locked() -> Optional[dict[str, Any]]:
         return None
 
 
-def write_agent_config(cfg: dict[str, Any], *, backup: bool = True) -> None:
+def _emit_config_write_audit(
+    *, via: str, new_cfg: dict[str, Any], backup: bool
+) -> None:
+    """CS-A (2026-09-08): emit a best-effort ``config_write`` session-log
+    event after a successful on-disk config write.
+
+    Before CS-A the ONLY config write that produced an audit record was the
+    dashboard HTTP API (``config_update``); direct writes from the MCP
+    server, CLI, weekly calibration script, backup/snapshot restores, or a
+    hand-held python session left no trace. The file-integrity watchers
+    (hermes-config-watch) DO see the file change, so a config file mutation
+    without a matching audit event is now an actionable incident signal.
+    The ``via`` label identifies the write path (e.g. ``mcp``,
+    ``weekly_calibrate``, ``cli``, ``web_api``, ``restore_backup``,
+    ``unknown``); ``changed_keys`` is the set of top-level keys whose
+    normalized JSON differs from the pre-write raw file. This function must
+    NEVER raise — auditing cannot be allowed to break a valid write.
+    """
+    try:
+        # Called AFTER the write: the on-disk file is already the new cfg,
+        # so the prior state is reconstructed from the .bak just refreshed
+        # by _write_raw_locked. When backup=False, changed_keys is reported
+        # as null (the caller chose not to keep the prior state).
+        prior = None
+        if backup:
+            try:
+                with open(_BACKUP_PATH, "r") as f:
+                    prior = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                prior = None
+        new_eff = _effective_view_for_diff(new_cfg)
+        # CS-E: 计算写入前后的 era 指纹，作为离线 era 分段的边界信号。
+        new_era = _era_id_from_subset(_extract_tracked_subset(new_eff))
+        changed: Optional[list[str]]
+        old_changed: Optional[dict[str, Any]]
+        new_changed: Optional[dict[str, Any]]
+        prev_era: Optional[str]
+        if prior is not None:
+            # Compare EFFECTIVE views: the .bak holds the raw (sparse,
+            # hand-editable) file while the just-written cfg is usually the
+            # full CANONICAL_DEFAULTS-merged view (update_agent_config RMW).
+            # Normalize both through the same merge so only real operator
+            # changes show up in changed_keys. CS-D verdict 5: the diff view
+            # also re-materializes canonical None defaults (null ≡ missing),
+            # otherwise the RMW full view's explicit null stubs —
+            # debate_research.bull_timeout_s / synth_timeout_s — get deleted
+            # by _deep_merge on one side only and every no-op write cries
+            # wolf on the enclosing section.
+            prior_eff = _effective_view_for_diff(prior)
+            prev_era = _era_id_from_subset(_extract_tracked_subset(prior_eff))
+            keys = sorted(set(prior_eff) | set(new_eff))
+            changed = sorted(
+                k for k in keys
+                if json.dumps(prior_eff.get(k), sort_keys=True, default=str)
+                != json.dumps(new_eff.get(k), sort_keys=True, default=str)
+            )
+            # CS-E: 携带发生变化的顶层键的 old/new 完整值，供 era 边界严格
+            # 重建；体量受限于本次实际改动的键。
+            old_changed = {k: prior_eff.get(k) for k in changed}
+            new_changed = {k: new_eff.get(k) for k in changed}
+        else:
+            changed = None
+            old_changed = None
+            new_changed = None
+            prev_era = None
+        from hermes_trader import session_log
+
+        session_log.append({
+            "event": "config_write",
+            "via": str(via or "unknown"),
+            "path": CONFIG_PATH,
+            "backup": bool(backup),
+            "changed_keys": changed,
+            "key_count": len(new_cfg),
+            "old": old_changed,
+            "new": new_changed,
+            "prev_era_id": prev_era,
+            "era_id": new_era,
+        })
+    except Exception:  # pragma: no cover - audit must never break the write
+        logger.debug("[config] config_write audit emit failed", exc_info=True)
+
+
+def write_agent_config(
+    cfg: dict[str, Any], *, backup: bool = True, via: str = "unknown"
+) -> None:
     """Write the agent config to .agent-config.json (atomic replace + lock).
 
     F20: thin flock wrapper around :func:`_write_raw_locked` so the write
     body can run inside the exclusive lock already held by
     :func:`update_agent_config` (a second LOCK_EX fd in the same process
     would self-deadlock — flock binds to the open file description).
+
+    CS-A: *via* labels the write path in the best-effort ``config_write``
+    audit event emitted after a successful persist.
     """
     lock_fd = None
     try:
@@ -2250,6 +2338,7 @@ def write_agent_config(cfg: dict[str, Any], *, backup: bool = True) -> None:
         # D-FCFG-4).
         _validate_or_raise(cfg, source="write_agent_config", strict_keys=False)
         _write_raw_locked(cfg, backup=backup)
+        _emit_config_write_audit(via=via, new_cfg=cfg, backup=backup)
     except OSError as e:
         logger.error(f"[config] FAILED to write {CONFIG_PATH}: {e}")
         raise
@@ -2303,7 +2392,9 @@ def _write_raw_locked(cfg: dict[str, Any], *, backup: bool = True) -> None:
 
 
 @contextmanager
-def update_agent_config(*, backup: bool = True) -> Iterator[dict[str, Any]]:
+def update_agent_config(
+    *, backup: bool = True, via: str = "unknown"
+) -> Iterator[dict[str, Any]]:
     """F20: cross-process read-modify-write critical section for the agent
     config.
 
@@ -2350,6 +2441,7 @@ def update_agent_config(*, backup: bool = True) -> Iterator[dict[str, Any]]:
         # to preserve the historical round-trip contract.
         _validate_or_raise(cfg, source="update_agent_config", strict_keys=False)
         _write_raw_locked(cfg, backup=backup)
+        _emit_config_write_audit(via=via, new_cfg=cfg, backup=backup)
     finally:
         if lock_fd is not None:
             try:
@@ -2391,7 +2483,7 @@ def restore_backup() -> bool:
     if old is None:
         return False
     try:
-        write_agent_config(old, backup=False)
+        write_agent_config(old, backup=False, via="restore_backup")
     except RuntimeError as e:
         # The .bak is corrupt — surface a clear log line distinct from
         # the generic write rejection so the operator can tell which
@@ -2505,7 +2597,7 @@ def restore_snapshot(ts: int) -> bool:
         # Do not overwrite the rolling .bak with the snapshot itself; a
         # restore is a recovery action, not a normal edit.
         try:
-            write_agent_config(old, backup=False)
+            write_agent_config(old, backup=False, via="restore_snapshot")
         except RuntimeError as e:
             logger.error(
                 f"[config] refusing to restore from snapshot {path}: {e}"

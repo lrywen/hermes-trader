@@ -328,7 +328,7 @@ def cmd_config(*args: str) -> None:
 
         # F20: read-modify-write under one cross-process exclusive flock so
         # a concurrent dashboard/server write cannot be clobbered.
-        with update_agent_config() as config:
+        with update_agent_config(via="cli") as config:
             _mutate(config)
         print("\n  ✓ Config updated.\n")
 

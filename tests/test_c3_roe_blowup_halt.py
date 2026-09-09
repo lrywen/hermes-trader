@@ -49,7 +49,7 @@ def halt_env(monkeypatch):
         return node
 
     @contextlib.contextmanager
-    def _fake_update(backup=True):
+    def _fake_update(backup=True, via="unknown"):
         cfg = _fake_read_config()
         yield cfg
         # persist the mode switch back into state, mirroring the RMW write
@@ -165,7 +165,7 @@ def test_never_raises_when_side_effects_fail(halt_env, monkeypatch):
     state, event_log = halt_env
 
     @contextlib.contextmanager
-    def _boom(backup=True):
+    def _boom(backup=True, via="unknown"):
         raise RuntimeError("config file corrupt")
         yield  # pragma: no cover
 

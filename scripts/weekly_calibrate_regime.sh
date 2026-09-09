@@ -21,6 +21,16 @@
 set -euo pipefail
 
 REPO_DIR="/home/ldy/hermes-trader"
+# CS-A (2026-09-08): the LIVE config is NOT $REPO_DIR/.agent-config.json —
+# docker-compose bind-mounts /home/ldy/hermes-deploy/.agent-config.json onto
+# /data/.agent-config.json in the container, and the container sets
+# HERMES_AGENT_CONFIG_FILE=/data/.agent-config.json. This script runs on the
+# HOST from cron (no container env), so without an explicit export the
+# embedded python read/wrote the repo-root file (which nothing reads) and the
+# `cp` snapshots silently missed — the weekly calibration never reached
+# production. Default to the host path of the live file; an operator may
+# override HERMES_AGENT_CONFIG_FILE for dry-run/test environments.
+export HERMES_AGENT_CONFIG_FILE="${HERMES_AGENT_CONFIG_FILE:-/home/ldy/hermes-deploy/.agent-config.json}"
 ARCHIVE_DIR="${ARCHIVE_DIR:-/var/lib/hermes-trader/regime_calib}"
 DAYS="${DAYS:-30}"
 COINS="${COINS:-20}"
@@ -137,7 +147,13 @@ if [[ "$VERDICT" == "PROMOTE" ]]; then
     SLOPE="$(echo "$PROMOTE_OUT"  | sed -n 's/^SLOPE=//p')"
     ADX="$(echo "$PROMOTE_OUT"    | sed -n 's/^ADX=//p')"
 
-    cp .agent-config.json "$RUN_DIR/agent_config_before.json"
+    # CS-A: fail closed — never promote into a missing/wrong config path.
+    if [[ ! -f "$HERMES_AGENT_CONFIG_FILE" ]]; then
+        echo "[$(date -Iseconds)] ERROR: live config not found at $HERMES_AGENT_CONFIG_FILE (HERMES_AGENT_CONFIG_FILE) — aborting promotion" >&2
+        exit 3
+    fi
+    echo "[$(date -Iseconds)] promoting into live config: $HERMES_AGENT_CONFIG_FILE"
+    cp "$HERMES_AGENT_CONFIG_FILE" "$RUN_DIR/agent_config_before.json"
     python3 - "$FAST" "$SLOW" "$SLOPE" "$ADX" <<'PYEOF'
 import sys
 sys.path.insert(0, ".")
@@ -148,10 +164,10 @@ cfg["regime_classifier"] = {
     "fast_ema": fast, "slow_ema": slow,
     "slope_threshold": slope, "chop_adx_max": adx,
 }
-write_agent_config(cfg)
+write_agent_config(cfg, via="weekly_calibrate")
 print(f"[config] regime_classifier updated -> fast={fast} slow={slow} slope={slope} adx<{adx}")
 PYEOF
-    cp .agent-config.json "$RUN_DIR/agent_config_after.json"
+    cp "$HERMES_AGENT_CONFIG_FILE" "$RUN_DIR/agent_config_after.json"
     echo "[$(date -Iseconds)] config promoted and snapshotted in $RUN_DIR"
 elif [[ "$VERDICT" == "REJECT" ]]; then
     echo "[$(date -Iseconds)] best params rejected by guardrails — config unchanged" >&2

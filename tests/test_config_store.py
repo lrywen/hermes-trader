@@ -347,6 +347,92 @@ def test_restore_snapshot_does_not_self_deadlock(tmp_path, monkeypatch):
     assert restored["leverage"] == 7
 
 
+# ── CS-A: universal config_write audit net (2026-09-08) ────────────────────
+
+def _config_write_events(path: str) -> list[dict]:
+    out = []
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if rec.get("event") == "config_write":
+                out.append(rec)
+    return out
+
+
+def test_config_write_audit_emitted_on_write(tmp_path, monkeypatch):
+    """Every successful on-disk write leaves a config_write record carrying
+    the via label and the effective-view diff (real keys only, not the
+    whole CANONICAL_DEFAULTS surface)."""
+    from hermes_trader import session_log
+    from hermes_trader.agents.config_store import update_agent_config
+
+    cfg_file = tmp_path / ".agent-config.json"
+    log_file = tmp_path / "session-log.jsonl"
+    monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
+    monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(log_file))
+
+    write_agent_config({"mode": "LIVE", "leverage": 10}, backup=False, via="test")
+    # RMW path: change exactly one key through the full-merge context manager.
+    with update_agent_config(via="mcp") as cfg:
+        cfg["leverage"] = 8
+
+    evts = _config_write_events(str(log_file))
+    assert len(evts) == 2
+    assert evts[0]["via"] == "test"
+    assert evts[0]["backup"] is False
+    assert evts[0]["changed_keys"] is None      # backup=False → no prior state
+    # Second write: leverage MUST be the ONLY key in the diff. The diff is
+    # computed on the effective view, so the full CANONICAL_DEFAULTS surface
+    # must NOT flood it — and CS-D verdict 5 additionally removes the
+    # None-stub noise: debate_research.bull_timeout_s/synth_timeout_s round-
+    # trip as explicit nulls in the full RMW view but are the same effective
+    # state as a missing key, so the enclosing section must not cry wolf.
+    assert evts[1]["via"] == "mcp"
+    assert evts[1]["backup"] is True
+    changed = evts[1]["changed_keys"]
+    assert changed == ["leverage"]
+    assert "mode" not in changed                # untouched top-level key stays out
+    assert "debate_research" not in changed     # None-stub noise eliminated
+
+
+def test_rmw_noop_write_reports_empty_diff(tmp_path, monkeypatch):
+    """CS-D verdict 5: an RMW context manager that changes NOTHING must not
+    cry wolf — the full-view rewrite (sparse .bak vs defaults-merged full
+    view, with debate_research null stubs oscillating per write) reports an
+    empty changed_keys on the first AND a repeated no-op write."""
+    from hermes_trader import session_log
+    from hermes_trader.agents.config_store import update_agent_config
+
+    cfg_file = tmp_path / ".agent-config.json"
+    log_file = tmp_path / "session-log.jsonl"
+    monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
+    monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(log_file))
+
+    write_agent_config({"mode": "LIVE", "leverage": 10}, backup=False, via="test")
+    # Two no-op RMW passes back to back: the stubs oscillate null/missing on
+    # each full-view write, so a naive diff fires on alternating writes.
+    with update_agent_config(via="mcp"):
+        pass
+    with update_agent_config(via="mcp"):
+        pass
+
+    evts = _config_write_events(str(log_file))
+    rmw_evts = [e for e in evts if e["via"] == "mcp"]
+    assert len(rmw_evts) == 2
+    assert all(e["changed_keys"] == [] for e in rmw_evts), \
+        f"no-op RMW writes must report no changed keys, got {[e['changed_keys'] for e in rmw_evts]}"
+
+
 def test_effective_view_null_stub_equals_missing():
     """CS-D verdict 5 unit check: a sparse raw config without the
     debate_research timeout stubs and a full view carrying them as explicit
@@ -373,6 +459,59 @@ def test_effective_view_null_stub_equals_missing():
     changed = copy.deepcopy(_deep_merge(CANONICAL_DEFAULTS, sparse))
     changed["debate_research"]["max_latency_s"] = 99.0
     assert _effective_view_for_diff(changed) != _effective_view_for_diff(sparse)
+
+
+def test_config_write_audit_restore_paths_labeled(tmp_path, monkeypatch):
+    """restore_backup / restore_snapshot write via write_agent_config and so
+    must also leave a config_write trail with their own via labels."""
+    from hermes_trader import session_log
+    from hermes_trader.agents.config_store import _snap_path
+
+    cfg_file = tmp_path / ".agent-config.json"
+    log_file = tmp_path / "session-log.jsonl"
+    monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
+    monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
+    monkeypatch.setattr(config_store, "_SNAP_PREFIX", str(cfg_file) + ".snap.")
+    monkeypatch.setattr(config_store, "_SNAP_SUFFIX", ".json")
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(log_file))
+
+    write_agent_config({"mode": "ORIGINAL", "leverage": 7}, backup=False)
+    write_agent_config({"mode": "CHANGED", "leverage": 99}, backup=True)
+    assert restore_backup() is True
+
+    write_agent_config({"mode": "CHANGED2", "leverage": 50}, backup=False)
+    ts = 1700000999
+    with open(_snap_path(ts), "w") as f:
+        json.dump({"mode": "SNAPPED", "leverage": 3}, f)
+    from hermes_trader.agents.config_store import restore_snapshot
+    assert restore_snapshot(ts) is True
+
+    vias = [e["via"] for e in _config_write_events(str(log_file))]
+    assert "restore_backup" in vias
+    assert "restore_snapshot" in vias
+    # Restore writes pass backup=False → changed_keys null (no .bak refresh).
+    restore_evts = [e for e in _config_write_events(str(log_file))
+                    if e["via"].startswith("restore_")]
+    assert all(e["changed_keys"] is None for e in restore_evts)
+
+
+def test_config_write_audit_never_breaks_write(tmp_path, monkeypatch):
+    """If the session log is unwritable, the config write still succeeds —
+    auditing is best-effort and must never block a valid write."""
+    from hermes_trader import session_log
+
+    cfg_file = tmp_path / ".agent-config.json"
+    # Point the session log at a directory path → open() raises OSError,
+    # which append() swallows.
+    monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
+    monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
+    monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(tmp_path))
+
+    write_agent_config({"mode": "SURVIVES", "leverage": 11}, backup=False, via="test")
+    assert read_agent_config()["mode"] == "SURVIVES"
+    assert read_agent_config()["leverage"] == 11
 
 
 # ── _env_override key mapping ───────────────────────────────────────────────

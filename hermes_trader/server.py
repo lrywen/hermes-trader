@@ -934,7 +934,7 @@ async def update_config(request: Request) -> JSONResponse:
         raise HTTPException(422, json.dumps({"errors": errors}))
     write_body = {k: v for k, v in body.items() if k != "confirm_token"}
     try:
-        with update_agent_config() as cfg:
+        with update_agent_config(via="web_api_legacy") as cfg:
             merged = _deep_merge(cfg, write_body)
             cfg.clear()
             cfg.update(merged)

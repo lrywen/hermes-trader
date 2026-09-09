@@ -1101,6 +1101,14 @@ def _atr_calib_apply(
 #             sizing_v2_enabled=true behavior).
 _SIZING_V2_MODES = ("off", "shadow", "enforce")
 
+# CS-A (2026-09-08): warn once per process when an env gray-release override
+# disagrees with the persisted config. The env wins by design (deliberate
+# emergency flip), but a persistent mismatch means a container recreated
+# without the env (or a stale config value) would silently change behavior —
+# the operator needs an explicit, visible signal rather than two "sources of
+# truth" drifting apart.
+_SIZING_V2_MISMATCH_WARNED = False
+
 
 def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the sizing v2 gray-release mode.
@@ -1110,6 +1118,7 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
     the merged agent config, then the legacy boolean
     ``atr_risk_sizing.sizing_v2_enabled`` (true → enforce, for backward
     compatibility). Invalid values fall back to off."""
+    global _SIZING_V2_MISMATCH_WARNED
     blk = config.get("atr_risk_sizing") or {}
     mode = ""
     env_mode = str(os.environ.get("HERMES_SIZING_V2_MODE") or "").strip().lower()
@@ -1123,6 +1132,31 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
             mode = "enforce"
     if mode not in _SIZING_V2_MODES:
         mode = "off"
+    # CS-A: one-time env-vs-config drift alarm (env wins; config is stale).
+    if not _SIZING_V2_MISMATCH_WARNED:
+        cfg_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
+        if cfg_mode and env_mode and env_mode in _SIZING_V2_MODES and cfg_mode != env_mode:
+            _SIZING_V2_MISMATCH_WARNED = True
+            logger.warning(
+                "[config] sizing v2 mode drift: HERMES_SIZING_V2_MODE=%r "
+                "(env, ACTIVE) differs from atr_risk_sizing.sizing_v2_mode=%r "
+                "(config file). Env override wins, but the persisted config is "
+                "stale — reconcile .env.local vs .agent-config.json so a "
+                "container recreate without the env does not silently change "
+                "sizing behavior.",
+                env_mode, cfg_mode,
+            )
+            try:
+                from hermes_trader import session_log
+                session_log.append({
+                    "event": "config_env_drift",
+                    "key": "atr_risk_sizing.sizing_v2_mode",
+                    "env_value": env_mode,
+                    "config_value": cfg_mode,
+                    "effective": env_mode,
+                })
+            except Exception:  # audit must never break sizing
+                pass
     return {"mode": mode, "block": blk}
 
 
@@ -4957,7 +4991,7 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
         switched = False
         if old_mode != "OFF":
             from hermes_trader.agents.config_store import update_agent_config
-            with update_agent_config() as wcfg:
+            with update_agent_config(via="risk_halt_roe") as wcfg:
                 wcfg["mode"] = "OFF"
             switched = True
         logger.critical(
