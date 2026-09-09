@@ -250,6 +250,32 @@ def test_change_arm_promote_reason_reports_arm_beneficial_rate(sg):
     assert "回填胜率" not in out["reason"]
 
 
+def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
+    # CS-C gate fix: a change arm whose backfilled counterfactual outcomes are
+    # mostly "win" (arm-HARMFUL: the change foregoes profit) must be REVIEW,
+    # even when it never writes pnl_usd (confidence_decay / atr_regime_calib).
+    # Before the fix the `kind == "block"` guard skipped the high-harm-rate
+    # branch for change arms and such an arm was mislabelled PROMOTE_CANDIDATE.
+    now = 1_700_000_000_000.0
+    recs = []
+    # 20 harmful (outcome=win, no pnl_usd at all) + 5 beneficial (outcome=loss),
+    # all on records the arm would have changed; 40 more non-outcome records to
+    # clear the 60-record promote threshold.
+    for i in range(20):
+        recs.append(_rec(now, would_change=True, outcome="win"))
+    for i in range(5):
+        recs.append(_rec(now, would_change=True, outcome="loss"))
+    for i in range(40):
+        recs.append(_rec(now, would_change=(i < 4)))
+    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["kind"] == "change"
+    assert out["verdict"] == sg.REVIEW
+    # 20/25 = 80% arm-harmful rate must be surfaced (not the inverted label).
+    assert "臂有害率" in out["reason"]
+    assert "80%" in out["reason"]
+
+
 def test_change_arm_report_lines_label_outcomes_arm_beneficial(sg):
     d = {
         "generated_at": "2026-09-08 00:00 UTC",

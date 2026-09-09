@@ -287,10 +287,22 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
             verdict = REVIEW
             reason = (f"拦截/调整命中 {longest['hits']} 次，但回填反事实合计 "
                       f"${longest['pnl_usd_sum']:.2f} 为正 —— 闸门可能误伤盈利交易")
-        elif wr > MAX_FUTILE_BLOCK_RATE and kind == "block":
+        elif wr > MAX_FUTILE_BLOCK_RATE and kind in ("block", "change"):
+            # Audit 2026-09-08 (CS-C change-arm gate fix): outcome "win" means
+            # arm-HARMFUL for ALL arms. For a change arm wr is therefore the
+            # arm-HARMFUL rate, not a block win-rate — the same futile/harmful
+            # threshold must gate change arms too, or a harmful change arm
+            # (e.g. confidence_decay / atr_regime_calib, which never write
+            # pnl_usd and so cannot be caught by the sum branch above) would
+            # be mislabelled PROMOTE_CANDIDATE.
             verdict = REVIEW
-            reason = (f"被拦信号 {longest['mature_outcomes']} 条中胜率 "
-                      f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— 拦太宽，疑似误伤")
+            if kind == "change":
+                reason = (f"回填反事实 {longest['mature_outcomes']} 条中臂有害率 "
+                          f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— "
+                          f"调整/跳过反而放弃盈利，疑似有害，勿升级")
+            else:
+                reason = (f"被拦信号 {longest['mature_outcomes']} 条中胜率 "
+                          f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— 拦太宽，疑似误伤")
         else:
             verdict = PROMOTE if mode == "shadow" else COLLECTING
             if kind == "change":
@@ -427,13 +439,20 @@ def _push_feishu(d: dict) -> None:
 
 def _slim_snapshot(d: dict) -> dict:
     """Project a full grade report down to one slim, JSONL-friendly history
-    line: per-arm verdict/mode + the longest-window counts the trend chart
-    needs (total/hits/decisions/hit_rate/mature_outcomes)."""
+    line: per-arm verdict/mode + per-window counts the trend chart needs
+    (total/hits/decisions/hit_rate/mature_outcomes). Audit 2026-09-08 (CS-C
+    window-scoped history): all windows are kept under `windows` so the 24h/72h
+    trend survives the nightly snapshot; the flat longest-window fields are
+    retained for older readers / pre-CS-C history rows."""
     w_long = max(d.get("windows_h") or [168])
+    _WIN_KEYS = ("window_h", "total", "hits", "decisions", "hit_rate",
+                 "mature_outcomes")
     arms = []
     for a in d.get("arms", []):
         longest = next((s for s in a.get("windows", [])
                         if s.get("window_h") == w_long), {})
+        windows = [{k: s.get(k, 0) for k in _WIN_KEYS}
+                   for s in a.get("windows", [])]
         arms.append({
             "arm": a.get("arm"),
             "mode": a.get("mode"),
@@ -444,6 +463,7 @@ def _slim_snapshot(d: dict) -> dict:
             "decisions": longest.get("decisions", 0),
             "hit_rate": longest.get("hit_rate", 0.0),
             "mature_outcomes": longest.get("mature_outcomes", 0),
+            "windows": windows,
         })
     return {
         "ts": int(time.time() * 1000),

@@ -79,8 +79,16 @@ def test_slim_snapshot_projects_longest_window(sg):
     assert by_arm["ta_late_entry"]["total"] == 0
     sizing = by_arm["sizing_v2"]
     assert sizing["verdict"] == "PROMOTE_CANDIDATE"
+    # flat longest-window fields are retained for old readers...
     assert sizing["total"] == 70 and sizing["hits"] == 54
     assert sizing["hit_rate"] == 0.77
+    # ...and CS-C window-scoped history keeps ALL three windows per arm so the
+    # 24h/72h trend survives the nightly snapshot.
+    windows = {w["window_h"]: w for w in sizing["windows"]}
+    assert sorted(windows) == [24, 72, 168]
+    assert windows[24]["total"] == 10 and windows[24]["hit_rate"] == 0.8
+    assert windows[72]["total"] == 30
+    assert windows[168]["total"] == 70 and windows[168]["hits"] == 54
 
 
 def test_append_and_read_history_roundtrip(sg, tmp_path):
