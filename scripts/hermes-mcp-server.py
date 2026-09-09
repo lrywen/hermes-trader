@@ -1033,9 +1033,10 @@ def handle_config(params: Dict[str, Any]) -> str:
     gate = _check_write_gate()
     if gate:
         return gate
-    from hermes_trader.agents.config_store import read_agent_config, write_agent_config
-
-    config = read_agent_config()
+    from hermes_trader.agents.config_store import (
+        read_agent_config,
+        update_agent_config,
+    )
 
     # Snake_case scalar/bool/list keys that map 1:1 to .agent-config.json. Writing
     # snake_case (not the old camelCase) keeps a single canonical key per setting —
@@ -1053,33 +1054,47 @@ def handle_config(params: Dict[str, Any]) -> str:
         "min_market_volume_usd", "min_short_volume_usd", "max_crypto_long_correlated",
         "cooldown_min", "coin_allowlist", "coin_blocklist",
     ]
-    for key in _DIRECT_KEYS:
-        if key in params and params[key] is not None:
-            config[key] = params[key]
-
-    # Nested toggle: momentum_continuation lives under its own block; expose a flat
-    # boolean so the agent can flip it without resending the whole sub-object.
-    if params.get("momentum_continuation_enabled") is not None:
-        mc = dict(config.get("momentum_continuation") or {})
-        mc["enabled"] = bool(params["momentum_continuation_enabled"])
-        config["momentum_continuation"] = mc
-
-    # Save only if a setting was actually passed (a bare read must not rewrite).
-    if params.get("runner_mover_surface_enabled") is not None:
-        rms = dict(config.get("runner_mover_surface") or {})
-        rms["enabled"] = bool(params["runner_mover_surface_enabled"])
-        config["runner_mover_surface"] = rms
 
     _setting_keys = set(_DIRECT_KEYS) | {
         "momentum_continuation_enabled",
         "runner_mover_surface_enabled",
     }
-    if any(k in params for k in _setting_keys):
-        # CS-A: tag the write so the config_write audit event identifies the
-        # MCP path (previously MCP writes left no audit trace at all).
-        write_agent_config(config, via="mcp")
 
-    return json.dumps(config)
+    # P2-4: the old read_agent_config()/write_agent_config() pair took two
+    # independent flocks; a config write from another process between them
+    # was silently overwritten. The write path now runs entirely inside the
+    # single-LOCK_EX read-modify-write critical section.
+    if not any(k in params for k in _setting_keys):
+        # Bare read: no rewrite.
+        return json.dumps(read_agent_config())
+
+    try:
+        with update_agent_config(via="mcp") as config:
+            for key in _DIRECT_KEYS:
+                if key in params and params[key] is not None:
+                    config[key] = params[key]
+
+            # Nested toggle: momentum_continuation lives under its own block; expose
+            # a flat boolean so the agent can flip it without resending the whole
+            # sub-object.
+            if params.get("momentum_continuation_enabled") is not None:
+                mc = dict(config.get("momentum_continuation") or {})
+                mc["enabled"] = bool(params["momentum_continuation_enabled"])
+                config["momentum_continuation"] = mc
+
+            # Save only if a setting was actually passed (a bare read must not rewrite).
+            if params.get("runner_mover_surface_enabled") is not None:
+                rms = dict(config.get("runner_mover_surface") or {})
+                rms["enabled"] = bool(params["runner_mover_surface_enabled"])
+                config["runner_mover_surface"] = rms
+    except RuntimeError as e:
+        # Missing/corrupt on-disk config: update_agent_config refuses to
+        # overwrite blindly — surface the reason to the operator.
+        return json.dumps({"error": str(e)}, default=str)
+
+    # Re-read the merged effective view (parity with the old response
+    # contract, incl. canonical default-None key materialization).
+    return json.dumps(read_agent_config())
 
 
 def handle_research(params: Dict[str, Any]) -> str:
@@ -1506,13 +1521,71 @@ def handle_set_leverage(params: Dict[str, Any]) -> str:
         return gate
     """Handle set_leverage tool call."""
     from hermes_trader.client.exchange import set_leverage as set_leverage_fn
+    from hermes_trader import event_log
     coin = _norm_coin(params.get('coin', 'BTC'))
     leverage = params.get('leverage', 5)
+    # P1-3b: changing leverage while a position is open changes its
+    # liquidation math and margin profile live; the autonomous executor
+    # only ever calls set_leverage pre-entry on a flat coin. Refuse here
+    # unless the coin is flat. Account read failure fails closed.
+    user = resolve_user_address()
+    try:
+        _acct = fetch_account_state(user, include_hip3=True) if user else {}
+        _has_pos = False
+        for _p in (_acct.get('asset_positions') or []):
+            _pos = _p.get('position') if isinstance(_p, dict) else None
+            if not isinstance(_pos, dict):
+                continue
+            if _norm_coin(str(_pos.get('coin') or '')) != coin:
+                continue
+            try:
+                if float(_pos.get('szi') or 0) != 0.0:
+                    _has_pos = True
+                    break
+            except (TypeError, ValueError):
+                _has_pos = True
+                break
+    except Exception as e:
+        try:
+            event_log.append("operator_action", payload={
+                "action": "set_leverage_blocked", "via": "mcp", "coin": coin,
+                "leverage": leverage, "reason": "account_lookup_failed",
+                "error": str(e),
+            })
+        except Exception:
+            pass
+        return json.dumps({
+            "ok": False,
+            "error": f"could not verify {coin} is flat before leverage change: {e}",
+        }, default=str)
+    if _has_pos:
+        try:
+            event_log.append("operator_action", payload={
+                "action": "set_leverage_blocked", "via": "mcp", "coin": coin,
+                "leverage": leverage, "reason": "position_open",
+            })
+        except Exception:
+            pass
+        return json.dumps({
+            "ok": False,
+            "error": (
+                f"refused: {coin} has an open position; flatten it before "
+                f"changing leverage"
+            ),
+        }, default=str)
     # P4-b: pass the raw value through. set_leverage validates types and
     # ranges itself (never raises on bad input; returns {"ok": False}) so a
     # typo like 0 / -3 / 500 / "abc" gets an error JSON instead of an
     # uncaught ValueError killing the stdio request.
     result = set_leverage_fn(coin, leverage)
+    try:
+        event_log.append("operator_action", payload={
+            "action": "set_leverage", "via": "mcp", "coin": coin,
+            "leverage": leverage, "ok": bool(result.get("ok")),
+            "error": result.get("error"),
+        })
+    except Exception:
+        pass
     return json.dumps(result, default=str)
 
 def handle_get_open_orders(params: Dict[str, Any]) -> str:
@@ -1549,6 +1622,52 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
         oid = int(order_id)
     except (TypeError, ValueError):
         return json.dumps({'cancelled': False, 'error': 'asset and order_id must be integers'})
+    # P1-2: refuse to cancel a DSL-managed SL/TP trigger. Without this guard
+    # an operator (or an LLM tool call) could remove the exchange-side stop
+    # of a live position while the tracker still believes it is protected —
+    # the position would run naked until the next scanner cycle notices.
+    # Force a fresh (throttled, shared-locked) disk read so the MCP process
+    # sees the trading loop's current trackers, then match the oid.
+    try:
+        from hermes_trader.agents import dsl_exit
+        dsl_exit.reset_force_load_throttle()
+        dsl_exit.load_state(force=True)
+        for _t in dsl_exit._active_positions.values():
+            if oid in (_t.sl_oid, _t.tp_oid):
+                _which = "sl" if oid == _t.sl_oid else "tp"
+                try:
+                    event_log.append("operator_action", payload={
+                        "action": "cancel_order_blocked", "via": "mcp",
+                        "asset_idx": asset_idx, "oid": oid,
+                        "coin": _t.coin, "side": _t.side,
+                        "bracket": _which,
+                        "reason": "dsl_managed_trigger",
+                    })
+                except Exception:
+                    pass
+                return json.dumps({
+                    'cancelled': False,
+                    'error': (
+                        f"refused: oid {oid} is the DSL-managed {_which.upper()} "
+                        f"trigger for {_t.coin}/{_t.side}; use the flatten/close "
+                        f"flow instead (it cancels brackets with the position)"
+                    ),
+                }, default=str)
+    except Exception as e:
+        # Fail closed: if we cannot establish whether the oid belongs to a
+        # DSL bracket, do not cancel. The operator can retry.
+        try:
+            event_log.append("operator_action", payload={
+                "action": "cancel_order_blocked", "via": "mcp",
+                "asset_idx": asset_idx, "oid": oid,
+                "reason": "dsl_tracker_lookup_failed", "error": str(e),
+            })
+        except Exception:
+            pass
+        return json.dumps({
+            'cancelled': False,
+            'error': f"refused: could not verify DSL bracket ownership: {e}",
+        }, default=str)
     try:
         result = cancel_orders(oid, asset_idx=asset_idx)
         ok = bool(result.get('ok'))

@@ -152,7 +152,11 @@ def _stub_deep_path(monkeypatch, fetch_fake=None, place_fake=None):
                         lambda ctx, config, *a, **k: {
                             "blocked": False, "block_reasons": [], "results": {}})
     # Network touchpoints reached after the gates but before claim.
-    monkeypatch.setattr(executor, "set_leverage", lambda *_a, **_k: None)
+    # P1-3a: the entry path now consumes the return dict and fails closed on
+    # {"ok": False}, so the stub must report success (real API never returns
+    # None; it returns {"ok": ...}).
+    monkeypatch.setattr(executor, "set_leverage",
+                        lambda *_a, **_k: {"ok": True})
 
     def _spread(_coin):
         return {"ok": True, "spread_pct": 0.01, "best_bid": 99.99,

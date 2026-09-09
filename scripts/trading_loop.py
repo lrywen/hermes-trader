@@ -81,6 +81,7 @@ from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
 from hermes_trader.agents.executor import (
+    arm_close_tiered_breakers,
     close_position_market,
     maybe_roe_blowup_halt,
     monitor_exits,
@@ -1462,6 +1463,22 @@ while True:
                                     logger.warning(
                                         f"[executor] loss-cooldown arm failed "
                                         f"for {_tr.coin}: {_lc_e}")
+                            # P2-5: the executor chokepoint is bypassed on
+                            # exchange-triggered closes, so settle the rest of
+                            # the tiered-breaker chain here: loss-streak
+                            # accounting, per-coin circuit and global daily-loss
+                            # halt (normally done inside close_position_market).
+                            try:
+                                arm_close_tiered_breakers(
+                                    _tr.coin,
+                                    _spot_pct,
+                                    (_net_usd / _notional * 100.0 * _lev)
+                                    if _notional > 0 else 0.0,
+                                    source="exchange_trigger")
+                            except Exception as _tb_e:
+                                logger.warning(
+                                    f"[outcome-store] tiered-breaker backfill "
+                                    f"failed for {_tr.coin}: {_tb_e}")
                             # C3 (HYPE RCA item 5): blow-up self-halt also
                             # covers exchange-triggered closes (server-side SL
                             # fill / liquidation) — the executor chokepoint is

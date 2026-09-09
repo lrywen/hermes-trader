@@ -3815,7 +3815,29 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "reason": f"atr_too_high ({_atr_pct:.2f}% > {_max_atr_pct:.1f}%)",
         }
 
-    set_leverage(coin, leverage)
+    # P1-3a: set_leverage swallows SDK/transport errors and returns
+    # {"ok": False}; the old bare call discarded the result, so sizing,
+    # the liquidation-buffer gate and the DSL ROE cap all proceeded under
+    # an unverified leverage assumption. Retry once after a short pause,
+    # then fail closed BEFORE the in-flight claim / order placement.
+    _lev_res = set_leverage(coin, leverage)
+    if not _lev_res.get("ok"):
+        logger.warning(
+            f"[executor] set_leverage {coin} {leverage}x failed "
+            f"({_lev_res.get('error')}); retrying once"
+        )
+        time.sleep(0.5)
+        _lev_res = set_leverage(coin, leverage)
+    if not _lev_res.get("ok"):
+        logger.error(
+            f"[executor] set_leverage {coin} {leverage}x failed twice "
+            f"({_lev_res.get('error')}); aborting entry (fail-closed)"
+        )
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"],
+            "reason": f"set_leverage_failed: {_lev_res.get('error')}",
+        }
 
     # Pre-trade spread gate: skip coins with illiquid order books to avoid
     # catastrophic slippage on testnet / low-cap names.
@@ -5378,6 +5400,97 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
     except Exception as e:
         logger.error(f"[risk] roe blow-up halt check failed for {coin}: {e}")
         return False
+
+
+def arm_close_tiered_breakers(
+    coin: str,
+    spot_pct: float,
+    realized_pnl_pct: float,
+    *,
+    source: str = "close",
+) -> None:
+    """Settle the tiered-breaker chain after a position close.
+
+    Shared by the in-process close chokepoint (close_position_market) and
+    the trading loop's external-close backfill (exchange-side SL/TP /
+    liquidation): before this existed the backfill only armed the loss
+    cooldown and the ROE blow-up halt, so an exchange-triggered stop never
+    updated the consecutive-loss streak, never tripped the single-coin
+    circuit, and never tripped the global daily breaker — the book could
+    keep entering into a server-side stop cascade.
+
+    ``spot_pct`` is the SIGNED unlevered spot move (negative = loss, same
+    convention as a close row's ``spot_pct``); ``realized_pnl_pct`` is the
+    leveraged ROE used for the loss streak. Best-effort: never raises.
+    """
+    try:
+        memory.record_loss_outcome(coin, float(realized_pnl_pct))
+        _tb_cfg = read_agent_config()
+        _spot_loss_pct = -float(spot_pct or 0.0)
+        _coin_breaker_pct = float(
+            cfg_get("circuit_breaker.single_coin_loss_pct", config=_tb_cfg, default=3.0))
+        _coin_breaker_min = float(
+            cfg_get("circuit_breaker.single_coin_halt_min", config=_tb_cfg, default=60.0))
+        if _spot_loss_pct >= _coin_breaker_pct and _coin_breaker_min > 0:
+            _until = int(time.time() * 1000 + _coin_breaker_min * 60_000)
+            memory.set_coin_circuit(coin, _until)
+            try:
+                from hermes_trader import metrics
+                metrics.TRADE_CIRCUIT_TRIPS.labels(scope="coin").inc()
+            except Exception:
+                pass
+            logger.warning(
+                f"[executor] COIN CIRCUIT on {coin} (source={source}): spot loss "
+                f"{_spot_loss_pct:.2f}% >= {_coin_breaker_pct}% → halt "
+                f"{_coin_breaker_min:.0f}min")
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"🛑 单币熔断: {coin}\n"
+                    f"单笔现货亏损 {_spot_loss_pct:.2f}% ≥ {_coin_breaker_pct}%\n"
+                    f"暂停开仓 {_coin_breaker_min:.0f} 分钟",
+                    category="risk")
+            except Exception:
+                pass
+        # Global daily breaker — same daily_pnl/SOD-equity basis the
+        # daily-loss kill-switch gate reads, so the two stay consistent.
+        _global_breaker_pct = float(
+            cfg_get("circuit_breaker.daily_loss_pct", config=_tb_cfg, default=5.0))
+        _global_breaker_min = float(
+            cfg_get("circuit_breaker.daily_halt_min", config=_tb_cfg, default=120.0))
+        _sod_eq = memory.get_start_of_day_equity()
+        _daily_pnl = memory.get_daily_pnl()
+        if _sod_eq > 0 and _global_breaker_pct > 0 and _global_breaker_min > 0:
+            _daily_loss_pct = -_daily_pnl / _sod_eq * 100.0
+            if _daily_loss_pct >= _global_breaker_pct:
+                # Only arm if not already halted for longer.
+                if memory.global_halt_remaining_min() < _global_breaker_min:
+                    _until = int(time.time() * 1000 + _global_breaker_min * 60_000)
+                    memory.set_global_halt(_until)
+                    try:
+                        from hermes_trader import metrics
+                        metrics.TRADE_CIRCUIT_TRIPS.labels(scope="global").inc()
+                    except Exception:
+                        pass
+                    logger.critical(
+                        f"[executor] GLOBAL CIRCUIT (source={source}): daily loss "
+                        f"{_daily_loss_pct:.2f}% >= {_global_breaker_pct}% "
+                        f"(PnL ${_daily_pnl:.2f}/SOD ${_sod_eq:.2f}) → halt all "
+                        f"entries {_global_breaker_min:.0f}min")
+                    try:
+                        from hermes_trader import notify
+                        notify.send_text(
+                            f"🚨 全策略熔断\n"
+                            f"当日累计亏损 {_daily_loss_pct:.2f}% ≥ {_global_breaker_pct}%\n"
+                            f"(${-_daily_pnl:.2f} / SOD ${_sod_eq:.2f})\n"
+                            f"全部暂停开仓 {_global_breaker_min:.0f} 分钟",
+                            category="risk")
+                    except Exception:
+                        pass
+    except Exception as _tb_e:
+        logger.warning(
+            f"[executor] tiered-breaker arm failed for {coin} "
+            f"(source={source}): {_tb_e}")
 
 
 def retry_pending_sl(retry_interval: int = 15) -> None:

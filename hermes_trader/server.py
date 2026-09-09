@@ -1286,6 +1286,14 @@ async def place_order(request: Request) -> JSONResponse:
                 coin, type(e).__name__, e,
             )
 
+        # P1-1: the API server is a separate process from the trading loop;
+        # its memory singleton only loaded risk state once at startup. The
+        # hard kill-switches (daily_loss / global_halt / coin_circuit) would
+        # otherwise be evaluated against a stale snapshot. Refresh the
+        # read-only risk fields from disk immediately before gate eval
+        # (mtime-gated; never marks dirty / never flushes).
+        memory.refresh_risk_state_from_disk()
+
         gate_report = _check_manual_order_gates(
             coin=coin,
             is_buy=is_buy,
