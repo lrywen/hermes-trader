@@ -147,6 +147,11 @@ CS-G 观察窗与既有 24/72/168h 评级并行，168h 末同时满足以下条�
 - **T0 = 2026-09-09 05:09 UTC（13:09 CST）**：HEAD `2b96c4f` 容器上线，
   CS-G 埋点开始累积。T0+23min 实测 v2_cost 块 0 条（属正常，新块按信号触发），
   离线评级为 COLLECTING。
+- **2026-09-09 06:21 UTC**：HEAD `944f79d` 重建容器（E-2 P0：trigger 单
+  cloid 透传修复 + §8.1 评级器），20s healthy；`HERMES_SIZING_V2_MODE=shadow`、
+  circuit `mode=shadow/tripped=false`、live 与 shadow 仓位均空、数据卷 313 行
+  保留。仅替换二进制，CS-G 埋点逻辑无变化，**168h 窗起点 T0 不重置**；
+  §8.1 窗口按 now-168h 滚动，v2_cost 笔数从首条块记录出现起算。
 - **24h = 09-10 13:09 CST**、**72h = 09-12 13:09 CST**、
   **168h = 09-16 13:09 CST** 三个检查点；每晚 00:45 UTC host cron 经容器执行
   `scripts/cron_shadow_grade.sh --windows 24 72 168` 自动出评级与飞书建议卡
