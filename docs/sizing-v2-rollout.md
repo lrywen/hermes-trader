@@ -125,8 +125,10 @@ CS-G 观察窗与既有 24/72/168h 评级并行，168h 末同时满足以下条�
 
 1. **分方向样本量**：168h 内 long、short 各自 ≥10 笔 shadow 评级；不足则
    延长窗口，不跨方向凑数。
-2. **来源成熟度**：`v2_cost_slip_source=fallback` 或
-   `v2_cost_hold_source=fallback` 的占比 ≤20%（冷启动默认值不得主导评级）。
+2. **来源成熟度**：冷启动来源（slip 侧实际取值 `default`、异常降级
+   `legacy`；hold 侧 `default`；文档早期写作 `fallback`）的占比 ≤20%
+   （冷启动默认值不得主导评级）。`coin_side/coin_shared/global_side`
+   视为成熟来源。
 3. **上限绑定率**：`v2_cost_cap_binds=true` 占比稳定且方向间差异可解释；
    绑定率 >50% 视为成本上限过紧或实测成本异常，禁止晋升，先核 funding/滑点。
 4. **比率合理性**：`v2_cost_vs_v2_ratio` 的 P50 ∈ [0.5, 1.0]（宽分母应更紧
@@ -139,4 +141,19 @@ CS-G 观察窗与既有 24/72/168h 评级并行，168h 末同时满足以下条�
 
 口径产出仍由离线 `scripts/shadow_grade.py --json` 汇总；任何一项不满足都只
 延长观察，不调闸门、不改阈值、不改 `scripts/trading_loop.py`。
+
+### 8.2 观察检查点（2026-09 CS-G 窗口）
+
+- **T0 = 2026-09-09 05:09 UTC（13:09 CST）**：HEAD `2b96c4f` 容器上线，
+  CS-G 埋点开始累积。T0+23min 实测 v2_cost 块 0 条（属正常，新块按信号触发），
+  离线评级为 COLLECTING。
+- **24h = 09-10 13:09 CST**、**72h = 09-12 13:09 CST**、
+  **168h = 09-16 13:09 CST** 三个检查点；每晚 00:45 UTC host cron 经容器执行
+  `scripts/cron_shadow_grade.sh --windows 24 72 168` 自动出评级与飞书建议卡
+  （六条件仅在 n>0 且未全过时告警，零样本不告警）。
+- 每个检查点人工核对：①long/short 各自笔数；②c6 两条 manual_required
+  （applied 仓位零变化、§5 回滚零触发）——shadow 文件无法自证，须查配置与
+  交易日志；③借币费是否仍为 0（`borrow_bps` 全 0 时结论按「未计借币」）。
+- 168h 末六条件全过 + §4 六条全过 → 列入 PROMOTE_CANDIDATE，人工晋升；
+  任一不过 → 只延长观察窗，不调任何闸门/阈值。
 
