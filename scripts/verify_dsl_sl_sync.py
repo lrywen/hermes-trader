@@ -145,6 +145,9 @@ def main() -> int:
     fake = FakeExchange()
     # sync_exchange_sl calls these as module-level names in executor.
     executor.modify_sl_trigger = fake.modify_sl_trigger  # type: ignore[assignment]
+    # The live-szi clamp gate (post-scale-out safety) must be stubbed offline:
+    # without a real account state fetch it returns None and the mover skips.
+    executor._live_abs_szi = lambda coin: float(SIZE)  # type: ignore[assignment]
 
     clock = FakeClock(start=tracker.entry_time + 1.0)
     executor.time = clock  # type: ignore[assignment]

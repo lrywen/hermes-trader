@@ -286,14 +286,20 @@ def resolve_close_fill(user: str, coin: str, side: str,
     return None
 
 
-def _fetch_open_orders(user: str) -> list[dict[str, Any]]:
-    """Fetch the user's resting orders from the HL REST endpoint. [] on failure."""
+def _fetch_open_orders(user: str) -> Optional[list[dict[str, Any]]]:
+    """Fetch the user's resting orders from the HL REST endpoint.
+
+    Returns a list (possibly EMPTY — an empty book is a real, actionable
+    result) or None when the lookup itself failed (network/timeout/parse).
+    Callers verifying HELD oids must treat None as ambiguous and defer — never
+    as "every stop vanished".
+    """
     try:
         data = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8)
         return data if isinstance(data, list) else []
     except Exception as e:
-        logger.debug(f"[dsl] openOrders lookup failed (non-fatal): {e}")
-        return []
+        logger.debug(f"[dsl] openOrders lookup failed (state ambiguous): {e}")
+        return None
 
 
 def _order_trigger_px(o: dict[str, Any]) -> Optional[float]:
@@ -312,7 +318,57 @@ def _order_trigger_px(o: dict[str, Any]) -> Optional[float]:
     return None
 
 
-def backfill_brackets_from_exchange(user: Optional[str]) -> int:
+def _find_sl_replacement(
+    orders: list[dict[str, Any]], tracker: "DSLTracker",
+    mark_px: Optional[float] = None,
+) -> Optional[tuple[int, float, Optional[float]]]:
+    """Find the cancel+replace NEW SL order for a tracker whose held oid is gone.
+
+    Matches THIS coin's reduce-only trigger resting on the SL side, sized within
+    the same 2%/0.001 tolerance the mover clamps to. With several candidates the
+    one closest to the tracker's last known sl_px wins (a hint, never a gate).
+    Returns (oid, trigger_px, size) or None.
+
+    Side boundary: once Phase-2 trailing starts the SL ratchets and can CROSS
+    entry (a long's locked-in stop ABOVE entry), so classifying against entry
+    would read the replacement as a TP and never claim it. When `mark_px` is
+    known the side is classified against the live mark (mirrors
+    exchange.find_sl_trigger_in_open_orders); without it the entry rule is the
+    conservative fallback (pre-trailing / no mark derivable).
+    """
+    ref_px = mark_px if mark_px else tracker.entry_px
+    candidates: list[tuple[float, int, float, Optional[float]]] = []
+    for o in orders:
+        if o.get("coin") != tracker.coin or o.get("reduceOnly") is not True:
+            continue
+        oid = _opt_int(o.get("oid"))
+        tpx = _order_trigger_px(o)
+        if oid is None or tpx is None:
+            continue
+        is_sl_side = (tracker.is_long() and tpx < ref_px) or \
+                     (not tracker.is_long() and tpx > ref_px)
+        if not is_sl_side:
+            continue
+        try:
+            sz = abs(float(o.get("sz", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+        want = tracker.sl_size or 0.0
+        if want > 0 and abs(sz - want) > max(0.001, want * 0.02):
+            continue
+        dist = abs(tpx - tracker.sl_px) if tracker.sl_px else 0.0
+        candidates.append((dist, oid, tpx, sz))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c[0])
+    _, oid, tpx, sz = candidates[0]
+    return oid, tpx, sz
+
+
+def backfill_brackets_from_exchange(
+    user: Optional[str],
+    marks: Optional[dict[str, float]] = None,
+) -> int:
     """Fill in missing sl_oid/tp_oid on trackers by scanning the user's open orders.
 
     Used on restart: a v1 state file (or a tracker synthesized before bracket
@@ -324,15 +380,102 @@ def backfill_brackets_from_exchange(user: Optional[str]) -> int:
     """
     if not user or not _active_positions:
         return 0
-    # Only query if at least one tracker is missing bracket info.
-    if all(t.sl_oid is not None for t in _active_positions.values()):
+    # Global flag distinguishing this process's first backfill (verify every
+    # held oid once) from steady-state ticks (query only when an oid is missing
+    # or suspected dead). The flag is module-level so tests exercising the
+    # idempotent second-call contract see exactly one verification pass.
+    global _held_oids_verified
+    # Only query when there is work: a missing oid, a suspected-dead oid, or
+    # the one-shot startup verification of already-held oids.
+    has_missing = any(t.sl_oid is None for t in _active_positions.values())
+    has_suspect = any(
+        f"{t.coin}_{t.side}" in _suspect_sl_keys for t in _active_positions.values()
+    )
+    verify_held = not _held_oids_verified
+    if not (has_missing or has_suspect or verify_held):
         return 0
     orders = _fetch_open_orders(user)
-    if not orders:
-        logger.debug("[dsl] backfill: openOrders empty or unavailable")
+    # None = lookup failed (AMBIGUOUS): an API blip must never be read as
+    # "every SL vanished" — that would null live oids on the startup verify.
+    # Defer ALL verification until a readable snapshot arrives. An empty list
+    # is a real, readable result.
+    if orders is None:
+        logger.debug("[dsl] backfill: openOrders lookup failed; deferring")
         return 0
+    _held_oids_verified = True
+    # Index every resting oid once for cheap held-oid liveness checks.
+    live_oids: set[int] = set()
+    for o in orders:
+        oid = _opt_int(o.get("oid"))
+        if oid is not None:
+            live_oids.add(oid)
     updated = 0
+    marks = marks or {}
     for tracker in _active_positions.values():
+        key = f"{tracker.coin}_{tracker.side}"
+        is_suspect = key in _suspect_sl_keys
+        # Live mark when derivable (from the caller's position snapshot). Used
+        # only as the SL-vs-TP side boundary: a trailing SL can cross entry, so
+        # the entry rule alone would misread a locked-in stop as a TP. Missing
+        # mark falls back to entry (safe for pre-trailing / fresh synth).
+        mark_px = marks.get(tracker.coin)
+        # ── Held-oid liveness (startup one-shot, or suspected-dead) ──────
+        # A held oid that still rests is authoritative: never replace it (this
+        # preserves the backfill idempotency contract — a healthy tracker is
+        # never overwritten by a spurious same-coin candidate).
+        if tracker.sl_oid is not None and (verify_held or is_suspect):
+            if int(tracker.sl_oid) in live_oids:
+                _clear_sl_suspect(tracker)
+            elif is_suspect:
+                # Held oid confirmed gone: look for the cancel+replace's new
+                # order among THIS coin's SL-side reduce-only triggers.
+                repl = _find_sl_replacement(orders, tracker, mark_px=mark_px)
+                if repl is not None:
+                    oid, tpx, sz = repl
+                    tracker.sl_oid = oid
+                    tracker.sl_px = tpx
+                    if sz:
+                        tracker.sl_size = sz
+                    if tracker._last_floor is None:
+                        tracker._last_floor = tpx
+                    _clear_sl_suspect(tracker)
+                    updated += 1
+                    logger.warning(
+                        f"[dsl] backfill: {key} dead sl_oid replaced by "
+                        f"reconciled oid={oid} trigger={tpx}"
+                    )
+                else:
+                    # Confirmed absent and no attributable replacement. Null
+                    # the dead oid so the position is visibly unprotected (the
+                    # mover skips nulls rather than silently pinning a dead
+                    # order) and scream for manual re-arm; DSL soft stop still
+                    # monitors. Never do this on a failed lookup (handled above).
+                    logger.error(
+                        f"[dsl] backfill: {key} held sl_oid={tracker.sl_oid} "
+                        f"CONFIRMED MISSING on exchange; no replacement found"
+                    )
+                    tracker.sl_oid = None
+                    _clear_sl_suspect(tracker)
+                    updated += 1
+                    try:
+                        from hermes_trader import notify
+                        notify.send_text(
+                            f"🚨 {tracker.coin} 交易所端止损单确认丢失（旧 oid 已失效），"
+                            f"未找到可认领的替代止损。DSL 软止损仍在监控，请立即人工核对"
+                            f"持仓并补挂止损单。",
+                            category="risk")
+                    except Exception:
+                        pass
+            # On the startup-only verify path a missing held oid with no suspect
+            # flag is left untouched: steady openOrders shape drift (e.g. a
+            # trigger mid-transition) must not null a healthy oid on a single
+            # empty-ish snapshot. Suspect entries are the executor's explicit
+            # "response lost" signal and are safe to act on as above.
+            # This tracker's SL was already reconciled (or deliberately left
+            # untouched): never fall through to the missing-oid fill scan in
+            # the same iteration, which could double-count the just-claimed
+            # replacement or overwrite it with a same-coin candidate.
+            continue
         # Consider every reduce-only resting order for this coin. HL's
         # openOrders does NOT reliably expose a trigger marker: live mainnet
         # market-tpsl orders come back with only `limitPx` (the trigger price)
@@ -356,12 +499,15 @@ def backfill_brackets_from_exchange(user: Optional[str]) -> int:
                     f"oid={oid} (no parseable trigger px; raw={o})"
                 )
                 continue
-            # Classify by direction relative to entry: a backup SL for a long is
-            # BELOW entry (sell trigger); a TP scale-out for a long is ABOVE entry.
-            # Shorts are the mirror. This is robust even when the exchange payload
-            # omits an explicit tpsl tag.
-            is_sl_side = (tracker.is_long() and tpx < tracker.entry_px) or \
-                         (not tracker.is_long() and tpx > tracker.entry_px)
+            # Classify by direction relative to the live mark when known (a
+            # trailing SL can cross entry into profit; using entry there would
+            # misread the stop as a TP and leave the oid unfilled), else entry:
+            # a backup SL for a long is BELOW the boundary (sell trigger), a TP
+            # scale-out ABOVE it; shorts are the mirror. Robust even when the
+            # exchange payload omits an explicit tpsl tag.
+            ref_px = mark_px if mark_px else tracker.entry_px
+            is_sl_side = (tracker.is_long() and tpx < ref_px) or \
+                         (not tracker.is_long() and tpx > ref_px)
             try:
                 sz = abs(float(o.get("sz", 0) or 0))
             except (TypeError, ValueError):
@@ -379,8 +525,10 @@ def backfill_brackets_from_exchange(user: Optional[str]) -> int:
                 # defect). The exchange bracket SL is the exchange-enforced
                 # stop, so using its trigger as the initial floor can never
                 # widen risk beyond what the bracket already guarantees, and
-                # is always on the correct side (long: sl < entry, short:
-                # sl > entry, established by is_sl_side above).
+                # is always on the correct side of the live boundary (long:
+                # sl below the mark/entry, short above, established by
+                # is_sl_side above); a locked-in trailing stop may rest past
+                # entry, which is still the safe ratchet direction.
                 if tracker._last_floor is None:
                     tracker._last_floor = tpx
                 updated += 1
@@ -1148,6 +1296,34 @@ class DSLTracker:
 
 _active_positions: dict[str, DSLTracker] = {}
 _loaded_from_disk = False
+
+# P1-1: trackers whose exchange SL oid is SUSPECTED dead after a batchModify
+# whose response was lost. In-memory only (a restart re-derives health from the
+# one-shot startup verification in backfill_brackets_from_exchange). Keys are
+# tracker keys "<coin>_<side>". backfill queries openOrders whenever this set is
+# non-empty, so a lost-response modify self-heals instead of pinning a dead oid
+# that freezes the trailing mover forever.
+_suspect_sl_keys: set[str] = set()
+# One-shot, per-process: verify already-held sl_oids against the exchange on the
+# first backfill after load. The steady-state gate stays "query only when an oid
+# is missing/suspect", so normal ticks never add network calls.
+_held_oids_verified = False
+
+
+def mark_sl_oid_suspect(coin: str, side: str) -> None:
+    """Flag a tracker's resting SL oid as possibly dead (lost modify response).
+
+    Never raises. Best-effort; the worst case of a missing flag is the pre-fix
+    behaviour, never a wrong order action.
+    """
+    try:
+        _suspect_sl_keys.add(f"{coin}_{side}")
+    except Exception:
+        pass
+
+
+def _clear_sl_suspect(tracker: DSLTracker) -> None:
+    _suspect_sl_keys.discard(f"{tracker.coin}_{tracker.side}")
 
 
 def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
@@ -1926,6 +2102,12 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
     live_keys = set()
     added = 0
     dropped: list["DSLTracker"] = []
+    # Best-effort live marks derived from the position snapshot itself, so the
+    # bracket backfill below can tell a trailing SL that crossed entry from a TP
+    # WITHOUT reordering the caller's mids fetch (mids arrive after rehydrate).
+    # Direct notional first; fall back to entry + uPnL/szi. A coin missing both
+    # simply gets no mark and the backfill uses the entry boundary.
+    live_marks: dict[str, float] = {}
     for p in asset_positions or []:
         pos = p.get("position", {}) if isinstance(p, dict) else {}
         coin = pos.get("coin")
@@ -1938,6 +2120,23 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
             continue
         if abs(szi) < 1e-12 or entry <= 0:
             continue
+        mark: Optional[float] = None
+        try:
+            pv = pos.get("positionValue")
+            if pv is not None:
+                mark = abs(float(pv)) / abs(szi)
+        except (TypeError, ValueError):
+            mark = None
+        if not mark:
+            try:
+                up = pos.get("unrealizedPnl")
+                if up is not None:
+                    # uPnL = (mark - entry) * szi  (szi signed)
+                    mark = entry + float(up) / szi
+            except (TypeError, ValueError):
+                mark = None
+        if mark and mark > 0:
+            live_marks[coin] = float(mark)
         side = "long" if szi > 0 else "short"
         key = f"{coin}_{side}"
         live_keys.add(key)
@@ -2075,7 +2274,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
     # when every tracker already has an sl_oid.
     if user:
         try:
-            backfill_brackets_from_exchange(user)
+            backfill_brackets_from_exchange(user, marks=live_marks)
         except Exception as e:
             logger.debug(f"[dsl] bracket backfill failed (non-fatal): {e}")
 

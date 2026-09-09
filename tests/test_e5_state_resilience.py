@@ -68,6 +68,8 @@ def _hermetic(monkeypatch):
     # backstop merges active_position_coins() into flattened account state).
     dsl_exit._active_positions.clear()
     dsl_exit._loaded_from_disk = False
+    dsl_exit._suspect_sl_keys.clear()
+    dsl_exit._held_oids_verified = False
 
 
 def _isolate(monkeypatch, tmp_path):
@@ -76,6 +78,8 @@ def _isolate(monkeypatch, tmp_path):
     monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE", str(state_file))
     dsl_exit._active_positions.clear()
     dsl_exit._loaded_from_disk = False
+    dsl_exit._suspect_sl_keys.clear()
+    dsl_exit._held_oids_verified = False
     return dsl_exit, state_file
 
 

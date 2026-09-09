@@ -45,6 +45,8 @@ from hermes_trader.client.exchange import (
     _resolve_min_order_usd,
     cancel_open_orders_for_coin,
     entry_size_for_notional,
+    find_open_order_by_cloid,
+    find_sl_trigger_in_open_orders,
     get_hl_atr,
     get_hl_price,
     get_max_leverage,
@@ -1572,7 +1574,46 @@ def _place_backup_sl(
         _sl_cloid = Cloid.from_int(uuid.uuid4().int)
         _band_kw["cloid"] = _sl_cloid
         sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
-        if not sl_res.get("ok"):
+        # P2-2: a lost placement response (408/timeout/SSL) is ambiguous — the
+        # stop may actually rest under this cloid. Claim it by cloid BEFORE any
+        # retry: reusing the same cloid blindly yields a permanent "duplicate
+        # cloid" error queue, while minting a new one risks arming two stops.
+        _skip_retry = False
+        if not sl_res.get("ok") and sl_res.get("error_code") == "response_unknown":
+            claim = find_open_order_by_cloid(coin, _sl_cloid)
+            if claim.get("found") and claim.get("oid"):
+                logger.warning(
+                    f"[executor] Backup SL place response lost for {coin} but "
+                    f"claimed resting order by cloid: oid={claim.get('oid')} "
+                    f"trigger={claim.get('trigger_px')}"
+                )
+                if claim.get("trigger_px"):
+                    sl_px = float(claim["trigger_px"])
+                sl_res = {"ok": True, "order_id": claim["oid"]}
+            elif claim.get("lookup_ok"):
+                # openOrders readable and the cloid is confirmed NOT resting:
+                # it is safe to mint a fresh cloid and retry once.
+                logger.warning(
+                    f"[executor] Backup SL place response lost for {coin}; "
+                    f"cloid confirmed absent on exchange — retrying once with "
+                    f"a NEW cloid"
+                )
+                _sl_cloid = Cloid.from_int(uuid.uuid4().int)
+                _band_kw["cloid"] = _sl_cloid
+                time.sleep(2)
+                sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
+                _skip_retry = True
+            else:
+                # Lookup itself failed: state is genuinely ambiguous. Do NOT
+                # retry blindly and do NOT mint a new cloid — enqueue with the
+                # original cloid so retry_pending_sl claims it first.
+                logger.error(
+                    f"[executor] Backup SL place response lost for {coin} AND "
+                    f"openOrders lookup failed; preserving cloid for deferred "
+                    f"reconciliation"
+                )
+                _skip_retry = True
+        if not sl_res.get("ok") and not _skip_retry:
             # One retry after a beat — observed failures are transient 429s; a
             # position with no server-side stop carries the full gap-through
             # risk between DSL checks, so a single retry is cheap insurance.
@@ -4250,7 +4291,11 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                 continue
 
         # ── Per-coin throttle ───────────────────────────────────────────
-        # R13-B2: same live-resolve pattern.
+        # R13-B2: same live-resolve pattern. NOTE: the throttle stamp is only
+        # written AFTER the modify is confirmed (success, or a lost response
+        # reconciled to the replacement oid). Writing it before the call
+        # poisoned the throttle on timeout: the next tighten stayed blocked
+        # even though no move ever applied.
         live_min_interval = cfg_get("sl_move.min_interval_sec", _SL_MOVE_MIN_INTERVAL_SEC)
         st = _sl_move_state.get(coin)
         if st is not None:
@@ -4259,7 +4304,6 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                 continue
             if last_target is not None and abs(last_target - target) < 1e-12:
                 continue
-        _sl_move_state[coin] = (now, target)
 
         # C4-3: live-resolve the trigger-limit band so a config edit takes
         # effect without restart; 0/absent = market-on-trigger (default). A
@@ -4293,11 +4337,92 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
             # batchModify is cancel+replace: persist the NEW oid and target px.
             set_bracket(coin, tracker.side,
                         sl_oid=new_oid, sl_px=target, sl_size=size)
+            _sl_move_state[coin] = (now, target)
             logger.info(
                 f"[sl-move] {coin} {tracker.side} moved exchange SL: "
                 f"old_oid={old_oid} new_oid={new_oid} "
                 f"floor={floor:.6g} target_sl={target:.6g}"
             )
+        elif res.get("error_code") == "response_unknown":
+            # batchModify response lost: the OLD oid may already be dead while
+            # the NEW oid is unknown. Reconcile against ONE openOrders snapshot
+            # before deciding. Never guess, never re-arm from here — a wrongly
+            # kept dead oid freezes the trailing mover; a wrong re-claim can
+            # double up stops.
+            old_oid = res.get("old_oid") or tracker.sl_oid
+            rec = find_sl_trigger_in_open_orders(
+                coin,
+                is_long=is_long,
+                entry_px=tracker.entry_px,
+                expect_size=size,
+                old_oid=int(old_oid) if old_oid is not None else None,
+                hint_trigger_px=target,
+                mark_px=mark_f,
+            )
+            status = rec.get("status")
+            if status == "replacement":
+                order = rec["order"]
+                n = rec.get("n_candidates", 1)
+                set_bracket(coin, tracker.side,
+                            sl_oid=order["oid"],
+                            sl_px=order.get("trigger_px") or target,
+                            sl_size=order.get("size") or size)
+                _sl_move_state[coin] = (now, target)
+                logger.warning(
+                    f"[sl-move] {coin} modify response lost; reconciled to NEW "
+                    f"oid={order['oid']} (old dead oid={old_oid}, "
+                    f"trigger={order.get('trigger_px')}, candidates={n})"
+                )
+                if n and n > 1:
+                    # Multiple plausible SLs rest — possible double-up. Keep the
+                    # closest-to-target one and alert for manual review.
+                    try:
+                        from hermes_trader import notify
+                        notify.send_text(
+                            f"🚨 {coin} SL modify 响应丢失后对账发现 {n} 张疑似止损单，"
+                            f"已认领 oid={order['oid']}，请立即在交易所端核对是否存在"
+                            f"重复止损并手动清理多余挂单。",
+                            category="risk")
+                    except Exception:
+                        pass
+            elif status == "old_alive":
+                # Modify never applied: keep the old order and retry the tighten
+                # next cycle. Do NOT stamp the throttle.
+                order = rec.get("order") or {}
+                logger.warning(
+                    f"[sl-move] {coin} modify response lost but old oid={old_oid} "
+                    f"still rests (trigger={order.get('trigger_px')}); "
+                    f"will retry the tighten next cycle"
+                )
+            elif status == "absent":
+                # No attributable SL either side. Keep the (likely dead) oid
+                # rather than claim an unrelated order, and DO NOT re-arm from
+                # the mover — flag the tracker suspect so the next backfill
+                # reconciles it (claims a replacement / nulls + alerts), and
+                # alert loudly now so an unprotected position is seen.
+                dsl_exit.mark_sl_oid_suspect(coin, tracker.side)
+                logger.error(
+                    f"[sl-move] {coin} modify response lost and NO SL found on "
+                    f"exchange (dead oid={old_oid}); tracker oid left untouched "
+                    f"pending backfill/manual review"
+                )
+                try:
+                    from hermes_trader import notify
+                    notify.send_text(
+                        f"🚨 {coin} SL 移动响应丢失且交易所端未查到止损挂单"
+                        f"（旧 oid={old_oid} 可能已失效）。软件 DSL 止损仍在监控，"
+                        f"请立即人工核对交易所持仓与止损单。",
+                        category="risk")
+                except Exception:
+                    pass
+            else:
+                # lookup_failed: state genuinely ambiguous. Keep the old oid,
+                # do not stamp the throttle, reconcile again next cycle.
+                logger.warning(
+                    f"[sl-move] {coin} modify response lost AND openOrders "
+                    f"lookup failed; keeping oid={old_oid}, will re-reconcile "
+                    f"next cycle"
+                )
         else:
             logger.warning(
                 f"[sl-move] {coin} modify FAILED (will retry next cycle): "
@@ -5313,6 +5438,41 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                         f"{_retry_size:g} -> live {_live_sz:g}"
                     )
                     _retry_size = _live_sz
+            # P2-2: an earlier attempt whose response was lost may actually have
+            # armed the stop under this cloid. Claim it by cloid BEFORE placing:
+            # this drains the otherwise-permanent "duplicate cloid" queue and
+            # avoids a double arm.
+            claim = find_open_order_by_cloid(coin, _retry_cloid)
+            if claim.get("found") and claim.get("oid"):
+                logger.warning(
+                    f"[executor] Pending SL retry {coin}: claimed ALREADY-RESTING "
+                    f"stop by cloid (attempt {entry['retry_count']}): "
+                    f"oid={claim.get('oid')} trigger={claim.get('trigger_px')}"
+                )
+                set_bracket(
+                    coin, entry.get("side", "long" if entry["is_buy"] else "short"),
+                    sl_oid=claim["oid"],
+                    sl_px=claim.get("trigger_px") or entry["sl_px"],
+                    sl_size=_retry_size)
+                del _pending_sl_retries[coin]
+                continue
+            if not claim.get("lookup_ok"):
+                # openOrders unreadable: keep the cloid and retry later; never
+                # mint a new one while the resting state is unknown.
+                logger.warning(
+                    f"[executor] Pending SL retry {coin}: openOrders lookup "
+                    f"failed (state ambiguous), keeping cloid, will retry"
+                )
+                continue
+            # Lookup OK and cloid confirmed absent. A prior response-lost
+            # attempt may have armed a stop the exchange later dropped, but the
+            # same cloid can also become permanently un-reusable after a
+            # "duplicate" rejection: mint a fresh cloid for this confirmed-empty
+            # placement while leaving the entry's carried one untouched until a
+            # place succeeds.
+            _place_cloid = Cloid.from_int(uuid.uuid4().int)
+            entry["cloid"] = _place_cloid
+            _retry_kw["cloid"] = _place_cloid
             res = place_hl_trigger_order(
                 entry["is_buy"], _retry_size, entry["sl_px"], "sl", entry["coin"],
                 **_retry_kw
@@ -5325,6 +5485,15 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                             sl_oid=res.get("order_id"),
                             sl_px=entry["sl_px"], sl_size=_retry_size)
                 del _pending_sl_retries[coin]
+            elif res.get("error_code") == "response_unknown":
+                # Ambiguous again. Preserve the just-used cloid (do NOT mint
+                # another next cycle): the claim-first lookup at the top of the
+                # next attempt reconciles it.
+                logger.error(
+                    f"[executor] Pending SL place response lost for {coin} "
+                    f"(attempt {entry['retry_count']}); cloid preserved for "
+                    f"reconciliation next cycle"
+                )
             else:
                 # NEVER drop. Loud error each time so the naked position is
                 # visible; capped backoff prevents log/rate-limit flooding.

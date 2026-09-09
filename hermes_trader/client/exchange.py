@@ -1397,7 +1397,17 @@ def modify_sl_trigger(
             )
         return parsed
     except Exception as e:
+        # batchModify is an atomic cancel+replace: on a lost response (408/
+        # timeout/SSL drop) the OLD oid may already be dead while the NEW oid
+        # is unknown. Tagging response_unknown lets callers reconcile against
+        # openOrders instead of blindly keeping the dead oid (which freezes
+        # the trailing mover forever) or blindly re-arming (which can double
+        # up stops).
         logger.error(f"[modify_sl_trigger] EXCEPTION {coin} oid={oid}: {e}")
+        if _is_response_unknown_error(e):
+            return {"ok": False, "error": str(e),
+                    "error_code": "response_unknown",
+                    "old_oid": int(oid)}
         return {"ok": False, "error": str(e)}
 
 
@@ -1584,6 +1594,195 @@ def verify_order_exists(
             "in_user_fills": False,
             "reason": f"verify_exception: {e!r}",
         }
+
+
+def _fetch_open_orders_snapshot(user: Optional[str] = None) -> Optional[list]:
+    """One openOrders fetch for reconciliation.
+
+    Returns the raw list on success (possibly empty — an empty list means the
+    account genuinely has NO resting orders), or None when the lookup itself
+    failed (network/timeout/parse). Callers MUST treat None as AMBIGUOUS and
+    never as "no orders" — collapsing the two is what turns a transient API
+    blip into a wrongly-nulled SL oid / duplicate re-arm.
+    """
+    try:
+        user = user or resolve_user_address()
+        if not user:
+            return None
+        data = _http_post("/info", {"type": "openOrders", "user": user}, timeout=8)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning(f"[openOrders snapshot] lookup failed (state ambiguous): {e!r}")
+        return None
+
+
+def _order_trigger_px_from_open(o: dict) -> Optional[float]:
+    """Real mainnet market-tpsl orders expose the trigger as `limitPx` with
+    no triggerPx field; accept either shape."""
+    for key in ("triggerPx", "limitPx"):
+        v = o.get(key)
+        if v is not None:
+            try:
+                return float(v)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def find_open_order_by_cloid(
+    coin: str,
+    cloid: Any,
+    user: Optional[str] = None,
+) -> dict[str, Any]:
+    """Claim a resting order by Cloid after a place whose response was lost.
+
+    A reduce-only SL placement that timed out / 408'd may actually have armed
+    on the exchange; blindly retrying with the SAME cloid produces a permanent
+    "duplicate cloid" error queue, and minting a NEW cloid risks arming two
+    stops. This looks the intent up by cloid FIRST.
+
+    Never raises. Returns:
+      {"found": True, "lookup_ok": True, "oid": int, "trigger_px": float|None,
+       "size": float|None, "side": str|None}
+      {"found": False, "lookup_ok": True}   — cloid confirmed not resting
+      {"found": False, "lookup_ok": False}  — openOrders unreadable; the
+                                              caller must keep the old cloid
+    """
+    cloid_str = str(cloid) if cloid is not None else ""
+    if not cloid_str:
+        return {"found": False, "lookup_ok": False, "reason": "no_cloid"}
+    oo = _fetch_open_orders_snapshot(user)
+    if oo is None:
+        return {"found": False, "lookup_ok": False, "reason": "lookup_failed"}
+    for o in oo:
+        if o.get("coin") != coin:
+            continue
+        if str(o.get("cloid")) != cloid_str:
+            continue
+        oid = None
+        try:
+            oid = int(o.get("oid"))
+        except (TypeError, ValueError):
+            pass
+        sz = None
+        try:
+            sz = abs(float(o.get("sz", 0) or 0))
+        except (TypeError, ValueError):
+            sz = None
+        return {
+            "found": True,
+            "lookup_ok": True,
+            "oid": oid,
+            "trigger_px": _order_trigger_px_from_open(o),
+            "size": sz,
+            "side": o.get("side"),
+        }
+    return {"found": False, "lookup_ok": True}
+
+
+def find_sl_trigger_in_open_orders(
+    coin: str,
+    *,
+    is_long: bool,
+    entry_px: float,
+    expect_size: float,
+    old_oid: Optional[int] = None,
+    hint_trigger_px: Optional[float] = None,
+    size_tol_frac: float = 0.02,
+    size_tol_abs: float = 0.001,
+    mark_px: Optional[float] = None,
+    user: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reconcile a reduce-only SL trigger after a lost batchModify response.
+
+    batchModify is an atomic cancel+replace: when the response is lost the OLD
+    oid may be dead while the NEW oid is unknown. Inspect ONE openOrders
+    snapshot and decide:
+
+      status="old_alive":    `old_oid` still rests — the modify never applied;
+                             the tracker should keep it.
+      status="replacement":  old oid is gone but a DIFFERENT SL-side
+                             reduce-only trigger with matching size rests —
+                             that is the cancel+replace's new order. `order`
+                             carries its oid/trigger_px/size/side; `n_candidates`
+                             >1 means multiple plausible SLs exist (possible
+                             double-up) and the closest-to-hint one is returned
+                             so the caller can alert.
+      status="absent":       no SL-side order attributable to this intent —
+                             the stop is genuinely missing and must be re-armed.
+      status="lookup_failed":openOrders unreadable; state stays ambiguous.
+
+    SL vs TP classification mirrors backfill_brackets_from_exchange's
+    mainnet-verified rule: a long's SL rests BELOW entry (sell side "A"), a
+    short's SL rests ABOVE entry (buy side "B"); market-tpsl payloads carry
+    the trigger in `limitPx` with no tpsl tag.
+
+    When `hint_trigger_px` is given (the just-requested modify target, or the
+    tracker's last known SL trigger on restart), candidates are ranked by
+    distance from it; the hint never GATES acceptance (it only tie-breaks),
+    so a slightly-off rounded trigger is still claimable.
+
+    `mark_px` (the current mark when known) sets the SL-vs-TP side boundary:
+    a trailing SL can cross entry into profit, so the entry rule alone would
+    misread the replacement as a TP. Without it, the entry rule is used (the
+    pre-trailing / restart-with-no-mark conservative boundary).
+    Never raises.
+    """
+    failed = {"status": "lookup_failed"}
+    try:
+        oo = _fetch_open_orders_snapshot(user)
+        if oo is None:
+            return failed
+        size_tol = max(size_tol_abs, abs(expect_size) * size_tol_frac)
+        candidates: list[dict[str, Any]] = []
+        for o in oo:
+            if o.get("coin") != coin or o.get("reduceOnly") is not True:
+                continue
+            oid = None
+            try:
+                oid = int(o.get("oid"))
+            except (TypeError, ValueError):
+                continue
+            if old_oid is not None and oid == int(old_oid):
+                return {
+                    "status": "old_alive",
+                    "order": {"oid": oid,
+                              "trigger_px": _order_trigger_px_from_open(o)},
+                }
+            tpx = _order_trigger_px_from_open(o)
+            if tpx is None:
+                continue
+            # SL-side classification. Before Phase 2 the backup SL rests on the
+            # loss side of entry; but once trailing starts the SL ratchets and
+            # can cross entry (a long's locked-in stop ABOVE entry). Classifying
+            # against entry in that regime reads the replacement as a TP and the
+            # reconcile never claims it. So when the live mark is known, classify
+            # the side against the mark: any below-mark sell trigger for a long
+            # is the stop, mirror above for a short. Fall back to the entry rule
+            # only without a live mark.
+            ref_px = mark_px if mark_px else entry_px
+            is_sl_side = (is_long and tpx < ref_px) or \
+                         (not is_long and tpx > ref_px)
+            if not is_sl_side:
+                continue
+            try:
+                sz = abs(float(o.get("sz", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if abs(sz - expect_size) > size_tol:
+                continue
+            candidates.append({"oid": oid, "trigger_px": tpx, "size": sz,
+                               "side": o.get("side")})
+        if not candidates:
+            return {"status": "absent"}
+        if hint_trigger_px is not None:
+            candidates.sort(key=lambda c: abs(c["trigger_px"] - hint_trigger_px))
+        best = candidates[0]
+        return {"status": "replacement", "order": best,
+                "n_candidates": len(candidates)}
+    except Exception as e:
+        logger.warning(f"[find_sl_trigger] reconcile exception for {coin}: {e!r}")
+        return failed
 
 
 def reconcile_order_fill(
