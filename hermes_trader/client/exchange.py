@@ -670,9 +670,42 @@ def set_leverage(coin: str, leverage: int) -> dict[str, Any]:
     with "Insufficient margin to place order" despite plenty of free margin.
 
     No-op when no private key is set.
+
+    P4-b (audit 2026-09-09): validate the leverage BEFORE hitting the SDK.
+    Previously a typo via MCP/manual tools (0, negative, 500x, "abc") was
+    forwarded straight to update_leverage; an absurd value the exchange
+    happened to accept would over-leverage the account, while a type error
+    surfaced as an opaque SDK exception. Reject non-integers, <1, and values
+    above the exchange per-coin maxLeverage; when the coin's max cannot be
+    resolved (meta failure/unknown coin) fall back to a 100x hard ceiling,
+    which no legitimate HL perp reaches, without blocking the autonomous
+    path (executor clamps to the resolved coin max upstream).
     """
     if not PRIVATE_KEY_HEX:
         return {"ok": False, "error": "no private key"}
+
+    # Strict integer coercion: bools are ints in Python but never a valid
+    # leverage, and a float like 5.5 must not be silently truncated.
+    if isinstance(leverage, bool):
+        return {"ok": False, "error": f"invalid leverage {leverage!r}: must be an integer"}
+    if isinstance(leverage, float):
+        if not leverage.is_integer():
+            return {"ok": False, "error": f"invalid leverage {leverage:g}: must be a whole number"}
+        lev_int = int(leverage)
+    else:
+        try:
+            lev_int = int(str(leverage).strip())
+        except (TypeError, ValueError):
+            return {"ok": False, "error": f"invalid leverage {leverage!r}: must be an integer"}
+    if lev_int < 1:
+        return {"ok": False, "error": f"invalid leverage {lev_int}: must be >= 1"}
+    try:
+        max_lev = int(get_max_leverage(coin))
+    except Exception:
+        max_lev = 100  # safe hard ceiling shared by no HL perp
+    if lev_int > max_lev:
+        return {"ok": False, "error": f"leverage {lev_int}x exceeds max {max_lev}x for {coin}"}
+    leverage = lev_int
 
     is_cross = not _is_isolated_only(coin)
     try:
@@ -1373,22 +1406,101 @@ def cancel_open_orders_for_coin(coin: str) -> int:
     SL/TP trigger bracket left stranded after a market close. Without this,
     stale triggers accumulate and a later reduce-only order on the same coin is
     rejected ('reduce only order would increase position'). Returns the count
-    cancelled. Never raises."""
+    cancelled. Never raises.
+
+    H3 hardening (2026-09-09): a single best-effort cancel that silently no-ops
+    leaves a full-size reduce-only trigger resting on the exchange, which can
+    later close a brand-new position on the same coin (or get rejected and leave
+    that new position unprotected). Each matching oid is now retried a bounded
+    number of times, followed by a second openOrders read-back; anything still
+    resting is logged at ERROR and escalated as a risk alert so an operator can
+    intervene. Returning (not raising) is deliberate: callers run this after
+    deregister/settle steps that must not be skipped."""
+    # Bounded retry so a transient API hiccup doesn't strand triggers for days.
+    max_attempts = 3
+    retry_sleep_s = 0.5
     try:
         user = resolve_user_address()
         if not user:
             return 0
         orders = _http_post("/info", {"type": "openOrders", "user": user}) or []
-        n = 0
-        for o in orders:
-            if o.get("coin") == coin and o.get("oid") is not None:
-                if cancel_orders(int(o["oid"]), coin).get("ok"):
-                    n += 1
-        if n:
-            logger.info(f"[cancel_open_orders_for_coin] cancelled {n} stranded order(s) for {coin}")
-        return n
+        target_oids = [
+            int(o["oid"]) for o in orders
+            if o.get("coin") == coin and o.get("oid") is not None
+        ]
+        if not target_oids:
+            return 0
+        cancelled: set[int] = set()
+        failed: dict[int, str] = {}
+        for oid in target_oids:
+            for attempt in range(1, max_attempts + 1):
+                res = cancel_orders(oid, coin)
+                if res.get("ok"):
+                    cancelled.add(oid)
+                    failed.pop(oid, None)
+                    break
+                failed[oid] = str(res.get("error") or res)
+                if attempt < max_attempts:
+                    _time.sleep(retry_sleep_s)
+        if cancelled:
+            logger.info(
+                f"[cancel_open_orders_for_coin] cancelled {len(cancelled)} "
+                f"stranded order(s) for {coin}"
+            )
+        # Read-back verification: re-fetch openOrders and flag anything still
+        # resting for this coin rather than trusting the cancel ack.
+        residual: list[int] = []
+        try:
+            recheck = _http_post("/info", {"type": "openOrders", "user": user}) or []
+            residual = [
+                int(o["oid"]) for o in recheck
+                if o.get("coin") == coin and o.get("oid") is not None
+            ]
+        except Exception as verify_e:
+            # Cannot confirm the exchange state — treat the original target set
+            # minus confirmed cancels as suspect so it is still escalated.
+            logger.error(
+                f"[cancel_open_orders_for_coin] {coin} post-cancel verification "
+                f"failed: {verify_e}"
+            )
+            residual = [oid for oid in target_oids if oid not in cancelled]
+        if residual:
+            detail = ", ".join(str(o) for o in residual)
+            logger.error(
+                f"[cancel_open_orders_for_coin] {coin}: {len(residual)} order(s) "
+                f"STILL RESTING after {max_attempts} attempt(s): oid={detail}; "
+                f"cancel_errors={failed or 'n/a'}. Stranded reduce-only triggers "
+                f"can close a later position or block its protective orders."
+            )
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"⚠️ {coin} 平仓后残留挂单未撤销: oid={detail}（已重试 "
+                    f"{max_attempts} 次）。残留 reduce-only 触发器可能误平后续"
+                    f"新仓或导致新仓止损单被拒，需立即人工核对撤单。",
+                    category="risk")
+            except Exception as alert_e:
+                logger.error(
+                    f"[cancel_open_orders_for_coin] {coin} risk alert failed: {alert_e}"
+                )
+        elif failed:
+            # Every oid disappeared on read-back despite non-ok acks (e.g.
+            # already-filled/cancelled race): record but don't escalate.
+            logger.warning(
+                f"[cancel_open_orders_for_coin] {coin}: non-ok cancel acks but "
+                f"read-back clean: {failed}"
+            )
+        return len(cancelled)
     except Exception as e:
         logger.warning(f"[cancel_open_orders_for_coin] {coin} failed: {e}")
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"⚠️ {coin} 平仓后挂单清理流程异常: {e}；可能存在残留 reduce-only "
+                f"触发器，需立即人工核对 openOrders。",
+                category="risk")
+        except Exception:
+            pass
         return 0
 
 

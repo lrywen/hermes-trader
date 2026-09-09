@@ -4095,6 +4095,28 @@ def monitor_exits(mids: dict[str, float]) -> list[dict[str, Any]]:
     ]
 
 
+def _live_abs_szi(coin: str) -> Optional[float]:
+    """Fetch the live absolute perp size for `coin` from the exchange.
+
+    Returns None when the position cannot be resolved (fetch failure / coin
+    absent / unparseable szi); callers treat None as "cannot verify" and must
+    keep the previously-armed order untouched rather than blindly resizing it.
+    """
+    try:
+        user = resolve_user_address()
+        if not user:
+            return None
+        state = fetch_account_state(user, include_hip3=True)
+        for p in state.get("asset_positions", []) or []:
+            pos = p.get("position", {})
+            if pos.get("coin") == coin:
+                return abs(float(pos.get("szi") or 0.0))
+        return 0.0
+    except Exception as e:
+        logger.warning(f"[sl-move] {coin} live szi fetch failed: {e}")
+        return None
+
+
 def sync_exchange_sl(mids: dict[str, float]) -> None:
     """Move each position's exchange backup SL to trail the DSL floor in Phase 2.
 
@@ -4168,6 +4190,49 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
 
         size = tracker.sl_size
         if not size or size <= 0:
+            continue
+
+        # TP scale-out / any external partial close shrinks the live position
+        # but the resting SL was armed with the ORIGINAL full size. An oversized
+        # reduce-only modify is either rejected ("reduce only order would
+        # increase position", leaving the SL stuck at the old wider price every
+        # retry) or asynchronously rejected on trigger (remaining size naked).
+        # Clamp to the live szi — the only authoritative remaining size.
+        live_sz = _live_abs_szi(coin)
+        if live_sz is None:
+            # Cannot verify exchange state; leave the armed order untouched.
+            continue
+        if live_sz <= 0:
+            # Position gone: nothing left to protect; the close path already
+            # cancels resting triggers, skip the modify rather than send a
+            # zero-size order.
+            continue
+        if live_sz < size - max(0.001, size * 0.02):
+            logger.info(
+                f"[sl-move] {coin} clamping SL size {size:g} -> live {live_sz:g} "
+                f"(partial close / TP scale-out)"
+            )
+            size = live_sz
+
+        # A clamped SL whose notional is under HL's hard minimum cannot be
+        # (re)armed — modify would rest then reject asynchronously, leaving the
+        # position with NO stop. Skip the tighten and alert so the DSL floor
+        # (primary exit) keeps polling; an operator can flatten the dust.
+        if size * target < _resolve_min_order_usd():
+            logger.error(
+                f"[sl-move] {coin} clamped SL notional ${size * target:.2f} below "
+                f"HL minimum ${_resolve_min_order_usd():.2f} — leaving the existing "
+                f"exchange SL untouched; DSL floor remains the primary exit"
+            )
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"⚠️ {coin} 剩余仓位 {size:g}（约 ${size * target:.2f}）低于交易所"
+                    f"最小单额，交易所端 SL 无法收紧；DSL 软件止损仍在工作，"
+                    f"建议人工处理残量仓位。",
+                    category="risk")
+            except Exception:
+                pass
             continue
 
         # ── Only-tighten guard ──────────────────────────────────────────
@@ -5229,8 +5294,27 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                 _retry_cloid = Cloid.from_int(uuid.uuid4().int)
                 entry["cloid"] = _retry_cloid
             _retry_kw["cloid"] = _retry_cloid
+            # TP scale-out / external partial close may have shrunk the
+            # position since the failed arm: clamp the re-armed size to the
+            # live szi so a full-size reduce-only trigger isn't rejected.
+            _retry_size = float(entry["size"])
+            _live_sz = _live_abs_szi(coin)
+            if _live_sz is not None:
+                if _live_sz <= 0:
+                    logger.info(
+                        f"[executor] Pending SL retry for {coin}: position gone "
+                        f"(live szi=0) — dropping retry"
+                    )
+                    del _pending_sl_retries[coin]
+                    continue
+                if _live_sz < _retry_size - max(0.001, _retry_size * 0.02):
+                    logger.info(
+                        f"[executor] Pending SL retry {coin} clamping size "
+                        f"{_retry_size:g} -> live {_live_sz:g}"
+                    )
+                    _retry_size = _live_sz
             res = place_hl_trigger_order(
-                entry["is_buy"], entry["size"], entry["sl_px"], "sl", entry["coin"],
+                entry["is_buy"], _retry_size, entry["sl_px"], "sl", entry["coin"],
                 **_retry_kw
             )
             if res.get("ok"):
@@ -5239,7 +5323,7 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                 # Persist the retried SL's oid/px/size on the tracker.
                 set_bracket(coin, entry.get("side", "long" if entry["is_buy"] else "short"),
                             sl_oid=res.get("order_id"),
-                            sl_px=entry["sl_px"], sl_size=entry["size"])
+                            sl_px=entry["sl_px"], sl_size=_retry_size)
                 del _pending_sl_retries[coin]
             else:
                 # NEVER drop. Loud error each time so the naked position is

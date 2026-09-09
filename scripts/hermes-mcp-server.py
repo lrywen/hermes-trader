@@ -1454,35 +1454,51 @@ def handle_close_position(params: Dict[str, Any]) -> str:
     gate = _check_write_gate()
     if gate:
         return gate
-    """Handle close_position tool call."""
-    from hermes_trader.client.exchange import get_hl_price, place_hl_order
-    
+    """Handle close_position tool call.
+
+    H2 hardening (2026-09-09): must route through the same guarded funnel as
+    the HTTP/operator endpoints (executor.close_position_market). A raw
+    place_hl_order(reduce_only=True) bypassed the per-coin lock, cloid
+    idempotency, partial-fill mop-up, DSL deregister, stranded-trigger
+    cancellation, record_close/cooldown/breaker bookkeeping, and audit.
+    """
+    from hermes_trader.agents.executor import close_position_market
+    from hermes_trader import event_log
+
     coin = _norm_coin(params.get('coin', 'BTC'))
-    user = resolve_user_address()
-    
+
     try:
-        # Fetch position — include_hip3=True so HIP-3 coins are findable.
-        state = fetch_account_state(user, include_hip3=True)
-        pos = None
-        for p in (state.get('asset_positions') or []):
-            if p.get('position', {}).get('coin') == coin:
-                pos = p
-                break
-        
-        if not pos:
-            return json.dumps({'closed': False, 'reason': f'No position found for {coin}'})
-        
-        # Get position details
-        szi = float(pos['position']['szi'])
-        is_long = szi > 0
-        size = abs(szi)
-        mid_price = get_hl_price(coin)
-        
-        # Place opposite order to close
-        result = place_hl_order(not is_long, size, mid_price, coin=coin, reduce_only=True)
-        return json.dumps({'closed': True, 'coin': coin, 'size': size, 'result': result}, default=str)
+        result = close_position_market(coin)
     except Exception as e:
-        return json.dumps({'closed': False, 'error': str(e)}, default=str)
+        try:
+            event_log.append("operator_action", payload={
+                "action": "close_position", "via": "mcp",
+                "coin": coin, "ok": False, "error": str(e),
+            })
+        except Exception:
+            pass
+        return json.dumps({'closed': False, 'coin': coin, 'error': str(e)}, default=str)
+
+    noop = result.get("noop")
+    ok = bool(result.get("ok")) and not noop
+    out: Dict[str, Any] = {'closed': ok, 'coin': coin, 'result': result}
+    if noop:
+        # Preserve the pre-hardening response contract for no-position calls.
+        out['reason'] = f'No position found for {coin}'
+    if result.get('total_sz') is not None:
+        try:
+            out['size'] = abs(float(result['total_sz']))
+        except (TypeError, ValueError):
+            pass
+    try:
+        event_log.append("operator_action", payload={
+            "action": "close_position", "via": "mcp", "coin": coin,
+            "ok": bool(result.get("ok")), "noop": noop,
+            "side": result.get("side"), "error": result.get("error"),
+        })
+    except Exception:
+        pass
+    return json.dumps(out, default=str)
 
 def handle_set_leverage(params: Dict[str, Any]) -> str:
     gate = _check_write_gate()
@@ -1492,7 +1508,11 @@ def handle_set_leverage(params: Dict[str, Any]) -> str:
     from hermes_trader.client.exchange import set_leverage as set_leverage_fn
     coin = _norm_coin(params.get('coin', 'BTC'))
     leverage = params.get('leverage', 5)
-    result = set_leverage_fn(coin, int(leverage))
+    # P4-b: pass the raw value through. set_leverage validates types and
+    # ranges itself (never raises on bad input; returns {"ok": False}) so a
+    # typo like 0 / -3 / 500 / "abc" gets an error JSON instead of an
+    # uncaught ValueError killing the stdio request.
+    result = set_leverage_fn(coin, leverage)
     return json.dumps(result, default=str)
 
 def handle_get_open_orders(params: Dict[str, Any]) -> str:
@@ -1510,17 +1530,46 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
     gate = _check_write_gate()
     if gate:
         return gate
-    """Handle cancel_order tool call."""
-    from hermes_trader.client.exchange import _make_exchange
+    """Handle cancel_order tool call.
+
+    H2 hardening (2026-09-09): route through the exchange wrapper
+    (cancel_orders) like the HTTP endpoint instead of driving the raw SDK.
+    The wrapper resolves the asset index to a coin name and returns a normal
+    {ok, error} dict. A cancel here can remove a DSL-managed SL trigger, so
+    the attempt is forked to the tamper-evident audit log.
+    """
+    from hermes_trader.client.exchange import cancel_orders
+    from hermes_trader import event_log
     asset = params.get('asset')
     order_id = params.get('order_id')
     if asset is None or order_id is None:
         return json.dumps({'cancelled': False, 'error': 'asset and order_id required'})
     try:
-        exchange = _make_exchange()
-        result = exchange.cancel(asset, order_id)
-        return json.dumps({'cancelled': True, 'result': result}, default=str)
+        asset_idx = int(asset)
+        oid = int(order_id)
+    except (TypeError, ValueError):
+        return json.dumps({'cancelled': False, 'error': 'asset and order_id must be integers'})
+    try:
+        result = cancel_orders(oid, asset_idx=asset_idx)
+        ok = bool(result.get('ok'))
+        try:
+            event_log.append("operator_action", payload={
+                "action": "cancel_order", "via": "mcp",
+                "asset_idx": asset_idx, "oid": oid,
+                "ok": ok, "error": result.get("error"),
+            })
+        except Exception:
+            pass
+        return json.dumps({'cancelled': ok, 'result': result}, default=str)
     except Exception as e:
+        try:
+            event_log.append("operator_action", payload={
+                "action": "cancel_order", "via": "mcp",
+                "asset_idx": asset_idx, "oid": oid,
+                "ok": False, "error": str(e),
+            })
+        except Exception:
+            pass
         return json.dumps({'cancelled': False, 'error': str(e)}, default=str)
 
 def handle_get_spot_balances(params: Dict[str, Any]) -> str:
