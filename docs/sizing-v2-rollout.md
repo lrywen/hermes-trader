@@ -94,3 +94,49 @@ docker exec hermes-trader grep 'clamped:.*gray' /data/trading-loop.log | tail -2
 # 配置热更新示例（阶段 1）：
 # atr_risk_sizing.sizing_v2_enabled = true, sizing_v2_cap_pct = 0.10
 ```
+
+## 8. CS-G 空头侧与成本上限 shadow 遥测（2026-09-09）
+
+CS-G 只在 **shadow 评级记录**上新增字段，applied 仓位与下单路径完全不动；
+`HERMES_SIZING_V2_MODE` 须保持 `shadow`。空头/多头序列按方向分别累计
+（出场滑点、费率、结果不再混用一个池子），成本分母加宽为
+「方向化实测出场滑点 + 实测费率 + 预期持仓时长内的 funding/借币 carry」。
+
+每笔 shadow 评级新增 `v2_cost_*` 字段（仅遥测，不参与 applied size）：
+
+| 字段 | 含义 |
+|------|------|
+| `v2_cost_denom_pct` | 加宽后的成本分母（占名义本金 %，含滑点+费+carry） |
+| `v2_cost_slip_bps` / `v2_cost_slip_extra_pct` | 方向化实测不利出场滑点（bps）与相对旧假设的增量（%） |
+| `v2_cost_slip_source` | 滑点来源：`measured_long` / `measured_short` / `fallback`（样本不足冷启动） |
+| `v2_cost_fee_rt_pct` / `v2_cost_fee_measured_bps` | 实测手续费率（%）与记忆层实测 bps |
+| `v2_cost_hold_hours` / `v2_cost_hold_source` | 预期持仓时长（小时）与来源：`config` / `fallback`（默认 8.0h） |
+| `v2_cost_funding_rate_hr` | 当期 funding 小时费率（空头符号方向化） |
+| `v2_cost_carry_pct` | 预期持仓内 funding/借币 carry 合计（%） |
+| `v2_cost_borrow_bps` | 借币成本 bps（冷启动保守取 0.0） |
+| `v2_cost_notional_usd` / `v2_cost_notional_clamped_usd` | 宽分母反推名义本金与经成本上限钳制后的名义本金 |
+| `v2_cost_cap_binds` | 该笔是否被成本上限钳制（bool） |
+| `v2_cost_vs_v2_ratio` | 宽分母口径相对现 v2 口径的名义本金比（<1=成本上限更紧） |
+
+### 8.1 168h 评级口径（CS-G 观察窗，不改变 §4 晋级闸门）
+
+CS-G 观察窗与既有 24/72/168h 评级并行，168h 末同时满足以下条件才允许把
+宽分母成本上限列入 PROMOTE_CANDIDATE（仍需 §4 六条全过 + 人工晋升）：
+
+1. **分方向样本量**：168h 内 long、short 各自 ≥10 笔 shadow 评级；不足则
+   延长窗口，不跨方向凑数。
+2. **来源成熟度**：`v2_cost_slip_source=fallback` 或
+   `v2_cost_hold_source=fallback` 的占比 ≤20%（冷启动默认值不得主导评级）。
+3. **上限绑定率**：`v2_cost_cap_binds=true` 占比稳定且方向间差异可解释；
+   绑定率 >50% 视为成本上限过紧或实测成本异常，禁止晋升，先核 funding/滑点。
+4. **比率合理性**：`v2_cost_vs_v2_ratio` 的 P50 ∈ [0.5, 1.0]（宽分母应更紧
+   但不应腰斩到失真）；空头比率须与空头 carry 符号方向一致，出现
+   ratio>1 的系统性反向即阻断。
+5. **carry 校验**：`v2_cost_carry_pct` 与窗口内实际 funding 同号同量级，
+   `v2_cost_borrow_bps=0.0` 期间结论按「未计借币」标注，不作为最终上限。
+6. **零路径副作用**：168h 内 applied 仓位零变化（v2 仍 false / cap 路径
+   不变）、无 `v2_cost_*` 相关异常、§5 回滚条件零触发。
+
+口径产出仍由离线 `scripts/shadow_grade.py --json` 汇总；任何一项不满足都只
+延长观察，不调闸门、不改阈值、不改 `scripts/trading_loop.py`。
+
