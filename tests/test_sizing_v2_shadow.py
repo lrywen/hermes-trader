@@ -110,6 +110,19 @@ class _StubMemory:
     def avg_exit_slip_bps(self, coin, days=None):
         return 0.0
 
+    # CS-G: neutral side-aware readers still degrade to the conservative
+    # default (never zero) so the shadow cost-cap fields are always populated.
+    def avg_exit_slip_bps_side(self, coin, side, days=None, min_samples=None,
+                               default_bps=2.0):
+        return default_bps, "default"
+
+    def avg_hold_hours_side(self, coin, side, days=None, min_samples=None,
+                            default_hours=8.0):
+        return default_hours, "default"
+
+    def avg_round_trip_fee_bps(self, coin, days=None, min_samples=None):
+        return 0.0
+
     def loss_cooldown_remaining_min(self, coin):
         return 0
 
@@ -139,6 +152,13 @@ def _wire_executor(monkeypatch, tmp_path, cfg_extra, shadow_file):
     see — that is the exact notional that would be ordered.
     """
     from hermes_trader.agents import market_regime, shadow_book
+    from hermes_trader.client import hl_client
+
+    # CS-G shadow cost block reads the latest funding rate via the cached
+    # primitive; keep the test offline and deterministic (no carry contribution
+    # unless a test overrides it).
+    monkeypatch.setattr(hl_client, "fetch_funding_history",
+                        lambda *_a, **_k: [])
 
     cfg = {
         "mode": "SHADOW", "enable_crypto": True,
@@ -370,3 +390,149 @@ def test_non_gray_sub_min_still_rejected_past_gap(monkeypatch, tmp_path):
     assert "below_min_order_notional" in res.get("reason", "")
     # No order/paper-book reached the gates.
     assert "ctx" not in captured
+
+
+# ── CS-G: short side + cost-cap (shadow-only observation) ───────────────────
+class _CostStubMemory(_StubMemory):
+    """Memory stub with explicit side-aware slip/hold/funding inputs."""
+
+    def __init__(self, side_slip_bps=2.0, hold_hours=8.0, slip_source="default",
+                 hold_source="default"):
+        self._side_slip = side_slip_bps
+        self._hold = hold_hours
+        self._slip_src = slip_source
+        self._hold_src = hold_source
+
+    def avg_exit_slip_bps_side(self, coin, side, days=None, min_samples=None,
+                               default_bps=2.0):
+        return self._side_slip, self._slip_src
+
+    def avg_hold_hours_side(self, coin, side, days=None, min_samples=None,
+                            default_hours=8.0):
+        return self._hold, self._hold_src
+
+
+def _short_analysis():
+    a = _analysis()
+    a.update({"action": "SHORT", "side": "short",
+              "stop_px": 101.0, "tp_px": 90.0})
+    return a
+
+
+def _set_funding(monkeypatch, rate_hr):
+    from hermes_trader.client import hl_client
+    monkeypatch.setattr(
+        hl_client, "fetch_funding_history",
+        lambda *_a, **_k: [{"fundingRate": rate_hr}])
+
+
+def test_shadow_long_cost_cap_fields_present_and_zero_regression(monkeypatch, tmp_path):
+    """CS-G long cold start: cost-cap decomposition is logged additively while
+    the existing v1/v2 widths and notionals stay byte-identical ($800/$2000)."""
+    monkeypatch.setenv(_ENV_MODE, "shadow")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    captured = _wire_executor(monkeypatch, tmp_path, {}, shadow_file)
+
+    res = executor.maybe_execute(_analysis())
+    assert res.get("reason") == "shadow_mode_would_execute"
+    # Live order sizing is untouched by the cost-cap experiment.
+    assert abs(captured["ctx"].trade_notional_usd - 800.0) < 1e-6
+
+    rec = _read_jsonl(shadow_file)[0]
+    # Original fields unchanged.
+    assert rec["v1_stop_pct"] == 2.5
+    assert rec["v2_stop_pct"] == 1.0
+    assert rec["v2_notional_usd"] == 2000.0
+    assert rec["notional_ratio"] == 2.5
+    # CS-G fields: side, fee 0.025%*2 = 0.05% round trip, no funding (stub [])
+    # and cold-start side slip default 2bps over the 0 shared slip → 0.02%.
+    assert rec["side"] == "long"
+    assert rec["v2_cost_slip_source"] == "default"
+    assert abs(rec["v2_cost_slip_extra_pct"] - 0.02) < 1e-9
+    assert abs(rec["v2_cost_fee_rt_pct"] - 0.05) < 1e-9
+    assert rec["v2_cost_funding_rate_hr"] is None
+    assert rec["v2_cost_carry_pct"] == 0.0
+    assert rec["v2_cost_borrow_bps"] == 0.0
+    assert rec["v2_cost_hold_source"] == "default"
+    assert abs(rec["v2_cost_hold_hours"] - 8.0) < 1e-9
+    # Denominator 1.0% + 0.02% slip + 0.05% fee = 1.07% → $20/0.0107.
+    assert abs(rec["v2_cost_denom_pct"] - 1.07) < 1e-9
+    assert abs(rec["v2_cost_notional_usd"] - (20.0 / 0.0107)) < 0.01
+    # Cost-widened notional is smaller than the plain v2 notional.
+    assert rec["v2_cost_notional_usd"] < rec["v2_notional_usd"]
+    assert 0.0 < rec["v2_cost_vs_v2_ratio"] < 1.0
+
+
+def test_shadow_short_negative_funding_adds_carry(monkeypatch, tmp_path):
+    """CS-G short: consistent with close accounting
+    (funding_cost = rate × hrs × notional × -1 for shorts), NEGATIVE funding
+    is a COST for shorts; the signed carry widens the denominator and the
+    $500 total-room cap binds."""
+    monkeypatch.setenv(_ENV_MODE, "shadow")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    # max_total_notional_pct is a FRACTION of equity: 0.5 × $1000 equity →
+    # $500 total-room cap (binds before the 1x lev cap of $1000).
+    captured = _wire_executor(monkeypatch, tmp_path,
+                              {"max_total_notional_pct": 0.5}, shadow_file)
+    monkeypatch.setattr(executor, "memory", _CostStubMemory())
+    # -0.01%/hr × 8h hold × (-1 short sign) = +0.08% carry cost.
+    _set_funding(monkeypatch, -0.0001)
+
+    res = executor.maybe_execute(_short_analysis())
+    assert res.get("reason") == "shadow_mode_would_execute"
+    # Live sizing still on the v1 width (2.5%); the cost model itself is
+    # observation-only. The $500 total-room cap binds on both paths, so the
+    # v1 raw $800 is clamped to $500 here (same clamp the enforce path uses).
+    assert abs(captured["ctx"].trade_notional_usd - 500.0) < 1e-6
+
+    rec = _read_jsonl(shadow_file)[0]
+    assert rec["side"] == "short"
+    assert abs(rec["v2_cost_carry_pct"] - 0.08) < 1e-9
+    # 1.0 stop + 0.02 slip + 0.05 fee + 0.08 carry = 1.15%.
+    assert abs(rec["v2_cost_denom_pct"] - 1.15) < 1e-9
+    raw = 20.0 / 0.0115
+    assert abs(rec["v2_cost_notional_usd"] - raw) < 0.01
+    # Raw cost notional ~ $1739 → lev cap $1000 → total-room cap $500 binds.
+    assert rec["v2_cost_notional_clamped_usd"] == 500.0
+    assert rec["v2_cost_cap_binds"] is True
+
+
+def test_shadow_short_positive_funding_income_clamped_to_zero(monkeypatch, tmp_path):
+    """CS-G short: POSITIVE funding PAYS the short (longs pay shorts on HL),
+    i.e. carry income. It must be clamped to 0 so expected income never
+    inflates notional."""
+    monkeypatch.setenv(_ENV_MODE, "shadow")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    _wire_executor(monkeypatch, tmp_path, {}, shadow_file)
+    monkeypatch.setattr(executor, "memory", _CostStubMemory())
+    _set_funding(monkeypatch, 0.0001)  # short receives funding
+
+    executor.maybe_execute(_short_analysis())
+    rec = _read_jsonl(shadow_file)[0]
+    assert rec["side"] == "short"
+    # Signed carry = 0.0001*8*(-1) < 0 → clamped to 0 (no denominator relief).
+    assert rec["v2_cost_carry_pct"] == 0.0
+    assert abs(rec["v2_cost_denom_pct"] - 1.07) < 1e-9
+
+
+def test_shadow_side_slip_measured_reuses_shared_no_extra(monkeypatch, tmp_path):
+    """When the side-aware slip equals the shared coin slip already embedded in
+    the v2 stop, the incremental slip widening is exactly zero (no double
+    count)."""
+    monkeypatch.setenv(_ENV_MODE, "shadow")
+    shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
+    monkeypatch.setenv(_ENV_FILE, shadow_file)
+    _wire_executor(monkeypatch, tmp_path, {}, shadow_file)
+    # side slip 0 with a coin_side source means shared slip is also 0 here.
+    monkeypatch.setattr(executor, "memory",
+                        _CostStubMemory(side_slip_bps=0.0, slip_source="coin_side"))
+
+    executor.maybe_execute(_short_analysis())
+    rec = _read_jsonl(shadow_file)[0]
+    assert rec["v2_cost_slip_source"] == "coin_side"
+    assert rec["v2_cost_slip_extra_pct"] == 0.0
+    # Denominator only carries the fee (no funding stub): 1.0 + 0.05 = 1.05%.
+    assert abs(rec["v2_cost_denom_pct"] - 1.05) < 1e-9

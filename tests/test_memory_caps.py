@@ -210,3 +210,146 @@ def test_daily_realized_pnl_zero_equity_guard(monkeypatch):
                     "closed_at": (m._day_start_ts + 60) * 1000})
     assert m.coin_daily_realized_pnl_pct("BTC", 0.0) == 0.0
     assert m.coin_daily_realized_pnl_pct("BTC", -10.0) == 0.0
+
+
+# ── CS-G: direction-differentiated slip / hold series ──────────────────────
+
+def _cs_close(m, coin, side, slip=None, hold_min=None, off=0):
+    """A today-stamped close row for CS-G stats (off = seconds past 01:00)."""
+    row = {"coin": coin, "side": side,
+           "closed_at": (m._day_start_ts + 3600 + off) * 1000}
+    if slip is not None:
+        row["exit_slip_bps"] = slip
+    if hold_min is not None:
+        row["hold_minutes"] = hold_min
+    m.record_close(row)
+
+
+def test_side_slip_prefers_coin_side_then_coin_shared(monkeypatch):
+    # 3 short closes for BTC feed coin_side. A single long close leaves the
+    # long coin_side series under min_samples, but the shared coin series
+    # (all four closes qualify) does — so the long read falls through to
+    # coin_shared with mean(4, 6, 8, 12) = 7.5.
+    m = _close_mem(monkeypatch)
+    for i, v in enumerate((4.0, 6.0, 8.0)):
+        _cs_close(m, "ZBTC", "short", slip=v, off=i * 60)
+    bps, src = m.avg_exit_slip_bps_side("ZBTC", "short", min_samples=3)
+    assert src == "coin_side"
+    assert bps == pytest.approx(6.0)
+    _cs_close(m, "ZBTC", "long", slip=12.0, off=1000)
+    bps, src = m.avg_exit_slip_bps_side("ZBTC", "long", min_samples=3)
+    assert src == "coin_shared"
+    assert bps == pytest.approx(7.5)
+
+
+def test_side_slip_falls_back_to_global_side_pool(monkeypatch):
+    # No BTC data at all: three OTHER coins' same-side (short) means pool
+    # together; opposite-side (long) rows must not enter the pool.
+    m = _close_mem(monkeypatch)
+    for i, coin in enumerate("ZABC"):
+        for j, v in enumerate((5.0, 7.0)):
+            _cs_close(m, coin, "short", slip=v, off=i * 300 + j * 60)
+    for i, coin in enumerate("ZABC"):
+        for j, v in enumerate((50.0, 70.0)):
+            _cs_close(m, coin, "long", slip=v, off=10_000 + i * 300 + j * 60)
+    bps, src = m.avg_exit_slip_bps_side("ZUNKNOWN", "short", min_samples=3)
+    assert src == "global_side"
+    assert bps == pytest.approx(6.0)
+
+
+def test_side_slip_cold_default_and_bad_side(monkeypatch):
+    # Empty memory (and an unseen coin): conservative 2.0 bps default, never
+    # zero-width. An unrecognized side argument normalizes to long.
+    m = _close_mem(monkeypatch)
+    bps, src = m.avg_exit_slip_bps_side("ZUNKNOWN", "short", min_samples=3)
+    assert src == "default"
+    assert bps == 2.0
+    bps, src = m.avg_exit_slip_bps_side("ZUNKNOWN", "weird", min_samples=3)
+    assert src == "default"
+    assert bps == 2.0
+
+
+def test_side_hold_converts_minutes_to_hours_coin_side(monkeypatch):
+    # hold_minutes is stored/returned in HOURS.
+    m = _close_mem(monkeypatch)
+    for i, mins in enumerate((120.0, 240.0, 480.0)):  # 2h, 4h, 8h
+        _cs_close(m, "ZBTC", "long", hold_min=mins, off=i * 60)
+    hours, src = m.avg_hold_hours_side("ZBTC", "long", min_samples=3)
+    assert src == "coin_side"
+    assert hours == pytest.approx((2.0 + 4.0 + 8.0) / 3.0)
+
+
+def test_side_hold_global_pool_and_default(monkeypatch):
+    # Three other coins' long holds pool into global_side; an unseen coin with
+    # no pool falls back to the 8.0h conservative default.
+    m = _close_mem(monkeypatch)
+    for i, coin in enumerate("ZABC"):
+        for j, mins in enumerate((120.0, 240.0)):  # 2h, 4h
+            _cs_close(m, coin, "long", hold_min=mins, off=i * 300 + j * 60)
+    hours, src = m.avg_hold_hours_side("ZUNKNOWN", "long", min_samples=3)
+    assert src == "global_side"
+    assert hours == pytest.approx(3.0)
+    hours, src = m.avg_hold_hours_side("ZUNKNOWN", "short", min_samples=3)
+    assert src == "default"
+    assert hours == 8.0
+
+
+def test_close_stats_rebuild_replays_side_series(monkeypatch):
+    # A rebuild (restart/hydration path) must reconstruct _slip_side /
+    # _hold_side from the _closes rows with identical reader results.
+    m = _close_mem(monkeypatch)
+    for i, v in enumerate((4.0, 6.0, 8.0)):
+        _cs_close(m, "ZBTC", "short", slip=v, hold_min=120.0 + i * 60,
+                  off=i * 60)
+    before = (m.avg_exit_slip_bps_side("ZBTC", "short", min_samples=3),
+              m.avg_hold_hours_side("ZBTC", "short", min_samples=3))
+    m._rebuild_close_stats_nolock()
+    after = (m.avg_exit_slip_bps_side("ZBTC", "short", min_samples=3),
+             m.avg_hold_hours_side("ZBTC", "short", min_samples=3))
+    assert before == after
+    assert after[0][1] == "coin_side"
+    assert after[0][0] == pytest.approx(6.0)
+    assert after[1][0] == pytest.approx((2.0 + 3.0 + 4.0) / 3.0)
+
+
+def test_side_series_evicts_in_lockstep_with_closes(monkeypatch):
+    # Pin the closes cap to 3: appending a 4th/5th short close evicts the
+    # oldest _closes row and its per-side slip/hold deque heads together.
+    from hermes_trader.agents import memory as memory_mod
+    real_limits = memory_mod._memory_limits
+
+    def tiny_limits():
+        d = dict(real_limits())
+        d["closes"] = 3
+        return d
+
+    monkeypatch.setattr(memory_mod, "_memory_limits", tiny_limits)
+    m = _close_mem(monkeypatch)
+    _cs_close(m, "ZBTC", "short", slip=4.0, hold_min=60.0, off=0)
+    _cs_close(m, "ZBTC", "short", slip=6.0, hold_min=120.0, off=60)
+    _cs_close(m, "ZBTC", "short", slip=8.0, hold_min=180.0, off=120)
+    _cs_close(m, "ZBTC", "short", slip=10.0, hold_min=240.0, off=180)
+    assert len(m._closes) == 3
+    # Deques hold the surviving three rows: 6 / 8 / 10 bps → 8.0;
+    # 2 / 3 / 4 hours → 3.0h.
+    assert len(m._slip_side[("ZBTC", "short")]) == 3
+    assert len(m._hold_side[("ZBTC", "short")]) == 3
+    bps, src = m.avg_exit_slip_bps_side("ZBTC", "short", min_samples=3)
+    assert src == "coin_side"
+    assert bps == pytest.approx(8.0)
+    hours, src = m.avg_hold_hours_side("ZBTC", "short", min_samples=3)
+    assert src == "coin_side"
+    assert hours == pytest.approx(3.0)
+
+
+def test_side_series_normalizes_uppercase_legacy_rows(monkeypatch):
+    # Legacy disk rows written with side="SHORT"/"LONG" must fold into the
+    # same lowercase-keyed side series, and uppercase reader args must match.
+    m = _close_mem(monkeypatch)
+    for i, v in enumerate((4.0, 6.0, 8.0)):
+        _cs_close(m, "ZBTC", "SHORT", slip=v, off=i * 60)
+    bps, src = m.avg_exit_slip_bps_side("ZBTC", "SHORT", min_samples=3)
+    assert src == "coin_side"
+    assert bps == pytest.approx(6.0)
+    bps, src = m.avg_exit_slip_bps_side("ZBTC", "short", min_samples=3)
+    assert bps == pytest.approx(6.0)

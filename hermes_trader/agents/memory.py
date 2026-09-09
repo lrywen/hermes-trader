@@ -250,6 +250,16 @@ _MEMORY_QUALITY_DEFAULTS: dict[str, Any] = {
     "slip_min_samples": 3,
     "flush_throttle_s": 0.2,
 }
+# CS-G (sizing-v2 short side + cost cap) cold-start conservative fallbacks.
+# When a per-side series has too few samples, the reader degrades to the
+# shared coin series / a global same-side mean, and only then to these
+# literals — never to ZERO (zero cost widening would size the position as if
+# fills and carry were free). 2.0 bps/side matches the existing offline PF
+# reports' no-measurement adverse-slip assumption (_DEFAULT_SLIPPAGE_BPS);
+# 8h is the conservative expected perp carry horizon before a same-side
+# measured mean-hold exists.
+_DEFAULT_COLD_EXIT_SLIP_BPS = 2.0
+_DEFAULT_EXPECTED_HOLD_HOURS = 8.0
 # leaf -> (legacy env var or None, kind "i"/"f", minimum guard).
 _MEMORY_QUALITY_SPEC: dict[str, tuple[Optional[str], str, float]] = {
     "implausible_pct": (None, "f", 0.0),
@@ -403,6 +413,14 @@ class AgentMemory:
         # fees (fee_usd / notional_usd from closes marked fee_actual=True —
         # i.e. real exchange fill fees, not the in-process modeled estimate).
         self._fee_series: dict[str, Deque[tuple[float, float]]] = {}
+        # CS-G (sizing-v2 short side): direction-differentiated views rebuilt
+        # from the same close rows (which carry `side`, `exit_slip_bps` and
+        # `hold_minutes`). Key (coin, side) -> deque of (closed_at_s, value).
+        # _slip_side tracks adverse exit slip per side (shorts and longs do
+        # not share fill quality under stress); _hold_side tracks realized
+        # holding time in HOURS per side to size the expected funding carry.
+        self._slip_side: dict[tuple[str, str], Deque[tuple[float, float]]] = {}
+        self._hold_side: dict[tuple[str, str], Deque[tuple[float, float]]] = {}
         self._day_realized_usd: dict[str, float] = {}
         self._day_stats_start_ts: int = 0
         self._initialized = False
@@ -1696,6 +1714,8 @@ class AgentMemory:
         _closes append order."""
         self._slip_series = {}
         self._fee_series = {}
+        self._slip_side = {}
+        self._hold_side = {}
         self._day_realized_usd = {}
         day_start = self._day_start_ts
         for c in self._closes:
@@ -1756,6 +1776,41 @@ class AgentMemory:
                 fdq.append((ts_s, fee_bps))
                 if len(fdq) > _memory_limits()["closes"]:
                     fdq.popleft()
+        # CS-G: direction-differentiated views. Only well-formed long/short
+        # rows contribute (normalized to lowercase so legacy disk rows written
+        # with "LONG"/"SHORT" still fold in); adverse exit slip stays >0-only
+        # (consistent with the shared _slip_series), and hold time must be
+        # positive.
+        _side = str(c.get("side") or "").lower()
+        if _side in ("long", "short"):
+            _cap = _memory_limits()["closes"]
+            if slip is not None:
+                try:
+                    _sv = float(slip)
+                except (TypeError, ValueError):
+                    _sv = 0.0
+                if _sv > 0:
+                    sdq = self._slip_side.get((coin, _side))
+                    if sdq is None:
+                        sdq = deque()
+                        self._slip_side[(coin, _side)] = sdq
+                    sdq.append((ts_s, _sv))
+                    if len(sdq) > _cap:
+                        sdq.popleft()
+            _hold_min = c.get("hold_minutes")
+            if _hold_min is not None:
+                try:
+                    _hv = float(_hold_min) / 60.0
+                except (TypeError, ValueError):
+                    _hv = 0.0
+                if _hv > 0:
+                    hdq = self._hold_side.get((coin, _side))
+                    if hdq is None:
+                        hdq = deque()
+                        self._hold_side[(coin, _side)] = hdq
+                    hdq.append((ts_s, _hv))
+                    if len(hdq) > _cap:
+                        hdq.popleft()
         if day_start is None:
             day_start = self._day_start_ts
         # Mirror the old scan: rows without a usable closed_at (0/None) were
@@ -1793,10 +1848,10 @@ class AgentMemory:
         if not coin:
             return
         ts_s = self._close_ts_s(c)
+        slip = c.get("exit_slip_bps")
         dq = self._slip_series.get(coin)
         if dq:
             head_ts, head_v = dq[0]
-            slip = c.get("exit_slip_bps")
             try:
                 v = float(slip) if slip is not None else 0.0
             except (TypeError, ValueError):
@@ -1816,6 +1871,27 @@ class AgentMemory:
                 _fb = 0.0
             if head_ts == ts_s and abs(_head_fb - _fb) < 1e-6:
                 fdq.popleft()
+        # CS-G: detach the per-side slip/hold heads the evicted close fed.
+        _eside = str(c.get("side") or "").lower()
+        if _eside in ("long", "short"):
+            sdq = self._slip_side.get((coin, _eside))
+            if sdq:
+                _h_ts, _h_v = sdq[0]
+                try:
+                    _sv = float(slip) if slip is not None else 0.0
+                except (TypeError, ValueError):
+                    _sv = 0.0
+                if _h_ts == ts_s and abs(_h_v - _sv) < 1e-9 and _sv > 0:
+                    sdq.popleft()
+            hdq = self._hold_side.get((coin, _eside))
+            if hdq:
+                _h_ts, _h_h = hdq[0]
+                try:
+                    _hv = float(c.get("hold_minutes")) / 60.0
+                except (TypeError, ValueError):
+                    _hv = 0.0
+                if _h_ts == ts_s and abs(_h_h - _hv) < 1e-9 and _hv > 0:
+                    hdq.popleft()
         if ts_s and ts_s >= float(self._day_stats_start_ts):
             pnl = c.get("realized_pnl_usd")
             if pnl is not None:
@@ -1927,6 +2003,88 @@ class AgentMemory:
         if len(samples) < min_samples:
             return 0.0
         return sum(samples) / len(samples)
+
+    @staticmethod
+    def _window_mean(dq: Optional[Deque[tuple[float, float]]], cutoff: float,
+                     min_samples: int) -> Optional[float]:
+        """Mean of a (ts, value) deque inside the window with >= min_samples,
+        else None. Rows with no usable ts (0.0) never age out (same rule as
+        avg_exit_slip_bps)."""
+        if not dq:
+            return None
+        samples = [v for ts, v in dq if not ts or ts >= cutoff]
+        if len(samples) < min_samples:
+            return None
+        return sum(samples) / len(samples)
+
+    def avg_exit_slip_bps_side(self, coin: str, side: str,
+                               days: Optional[float] = None,
+                               min_samples: Optional[int] = None,
+                               default_bps: float = _DEFAULT_COLD_EXIT_SLIP_BPS
+                               ) -> tuple[float, str]:
+        """CS-G: direction-differentiated adverse exit slip in bps.
+
+        Degradation chain (never to zero — a missing-data zero would size the
+        position as if exits were free): (1) this coin+side mean, (2) the
+        shared coin mean via avg_exit_slip_bps (its own insufficient-history
+        result is NOT trusted here), (3) a global same-side mean across coins,
+        (4) the conservative `default_bps` literal. Returns (bps, source)."""
+        _side = str(side or "long").lower()
+        if _side not in ("long", "short"):
+            _side = "long"
+        _q = _memory_quality_params()
+        if days is None:
+            days = _q["slip_window_days"]
+        if min_samples is None:
+            min_samples = _q["slip_min_samples"]
+        cutoff = time.time() - days * 86400.0
+        with self._lock:
+            self._ensure_close_stats_nolock()
+            m = self._window_mean(self._slip_side.get((coin, _side)),
+                                  cutoff, min_samples)
+            if m is not None:
+                return m, "coin_side"
+            m = self._window_mean(self._slip_series.get(coin), cutoff, min_samples)
+            if m is not None:
+                return m, "coin_shared"
+            pooled: list[float] = []
+            for (c2, s2), dq in self._slip_side.items():
+                if s2 == _side and c2 != coin:
+                    pooled.extend(v for ts, v in dq if not ts or ts >= cutoff)
+        if len(pooled) >= min_samples:
+            return sum(pooled) / len(pooled), "global_side"
+        return float(default_bps), "default"
+
+    def avg_hold_hours_side(self, coin: str, side: str,
+                            days: Optional[float] = None,
+                            min_samples: Optional[int] = None,
+                            default_hours: float = _DEFAULT_EXPECTED_HOLD_HOURS
+                            ) -> tuple[float, str]:
+        """CS-G: mean realized holding time in HOURS for `coin`+`side`, used
+        to size the expected funding-carry horizon. Degradation chain:
+        coin+side mean → global same-side mean → conservative default."""
+        _side = str(side or "long").lower()
+        if _side not in ("long", "short"):
+            _side = "long"
+        _q = _memory_quality_params()
+        if days is None:
+            days = _q["slip_window_days"]
+        if min_samples is None:
+            min_samples = _q["slip_min_samples"]
+        cutoff = time.time() - days * 86400.0
+        with self._lock:
+            self._ensure_close_stats_nolock()
+            m = self._window_mean(self._hold_side.get((coin, _side)),
+                                  cutoff, min_samples)
+            if m is not None:
+                return m, "coin_side"
+            pooled: list[float] = []
+            for (c2, s2), dq in self._hold_side.items():
+                if s2 == _side and c2 != coin:
+                    pooled.extend(v for ts, v in dq if not ts or ts >= cutoff)
+        if len(pooled) >= min_samples:
+            return sum(pooled) / len(pooled), "global_side"
+        return float(default_hours), "default"
 
     def coin_daily_realized_pnl_pct(self, coin: str,
                                     start_of_day_equity: float) -> float:
