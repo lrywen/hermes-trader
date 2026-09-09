@@ -15,6 +15,7 @@ nested keys, e.g. ``HERMES_CFG_DSL_EXIT__PROTECT_PCT``).
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import logging
 import os
@@ -70,6 +71,83 @@ def _invalidate_raw_cache() -> None:
     with _RAW_CACHE_LOCK:
         _RAW_CACHE = None
         _RAW_CACHE_SIG = None
+
+
+# ── CS-E (2026-09-09): 阈值 era 分段归因 ─────────────────────────────
+# 仅这些配置路径参与 era 指纹：它们是会改变入场选择 / 风控熔断 / 仓位与
+# DSL 退出 / 实验臂行为的阈值。无关键（mode、日志路径、UI 插件等）的改动
+# 不产生新 era，避免归因时间线被噪声改动污染。
+# - 以 ".*" 结尾：跟踪整个子树（该子树下任一叶变化都换 era）。
+# - 其余：跟踪标量或该精确节点。
+# 这是 era 归因的单一事实源，离线脚本 scripts/era_attribution.py 复用。
+ERA_TRACKED_PATHS: tuple[str, ...] = (
+    # 入场选择类
+    "min_ai_confidence",
+    "scan.minCompositeScore",
+    "runner_entry_gate.*",
+    "ta_late_entry.*",
+    # 风控 / 熔断类
+    "market_circuit.*",
+    "max_daily_loss_usd",
+    # 仓位 / DSL 退出类
+    "leverage",
+    "equity_fraction_per_trade",
+    "dsl_exit.*",
+    # 实验臂（off 臂无真实成交，离线仅做 would-be 信号归因）
+    "xs_reversal.*",
+    "trend_filter_200ma.*",
+    "daily_extension_cap.*",
+)
+
+
+def _extract_tracked_subset(
+    config: dict[str, Any], paths: tuple[str, ...] = ERA_TRACKED_PATHS
+) -> dict[str, Any]:
+    """从生效配置视图中抽取 era 跟踪路径的实际值。
+
+    缺失的精确键记为 None；整条子树缺失则跳过（不污染指纹）。
+    """
+    subset: dict[str, Any] = {}
+    for path in paths:
+        if path.endswith(".*"):
+            prefix = path[:-2]
+            try:
+                node = _lookup_in_dict(config, prefix)
+            except KeyError:
+                continue
+            subset[prefix] = node
+        else:
+            try:
+                subset[path] = _lookup_in_dict(config, path)
+            except KeyError:
+                subset[path] = None
+    return subset
+
+
+def _era_id_from_subset(subset: dict[str, Any]) -> str:
+    """对跟踪子集做 canonical-JSON SHA-256，返回 12 位短指纹。"""
+    blob = json.dumps(subset, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+
+def compute_config_era(
+    config: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """计算给定生效配置的 era 指纹（CS-E，纯读、无副作用）。
+
+    返回 ``{"era_id": <12 位 hex>, "tracked": {路径: 值}}``。*config* 为
+    None 时读取当前全局生效配置（已与 CANONICAL_DEFAULTS 合并）。per-coin
+    调用方应传入经 :func:`apply_coin_override` 合并后的视图，使 era 反映
+    该笔下单真正生效的阈值。任何异常都不抛出（记账埋点不得影响下单）。
+    """
+    try:
+        if config is None:
+            config = read_agent_config()
+        subset = _extract_tracked_subset(config)
+        return {"era_id": _era_id_from_subset(subset), "tracked": subset}
+    except Exception:  # pragma: no cover - 纯观测，不能阻断交易热路径
+        logger.debug("[config] compute_config_era failed", exc_info=True)
+        return {"era_id": None, "tracked": {}}
 
 # ---------------------------------------------------------------------------
 # Canonical defaults — MUST stay in sync with .agent-config.json.

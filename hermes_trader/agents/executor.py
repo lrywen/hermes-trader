@@ -6,7 +6,6 @@ Integrates the DSL exit engine for two-phase trailing stops
 
 from __future__ import annotations
 
-import json
 import logging
 import math
 import os
@@ -18,7 +17,12 @@ from typing import Any, Callable, Optional
 
 from hyperliquid.utils.types import Cloid
 
-from hermes_trader.agents.config_store import apply_coin_override, cfg_get, read_agent_config
+from hermes_trader.agents.config_store import (
+    apply_coin_override,
+    cfg_get,
+    compute_config_era,
+    read_agent_config,
+)
 from hermes_trader.agents.dsl_exit import (
     ExitPolicy,
     RetraceTier,
@@ -29,14 +33,16 @@ from hermes_trader.agents.dsl_exit import (
     set_bracket,
 )
 from hermes_trader.agents.market_regime import regime_score_params
+from hermes_trader.agents.memory import memory
+
 # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. regime_overlay
 # only imports market_regime (no cycle back to executor/risk_gates).
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay, resolve_applied_knobs
-from hermes_trader.agents.memory import memory
 from hermes_trader.agents.risk_gates import GateContext, eval_all_gates
 from hermes_trader.client.exchange import (
     HL_LEVERAGE,
     MIN_ORDER_USD,
+    _resolve_min_order_usd,
     cancel_open_orders_for_coin,
     entry_size_for_notional,
     get_hl_atr,
@@ -44,7 +50,6 @@ from hermes_trader.client.exchange import (
     get_max_leverage,
     get_orderbook_spread,
     min_entry_notional_usd,
-    _resolve_min_order_usd,
     modify_sl_trigger,
     place_hl_order,
     place_hl_trigger_order,
@@ -2200,6 +2205,10 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
                 logger.warning(f"[sizing-v2] drift assertion failed for {coin}: {_dv_e}")
 
         _entry_ts = int(time.time() * 1000)
+        # CS-E: 该笔下单瞬间实际生效（含 per-coin override）的阈值 era 指纹。
+        # 纯读计算、内部吞异常，绝不阻断下单。order 仅带轻量 id 以便开仓即可
+        # 归因；完整跟踪值随 entry_context→close 落库。
+        _era = compute_config_era(config)
         memory.record_trade({
             "id": str(uuid.uuid4()),
             "analysis_id": analysis["id"],
@@ -2209,6 +2218,7 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
             "size_usd": position_notional,
             "order_id": order_res.get("order_id"),
             "executed_at": _entry_ts,
+            "config_era_id": _era.get("era_id"),
         })
 
         # Entry-context snapshot for the forward signal backtest: record WHEN we
@@ -2256,6 +2266,7 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
                 "entry_slip_bps": _slip_bps,
                 "funding_rate_hr": _funding_hr,
                 "regime": _regime,          # market_regime at entry (already computed above)
+                "config_era": _era,         # CS-E: 阈值 era 指纹 + 跟踪值快照
                 "signals": _entry_sig,
                 "enforcement": ({"veto": enf.veto, "veto_reason": enf.veto_reason,
                                  "boost": enf.boost, "boost_reason": enf.boost_reason}
@@ -4718,6 +4729,9 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                                          * (1 if is_long else -1)) * -1, 1)
                                   if (fill_px and mid_price) else None),
                 "regime_at_entry": _ec.get("regime"),
+                # CS-E: 下单瞬间阈值 era 指纹（id + 跟踪值快照），供离线按 era
+                # 分段归因；埋点前开的仓无此字段，离线归 pre_instrumentation。
+                "config_era_at_entry": _ec.get("config_era"),
                 "is_hip3": ":" in coin,
                 # funding carry: rate_hr × hold_hrs × notional × side (long pays
                 # when rate>0). Estimate (entry-rate held constant over the hold).

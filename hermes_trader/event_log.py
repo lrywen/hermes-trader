@@ -146,6 +146,13 @@ _FORKABLE_EVENTS = frozenset({
     # unknown types.
     "mode_switch",
     "config_update",
+    # CS-E (2026-09-09): 全路径配置审计必须长留，离线 era 分段归因据此重建
+    # 阈值生效时间线。config_write 覆盖 MCP/CLI/脚本/restore 等非 web 落盘；
+    # snapshot/rollback 标记 era 边界。均为低频人工事件，memory replay 忽略
+    # 未知类型。
+    "config_write",
+    "config_snapshot",
+    "config_rollback",
     "operator_action",
 })
 
