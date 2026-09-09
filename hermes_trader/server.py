@@ -52,6 +52,7 @@ from hermes_trader.agents.executor import (
     _DEFAULT_SL_ATR_MULT,
     _DEFAULT_SL_CEILING_PCT,
     _DEFAULT_SL_FLOOR_PCT,
+    _ENTRY_LOCK,
     _EXEC_LOCK,
     _IN_FLIGHT_COINS,
     _resolve_live_float,
@@ -1077,6 +1078,12 @@ async def risk_review_stream(request: Request) -> StreamingResponse:
 async def run_execute(request: Request) -> JSONResponse:
     """POST /api/agent/execute — run risk gates and execute an analysis."""
     memory.load()
+    # G-P1-2 (audit 2026-09-10): the server is a separate process whose memory
+    # singleton is only hydrated at startup; memory.load() is a no-op after
+    # init. maybe_execute's hard gates (daily loss, global halt, coin circuit)
+    # would otherwise read a stale snapshot and let an order through a kill
+    # switch the autonomous loop armed seconds ago. Read-only, mtime-gated.
+    memory.refresh_risk_state_from_disk()
 
     try:
         body = await request.json()
@@ -1421,6 +1428,23 @@ async def place_order(request: Request) -> JSONResponse:
             )
         _IN_FLIGHT_COINS.add(coin)
 
+    # G-P1-3 (audit 2026-09-10): cross-process entry flock shared with the
+    # autonomous executor. The in-memory marker above only serialises callers
+    # in THIS process; the API server and the executor loop run as separate
+    # processes. Non-blocking — a manual order that loses the race gets 409
+    # and the caller retries, instead of queueing a stale market order behind
+    # exchange I/O. The kernel releases the flock if this process dies.
+    if not _ENTRY_LOCK.acquire():
+        with _EXEC_LOCK:
+            _IN_FLIGHT_COINS.discard(coin)
+        raise HTTPException(
+            409,
+            {"error": "entry_lock_busy",
+             "detail": f"another process is placing an entry order "
+                       f"(autonomous executor or another manual request); "
+                       f"retry after it settles"},
+        )
+
     try:
         from hermes_trader.client.exchange import (
             entry_size_for_notional,
@@ -1428,6 +1452,7 @@ async def place_order(request: Request) -> JSONResponse:
             get_hl_price,
             min_entry_notional_usd,
             place_hl_order,
+            reconcile_order_fill,
             set_leverage,
         )
 
@@ -1688,8 +1713,10 @@ async def place_order(request: Request) -> JSONResponse:
         # point an autonomous entry (or the other side of a concurrent manual
         # call) may have opened the same coin and filled. The market order has
         # not been sent yet, so a fresh live read settles it — refuse rather
-        # than double-open. Best-effort / fail-open: a read failure logs and
-        # proceeds (the in-flight marker + exchange Cloid remain backstops).
+        # than double-open. G-P1-3 (audit 2026-09-10): now fail-CLOSED — with
+        # the cross-process flock in place the only residual risk at this point
+        # is a stale/guessed position state, so a read failure refuses the
+        # order (503, safe to retry) instead of guessing "no position".
         try:
             _pre_user = locals().get("user") or resolve_user_address()
             if _pre_user:
@@ -1713,9 +1740,18 @@ async def place_order(request: Request) -> JSONResponse:
         except HTTPException:
             raise
         except Exception as _pre_e:
-            logger.warning(
-                "[manual-order] H-2 pre-place re-check failed (fail-open) for %s: %r",
+            logger.error(
+                "[manual-order] G-P1-3 pre-place re-check failed "
+                "(fail-closed) for %s: %r",
                 coin, _pre_e,
+            )
+            raise HTTPException(
+                503,
+                {"error": "pre_place_recheck_failed",
+                 "detail": f"could not verify {coin} has no live position "
+                           f"before placing the order; refusing to risk a "
+                           f"double-open. Safe to retry once the exchange "
+                           f"read recovers."},
             )
 
         # E-3 (P0 audit): idempotency key. The SDK POST wrapper retries up to
@@ -1729,8 +1765,89 @@ async def place_order(request: Request) -> JSONResponse:
             cloid=entry_cloid,
         )
 
+        # G-P1-1 (audit 2026-09-10): a response_unknown (408/timeout/SSL drop
+        # after submit) means the order MAY have filled even though we got no
+        # envelope. Treating it as a plain failure leaves a naked position
+        # with no bracket and invites the operator's client retry to double-
+        # open. Reconcile against userFills by Cloid (never raises; blocks up
+        # to a few seconds, so run it off the event loop):
+        #   filled     → backfill result in-place with the real fill and fall
+        #                through into the normal bracket path (no orphan);
+        #   not_filled → exchange answered cleanly, no order: safe 400 retry;
+        #   unknown    → fill state ambiguous: fail-closed 503 + LOUD alert;
+        #                the operator must verify on-exchange before retrying.
         if not result.get("ok"):
-            raise HTTPException(400, f"order failed: {result.get('error')}")
+            if result.get("error_code") == "response_unknown":
+                _rc = await asyncio.to_thread(
+                    reconcile_order_fill,
+                    coin=coin, cloid=entry_cloid,
+                    is_buy=is_buy, expect_size=float(size_in_coin or 0.0) or None,
+                )
+                _rc_status = _rc.get("status")
+                if _rc_status == "filled":
+                    logger.warning(
+                        "[manual-order] G-P1-1 RECONCILED %s fill after "
+                        "response loss: avg_px=%s total_sz=%s oid=%s — "
+                        "continuing to bracket from userFills (no orphan).",
+                        coin, _rc.get("avg_px"), _rc.get("total_sz"),
+                        _rc.get("oid"),
+                    )
+                    try:
+                        from hermes_trader import notify
+                        notify.send_text(
+                            f"⚠️ 手动下单响应丢失但已成交，已补登并挂保护单: {coin} "
+                            f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
+                            f"oid={_rc.get('oid')}", category="risk")
+                    except Exception:
+                        pass
+                    result = {
+                        "ok": True,
+                        "order_id": _rc.get("oid"),
+                        "cloid": str(entry_cloid),
+                        "avg_px": float(_rc.get("avg_px") or 0.0),
+                        "total_sz": float(_rc.get("total_sz") or 0.0),
+                        "filled_at_ms": _rc.get("filled_at_ms"),
+                        "reconciled_after_response_unknown": True,
+                    }
+                elif _rc_status == "not_filled":
+                    logger.info(
+                        "[manual-order] G-P1-1 %s confirmed NOT filled after "
+                        "response loss (%s); safe to retry.",
+                        coin, _rc.get("reason"),
+                    )
+                    raise HTTPException(
+                        400,
+                        {"error": "order_response_unknown_not_filled",
+                         "detail": "order response was lost but the exchange "
+                                   f"confirmed no fill for {coin}; safe to retry"},
+                    )
+                else:
+                    logger.error(
+                        "[manual-order] G-P1-1 UNRESOLVED response_unknown "
+                        "for %s: %s — refusing to place again (double-open "
+                        "risk); manual on-exchange verification required.",
+                        coin, _rc.get("reason"),
+                    )
+                    try:
+                        from hermes_trader import notify
+                        notify.send_text(
+                            f"🛑 手动下单 {coin} 响应丢失且无法核对成交状态"
+                            f"（{_rc.get('reason')}）；已拒绝重复下单，"
+                            f"请立即人工核查 openOrders/userFills 后再决定是否重试，"
+                            f"切勿盲目重发", category="risk")
+                    except Exception:
+                        pass
+                    raise HTTPException(
+                        503,
+                        {"error": "order_response_unknown_unresolved",
+                         "detail": f"order response was lost for {coin} and "
+                                   f"fill state could not be verified "
+                                   f"({_rc.get('reason')}); verify on-exchange "
+                                   f"before retrying — do NOT resubmit blindly",
+                         "reconcile": _rc},
+                    )
+            else:
+                raise HTTPException(400, f"order failed: {result.get('error')}")
 
         try:
             fill_px = float(result.get("avg_px") or 0.0)
@@ -1800,6 +1917,8 @@ async def place_order(request: Request) -> JSONResponse:
         # try; a leak here would wedge the coin against future orders.
         with _EXEC_LOCK:
             _IN_FLIGHT_COINS.discard(coin)
+        # G-P1-3: release the cross-process entry flock on EVERY exit.
+        _ENTRY_LOCK.release()
 
 
 @app.post("/api/hl/close-position", dependencies=[Depends(require_operator_write)])

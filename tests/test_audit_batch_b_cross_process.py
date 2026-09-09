@@ -106,8 +106,9 @@ def test_p1_1_server_refreshes_risk_state_before_gates():
     anchor = src.index("refresh_risk_state_from_disk()")
     gates = src.index("_check_manual_order_gates", anchor)
     assert anchor < gates, "refresh must precede gate evaluation"
-    # one manual-entry call site, one refresh (no double refresh)
-    assert src.count("memory.refresh_risk_state_from_disk()") == 1
+    # Two call sites: manual-entry pre-gate refresh (batch B) and the
+    # /api/agent/execute pre-maybe_execute refresh (batch G-P1-2).
+    assert src.count("memory.refresh_risk_state_from_disk()") == 2
 
 
 # ── P1-2: MCP cancel_order refuses DSL bracket oids ──────────────────────

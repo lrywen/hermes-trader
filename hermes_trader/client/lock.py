@@ -129,6 +129,80 @@ def scanner_lock(name: str, timeout: float = 300.0) -> Iterator[None]:
         logger.debug(f"[lock] Released lock '{name}'")
 
 
+class EntryOrderLock:
+    """Non-blocking cross-process lock serialising ENTRY order placement.
+
+    G-P1-3 (audit 2026-09-10): the API server (manual /api/hl/place-order and
+    /api/agent/execute) and the autonomous trading loop run as SEPARATE
+    processes, so the in-process ``threading.Lock`` + in-flight sets in
+    executor.py cannot mutually exclude them. Both can observe "no position"
+    and both place an entry → double-open. This single flock on a shared
+    sidecar serialises the check-then-place window across every process.
+
+    Intentionally NON-blocking (``LOCK_NB``): an entry path that finds the
+    lock held refuses immediately (manual → HTTP 409, auto → skips this tick)
+    rather than queueing an order behind an unknown amount of exchange I/O.
+    The kernel releases the flock on process death, so a crash never wedges
+    it (unlike a PID-stamped lock file, no stale recovery is needed).
+
+    Usage::
+
+        _ENTRY_LOCK = EntryOrderLock()
+        if not _ENTRY_LOCK.acquire():
+            raise ...  # another entry is mid-flight
+        try:
+            ...re-check position, place order, register tracker...
+        finally:
+            _ENTRY_LOCK.release()
+    """
+
+    def __init__(self, name: str = "entry-order", lock_dir: Optional[str] = None) -> None:
+        self._path = _lock_path(name, lock_dir)
+        self._fd: Optional[int] = None
+
+    def acquire(self) -> bool:
+        """Try once, never waits. Returns True if the lock was acquired."""
+        if self._fd is not None:
+            return True
+        fd = None
+        try:
+            fd = os.open(str(self._path), os.O_CREAT | os.O_RDWR, 0o644)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except (IOError, OSError):
+            # Held by another process/thread.
+            try:
+                if fd is not None:
+                    os.close(fd)
+            except OSError:
+                pass
+            return False
+        self._fd = fd
+        return True
+
+    def release(self) -> None:
+        if self._fd is None:
+            return
+        fd, self._fd = self._fd, None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+    @contextmanager
+    def hold(self) -> Iterator[None]:
+        """Context manager that raises ``BlockingIOError`` if already held."""
+        if not self.acquire():
+            raise BlockingIOError(f"entry order lock held: {self._path}")
+        try:
+            yield
+        finally:
+            self.release()
+
+
 def check_lock_status(name: str, lock_dir: Optional[str] = None) -> dict[str, Any]:
     """Check if a lock is currently held and by whom."""
     lock_path = _lock_path(name, lock_dir)

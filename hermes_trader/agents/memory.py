@@ -710,6 +710,18 @@ class AgentMemory:
                     data.get("peakEquityBasisFlow", 0.0) or 0.0)
             except (TypeError, ValueError):
                 self._peak_equity_basis_flow = 0.0
+            # D-1 (audit 2026-09-10): daily PnL fields feed the daily-loss
+            # kill switch / giveback halt. Without them the API/MCP processes
+            # kept their startup snapshot (usually 0.0) and a same-day
+            # drawdown armed by the loop was invisible to manual orders.
+            try:
+                self._daily_pnl = float(data.get("dailyPnl", 0) or 0.0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                self._peak_daily_pnl = float(data.get("peakDailyPnl", 0) or 0.0)
+            except (TypeError, ValueError):
+                pass
             trail = self._parse_equity_trail(data.get("equityTrail"))
             self._equity_trail = deque(trail[-4320:])
             self._dd_frozen_since_ms = int(data.get("ddFrozenSinceMs", 0) or 0)

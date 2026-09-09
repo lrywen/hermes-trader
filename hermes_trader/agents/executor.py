@@ -308,6 +308,16 @@ _IN_FLIGHT_ANALYSES: set = set()
 # second caller block until the first finishes placing/recording its order.
 _IN_FLIGHT_COINS: set = set()
 
+# G-P1-3 (audit 2026-09-10): cross-process entry lock. The API server process
+# (manual /api/hl/place-order + /api/agent/execute) and this trading-loop
+# process share the in-flight sets by import only within their own process;
+# the flock below is the real mutual-exclusion primitive. The SAME singleton
+# is imported by server.py so both sides contend on one lock file. Held from
+# the authoritative claim until the entry (or its rejection) settles.
+from hermes_trader.client.lock import EntryOrderLock as _EntryOrderLock
+
+_ENTRY_LOCK = _EntryOrderLock()
+
 # H6/C-M3: streak of order placements whose response was LOST (408/timeout)
 # AND whose fill could not be confirmed either way (reconcile lookup itself
 # failed). A confirmed fill and a confirmed non-fill both RESET the streak —
@@ -2403,6 +2413,9 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
         with _EXEC_LOCK:
             _IN_FLIGHT_ANALYSES.discard(aid)
             _IN_FLIGHT_COINS.discard(coin)
+        # G-P1-3: register runs only on the filled success path — release the
+        # cross-process entry flock here so the API process may enter again.
+        _ENTRY_LOCK.release()
 
     return {
         "entry_px": entry_px,
@@ -3956,6 +3969,24 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         _IN_FLIGHT_ANALYSES.add(_aid)
         _IN_FLIGHT_COINS.add(coin)
 
+    # G-P1-3: take the cross-process entry flock AFTER the in-process claim.
+    # If the API process is mid manual entry, skip this tick rather than race
+    # it. Non-blocking by design; released on every exit path below (the
+    # in-flight discards mark the same windows) and inside
+    # _register_filled_position's finally on the success path.
+    if not _ENTRY_LOCK.acquire():
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(_aid)
+            _IN_FLIGHT_COINS.discard(coin)
+        logger.warning(
+            f"[executor] G-P1-3 cross-process entry lock held for {coin} "
+            f"(analysis {_aid}); another process is placing — skipping tick.")
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": _aid, "reason": "entry_lock_busy",
+            "gate_results": gate_output["results"],
+        }
+
     # P0-4: pre-place liquidation-buffer gate. Refuse to add exposure
     # to a coin whose existing position is already within
     # HERMES_LIQ_BUFFER_USD of notional cushion from its liquidation
@@ -3972,6 +4003,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         with _EXEC_LOCK:
             _IN_FLIGHT_ANALYSES.discard(_aid)
             _IN_FLIGHT_COINS.discard(coin)
+        _ENTRY_LOCK.release()
         return {
             "executed": False, "mode": mode, "analysis_id": analysis["id"],
             "reason": f"liq_buffer_blocked: {_liq_gate.get('error', 'unknown')}",
@@ -4004,6 +4036,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             with _EXEC_LOCK:
                 _IN_FLIGHT_ANALYSES.discard(_aid)
                 _IN_FLIGHT_COINS.discard(coin)
+            _ENTRY_LOCK.release()
             return {
                 "executed": False, "mode": mode, "analysis_id": analysis["id"],
                 "reason": "position_already_open_pre_place",
@@ -4040,6 +4073,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             with _EXEC_LOCK:
                 _IN_FLIGHT_ANALYSES.discard(_aid)
                 _IN_FLIGHT_COINS.discard(coin)
+            _ENTRY_LOCK.release()
             return {
                 "executed": False, "mode": mode, "analysis_id": analysis["id"],
                 "reason": f"price_divergence_blocked: {_reason}",
@@ -4062,6 +4096,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         mid_price=mid_price, cloid=_cloid, config=config, user=user,
         mode=mode, aid=_aid, gate_results=gate_output["results"])
     if _order_fail is not None:
+        # G-P1-3: a definite rejection / confirmed-not-filled / unresolved
+        # lookup means no success-path register will run — release the flock.
+        # (A reconciled FILL returns None and falls through to register, whose
+        # finally releases it.)
+        _ENTRY_LOCK.release()
         return _order_fail
 
     # Phase-1: local state persistence — wrap in try/except to prevent
