@@ -424,7 +424,8 @@ def _patch_tp_deps(monkeypatch, min_size, placed):
     monkeypatch.setattr(executor, "set_bracket", lambda *a, **k: None)
 
     def _fake_place(is_buy, size, trig_px, kind, coin, **kw):
-        placed.append({"size": size, "px": trig_px, "kind": kind, "coin": coin})
+        placed.append({"size": size, "px": trig_px, "kind": kind, "coin": coin,
+                       "cloid": kw.get("cloid")})
         return {"ok": True, "order_id": "OID-1"}
 
     monkeypatch.setattr(executor, "place_hl_trigger_order", _fake_place)
@@ -457,6 +458,9 @@ def test_o9_small_account_sub_min_slice_upsized_instead_of_skipped(monkeypatch):
     assert placed[0]["size"] == 0.35  # upsized to the exchange minimum
     # Trigger price respects tp_atr_mult (long: entry + atr*mult above entry).
     assert placed[0]["px"] == pytest.approx(31.0)
+    # E-2: every TP intent carries an idempotency Cloid (POST-retry dedup).
+    assert placed[0]["cloid"] is not None
+    assert isinstance(placed[0]["cloid"], executor.Cloid)
 
 
 def test_o9_above_min_slice_places_normally(monkeypatch):
@@ -470,3 +474,5 @@ def test_o9_above_min_slice_places_normally(monkeypatch):
     )
     assert len(placed) == 1
     assert placed[0]["size"] == pytest.approx(0.5)  # intended fraction, untouched
+    # E-2: normal TP placement also carries an idempotency Cloid.
+    assert isinstance(placed[0]["cloid"], executor.Cloid)

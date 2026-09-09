@@ -1132,6 +1132,7 @@ def place_hl_trigger_order(
     kind: str,  # 'sl' or 'tp'
     coin: str = "BTC",
     limit_band_pct: Optional[float] = None,
+    cloid: Optional[Cloid] = None,
 ) -> dict[str, Any]:
     """Place a reduce-only trigger order (stop-loss or take-profit).
 
@@ -1152,6 +1153,14 @@ def place_hl_trigger_order(
     order rests unfilled (same residual risk as a missing stop) — the DSL
     soft-stop and the retry/re-arm cycle remain the backstop, so the default
     stays market and the limit band is operator opt-in.
+
+    E-2 (P0 fix 2026-09-09): ``cloid`` is the idempotency key for this
+    trigger intent. It is forwarded to the SDK so a POST retried by the SDK
+    (5x on 408/5xx) or by our own retry / deferred re-arm cannot arm a
+    DUPLICATE stop — HL rejects a repeated cloid. Callers pass ONE cloid per
+    SL/TP intent. It was previously accepted by callers but NOT by this
+    signature, which raised TypeError and left every entry without a
+    server-side stop.
     """
     if not PRIVATE_KEY_HEX:
         return {"ok": False, "error": "HYPERLIQUID_PRIVATE_KEY not set"}
@@ -1237,6 +1246,7 @@ def place_hl_trigger_order(
             limit_f if use_limit else trigger_f,
             order_type,
             reduce_only=True,
+            cloid=cloid,
         )
 
         parsed = _parse_order_result(result, accept_resting=True)

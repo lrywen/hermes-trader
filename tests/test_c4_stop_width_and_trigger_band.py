@@ -19,6 +19,7 @@ from __future__ import annotations
 import math
 
 import pytest
+from hyperliquid.utils.types import Cloid
 
 from hermes_trader.agents import executor
 from hermes_trader.client import exchange
@@ -84,10 +85,11 @@ class _FakeExchange:
         return {"status": "ok",
                 "response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}
 
-    def order(self, name, is_buy, sz, limit_px, order_type, reduce_only=False):
+    def order(self, name, is_buy, sz, limit_px, order_type, reduce_only=False,
+              cloid=None):
         self.order_calls.append({"name": name, "is_buy": is_buy, "sz": sz,
                                  "limit_px": limit_px, "order_type": order_type,
-                                 "reduce_only": reduce_only})
+                                 "reduce_only": reduce_only, "cloid": cloid})
         return self._resting(12345)
 
     def modify_order(self, oid, name, is_buy, sz, limit_px, order_type,
@@ -168,6 +170,61 @@ def test_c4_3_tp_kind_uses_tpsl_tp(_trigger_env):
         coin="HYPE", limit_band_pct=1.0)
     assert res["ok"]
     assert _trigger_env.order_calls[-1]["order_type"]["trigger"]["tpsl"] == "tp"
+
+
+# ── E-2: cloid idempotency key forwarded to the HL SDK ──────────────────────
+
+def test_e2_cloid_is_forwarded_to_sdk(_trigger_env):
+    # Regression: the callers (executor SL/TP/re-arm, server.py manual bracket)
+    # mint one Cloid per trigger intent and pass it, but place_hl_trigger_order's
+    # signature did not accept it → TypeError → every entry armed NO server-side
+    # stop. The cloid must reach the SDK order() call verbatim.
+    cloid = Cloid.from_int(123456789)
+    res = exchange.place_hl_trigger_order(
+        is_long_position=True, size=1.0, trigger_px=100.0, kind="sl",
+        coin="HYPE", cloid=cloid)
+    assert res["ok"]
+    assert _trigger_env.order_calls[-1]["cloid"] is cloid
+
+
+def test_e2_cloid_defaults_to_none_when_omitted(_trigger_env):
+    # Backwards-compatible default: internal/direct callers that mint no cloid
+    # still submit (SDK treats a missing cloid as a normal non-idempotent order).
+    res = exchange.place_hl_trigger_order(
+        is_long_position=False, size=1.0, trigger_px=100.0, kind="tp",
+        coin="HYPE")
+    assert res["ok"]
+    assert _trigger_env.order_calls[-1]["cloid"] is None
+
+
+def test_e2_backup_sl_retry_reuses_same_cloid(monkeypatch):
+    # Executor-level idempotency: the immediate 2s retry after a transient
+    # failure MUST reuse the original intent's cloid, so a lost-response first
+    # attempt cannot be duplicated into two resting stops by the retry.
+    class _Mem:
+        @staticmethod
+        def avg_exit_slip_bps(coin, days=30.0):
+            return 0.0
+
+    calls = []
+
+    def _fake_place(is_buy, size, px, kind, coin, **kw):
+        calls.append(kw.get("cloid"))
+        return {"ok": True, "order_id": "OID-SL"} if len(calls) == 2 \
+            else {"ok": False, "error": "transient 429"}
+
+    monkeypatch.setattr(executor, "place_hl_trigger_order", _fake_place)
+    monkeypatch.setattr(executor.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(executor, "set_bracket", lambda *a, **k: None)
+
+    missing = executor._place_backup_sl(
+        atr=1.0, entry_px=100.0, sl_atr_mult=1.5, sl_floor_pct=1.0,
+        sl_ceiling_pct=3.0, size_in_coin=1.0, is_buy=False, coin="HYPE",
+        trade_side="long", memory=_Mem())
+    assert missing is False
+    assert len(calls) == 2
+    assert calls[0] is not None and calls[0] is calls[1]
+    assert isinstance(calls[0], executor.Cloid)
 
 
 def test_c4_3_modify_default_market_keeps_limit_equals_trigger(_trigger_env):
