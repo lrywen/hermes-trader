@@ -347,6 +347,34 @@ def test_restore_snapshot_does_not_self_deadlock(tmp_path, monkeypatch):
     assert restored["leverage"] == 7
 
 
+def test_effective_view_null_stub_equals_missing():
+    """CS-D verdict 5 unit check: a sparse raw config without the
+    debate_research timeout stubs and a full view carrying them as explicit
+    nulls normalize to the SAME effective diff view."""
+    from hermes_trader.agents.config_store import (
+        CANONICAL_DEFAULTS,
+        _deep_merge,
+        _effective_view_for_diff,
+    )
+
+    sparse = {"mode": "LIVE", "leverage": 10}
+    # What update_agent_config writes after one RMW pass: the full merged
+    # view, whose debate_research block carries explicit null stubs (and is
+    # the same shape that serializes the stubs as JSON null).
+    full = _deep_merge(CANONICAL_DEFAULTS, sparse)
+    assert full["debate_research"].get("bull_timeout_s") is None  # stub present
+
+    assert _effective_view_for_diff(sparse) == _effective_view_for_diff(full)
+
+    # And a REAL nested change is still visible through the normalization.
+    # deepcopy: _deep_merge shares nested dicts with CANONICAL_DEFAULTS, so
+    # mutating without it would corrupt the process-wide defaults.
+    import copy
+    changed = copy.deepcopy(_deep_merge(CANONICAL_DEFAULTS, sparse))
+    changed["debate_research"]["max_latency_s"] = 99.0
+    assert _effective_view_for_diff(changed) != _effective_view_for_diff(sparse)
+
+
 # ── _env_override key mapping ───────────────────────────────────────────────
 
 def test_env_override_flat_key():

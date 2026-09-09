@@ -324,10 +324,12 @@ def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseExce
 
     Audit 2026-09-07 (M1 / F4): ALSO publish a ``risk_gate_blind`` event to the
     session-log feed (the SSE stream the portal tails), so the web UI shows the
-    blind-gate alarm in real time instead of only via Feishu. The event is NOT
-    added to _PUBLIC_FEED_EVENTS (operator feed only — a blind gate is an
-    internal risk posture, not public posture). It is outside the
-    notify_dispatch fork whitelist too, so it neither re-cards Feishu nor
+    blind-gate alarm in real time instead of only via Feishu.
+    Audit 2026-09-08 (CS-D verdict 4): the event IS now in _PUBLIC_FEED_EVENTS —
+    a fail-open gate is a degraded *protection* state that anyone watching the
+    public feed deserves to see; _public_feed_filter projects gate/coin/posture
+    only and withholds the internal error string. It stays outside the
+    notify_dispatch fork whitelist, so it neither re-cards Feishu nor
     forks into events.jsonl; the SSE tail is its only extra destination.
     """
     coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
@@ -583,8 +585,27 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
             return {"pass": True}  # no reference peak yet
         dd_pct = (peak - equity) / peak * 100.0
         if dd_pct >= max_drawdown_pct:
-            since_ms = memory.mark_drawdown_frozen()
+            since_ms, newly_frozen = memory.mark_drawdown_frozen()
             frozen_min = max(0.0, (int(time.time() * 1000) - since_ms) / 60_000)
+            # CS-D audit: one equity snapshot per freeze episode (first stamp
+            # only), so a freeze is never just a timestamp — the blocked
+            # decision's equity/peak/dd context is in the session log.
+            if newly_frozen:
+                try:
+                    from hermes_trader import session_log
+                    session_log.append({
+                        "event": "drawdown_frozen",
+                        "ts": int(time.time() * 1000),
+                        "frozen_since_ms": int(since_ms),
+                        "equity": round(float(equity), 4),
+                        "peak_equity": round(float(peak), 4),
+                        "dd_pct": round(float(dd_pct), 2),
+                        "threshold_pct": float(max_drawdown_pct),
+                        "window_days": float(window_days),
+                        "cooldown_hours": float(cooldown_hours),
+                    })
+                except Exception as _le:
+                    logger.warning("[risk] drawdown freeze audit event failed: %s", _le)
             # Cooldown recovery: a continuous freeze lasting cooldown_hours
             # re-baselines the peak to current equity and lets entries resume.
             if cooldown_hours > 0 and frozen_min >= cooldown_hours * 60.0:

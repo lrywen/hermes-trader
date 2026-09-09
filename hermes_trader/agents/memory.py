@@ -331,17 +331,25 @@ class AgentMemory:
         # equity the account has ever reached. Updated on every accepted equity
         # tick in track_daily_pnl (after the implausible-read filter).
         self._peak_equity: float = 0
+        # CS-D: the cumulative net external flow basis that _peak_equity was
+        # recorded on. The all-time peak is re-based onto the current flow
+        # basis at read time (_peak_equity + cur_flow − _peak_equity_basis_flow)
+        # so money added AFTER the high-water tick doesn't understate dd%.
+        self._peak_equity_basis_flow: float = 0.0
         # Drawdown-gate recovery (fix 2026-09-03): the all-time peak above
         # never resets, so after a permanent equity drop (realized loss,
         # withdrawal, balance rebase) the drawdown gate latched FOREVER with
         # no recovery path (observed: peak $50.9 vs equity $20.9 → −58.9%,
         # 111 consecutive blocks). The gate now measures against a ROLLING
         # peak over a configurable window instead of the all-time high.
-        #   _equity_trail: deque of (epoch_s, equity), one sample ~per
-        #     scan tick (age-pruned); rolling_peak_equity(window_days) takes
-        #     the max over samples newer than window_days, falling back to the
-        #     all-time peak when no windowed samples exist.
-        self._equity_trail: Deque[tuple[float, float]] = deque()
+        #   _equity_trail: deque of (epoch_s, raw_equity, cum_flow), one
+        #     sample ~per scan tick (age-pruned); rolling_peak_equity(window_days)
+        #     re-bases each sample onto the current flow basis, takes the max
+        #     over samples newer than window_days, and falls back to the
+        #     flow-rebased all-time peak when no windowed samples exist. CS-D
+        #     (2026-09-08): cum_flow is cumulative net external flow as of the
+        #     tick; legacy (ts, equity) pairs parse as flow=None → one-shot rebase.
+        self._equity_trail: Deque[tuple[float, float, float]] = deque()
         # Drawdown freeze bookkeeping (epoch ms): when the gate freezes it
         # stamps _dd_frozen_since_ms; once the freeze has lasted the
         # configured cooldown, the baseline re-arms to current equity (the
@@ -349,6 +357,11 @@ class AgentMemory:
         # age out, but bounded to ~cooldown hours instead of a full window).
         self._dd_frozen_since_ms: int = 0
         self._dd_last_baseline_ms: int = 0
+        # CS-D (2026-09-08): one-shot flag — becomes True once the persisted
+        # equity trail has been migrated from bare (ts, equity) tuples onto the
+        # flow-annotated (ts, equity, cum_flow) basis. Persisted so the rebase
+        # runs exactly once across the upgrade, not once per process start.
+        self._dd_basis_migrated: bool = False
         self._start_of_day_equity: float = 0
         self._day_start_ts: int = 0
         # P0-1 (v3): cumulative net EXTERNAL capital flow into the tradeable
@@ -559,26 +572,27 @@ class AgentMemory:
                     self._peak_equity = float(data.get("peakEquity", 0) or 0)
                 except (TypeError, ValueError):
                     self._peak_equity = 0.0
+                # CS-D: flow basis the persisted peak was recorded on (absent
+                # in pre-CS-D files → 0.0; the one-shot legacy rebase re-tags
+                # it onto the current basis on the first accepted tick).
+                try:
+                    self._peak_equity_basis_flow = float(
+                        data.get("peakEquityBasisFlow", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    self._peak_equity_basis_flow = 0.0
                 # Drawdown recovery state (absent in old files → empty trail /
                 # zero stamps; the trail seeds itself from the next accepted
                 # equity tick, and the first gate pass after upgrade re-baselines
                 # a pre-existing latched freeze immediately rather than after a
                 # full cooldown window).
-                trail = []
-                _trail_rows = data.get("equityTrail")
-                if isinstance(_trail_rows, list):
-                    for row in _trail_rows:
-                        try:
-                            ts_s = float(row[0])
-                            eq = float(row[1])
-                            if ts_s > 0 and eq > 0:
-                                trail.append((ts_s, eq))
-                        except (TypeError, ValueError, IndexError):
-                            continue
-                trail.sort(key=lambda r: r[0])
+                trail = self._parse_equity_trail(data.get("equityTrail"))
                 self._equity_trail = deque(trail[-4320:])  # ≤ ~30d at 10-min cadence
                 self._dd_frozen_since_ms = _num("ddFrozenSinceMs", int, 0)
                 self._dd_last_baseline_ms = _num("ddLastBaselineMs", int, 0)
+                # CS-D: a persisted flag means the trail is already on the
+                # flow-annotated basis; absent (pre-CS-D file) → False so the
+                # first accepted tick runs the one-shot legacy rebase.
+                self._dd_basis_migrated = bool(data.get("ddBasisMigrated", False))
                 _open_positions = data.get("openPositions", [])
                 self._open_positions = _open_positions if isinstance(_open_positions, list) else []
 
@@ -673,19 +687,16 @@ class AgentMemory:
                 self._peak_equity = float(data.get("peakEquity", 0) or 0.0)
             except (TypeError, ValueError):
                 pass
-            trail = []
-            for row in (data.get("equityTrail") or []):
-                try:
-                    ts_s = float(row[0])
-                    eq = float(row[1])
-                    if ts_s > 0 and eq > 0:
-                        trail.append((ts_s, eq))
-                except (TypeError, ValueError, IndexError):
-                    continue
-            trail.sort(key=lambda r: r[0])
+            try:
+                self._peak_equity_basis_flow = float(
+                    data.get("peakEquityBasisFlow", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                self._peak_equity_basis_flow = 0.0
+            trail = self._parse_equity_trail(data.get("equityTrail"))
             self._equity_trail = deque(trail[-4320:])
             self._dd_frozen_since_ms = int(data.get("ddFrozenSinceMs", 0) or 0)
             self._dd_last_baseline_ms = int(data.get("ddLastBaselineMs", 0) or 0)
+            self._dd_basis_migrated = bool(data.get("ddBasisMigrated", False))
             # Circuit breakers (same cross-process staleness issue).
             self._global_halt_until_ms = int(data.get("globalHaltUntilMs", 0) or 0)
             if self._global_halt_until_ms < now_ms:
@@ -821,9 +832,20 @@ class AgentMemory:
                 "cumContribFolded": self._contrib_folded_total,
                 "cumContribToday": self._contrib_today,
                 "peakEquity": self._peak_equity,  # B-F7 all-time equity HWM
-                "equityTrail": [(ts, eq) for ts, eq in self._equity_trail],
+                # CS-D: the flow basis _peak_equity was recorded on; re-based at
+                # read time (peak + cur_flow − basis) so deposits/transfers
+                # cannot inflate the peak or fake a drawdown.
+                "peakEquityBasisFlow": self._peak_equity_basis_flow,
+                # CS-D: trail rows are (ts, raw_equity, cum_flow) triples; the
+                # third element is absent only on pre-CS-D files (parsed as
+                # None → one-shot legacy rebase on the first accepted tick).
+                "equityTrail": [[ts, eq, flow]
+                                for ts, eq, flow in self._equity_trail],
                 "ddFrozenSinceMs": int(self._dd_frozen_since_ms or 0),
                 "ddLastBaselineMs": int(self._dd_last_baseline_ms or 0),
+                # CS-D: one-shot legacy-trail migration flag (survives restarts
+                # so the rigid rebase runs exactly once across the upgrade).
+                "ddBasisMigrated": bool(self._dd_basis_migrated),
                 "openPositions": list(self._open_positions),
                 "coinCircuit": dict(self._coin_circuit),
                 "globalHaltUntilMs": int(self._global_halt_until_ms or 0),
@@ -1095,13 +1117,47 @@ class AgentMemory:
             # implausible-read filter above already ran, so the values reaching
             # here are accepted (sustained) readings — a one-tick partial-dex
             # blip can neither inflate the peak nor fake a crash below it.
-            self._peak_equity = max(self._peak_equity, current_equity)
+            #
+            # CS-D (2026-09-08) contribution-invariant drawdown basis: raw
+            # equity conflates trading PnL with EXTERNAL cash flow (spot↔perp
+            # transfers, deposits, withdrawals). A $30 spot→perp transfer used
+            # to inflate the peak (dd% understated, gate too loose); a
+            # perp→spot transfer used to fake a crash (gate froze with zero
+            # trading loss — the −58.9% / 111-block latch of 2026-09-01). The
+            # peak/trail are now stored on a cash-flow-normalised basis: each
+            # sample carries the cumulative net external flow as of that tick,
+            # and rolling_peak_equity() re-bases every sample onto TODAY's flow
+            # before taking the max, so transfers slide both peak and equity
+            # together while a genuine trading loss still shows a real %.
+            cum_flow = float(self._contrib_folded_total + self._contrib_today)
+            # One-shot legacy migration: samples persisted before CS-D are bare
+            # (ts, equity) tuples with no flow annotation — they sit on the
+            # flow basis of their day, unknown now. Rebase the whole trail and
+            # the all-time peak onto the CURRENT flow basis exactly once, then
+            # every new sample is natively annotated. Runs even when the trail
+            # is empty: a pre-CS-D file can still carry a bare all-time peak
+            # whose basis is unknown, and that peak must be tagged to the
+            # current basis too. Harmless when cum_flow is ~0 (fresh / no
+            # transfers): the rigid shift is a no-op and the log notes it.
+            if not self._dd_basis_migrated:
+                self._rebase_legacy_trail_to_flow_basis_nolock(cum_flow)
+            self._dd_basis_migrated = True
+            # All-time peak on a NAMED flow basis: _peak_equity is raw equity as
+            # of the high-water tick and _peak_equity_basis_flow is the cum_flow
+            # that tick sat on. Re-based to today's basis at read time so a
+            # deposit since the peak cannot understate the drawdown.
+            cand_peak = float(current_equity)
+            if cand_peak >= self._peak_equity:
+                self._peak_equity = cand_peak
+                self._peak_equity_basis_flow = cum_flow
             self._equity = current_equity
             # Drawdown-gate rolling peak (fix 2026-09-03): append the accepted
             # equity tick, then age-prune the trail. Samples are appended at
             # most one per ~600s so the deque stays tiny (≤ ~4,320 for 30d)
             # while still giving the rolling-window peak daily resolution.
-            self._append_equity_trail_nolock(now_s, current_equity)
+            # CS-D: tuples are (ts, raw_equity, cum_flow) so the peak can be
+            # re-normalised onto the current cash-flow basis at read time.
+            self._append_equity_trail_nolock(now_s, current_equity, cum_flow)
             # P1-6: every accepted equity tick mutates dailyPnl/peak/equity;
             # coalesced onto the trading loop's periodic (throttled) flush.
             self._dirty = True
@@ -1167,53 +1223,147 @@ class AgentMemory:
     _EQUITY_TRAIL_MIN_SPACING_S = 600.0   # ≤ one sample per ~10 scan minutes
     _EQUITY_TRAIL_MAX_AGE_S = 45 * 86400  # retain ~45 days (window is ≤ this)
 
-    def _append_equity_trail_nolock(self, now_s: float, equity: float) -> None:
+    @staticmethod
+    def _parse_equity_trail(rows: Any) -> list[tuple[float, float, float]]:
+        """Parse the persisted equity trail into (ts_s, raw_equity, cum_flow)
+        triples. CS-D (2026-09-08): rows written before the contribution-
+        invariant basis are bare (ts, equity) pairs; their flow is unknown, so
+        cum_flow is left as None and the one-shot legacy rebase annotates them
+        on the first accepted tick. Rows written by CS-D+ carry cum_flow as the
+        third element."""
+        out: list[tuple[float, float, float]] = []
+        if isinstance(rows, list):
+            for row in rows:
+                try:
+                    ts_s = float(row[0])
+                    eq = float(row[1])
+                    if ts_s <= 0 or eq <= 0:
+                        continue
+                    flow = float(row[2]) if len(row) >= 3 and row[2] is not None else None
+                    out.append((ts_s, eq, flow))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        out.sort(key=lambda r: r[0])
+        return out
+
+    def _rebase_legacy_trail_to_flow_basis_nolock(self, cur_cum_flow: float) -> None:
+        """One-shot CS-D migration (call under lock): rewrite every bare legacy
+        (ts, equity, flow=None) sample onto the CURRENT cumulative-flow basis.
+
+        Legacy samples were recorded on whatever flow basis held at their time;
+        that per-sample flow is unknown, so we attribute ALL external flow seen
+        so far (``cur_cum_flow``) to the period before the migration tick and
+        shift each legacy sample by the SAME constant. This slides the entire
+        pre-migration trail rigidly onto today's basis: the post-migration peak
+        vs current-equity gap then reflects only TRADING PnL (transfers cancel),
+        while within the legacy stretch the rigid shift preserves every dd%
+        (peak and equity move together). New samples after this point are
+        natively flow-annotated, so the basis only tightens from here."""
+        rebased = deque()
+        for ts_s, eq, flow in self._equity_trail:
+            f = float(cur_cum_flow) if flow is None else float(flow)
+            rebased.append((ts_s, float(eq), f))
+        self._equity_trail = rebased
+        # The all-time peak is a bare raw-equity number on an unknown flow
+        # basis. Like the trail, rigidly re-base it onto the current basis:
+        # record the raw peak value but tag its flow basis as cur_cum_flow, so
+        # the read-time re-base (peak + cur − basis) reads it raw on the very
+        # next tick (cur == basis) and stays consistent with the re-based trail.
+        self._peak_equity_basis_flow = float(cur_cum_flow)
+        logger.warning(
+            "[memory] CS-D one-shot drawdown-basis migration: %d legacy trail "
+            "samples re-based onto current cumulative-flow basis (cum_flow=%.2f)",
+            len(rebased), float(cur_cum_flow))
+
+    def _append_equity_trail_nolock(self, now_s: float, equity: float,
+                                    cum_flow: float = 0.0) -> None:
         """Append an accepted equity tick to the rolling trail (call under lock).
 
         Samples land at most once per _EQUITY_TRAIL_MIN_SPACING_S; a fresh
         accepted tick simply refreshes the latest value, so the window's peak
         always reflects the newest reading. Age-prunes from the left (trail is
-        time-ordered) and caps length so the persisted file stays small.
-        """
+        time-ordered) and caps length so the persisted file stays small. CS-D:
+        each sample is (ts, raw_equity, cum_flow_at_tick)."""
+        triple = (now_s, float(equity), float(cum_flow or 0.0))
         if self._equity_trail and (now_s - self._equity_trail[-1][0]) < self._EQUITY_TRAIL_MIN_SPACING_S:
-            self._equity_trail[-1] = (now_s, float(equity))
+            self._equity_trail[-1] = triple
         else:
-            self._equity_trail.append((now_s, float(equity)))
+            self._equity_trail.append(triple)
         cutoff = now_s - self._EQUITY_TRAIL_MAX_AGE_S
         while self._equity_trail and self._equity_trail[0][0] < cutoff:
             self._equity_trail.popleft()
         while len(self._equity_trail) > 4320:
             self._equity_trail.popleft()
 
+    @staticmethod
+    def _rebased_peak_nolock(trail: "Deque[tuple[float, float, float]]",
+                             cutoff: float, cur_cum_flow: float) -> float:
+        """CS-D: highest equity over the window, re-based onto TODAY's cumulative
+        -flow basis so external transfers cannot inflate/fake the peak.
+
+        Sample i on flow basis f_i with raw equity e_i represents trading
+        equity ``e_i − f_i``; to compare like-for-like with the CURRENT book
+        (whose basis is cur_cum_flow) we re-base it to ``e_i − f_i + cur_flow``.
+        A transfer (Δ in BOTH equity and cum_flow) slides peak and current
+        equity together → dd% unchanged by cash movement; only a genuine trading
+        loss moves the gap. Samples with unknown flow (pre-migration, already
+        rigidly re-based at migration) carry f == cur_cum_flow and are read
+        raw."""
+        best = 0.0
+        for ts_s, eq, flow in trail:
+            if ts_s < cutoff:
+                continue
+            f = float(flow) if flow is not None else float(cur_cum_flow)
+            rebased = float(eq) - f + float(cur_cum_flow)
+            if rebased > best:
+                best = rebased
+        return float(best)
+
+    def _current_cum_flow_nolock(self) -> float:
+        return float(self._contrib_folded_total + self._contrib_today)
+
     def rolling_peak_equity(self, window_days: float) -> float:
-        """High-water mark of equity over the trailing ``window_days`` days.
+        """High-water mark of equity over the trailing ``window_days`` days, on
+        the CS-D cash-flow-normalised basis (transfers cannot inflate the peak
+        or fake a drawdown — see _rebased_peak_nolock).
 
         Falls back to the all-time peak when the trail is empty/has no samples
         inside the window (cold start / pre-upgrade memory) so the gate never
         silently disarms. window_days <= 0 means "use the all-time peak"
         (legacy behavior)."""
         with self._lock:
+            cur_flow = self._current_cum_flow_nolock()
             if window_days <= 0:
-                return float(self._peak_equity)
+                # Re-base the all-time peak onto today's basis as well so a
+                # net inflow since the peak doesn't understate the drawdown.
+                return float(max(0.0, self._peak_equity + cur_flow
+                                 - self._peak_equity_basis_flow))
             cutoff = time.time() - float(window_days) * 86400.0
-            window_vals = [eq for ts, eq in self._equity_trail if ts >= cutoff]
-            if window_vals:
-                return float(max(window_vals))
-            return float(self._peak_equity)
+            peak = self._rebased_peak_nolock(self._equity_trail, cutoff, cur_flow)
+            if peak > 0:
+                return peak
+            # Empty window → fall back to the all-time peak on today's basis.
+            return float(max(0.0, self._peak_equity + cur_flow
+                             - self._peak_equity_basis_flow))
 
-    def mark_drawdown_frozen(self) -> int:
+    def mark_drawdown_frozen(self) -> tuple[int, bool]:
         """Stamp the drawdown-freeze start on first block (call when gate
-        trips). Returns the epoch-ms freeze start. Idempotent: a stamp is only
-        written once per freeze episode (cleared on recovery)."""
+        trips). Returns ``(epoch_ms_freeze_start, newly_frozen)`` where
+        ``newly_frozen`` is True only on the FIRST stamp of this freeze
+        episode (cleared on recovery) — callers emit the freeze audit event
+        exactly once per episode. Idempotent: a repeat call just reports the
+        existing stamp with ``newly_frozen=False``."""
+        newly = False
         with self._lock:
             if not self._dd_frozen_since_ms:
                 self._dd_frozen_since_ms = int(time.time() * 1000)
                 self._dirty = True
+                newly = True
+            since = int(self._dd_frozen_since_ms)
         # Risk-blocking state: persist immediately so a restart cannot erase a
         # freeze stamp (mirrors set_loss_cooldown's force-flush policy).
         self.flush(force=True)
-        with self._lock:
-            return int(self._dd_frozen_since_ms)
+        return since, newly
 
     def clear_drawdown_freeze(self) -> None:
         """Clear the drawdown freeze bookkeeping on recovery (gate passing)."""
@@ -1228,22 +1378,61 @@ class AgentMemory:
         stamp AND the rolling trail (reseeded at the new baseline) so the gate
         starts measuring forward from here instead of re-tripping on stale
         highs still inside the window — the next genuine drawdown starts a
-        fresh freeze episode."""
+        fresh freeze episode.
+
+        CS-D audit: the cleared trail is NOT destroyed silently — its
+        span/sample count plus both peak values (re-based onto the current
+        flow basis) are recorded as a ``drawdown_peak_rebased`` session event
+        so a post-mortem can see what the baseline was reset from."""
         with self._lock:
             old = float(self._peak_equity)
+            old_basis = float(self._peak_equity_basis_flow)
+            cur_flow = self._current_cum_flow_nolock()
             self._peak_equity = float(new_peak)
+            # CS-D: new_peak is raw CURRENT equity (ctx.equity) passed by the
+            # gate, so it sits on the current cum_flow basis — tag it as such
+            # or the read-time re-base would misread the new baseline.
+            self._peak_equity_basis_flow = float(cur_flow)
             self._dd_frozen_since_ms = 0
             self._dd_last_baseline_ms = int(time.time() * 1000)
+            # Archive the trail ABOUT to be destroyed (span + sample count;
+            # values stay in the events.jsonl audit stream, not in memory).
+            archived_samples = len(self._equity_trail)
+            archived_oldest_ms = int(self._equity_trail[0][0] * 1000) if self._equity_trail else 0
+            archived_newest_ms = int(self._equity_trail[-1][0] * 1000) if self._equity_trail else 0
             # Reset the rolling trail to the accepted new baseline: any older
             # (higher) samples would otherwise keep rolling_peak_equity above
-            # threshold and re-freeze on the very next gate pass.
+            # threshold and re-freeze on the very next gate pass. CS-D: seed a
+            # flow-annotated triple on the current basis.
             self._equity_trail.clear()
-            self._equity_trail.append((time.time(), float(new_peak)))
+            self._equity_trail.append(
+                (time.time(), float(new_peak), float(cur_flow)))
             self._dirty = True
+            old_rebased = float(max(0.0, old + cur_flow - old_basis))
         self.flush(force=True)
         logger.warning(
             "[risk] drawdown baseline re-armed: peak $%.2f -> $%.2f (%s)",
-            old, float(new_peak), reason or "cooldown recovery")
+            old_rebased, float(new_peak), reason or "cooldown recovery")
+        # CS-D: audit event for the baseline reset (best-effort; never blocks
+        # the gate path). All dollar figures are on the CURRENT flow basis.
+        try:
+            from hermes_trader import session_log
+            session_log.append({
+                "event": "drawdown_peak_rebased",
+                "ts": int(time.time() * 1000),
+                "reason": str(reason or "cooldown recovery")[:200],
+                "old_peak_equity": round(old_rebased, 4),
+                "new_peak_equity": round(float(new_peak), 4),
+                "peak_reset_pct": round(
+                    (old_rebased - float(new_peak)) / old_rebased * 100.0, 2)
+                    if old_rebased > 0 else 0.0,
+                "basis_cum_flow": round(float(cur_flow), 4),
+                "archived_trail_samples": int(archived_samples),
+                "archived_oldest_ms": archived_oldest_ms,
+                "archived_newest_ms": archived_newest_ms,
+            })
+        except Exception as _le:
+            logger.warning("[risk] drawdown rebase audit event failed: %s", _le)
 
     def drawdown_freeze_status(self, max_drawdown_pct: float,
                                window_days: float, cooldown_hours: float) -> dict[str, Any]:
@@ -1255,11 +1444,21 @@ class AgentMemory:
         """
         with self._lock:
             equity = float(self._equity or 0.0)
-            at_peak = float(self._peak_equity or 0.0)
+            cur_flow = self._current_cum_flow_nolock()
+            # CS-D: every peak figure must be on the SAME current-flow basis as
+            # raw current equity, or a deposit/transfer would move dd% on the
+            # dashboard (the gate itself uses rolling_peak_equity(), so mirror
+            # that basis here rather than reading bare stored peaks).
+            at_peak = float(max(
+                0.0, self._peak_equity + cur_flow - self._peak_equity_basis_flow))
             cutoff = time.time() - float(window_days) * 86400.0 if window_days > 0 else 0.0
-            window_vals = [eq for ts, eq in self._equity_trail
-                           if window_days <= 0 or ts >= cutoff]
-            peak = float(max(window_vals)) if window_vals else at_peak
+            if window_days > 0:
+                peak = self._rebased_peak_nolock(
+                    self._equity_trail, cutoff, cur_flow)
+                if peak <= 0:
+                    peak = at_peak
+            else:
+                peak = at_peak
             frozen_since = int(self._dd_frozen_since_ms or 0)
             last_baseline = int(self._dd_last_baseline_ms or 0)
             trail_len = len(self._equity_trail)

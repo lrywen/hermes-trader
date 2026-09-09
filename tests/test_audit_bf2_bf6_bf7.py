@@ -378,8 +378,10 @@ def test_bf7_rolling_window_ages_out_old_peak(monkeypatch, tmp_path):
     m._equity = 840.0
     m._peak_equity = 1000.0  # all-time HWM stays $1000
     m._equity_trail.clear()
-    m._equity_trail.append((now_s - 20 * 86400.0, 1000.0))
-    m._equity_trail.append((now_s - 100.0, 840.0))
+    # CS-D: trail samples are (ts, raw_equity, cum_flow); flow=0.0 keeps the
+    # no-external-flow scenario rebasing as a no-op.
+    m._equity_trail.append((now_s - 20 * 86400.0, 1000.0, 0.0))
+    m._equity_trail.append((now_s - 100.0, 840.0, 0.0))
     # 14d window: the $1000 peak aged out → the in-window peak is $840 → 0%
     # drawdown → pass even though the all-time HWM is still $1000.
     _patch_drawdown_cfg(monkeypatch, window_days=14.0, cooldown_hours=24.0)
@@ -402,8 +404,8 @@ def test_bf7_cooldown_rebases_after_frozen_window(monkeypatch, tmp_path):
     now_s = time.time()
     m._peak_equity = 1000.0
     m._equity_trail.clear()
-    m._equity_trail.append((now_s - 3600.0, 1000.0))  # in-window peak, >600s old
-    m._equity_trail.append((now_s, 800.0))            # -20% → trips the 15% cap
+    m._equity_trail.append((now_s - 3600.0, 1000.0, 0.0))  # in-window peak
+    m._equity_trail.append((now_s, 800.0, 0.0))            # -20% trips the 15% cap
     _patch_drawdown_cfg(monkeypatch, window_days=14.0, cooldown_hours=24.0)
     r = drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)
     assert r["pass"] is False
@@ -445,7 +447,7 @@ def test_bf7_legacy_memory_oneshot_rebase(monkeypatch, tmp_path):
     m2, _ = _isolated_memory(monkeypatch, tmp_path)
     m2._peak_equity = 1000.0
     m2._equity_trail.clear()
-    m2._equity_trail.append((time.time() - 60.0, 1000.0))  # fresh in-window peak
+    m2._equity_trail.append((time.time() - 60.0, 1000.0, 0.0))  # in-window peak
     assert len(m2._equity_trail) == 1
     assert drawdown_gate(_ctx(equity=800.0), max_drawdown_pct=15.0)["pass"] is False
     assert m2.peak_equity() == 1000.0  # fresh drawdown fails closed, no rebase

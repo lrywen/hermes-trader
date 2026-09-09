@@ -1866,6 +1866,49 @@ def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]
     return result
 
 
+def _reify_none_defaults(defaults: dict[str, Any], view: dict[str, Any]) -> None:
+    """Re-materialize, recursively into *view*, every canonical key whose
+    default is ``None`` and that is absent from *view*.
+
+    CS-D verdict 5 (2026-09-08): for config-diff purposes an explicit null
+    and a missing key are the SAME effective state ("unset → scale off
+    max_latency_s"), which is exactly how the runtime read path treats them
+    (``d.get(k)`` + ``is not None`` guards). ``_deep_merge`` uses None as a
+    deletion marker, so a full RMW view carrying explicit None stubs (e.g.
+    ``debate_research.bull_timeout_s: null``) loses them on re-merge while a
+    sparse .bak keeps the defaults' stubs — the two effective views then
+    differ in JSON alone and every no-op RMW write falsely reports the
+    enclosing section in ``changed_keys`` (the stubs oscillate null/missing
+    on each full-view write). Re-materializing the canonical None defaults
+    on BOTH sides normalizes the diff without touching runtime semantics:
+    nothing here is ever read by the trading loop, only serialized for
+    comparison. Operators cannot set these keys to null either — validation
+    treats a type collision (dict-valued default overridden with null) as a
+    schema error — so missing vs null carries no operator signal to lose.
+    """
+    for key, default in defaults.items():
+        if isinstance(default, dict):
+            if key not in view:
+                view[key] = {}
+            if isinstance(view.get(key), dict):
+                _reify_none_defaults(default, view[key])
+        elif default is None and key not in view:
+            view[key] = None
+
+
+def _effective_view_for_diff(raw: dict[str, Any]) -> dict[str, Any]:
+    """Canonical effective config view for write-audit diffs ONLY.
+
+    Same merge as the runtime read path (:func:`read_agent_config`) plus
+    :func:`_reify_none_defaults`, applied identically to the prior (.bak)
+    and the just-written views so no-op RMW writes report an empty
+    ``changed_keys`` instead of false None-stub noise.
+    """
+    view = _deep_merge(CANONICAL_DEFAULTS, raw)
+    _reify_none_defaults(CANONICAL_DEFAULTS, view)
+    return view
+
+
 def _env_override(dotted_key: str) -> Optional[str]:
     """Return the HERMES_CFG_<UPPER_KEY> env value for a dotted key, or None.
 

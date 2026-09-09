@@ -207,7 +207,10 @@ def test_payload_global_halt_surfaces(monkeypatch):
 
 def test_payload_degrades_when_backing_reads_raise(monkeypatch):
     """A broken memory file or unreadable session log must never turn the
-    card into a 500 — the endpoint still returns the quiet defaults."""
+    card into a 500 — the endpoint still returns the quiet defaults.
+    CS-D verdict 4: and it must explicitly flag risk_blind=True — a
+    fail-open breaker card that silently renders quiet breakers looks
+    identical to a healthy one."""
     from hermes_trader import dashboard
     from hermes_trader.agents import memory as memory_mod
 
@@ -221,7 +224,75 @@ def test_payload_degrades_when_backing_reads_raise(monkeypatch):
     assert out["global_halt"] is False
     assert out["coin_circuits"] == {}
     assert out["armed_coins"] == 0
+    assert out["risk_blind"] is True
+    assert out["blind_gates"] == []
     assert "ts" in out
+
+
+def _blind_event(*, ts_ms: int, gate: str = "drawdown", coin: str = "BTC",
+                 error: str = "RuntimeError: simulated") -> dict:
+    return {
+        "event": "risk_gate_blind",
+        "ts": ts_ms,
+        "gate": gate,
+        "coin": coin,
+        "posture": "fail-open",
+        "error": error,
+    }
+
+
+def test_payload_flags_recent_blind_gate_events(monkeypatch):
+    """CS-D verdict 4: a recent risk_gate_blind session-log event (emitted
+    when a gate fails open) lists the gate and sets risk_blind — even when
+    the current memory read succeeds (transient blindness still means the
+    protection was absent)."""
+    from hermes_trader import dashboard
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(
+        dashboard, "_read_log_lines",
+        lambda: [
+            _hb_event(ts_ms=now_ms - 2000),
+            _blind_event(ts_ms=now_ms - 60_000, gate="drawdown"),
+            _blind_event(ts_ms=now_ms - 90_000, gate="coin_circuit", coin="ETH"),
+        ],
+    )
+    out = dashboard._risk_status_payload()
+    assert out["risk_blind"] is True
+    assert out["blind_gates"] == ["coin_circuit", "drawdown"]
+    # Breaker read itself was healthy — global halt stays False (the blind
+    # flag is independent of the current snapshot values).
+    assert out["global_halt"] is False
+
+
+def test_payload_ignores_stale_blind_gate_events(monkeypatch):
+    """A blind-gate event older than the 15m lookback must not keep the card
+    flagged forever after the gate has recovered."""
+    from hermes_trader import dashboard
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(
+        dashboard, "_read_log_lines",
+        lambda: [
+            _hb_event(ts_ms=now_ms - 2000),
+            _blind_event(ts_ms=now_ms - 20 * 60_000, gate="drawdown"),
+        ],
+    )
+    out = dashboard._risk_status_payload()
+    assert out["risk_blind"] is False
+    assert out["blind_gates"] == []
+
+
+def test_payload_healthy_by_default(monkeypatch):
+    """With a live heartbeat, healthy memory and no blind events, the card
+    reports risk_blind=False / blind_gates=[]."""
+    from hermes_trader import dashboard
+    now_ms = int(time.time() * 1000)
+    monkeypatch.setattr(
+        dashboard, "_read_log_lines",
+        lambda: [_hb_event(ts_ms=now_ms - 2000)],
+    )
+    out = dashboard._risk_status_payload()
+    assert out["risk_blind"] is False
+    assert out["blind_gates"] == []
 
 
 # ─────────────────────────── HTTP endpoint ──────────────────────────────
@@ -243,10 +314,13 @@ def test_endpoint_anonymous_200_and_shape(client, monkeypatch):
         "global_halt", "global_halt_remaining_min", "coin_circuits",
         "armed_coins", "mode", "daily_pnl", "daily_loss_limit",
         "kill_armed", "open_positions", "feed_status", "feed_age_s", "ts",
+        "risk_blind", "blind_gates",
     ):
         assert key in body
     assert body["mode"] == "PAPER"
     assert body["feed_status"] == "live"
+    assert body["risk_blind"] is False
+    assert body["blind_gates"] == []
 
 
 def test_endpoint_survives_backend_failure(client, monkeypatch):

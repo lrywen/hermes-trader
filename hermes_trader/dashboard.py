@@ -443,6 +443,10 @@ def _summary_payload() -> dict[str, Any]:
 # O-4: feed liveness for the risk-status card uses the same staleness window
 # as summary (a loop heartbeat older than this means the feed is stale/dead).
 _RISK_STATUS_STALE_AFTER_S = 180
+# CS-D verdict 4: a risk_gate_blind event younger than this keeps the card
+# flagged as blind (15m — long enough to span a scrape/operator shift, short
+# enough that a one-off recovered blip doesn't stay pinned forever).
+_RISK_BLIND_LOOKBACK_MS = 15 * 60 * 1000
 
 
 def _risk_status_payload() -> dict[str, Any]:
@@ -473,8 +477,26 @@ def _risk_status_payload() -> dict[str, Any]:
         "open_positions": 0,
         "feed_status": "offline",
         "feed_age_s": None,
+        # Audit 2026-09-08 (CS-D verdict 4): the five memory-backed gates
+        # deliberately fail-OPEN on a state-read fault (pass=True); the
+        # compensation was error log + Prom counter + Feishu + operator SSE,
+        # but this card stayed silent and rendered quiet breakers — a blind
+        # kill-switch looked identical to a healthy one. risk_blind=True now
+        # means "breaker state could NOT be read; the protections shown here
+        # are not in force"; blind_gates lists gates that logged a
+        # risk_gate_blind event within the recent window (transient blindness
+        # even when the current read succeeds).
+        "risk_blind": False,
+        "blind_gates": [],
         "ts": now_ms,
     }
+
+    # Session log once: heartbeat (mode/pnl/feed) + recent blind-gate alarms.
+    events: list = []
+    try:
+        events = _read_log_lines()
+    except Exception:  # an unreadable log must not 500 the card
+        logger.warning("[risk-status] session-log read failed; feed=offline", exc_info=True)
 
     # Breaker state from the flushed memory singleton (read-only snapshot).
     try:
@@ -488,18 +510,37 @@ def _risk_status_payload() -> dict[str, Any]:
         # and cooldown remaining) — the frontend surfaces a freeze banner from it.
         out["drawdown"] = snap.get("drawdown")
     except Exception:  # card stays readable even if memory is corrupt
-        logger.warning("[risk-status] memory breaker read failed; serving quiet breakers",
+        # CS-D verdict 4: surface the blindness explicitly instead of quietly
+        # serving breaker values that are NOT in force (fail-open path).
+        out["risk_blind"] = True
+        logger.warning("[risk-status] memory breaker read failed; RISK BLIND — "
+                       "gates fail-open, breaker card values are not in force",
                        exc_info=True)
 
+    # CS-D verdict 4: scan recent risk_gate_blind events (emitted by
+    # risk_gates._alert_memory_gate_blind whenever a gate fails open). A gate
+    # that went blind within the window stays listed even if the latest memory
+    # read recovered — the protection was absent and the operator must know.
+    blind_gates: set[str] = set()
+    blind_cutoff_ms = now_ms - _RISK_BLIND_LOOKBACK_MS
+    for e in events:
+        if not isinstance(e, dict) or e.get("event") != "risk_gate_blind":
+            continue
+        try:
+            if int(e.get("ts", 0) or 0) >= blind_cutoff_ms:
+                g = e.get("gate")
+                if isinstance(g, str) and g:
+                    blind_gates.add(g)
+        except (TypeError, ValueError):
+            continue
+    if blind_gates:
+        out["blind_gates"] = sorted(blind_gates)
+        out["risk_blind"] = True
+
     # Mode / daily-PnL-vs-kill / feed liveness from the latest heartbeat.
-    try:
-        events = _read_log_lines()
-        # P0-2d: schema-validated at the read boundary; a malformed event
-        # degrades to "no heartbeat" (feed=offline) rather than 500ing.
-        hb = parse_heartbeat(_last_event(events, "loop_heartbeat")) or {}
-    except Exception:  # an unreadable log must not 500 the card
-        logger.warning("[risk-status] session-log read failed; feed=offline", exc_info=True)
-        hb = {}
+    # P0-2d: schema-validated at the read boundary; a malformed event
+    # degrades to "no heartbeat" (feed=offline) rather than 500ing.
+    hb = parse_heartbeat(_last_event(events, "loop_heartbeat")) or {}
 
     if hb:
         hb_ts = int(hb.get("ts", 0) or 0)
@@ -1332,6 +1373,11 @@ _PUBLIC_FEED_EVENTS: frozenset[str] = frozenset({
     "near_miss",       # coin + reason, no order data
     "loop_start",      # loop lifecycle marker
     "loop_stop",       # loop lifecycle marker
+    # CS-D verdict 4: a fail-open gate is a degraded *protection* state, not a
+    # strategy/position secret — anyone watching the public feed deserves to
+    # know the kill-switch may be blind. Projected to gate/coin/posture only;
+    # the internal error string stays operator-only (see _public_feed_filter).
+    "risk_gate_blind",
 })
 
 
@@ -1356,6 +1402,16 @@ def _public_feed_filter(event: dict[str, Any]) -> dict[str, Any] | None:
             "hip3": hb_cfg.get("hip3"),
         }
         return _redact(out)
+    if etype == "risk_gate_blind":
+        # CS-D verdict 4: public projection names WHICH protection is blind
+        # (gate/coin/posture) but withholds the internal error string.
+        return _redact({
+            "ts": event.get("ts"),
+            "event": "risk_gate_blind",
+            "gate": event.get("gate"),
+            "coin": event.get("coin"),
+            "posture": event.get("posture"),
+        })
     # scan/error/near_miss/loop_*: keep top-level scalars, drop any nested
     # payload blobs wholesale (defense in depth — never trust a future field).
     out = {

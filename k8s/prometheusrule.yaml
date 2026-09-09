@@ -138,6 +138,38 @@ spec:
               with ``grep circuit ~/.hermes-trader/memory.json`` (or
               the equivalent in the pod) before leaving it on.
 
+        - alert: HermesMemoryGateReadErrors
+          # CS-D verdict 4 (audit 2026-09-08): the five memory-backed
+          # gates (coin_circuit, global_halt, consecutive_loss,
+          # per_coin_daily_loss, drawdown) deliberately fail-OPEN when
+          # their state read raises — pass=True so a transient memory
+          # fault never becomes an account-wide trading DoS. But while
+          # this counter increments the corresponding protection is
+          # BLIND: the kill-switch is not actually evaluating. The
+          # fail-open was previously visible only via logs/Feishu; the
+          # risk-status card now also flags risk_blind, and this alert
+          # pages on any sustained rate. A single blip can be a pod
+          # restart; 5m of increments means the breaker is gone.
+          expr: increase(hermes_memory_gate_read_errors_total[5m]) > 0
+          for: 5m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "Memory-backed risk gate is fail-OPEN (blind breaker): {{ $labels.gate }}"
+            description: |
+              ``hermes_memory_gate_read_errors_total{{gate="{{ $labels.gate }}"}}``
+              has incremented over the last 5 minutes. The
+              {{ $labels.gate }} gate could not read its state and is
+              failing open (pass=True) — the protection it provides is
+              NOT in force while this fires. The risk-status dashboard
+              card shows risk_blind=true and a Feishu blind-gate card is
+              sent. Check the loop logs for memory/state read errors
+              (``grep -i 'gate.*blind\|memory' loop.log``), verify
+              ``memory.json`` is readable on the PVC, and consider
+              pausing the loop until the gate reads cleanly.
+
     # ── Group 3: dispatch / rate-gate (R11-A1 + R11-C1) ───────────────
     - name: hermes.dispatch
       interval: 30s

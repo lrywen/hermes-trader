@@ -2903,7 +2903,26 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # `equity` (which is kept main-only for margin sizing). Using main-only here
     # poisoned daily_pnl/peak vs the heartbeat's aggregate — it read ~$30 low and
     # spuriously fired the daily give-back breaker (saw day $24 vs true $54).
-    memory.track_daily_pnl(agg_equity)
+    # CS-D (2026-09-08): the heartbeat path passed today's net contributions but
+    # the ORDER path did not, so a spot↔perp transfer/deposit between heartbeats
+    # folded external cash flow into the peak/trail and inflated/faked the
+    # drawdown basis. Fetch the same SOD-anchored contribution window here
+    # (best-effort: a ledger flake degrades to 0.0, the old behavior, and never
+    # blocks a placement).
+    _contrib = 0.0
+    try:
+        from datetime import datetime
+        from datetime import timezone as _tz
+
+        from hermes_trader.client.hl_client import fetch_aggregate_contributions_since
+        _sod_ms = int(datetime.now(_tz.utc).replace(
+            hour=0, minute=0, second=0, microsecond=0).timestamp()) * 1000
+        if _sod_ms > 0:
+            _contrib = float(fetch_aggregate_contributions_since(user, _sod_ms) or 0.0)
+    except Exception as _e:
+        logger.warning(f"[execute] contribution fetch failed (degrading to 0.0): {_e}")
+        _contrib = 0.0
+    memory.track_daily_pnl(agg_equity, _contrib)
     daily_pnl = memory.get_daily_pnl()
 
     # P0-2a: defensive read of the live account state — a single malformed
@@ -4930,6 +4949,28 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
         logger.critical(
             f"[risk] ROE BLOW-UP HALT on {coin}: realized ROE {roe:.2f}% <= "
             f"{threshold:.2f}% (source={source}) → mode switched OFF")
+        # CS-D audit: attach the account-level equity snapshot (same rolling
+        # peak/dd the drawdown gate enforces) so the halt event answers "what
+        # did the book look like" instead of just the per-trade ROE.
+        # Best-effort: a snapshot failure must not mute the halt.
+        snap: dict = {}
+        try:
+            _max_dd = float(cfg_get("circuit_breaker.max_drawdown_pct", default=15.0) or 15.0)
+            _win = float(cfg_get("circuit_breaker.drawdown_peak_window_days", default=14.0) or 14.0)
+            _cd = float(cfg_get("circuit_breaker.drawdown_cooldown_hours", default=24.0) or 24.0)
+            _st = memory.drawdown_freeze_status(_max_dd, _win, _cd)
+            snap = {
+                "equity": _st.get("equity"),
+                "peak_equity": _st.get("peak_equity"),
+                "all_time_peak_equity": _st.get("all_time_peak_equity"),
+                "dd_pct": _st.get("dd_pct"),
+                "dd_frozen": bool(_st.get("frozen")),
+                "window_days": _win,
+                "snapshot_ts_ms": int(time.time() * 1000),
+            }
+        except Exception as _se:
+            logger.warning(f"[risk] roe-halt equity snapshot failed for {coin}: {_se}")
+            snap = {}
         try:
             from hermes_trader import notify
             notify.send_card(
@@ -4941,6 +4982,9 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
                     "已实现 ROE": f"{roe:.2f}%",
                     "熔断阈值": f"{threshold:.2f}%",
                     "触发来源": source,
+                    "账户权益": f"${snap['equity']:.2f}" if snap.get("equity") is not None else "n/a",
+                    "滚动峰值/回撤": (f"${snap['peak_equity']:.2f} / {snap['dd_pct']:.2f}%"
+                                   if snap.get("peak_equity") is not None else "n/a"),
                     "模式": "OFF（需人工复盘后手动恢复）" if switched else "已处于 OFF",
                 },
                 markdown="单笔交易杠杆后亏损达到穿仓级阈值，系统已自动停止开新仓。"
@@ -4954,7 +4998,8 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
                 event_log({"event": "roe_halt", "coin": coin,
                            "realized_pnl_pct": round(roe, 4),
                            "threshold_pct": threshold, "source": source,
-                           "mode_switched": switched})
+                           "mode_switched": switched,
+                           "equity_snapshot": snap})
             else:
                 # No injected sink (executor close chokepoint): fall back to
                 # the global session log lazily, so the halt is audited on
@@ -4963,7 +5008,8 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
                 session_log.append({"event": "roe_halt", "coin": coin,
                                     "realized_pnl_pct": round(roe, 4),
                                     "threshold_pct": threshold, "source": source,
-                                    "mode_switched": switched})
+                                    "mode_switched": switched,
+                                    "equity_snapshot": snap})
         except Exception as _le:
             logger.warning(f"[risk] roe-halt event log failed for {coin}: {_le}")
         return True

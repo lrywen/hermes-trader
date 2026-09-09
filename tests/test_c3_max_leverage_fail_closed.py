@@ -46,7 +46,7 @@ class _StubMemory:
     def get_recent_trades(self, n=10):
         return []
 
-    def track_daily_pnl(self, equity):
+    def track_daily_pnl(self, equity, net_contributions=0.0):
         return None
 
 

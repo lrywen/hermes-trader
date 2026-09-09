@@ -831,6 +831,29 @@ def test_public_feed_filter_unit():
     assert hb["equity"] == 5.0
 
 
+def test_public_feed_filter_blind_gate_event():
+    """CS-D verdict 4: risk_gate_blind reaches the anonymous feed (a blind
+    kill-switch is not a secret), but only gate/coin/posture — the internal
+    error string is operator-only."""
+    from hermes_trader.dashboard import _public_feed_filter
+    out = _public_feed_filter({
+        "event": "risk_gate_blind",
+        "ts": 12345,
+        "gate": "drawdown",
+        "coin": "BTC",
+        "posture": "fail-open",
+        "error": "RuntimeError: /data/memory.json: disk broken",
+    })
+    assert out == {
+        "ts": 12345,
+        "event": "risk_gate_blind",
+        "gate": "drawdown",
+        "coin": "BTC",
+        "posture": "fail-open",
+    }
+    assert "error" not in out
+
+
 def test_feed_stream_anonymous_projects(client, monkeypatch):
     """D-FCFG-3: the SSE generator with public_only=True never emits a
     sensitive event type (drives _tail_log_sse directly so the infinite poll
