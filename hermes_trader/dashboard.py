@@ -579,6 +579,38 @@ def _risk_status_payload() -> dict[str, Any]:
             if daily_pnl is not None and float(daily_pnl) <= kill_floor:
                 out["kill_armed"] = True
 
+    # CS-F (2026-09-08): market_circuit cross-process heartbeat. The trading
+    # loop rewrites a state file per evaluate tick; surface its freshness and
+    # verdict to the risk-status card. Pure observability — a missing/corrupt
+    # heartbeat only reports available=False and NEVER sets risk_blind (an
+    # observability gap is not a trading gate being blind).
+    mc_block: dict[str, Any] = {"available": False}
+    try:
+        from hermes_trader.agents.market_circuit_state import read_state
+
+        mc = read_state()
+        if isinstance(mc, dict):
+            mc_state = int(mc.get("state", 4))
+            mc_ts = float(mc.get("ts", 0.0) or 0.0)
+            mc_block = {
+                "available": True,
+                "mode": str(mc.get("mode", "off")),
+                "state": mc_state,
+                "state_label": {
+                    0: "clear", 1: "tripped", 2: "data_missing",
+                    3: "off", 4: "error",
+                }.get(mc_state, "unknown"),
+                "action": str(mc.get("action", "")),
+                "data_ok": bool(mc.get("data_ok", False)),
+                "tripped": bool(mc.get("tripped", False)),
+                "last_eval_ts": mc_ts,
+                "age_s": max(0.0, time.time() - mc_ts) if mc_ts > 0 else None,
+                "counts": mc.get("counts", {}),
+            }
+    except Exception as e:  # never 500 the risk-status payload
+        logger.debug("[dashboard] market_circuit heartbeat read failed: %s", e)
+    out["market_circuit"] = mc_block
+
     return out
 
 

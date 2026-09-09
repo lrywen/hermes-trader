@@ -170,6 +170,114 @@ spec:
               ``memory.json`` is readable on the PVC, and consider
               pausing the loop until the gate reads cleanly.
 
+        - alert: HermesMarketCircuitDataMissing
+          # CS-D verdict 4 (audit 2026-09-08): market_circuit fails OPEN
+          # when no usable index data (candles/funding) is available —
+          # the market-level tail-risk breaker cannot trip without data.
+          # In shadow/enforce a sustained data_missing state means the
+          # crash protection is silently absent.
+          # CS-F (audit 2026-09-08): the original expr was an increase()
+          # on hermes_market_circuit_verdicts_total, a Counter incremented
+          # in the trading-loop PROCESS while Prometheus scrapes the web
+          # process — the increments never reached the scraped registry,
+          # so this alert could never fire. It now reads the cross-process
+          # state gauge the loop writes to the shared /data heartbeat file
+          # (2=data_missing). mode=off does not evaluate, so this cannot
+          # fire while the feature is disabled; a missing heartbeat file
+          # is covered by HermesMarketCircuitHeartbeatAbsent instead.
+          expr: hermes_market_circuit_state == 2
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "market_circuit failing open — no usable market data ({{ $labels.mode }})"
+            description: |
+              ``hermes_market_circuit_state{{mode="{{ $labels.mode }}"}}``
+              has been 2 (data_missing) for 10+ minutes. The
+              market-level tail-risk breaker cannot evaluate index
+              drawdowns / funding-stress triggers because candle or
+              funding fetches are returning nothing usable, so it is
+              failing open. Check the HL market-data endpoints and the
+              loop logs (``grep market_circuit loop.log``); the WS/REST
+              feed may be degraded even if the position feed looks alive.
+
+        - alert: HermesMarketCircuitHeartbeatAbsent
+          # CS-F (audit 2026-09-08): the loop rewrites the heartbeat state
+          # file once per evaluate tick and the web process exports its
+          # timestamp. A plain prometheus_client Gauge always emits a 0.0
+          # sample even before first .set(), so absent_over_time() cannot
+          # distinguish "never wrote"; the web exporter instead sets an
+          # EXPLICIT sentinel — last_eval_ts=0 (and state=4 for
+          # mode=unknown) whenever the file is missing/corrupt. ts==0 for
+          # 5m means the trading loop is not evaluating market_circuit
+          # (never wrote since boot, file deleted, /data volume unshared,
+          # or regression). Distinct from a stale-but-present heartbeat
+          # (EvalStale/EvalDead below). Expected when
+          # market_circuit.mode=off — silence the alert or leave the
+          # feature off deliberately; production runs shadow.
+          expr: hermes_market_circuit_last_eval_timestamp_seconds == 0
+          for: 5m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "market_circuit heartbeat absent — loop is not evaluating"
+            description: |
+              ``hermes_market_circuit_last_eval_timestamp_seconds`` has
+              been 0 (no heartbeat file) for 5+ minutes. The trading loop
+              has never written (or stopped writing) the market_circuit
+              heartbeat state file on /data. If market_circuit.mode is
+              meant to be shadow/enforce, check that the trading-loop
+              process is alive, that /data is shared between the loop and
+              web processes, and ``grep market_circuit loop.log``. With
+              mode=off this alert is expected; silence it in that case.
+
+        - alert: HermesMarketCircuitEvalStale
+          # CS-F (audit 2026-09-08): heartbeat file exists but its last
+          # evaluation is aging. The loop ticks every scan interval (tens
+          # of seconds), so 5m old means evaluation is stuck/starved even
+          # though the web scrape itself works.
+          expr: hermes_market_circuit_eval_age_seconds > 300
+          for: 5m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "market_circuit evaluation stale ({{ $value | printf \"%.0f\" }}s since last tick)"
+            description: |
+              ``hermes_market_circuit_eval_age_seconds`` has exceeded
+              300s for 5+ minutes. The last market_circuit evaluation is
+              aging — the trading loop may be stalled on an upstream call
+              ahead of the circuit tick. Check loop logs and the scan
+              interval; the positions snapshot heartbeat can confirm
+              whether the whole loop is stuck.
+
+        - alert: HermesMarketCircuitEvalDead
+          # CS-F (audit 2026-09-08): 15m with no fresh evaluation while a
+          # heartbeat file exists — the market-level breaker is effectively
+          # not running. Critical because shadow/enforce protection is
+          # absent while the file's last timestamp hides the condition
+          # from the absent-over-time alert.
+          expr: hermes_market_circuit_eval_age_seconds > 900
+          for: 2m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "market_circuit evaluation dead — no verdict for {{ $value | printf \"%.0f\" }}s"
+            description: |
+              ``hermes_market_circuit_eval_age_seconds`` has exceeded
+              900s. No market_circuit verdict for 15+ minutes: the
+              market-level tail-risk breaker is effectively not running
+              while a (stale) heartbeat file remains. Treat as a risk
+              blind spot — check trading-loop health immediately and
+              consider halting new entries until ticks resume.
+
     # ── Group 3: dispatch / rate-gate (R11-A1 + R11-C1) ───────────────
     - name: hermes.dispatch
       interval: 30s

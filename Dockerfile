@@ -55,7 +55,8 @@ RUN mkdir -p /data
 ENV SESSION_LOG_PATH=/data/session-log.jsonl \
     HERMES_DSL_STATE_FILE=/data/.dsl-state.json \
     HERMES_AGENT_CONFIG_FILE=/data/.agent-config.json \
-    HERMES_AGENT_MEMORY_FILE=/data/.agent-memory.json
+    HERMES_AGENT_MEMORY_FILE=/data/.agent-memory.json \
+    HERMES_MARKET_CIRCUIT_STATE_FILE=/data/.market-circuit.state
 
 EXPOSE 8000
 

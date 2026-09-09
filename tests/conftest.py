@@ -38,6 +38,12 @@ os.environ["HERMES_TA_LATE_ENTRY_SHADOW_FILE"] = os.path.join(
 # tests never append to the developer's real market_circuit_shadow.jsonl.
 os.environ["HERMES_MARKET_CIRCUIT_SHADOW_FILE"] = os.path.join(
     _tmp, "market_circuit_shadow.jsonl")
+# CS-F: redirect the market_circuit cross-process heartbeat state the same way
+# (default /data is unwritable on dev hosts and shared in the container).
+# Tests asserting on heartbeat contents monkeypatch market_circuit_state.STATE_FILE
+# (or pass path=) to their own tmp_path; the env var is read once at import.
+os.environ["HERMES_MARKET_CIRCUIT_STATE_FILE"] = os.path.join(
+    _tmp, ".market-circuit.state")
 # Audit 2026-09-07 (test isolation): the remaining ten shadow arms were NOT
 # redirected here, so a gate/shadow test that omitted an explicit path
 # appended synthetic rows (e.g. coin "TESTCOIN") to the developer's REAL

@@ -316,6 +316,44 @@ MARKET_CIRCUIT_VERDICTS = Counter(
     "(trip/no_trip/data_missing). In shadow mode trip = would-trigger.",
     ["mode", "verdict"],
 )
+# CS-F (2026-09-08): the Counter above is incremented in the trading-loop
+# process while Prometheus scrapes the web process; without multi-process mode
+# those increments never reach the scraped registry, so the market_circuit
+# alerts were blind. The loop instead rewrites a whole-file heartbeat state
+# (agents/market_circuit_state.py) on the shared /data volume; these gauges
+# are refreshed from that file in _refresh() so BOTH processes are visible.
+# Sentinels (a plain Gauge always exports a 0.0 sample even when never set,
+# so absent_over_time() cannot distinguish "never wrote"; use explicit values):
+#   no heartbeat file yet  → last_eval_ts = 0 (HeartbeatAbsent fires on == 0);
+#   file deleted after run → last_eval_ts = 0 likewise;
+#   stale loop             → age keeps growing against the last real ts.
+MARKET_CIRCUIT_LAST_EVAL_TS = Gauge(
+    "hermes_market_circuit_last_eval_timestamp_seconds",
+    "Unix timestamp of the most recent market_circuit evaluation "
+    "(cross-process heartbeat written by the trading loop); 0 = no heartbeat "
+    "file yet (loop never evaluated or state file missing).",
+)
+MARKET_CIRCUIT_EVAL_AGE = Gauge(
+    "hermes_market_circuit_eval_age_seconds",
+    "Seconds since the most recent market_circuit evaluation. Grows without "
+    "bound while the loop is not evaluating (crashed/off/stuck); 0 when no "
+    "heartbeat has ever been written (use last_eval_timestamp == 0 for that).",
+)
+MARKET_CIRCUIT_STATE = Gauge(
+    "hermes_market_circuit_state",
+    "Latest market_circuit verdict state, labelled by mode: 0=clear, "
+    "1=tripped (halt armed or shadow would-trip), 2=data_missing, 3=off, "
+    "4=error/unknown (also exported for mode=unknown while no heartbeat).",
+    ["mode"],
+)
+MARKET_CIRCUIT_VERDICTS_CUMULATIVE = Gauge(
+    "hermes_market_circuit_verdicts_cumulative",
+    "Cumulative market_circuit evaluations persisted in the heartbeat state "
+    "file (survives loop restart), labelled by mode and bounded verdict; "
+    "cross-process replacement for the process-local verdicts Counter. In "
+    "shadow mode trip = would-trigger.",
+    ["mode", "verdict"],
+)
 
 # ── Gray-release decay / regime factors (roadmap §1/§2, 2026-09-04) ────
 # One observation per evaluation while mode != off. Bounded labels:
@@ -617,6 +655,50 @@ def _refresh() -> None:
             HL_REST_TOKENS_AVAILABLE.set(float(st.get("tokens_available", 0.0)))
     except Exception as e:
         logger.debug(f"[metrics] hl rate stats read failed: {e}")
+
+    # CS-F: market_circuit cross-process heartbeat. The trading loop rewrites
+    # the state file each tick. A missing/corrupt file (feature never ran /
+    # file deleted / unreadable) is an EXPLICIT sentinel — last_eval_ts=0
+    # (a plain Gauge always exports 0.0 even if never set, so absent() cannot
+    # distinguish "never wrote") and state=4 for mode=unknown. Labelled gauges
+    # are cleared each scrape so a mode change never leaves phantom samples.
+    try:
+        from hermes_trader.agents.market_circuit_state import (
+            STATE_ERROR,
+            read_state,
+        )
+
+        st = read_state()
+        MARKET_CIRCUIT_STATE.clear()
+        MARKET_CIRCUIT_VERDICTS_CUMULATIVE.clear()
+        if st is None:
+            MARKET_CIRCUIT_LAST_EVAL_TS.set(0.0)
+            MARKET_CIRCUIT_EVAL_AGE.set(0.0)
+            MARKET_CIRCUIT_STATE.labels(mode="unknown").set(float(STATE_ERROR))
+        else:
+            ts = _to_float(st.get("ts"))
+            mode = str(st.get("mode", "off")) or "off"
+            MARKET_CIRCUIT_LAST_EVAL_TS.set(ts if ts > 0 else 0.0)
+            MARKET_CIRCUIT_EVAL_AGE.set(
+                max(0.0, time.time() - ts) if ts > 0 else 0.0
+            )
+            try:
+                state_val = float(int(st.get("state", STATE_ERROR)))
+            except (TypeError, ValueError):
+                state_val = float(STATE_ERROR)
+            MARKET_CIRCUIT_STATE.labels(mode=mode).set(state_val)
+            counts = st.get("counts")
+            if isinstance(counts, dict):
+                for m, bucket in counts.items():
+                    if not isinstance(m, str) or not isinstance(bucket, dict):
+                        continue
+                    for verdict, n in bucket.items():
+                        if isinstance(verdict, str):
+                            MARKET_CIRCUIT_VERDICTS_CUMULATIVE.labels(
+                                mode=m, verdict=verdict
+                            ).set(_to_float(n))
+    except Exception as e:
+        logger.debug(f"[metrics] market_circuit state read failed: {e}")
 
 
 def render_metrics() -> tuple[bytes, str]:

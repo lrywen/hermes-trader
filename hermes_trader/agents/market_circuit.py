@@ -297,6 +297,20 @@ def _metric(mode: str, verdict: str) -> None:
         pass
 
 
+def _heartbeat(verdict: dict[str, Any], mode: str, verdict_label: str) -> None:
+    """CS-F: rewrite the cross-process heartbeat state file (best-effort).
+
+    Mirrors ``_metric`` — never raises into the loop. The web process reads
+    this file from the shared /data volume because its Prometheus registry
+    cannot see the loop-process Counter increments.
+    """
+    try:
+        from hermes_trader.agents.market_circuit_state import record_evaluation
+        record_evaluation(verdict, mode=mode, verdict_label=verdict_label)
+    except Exception:
+        pass
+
+
 def evaluate(cfg: dict[str, Any], *,
              mem: Optional[Any] = None,
              halt_minutes: Optional[float] = None,
@@ -323,13 +337,17 @@ def evaluate(cfg: dict[str, Any], *,
             "details": {}, "data_ok": False, "mode": "off", "action": "error"}
     try:
         if not isinstance(cfg, dict):
+            _heartbeat(safe, "off", "data_missing")
             return safe
         mode = str(cfg.get("mode", "off") or "off").lower()
         if mode not in ("off", "shadow", "enforce"):
             mode = "off"
         if mode == "off":
-            return {"tripped": False, "trigger": None, "reasons": [],
-                    "details": {}, "data_ok": True, "mode": "off", "action": "off"}
+            off_verdict = {"tripped": False, "trigger": None, "reasons": [],
+                           "details": {}, "data_ok": True, "mode": "off",
+                           "action": "off"}
+            _heartbeat(off_verdict, "off", "off")
+            return off_verdict
 
         halt_min = float(cfg.get("halt_minutes", 60.0) if halt_minutes is None
                          else halt_minutes)
@@ -361,11 +379,13 @@ def evaluate(cfg: dict[str, Any], *,
             logger.warning("[market_circuit] no usable market data — failing open")
             _metric(mode, "data_missing")
             verdict["action"] = "data_missing"
+            _heartbeat(verdict, mode, "data_missing")
             return verdict
 
         if not verdict.get("tripped"):
             _metric(mode, "no_trip")
             verdict["action"] = "clear"
+            _heartbeat(verdict, mode, "no_trip")
             return verdict
 
         # A trigger fired.
@@ -389,6 +409,7 @@ def evaluate(cfg: dict[str, Any], *,
             _metric(mode, "trip")
             verdict["action"] = "halt_already_armed"
             _record_shadow(rec, shadow_log_path(cfg))
+            _heartbeat(verdict, mode, "trip")
             return verdict
 
         if mode == "shadow":
@@ -396,6 +417,7 @@ def evaluate(cfg: dict[str, Any], *,
             _metric(mode, "trip")
             verdict["action"] = "would_trip"
             _record_shadow(rec, shadow_log_path(cfg))
+            _heartbeat(verdict, mode, "trip")
             return verdict
 
         # enforce: arm the existing global-halt channel.
@@ -433,9 +455,11 @@ def evaluate(cfg: dict[str, Any], *,
                 logger.warning("[market_circuit] event log failed: %s", e)
         verdict["action"] = "halt_armed"
         verdict["armed"] = armed
+        _heartbeat(verdict, mode, "trip")
         return verdict
     except Exception as e:
         logger.error("[market_circuit] evaluate failed (failing open): %s", e)
-        _metric(str(cfg.get("mode", "off") if isinstance(cfg, dict) else "off"),
-                "data_missing")
+        exc_mode = str(cfg.get("mode", "off") if isinstance(cfg, dict) else "off")
+        _metric(exc_mode, "data_missing")
+        _heartbeat(safe, exc_mode, "data_missing")
         return safe
