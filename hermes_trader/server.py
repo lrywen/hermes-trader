@@ -347,7 +347,9 @@ def _send_bypass_gates_alert_safe(coin: str, reason: str) -> bool:
         if send_text is None:
             from hermes_trader.notify import send_text as _st
             send_text = _st
-        send_text(reason, category="risk", priority="high")
+        # notify.send_text has no priority= kwarg (send_card uses level=);
+        # passing it raised TypeError on every bypass, dropping the alert.
+        send_text(reason, category="risk")
         return True
     except Exception as e:
         logger.exception(
@@ -1374,31 +1376,18 @@ async def place_order(request: Request) -> JSONResponse:
             )
 
         if bypass:
-            # Bypass path: write audit + fire high-priority alert so any
+            # Bypass path: write audit + fire a risk-category alert so any
             # operator override is visible to the alerting layer (feishu /
-            # voice / structured log) and to the post-trade review.
-            try:
-                from hermes_trader.notify import send_text
-                send_text(
-                    f"⚠️ manual order BYPASS gates: {coin} {side} "
-                    f"notional=${position_notional:.2f} lev={leverage}x "
-                    f"reason={bypass_reason}",
-                    category="risk",
-                    priority="high",
-                )
-            except Exception as e:
-                # R12-A1: a high-priority Feishu card dropping silently
-                # is the worst possible swallow — the operator was
-                # *trying* to push a "manual order bypassed gates" alarm
-                # and the dispatch failed. logger.exception so the full
-                # traceback is preserved; the manual-order path itself
-                # still proceeds (the rest of the handler runs), but
-                # the alert-loss is now visible.
-                logger.exception(
-                    "[manual-order] Feishu card send failed for "
-                    "bypass-gates %s: %s",
-                    coin, e,
-                )
+            # voice / structured log) and to the post-trade review. Routed
+            # through the never-raises helper (R12-A1); the previous inline
+            # call passed an unsupported priority= kwarg and failed 100% of
+            # the time with TypeError, so no bypass alert was ever sent.
+            _send_bypass_gates_alert_safe(
+                coin,
+                f"⚠️ manual order BYPASS gates: {coin} {side} "
+                f"notional=${position_notional:.2f} lev={leverage}x "
+                f"reason={bypass_reason}",
+            )
             await _append_session_log({
                 "event": "place_order_bypass_gates",
                 "coin": coin,

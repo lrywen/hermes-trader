@@ -293,6 +293,47 @@ def test_r12_a1_feishu_send_failed_logs_exception(monkeypatch, caplog):
     )
 
 
+def test_r12_a1_bypass_alert_actually_sends_with_real_signature(monkeypatch):
+    """Regression: the bypass alert previously called send_text with an
+    unsupported priority="high" kwarg, which raised TypeError on 100% of
+    bypass attempts (swallowed by except) — no Feishu alert ever went out.
+    A spy on the REAL module slot proves the helper now calls send_text
+    with exactly the live signature (text, category="risk")."""
+    import inspect
+    from hermes_trader import server, notify
+
+    sig = inspect.signature(notify.send_text)
+    assert "priority" not in sig.parameters, (
+        "if send_text gains a priority param, re-evaluate the helper call")
+
+    calls = []
+
+    def _spy(text, *, category="report"):
+        calls.append((text, category))
+        return True
+
+    monkeypatch.setattr(server, "send_text", _spy, raising=False)
+    ok = server._send_bypass_gates_alert_safe("BTC", "bypass reason text")
+    assert ok is True
+    assert calls == [("bypass reason text", "risk")]
+
+
+def test_r12_a1_bypass_alert_wired_into_place_order():
+    """The helper used to be dead code: only the test imported it, while
+    place_order carried its own (broken) inline send. Guard that the live
+    bypass branch routes through the never-raises helper and no longer
+    passes priority= anywhere."""
+    import pathlib
+    from hermes_trader import server
+
+    src = pathlib.Path(server.__file__).read_text(encoding="utf-8")
+    assert "_send_bypass_gates_alert_safe(" in src
+    # Definition + at least one production call site (the test file is a
+    # different path, so two occurrences here means wired).
+    assert src.count("_send_bypass_gates_alert_safe(") >= 2
+    assert 'priority="high"' not in src
+
+
 # ---------------------------------------------------------------------------
 # R12-B1 — dashboard.py terminal handlers + helpers
 # ---------------------------------------------------------------------------
