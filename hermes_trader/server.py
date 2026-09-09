@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import time
 import uuid
@@ -48,8 +49,14 @@ from hermes_trader import __version__, dashboard, session_log
 from hermes_trader.agents.config_schema import validate_config_updates
 from hermes_trader.agents.config_store import _deep_merge, read_agent_config, update_agent_config
 from hermes_trader.agents.executor import (
+    _DEFAULT_SL_ATR_MULT,
+    _DEFAULT_SL_CEILING_PCT,
+    _DEFAULT_SL_FLOOR_PCT,
     _EXEC_LOCK,
     _IN_FLIGHT_COINS,
+    _resolve_live_float,
+    _resolve_sl_width_config,
+    _signed_price,
     close_position_market,
     maybe_execute,
 )
@@ -358,6 +365,283 @@ def _send_bypass_gates_alert_safe(coin: str, reason: str) -> bool:
             coin, e,
         )
         return False
+
+
+def _place_manual_post_fill_brackets(
+    *,
+    coin: str,
+    is_buy: bool,
+    atr: float,
+    entry_px: float,
+    size_in_coin: float,
+    leverage: int,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Place the MANUAL-order post-fill SL/TP bracket (blocking; run via
+    ``asyncio.to_thread`` — the helper sleeps/retries on the exchange).
+
+    Mirrors the autonomous path (executor._place_post_fill_brackets /
+    _place_backup_sl) so a manual web order gets the same money-safety
+    guarantees instead of a raw single-shot trigger:
+
+      * stop width resolved through ``_resolve_sl_width_config`` (shared
+        dsl_exit.atr_stop block + per-coin floor), then floor/ceiling
+        validated and clamped to the 15% ``sl_ceiling_hard_max_pct``;
+      * widened for recent adverse exit slip (capped at ceiling*0.5);
+      * direction asserted (long: sl<entry<tp, short: the reverse) — a
+        wrong-side trigger is never submitted;
+      * tracker registered AFTER ``load_state(force=True)`` so the web
+        process never clobbers the trading loop's on-disk registry, and
+        ``set_bracket`` has a tracker to persist the resting oids onto;
+      * SL: ONE cloid per intent, one retry; a lost response is claimed
+        by cloid first (three-state: claimed / confirmed absent → new
+        cloid retry / lookup unreadable → preserve cloid, no blind
+        retry). Missing SL → logger.error + Feishu LOUD + sl_missing.
+      * TP: validated price, single attempt; failure is a warning only.
+
+    Returns ``{"brackets": [...], "warnings": [...], "sl_missing": bool}``.
+    """
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader.client.exchange import (
+        find_open_order_by_cloid,
+        place_hl_trigger_order,
+    )
+
+    warnings: list[str] = []
+    brackets: list[dict[str, Any]] = []
+    sl_missing = False
+
+    if not (atr > 0 and size_in_coin > 0 and entry_px > 0):
+        # No ATR (indicator read failed) means we cannot derive a sane stop:
+        # leave the position without a bracket but make it VISIBLE instead
+        # of returning an empty bracket list as before.
+        warnings.append(
+            f"no bracket armed for {coin}: atr={atr} size={size_in_coin} "
+            f"entry_px={entry_px} — position has no server-side SL/TP"
+        )
+        logger.error(
+            "[manual-order] %s filled @ %s size=%s but bracket skipped "
+            "(atr=%s) — POSITION HAS NO SERVER-SIDE STOP",
+            coin, entry_px, size_in_coin, atr,
+        )
+        _send_bypass_gates_alert_safe(
+            coin,
+            f"🚨 {coin} 手动开仓未挂止损\n"
+            f"ATR 不可用，无法计算止损价，交易所端无止损单\n"
+            f"请立即手动确认持仓并补单",
+        )
+        return {"brackets": brackets, "warnings": warnings, "sl_missing": True}
+
+    trade_side = "long" if is_buy else "short"
+
+    # ── Stop width: same resolution + hard-max clamp as the autonomous path
+    # (executor.py:2437-2479). Trusting raw cfg.get('sl_atr_mult') here was
+    # the manual-path gap: a typo/giant config value armed an inverted or
+    # HYPE-class 40%-away stop.
+    widths = _resolve_sl_width_config(cfg or {}, coin)
+    sl_mult = float(widths["sl_atr_mult"])
+    ceiling = float(widths["sl_ceiling_pct"])
+    floor = float(widths["sl_floor_pct"])
+    band = float(widths["sl_limit_band_pct"])
+    if not (math.isfinite(sl_mult) and sl_mult > 0):
+        logger.warning("[manual-order] invalid sl_atr_mult=%s — fallback %s",
+                       sl_mult, _DEFAULT_SL_ATR_MULT)
+        sl_mult = _DEFAULT_SL_ATR_MULT
+    if not (math.isfinite(ceiling) and ceiling > 0):
+        logger.warning("[manual-order] invalid sl_ceiling_pct=%s — fallback %s",
+                       ceiling, _DEFAULT_SL_CEILING_PCT)
+        ceiling = _DEFAULT_SL_CEILING_PCT
+    if not (math.isfinite(floor) and floor > 0):
+        logger.warning("[manual-order] invalid sl_floor_pct=%s — fallback %s",
+                       floor, _DEFAULT_SL_FLOOR_PCT)
+        floor = _DEFAULT_SL_FLOOR_PCT
+    hard_max = _resolve_live_float("sl_ceiling_hard_max_pct", 15.0, config=cfg)
+    if not (math.isfinite(hard_max) and hard_max > 0):
+        logger.warning("[manual-order] invalid sl_ceiling_hard_max_pct=%s — fallback 15.0",
+                       hard_max)
+        hard_max = 15.0
+    if ceiling > hard_max:
+        logger.warning("[manual-order] sl_ceiling_pct=%s > hard max %s — clamping",
+                       ceiling, hard_max)
+        ceiling = hard_max
+    if floor > ceiling:
+        floor = ceiling
+    if band > ceiling:
+        logger.warning("[manual-order] sl_limit_band_pct=%s > ceiling %s — clamping band",
+                       band, ceiling)
+        band = ceiling
+
+    atr_stop_pct = (atr / entry_px) * sl_mult * 100
+    sl_width_pct = min(max(atr_stop_pct, floor), ceiling)
+    # Widen for recent mean adverse exit slip (cap ceiling*0.5), mirroring
+    # executor._place_backup_sl:1553-1563.
+    slip_widen_pct = 0.0
+    try:
+        slip_widen_pct = max(0.0, float(memory.avg_exit_slip_bps(coin, days=30.0)) / 100.0)
+        slip_widen_pct = min(slip_widen_pct, ceiling * 0.5)
+    except Exception as e:
+        logger.debug("[manual-order] avg_exit_slip_bps failed for %s: %s",
+                     coin, e)
+    sl_width_pct = min(sl_width_pct + slip_widen_pct, ceiling)
+    sl_px = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
+
+    tp_mult = _resolve_live_float("tp_atr_mult", 1.0, config=cfg)
+    if not (math.isfinite(tp_mult) and tp_mult > 0):
+        logger.warning("[manual-order] invalid tp_atr_mult=%s — fallback 1.0", tp_mult)
+        tp_mult = 1.0
+    tp_px = _signed_price(entry_px, atr * tp_mult, is_buy)
+
+    # ── Direction assertion: never arm a trigger on the wrong side.
+    if is_buy:
+        sl_ok = sl_px < entry_px
+        tp_ok = tp_px > entry_px
+    else:
+        sl_ok = sl_px > entry_px
+        tp_ok = tp_px < entry_px
+
+    # ── Register the tracker for cross-process bracket persistence. Force a
+    # disk load FIRST: this web process's in-memory registry is empty/stale,
+    # and register_position() writes the whole table — without the reload it
+    # would clobber the trading loop's authoritative trackers.
+    try:
+        dsl_exit.load_state(force=True)
+        dsl_exit.register_position(
+            coin, trade_side, entry_px, leverage=int(leverage),
+            entry_atr_pct=(atr / entry_px) * 100.0,
+        )
+    except Exception as e:
+        logger.exception(
+            "[manual-order] register_position failed for %s_%s: %s — "
+            "proceeding with exchange brackets, but oid persistence is "
+            "unavailable until reconciled",
+            coin, trade_side, e,
+        )
+        warnings.append(f"tracker register failed for {coin}: {e}")
+
+    def _record_bracket(kind: str, px: float, res: dict[str, Any]) -> None:
+        brackets.append({
+            "type": kind,
+            "price": px,
+            "ok": bool(res.get("ok")),
+            "order_id": res.get("order_id"),
+        })
+
+    band_kw = {"limit_band_pct": band} if band > 0 else {}
+
+    # ── SL: one cloid, claim-before-retry, one retry (mirrors
+    # executor._place_backup_sl:1574-1654).
+    if not sl_ok:
+        sl_missing = True
+        logger.error(
+            "[manual-order] SL direction assertion FAILED for %s is_buy=%s "
+            "entry=%s sl_px=%s — not submitting wrong-side stop",
+            coin, is_buy, entry_px, sl_px,
+        )
+        warnings.append(f"SL not armed: computed stop on wrong side (sl_px={sl_px})")
+    else:
+        sl_cloid = Cloid.from_int(uuid.uuid4().int)
+        sl_res = place_hl_trigger_order(
+            is_buy, size_in_coin, sl_px, "sl", coin,
+            cloid=sl_cloid, **band_kw,
+        )
+        skip_retry = False
+        if not sl_res.get("ok") and sl_res.get("error_code") == "response_unknown":
+            claim = find_open_order_by_cloid(coin, sl_cloid)
+            if claim.get("found") and claim.get("oid"):
+                logger.warning(
+                    "[manual-order] SL response lost for %s but claimed resting "
+                    "order by cloid: oid=%s trigger=%s",
+                    coin, claim.get("oid"), claim.get("trigger_px"),
+                )
+                if claim.get("trigger_px"):
+                    sl_px = float(claim["trigger_px"])
+                sl_res = {"ok": True, "order_id": claim["oid"]}
+            elif claim.get("lookup_ok"):
+                logger.warning(
+                    "[manual-order] SL response lost for %s; cloid confirmed "
+                    "absent — retrying once with a NEW cloid", coin,
+                )
+                sl_cloid = Cloid.from_int(uuid.uuid4().int)
+                time.sleep(2)
+                sl_res = place_hl_trigger_order(
+                    is_buy, size_in_coin, sl_px, "sl", coin,
+                    cloid=sl_cloid, **band_kw,
+                )
+                skip_retry = True
+            else:
+                logger.error(
+                    "[manual-order] SL response lost for %s AND openOrders "
+                    "lookup failed — preserving cloid, no blind retry", coin,
+                )
+                skip_retry = True
+        if not sl_res.get("ok") and not skip_retry:
+            time.sleep(2)
+            sl_res = place_hl_trigger_order(
+                is_buy, size_in_coin, sl_px, "sl", coin,
+                cloid=sl_cloid, **band_kw,
+            )
+        _record_bracket("SL", sl_px, sl_res)
+        if sl_res.get("ok"):
+            try:
+                dsl_exit.set_bracket(
+                    coin, trade_side,
+                    sl_oid=sl_res.get("order_id"),
+                    sl_px=sl_px, sl_size=size_in_coin,
+                )
+            except Exception as e:
+                logger.exception(
+                    "[manual-order] set_bracket(SL) failed for %s: %s", coin, e,
+                )
+        else:
+            sl_missing = True
+            warnings.append(
+                f"SL placement failed after retry: {sl_res.get('error')}"
+            )
+            logger.error(
+                "[manual-order] SL FAILED for %s — POSITION HAS NO SERVER-SIDE "
+                "STOP: target_px=%s is_buy=%s size=%s err=%s",
+                coin, sl_px, is_buy, size_in_coin, sl_res.get("error"),
+            )
+            _send_bypass_gates_alert_safe(
+                coin,
+                f"🚨 {coin} 手动开仓止损下单失败\n"
+                f"交易所端无止损单，仅靠 DSL 软止损保护\n"
+                f"请立即手动确认持仓并补单",
+            )
+
+    # ── TP: single attempt (offensive order; failure does not leave the
+    # position unprotected). Persist oid/px on success.
+    if not tp_ok:
+        warnings.append(f"TP not armed: computed target on wrong side (tp_px={tp_px})")
+        logger.error(
+            "[manual-order] TP direction assertion FAILED for %s is_buy=%s "
+            "entry=%s tp_px=%s — not submitting",
+            coin, is_buy, entry_px, tp_px,
+        )
+    else:
+        tp_cloid = Cloid.from_int(uuid.uuid4().int)
+        tp_res = place_hl_trigger_order(
+            is_buy, size_in_coin, tp_px, "tp", coin, cloid=tp_cloid,
+        )
+        _record_bracket("TP", tp_px, tp_res)
+        if tp_res.get("ok"):
+            try:
+                dsl_exit.set_bracket(
+                    coin, trade_side,
+                    tp_oid=tp_res.get("order_id"), tp_px=tp_px,
+                )
+            except Exception as e:
+                logger.exception(
+                    "[manual-order] set_bracket(TP) failed for %s: %s", coin, e,
+                )
+        else:
+            warnings.append(f"TP placement failed: {tp_res.get('error')}")
+            logger.error(
+                "[manual-order] TP FAILED for %s: target_px=%s err=%s",
+                coin, tp_px, tp_res.get("error"),
+            )
+
+    return {"brackets": brackets, "warnings": warnings, "sl_missing": sl_missing}
 
 
 def _flatten_asset_positions(asset_positions: list) -> list[dict]:
@@ -1144,7 +1428,6 @@ async def place_order(request: Request) -> JSONResponse:
             get_hl_price,
             min_entry_notional_usd,
             place_hl_order,
-            place_hl_trigger_order,
             set_leverage,
         )
 
@@ -1458,39 +1741,41 @@ async def place_order(request: Request) -> JSONResponse:
         except (TypeError, ValueError):
             fill_sz = 0.0
         entry_px = fill_px if fill_px > 0 else mid_price
+        if not (fill_px > 0):
+            # c9: the exchange fill response lacked avgPx — falling back to
+            # the pre-trade mid means SL/TP prices anchor on a quote, not the
+            # actual fill. Mirror the close-side loud fallback (executor.py
+            # avgPx three-tier fallback) so it is never silent.
+            logger.warning(
+                "[manual-order] %s avgPx missing in fill response "
+                "(fill_sz=%s) — bracketing from mid_price fallback px=%s",
+                coin, fill_sz, entry_px,
+            )
         if fill_sz > 0:
             size_in_coin = fill_sz
 
-        brackets = []
-        if atr > 0 and size_in_coin > 0:
-            sl_mult = float(cfg.get("sl_atr_mult", 1.5) or 1.5)
-            tp_mult = float(cfg.get("tp_atr_mult", 1.0) or 1.0)
-            sl_px = entry_px - atr * sl_mult if is_buy else entry_px + atr * sl_mult
-            tp_px = entry_px + atr * tp_mult if is_buy else entry_px - atr * tp_mult
-
-            # E-3: one cloid per bracket intent — SDK POST retries must arm
-            # the SL/TP exactly once, not stack duplicate triggers.
-            sl_cloid = Cloid.from_int(uuid.uuid4().int)
-            tp_cloid = Cloid.from_int(uuid.uuid4().int)
-            # H-3: blocking trigger placement off the event loop.
-            sl = await asyncio.to_thread(
-                place_hl_trigger_order, is_buy, size_in_coin, sl_px, "sl", coin,
-                cloid=sl_cloid,
-            )
-            tp = await asyncio.to_thread(
-                place_hl_trigger_order, is_buy, size_in_coin, tp_px, "tp", coin,
-                cloid=tp_cloid,
-            )
-            brackets = [
-                {"type": "SL", "price": sl_px, "ok": sl.get("ok")},
-                {"type": "TP", "price": tp_px, "ok": tp.get("ok")},
-            ]
+        # c6: the manual bracket now mirrors the autonomous path (hard-max
+        # clamp, slip widening, direction assertion, cloid claim/retry,
+        # cross-process tracker registration, LOUD alert + warnings on a
+        # missing SL). Blocking helper runs off the event loop.
+        bracket_out = await asyncio.to_thread(
+            _place_manual_post_fill_brackets,
+            coin=coin,
+            is_buy=is_buy,
+            atr=atr,
+            entry_px=entry_px,
+            size_in_coin=size_in_coin,
+            leverage=leverage,
+            cfg=cfg,
+        )
+        brackets = bracket_out["brackets"]
 
         await _append_session_log({
             "event": "place_order",
             "coin": coin,
             "side": side,
             "ok": result.get("ok"),
+            "sl_missing": bracket_out["sl_missing"],
         })
 
         return JSONResponse(content={
@@ -1501,6 +1786,8 @@ async def place_order(request: Request) -> JSONResponse:
             "midPrice": mid_price,
             "entryPrice": entry_px,
             "brackets": brackets,
+            "warnings": bracket_out["warnings"],
+            "sl_missing": bracket_out["sl_missing"],
         })
     except HTTPException:
         raise

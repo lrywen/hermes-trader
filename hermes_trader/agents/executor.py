@@ -2136,6 +2136,16 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
         except (TypeError, ValueError):
             filled_size = 0.0
         entry_px = filled_px if filled_px > 0 else mid_price
+        if not (filled_px > 0):
+            # c9: avgPx missing in the fill response — entry/tracker/SL
+            # anchoring falls back to the pre-trade mid instead of the actual
+            # fill. Mirrors the close-side three-tier avgPx fallback warning
+            # (executor close path) so a quote-based anchor is never silent.
+            logger.warning(
+                f"[executor] {coin} entry avgPx missing in fill response "
+                f"(filled_sz={filled_size}) — anchoring tracker/brackets "
+                f"from mid_price fallback px={entry_px}"
+            )
         if filled_size > 0:
             size_in_coin = filled_size
         position_notional = abs(size_in_coin) * entry_px
