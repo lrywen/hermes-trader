@@ -672,6 +672,50 @@ def _record_pullback_shadow(*, coin: str, side: str, score: float,
         logger.info(f"[executor] pullback-long SHADOW recorded for {coin} "
                     f"-> {_PULLBACK_SHADOW_FILE}")
 
+# ── Risk-tuning shadow audit (2026-09-10 ADA/DOT/ZEC follow-ups) ───────────
+# Four proposed behaviour changes are run in SHADOW first (the 18-trade
+# sample is too small to calibrate on live): (4) a breakout-path minimum
+# composite, (5) a per-coin 24h repeat / consecutive-loss cooldown, (6) an
+# ATR/score-driven leverage tier, and (3) wider stop / lower breakeven. When
+# enabled, every candidate that WOULD be blocked / de-levered / re-armed by
+# the proposed rule is appended to ONE JSONL with ``rule`` discriminator,
+# while the live decision is unchanged. A reconciliation pass over this feed
+# decides which rule is safe to flip to enforce. Mirrors the pullback shadow
+# (same shared rotating writer, never raises into the trade path).
+_RISK_TUNING_SHADOW_FILE = os.environ.get(
+    "HERMES_RISK_TUNING_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"),
+)
+
+
+def _record_risk_tuning_shadow(*, rule: str, coin: str, side: str,
+                               would: str, detail: dict[str, Any],
+                               trace_id: str = "") -> None:
+    """Best-effort append a risk-tuning shadow verdict.
+
+    ``would`` is the counter-factual action ("block" / "deleverage" /
+    "rearm_stop"); ``detail`` carries the observed vs threshold values needed
+    for offline reconciliation. Never raises into the entry hot path.
+    """
+    from datetime import datetime, timezone
+    rec = {
+        "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "trace_id": trace_id or "",
+        "rule": rule,
+        "coin": coin,
+        "side": side,
+        "would": would,
+        "detail": detail,
+        "outcome": None,      # filled by reconciliation
+        "exit_px": None,
+        "pnl_usd": None,
+    }
+    from hermes_trader.shadow_log import append_jsonl
+
+    if append_jsonl(_RISK_TUNING_SHADOW_FILE, rec, stream="risk_tuning"):
+        logger.info(f"[executor] risk-tuning SHADOW[{rule}] for {coin}: "
+                    f"would={would} -> {_RISK_TUNING_SHADOW_FILE}")
+
 # ── Dynamic exchange-SL mover (Phase 2 trailing coordination) ───────────────
 # When the DSL floor ratchets tighter in Phase 2, move the exchange backup SL
 # to trail just behind the floor so a server-side stop can still cap gap-
@@ -3157,6 +3201,53 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
                 "reason": f"unknown_max_leverage_{analysis['coin']}"}
     leverage = min(int(config.get("leverage", HL_LEVERAGE)), _coin_max_lev)
+
+    # ── Shadow (6): volatility/score leverage tier ──
+    # Audit 2026-09-10 (recent trades all 10x; ZEC ATR%=4.155 stopped out by a
+    # 0.80% = 0.19-ATR cap). Proposed: de-lever to a lower tier when 4h ATR% is
+    # above `atr_pct_max` OR composite below `min_composite`. Shadow only: the
+    # live leverage above is unchanged; we record what the tier WOULD pick.
+    try:
+        _lev_tier = config.get("leverage_tier_shadow") or {}
+        if bool(_lev_tier.get("shadow_mode", False)):
+            _atr_pct = None
+            try:
+                _a4 = analysis.get("atr4h")
+                _c4 = analysis.get("close4h")
+                if _a4 and _c4 and float(_c4) > 0:
+                    _atr_pct = float(_a4) / float(_c4) * 100.0
+            except (TypeError, ValueError):
+                _atr_pct = None
+            _score6 = float(analysis.get("composite_score", 0) or 0)
+            _atr_max = float(_lev_tier.get("atr_pct_max", 3.5))
+            _score_min = float(_lev_tier.get("min_composite", 40.0))
+            _low_lev = int(_lev_tier.get("low_leverage", 5))
+            _reasons = []
+            if _atr_pct is not None and _atr_pct > _atr_max:
+                _reasons.append(f"atr_pct {_atr_pct:.2f} > {_atr_max}")
+            if _score6 < _score_min:
+                _reasons.append(f"score {_score6:.1f} < {_score_min:.0f}")
+            if _reasons and leverage > _low_lev:
+                _record_risk_tuning_shadow(
+                    rule="leverage_tier",
+                    coin=str(analysis.get("coin") or ""),
+                    side=str(analysis.get("side") or ""),
+                    would="deleverage",
+                    detail={
+                        "live_leverage": leverage,
+                        "proposed_leverage": min(_low_lev, leverage),
+                        "atr_pct_4h": (round(_atr_pct, 3)
+                                      if _atr_pct is not None else None),
+                        "composite_score": round(_score6, 4),
+                        "atr_pct_max": _atr_max,
+                        "min_composite": _score_min,
+                        "reason": "; ".join(_reasons),
+                    },
+                    trace_id=str(analysis.get("id") or ""),
+                )
+    except Exception as _lev_e:
+        logger.debug(f"[executor] leverage-tier shadow failed for "
+                     f"{analysis.get('coin')}: {_lev_e}")
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
     # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
     # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
@@ -4795,6 +4886,102 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         and (slow_count >= 1 or volume or breakout or burst)
     )
     structured_runner = fresh_impulse and (slow_count >= 1 or score >= min_score)
+
+    # ── Shadow (4): breakout-path weak-score floor ──
+    # Audit 2026-09-10 (ZEC 26.5 admitted via breakout+slow vs min_composite
+    # 45). Proposed: even the breakout single-trigger path must clear
+    # breakout_min_composite (suggested 31.5 = 45*0.7). In shadow we only
+    # record a candidate that WOULD be blocked; live admission is untouched.
+    _brk_floor = gate.get("breakout_score_floor") or {}
+    if (
+        bool(_brk_floor.get("shadow_mode", False))
+        and side == "long"
+        and structured_runner
+        and breakout
+        and not (volume and burst)
+    ):
+        try:
+            _brk_min = float(_brk_floor.get("min_composite", min_score * 0.7))
+        except (TypeError, ValueError):
+            _brk_min = min_score * 0.7
+        if score < _brk_min:
+            _record_risk_tuning_shadow(
+                rule="breakout_score_floor", coin=coin, side=side, would="block",
+                detail={
+                    "composite_score": round(score, 4),
+                    "floor": round(_brk_min, 4),
+                    "min_composite": min_score,
+                    "breakout": breakout, "volume": volume, "burst": burst,
+                    "slow_burn_count": slow_count,
+                    "confidence": round(gate_conf, 4),
+                    "entry_px": float(
+                        analysis.get("mid") or analysis.get("price") or 0.0),
+                },
+                trace_id=str(analysis.get("id") or ""),
+            )
+
+    # ── Shadow (5): per-coin repeat / consecutive-loss cooldown ──
+    # Audit 2026-09-10 (PURR x3 over consecutive days, -$1.12; ZRO 3rd entry).
+    # The existing loss_cooldown is only 180min and momentum-exempt. Proposed:
+    # (a) the 2nd+ entry on the same coin within `window_hours` must clear a
+    # higher score, and (b) `consecutive_losses` recent losses on the coin cool
+    # it for `loss_cooldown_hours`. Shadow records what WOULD block; the live
+    # 180-min cooldown is unchanged.
+    _pc_cfg = gate.get("per_coin_cooldown") or {}
+    if bool(_pc_cfg.get("shadow_mode", False)) and side in ("long", "short"):
+        try:
+            import time as _time
+            _now_ms = int(_time.time() * 1000)
+            _window_ms = float(_pc_cfg.get("window_hours", 24)) * 3600_000
+            _loss_hours = float(_pc_cfg.get("loss_cooldown_hours", 24))
+            _repeat_min = float(_pc_cfg.get("repeat_min_composite", min_score))
+            _max_consec_loss = int(_pc_cfg.get("max_consecutive_losses", 2))
+
+            coin_closes = [
+                c for c in memory.get_closes(limit=200)
+                if str(c.get("coin")) == coin
+                and isinstance(c.get("closed_at"), (int, float))
+            ]
+            recent = [c for c in coin_closes
+                      if _now_ms - float(c["closed_at"]) <= _window_ms]
+            consec = 0
+            try:
+                consec = int(memory.consecutive_losses(coin) or 0)
+            except Exception:
+                consec = 0
+
+            _pc_would = None
+            _pc_detail = {
+                "entries_in_window": len(recent),
+                "window_hours": float(_pc_cfg.get("window_hours", 24)),
+                "consecutive_losses": consec,
+                "composite_score": round(score, 4),
+                "repeat_min_composite": _repeat_min,
+                "confidence": round(gate_conf, 4),
+            }
+            # most-recent close age in hours (for reconciliation)
+            if coin_closes:
+                _last_ms = max(float(c["closed_at"]) for c in coin_closes)
+                _pc_detail["hours_since_last_close"] = round(
+                    (_now_ms - _last_ms) / 3600_000.0, 2)
+            if consec >= _max_consec_loss:
+                _pc_would = "block"
+                _pc_detail["reason"] = (
+                    f"consecutive_losses {consec} >= {_max_consec_loss} "
+                    f"-> cool {_loss_hours}h")
+            elif len(recent) >= 1 and score < _repeat_min:
+                _pc_would = "block"
+                _pc_detail["reason"] = (
+                    f"repeat entry within {_pc_cfg.get('window_hours', 24)}h "
+                    f"with score {score:.1f} < {_repeat_min:.0f}")
+            if _pc_would:
+                _record_risk_tuning_shadow(
+                    rule="per_coin_cooldown", coin=coin, side=side,
+                    would=_pc_would, detail=_pc_detail,
+                    trace_id=str(analysis.get("id") or ""))
+        except Exception as _pc_e:
+            logger.debug(f"[runner_gate] per-coin cooldown shadow failed for "
+                         f"{coin}: {_pc_e}")
 
     if is_hip3:
         en = config.get("signal_enforcement") or {}

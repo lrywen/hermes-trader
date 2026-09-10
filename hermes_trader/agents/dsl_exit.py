@@ -137,6 +137,79 @@ def _record_floor_move() -> None:
         pass
 
 
+def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
+                               effective_max_loss: float, loss_pct: float,
+                               roe_loss: float, atr_active: bool,
+                               spot_cap_display: float) -> None:
+    """Shadow (3): record whether a wider cap / lower breakeven would matter.
+
+    Audit 2026-09-10 (ADA/ZEC died at the 0.80% spot cap; the 2.5% breakeven
+    never armed). At a max_loss exit this appends ONE risk-tuning record with:
+      * would="survive" when the adverse excursion at exit is still inside the
+        candidate wider cap (i.e. the proposed stop would NOT have stopped out
+        at this tick — counter-factual, not a profit claim);
+      * whether the realized MFE would have armed a candidate lower breakeven.
+    Live stop behaviour is unchanged. Best-effort, never raises.
+    """
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        cfg = read_agent_config() or {}
+        tun = ((cfg.get("dsl_exit") or {}).get("stop_tuning_shadow")) or {}
+        if not bool(tun.get("shadow_mode", False)):
+            return
+
+        wider_cap = tun.get("candidate_max_loss_pct")
+        try:
+            wider_cap = float(wider_cap) if wider_cap is not None else None
+        except (TypeError, ValueError):
+            wider_cap = None
+        cand_be = tun.get("candidate_breakeven_trigger_pct")
+        try:
+            cand_be = float(cand_be) if cand_be is not None else None
+        except (TypeError, ValueError):
+            cand_be = None
+
+        mfe_pct = float(tracker._peak_profit_pct())
+        would_survive = (
+            wider_cap is not None and abs(loss_pct) < wider_cap
+            and abs(loss_pct) >= effective_max_loss
+        )
+        be_would_arm = cand_be is not None and mfe_pct >= cand_be
+        if not (would_survive or be_would_arm):
+            return
+
+        import os
+        from datetime import datetime, timezone
+        from hermes_trader.shadow_log import append_jsonl
+        path = os.environ.get(
+            "HERMES_RISK_TUNING_SHADOW_FILE",
+            os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"))
+        append_jsonl(path, {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "rule": "stop_tuning",
+            "coin": tracker.coin,
+            "side": tracker.side,
+            "would": ("survive_wider_cap" if would_survive
+                      else "breakeven_would_arm"),
+            "detail": {
+                "live_spot_cap_pct": round(float(spot_cap_display), 4),
+                "loss_spot_pct": round(float(loss_pct), 4),
+                "loss_roe_pct": round(float(roe_loss), 4),
+                "atr_stop_active": bool(atr_active),
+                "mfe_spot_pct": round(mfe_pct, 4),
+                "candidate_max_loss_pct": wider_cap,
+                "candidate_breakeven_trigger_pct": cand_be,
+                "live_breakeven_trigger_pct": float(pol.breakeven_trigger_pct),
+                "breakeven_would_have_armed": bool(be_would_arm),
+                "entry_px": float(tracker.entry_px),
+                "leverage": int(getattr(tracker, "leverage", 0) or 0),
+            },
+        }, stream="risk_tuning")
+    except Exception as e:  # never break the exit hot path
+        logger.debug("[dsl] stop-tuning shadow record failed: %r", e)
+
+
 def _refresh_positions_gauge() -> None:
     """Set hermes_dsl_positions to the current registry size."""
     try:
@@ -1067,6 +1140,9 @@ class DSLTracker:
                 )
             if hs_time_ok and hs_index_ok:
                 _record_exit("max_loss")
+                _record_stop_tuning_shadow(
+                    self, pol, effective_max_loss, loss_pct, roe_loss,
+                    atr_active, spot_cap_display)
                 _request_save(force=True)
                 return self._verdict(
                     exit=True,
