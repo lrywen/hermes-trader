@@ -1626,33 +1626,31 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
     # an operator (or an LLM tool call) could remove the exchange-side stop
     # of a live position while the tracker still believes it is protected —
     # the position would run naked until the next scanner cycle notices.
-    # Force a fresh (throttled, shared-locked) disk read so the MCP process
-    # sees the trading loop's current trackers, then match the oid.
+    # The shared dsl_exit guard force-reloads the trading loop's current
+    # on-disk trackers before matching the oid.
     try:
         from hermes_trader.agents import dsl_exit
-        dsl_exit.reset_force_load_throttle()
-        dsl_exit.load_state(force=True)
-        for _t in dsl_exit._active_positions.values():
-            if oid in (_t.sl_oid, _t.tp_oid):
-                _which = "sl" if oid == _t.sl_oid else "tp"
-                try:
-                    event_log.append("operator_action", payload={
-                        "action": "cancel_order_blocked", "via": "mcp",
-                        "asset_idx": asset_idx, "oid": oid,
-                        "coin": _t.coin, "side": _t.side,
-                        "bracket": _which,
-                        "reason": "dsl_managed_trigger",
-                    })
-                except Exception:
-                    pass
-                return json.dumps({
-                    'cancelled': False,
-                    'error': (
-                        f"refused: oid {oid} is the DSL-managed {_which.upper()} "
-                        f"trigger for {_t.coin}/{_t.side}; use the flatten/close "
-                        f"flow instead (it cancels brackets with the position)"
-                    ),
-                }, default=str)
+        _owner = dsl_exit.find_dsl_bracket_trigger(oid)
+        if _owner is not None:
+            _coin, _side, _which = _owner
+            try:
+                event_log.append("operator_action", payload={
+                    "action": "cancel_order_blocked", "via": "mcp",
+                    "asset_idx": asset_idx, "oid": oid,
+                    "coin": _coin, "side": _side,
+                    "bracket": _which,
+                    "reason": "dsl_managed_trigger",
+                })
+            except Exception:
+                pass
+            return json.dumps({
+                'cancelled': False,
+                'error': (
+                    f"refused: oid {oid} is the DSL-managed {_which.upper()} "
+                    f"trigger for {_coin}/{_side}; use the flatten/close "
+                    f"flow instead (it cancels brackets with the position)"
+                ),
+            }, default=str)
     except Exception as e:
         # Fail closed: if we cannot establish whether the oid belongs to a
         # DSL bracket, do not cancel. The operator can retry.

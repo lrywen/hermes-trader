@@ -4018,8 +4018,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # already opened the same coin and filled before we placed. The market
     # order hasn't been sent yet, so a fresh live read settles it: if the
     # coin now shows a real position, refuse to place rather than double-open.
-    # Best-effort / fail-open: a read failure logs and proceeds (the exchange
-    # Cloid + DSL one-position-per-coin registry remain the backstops).
+    # G-P1 -> H-P1 (audit 2026-09-10): now fail-CLOSED, matching the HTTP
+    # path — with the cross-process flock held, the only residual risk on a
+    # read failure is a stale/guessed position state, so skip the entry
+    # (reason pre_place_recheck_failed) instead of guessing "no position".
+    # Returning (not raising) keeps the unattended loop healthy: this tick is
+    # simply skipped and retried on the next cycle.
     try:
         _pre_state = fetch_account_state(user)
         _pre_pos = next(
@@ -4043,7 +4047,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 "gate_results": gate_output["results"],
             }
     except Exception as _pre_e:
-        logger.warning(f"[executor] A-F4 pre-place re-check failed (fail-open): {_pre_e!r}")
+        logger.error(
+            f"[executor] A-F4 pre-place re-check failed (fail-closed) for "
+            f"{coin} — skipping entry (analysis {_aid}): {_pre_e!r}")
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(_aid)
+            _IN_FLIGHT_COINS.discard(coin)
+        _ENTRY_LOCK.release()
+        return {
+            "executed": False, "mode": mode, "analysis_id": analysis["id"],
+            "reason": "pre_place_recheck_failed",
+            "gate_results": gate_output["results"],
+        }
 
     # H-6 (supplemental audit 2026-08-30): cross-source price veto. Every gate
     # and the order itself price off the single Hyperliquid mid (WS allMids /

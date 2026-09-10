@@ -379,19 +379,65 @@ def test_gp1_route_lock_busy_returns_409(tmp_path, manual_harness):
 
 
 def test_gp1_route_pre_place_reread_failure_is_503_fail_closed(manual_harness):
-    """If the live account read fails at the pre-place re-check, the manual
-    order is refused with 503 pre_place_recheck_failed (never guesses
-    'no position' and double-opens)."""
+    """If the live account read fails at the pre-place re-check (the SECOND
+    account read; the gate-stage read must still succeed), the manual order
+    is refused with 503 pre_place_recheck_failed (never guesses 'no position'
+    and double-opens)."""
     client, srv, env = manual_harness
 
-    def _boom(user, include_hip3=False):
+    calls = {"n": 0}
+
+    def _phase_fake(user=None, include_hip3=False):
+        calls["n"] += 1
+        # 1st read: gate-stage snapshot (succeeds, no positions).
+        if calls["n"] == 1:
+            return {"equity": 100000.0, "asset_positions": []}
+        # 2nd read: the pre-place re-check fails.
         raise ConnectionError("userFills/deaf clearinghouse")
+
+    env["account_state"] = _phase_fake
+    try:
+        r = _post(client)
+        assert r.status_code == 503
+        assert r.json()["detail"]["error"] == "pre_place_recheck_failed"
+        assert env["reconcile_calls"] == 0
+        assert env["brackets_called"] == 0
+    finally:
+        env["lock"].release()
+
+
+def test_hp1_route_gate_stage_account_read_failure_is_503_fail_closed(manual_harness):
+    """H-P1: the FIRST account read (before the 22-gate chain) used to
+    degrade to acct={} on failure, so exposure/notional gates evaluated
+    against a zero-positions fiction. It must now refuse with 503
+    account_state_unavailable before any order is placed."""
+    client, srv, env = manual_harness
+
+    def _boom(*a, **k):
+        raise ConnectionError("clearinghouse down")
 
     env["account_state"] = _boom
     try:
         r = _post(client)
         assert r.status_code == 503
-        assert r.json()["detail"]["error"] == "pre_place_recheck_failed"
+        assert r.json()["detail"]["error"] == "account_state_unavailable"
+        assert env["reconcile_calls"] == 0
+        assert env["brackets_called"] == 0
+    finally:
+        env["lock"].release()
+
+
+def test_hp1_route_non_positive_atr_is_503(manual_harness, monkeypatch):
+    """H-P1: without a positive 4h ATR the post-fill bracket helper would arm
+    NO stop and leave the new position naked. The order must be refused with
+    503 atr_unavailable before placement."""
+    from hermes_trader.client import exchange
+    client, srv, env = manual_harness
+    monkeypatch.setattr(exchange, "get_hl_atr", lambda *a, **k: 0.0)
+    try:
+        r = _post(client)
+        assert r.status_code == 503
+        assert r.json()["detail"]["error"] == "atr_unavailable"
         assert env["reconcile_calls"] == 0
         assert env["brackets_called"] == 0
     finally:

@@ -1838,6 +1838,23 @@ def reset_force_load_throttle() -> None:
     _LAST_FORCE_LOAD_TS = 0.0
 
 
+def find_dsl_bracket_trigger(oid: int) -> Optional[tuple[str, str, str]]:
+    """Return ``(coin, side, "sl"|"tp")`` if ``oid`` is a DSL-managed bracket.
+
+    Shared guard for every cancel path (HTTP, MCP, autonomous loop): force a
+    throttled shared-locked reload of the on-disk tracker registry first, so a
+    process that does not own the trading loop still sees current oids. Raises
+    on tracker-load failure so callers can fail closed; returns ``None`` when
+    the oid is not a DSL-managed SL/TP trigger.
+    """
+    reset_force_load_throttle()
+    load_state(force=True)
+    for _t in _active_positions.values():
+        if oid in (_t.sl_oid, _t.tp_oid):
+            return _t.coin, _t.side, ("sl" if oid == _t.sl_oid else "tp")
+    return None
+
+
 def active_tracker_snapshots() -> list[dict[str, Any]]:
     """Return public snapshot dicts of all active DSL trackers (F23).
 

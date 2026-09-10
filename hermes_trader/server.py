@@ -1467,6 +1467,24 @@ async def place_order(request: Request) -> JSONResponse:
         if not (lev_res or {}).get("ok"):
             raise HTTPException(400, f"set_leverage failed: {(lev_res or {}).get('error')}")
         atr = await asyncio.to_thread(get_hl_atr, "4h", 14, coin)
+        # G-P2-3 -> H-P1 (audit 2026-09-10): an ATR read failure used to flow
+        # into the bracket helper as atr=0, which arms NOTHING and leaves the
+        # new position naked (visible via LOUD alert, but only AFTER the fill).
+        # We cannot derive a sane stop without volatility, so refuse BEFORE
+        # placing (503, safe to retry) rather than open an unprotected position.
+        try:
+            atr = float(atr)
+        except (TypeError, ValueError):
+            atr = 0.0
+        if not (atr > 0.0):
+            raise HTTPException(
+                503,
+                {"error": "atr_unavailable",
+                 "detail": f"could not obtain a positive 4h ATR for {coin}; "
+                           f"refusing to open a position whose stop/target "
+                           f"cannot be derived. Safe to retry once the "
+                           f"indicator read recovers."},
+            )
 
         # Sizing: use riskUSD if provided, else riskPct of live equity.
         risk_usd = body.get("riskUSD")
@@ -1538,17 +1556,24 @@ async def place_order(request: Request) -> JSONResponse:
                 fetch_account_state, user, include_hip3=_hip3_on()
             ) if user else {}
         except Exception as e:
-            # R12-A1: account-state readout failure used to silently empty
-            # `acct` — meaning the manual-order gates see no current
-            # positions, no current exposure, and may approve a trade
-            # the live book already contradicts. Warning, not error,
-            # because the gate pipeline still runs; the warning is the
-            # signal the operator needs to investigate.
-            logger.warning(
-                "[gates] fetch_account_state failed, defaulting to empty: %s: %s",
-                type(e).__name__, e,
+            # G-P2-2 -> H-P1 (audit 2026-09-10): this used to silently empty
+            # ``acct``, so the gate pipeline ran assuming zero positions and
+            # zero exposure — potentially approving a trade the live book
+            # contradicts (exposure/notional gates watered down even though
+            # the later pre-place re-check catches same-coin double-opens).
+            # Now fail-CLOSED: refuse the order (503, safe to retry).
+            logger.error(
+                "[gates] fetch_account_state failed (fail-closed) for %s: %s: %s",
+                coin, type(e).__name__, e,
             )
-            acct = {}
+            raise HTTPException(
+                503,
+                {"error": "account_state_unavailable",
+                 "detail": f"could not read live account state before gate "
+                           f"evaluation for {coin}; refusing to risk stale "
+                           f"gates. Safe to retry once the exchange read "
+                           f"recovers: {type(e).__name__}: {e}"},
+            )
         # P0-2c: fetch_account_state() normalizes positions to the snake_case
         # ``asset_positions`` key; this block used to read the raw HL envelope
         # key ``assetPositions``, which never exists on the normalized dict —
@@ -2065,10 +2090,65 @@ async def cancel_order(request: Request) -> JSONResponse:
     coin = body.get("coin")
     if not oid:
         raise HTTPException(400, "oid required")
+    try:
+        oid = int(oid)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "oid must be an integer")
+
+    # H-P1 (audit 2026-09-10): mirror the MCP cancel guard — refuse to cancel
+    # a DSL-managed SL/TP trigger so an operator/API call cannot strip the
+    # exchange-side stop of a live position. Shared force-reload lookup;
+    # tracker-load failure fails closed (503, safe to retry).
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader import event_log
+    try:
+        _owner = dsl_exit.find_dsl_bracket_trigger(oid)
+    except Exception as e:
+        logger.error("[cancel-order] DSL bracket lookup failed (fail-closed) "
+                     "for oid=%s: %r", oid, e)
+        raise HTTPException(
+            503,
+            {"error": "dsl_tracker_lookup_failed",
+             "detail": f"could not verify DSL bracket ownership for oid "
+                       f"{oid}; refusing to cancel. Safe to retry: {e}"},
+        )
+    if _owner is not None:
+        _dcoin, _dside, _which = _owner
+        try:
+            event_log.append("operator_action", payload={
+                "action": "cancel_order_blocked", "via": "http",
+                "oid": oid, "coin": _dcoin, "side": _dside,
+                "bracket": _which, "reason": "dsl_managed_trigger",
+            })
+        except Exception:
+            pass
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"🛑 HTTP 撤单被拦截：oid {oid} 是 {_dcoin}/{_dside} 的 DSL 托管"
+                f"{_which.upper()} 保护单，已拒绝。如需平仓请走 flatten/close "
+                f"流程（会随持仓一起撤销保护单），切勿裸撤止损。")
+        except Exception:
+            pass
+        raise HTTPException(
+            409,
+            {"error": "dsl_managed_trigger",
+             "detail": f"oid {oid} is the DSL-managed {_which.upper()} trigger "
+                       f"for {_dcoin}/{_dside}; use the flatten/close flow "
+                       f"instead"},
+        )
 
     try:
         from hermes_trader.client.exchange import cancel_orders
         result = cancel_orders(oid, coin=coin)
+        try:
+            event_log.append("operator_action", payload={
+                "action": "cancel_order", "via": "http", "oid": oid,
+                "coin": coin, "ok": bool(result.get("ok")),
+                "error": result.get("error"),
+            })
+        except Exception:
+            pass
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(500, str(e))

@@ -7,7 +7,8 @@ Covers four P1 items:
   invisible to the analysis-id in-flight set. A coin-dimension in-flight set
   (``_IN_FLIGHT_COINS``) blocks the second caller, and a fresh live position
   re-check immediately before place_hl_order refuses to double-open when the
-  coin already has a position (fail-open on read failure).
+  coin already has a position (H-P1: fail-CLOSED on read failure — the entry
+  is skipped with reason pre_place_recheck_failed rather than placed).
 
 * A-F5 — DSL must not exit on a single-book wick. Floor-breach exits now
   require the position to be held for ``breach_confirm_sec`` (default 4.0s)
@@ -224,11 +225,16 @@ def test_af4_pre_place_recheck_blocks_double_open(monkeypatch, tmp_path):
     assert "af4-recheck" not in executor._IN_FLIGHT_ANALYSES
 
 
-def test_af4_pre_place_recheck_fail_open_then_order_failed(monkeypatch, tmp_path):
-    """A re-check READ failure must not block trading (fail-open): placement
-    proceeds; a definite order failure then clears both markers."""
+def test_af4_pre_place_recheck_failure_is_fail_closed_skip(monkeypatch, tmp_path):
+    """H-P1 (audit 2026-09-10): a re-check READ failure must skip the entry
+    (fail-closed) instead of guessing "no position". The autonomous loop must
+    not crash — the failure is surfaced as a result reason, no order is sent,
+    both markers roll back, and the entry flock is released."""
     from hermes_trader.agents import executor
+    from hermes_trader.client.lock import EntryOrderLock
     _isolated_memory(monkeypatch, tmp_path)
+    iso_lock = EntryOrderLock(lock_dir=str(tmp_path))
+    monkeypatch.setattr(executor, "_ENTRY_LOCK", iso_lock)
 
     def fetch_fake(*_a, **kwargs):
         if kwargs.get("include_hip3"):
@@ -238,17 +244,21 @@ def test_af4_pre_place_recheck_fail_open_then_order_failed(monkeypatch, tmp_path
 
     place_calls = _stub_deep_path(monkeypatch, fetch_fake=fetch_fake)
 
-    analysis = dict(_ANALYSIS, id="af4-failopen")
+    analysis = dict(_ANALYSIS, id="af4-failclosed")
     result = executor.maybe_execute(analysis)
 
-    # Re-check raised → fail-open → place reached; our fake returns a definite
-    # failure, so the order_failed branch (NOT the H6 reconcile) handles it.
-    assert len(place_calls) == 1
+    # Re-check raised → fail-CLOSED → no order placed.
+    assert place_calls == []
     assert result.get("executed") is False
-    assert result.get("reason") == "order_failed: forced"
-    # No marker leak on the failure path.
+    assert result.get("reason") == "pre_place_recheck_failed"
+    # Gate results are still echoed for telemetry.
+    assert result.get("analysis_id") == "af4-failclosed"
+    # Both markers roll back on the skip path.
     assert "ETH" not in executor._IN_FLIGHT_COINS
-    assert "af4-failopen" not in executor._IN_FLIGHT_ANALYSES
+    assert "af4-failclosed" not in executor._IN_FLIGHT_ANALYSES
+    # The entry flock is released so the next cycle/process can enter.
+    assert iso_lock.acquire() is True
+    iso_lock.release()
 
 
 # ── P0-2a: defensive asset_positions read ────────────────────────────────
