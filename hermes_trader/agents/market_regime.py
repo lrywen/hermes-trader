@@ -524,6 +524,34 @@ def detect_regime(coin: str, *, force: bool = False) -> Regime:
     return regime
 
 
+# Per-coin OWN trend (坑1 root fix / 坑2 per-coin strength). The macro detector
+# above maps every crypto perp to the BTC proxy; this cache holds the coin's
+# OWN 1h regime + 5-component strength, keyed by the bare coin so the per-coin
+# shadow/enforce overlay never overwrites the shared BTC macro cache.
+_own_regime_cache: dict[str, tuple[Regime, float, float]] = {}
+
+
+def detect_own_regime_with_score(coin: str, *, force: bool = False
+                                 ) -> tuple[Regime, float]:
+    """Classify the coin's OWN 1h trend (no asset-class proxy substitution).
+
+    Unlike detect_regime_with_score — which resolves crypto to BTC — this always
+    fetches the coin's own candles and runs the same EMA20/30 + slope + ADX
+    classifier and the same 5-component strength score. Cached per coin for
+    REGIME_TTL_S. Feeds the per-coin macro×own quadrant / strength-tier overlay
+    (shadow first). Returns ("neutral", 0.0) on any fetch/parse failure.
+    """
+    key = (coin or "").upper()
+    ttl_s = _regime_cache_ttl()
+    now = time.time()
+    cached = _own_regime_cache.get(key)
+    if not force and cached and (now - cached[2]) < ttl_s:
+        return cached[0], cached[1]
+    regime, score = _detect_for_proxy_with_score(key)
+    _own_regime_cache[key] = (regime, score, now)
+    return regime, score
+
+
 def regime_snapshot() -> dict[str, dict[str, object]]:
     """Operator-facing summary: every cached proxy + regime + score + cache age."""
     now = time.time()

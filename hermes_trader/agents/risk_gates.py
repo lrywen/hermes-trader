@@ -2164,6 +2164,19 @@ def eval_all_gates(
         float(cfg_get("min_trend_score", config=config) or 0.0),
         config=config,
     )
+    # 坑1 quick probe (shadow-only): the gate above keys crypto off the BTC
+    # proxy; record what a per-coin OWN-4h direction check would do when BTC is
+    # aligned but the alt's own 4h rolls over. Never changes the verdict.
+    try:
+        from hermes_trader.agents.per_coin_regime_shadow import (
+            record_per_coin_regime_shadow)
+        record_per_coin_regime_shadow(
+            coin=ctx.coin, side=ctx.trade_side,
+            confidence=ctx.confidence, composite_score=ctx.composite_score,
+            market_regime_result=results["market_regime"],
+            analysis=analysis, config=config, trace_id=trace_id)
+    except Exception:
+        pass
     results["news"] = news_blackout_gate(ctx)
     results["debate"] = debate_gate(ctx, config)
     # ta_late_entry (deep audit 高危项, 2026-08-30): hard late-entry veto

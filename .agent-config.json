@@ -232,5 +232,12 @@
     "atr_pct_max": 3.5,
     "min_composite": 40,
     "low_leverage": 5
+  },
+  "per_coin_regime_shadow": {
+    "shadow_mode": false,
+    "require_own_adx": 20,
+    "strong_own_score": 0.65,
+    "mid_own_score": 0.55,
+    "shadow_log_path": ""
   }
 }
