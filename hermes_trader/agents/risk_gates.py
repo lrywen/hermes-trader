@@ -349,8 +349,12 @@ def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseExce
             level="danger",
             dedup_key=f"mem_gate_blind:{gate}",
         )
-    except Exception:
-        pass
+    except Exception as alert_e:
+        # H-P3: the gate is already blind (fail-open); losing the ONLY alert
+        # that makes that visible must not be silent — operators could keep
+        # trading with a disarmed breaker and no card to tell them.
+        logger.error("[risk] blind-gate Feishu alert failed for gate=%s coin=%s: %r",
+                     gate, coin, alert_e)
     # M1: mirror the same blind-gate alarm onto the operator SSE feed. Kept in
     # its OWN try block (independent of the Feishu card) so a Feishu failure
     # cannot suppress the web feed event. session_log.append is itself
@@ -365,8 +369,11 @@ def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseExce
             "posture": "fail-open",
             "error": err_msg,
         })
-    except Exception:
-        pass
+    except Exception as feed_e:
+        # H-P3: both the card and the SSE/audit feed failing would hide a blind
+        # gate entirely; log so it remains discoverable.
+        logger.error("[risk] blind-gate session_log mirror failed for gate=%s coin=%s: %r",
+                     gate, coin, feed_e)
 
 
 def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:

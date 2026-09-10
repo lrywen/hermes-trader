@@ -2017,8 +2017,11 @@ def _log_operator_action(action: str, *, via: str, result: Optional[dict[str, An
         }
     try:
         session_log.append(record)
-    except Exception:  # pragma: no cover - audit must never break the action
-        pass
+    except Exception as audit_e:  # audit must never break the action
+        # H-P3: this is the tamper-evident trail for fund-moving operator
+        # actions; keep it best-effort but never let a dropped record vanish.
+        logger.error("[audit] operator_action append failed action=%s via=%s: %r",
+                     action, via, audit_e)
 
 
 # ── agent-config write validation (F25: hoisted from register_routes so the ──

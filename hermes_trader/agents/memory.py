@@ -47,8 +47,10 @@ def _quarantine_corrupt_memory(path: str) -> None:
         from hermes_trader.metrics import MEMORY_CORRUPT_ISOLATIONS
 
         MEMORY_CORRUPT_ISOLATIONS.inc()
-    except Exception:
-        pass
+    except Exception as metric_e:
+        # H-P3: a corruption isolation is a fund-safety event; a dropped metric
+        # must at least be visible in logs.
+        logger.error("[memory] MEMORY_CORRUPT_ISOLATIONS metric inc failed: %r", metric_e)
     try:
         from hermes_trader import notify
 
@@ -63,8 +65,10 @@ def _quarantine_corrupt_memory(path: str) -> None:
             level="danger",
             dedup_key="agent-memory-corrupt",
         )
-    except Exception:
-        pass
+    except Exception as alert_e:
+        # H-P3: this danger card is the operator's only notice that the
+        # authoritative state file was corrupt; never let its failure vanish.
+        logger.error("[memory] corrupt-memory danger card failed for %s: %r", path, alert_e)
 
 
 def _read_memory_candidate(path: str) -> Optional[dict[str, Any]]:

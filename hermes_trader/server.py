@@ -1857,8 +1857,9 @@ async def place_order(request: Request) -> JSONResponse:
                             f"⚠️ 手动下单响应丢失但已成交，已补登并挂保护单: {coin} "
                             f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
                             f"oid={_rc.get('oid')}", category="risk")
-                    except Exception:
-                        pass
+                    except Exception as alert_e:
+                        logger.error("[place-order] orphan-fill risk alert failed for %s: %r",
+                                     coin, alert_e)
                     result = {
                         "ok": True,
                         "order_id": _rc.get("oid"),
@@ -1894,8 +1895,9 @@ async def place_order(request: Request) -> JSONResponse:
                             f"（{_rc.get('reason')}）；已拒绝重复下单，"
                             f"请立即人工核查 openOrders/userFills 后再决定是否重试，"
                             f"切勿盲目重发", category="risk")
-                    except Exception:
-                        pass
+                    except Exception as alert_e:
+                        logger.error("[place-order] unresolved-order risk alert failed for %s: %r",
+                                     coin, alert_e)
                     raise HTTPException(
                         503,
                         {"error": "order_response_unknown_unresolved",
@@ -2154,16 +2156,18 @@ async def cancel_order(request: Request) -> JSONResponse:
                 "oid": oid, "coin": _dcoin, "side": _dside,
                 "bracket": _which, "reason": "dsl_managed_trigger",
             })
-        except Exception:
-            pass
+        except Exception as audit_e:
+            logger.error("[cancel-order] blocked-cancel audit append failed for oid=%s: %r",
+                         oid, audit_e)
         try:
             from hermes_trader import notify
             notify.send_text(
                 f"🛑 HTTP 撤单被拦截：oid {oid} 是 {_dcoin}/{_dside} 的 DSL 托管"
                 f"{_which.upper()} 保护单，已拒绝。如需平仓请走 flatten/close "
                 f"流程（会随持仓一起撤销保护单），切勿裸撤止损。")
-        except Exception:
-            pass
+        except Exception as alert_e:
+            logger.error("[cancel-order] blocked-cancel risk alert failed for oid=%s: %r",
+                         oid, alert_e)
         raise HTTPException(
             409,
             {"error": "dsl_managed_trigger",
@@ -2181,8 +2185,8 @@ async def cancel_order(request: Request) -> JSONResponse:
                 "coin": coin, "ok": bool(result.get("ok")),
                 "error": result.get("error"),
             })
-        except Exception:
-            pass
+        except Exception as audit_e:
+            logger.error("[cancel-order] audit append failed for oid=%s: %r", oid, audit_e)
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(500, str(e))

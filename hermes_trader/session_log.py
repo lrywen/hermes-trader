@@ -29,10 +29,13 @@ import fcntl
 import glob
 import gzip
 import json
+import logging
 import os
 import threading
 import time
 from typing import Any, Optional
+
+logger = logging.getLogger("hermes-session-log")
 
 SESSION_LOG_FILE = os.environ.get(
     "SESSION_LOG_PATH",
@@ -309,8 +312,10 @@ def append(event: dict[str, Any]) -> None:
     try:
         from hermes_trader import event_log
         event_log.fork_from_session(record)
-    except Exception:
-        pass
+    except Exception as e:
+        # H-P3: a failed fork breaks the signal->order->close audit trace used
+        # by post-trade reconciliation; surface it without blocking the loop.
+        logger.exception("fork_from_session failed for record=%r: %r", record, e)
     # Best-effort Feishu notification dispatch. Imported lazily to avoid a
     # circular import (notify_dispatch may import modules that log events at
     # import time). Dispatched AFTER the disk write so a notification failure

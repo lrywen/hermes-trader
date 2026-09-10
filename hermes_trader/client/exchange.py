@@ -1509,8 +1509,13 @@ def cancel_open_orders_for_coin(coin: str) -> int:
                 f"⚠️ {coin} 平仓后挂单清理流程异常: {e}；可能存在残留 reduce-only "
                 f"触发器，需立即人工核对 openOrders。",
                 category="risk")
-        except Exception:
-            pass
+        except Exception as alert_e:
+            # H-P3: this is the residual-trigger warning for a failed post-flat
+            # cleanup; if the alert itself vanishes the operator gets no signal
+            # that a reduce-only order may be stranded. Log loudly.
+            logger.error(
+                f"[cancel_open_orders_for_coin] {coin} residual-trigger risk alert failed: {alert_e}"
+            )
         return 0
 
 

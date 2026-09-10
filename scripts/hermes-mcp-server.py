@@ -14,6 +14,7 @@ Automatically loads .env.local from project root if present.
 """
 
 import json
+import logging
 import os
 import sys
 import time
@@ -83,6 +84,25 @@ def _check_write_gate() -> str | None:
                      "Set HERMES_MCP_ALLOW_WRITE=1 in the MCP server env to enable.",
         })
     return None
+
+logger = logging.getLogger("hermes-mcp")
+
+
+def _mcp_audit(action: str, **payload: Any) -> None:
+    """Fork a write-side operator action to the tamper-evident audit log.
+
+    H-P3: the audit fork must NEVER change the tool response (trading is not
+    blocked when audit storage is down), but a failed or undurable write must
+    be visible in the MCP logs instead of vanishing behind a bare except.
+    """
+    from hermes_trader import event_log
+    payload["action"] = action
+    payload["via"] = "mcp"
+    try:
+        if event_log.append("operator_action", payload=payload) is not True:
+            logger.error("audit append returned False for action=%s payload=%r", action, payload)
+    except Exception as e:
+        logger.exception("audit append failed for action=%s: %r", action, e)
 
 # Tools whose underlying SDK call is not yet wired up. Each one is registered
 # with the MCP server so clients don't get a "tool not found" error, but
@@ -1478,20 +1498,13 @@ def handle_close_position(params: Dict[str, Any]) -> str:
     cancellation, record_close/cooldown/breaker bookkeeping, and audit.
     """
     from hermes_trader.agents.executor import close_position_market
-    from hermes_trader import event_log
 
     coin = _norm_coin(params.get('coin', 'BTC'))
 
     try:
         result = close_position_market(coin)
     except Exception as e:
-        try:
-            event_log.append("operator_action", payload={
-                "action": "close_position", "via": "mcp",
-                "coin": coin, "ok": False, "error": str(e),
-            })
-        except Exception:
-            pass
+        _mcp_audit("close_position", coin=coin, ok=False, error=str(e))
         return json.dumps({'closed': False, 'coin': coin, 'error': str(e)}, default=str)
 
     noop = result.get("noop")
@@ -1505,14 +1518,9 @@ def handle_close_position(params: Dict[str, Any]) -> str:
             out['size'] = abs(float(result['total_sz']))
         except (TypeError, ValueError):
             pass
-    try:
-        event_log.append("operator_action", payload={
-            "action": "close_position", "via": "mcp", "coin": coin,
-            "ok": bool(result.get("ok")), "noop": noop,
-            "side": result.get("side"), "error": result.get("error"),
-        })
-    except Exception:
-        pass
+    _mcp_audit("close_position", coin=coin,
+               ok=bool(result.get("ok")), noop=noop,
+               side=result.get("side"), error=result.get("error"))
     return json.dumps(out, default=str)
 
 def handle_set_leverage(params: Dict[str, Any]) -> str:
@@ -1521,7 +1529,6 @@ def handle_set_leverage(params: Dict[str, Any]) -> str:
         return gate
     """Handle set_leverage tool call."""
     from hermes_trader.client.exchange import set_leverage as set_leverage_fn
-    from hermes_trader import event_log
     coin = _norm_coin(params.get('coin', 'BTC'))
     leverage = params.get('leverage', 5)
     # P1-3b: changing leverage while a position is open changes its
@@ -1546,26 +1553,15 @@ def handle_set_leverage(params: Dict[str, Any]) -> str:
                 _has_pos = True
                 break
     except Exception as e:
-        try:
-            event_log.append("operator_action", payload={
-                "action": "set_leverage_blocked", "via": "mcp", "coin": coin,
-                "leverage": leverage, "reason": "account_lookup_failed",
-                "error": str(e),
-            })
-        except Exception:
-            pass
+        _mcp_audit("set_leverage_blocked", coin=coin, leverage=leverage,
+                   reason="account_lookup_failed", error=str(e))
         return json.dumps({
             "ok": False,
             "error": f"could not verify {coin} is flat before leverage change: {e}",
         }, default=str)
     if _has_pos:
-        try:
-            event_log.append("operator_action", payload={
-                "action": "set_leverage_blocked", "via": "mcp", "coin": coin,
-                "leverage": leverage, "reason": "position_open",
-            })
-        except Exception:
-            pass
+        _mcp_audit("set_leverage_blocked", coin=coin, leverage=leverage,
+                   reason="position_open")
         return json.dumps({
             "ok": False,
             "error": (
@@ -1578,14 +1574,8 @@ def handle_set_leverage(params: Dict[str, Any]) -> str:
     # typo like 0 / -3 / 500 / "abc" gets an error JSON instead of an
     # uncaught ValueError killing the stdio request.
     result = set_leverage_fn(coin, leverage)
-    try:
-        event_log.append("operator_action", payload={
-            "action": "set_leverage", "via": "mcp", "coin": coin,
-            "leverage": leverage, "ok": bool(result.get("ok")),
-            "error": result.get("error"),
-        })
-    except Exception:
-        pass
+    _mcp_audit("set_leverage", coin=coin, leverage=leverage,
+               ok=bool(result.get("ok")), error=result.get("error"))
     return json.dumps(result, default=str)
 
 def handle_get_open_orders(params: Dict[str, Any]) -> str:
@@ -1612,7 +1602,6 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
     the attempt is forked to the tamper-evident audit log.
     """
     from hermes_trader.client.exchange import cancel_orders
-    from hermes_trader import event_log
     asset = params.get('asset')
     order_id = params.get('order_id')
     if asset is None or order_id is None:
@@ -1633,16 +1622,9 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
         _owner = dsl_exit.find_dsl_bracket_trigger(oid)
         if _owner is not None:
             _coin, _side, _which = _owner
-            try:
-                event_log.append("operator_action", payload={
-                    "action": "cancel_order_blocked", "via": "mcp",
-                    "asset_idx": asset_idx, "oid": oid,
-                    "coin": _coin, "side": _side,
-                    "bracket": _which,
-                    "reason": "dsl_managed_trigger",
-                })
-            except Exception:
-                pass
+            _mcp_audit("cancel_order_blocked", asset_idx=asset_idx, oid=oid,
+                       coin=_coin, side=_side, bracket=_which,
+                       reason="dsl_managed_trigger")
             return json.dumps({
                 'cancelled': False,
                 'error': (
@@ -1654,14 +1636,8 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
     except Exception as e:
         # Fail closed: if we cannot establish whether the oid belongs to a
         # DSL bracket, do not cancel. The operator can retry.
-        try:
-            event_log.append("operator_action", payload={
-                "action": "cancel_order_blocked", "via": "mcp",
-                "asset_idx": asset_idx, "oid": oid,
-                "reason": "dsl_tracker_lookup_failed", "error": str(e),
-            })
-        except Exception:
-            pass
+        _mcp_audit("cancel_order_blocked", asset_idx=asset_idx, oid=oid,
+                   reason="dsl_tracker_lookup_failed", error=str(e))
         return json.dumps({
             'cancelled': False,
             'error': f"refused: could not verify DSL bracket ownership: {e}",
@@ -1669,24 +1645,12 @@ def handle_cancel_order(params: Dict[str, Any]) -> str:
     try:
         result = cancel_orders(oid, asset_idx=asset_idx)
         ok = bool(result.get('ok'))
-        try:
-            event_log.append("operator_action", payload={
-                "action": "cancel_order", "via": "mcp",
-                "asset_idx": asset_idx, "oid": oid,
-                "ok": ok, "error": result.get("error"),
-            })
-        except Exception:
-            pass
+        _mcp_audit("cancel_order", asset_idx=asset_idx, oid=oid,
+                   ok=ok, error=result.get("error"))
         return json.dumps({'cancelled': ok, 'result': result}, default=str)
     except Exception as e:
-        try:
-            event_log.append("operator_action", payload={
-                "action": "cancel_order", "via": "mcp",
-                "asset_idx": asset_idx, "oid": oid,
-                "ok": False, "error": str(e),
-            })
-        except Exception:
-            pass
+        _mcp_audit("cancel_order", asset_idx=asset_idx, oid=oid,
+                   ok=False, error=str(e))
         return json.dumps({'cancelled': False, 'error': str(e)}, default=str)
 
 def handle_get_spot_balances(params: Dict[str, Any]) -> str:

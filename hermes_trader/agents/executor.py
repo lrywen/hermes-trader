@@ -461,8 +461,8 @@ def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[st
                 f"阈值 ${live_buffer_usd:.2f}；需先手动减仓",
                 category="risk",
             )
-        except Exception:
-            pass
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         return {
             "ok": False,
             "error": f"too_close_to_liquidation: {coin} buffer_usd={buffer_usd:.2f} < {live_buffer_usd:.2f}",
@@ -1674,8 +1674,8 @@ def _place_backup_sl(
                 f"交易所端无止损单，DSL 软止损为唯一保护\n"
                 f"请立即手动确认持仓并补单",
                 category="risk")
-        except Exception:
-            pass
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
     return sl_missing
 
 
@@ -2032,8 +2032,8 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
                 f"⚠️ H6 下单响应丢失但已成交，已补登: {coin} "
                 f"px={_rc.get('avg_px')} sz={_rc.get('total_sz')} "
                 f"oid={_rc.get('oid')}", category="risk")
-        except Exception:
-            pass
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         order_res.clear()
         order_res.update({
             "ok": True,
@@ -2107,8 +2107,8 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
                     f"🛑 C-M3 连续 {_streak} 次下单响应未知且无法核对，"
                     f"暂停自动开仓 {_halt_min:.0f} 分钟（交易所连接异常）",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         except Exception as _h_e:
             logger.error(f"[executor] C-M3 halt arm failed: {_h_e}")
     with _EXEC_LOCK:
@@ -4083,8 +4083,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 notify.send_text(
                     f"🚫 H-6 跨源价格偏离否决开仓 {coin}: {_reason}",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             with _EXEC_LOCK:
                 _IN_FLIGHT_ANALYSES.discard(_aid)
                 _IN_FLIGHT_COINS.discard(coin)
@@ -4101,8 +4101,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             notify.send_text(
                 f"⚠️ H-6 跨源价格偏离告警 {coin}: {_reason}（未超过否决阈值，继续开仓）",
                 category="risk")
-        except Exception:
-            pass
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
@@ -4151,8 +4151,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                         f"⚠️ 下单响应未在交易所核对: {coin} oid={_oid} cloid={_cloid_str}；"
                         f"可能孤儿仓位，需人工查 openOrders/userFills",
                         category="risk")
-                except Exception:
-                    pass
+                except Exception as _alert_e:
+                    logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
                 logger.error(
                     f"[executor] execute_plan {coin} order NOT verified on "
                     f"exchange (oid={_oid} cloid={_cloid_str}): {_vre.get('reason')}"
@@ -4358,8 +4358,8 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                     f"最小单额，交易所端 SL 无法收紧；DSL 软件止损仍在工作，"
                     f"建议人工处理残量仓位。",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             continue
 
         # ── Only-tighten guard ──────────────────────────────────────────
@@ -4469,8 +4469,8 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                             f"已认领 oid={order['oid']}，请立即在交易所端核对是否存在"
                             f"重复止损并手动清理多余挂单。",
                             category="risk")
-                    except Exception:
-                        pass
+                    except Exception as _alert_e:
+                        logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             elif status == "old_alive":
                 # Modify never applied: keep the old order and retry the tighten
                 # next cycle. Do NOT stamp the throttle.
@@ -4499,8 +4499,8 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
                         f"（旧 oid={old_oid} 可能已失效）。软件 DSL 止损仍在监控，"
                         f"请立即人工核对交易所持仓与止损单。",
                         category="risk")
-                except Exception:
-                    pass
+                except Exception as _alert_e:
+                    logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             else:
                 # lookup_failed: state genuinely ambiguous. Keep the old oid,
                 # do not stamp the throttle, reconcile again next cycle.
@@ -5007,8 +5007,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                     f"{_filled:g} 补单实平 {_follow_filled:g} 仍剩 {_still_open:g}；"
                     f"本地 tracker 保留，需人工核对",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             logger.error(
                 f"[executor] close {coin} PARTIAL: requested={_requested:g} "
                 f"filled={_filled:g} follow_filled={_follow_filled:g} "
@@ -5186,8 +5186,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                     f"错误: {_rc_e}\n"
                     f"请立即检查 outcome store 完整性",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         # Loss cooldown: a losing close arms an extended re-entry block on
         # this coin (config `loss_cooldown_min`, 0 = off). Anti-revenge rule:
         # TON was churned 3x in one day because the standard cooldown expired
@@ -5275,8 +5275,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                 try:
                     from hermes_trader import metrics
                     metrics.TRADE_CIRCUIT_TRIPS.labels(scope="coin").inc()
-                except Exception:
-                    pass
+                except Exception as _metric_e:
+                    logger.error("[executor] TRADE_CIRCUIT_TRIPS metric failed: %r", _metric_e)
                 logger.warning(
                     f"[executor] COIN CIRCUIT on {coin}: spot loss {_spot_loss_pct:.2f}% "
                     f">= {_coin_breaker_pct}% → halt {_coin_breaker_min:.0f}min")
@@ -5287,8 +5287,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                         f"单笔现货亏损 {_spot_loss_pct:.2f}% ≥ {_coin_breaker_pct}%\n"
                         f"暂停开仓 {_coin_breaker_min:.0f} 分钟",
                         category="risk")
-                except Exception:
-                    pass
+                except Exception as _alert_e:
+                    logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
             # Global daily breaker: cumulative realized + unrealized daily
             # PnL as a % of start-of-day equity. Intentionally uses the
             # memory-tracked daily_pnl (same number the daily-loss
@@ -5309,8 +5309,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                         try:
                             from hermes_trader import metrics
                             metrics.TRADE_CIRCUIT_TRIPS.labels(scope="global").inc()
-                        except Exception:
-                            pass
+                        except Exception as _metric_e:
+                            logger.error("[executor] TRADE_CIRCUIT_TRIPS metric failed: %r", _metric_e)
                         logger.critical(
                             f"[executor] GLOBAL CIRCUIT: daily loss {_daily_loss_pct:.2f}% "
                             f">= {_global_breaker_pct}% (PnL ${_daily_pnl:.2f}/"
@@ -5323,8 +5323,8 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                                 f"(${-_daily_pnl:.2f} / SOD ${_sod_eq:.2f})\n"
                                 f"全部暂停开仓 {_global_breaker_min:.0f} 分钟",
                                 category="risk")
-                        except Exception:
-                            pass
+                        except Exception as _alert_e:
+                            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         except Exception as _tb_e:
             logger.warning(f"[executor] tiered-breaker arm failed for {coin}: {_tb_e}")
         # C3 (HYPE RCA item 5): blow-up-level self-halt. A single closing
@@ -5501,8 +5501,8 @@ def arm_close_tiered_breakers(
             try:
                 from hermes_trader import metrics
                 metrics.TRADE_CIRCUIT_TRIPS.labels(scope="coin").inc()
-            except Exception:
-                pass
+            except Exception as _metric_e:
+                logger.error("[executor] TRADE_CIRCUIT_TRIPS metric failed: %r", _metric_e)
             logger.warning(
                 f"[executor] COIN CIRCUIT on {coin} (source={source}): spot loss "
                 f"{_spot_loss_pct:.2f}% >= {_coin_breaker_pct}% → halt "
@@ -5514,8 +5514,8 @@ def arm_close_tiered_breakers(
                     f"单笔现货亏损 {_spot_loss_pct:.2f}% ≥ {_coin_breaker_pct}%\n"
                     f"暂停开仓 {_coin_breaker_min:.0f} 分钟",
                     category="risk")
-            except Exception:
-                pass
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         # Global daily breaker — same daily_pnl/SOD-equity basis the
         # daily-loss kill-switch gate reads, so the two stay consistent.
         _global_breaker_pct = float(
@@ -5534,8 +5534,8 @@ def arm_close_tiered_breakers(
                     try:
                         from hermes_trader import metrics
                         metrics.TRADE_CIRCUIT_TRIPS.labels(scope="global").inc()
-                    except Exception:
-                        pass
+                    except Exception as _metric_e:
+                        logger.error("[executor] TRADE_CIRCUIT_TRIPS metric failed: %r", _metric_e)
                     logger.critical(
                         f"[executor] GLOBAL CIRCUIT (source={source}): daily loss "
                         f"{_daily_loss_pct:.2f}% >= {_global_breaker_pct}% "
@@ -5549,8 +5549,8 @@ def arm_close_tiered_breakers(
                             f"(${-_daily_pnl:.2f} / SOD ${_sod_eq:.2f})\n"
                             f"全部暂停开仓 {_global_breaker_min:.0f} 分钟",
                             category="risk")
-                    except Exception:
-                        pass
+                    except Exception as _alert_e:
+                        logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
     except Exception as _tb_e:
         logger.warning(
             f"[executor] tiered-breaker arm failed for {coin} "
