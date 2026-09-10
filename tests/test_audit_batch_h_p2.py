@@ -99,7 +99,10 @@ def test_stop_signal_delivery_error_when_still_alive_is_503(client, monkeypatch,
     pid_file.write_text("4323")
     monkeypatch.setattr(server, "PID_FILE", str(pid_file))
 
+    killed = []
+
     def _kill(pid, sig):
+        killed.append((pid, sig))
         raise OSError("EPERM")
 
     monkeypatch.setattr(os, "kill", _kill)
@@ -108,6 +111,8 @@ def test_stop_signal_delivery_error_when_still_alive_is_503(client, monkeypatch,
     r = client.post("/api/agent/stop", headers=_auth())
     assert r.status_code == 503, r.text
     assert r.json()["status"] == "stop_failed"
+    # SIGTERM delivery was actually attempted once before the failure surfaced.
+    assert killed == [(4323, 15)]
     assert pid_file.exists()
 
 

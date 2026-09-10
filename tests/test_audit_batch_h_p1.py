@@ -96,6 +96,44 @@ def test_find_dsl_bracket_trigger_load_failure_raises(monkeypatch, tmp_path):
         dsl_exit.find_dsl_bracket_trigger(111)
 
 
+def test_find_dsl_bracket_trigger_double_corrupt_registry_fails_closed(
+    monkeypatch, tmp_path
+):
+    """H-P1 follow-up: live + .bak both corrupt must RAISE, not return None.
+
+    load_state() tolerates a corrupt registry by clearing and returning (the
+    trading loop must not crash), but an empty table after a registry that
+    *existed* and is unreadable is not proof an oid is not a DSL bracket — the
+    cancel guard must fail closed in that case.
+    """
+    dsl_exit = _isolate_dsl(monkeypatch, tmp_path)
+    dsl_exit.register_position("ETH", "long", 2500.0)
+    dsl_exit.set_bracket("ETH", "long", sl_oid=555, tp_oid=666)
+    dsl_exit._save_state()
+    # Corrupt both generations, then drop memory like a separate process.
+    with open(dsl_exit.DSL_STATE_FILE, "w") as f:
+        f.write("{ broken live json ]")
+    with open(dsl_exit.DSL_STATE_FILE + ".bak", "w") as f:
+        f.write("broken bak [")
+    dsl_exit._active_positions.clear()
+    dsl_exit.reset_force_load_throttle()
+
+    with pytest.raises(RuntimeError):
+        dsl_exit.find_dsl_bracket_trigger(555)
+
+
+def test_find_dsl_bracket_trigger_never_existed_returns_none(
+    monkeypatch, tmp_path
+):
+    """The legitimate empty registry (no state file ever written) is NOT a
+    corrupt-registry condition and must still resolve to None (cancel allowed).
+    """
+    dsl_exit = _isolate_dsl(monkeypatch, tmp_path)
+    assert not os.path.exists(dsl_exit.DSL_STATE_FILE)
+    assert dsl_exit.find_dsl_bracket_trigger(777) is None
+    assert dsl_exit._last_force_load_corrupt is False
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # H-P1-1 (HTTP): /api/hl/cancel-order
 # ──────────────────────────────────────────────────────────────────────────

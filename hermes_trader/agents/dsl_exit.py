@@ -1299,6 +1299,12 @@ class DSLTracker:
 
 _active_positions: dict[str, DSLTracker] = {}
 _loaded_from_disk = False
+# H-P1 follow-up: latches True when a force-reload finds at least one on-disk
+# state candidate that exists but cannot be read/migrated (live + .bak both
+# unusable), versus the legitimate "no state file has ever existed" empty
+# registry. find_dsl_bracket_trigger reads this so a corrupt tracker cannot be
+# mistaken for "not a DSL bracket" (which would fail open on a cancel).
+_last_force_load_corrupt = False
 
 # P1-1: trackers whose exchange SL oid is SUSPECTED dead after a batchModify
 # whose response was lost. In-memory only (a restart re-derives health from the
@@ -1770,7 +1776,7 @@ def load_state(force: bool = False) -> None:
     are throttled to once per ``_FORCE_LOAD_TTL_S`` so repeated dashboard
     polls don't contend with the loop's LOCK_EX writes on every request.
     """
-    global _loaded_from_disk, _LAST_FORCE_LOAD_TS
+    global _loaded_from_disk, _LAST_FORCE_LOAD_TS, _last_force_load_corrupt
     if _loaded_from_disk and not force:
         return
     if force:
@@ -1781,6 +1787,10 @@ def load_state(force: bool = False) -> None:
     _loaded_from_disk = True
     lock_fd = None
     payload = None
+    # H-P1 follow-up: distinguish "no state file exists yet" (legitimate empty
+    # registry) from "a state file exists but is unreadable/migratable" (must
+    # fail closed for the cancel guard). Reset the corrupt latch for this load.
+    saw_existing_candidate = False
     try:
         # Shared lock pairs with the exclusive lock in _save_state so a
         # force-reload never observes a torn write.
@@ -1792,6 +1802,8 @@ def load_state(force: bool = False) -> None:
         # SAME load call — _loaded_from_disk is already latched True, so this
         # is the only point a fallback read can happen in this process.
         for candidate in (DSL_STATE_FILE, DSL_STATE_FILE + ".bak"):
+            if os.path.exists(candidate):
+                saw_existing_candidate = True
             raw = _read_state_candidate(candidate)
             if raw is None:
                 continue
@@ -1819,7 +1831,12 @@ def load_state(force: bool = False) -> None:
         # running on stale in-memory trackers whose disk state is gone.
         _active_positions.clear()
         _refresh_positions_gauge()
+        # Latch corrupt (vs legitimately-never-existed) ONLY on a force reload
+        # so find_dsl_bracket_trigger can fail closed; the trading loop's own
+        # non-force startup load keeps its tolerate-and-clear behavior.
+        _last_force_load_corrupt = bool(force and saw_existing_candidate)
         return
+    _last_force_load_corrupt = False
     # Record the successful reload time only AFTER reading the file so a
     # missing/empty file doesn't block the next attempt for a full TTL.
     if force:
@@ -1858,6 +1875,15 @@ def find_dsl_bracket_trigger(oid: int) -> Optional[tuple[str, str, str]]:
     """
     reset_force_load_throttle()
     load_state(force=True)
+    if _last_force_load_corrupt:
+        # The on-disk registry existed but could not be loaded from either the
+        # live file or .bak. An empty table here is NOT proof the oid is not a
+        # DSL bracket — refusing the cancel (fail closed) is the only safe
+        # answer, matching this helper's contract and its HTTP/MCP callers.
+        raise RuntimeError(
+            "DSL tracker registry exists but could not be loaded (live + .bak "
+            "unreadable/corrupt); cannot verify bracket ownership"
+        )
     for _t in _active_positions.values():
         if oid in (_t.sl_oid, _t.tp_oid):
             return _t.coin, _t.side, ("sl" if oid == _t.sl_oid else "tp")
