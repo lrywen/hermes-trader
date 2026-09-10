@@ -408,8 +408,11 @@ def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
         try:
             from hermes_trader import metrics
             metrics.MEMORY_GATE_READ_ERRORS.labels(gate="coin_circuit").inc()
-        except Exception:
-            pass
+        except Exception as metric_e:
+            # H-P3: the breaker is blind (fail-open); a dropped blind-gate
+            # metric removes one of the two non-card signals — log it.
+            logger.error("[risk] MEMORY_GATE_READ_ERRORS metric failed for coin_circuit: %r",
+                         metric_e)
         # Audit 2026-09-07 (C1): make the blind gate visible via Feishu too
         # (the metric has no alert rule in this deployment). Never blocks.
         _alert_memory_gate_blind("coin_circuit", ctx, e)

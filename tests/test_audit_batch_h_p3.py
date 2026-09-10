@@ -35,6 +35,7 @@ SERVER_PY = ROOT / "hermes_trader" / "server.py"
 EXCHANGE_PY = ROOT / "hermes_trader" / "client" / "exchange.py"
 MEMORY_PY = ROOT / "hermes_trader" / "agents" / "memory.py"
 RISK_GATES_PY = ROOT / "hermes_trader" / "agents" / "risk_gates.py"
+DSL_EXIT_PY = ROOT / "hermes_trader" / "agents" / "dsl_exit.py"
 DASHBOARD_PY = ROOT / "hermes_trader" / "dashboard.py"
 SESSION_LOG_PY = ROOT / "hermes_trader" / "session_log.py"
 
@@ -147,8 +148,15 @@ def test_exchange_memory_riskgates_dashboard_session_log_sites_log():
     rg = RISK_GATES_PY.read_text(encoding="utf-8")
     assert "blind-gate Feishu alert failed" in rg
     assert "blind-gate session_log mirror failed" in rg
+    assert "MEMORY_GATE_READ_ERRORS metric failed" in rg
     # The C1 fail-open posture is unchanged (not flipped to fail-closed).
     assert 'return {"pass": True}' in rg
+
+    dsl = DSL_EXIT_PY.read_text(encoding="utf-8")
+    assert "backfill missing-SL risk alert failed" in dsl
+    assert "corrupt-state danger card failed" in dsl
+    assert "state-save-failed danger card failed" in dsl
+    assert "DSL_STATE_CORRUPT_ISOLATIONS metric inc failed" in dsl
 
     dash = DASHBOARD_PY.read_text(encoding="utf-8")
     assert "operator_action append failed" in dash

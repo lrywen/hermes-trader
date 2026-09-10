@@ -464,8 +464,11 @@ def backfill_brackets_from_exchange(
                             f"未找到可认领的替代止损。DSL 软止损仍在监控，请立即人工核对"
                             f"持仓并补挂止损单。",
                             category="risk")
-                    except Exception:
-                        pass
+                    except Exception as alert_e:
+                        # H-P3: this is the naked-stop warning; a failed alert
+                        # would leave an unprotected position with no signal.
+                        logger.error("[dsl] backfill missing-SL risk alert failed for %s: %r",
+                                     tracker.coin, alert_e)
             # On the startup-only verify path a missing held oid with no suspect
             # flag is left untouched: steady openOrders shape drift (e.g. a
             # trigger mid-transition) must not null a healthy oid on a single
@@ -1556,8 +1559,10 @@ def _quarantine_corrupt_state(path: str) -> None:
         from hermes_trader.metrics import DSL_STATE_CORRUPT_ISOLATIONS
 
         DSL_STATE_CORRUPT_ISOLATIONS.inc()
-    except Exception:
-        pass
+    except Exception as metric_e:
+        # H-P3: a corrupt tracker isolation is a fund-safety event; a dropped
+        # metric must at least be visible in logs.
+        logger.error("[dsl] DSL_STATE_CORRUPT_ISOLATIONS metric inc failed: %r", metric_e)
     try:
         from hermes_trader import notify
 
@@ -1572,8 +1577,10 @@ def _quarantine_corrupt_state(path: str) -> None:
             level="danger",
             dedup_key="dsl-state-corrupt",
         )
-    except Exception:
-        pass
+    except Exception as alert_e:
+        # H-P3: this danger card is the only notice that the stop-tracker
+        # registry was corrupt; never let its delivery failure vanish.
+        logger.error("[dsl] corrupt-state danger card failed for %s: %r", path, alert_e)
 
 
 def _read_state_candidate(path: str) -> Optional[dict[str, Any]]:
@@ -1720,8 +1727,10 @@ def _save_state() -> None:
                     level="danger",
                     dedup_key="dsl-state-save-failed",
                 )
-            except Exception:
-                pass
+            except Exception as alert_e:
+                # H-P3: a failed tracker persist means stop state may be lost
+                # across restart; the danger card must not vanish silently.
+                logger.error("[dsl] state-save-failed danger card failed: %r", alert_e)
         # P3-1: save latency (covers lock + all retries) and dirty gauge.
         try:
             from hermes_trader import metrics
