@@ -47,7 +47,15 @@ def _hermetic(monkeypatch):
         lambda: {"dsl_exit": DSL_CFG})
     monkeypatch.setattr(dsl_exit, "_POLICY_CACHE", None)
     monkeypatch.setattr(dsl_exit, "_POLICY_CACHE_TS", 0.0)
+    # These tests synth trackers into the module-level live registry; clear on
+    # teardown too so BTC/ETH/SOL trackers and suspect-SL state do not leak into
+    # later test modules run in the same process (cross-file isolation).
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
     yield
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
+    dsl_exit._loaded_from_disk = False
 
 
 def _isolate(monkeypatch, tmp_path):

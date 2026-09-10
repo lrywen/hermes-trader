@@ -160,21 +160,39 @@ def test_r13_b1_config_patch_knows_dsl_state_io_field():
 # ── dsl_exit.py 接线验证：5 个常量实际从 cfg_get / env 读取 ──────────────
 
 def _reload_dsl_exit(monkeypatch, *, preserve: bool = False):
-    """带 env 清理的 reload。
+    """带 env 清理的 reload（保持模块对象身份不变）。
 
     默认行为：pop 掉所有可能干扰的 HERMES_DSL_* 与 HERMES_CFG_DSL_STATE_IO__*
     key（用 monkeypatch.delenv 走 monkeypatch 回滚路径）。当 ``preserve=True``
     时（如 canonical env 覆盖测试），保留 monkeypatch.setenv 已设的 key，只
     pop 显式列出的 legacy HERMES_DSL_* key。
+
+    Uses ``importlib.reload`` on the SAME module object (never pops it out of
+    ``sys.modules``): deleting/inserting a fresh module instance splits the
+    reference held by sibling modules such as ``executor`` and leaves a second
+    set of module globals in the process, contaminating later test modules.
+    Re-running the module body on the same object also resets the module-level
+    registries to their initial empty state.
     """
     for k in list(os.environ):
         if k.startswith("HERMES_DSL_") and not (preserve and k in os.environ and os.environ[k]):
             monkeypatch.delenv(k, raising=False)
         if k.startswith("HERMES_CFG_DSL_STATE_IO__") and not preserve:
             monkeypatch.delenv(k, raising=False)
-    if "hermes_trader.agents.dsl_exit" in sys.modules:
-        del sys.modules["hermes_trader.agents.dsl_exit"]
-    return importlib.import_module("hermes_trader.agents.dsl_exit")
+    mod = importlib.import_module("hermes_trader.agents.dsl_exit")
+    return importlib.reload(mod)
+
+
+@pytest.fixture(autouse=True)
+def _restore_default_dsl_exit_module():
+    """After each test, reload dsl_exit with a clean env so module-level
+    registries and the canonical-config constants are restored for later
+    modules in the same process (module object identity preserved)."""
+    yield
+    for k in list(os.environ):
+        if k.startswith(("HERMES_DSL_", "HERMES_CFG_DSL_STATE_IO__")):
+            os.environ.pop(k, None)
+    importlib.reload(importlib.import_module("hermes_trader.agents.dsl_exit"))
 
 
 def test_r13_b1_dsl_exit_min_save_interval_uses_canonical(monkeypatch):
