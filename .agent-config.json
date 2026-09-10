@@ -126,6 +126,10 @@
       "repeat_min_composite": 45,
       "max_consecutive_losses": 2,
       "loss_cooldown_hours": 24
+    },
+    "short_only_shadow": {
+      "shadow_mode": false,
+      "shadow_log_path": ""
     }
   },
   "momentum_continuation": {

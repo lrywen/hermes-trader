@@ -716,6 +716,97 @@ def _record_risk_tuning_shadow(*, rule: str, coin: str, side: str,
         logger.info(f"[executor] risk-tuning SHADOW[{rule}] for {coin}: "
                     f"would={would} -> {_RISK_TUNING_SHADOW_FILE}")
 
+
+_SHORT_ONLY_SHADOW_FILE = os.environ.get(
+    "HERMES_SHORT_ONLY_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/short_only_shadow.jsonl"),
+)
+
+
+def _record_short_only_shadow(analysis: dict[str, Any], gate: dict[str, Any],
+                              *, reason: str) -> None:
+    """Record a short candidate that the operator's allow_shorts=false switch
+    is suppressing, so the counter-factual EV of re-enabling shorts can be
+    measured before flipping the live switch.
+
+    Shadow-only: writes a JSONL line, never places an order and never changes
+    the live block decision. Captures everything the offline reconciliation
+    needs — the model conviction, composite, structure flags, signal price and
+    the short thresholds the candidate would otherwise face — plus the macro
+    (BTC proxy) regime and the coin's OWN 1h regime/score so the BTC-proxy
+    mismatch on the short side is auditable. Best-effort: never raises.
+    """
+    try:
+        from datetime import datetime, timezone
+        coin = analysis.get("coin") or ""
+
+        def _f(v):
+            try:
+                x = float(v)
+                return x if x == x else None
+            except (TypeError, ValueError):
+                return None
+
+        entry_px = (_f(analysis.get("mid")) or _f(analysis.get("price"))
+                    or _f(analysis.get("entry_px")))
+        macro_regime = macro_score = own_regime = own_score = None
+        try:
+            from hermes_trader.agents.market_regime import (
+                detect_regime_with_score, detect_own_regime_with_score)
+            macro_regime, macro_score = detect_regime_with_score(coin)
+            own_regime, own_score = detect_own_regime_with_score(coin)
+        except Exception:
+            pass
+        rec = {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "trace_id": str(analysis.get("id") or ""),
+            "rule": "short_only",
+            "coin": coin,
+            "side": "short",
+            "would": "admit_if_shorts_enabled",
+            "block_reason": reason,
+            "detail": {
+                "confidence": _f(analysis.get("ai_confidence_raw")
+                                 or analysis.get("confidence")),
+                "composite_score": _f(analysis.get("composite_score")),
+                "entry_px": entry_px,
+                "rsi4h": _f(analysis.get("rsi4h")),
+                "adx4h": _f(analysis.get("adx4h")),
+                "atr4h": _f(analysis.get("atr4h")),
+                "volume_spike": bool(analysis.get("volume_spike_fired")),
+                "breakout": bool(analysis.get("breakout_fired")),
+                "burst": bool(analysis.get("momentum_burst_fired")),
+                "downtrend": bool(analysis.get("downtrend_momentum_fired")),
+                "slow_burn_count": int(analysis.get("slow_burn_count", 0) or 0),
+                "whale": bool(analysis.get("whale_signal")),
+                "min_short_confidence": _f(gate.get("min_short_confidence")),
+                "min_short_composite": _f(gate.get("min_short_composite")),
+                "macro_regime": macro_regime,
+                "macro_trend_score": (round(macro_score, 3)
+                                      if macro_score is not None else None),
+                "own_1h_regime": own_regime,
+                "own_1h_score": (round(own_score, 3)
+                                 if own_score is not None else None),
+            },
+            "outcome": None,
+            "exit_px": None,
+            "pnl_usd": None,
+        }
+        from hermes_trader.shadow_log import append_jsonl
+        path = str(
+            (gate.get("short_only_shadow") or {}).get("shadow_log_path")
+            or "").strip() or _SHORT_ONLY_SHADOW_FILE
+        if append_jsonl(path, rec, stream="short_only"):
+            logger.info(
+                f"[runner_gate] short-only SHADOW for {coin}: "
+                f"conf={rec['detail']['confidence']} score={rec['detail']['composite_score']} "
+                f"down={int(rec['detail']['downtrend'])} macro={macro_regime} "
+                f"own1h={own_regime} -> {path}")
+    except Exception as e:  # never break the entry hot path
+        logger.debug(f"[runner_gate] short-only shadow record failed: {e}")
+
+
 # ── Dynamic exchange-SL mover (Phase 2 trailing coordination) ───────────────
 # When the DSL floor ratchets tighter in Phase 2, move the exchange backup SL
 # to trail just behind the floor so a server-side stop can still cap gap-
@@ -4852,6 +4943,15 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         # E1 (Audit 2026-09-06): allow_shorts may be force-disabled by the
         # choppy-market overlay in enforce+de-risk posture (shadow never does).
         if not _ov_allow_shorts:
+            # Short-only shadow (Audit 2026-09-10): record what the operator's
+            # allow_shorts=false switch is suppressing so the EV of re-enabling
+            # shorts can be measured. Pure observation; the live block stands.
+            if bool((gate.get("short_only_shadow") or {}).get("shadow_mode", False)):
+                _record_short_only_shadow(
+                    analysis, gate,
+                    reason=("overlay_disabled"
+                            if bool(gate.get("allow_shorts", False))
+                            else "shorts_disabled"))
             if bool(gate.get("allow_shorts", False)):
                 # Base config allows shorts but the overlay turned them off.
                 logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
