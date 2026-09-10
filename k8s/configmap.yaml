@@ -9,6 +9,9 @@ metadata:
 # containers already agree on where shared state lives.
 data:
   HERMES_PORT: "8000"
+  # The server binds 127.0.0.1 by default (H-P2); the kubelet probes and
+  # Service hit the pod IP, so the container must listen on all interfaces.
+  HERMES_HOST: "0.0.0.0"
   HERMES_SCAN_INTERVAL: "15"
   # P3-14: egress IP drift watchdog. Flip HERMES_IP_DRIFT_WATCH to "1" to
   # enable the ipdrift sidecar container in statefulset.yaml.

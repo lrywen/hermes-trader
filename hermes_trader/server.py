@@ -171,7 +171,19 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
 # ── App ────────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="Hermes-Trader", version=__version__, lifespan=lifespan)
+# H-P2: interactive API docs (Swagger UI / ReDoc / openapi.json) are disabled
+# by default — this service holds fund-moving write endpoints and should not
+# advertise its full surface to unauthenticated network callers. Set
+# HERMES_EXPOSE_DOCS=1 for local debugging.
+_expose_docs = os.environ.get("HERMES_EXPOSE_DOCS", "").strip() in ("1", "true", "yes")
+app = FastAPI(
+    title="Hermes-Trader",
+    version=__version__,
+    lifespan=lifespan,
+    docs_url="/docs" if _expose_docs else None,
+    redoc_url="/redoc" if _expose_docs else None,
+    openapi_url="/openapi.json" if _expose_docs else None,
+)
 
 # L-6 (supplemental audit 2026-08-30): do not emit `Access-Control-Allow-
 # Origin: *` for browser traffic. The trader sits behind the Portal BFF, which
@@ -1178,13 +1190,35 @@ async def agent_stop(request: Request) -> JSONResponse:
             os.kill(pid, 15)  # SIGTERM
         except OSError:
             pass
+        # H-P2: verify the process actually exits before reporting "stopped".
+        # SIGTERM can be caught/ignored (or the pid file can be stale), and a
+        # lying "stopped" makes the operator believe automated risk monitoring
+        # was halted while it keeps trading. Poll briefly, then report the real
+        # state.
+        _wait_s = float(os.environ.get("HERMES_STOP_WAIT_S", "5"))
+        _deadline = time.monotonic() + _wait_s
+        while time.monotonic() < _deadline and _is_alive(pid):
+            await asyncio.sleep(0.2)
 
-    try:
-        os.remove(PID_FILE)
-    except OSError:
-        pass
+    if not _is_alive(pid):
+        try:
+            os.remove(PID_FILE)
+        except OSError:
+            pass
+        return JSONResponse(content={"status": "stopped", "pid": pid})
 
-    return JSONResponse(content={"status": "stopped", "pid": pid})
+    # Process survived SIGTERM (or the signal could not be delivered): keep the
+    # pid file for escalation and return the honest state instead of deleting
+    # evidence and claiming success.
+    logger.error("[agent-stop] pid %s still alive after SIGTERM — reporting stop_failed", pid)
+    return JSONResponse(
+        status_code=503,
+        content={
+            "status": "stop_failed",
+            "pid": pid,
+            "detail": "process still alive after SIGTERM; escalate manually (SIGKILL) and verify risk monitoring state",
+        },
+    )
 
 
 @app.get("/api/agent/config", dependencies=[Depends(_require_operator)])
@@ -2464,5 +2498,9 @@ if __name__ == "__main__":
     # (notably PRIVATE_KEY_HEX in client/exchange.py) capture real values.
     import uvicorn
     port = int(os.environ.get("HERMES_PORT", 8000))
-    logger.info(f"Starting Hermes server on port {port}")
-    uvicorn.run("hermes_trader.server:app", host="0.0.0.0", port=port, reload=False)
+    # H-P2: bind loopback by default. Container deployments (Fly/k8s) must set
+    # HERMES_HOST=0.0.0.0 explicitly so the change cannot silently expose a
+    # bare-metal/portal-bridge install to the LAN.
+    host = os.environ.get("HERMES_HOST", "127.0.0.1").strip() or "127.0.0.1"
+    logger.info(f"Starting Hermes server on {host}:{port}")
+    uvicorn.run("hermes_trader.server:app", host=host, port=port, reload=False)
