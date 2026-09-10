@@ -135,6 +135,12 @@ _FORKABLE_EVENTS = frozenset({
     "execute",
     "dsl_exit",
     "ai_close",
+    # Audit 2026-09-10 (ADA/DOT): a post-fill failure (e.g. bracket/SL
+    # placement exception) previously existed only in session-log.jsonl while
+    # the fill itself was live — the authoritative outcome feed showed no
+    # trace of the failed protection arm. Error rows are low-churn and
+    # essential for post-trade reconstruction, so fork them like execute.
+    "error",
     "external_close_recorded",
     "external_close_unattributed",
     "hard_killswitch",

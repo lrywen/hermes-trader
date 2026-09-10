@@ -928,6 +928,19 @@ class DSLTracker:
             self.peak_px = mark_px
             peak_changed = True
 
+        # Audit 2026-09-10 (ADA MFE loss): a new favorable peak previously
+        # never requested a save (the comment was "peak rebuilds"), so a
+        # restart rehydrated a STALE peak from the last floor/register save
+        # and the tracker could never rebuild it once price had rolled over
+        # (ADA printed mfe=1.14% after restart vs a true 1.40% peak seen
+        # pre-restart). Persist peak advances through the same coalesced
+        # throttle as floor moves — at most one state write per
+        # _MIN_SAVE_INTERVAL_SEC process-wide, so tick-rate I/O is unchanged
+        # in practice while a crash/restart loses at most one interval of
+        # peak advance instead of the whole favorable excursion.
+        if peak_changed:
+            _request_save(force=False)
+
         # ── Effective max-loss in SPOT % terms ───────────────────────
         # Two thresholds combine into one effective floor:
         #   * `max_loss_pct`        — direct spot-% cap (e.g. 2.5%)
@@ -1755,8 +1768,9 @@ def _request_save(force: bool = False) -> None:
     ``force=True`` writes through immediately (exit verdict, structural
     register/deregister) and clears any pending dirty state. Otherwise the
     request is rate-limited to once per ``_MIN_SAVE_INTERVAL_SEC``; a floor
-    move that lands inside the window sets the dirty flag so the next tick
-    flushes it. Peak-only changes don't call this at all (peak rebuilds).
+    move (or, since 2026-09-10, a favorable PEAK advance — see the peak-save
+    fix in DSLTracker.check) that lands inside the window sets the dirty flag
+    so the next tick flushes it, bounding restart loss to one interval.
     """
     global _SAVE_DIRTY
     if force:

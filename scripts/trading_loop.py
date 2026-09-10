@@ -2093,6 +2093,15 @@ while True:
                                    "entry_px": result.get("entry_px"),
                                    "stop_px": result.get("stop_px"),
                                    "tp_px": result.get("tp_px"),
+                                   # Audit 2026-09-10 (ADA/DOT): a live fill
+                                   # whose server-side bracket failed to arm
+                                   # must be reconstructable from the
+                                   # authoritative event feed, not only from
+                                   # session-log. sl_missing=True / a non-null
+                                   # bracket_error mean the DSL loop is the
+                                   # sole stop until a retry/re-arm succeeds.
+                                   "sl_missing": result.get("sl_missing") if executed else None,
+                                   "bracket_error": result.get("bracket_error") if executed else None,
                                    "regime": mr.get("regime"),
                                    "funding_regime": mr.get("funding"),
                                    "regime_via": mr.get("via"),

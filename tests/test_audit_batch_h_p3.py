@@ -123,8 +123,10 @@ def test_mcp_handlers_route_through_audit_helper_no_bare_pass():
 
 def test_executor_fund_safety_alerts_log_on_failure():
     src = EXECUTOR_PY.read_text(encoding="utf-8")
-    # 16 risk alerts + 4 breaker metric guards converted in this batch.
-    assert src.count("fund-safety risk alert failed") == 16
+    # 16 risk alerts + 4 breaker metric guards converted in this batch;
+    # +1 from the 2026-09-10 bracket-containment fix (backup-SL placement
+    # exception path logs a failed fund-safety risk alert the same way).
+    assert src.count("fund-safety risk alert failed") == 17
     assert src.count("TRADE_CIRCUIT_TRIPS metric failed") == 4
 
 

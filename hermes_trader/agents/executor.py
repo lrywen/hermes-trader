@@ -2522,10 +2522,39 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
         logger.warning(f"[executor] sl_limit_band_pct={sl_limit_band_pct}% exceeds "
                        f"ceiling {sl_ceiling_pct}% — clamping band to ceiling")
         sl_limit_band_pct = sl_ceiling_pct
-    sl_missing = _place_backup_sl(
-        atr, entry_px, sl_atr_mult, sl_floor_pct, sl_ceiling_pct,
-        size_in_coin, is_buy, coin, trade_side, memory,
-        sl_limit_band_pct=sl_limit_band_pct)
+    # Audit 2026-09-10 (ADA/DOT incident): an exception from the backup-SL
+    # placement (e.g. a client signature drift like the cloid TypeError on
+    # 2026-09-08) previously propagated out of this whole function, so the
+    # filled position was registered but the execute decision was NEVER
+    # recorded — events.jsonl showed no execute row while the exchange held
+    # the position (an audit blind spot + unprotected fill). Contain each
+    # bracket leg independently: a dead SL/TP placer must fail loudly via
+    # sl_missing / bracket_error without voiding the decision record. The
+    # deferred retry queue (retry_pending_sl) / operator alert remain the
+    # recovery paths for the missing server-side stop.
+    sl_missing = False
+    bracket_error: Optional[str] = None
+    try:
+        sl_missing = _place_backup_sl(
+            atr, entry_px, sl_atr_mult, sl_floor_pct, sl_ceiling_pct,
+            size_in_coin, is_buy, coin, trade_side, memory,
+            sl_limit_band_pct=sl_limit_band_pct)
+    except Exception as _sl_e:
+        sl_missing = True
+        bracket_error = f"backup_sl: {type(_sl_e).__name__}: {_sl_e}"
+        logger.error(
+            f"[executor] Backup SL placement raised for {coin} — POSITION HAS "
+            f"NO SERVER-SIDE STOP (DSL loop is sole protection): {bracket_error}"
+        )
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"🚨 {coin} 备份止损下单异常\n"
+                f"交易所端无止损单，DSL 软止损为唯一保护\n"
+                f"错误: {bracket_error}\n请立即手动确认持仓并补单",
+                category="risk")
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
 
     # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
     # fraction of the position SERVER-SIDE at the TP target so a winner is
@@ -2533,7 +2562,13 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
     # to a peak and round-tripping back into the trailing stop — the documented
     # "we had it all and gave it back" leak. The remainder rides the DSL trail,
     # so we lock realized profit AND keep upside. Disable with tp_scale_fraction<=0.
-    _place_tp_scale_out(config, atr, size_in_coin, entry_px, is_buy, coin, trade_side)
+    # A TP failure must never mask the SL result or void the execute record.
+    try:
+        _place_tp_scale_out(config, atr, size_in_coin, entry_px, is_buy, coin, trade_side)
+    except Exception as _tp_e:
+        _tp_err = f"tp_scale: {type(_tp_e).__name__}: {_tp_e}"
+        bracket_error = f"{bracket_error}; {_tp_err}" if bracket_error else _tp_err
+        logger.error(f"[executor] TP scale-out placement raised for {coin}: {_tp_err}")
 
     if atr > 0 and size_in_coin > 0:
         atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100
@@ -2562,7 +2597,8 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
     else:
         final_tp = tp_px
 
-    return {"sl_missing": sl_missing, "final_sl": final_sl, "final_tp": final_tp}
+    return {"sl_missing": sl_missing, "final_sl": final_sl, "final_tp": final_tp,
+            "bracket_error": bracket_error}
 
 
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
@@ -4201,6 +4237,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     sl_missing = _brackets["sl_missing"]
     final_sl = _brackets["final_sl"]
     final_tp = _brackets["final_tp"]
+    bracket_error = _brackets.get("bracket_error")
 
     _record_decision("executed")
     _record_entry(trade_side)
@@ -4215,6 +4252,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         "tp_px": final_tp,
         "dsl_registered": True,
         "sl_missing": sl_missing,
+        # Audit 2026-09-10: surfaced so the loop can log/fork it when the fill
+        # is live but one bracket leg failed to arm. Never flips executed to
+        # False — the position already exists on the exchange.
+        "bracket_error": bracket_error,
     }
 
 
