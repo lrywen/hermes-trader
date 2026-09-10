@@ -130,9 +130,12 @@ def test_executor_fund_safety_alerts_log_on_failure():
 
 def test_server_cancel_and_place_alerts_log_on_failure():
     src = SERVER_PY.read_text(encoding="utf-8")
-    assert src.count("[cancel-order] blocked-cancel audit append failed") == 1
+    # H-P3 follow-up: the two cancel audit sites now funnel through the shared
+    # _http_operator_audit helper (which logs itself); the Feishu risk-alert
+    # except sites remain inline and still log.
+    assert src.count("def _http_operator_audit(") == 1
+    assert src.count("_http_operator_audit(") >= 3  # 1 def + 2 cancel call sites
     assert src.count("[cancel-order] blocked-cancel risk alert failed") == 1
-    assert src.count("[cancel-order] audit append failed") == 1
     assert src.count("[place-order] orphan-fill risk alert failed") == 1
     assert src.count("[place-order] unresolved-order risk alert failed") == 1
 
@@ -210,3 +213,96 @@ def test_session_log_fork_failure_is_logged_not_swallowed(monkeypatch, tmp_path,
     with caplog.at_level(logging.ERROR):
         session_log.append({"event": "execute", "coin": "BTC"})  # must not raise
     assert any("fork_from_session failed" in r.getMessage() for r in caplog.records)
+
+
+# ── H-P3 follow-up: HTTP audit helper + cross-ingress error_code ──────────────
+
+def test_http_audit_logs_when_append_raises(monkeypatch, caplog):
+    from hermes_trader import server
+    import hermes_trader.event_log as event_log
+
+    def _boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(event_log, "append", _boom)
+    with caplog.at_level(logging.ERROR, logger="hermes-server"):
+        # Must NOT raise — audit failure can never break the API response.
+        server._http_operator_audit("cancel_order", oid=9)
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("audit append failed" in m and "cancel_order" in m for m in msgs), msgs
+
+
+def test_http_audit_logs_when_append_returns_false(monkeypatch, caplog):
+    from hermes_trader import server
+    import hermes_trader.event_log as event_log
+    captured = {}
+
+    def _append(event, payload=None):
+        captured["event"] = event
+        captured["payload"] = payload
+        return False
+    monkeypatch.setattr(event_log, "append", _append)
+    with caplog.at_level(logging.ERROR, logger="hermes-server"):
+        server._http_operator_audit("cancel_order_blocked", oid=5, bracket="sl")
+    assert captured["event"] == "operator_action"
+    # action/via injected, caller payload preserved.
+    assert captured["payload"]["action"] == "cancel_order_blocked"
+    assert captured["payload"]["via"] == "http"
+    assert captured["payload"]["bracket"] == "sl"
+    msgs = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    assert any("returned False" in m and "cancel_order_blocked" in m for m in msgs), msgs
+
+
+def test_http_audit_silent_on_success(monkeypatch, caplog):
+    from hermes_trader import server
+    import hermes_trader.event_log as event_log
+    monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
+    with caplog.at_level(logging.ERROR, logger="hermes-server"):
+        server._http_operator_audit("cancel_order", oid=3)
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
+def test_executor_reason_to_error_code_mapping():
+    from hermes_trader.agents.executor import error_code_for_reason as f
+    assert f("pre_place_recheck_failed") == "pre_place_recheck_failed"
+    assert f("no_atr_no_stop (ETH: insufficient candles)") == "atr_unavailable"
+    assert f("equity_unavailable (live account state returned 0)") == \
+        "account_state_unavailable"
+    # Normal skips / non-strings map to nothing.
+    assert f("mode_off") is None
+    assert f("already_executed") is None
+    assert f(None) is None
+    assert f(123) is None
+    # Prefix must not match a similarly-prefixed unrelated reason.
+    assert f("no_atr_no_stop_extra") is None
+
+
+def test_mcp_execute_annotates_fund_safety_refusal_with_error_code(monkeypatch):
+    """MCP execute must surface the SAME stable code the HTTP API uses for an
+    executor fund-safety refusal, without dropping the original reason."""
+    mcp = _load_mcp()
+    from hermes_trader.agents import memory
+
+    _analysis = {"id": "ec-1", "coin": "ETH", "verdict": "LONG"}
+
+    class _Mem:
+        def get_recent_analyses(self, n):
+            return [_analysis]
+
+    monkeypatch.setattr(memory, "memory", _Mem())
+
+    import hermes_trader.agents.executor as executor
+    monkeypatch.setattr(
+        executor, "maybe_execute",
+        lambda a: {"executed": False, "mode": "live", "analysis_id": "ec-1",
+                   "reason": "no_atr_no_stop (ETH: insufficient candles)"})
+    import json
+    out = json.loads(mcp.handle_execute({"analysisId": "ec-1"}))
+    assert out["error_code"] == "atr_unavailable"
+    assert out["reason"].startswith("no_atr_no_stop")
+
+    # An executed / normal-skip outcome carries no error_code.
+    monkeypatch.setattr(
+        executor, "maybe_execute",
+        lambda a: {"executed": False, "mode": "live", "reason": "mode_off"})
+    out2 = json.loads(mcp.handle_execute({"analysisId": "ec-1"}))
+    assert "error_code" not in out2

@@ -91,6 +91,27 @@ logging.basicConfig(
 logger = logging.getLogger("hermes-server")
 
 
+def _http_operator_audit(action: str, **payload: Any) -> None:
+    """Fork a write-side operator action to the tamper-evident audit log.
+
+    HTTP counterpart of the MCP ``_mcp_audit`` helper (single behavior, not a
+    third implementation): injects ``via="http"``; the audit fork must NEVER
+    change the API response, but a failed or non-durable write is logged at
+    error level instead of vanishing behind a bare ``except: pass``.
+    """
+    from hermes_trader import event_log
+    payload["action"] = action
+    payload["via"] = "http"
+    try:
+        if event_log.append("operator_action", payload=payload) is not True:
+            logger.error(
+                "audit append returned False for action=%s payload=%r",
+                action, payload,
+            )
+    except Exception as e:
+        logger.exception("audit append failed for action=%s: %r", action, e)
+
+
 # ── Session log ────────────────────────────────────────────────────────────────
 # Shared activity feed (hermes_trader.session_log) — the same JSONL file the
 # trading loop and status.py use. Writes run in an executor so the file append
@@ -2136,7 +2157,6 @@ async def cancel_order(request: Request) -> JSONResponse:
     # exchange-side stop of a live position. Shared force-reload lookup;
     # tracker-load failure fails closed (503, safe to retry).
     from hermes_trader.agents import dsl_exit
-    from hermes_trader import event_log
     try:
         _owner = dsl_exit.find_dsl_bracket_trigger(oid)
     except Exception as e:
@@ -2150,15 +2170,11 @@ async def cancel_order(request: Request) -> JSONResponse:
         )
     if _owner is not None:
         _dcoin, _dside, _which = _owner
-        try:
-            event_log.append("operator_action", payload={
-                "action": "cancel_order_blocked", "via": "http",
-                "oid": oid, "coin": _dcoin, "side": _dside,
-                "bracket": _which, "reason": "dsl_managed_trigger",
-            })
-        except Exception as audit_e:
-            logger.error("[cancel-order] blocked-cancel audit append failed for oid=%s: %r",
-                         oid, audit_e)
+        _http_operator_audit(
+            "cancel_order_blocked",
+            oid=oid, coin=_dcoin, side=_dside,
+            bracket=_which, reason="dsl_managed_trigger",
+        )
         try:
             from hermes_trader import notify
             notify.send_text(
@@ -2179,14 +2195,10 @@ async def cancel_order(request: Request) -> JSONResponse:
     try:
         from hermes_trader.client.exchange import cancel_orders
         result = cancel_orders(oid, coin=coin)
-        try:
-            event_log.append("operator_action", payload={
-                "action": "cancel_order", "via": "http", "oid": oid,
-                "coin": coin, "ok": bool(result.get("ok")),
-                "error": result.get("error"),
-            })
-        except Exception as audit_e:
-            logger.error("[cancel-order] audit append failed for oid=%s: %r", oid, audit_e)
+        _http_operator_audit(
+            "cancel_order", oid=oid, coin=coin,
+            ok=bool(result.get("ok")), error=result.get("error"),
+        )
         return JSONResponse(content=result)
     except Exception as e:
         raise HTTPException(500, str(e))

@@ -1201,13 +1201,27 @@ def handle_execute(params: Dict[str, Any]) -> str:
 
     try:
         result = maybe_execute(analysis)
-        return json.dumps(result)
     except Exception as e:
         return json.dumps({
             "status": "error",
             "coin": analysis.get("coin"),
             "error": str(e),
         })
+
+    # Annotate fund-safety refusals with the SAME stable error_code the HTTP
+    # manual-order API returns, so cross-ingress alerting/retry matches one
+    # vocabulary. The original reason string is left untouched.
+    try:
+        if isinstance(result, dict) and not result.get("executed"):
+            from hermes_trader.agents.executor import error_code_for_reason
+
+            code = error_code_for_reason(result.get("reason"))
+            if code:
+                result["error_code"] = code
+    except Exception:
+        # Annotation is best-effort; never mask the real execution outcome.
+        pass
+    return json.dumps(result)
 
 
 def handle_deep_research(params: Dict[str, Any]) -> str:

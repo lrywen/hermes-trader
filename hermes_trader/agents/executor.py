@@ -318,6 +318,28 @@ from hermes_trader.client.lock import EntryOrderLock as _EntryOrderLock
 
 _ENTRY_LOCK = _EntryOrderLock()
 
+# Single source of truth mapping an executor skip/refusal reason (which may
+# carry a parenthesized detail suffix, hence prefix matching) to the stable
+# error_code the HTTP manual-order API already returns. The MCP execute path
+# annotates its result dict with the same code so cross-ingress alerting/retry
+# logic can match one vocabulary instead of two. Reasons not listed here are
+# normal skips (mode_off, already_executed, ...) and get no code.
+_EXEC_REASON_ERROR_CODES = (
+    ("no_atr_no_stop", "atr_unavailable"),
+    ("equity_unavailable", "account_state_unavailable"),
+    ("pre_place_recheck_failed", "pre_place_recheck_failed"),
+)
+
+
+def error_code_for_reason(reason: str | None) -> str | None:
+    """Return the stable cross-ingress error_code for a refusal reason, or None."""
+    if not isinstance(reason, str):
+        return None
+    for prefix, code in _EXEC_REASON_ERROR_CODES:
+        if reason == prefix or reason.startswith(prefix + " "):
+            return code
+    return None
+
 # H6/C-M3: streak of order placements whose response was LOST (408/timeout)
 # AND whose fill could not be confirmed either way (reconcile lookup itself
 # failed). A confirmed fill and a confirmed non-fill both RESET the streak —
