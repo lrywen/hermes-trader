@@ -2321,8 +2321,16 @@ async def metrics() -> Response:
 # Read-only endpoints so the "view full report" button in Feishu push cards
 # can open the markdown in a browser. L-2: LAN/loopback viewers (the internal
 # network the Feishu card is opened from) stay token-free; external access
-# requires a valid operator token. Reports contain no secrets — only market
-# data, scores, and trigger metadata.
+# requires a valid operator token.
+#
+# Audit 2026-09-11 (Q3 follow-up): an earlier version of this note claimed the
+# reports "contain no secrets — only market data, scores, and trigger metadata".
+# A scan of the 594 live reports disproves that: no wallet address, token or
+# private key appears, but the risk-gate trace embeds account equity, the daily
+# loss killswitch threshold, position leverage, exchange order ids and the max
+# concurrent position cap. That is exploitable intel, so the edge (nginx) now
+# also restricts /trader/postmortems* to RFC-1918 origins; this in-process gate
+# is the second layer, not the only one.
 
 _POSTMORTEM_DIR = Path(os.environ.get(
     "HERMES_POSTMORTEM_DIR", "/data/postmortems"))

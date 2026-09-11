@@ -152,10 +152,40 @@ def test_nginx_bare_trader_paths_are_private_network_only():
         assert body.index("deny  all;") > body.index("allow 192.168.0.0/16;")
 
 
+def test_nginx_postmortems_allowlist_is_private_network_only():
+    """Q3 follow-up: the two /trader/postmortems locations are the only holes in
+    the /trader/ 404 wall, and trader's require_operator_or_internal sees every
+    proxied request as a private bridge peer — so without an edge allowlist the
+    reports (account equity, killswitch thresholds, leverage, order ids) are
+    served to anyone who can reach 0.0.0.0:8443. Feishu cards are opened from the
+    LAN, so restricting to RFC-1918 keeps the token-free viewer working."""
+    text = _deployed_nginx_conf().read_text(encoding="utf-8")
+    blocks = _location_bodies(text)
+    for path in ("/trader/postmortems", "/trader/postmortems/"):
+        body = blocks.get(path)
+        assert body is not None, f"location {path} missing from deployed config"
+        for rule in (
+            "allow 127.0.0.1;",
+            "allow 10.0.0.0/8;",
+            "allow 172.16.0.0/12;",
+            "allow 192.168.0.0/16;",
+            "deny  all;",
+        ):
+            assert rule in body, f"{path} lost allowlist rule {rule!r}"
+        assert body.index("deny  all;") > body.index("allow 192.168.0.0/16;")
+        # The allowlist must precede proxy_pass so access phase runs first.
+        assert body.index("deny  all;") < body.index("proxy_pass")
+
+
 def _location_bodies(text: str) -> dict[str, str]:
-    """Map ``location <path>`` -> raw body text for simple one-level blocks."""
+    """Map ``location <path>`` -> raw body text for simple one-level blocks.
+
+    The optional nginx modifier (``=``, ``^~``, ``~``, ``~*``) is stripped so the
+    key is always the bare path/pattern.
+    """
     bodies: dict[str, str] = {}
-    for match in re.finditer(r"location\s+([^\s{]+)\s*\{", text):
+    pattern = r"location\s+(?:(?:=|\^~|~\*|~)\s+)?([^\s{]+)\s*\{"
+    for match in re.finditer(pattern, text):
         start = match.end()
         depth = 1
         idx = start
