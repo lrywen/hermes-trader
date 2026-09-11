@@ -2004,6 +2004,22 @@ def _request_has_operator_creds(request: Request) -> bool:
     )
 
 
+def operator_portal_user(request: Request) -> str:
+    """Return the BFF-authenticated portal username from ``X-Portal-User``.
+
+    Audit 2026-09-11 (Q4): the BFF injects one shared X-Operator-Token for every
+    portal user, so trader-side audit rows previously could not tell which portal
+    user drove a write. The BFF (which strips client-forged copies of this header
+    before re-injecting it) is the trusted source. The value is strictly sanitized
+    so it cannot be used for log/audit injection; returns "" when absent/invalid.
+    """
+    import re as _re
+    raw = (request.headers.get("X-Portal-User") or "").strip()
+    if raw and len(raw) <= 64 and _re.fullmatch(r"[A-Za-z0-9_.@\-]+", raw):
+        return raw
+    return ""
+
+
 def feed_client_is_operator(request: Request) -> bool:
     """D-FCFG-3: authorize a feed/history client that may not be able to send
     auth headers (EventSource).

@@ -76,6 +76,7 @@ from hermes_trader.dashboard import (
     _client_ip,
     _require_operator,
     consume_force_confirm_token,
+    operator_portal_user,
     require_operator_or_internal,
     require_operator_or_loopback,
     require_operator_write,
@@ -92,17 +93,24 @@ logging.basicConfig(
 logger = logging.getLogger("hermes-server")
 
 
-def _http_operator_audit(action: str, **payload: Any) -> None:
+def _http_operator_audit(action: str, *, request: "Request | None" = None,
+                         **payload: Any) -> None:
     """Fork a write-side operator action to the tamper-evident audit log.
 
     HTTP counterpart of the MCP ``_mcp_audit`` helper (single behavior, not a
     third implementation): injects ``via="http"``; the audit fork must NEVER
     change the API response, but a failed or non-durable write is logged at
-    error level instead of vanishing behind a bare ``except: pass``.
+    error level instead of vanishing behind a bare ``except: pass``. When the
+    call arrives through the portal BFF, ``request`` lets us record which
+    authenticated portal user drove the action (Q4) alongside the shared token.
     """
     from hermes_trader import event_log
     payload["action"] = action
     payload["via"] = "http"
+    if request is not None:
+        _portal_user = operator_portal_user(request)
+        if _portal_user:
+            payload["portal_user"] = _portal_user
     try:
         if event_log.append("operator_action", payload=payload) is not True:
             logger.error(
@@ -2172,7 +2180,7 @@ async def cancel_order(request: Request) -> JSONResponse:
     if _owner is not None:
         _dcoin, _dside, _which = _owner
         _http_operator_audit(
-            "cancel_order_blocked",
+            "cancel_order_blocked", request=request,
             oid=oid, coin=_dcoin, side=_dside,
             bracket=_which, reason="dsl_managed_trigger",
         )
@@ -2197,7 +2205,7 @@ async def cancel_order(request: Request) -> JSONResponse:
         from hermes_trader.client.exchange import cancel_orders
         result = cancel_orders(oid, coin=coin)
         _http_operator_audit(
-            "cancel_order", oid=oid, coin=coin,
+            "cancel_order", request=request, oid=oid, coin=coin,
             ok=bool(result.get("ok")), error=result.get("error"),
         )
         return JSONResponse(content=result)
