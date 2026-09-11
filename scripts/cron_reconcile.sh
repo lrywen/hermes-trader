@@ -73,6 +73,18 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --write
   echo "$(ts) xs_reversal shadow backfill exit=$?"
 
+  # Audit 2026-09-11 (daily_extension_cap outcome gap): this anti-chase long
+  # gate had NO reconcile script at all, and its probe records carry no
+  # entry_px. The new script reconstructs the would-be chase entry as the
+  # signal-bar 1h close and grades a 72h forward long return (win/loss),
+  # bucketing ext_would_block true/false. Long-only; data_missing rows skipped.
+  # Pure paper, best-effort: never masks the fills reconcile exit code above.
+  echo "$(ts) daily_extension_cap shadow backfill start"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_daily_extension_cap_shadow.py \
+    --file "${HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE:-/data/daily_extension_cap_shadow.jsonl}" \
+    --write
+  echo "$(ts) daily_extension_cap shadow backfill exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1
