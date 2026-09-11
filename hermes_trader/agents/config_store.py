@@ -1203,6 +1203,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "rsi_os_relaxed": 18,
         "ext_ob_relaxed": 3.5,
         "ext_os_relaxed": -3.5,
+        # --- relax_tier SHADOW probe (2026-09-11; observation only) ---
+        # Tighter trend-strength counterfactuals scored into the gate shadow
+        # log, never fed to the live veto. Enable toggle and thresholds so the
+        # probe is env-tunable without code changes.
+        "relax_tier_probe_enabled": True,
+        "rt_relax_adx": 45,        # stricter relax floor (vs today's 35)
+        "rt_weak_adx": 35,         # weak-trend ceiling for the high-RSI probe
+        "rt_weak_rsi_long": 70,    # long high-RSI floor inside a weak trend
+        "rt_weak_rsi_short": 30,   # short mirror
+        "rt_no_trend_adx": 20,     # no-trend chase ceiling
         # --- multi-timeframe: 15m RSI continuation override ---
         # Phase 0 (deep audit R3, 2026-08-30): DEFAULT OFF. The 15m fetch is
         # the only cold candle HTTP in the gate path (the screen never warms

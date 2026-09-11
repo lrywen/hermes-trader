@@ -516,6 +516,151 @@ def weak_trend_noise_check(
     return result
 
 
+def relax_tier_check(
+    candles_4h: Optional[list[Candle]],
+    side: str,
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Trend-strength-tiered chase counterfactual (relax_tier probe, 2026-09-11).
+
+    SHADOW-ONLY PROBE — observation only, never wired into a live veto.
+
+    Motivation (read-only replays): over the 16 real fills and a 12,429-row
+    graded ta_late shadow sample, a LONG's forward edge is governed by 4h trend
+    STRENGTH rather than raw price height — high extension is +EV in a strong
+    trend (ADX>=45 58% WR, ADX>=55 88% / +9.2%) and -EV in a weak one (high
+    extension with ADX<35 = 38% WR). The current trend-relax exception switches
+    on at ADX>=35, but the ADX 35-45 bucket itself is only 32% WR / -0.97%, and
+    a high RSI in a weak trend is the cleanest negative cell. This probe records
+    three independent, tighter counterfactuals so their real selection can be
+    measured BEFORE any enforcement:
+
+      1. ``rt_relax45_would_block`` — the pass only qualifies for the widened
+         relax limits under TODAY'S ADX>=35 rule (``relaxed_by_trend``), yet a
+         stricter ADX>=``rt_relax_adx`` (45) floor would NOT relax it, AND under
+         the STRICT (non-relax) limits the same reading would block. I.e. a pass
+         the live gate admits solely because relax switched on in the weak
+         35-45 band.
+      2. ``rt_weak_rsi70_would_block`` — weak-trend (ADX<``rt_weak_adx`` 35)
+         LONG with RSI>=``rt_weak_rsi_long`` (70): the clean -EV high-RSI cell
+         that does not touch strong-trend winners (shorts mirror).
+      3. ``rt_no_adx20_would_block`` — breakout/continuation chase with
+         ADX<``rt_no_trend_adx`` (20), i.e. no measurable trend at all (the
+         large-sample 21% WR / -1.49% cell). A simple hard-threshold companion
+         to weak_trend_noise_check (which uses ADX<25 AND an EMA8/21 non-support
+         test plus a regime-aligned exemption); recorded independently.
+
+    Readings use the last CLOSED 4h bar (the same series the gate scores after
+    dropping the forming bar), keeping the rule backtest-aligned. Returns the
+    measured rsi/adx/extension and ``data_ok`` (False → caller fails open and
+    skips the observation).
+    """
+    p: dict[str, Any] = params or {}
+
+    def _p(key: str, default: Any) -> Any:
+        v = p.get(key, default)
+        return default if v is None else v
+
+    result: dict[str, Any] = {
+        "rt_relax45_would_block": None,
+        "rt_relax45_reason": "",
+        "rt_weak_rsi70_would_block": None,
+        "rt_weak_rsi70_reason": "",
+        "rt_no_adx20_would_block": None,
+        "rt_no_adx20_reason": "",
+        "rsi4h": None,
+        "adx4h": None,
+        "extension": None,
+        "relaxed_by_trend_today": None,
+        "data_ok": False,
+    }
+    if side not in ("long", "short"):
+        result["rt_relax45_reason"] = f"unknown side {side!r}"
+        return result
+
+    min_bars_4h = int(_p("min_bars_4h", 30))
+    if not candles_4h or len(candles_4h) < min_bars_4h:
+        result["rt_relax45_reason"] = "insufficient 4h candle data"
+        return result
+    result["data_ok"] = True
+
+    rsi4h = _compute_rsi(candles_4h)
+    adx4h = _compute_adx(candles_4h)
+    extension = _extension_atr(candles_4h)
+    result["rsi4h"] = rsi4h
+    result["adx4h"] = adx4h
+    result["extension"] = extension
+    if adx4h is None or rsi4h is None:
+        return result
+
+    is_long = side == "long"
+    trend_dir = _assess_trend(candles_4h)
+    aligned = (trend_dir == "bullish") if is_long else (trend_dir == "bearish")
+
+    # Would TODAY's rule relax this pass? (same condition as late_entry_check.)
+    relax_today = (
+        bool(_p("trend_relax_enabled", True))
+        and adx4h >= float(_p("adx_trend_threshold", 35))
+        and aligned
+    )
+    result["relaxed_by_trend_today"] = relax_today
+
+    # ── Probe 1: stricter relax floor ────────────────────────────────────────
+    rt_relax_adx = float(_p("rt_relax_adx", 45))
+    if relax_today and adx4h < rt_relax_adx:
+        # A 45 floor would not relax here → score against STRICT limits.
+        if is_long:
+            rsi_strict = float(_p("rsi_ob", 75)); ext_strict = float(_p("ext_ob", 2.5))
+            rsi_hit = rsi4h > rsi_strict; ext_hit = extension is not None and extension > ext_strict
+        else:
+            rsi_strict = float(_p("rsi_os", 25)); ext_strict = float(_p("ext_os", -2.5))
+            rsi_hit = rsi4h < rsi_strict; ext_hit = extension is not None and extension < ext_strict
+        if rsi_hit or ext_hit:
+            result["rt_relax45_would_block"] = True
+            tags = [f"ADX {adx4h:.0f}<{rt_relax_adx:.0f} relax band"]
+            if rsi_hit:
+                tags.append(f"RSI {rsi4h:.0f}{'>' if is_long else '<'}{rsi_strict:.0f}")
+            if ext_hit:
+                tags.append(f"ext {extension:+.1f}")
+            result["rt_relax45_reason"] = f"relax-tier {side} ({', '.join(tags)})"
+        else:
+            result["rt_relax45_would_block"] = False
+    else:
+        result["rt_relax45_would_block"] = False
+
+    # ── Probe 2: high RSI in a weak trend ────────────────────────────────────
+    weak_adx = float(_p("rt_weak_adx", 35))
+    if adx4h < weak_adx:
+        if is_long:
+            rsi_floor = float(_p("rt_weak_rsi_long", 70))
+            hit = rsi4h >= rsi_floor
+            cmp = ">="
+        else:
+            rsi_floor = float(_p("rt_weak_rsi_short", 30))
+            hit = rsi4h <= rsi_floor
+            cmp = "<="
+        if hit:
+            result["rt_weak_rsi70_would_block"] = True
+            result["rt_weak_rsi70_reason"] = (
+                f"weak-trend {side} (ADX {adx4h:.0f}<{weak_adx:.0f}, "
+                f"RSI {rsi4h:.0f}{cmp}{rsi_floor:.0f})")
+        else:
+            result["rt_weak_rsi70_would_block"] = False
+    else:
+        result["rt_weak_rsi70_would_block"] = False
+
+    # ── Probe 3: no-trend (ADX<20) chase ─────────────────────────────────────
+    no_adx = float(_p("rt_no_trend_adx", 20))
+    if adx4h < no_adx:
+        result["rt_no_adx20_would_block"] = True
+        result["rt_no_adx20_reason"] = (
+            f"no-trend {side} (ADX {adx4h:.0f}<{no_adx:.0f})")
+    else:
+        result["rt_no_adx20_would_block"] = False
+
+    return result
+
+
 def _late_entry_params() -> dict[str, Any]:
     """ta_late_entry config block for the shared late-entry veto.
 

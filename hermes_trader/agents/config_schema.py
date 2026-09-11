@@ -543,6 +543,13 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "rsi_os_relaxed": _num_leaf(0.0, 50.0),
         "ext_ob_relaxed": _num_leaf(0.0, 20.0),
         "ext_os_relaxed": _num_leaf(-20.0, 0.0),
+        # relax_tier SHADOW probe (observation only, 2026-09-11).
+        "relax_tier_probe_enabled": ("bool",),
+        "rt_relax_adx": _num_leaf(0.0, 100.0),
+        "rt_weak_adx": _num_leaf(0.0, 100.0),
+        "rt_weak_rsi_long": _num_leaf(50.0, 100.0),
+        "rt_weak_rsi_short": _num_leaf(0.0, 50.0),
+        "rt_no_trend_adx": _num_leaf(0.0, 100.0),
         # Multi-timeframe: 15m RSI continuation override.
         "mtf_enabled": ("bool",),
         "rsi15m_ob": _num_leaf(50.0, 100.0),

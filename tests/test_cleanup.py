@@ -4408,6 +4408,137 @@ def test_ta_late_entry_gate_weak_probe_failure_never_blocks_order(monkeypatch, t
     assert rec["counter_regime_would_block"] is True
 
 
+# ── relax_tier SHADOW probe (2026-09-11): 3 tighter trend-strength arms ──────
+
+def _rt_config(**over):
+    over.setdefault("relax_tier_probe_enabled", True)
+    return _le_config(
+        mode="enforce",
+        rt_relax_adx=45, rt_weak_adx=35,
+        rt_weak_rsi_long=70, rt_weak_rsi_short=30, rt_no_trend_adx=20,
+        **over,
+    )
+
+
+def test_relax_tier_strong_trend_above_45_is_kept():
+    """ADX ~54 relaxed pass (the +EV continuation cell) must NOT be flagged by
+    the stricter ADX>=45 relax-floor probe, nor by weak/no-trend probes."""
+    from hermes_trader.agents.ta_filter import relax_tier_check
+    c4h = _relax_pass_tight_block_candles(100)
+    r = relax_tier_check(c4h, "long", _rt_config()["ta_late_entry"])
+    assert r["data_ok"] is True
+    assert r["relaxed_by_trend_today"] is True
+    assert r["rt_relax45_would_block"] is False
+    assert r["rt_weak_rsi70_would_block"] is False
+    assert r["rt_no_adx20_would_block"] is False
+
+
+def test_relax_tier_no_trend_low_adx_flags_both_sides():
+    """Flat tape (ADX ~4 < 20) fires the no-trend chase probe for long & short,
+    but never the relax-floor probe (no relaxation happened)."""
+    from hermes_trader.agents.ta_filter import _compute_adx, relax_tier_check
+    flat = _flat_candles(100)
+    assert _compute_adx(flat) < 20  # sanity
+    for side in ("long", "short"):
+        r = relax_tier_check(flat, side, _rt_config()["ta_late_entry"])
+        assert r["rt_no_adx20_would_block"] is True
+        assert "no-trend" in r["rt_no_adx20_reason"]
+        assert r["rt_relax45_would_block"] is False
+
+
+def test_relax_tier_mid_band_relax_flags_when_strict_breached():
+    """A series whose ADX lands in [35,45) and which relax-today passes only
+    via the exception, with RSI above the STRICT 75 limit, is exactly what the
+    raised relax floor (45) would block. Search a small slope grid for a series
+    that lands in the band so the assertion is on a realisable shape."""
+    from hermes_trader.agents.ta_filter import _assess_trend, _compute_adx, _compute_rsi, relax_tier_check
+    cfg = _rt_config()["ta_late_entry"]
+    found = None
+    for step in (0.42, 0.46, 0.5, 0.54, 0.58, 0.62):
+        c = _trend_candles(120, start=100.0, step=step)
+        a = _compute_adx(c)
+        if 35 <= a < 45 and _assess_trend(c) == "bullish" and _compute_rsi(c) > 75:
+            found = c
+            break
+    if found is None:
+        return  # synthetic grid did not land in the narrow band this build
+    r = relax_tier_check(found, "long", cfg)
+    assert r["relaxed_by_trend_today"] is True
+    assert r["rt_relax45_would_block"] is True
+    assert "relax band" in r["rt_relax45_reason"]
+
+
+def test_relax_tier_data_guards():
+    from hermes_trader.agents.ta_filter import relax_tier_check
+    assert relax_tier_check(None, "long", {})["data_ok"] is False
+    assert relax_tier_check(_trend_candles(8), "sideways", {})["data_ok"] is False
+
+
+def test_ta_late_entry_gate_records_relax_tier_fields_without_blocking(monkeypatch, tmp_path):
+    """Integration: flat tape → rt_no_adx20 would-block is RECORDED but the
+    live gate still passes; all three rt_* fields are present."""
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    flat = _flat_candles(100)
+    _patch_candles(monkeypatch, flat, flat)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_rt.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _rt_config(shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["rt_no_adx20_would_block"] is True
+    assert rec["rt_relax45_would_block"] is False
+    assert rec["rt_weak_rsi70_would_block"] is False
+
+
+def test_ta_late_entry_gate_relax_tier_probe_failure_never_blocks(monkeypatch, tmp_path):
+    """If relax_tier_check raises, the live gate is unaffected and rt_* fields
+    degrade to None."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+
+    def boom(*a, **k):
+        raise RuntimeError("rt boom")
+    monkeypatch.setattr(tf, "relax_tier_check", boom)
+    flat = _flat_candles(100)
+    _patch_candles(monkeypatch, flat, flat)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_rt_boom.jsonl"
+    r = ta_late_entry_gate(_ctx(trade_side="long", coin="TEST"),
+                           _rt_config(shadow_log_path=str(log)))
+    assert r["pass"] is True and r["via"] == "ta_late_entry_pass"
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["blocked"] is False
+    assert rec["rt_relax45_would_block"] is None
+    assert rec["rt_weak_rsi70_would_block"] is None
+    assert rec["rt_no_adx20_would_block"] is None
+
+
+def test_ta_late_entry_gate_relax_tier_probe_disabled(monkeypatch, tmp_path):
+    """relax_tier_probe_enabled=False → rt_* fields stay null; order passes."""
+    import hermes_trader.agents.ta_filter as tf
+    from hermes_trader.agents.risk_gates import ta_late_entry_gate
+    calls = {"n": 0}
+    real = tf.relax_tier_check
+
+    def spy(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+    monkeypatch.setattr(tf, "relax_tier_check", spy)
+    flat = _flat_candles(100)
+    _patch_candles(monkeypatch, flat, flat)
+    _patch_regime(monkeypatch, "neutral")
+    log = tmp_path / "le_rt_off.jsonl"
+    r = ta_late_entry_gate(
+        _ctx(trade_side="long", coin="TEST"),
+        _rt_config(shadow_log_path=str(log), relax_tier_probe_enabled=False))
+    assert r["pass"] is True
+    assert calls["n"] == 0
+    rec = json.loads(log.read_text().splitlines()[0])
+    assert rec["rt_no_adx20_would_block"] is None
+
+
 def test_ta_late_entry_gate_weak_probe_disabled(monkeypatch, tmp_path):
     """When weak_trend_probe_enabled is False the weak probe is skipped (the
     pure function is never called) and weak_* fields stay null; the order

@@ -1322,6 +1322,7 @@ def ta_late_entry_gate(
             chase_exhaustion_check,
             forming_readings_4h,
             late_entry_check,
+            relax_tier_check,
             weak_trend_noise_check,
         )
         from hermes_trader.client.hl_client import fetch_hl_candles
@@ -1505,6 +1506,40 @@ def ta_late_entry_gate(
         weak_trend_would_block = None
         weak_trend_reason = ""
 
+    # SHADOW-ONLY relax_tier probe (2026-09-11): three independent, tighter
+    # trend-strength counterfactuals scored by relax_tier_check — (1) relax
+    # floor raised ADX 35→45 so the weak 35-45 relax band is judged on STRICT
+    # limits; (2) high RSI (long>=70/short<=30) in a weak trend ADX<35;
+    # (3) any chase with no trend ADX<20. Read-only replays (16 fills + a
+    # 12,429-row graded shadow sample) motivate these: high extension is +EV in
+    # ADX>=45 trends but -EV in weak ones, and the 35-45 relax band is 32% WR.
+    # OBSERVATION ONLY: never feeds the live `blocked` above; wrapped so a
+    # failure can never touch the order path.
+    rt_relax45_would_block = None
+    rt_relax45_reason = ""
+    rt_weak_rsi70_would_block = None
+    rt_weak_rsi70_reason = ""
+    rt_no_adx20_would_block = None
+    rt_no_adx20_reason = ""
+    try:
+        if bool(le_cfg.get("relax_tier_probe_enabled", True)):
+            rt = relax_tier_check(candles_4h, side, le_cfg)
+            if rt.get("data_ok"):
+                rt_relax45_would_block = rt.get("rt_relax45_would_block")
+                rt_relax45_reason = rt.get("rt_relax45_reason", "")
+                rt_weak_rsi70_would_block = rt.get("rt_weak_rsi70_would_block")
+                rt_weak_rsi70_reason = rt.get("rt_weak_rsi70_reason", "")
+                rt_no_adx20_would_block = rt.get("rt_no_adx20_would_block")
+                rt_no_adx20_reason = rt.get("rt_no_adx20_reason", "")
+    except Exception as e:  # never let the probe touch the order path
+        logger.warning(
+            "[risk][gates] ta_late_entry relax-tier counterfactual failed for "
+            "%s (observation only): %s", ctx.coin, e,
+        )
+        rt_relax45_would_block = None
+        rt_weak_rsi70_would_block = None
+        rt_no_adx20_would_block = None
+
     rec = {
         "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "coin": ctx.coin,
@@ -1539,6 +1574,15 @@ def ta_late_entry_gate(
         # probe failure/disabled. Observation only — never feeds live `blocked`.
         "weak_trend_would_block": weak_trend_would_block,
         "weak_trend_reason": weak_trend_reason,
+        # SHADOW-ONLY relax_tier probe (2026-09-11): three tighter trend-strength
+        # counterfactuals — relax floor ADX 35→45, weak-trend high RSI, and
+        # no-trend ADX<20 chase. Observation only; never feeds live `blocked`.
+        "rt_relax45_would_block": rt_relax45_would_block,
+        "rt_relax45_reason": rt_relax45_reason,
+        "rt_weak_rsi70_would_block": rt_weak_rsi70_would_block,
+        "rt_weak_rsi70_reason": rt_weak_rsi70_reason,
+        "rt_no_adx20_would_block": rt_no_adx20_would_block,
+        "rt_no_adx20_reason": rt_no_adx20_reason,
         "reason": verdict.get("reason", ""),
         "rsi4h": verdict.get("rsi4h"),
         "adx4h": verdict.get("adx4h"),
