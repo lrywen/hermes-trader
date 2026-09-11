@@ -125,6 +125,30 @@ FILLS_TOTAL = Counter(
     ["side"],
 )
 
+# ── Backup-SL safety net (audit 2026-09-11, Q6/Q8) ─────────────────────
+# A position whose server-side stop failed twice is queued in
+# executor._pending_sl_retries for aggressive retry. The queue used to be
+# purely in-memory, so a process restart dropped it and the position was left
+# with NO exchange-side stop for the rest of its life (DSL soft stop being a
+# common-cause dependent fallback). These metrics make that tail risk visible
+# and the queue itself is now persisted to disk and reloaded on startup.
+PENDING_SL_RETRIES = Gauge(
+    "hermes_pending_sl_retries",
+    "Number of positions currently awaiting a server-side stop re-arm "
+    "(naked except for the DSL soft-stop loop). Any positive value is "
+    "page-worthy.",
+)
+PENDING_SL_MISSING_TOTAL = Counter(
+    "hermes_pending_sl_missing_total",
+    "Number of times a position entered the pending-SL queue because its "
+    "stop placement failed twice (one per newly-naked position).",
+)
+PENDING_SL_REARM_FAILURES = Counter(
+    "hermes_pending_sl_rearm_failures_total",
+    "Number of deferred stop re-arm attempts that still failed (excluding "
+    "ambiguous openOrders lookups and in-backoff skips).",
+)
+
 # ── P3-1: full-chain instrumentation (2026-08-27) ──────────────────────
 # Every hot-path metric follows the existing contract:
 #   * imported lazily inside the calling function and wrapped in

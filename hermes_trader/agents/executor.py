@@ -9,6 +9,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import json
 import re
 import threading
 import time
@@ -289,6 +290,98 @@ _SIZING_V2_BORROW_BPS = 0.0
 # Pending SL retry queue — positions whose server-side SL failed twice
 # and need aggressive retry at sub-60s intervals.
 _pending_sl_retries: dict[str, dict[str, Any]] = {}
+
+# ── Pending-SL queue persistence (audit 2026-09-11, Q6/Q8) ─────────────────
+# The queue was purely in-memory: after a process restart (crash / watchdog /
+# deploy) a naked position vanished from the queue AND rehydrate_from_exchange
+# never actively re-arms a missing stop, so it could run for the rest of its
+# life with no exchange-side stop (the DSL soft loop is a common-cause fallback
+# that dies with the same process). Mirror the queue to a small JSON state file
+# with an flock and atomic replace; reload on startup. The carried Cloid is
+# stored as its int value and rebuilt on load.
+_PENDING_SL_FILE = os.environ.get(
+    "HERMES_PENDING_SL_FILE",
+    "/data/.pending-sl-retries.json" if os.path.isdir("/data") else ".pending-sl-retries.json",
+)
+_PENDING_SL_LOCK_FILE = f"{_PENDING_SL_FILE}.lock"
+_pending_sl_loaded = False
+
+
+def _persist_pending_sl() -> None:
+    """Atomic best-effort flush of the pending-SL queue; never raises on the
+    trade path. A persistence failure is logged and counted but must not block
+    the (already loud) naked-position handling — the in-memory queue and DSL
+    loop remain the primary guard."""
+    try:
+        import fcntl
+        serial: dict[str, dict[str, Any]] = {}
+        with _EXEC_LOCK:
+            for coin, entry in _pending_sl_retries.items():
+                item = dict(entry)
+                cloid = item.get("cloid")
+                if cloid is not None and hasattr(cloid, "to_raw"):
+                    item["cloid_raw"] = cloid.to_raw()
+                item.pop("cloid", None)
+                serial[coin] = item
+            payload = json.dumps({"version": 1, "entries": serial}, separators=(",", ":"))
+        os.makedirs(os.path.dirname(os.path.abspath(_PENDING_SL_FILE)), exist_ok=True)
+        with open(_PENDING_SL_LOCK_FILE, "w") as lk:
+            fcntl.flock(lk, fcntl.LOCK_EX)
+            tmp = f"{_PENDING_SL_FILE}.tmp"
+            with open(tmp, "w") as f:
+                f.write(payload)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, _PENDING_SL_FILE)
+    except Exception as e:
+        logger.error("[executor] pending-SL queue persist failed: %r", e)
+
+
+def load_pending_sl() -> int:
+    """Reload the persisted pending-SL queue once per process. Rebuilds each
+    entry's Cloid and resets retry timing so entries become retry-eligible
+    promptly after a restart (the naked position has already waited through
+    the downtime). Returns the number of entries restored."""
+    global _pending_sl_loaded
+    if _pending_sl_loaded:
+        return 0
+    _pending_sl_loaded = True
+    try:
+        if not os.path.exists(_PENDING_SL_FILE):
+            return 0
+        with open(_PENDING_SL_FILE) as f:
+            doc = json.load(f)
+        restored = 0
+        with _EXEC_LOCK:
+            for coin, item in (doc.get("entries") or {}).items():
+                cloid_raw = item.pop("cloid_raw", None)
+                item.pop("cloid_int", None)
+                if cloid_raw:
+                    item["cloid"] = Cloid.from_str(cloid_raw)
+                item["last_attempt"] = 0.0  # retry-eligible on first cycle
+                item.setdefault("retry_count", 0)
+                _pending_sl_retries[coin] = item
+                restored += 1
+        if restored:
+            logger.warning(
+                "[executor] Restored %d pending-SL retrie(s) from %s — "
+                "these positions had no server-side stop across the restart",
+                restored, _PENDING_SL_FILE,
+            )
+        return restored
+    except Exception as e:
+        logger.error("[executor] pending-SL queue load failed: %r", e)
+        return 0
+
+
+def _set_pending_sl_gauge() -> None:
+    """Reflect the current naked-position queue depth; best-effort."""
+    try:
+        from hermes_trader import metrics as _m
+        with _EXEC_LOCK:
+            _m.PENDING_SL_RETRIES.set(len(_pending_sl_retries))
+    except Exception:
+        pass
 
 # Idempotency guard for execute(): the memory.get_recent_trades check below
 # races with two concurrent invocations of the same analysis (e.g. scanner
@@ -1819,6 +1912,14 @@ def _place_backup_sl(
                 "retry_count": 0,
                 "last_attempt": time.time(),
             }
+            # Q6/Q8: persist the newly-naked position so a restart re-arms it.
+            try:
+                from hermes_trader import metrics as _m
+                _m.PENDING_SL_MISSING_TOTAL.inc()
+            except Exception:
+                pass
+            _persist_pending_sl()
+            _set_pending_sl_gauge()
     # SL aliveness probe: if the bracket claims a resting SL oid but placement
     # just reported it missing, scream loudly so an operator can reconcile —
     # a "present but dead" stop is the worst failure mode (looks protected in
@@ -5919,6 +6020,9 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
     operator can intervene.
     """
     from hermes_trader.client.exchange import place_hl_trigger_order
+    # Q6: rehydrate any naked positions queued before a crash/restart so they
+    # keep getting a server-side stop instead of vanishing with the process.
+    load_pending_sl()
     now = time.time()
     # Cap the backoff at 5 minutes so a sustained outage retries promptly on
     # recovery while avoiding tight retry loops / rate-limit amplification.
@@ -6029,8 +6133,17 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                     f"(attempt {entry['retry_count']}, next retry in {backoff}s) — "
                     f"position has NO server-side stop, manual intervention required"
                 )
+                try:
+                    from hermes_trader import metrics as _m
+                    _m.PENDING_SL_REARM_FAILURES.inc()
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(
                 f"[executor] Pending SL retry error for {coin} "
                 f"(attempt {entry['retry_count']}): {e} — will keep retrying"
             )
+    # Persist any queue transitions (drained entries, refreshed retry_count/
+    # cloid) and refresh the naked-position gauge after each sweep.
+    _persist_pending_sl()
+    _set_pending_sl_gauge()
