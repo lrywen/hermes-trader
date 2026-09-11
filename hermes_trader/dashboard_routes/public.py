@@ -33,6 +33,7 @@ from hermes_trader.dashboard import (
     _risk_status_payload,
     _summary_payload,
     _tail_log_sse,
+    _trades_payload,
     _ttl_cached,
     feed_client_is_operator,
 )
@@ -207,6 +208,18 @@ def register_public_routes(app: FastAPI) -> None:
         def _serve():
             ttl = _http_cache_params()["closed_trades_ttl_s"]
             return _ttl_cached(f"closed-trades:{limit}", ttl, lambda: _closed_trades_payload(limit))
+
+        payload = await asyncio.to_thread(_serve)
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/trades")
+    async def dashboard_trades(limit: int = Query(20, ge=1, le=200)) -> JSONResponse:
+        # Unified fills timeline: real opens (session-log execute fills) and
+        # closes, paired into round trips. Same cache/visibility as
+        # /closed-trades (anonymous-readable, redacted by the portal proxy).
+        def _serve():
+            ttl = _http_cache_params()["closed_trades_ttl_s"]
+            return _ttl_cached(f"trades:{limit}", ttl, lambda: _trades_payload(limit))
 
         payload = await asyncio.to_thread(_serve)
         return JSONResponse(payload)

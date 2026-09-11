@@ -759,7 +759,12 @@ def _rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
 
 # Preference order when the same fill is reported by multiple sources: the
 # reconciled record (events.jsonl) is richest; the AI audit row is poorest.
-_CLOSE_SOURCE_RANK = {"reconcile": 0, "external": 1, "dsl": 2, "manual": 3, "ai": 4}
+# "dsl_outcome" is a dsl_exit mirrored into events.jsonl (the outcome log keeps
+# ~17 such mirrors while the high-frequency session log keeps only a handful);
+# it is the strategy-reason twin of an events.jsonl `close`, so it ranks with
+# the session-log dsl rows and merges cross-source into the reconcile winner.
+_CLOSE_SOURCE_RANK = {"reconcile": 0, "external": 1, "dsl": 2, "dsl_outcome": 2,
+                      "manual": 3, "ai": 4}
 
 
 def _find_open_side(events: list[dict[str, Any]], coin: str, before_idx: int) -> Optional[str]:
@@ -848,6 +853,7 @@ def _close_row(
     leverage: int,
     leverage_estimated: bool,
     reason: Any,
+    exit_mechanism: Any = None,
     pnl_pct: Any,
     pnl_pct_gross: Any,
     pnl_source: str,
@@ -857,9 +863,25 @@ def _close_row(
     entry_px: Any,
     executed: bool,
     detail: Any,
+    close_oid: Any = None,
+    pnl_usd: Any = None,
+    gross_pnl_usd: Any = None,
+    fee_usd: Any = None,
+    notional_usd: Any = None,
+    hold_minutes: Any = None,
+    entry_regime: Any = None,
 ) -> dict[str, Any]:
-    """A single closed-trade row; field set is identical across all sources."""
+    """A single closed-trade row; field set is identical across all sources.
+
+    `reason` carries the STRATEGY exit semantics (trailing stop / max loss /
+    timeout / exchange trigger …); `exit_mechanism` carries HOW the fill was
+    produced (dsl market close vs. an exchange-side SL/TP trigger vs. manual).
+    Dollar amounts (`pnl_usd` net realized, `gross_pnl_usd`, `fee_usd`,
+    `notional_usd`) are only populated by sources that actually measured them
+    (events.jsonl `close` / external_close_recorded) and stay None otherwise.
+    """
     return {
+        "kind": "close",
         "ts": ts,
         "coin": coin,
         "source": source,
@@ -867,6 +889,7 @@ def _close_row(
         "leverage": leverage,
         "leverage_estimated": leverage_estimated,
         "reason": reason,
+        "exit_mechanism": exit_mechanism,
         "pnl_pct": pnl_pct,
         "pnl_pct_gross": pnl_pct_gross,
         "pnl_source": pnl_source,  # "fill" = exact, "estimated"/"unknown" = not
@@ -876,7 +899,35 @@ def _close_row(
         "entry_px": entry_px,
         "executed": executed,
         "detail": detail,
+        "close_oid": close_oid,
+        "pnl_usd": pnl_usd,
+        "gross_pnl_usd": gross_pnl_usd,
+        "fee_usd": fee_usd,
+        "notional_usd": notional_usd,
+        "hold_minutes": hold_minutes,
+        "entry_regime": entry_regime,
+        # Filled in by the open/close pairing step:
+        "pair_id": None,
+        "open_ts": None,
     }
+
+
+def _canon_exit_reason(reason: Any) -> Any:
+    """Canonicalise a DSL exit reason the same way trading_loop._process_exits
+    does (floor_breach* → trailing_stop, etc.) so the UI shows the strategy
+    reason instead of the raw floor-price detail string."""
+    if not reason or not isinstance(reason, str):
+        return reason
+    r = reason
+    if r.startswith("floor_breach"):
+        return "trailing_stop"
+    if r.startswith("max_loss"):
+        return "max_loss"
+    if r.startswith("hard_timeout"):
+        return "hard_timeout"
+    if r.startswith("stale_flat_timeout"):
+        return "stale_flat_timeout"
+    return r.split(" ")[0]
 
 
 def _row_from_dsl_exit(
@@ -903,13 +954,36 @@ def _row_from_dsl_exit(
         net_pnl_pct = gross_pnl_pct - fees_pct
         pnl_source = "estimated"
 
+    # Strategy reason: prefer the canonical exit_reason the trading loop
+    # computes (trailing_stop / max_loss / …); raw `reason` may carry a
+    # verbose floor_breach detail string. exit_mechanism says HOW it filled.
+    reason = _canon_exit_reason(e.get("exit_reason") or e.get("reason", ""))
+    raw_reason = str(e.get("reason") or "")
+    if e.get("close_source") == "exchange_trigger" or raw_reason == "external_close_backfill":
+        mechanism = "exchange_trigger"
+    else:
+        mechanism = "dsl_market"
+    # Backfill mirrors of exchange triggers do not carry the original DSL
+    # strategy reason; say so honestly instead of mislabeling it.
+    if raw_reason == "external_close_backfill":
+        reason = "exchange_trigger"
+    detail = e.get("detail")
+    close_oid = None
+    if detail and "oid=" in str(detail):
+        try:
+            close_oid = int(str(detail).split("oid=")[-1].split()[0])
+        except (ValueError, IndexError):
+            close_oid = None
+    hold_minutes = e.get("hold_min")
     return _close_row(
         ts=e.get("ts"), coin=coin, source="dsl", side=side,
         leverage=leverage, leverage_estimated=leverage_estimated,
-        reason=e.get("reason", ""), pnl_pct=net_pnl_pct,
+        reason=reason, exit_mechanism=mechanism, pnl_pct=net_pnl_pct,
         pnl_pct_gross=gross_pnl_pct, pnl_source=pnl_source, fees_pct=fees_pct,
         spot_pct=spot_pct, fill_px=e.get("fill_px"), entry_px=e.get("entry_px"),
-        executed=bool(e.get("executed")), detail=e.get("detail"),
+        executed=bool(e.get("executed")), detail=detail,
+        close_oid=close_oid, hold_minutes=hold_minutes,
+        entry_regime=e.get("entry_regime"),
     )
 
 
@@ -949,7 +1023,8 @@ def _row_from_close_position(
     return _close_row(
         ts=e.get("ts"), coin=coin, source="manual", side=side,
         leverage=leverage, leverage_estimated=leverage_estimated,
-        reason=e.get("reason") or "manual_close", pnl_pct=net_pnl_pct,
+        reason=e.get("reason") or "manual_close",
+        exit_mechanism="manual", pnl_pct=net_pnl_pct,
         pnl_pct_gross=gross_pnl_pct, pnl_source=pnl_source, fees_pct=fees_pct,
         spot_pct=spot_pct, fill_px=fill_px, entry_px=entry_px,
         executed=bool(e.get("ok", e.get("executed"))), detail=e.get("detail"),
@@ -968,19 +1043,40 @@ def _row_from_external_close(
     side, leverage, leverage_estimated = _close_side_and_leverage(e, events, idx, estimate_leverage)
     entry_px = e.get("entry_px")
     exit_px = e.get("exit_px")
-    realized_usd = e.get("realized_pnl_usd")
+    realized_usd = float(e["realized_pnl_usd"]) if e.get("realized_pnl_usd") is not None else None
     spot_pct = float(e.get("spot_pct") or 0)
-    if realized_usd is not None and entry_px and exit_px:
-        size_coin = abs(float(realized_usd)
-                        / max(abs(exit_px - entry_px), 1e-12))
-        notional = size_coin * float(entry_px)
-        if notional > 0:
-            net_pnl_pct = float(realized_usd) / notional * 100.0 * leverage
+    notional = None
+    fee_usd = None
+    gross_usd = None
+    if realized_usd is not None and entry_px and exit_px and abs(spot_pct) > 1e-9:
+        # Recover notional from the MEASURED net dollar PnL. Position-aware
+        # gross move is |exit-entry| per coin; net = gross − entry fee − exit
+        # fee = size·|Δpx| − size·fee_per_side·(entry + exit). Inverting that
+        # identity recovers size (the previous code inverted on net alone,
+        # treating net as gross — 14.44% vs the real 14.19% ROE — and a
+        # later variant charged the round-trip rate twice over entry).
+        try:
+            fee_per_side = HL_TAKER_FEE_PCT / 100.0
+            size_coin = abs(realized_usd) / max(
+                abs(float(exit_px) - float(entry_px))
+                - fee_per_side * (float(entry_px) + float(exit_px)), 1e-12)
+            notional = size_coin * float(entry_px)
+        except (TypeError, ValueError, ZeroDivisionError):
+            notional = None
+        if notional and notional > 0 and leverage:
+            gross_usd = notional * spot_pct / 100.0
+            fee_usd = max(0.0, gross_usd - realized_usd)
+            net_pnl_pct = realized_usd / notional * 100.0 * leverage
+            gross_pnl_pct = spot_pct * leverage
+            fees_pct = gross_pnl_pct - net_pnl_pct
         else:
-            net_pnl_pct = spot_pct * leverage
-        gross_pnl_pct = spot_pct * leverage
-        fees_pct = gross_pnl_pct - net_pnl_pct
-        pnl_source = "fill"
+            gross_pnl_pct = spot_pct * leverage
+            fees_pct = HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage
+            net_pnl_pct = gross_pnl_pct - fees_pct
+        # Dollar PnL here is the actual settled amount (net of the closing
+        # fee, entry fee estimated); the PERCENT is reconstructed, not read
+        # from the fill, so mark it estimated rather than "fill".
+        pnl_source = "fill_usd"
     else:
         gross_pnl_pct = spot_pct * leverage
         fees_pct = HL_TAKER_FEE_PCT * HL_ROUND_TRIP_FILLS * leverage
@@ -989,11 +1085,15 @@ def _row_from_external_close(
     return _close_row(
         ts=e.get("ts"), coin=coin, source="external", side=side,
         leverage=leverage, leverage_estimated=leverage_estimated,
-        reason="exchange_trigger", pnl_pct=net_pnl_pct,
+        reason="exchange_trigger", exit_mechanism="exchange_trigger",
+        pnl_pct=net_pnl_pct,
         pnl_pct_gross=gross_pnl_pct, pnl_source=pnl_source, fees_pct=fees_pct,
         spot_pct=spot_pct, fill_px=exit_px, entry_px=entry_px,
         executed=True,
         detail=f"oid={e.get('oid')}" if e.get("oid") else None,
+        close_oid=e.get("oid"),
+        pnl_usd=realized_usd, gross_pnl_usd=gross_usd, fee_usd=fee_usd,
+        notional_usd=round(notional, 4) if notional else None,
     )
 
 
@@ -1012,6 +1112,7 @@ def _row_from_ai_close(
         ts=e.get("ts"), coin=coin, source="ai", side=side,
         leverage=leverage, leverage_estimated=True,
         reason=(e.get("reasoning") or "ai_close")[:120],
+        exit_mechanism="ai_market",
         pnl_pct=None, pnl_pct_gross=None, pnl_source="unknown",
         fees_pct=None, spot_pct=None, fill_px=None, entry_px=None,
         executed=bool(e.get("executed")), detail=e.get("detail"),
@@ -1046,17 +1147,53 @@ def _row_from_outcome_close(
         net_pnl_pct = gross_pnl_pct - fees_pct
         pnl_source = "estimated"
     close_source = p.get("close_source") or "reconcile"
+    # close_source is the FILL mechanism, not the strategy reason: map it to
+    # exit_mechanism and leave reason for the strategy semantics (filled in
+    # from the matching session-log dsl_exit during cross-source enrichment;
+    # exchange-side triggers are themselves the reason, though).
+    if close_source in ("exchange_trigger", "exchange_trigger_manual_backfill",
+                        "reconcile_backfill", "rehydrate_synth"):
+        mechanism = "exchange_trigger"
+        reason = "exchange_trigger"
+    else:
+        mechanism = "dsl_market"
+        reason = None  # enriched from the dsl_exit mirror; None → UI shows "—"
+    detail = (f"hold={p.get('hold_minutes')}m oid={p.get('close_oid')}"
+              if p.get("hold_minutes") is not None
+              else (f"oid={p.get('close_oid')}" if p.get("close_oid") else None))
     return _close_row(
         ts=ts, coin=coin, source="reconcile",
         side=p.get("side") or "?", leverage=leverage,
         leverage_estimated=p.get("leverage") is None,
-        reason=close_source, pnl_pct=net_pnl_pct,
+        reason=reason, exit_mechanism=mechanism, pnl_pct=net_pnl_pct,
         pnl_pct_gross=gross_pnl_pct, pnl_source=pnl_source, fees_pct=fees_pct,
         spot_pct=spot_pct, fill_px=fill_px, entry_px=entry_px,
-        executed=True,
-        detail=f"hold={p.get('hold_minutes')}m oid={p.get('close_oid')}"
-               if p.get("hold_minutes") is not None else None,
+        executed=True, detail=detail,
+        close_oid=p.get("close_oid"),
+        pnl_usd=(float(p["realized_pnl_usd"])
+                 if p.get("realized_pnl_usd") is not None else None),
+        gross_pnl_usd=(float(p["gross_pnl_usd"])
+                       if p.get("gross_pnl_usd") is not None else None),
+        fee_usd=float(p["fee_usd"]) if p.get("fee_usd") is not None else None,
+        notional_usd=float(p["notional_usd"]) if p.get("notional_usd") else None,
+        hold_minutes=p.get("hold_minutes"),
+        entry_regime=p.get("regime_at_entry") or None,
     )
+
+
+def _row_from_outcome_dsl_exit(
+    rec: dict[str, Any], estimate_leverage: Callable[[str], int],
+) -> dict[str, Any]:
+    # A `dsl_exit` mirrored into events.jsonl — carries the STRATEGY reason
+    # (max_loss / trailing_stop / stale_flat_timeout / exchange_trigger …) that
+    # the companion `close` record lacks. Flatten the nested payload into the
+    # session-log dsl_exit shape and reuse that parser; the outcome timestamps
+    # are ISO second-precision, so convert to epoch ms.
+    p = dict(rec.get("payload") or {})
+    p.setdefault("ts", _iso_to_ms(rec.get("timestamp")))
+    row = _row_from_dsl_exit(p, [], -1, estimate_leverage)
+    row["source"] = "dsl_outcome"
+    return row
 
 
 # Session-log close-event parsers, keyed by event name.
@@ -1068,39 +1205,100 @@ _SESSION_CLOSE_PARSERS: dict[str, Callable] = {
 }
 
 
+def _merge_close_rows(winner: dict[str, Any], loser: dict[str, Any]) -> None:
+    """Fill the winning duplicate row's gaps from the losing source.
+
+    Rank picks the row with the best MEASURED money fields (reconcile >
+    external > dsl …), but the loser often carries context the winner lacks:
+    a session-log ``dsl_exit`` knows the strategy reason (trailing stop /
+    max loss …), while an events.jsonl ``close`` only knows the fill
+    mechanism; conversely the dsl row lacks measured dollar amounts. Each
+    side fills the other's blanks in place.
+    """
+    if not winner.get("reason") and loser.get("reason"):
+        winner["reason"] = loser["reason"]
+    for k in ("exit_mechanism", "close_oid", "pnl_usd", "gross_pnl_usd",
+              "fee_usd", "notional_usd", "hold_minutes", "entry_regime",
+              "entry_px", "fill_px", "spot_pct", "leverage"):
+        if winner.get(k) in (None, "", "?") and loser.get(k) not in (None, "", "?"):
+            winner[k] = loser[k]
+    if winner.get("leverage_estimated") and not loser.get("leverage_estimated"):
+        winner["leverage_estimated"] = False
+    # A modeled percentage on the winner yields to a fill-derived one.
+    if winner.get("pnl_source") in ("estimated", "unknown") and loser.get("pnl_pct") is not None:
+        for k in ("pnl_pct", "pnl_pct_gross", "fees_pct", "pnl_source"):
+            if loser.get(k) is not None:
+                winner[k] = loser[k]
+
+
+def _rows_are_same_fill(m: dict[str, Any], r: dict[str, Any], window_ms: int) -> bool:
+    if m.get("coin") != r.get("coin"):
+        return False
+    m_side = (m.get("side") or "").lower() or None
+    r_side = (r.get("side") or "").lower() or None
+    if r_side != m_side:
+        return False
+    # A shared exchange fill oid is a positive identity even when the mirrors
+    # landed far apart (backfill after a restart can trail by > the time
+    # window); fall back to the coin+side time window only when oids absent.
+    m_oid = m.get("close_oid")
+    r_oid = r.get("close_oid")
+    if m_oid is not None and r_oid is not None:
+        return m_oid == r_oid
+    same_source = m.get("source") == r.get("source")
+    if same_source:
+        # Two rows from one source are normally distinct trades — EXCEPT the
+        # executor's DSL-path record_close (a modeled `close` with no oid) and
+        # the exchange-trigger backfill of the SAME fill (a `close` with the
+        # real oid and measured fees). Merge an oid-less reconcile row with an
+        # oid-bearing one inside the window; two oid-less / two oid-bearing
+        # rows stay distinct (genuine sequential closes).
+        if m.get("source") != "reconcile":
+            return False
+        if not (m_oid is None) ^ (r_oid is None):
+            return False
+    return bool(m.get("ts") and r.get("ts")
+                and abs(int(m["ts"]) - int(r["ts"])) <= window_ms)
+
+
 def _deduplicate_close_rows(rows: list[dict[str, Any]], window_ms: int) -> list[dict[str, Any]]:
     """Merge cross-source duplicates of one fill; newest-first.
 
     A single fill can be reported by MULTIPLE sources (a dsl_exit backfill + its
     external_close_recorded mirror, or an events.jsonl `close`) — merge only
-    those cross-source duplicates for the same coin AND side within the window.
-    Two rows from the SAME source are always distinct trades (a greedy
-    nearest-window match here would chain several rapid sequential closes into
-    one, F2/limit bug). Prefer the richest row (rank in
-    ``_CLOSE_SOURCE_RANK``: `reconcile` > `external` > `dsl` > `manual` > `ai`).
+    those cross-source duplicates for the same coin AND side. Identity is a
+    shared ``close_oid`` when both rows carry one, else the time window
+    (default 5s). Two rows from the SAME source are always distinct trades (a
+    greedy nearest-window match here would chain several rapid sequential
+    closes into one, F2/limit bug). Prefer the richest row (rank in
+    ``_CLOSE_SOURCE_RANK``: `reconcile` > `external` > `dsl` > `manual` > `ai`)
+    and back-fill its missing fields from the loser via ``_merge_close_rows``.
+    Within one rank the MEASURED row (carries a real exchange close_oid) sorts
+    ahead of the modeled checkpoint row so the measured dollars/fees win.
     """
+    def _evidence(rank_row: dict[str, Any]) -> int:
+        return 0 if rank_row.get("close_oid") is not None else 1
+
     rows.sort(key=lambda r: (
-        -(r.get("ts") or 0),
         _CLOSE_SOURCE_RANK.get(r.get("source"), 9),
+        _evidence(r),
+        -(r.get("ts") or 0),
     ))
     merged: list[dict[str, Any]] = []
     for r in rows:
-        dup = None
-        r_side = (r.get("side") or "").lower() or None
-        for m in merged:
-            m_side = (m.get("side") or "").lower() or None
-            if (m.get("source") != r.get("source")
-                    and m.get("coin") == r.get("coin")
-                    and r_side == m_side
-                    and m.get("ts") and r.get("ts")
-                    and abs(int(m["ts"]) - int(r["ts"])) <= window_ms):
-                dup = m
-                break
+        dup = next((m for m in merged if _rows_are_same_fill(m, r, window_ms)), None)
         if dup is None:
             merged.append(r)
-        elif _CLOSE_SOURCE_RANK.get(r.get("source"), 9) < _CLOSE_SOURCE_RANK.get(dup.get("source"), 9):
+            continue
+        r_rank = _CLOSE_SOURCE_RANK.get(r.get("source"), 9)
+        dup_rank = _CLOSE_SOURCE_RANK.get(dup.get("source"), 9)
+        if r_rank < dup_rank or (r_rank == dup_rank
+                                 and _evidence(r) < _evidence(dup)):
+            _merge_close_rows(r, dup)
             merged.remove(dup)
             merged.append(r)
+        else:
+            _merge_close_rows(dup, r)
 
     merged.sort(key=lambda r: -(r.get("ts") or 0))
     return merged
@@ -1147,16 +1345,132 @@ def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
         if parser is not None:
             rows.append(parser(events[i], events, i, _estimate_leverage))
 
-    # ── events.jsonl: authoritative reconciled `close` records ──
+    # ── events.jsonl: authoritative reconciled `close` records + dsl_exit mirrors ──
     for rec in _read_outcome_lines():
         if rec.get("event") == "close":
             rows.append(_row_from_outcome_close(rec, _estimate_leverage))
+        elif rec.get("event") == "dsl_exit":
+            # Strategy-reason twin (max_loss / trailing_stop / timeout …);
+            # merges cross-source into its reconcile `close`.
+            rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
 
     # ── De-duplicate cross-source reports of the same fill (see helper) ──
     # R13-B11: window resolves through dashboard_equity.dedup_window_ms (legacy
     # HERMES_CLOSED_TRADES_DEDUP_MS env still wins; 5000ms literal as fallback).
     dedup_window_ms = int(_dashboard_equity_params()["dedup_window_ms"])
     return _deduplicate_close_rows(rows, dedup_window_ms)[:limit]
+
+
+def _open_row(e: dict[str, Any]) -> dict[str, Any]:
+    """A session-log `execute` event that actually FILLED → open timeline row."""
+    return {
+        "kind": "open",
+        "ts": e.get("ts"),
+        "coin": e.get("coin", "?"),
+        "side": e.get("side") or "?",
+        "entry_px": e.get("entry_px"),
+        "notional_usd": float(e["size_usd"]) if e.get("size_usd") is not None else None,
+        "stop_px": e.get("stop_px"),
+        "tp_px": e.get("tp_px"),
+        "regime": e.get("regime"),
+        "funding_regime": e.get("funding_regime"),
+        "counter_regime": e.get("counter_regime"),
+        "sl_missing": e.get("sl_missing"),
+        "bracket_error": e.get("bracket_error"),
+        "gates": e.get("gates"),
+        "close_oid": None,
+        # detail is the exchange order id when the order filled.
+        "order_id": e.get("detail"),
+        "executed": True,
+        "detail": e.get("detail"),
+        # Filled in by pairing; kept on both row kinds for UI symmetry.
+        "pair_id": None,
+        "close_ts": None,
+    }
+
+
+def _pair_opens_and_closes(
+    close_rows: list[dict[str, Any]], events: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Build a unified newest-first timeline of fills: real opens (execute
+    executed=true) interleaved with the deduplicated close rows, and pair each
+    close with its open (same coin+side, closest earlier unmatched open).
+
+    Pairing stamps ``pair_id``/``open_ts``/``hold_minutes`` on the close and
+    ``pair_id``/``close_ts`` on the open so the UI can render the two legs as
+    one round trip. Opens left without a close are still listed (the open
+    history the old panel hid entirely).
+    """
+    # Filled opens in chronological order, grouped by (coin, side).
+    opens_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for e in events:
+        if e.get("event") == "execute" and e.get("executed"):
+            row = _open_row(e)
+            opens_by_key.setdefault((row["coin"], row["side"]), []).append(row)
+
+    consumed: set[int] = set()  # id() of open rows already paired
+    # Pair oldest close first so sequential round trips take opens in order
+    # (close_rows arrive newest-first; pairing that way would let the latest
+    # close consume the shared queue's most recent open before an older close
+    # could claim it).
+    for c in sorted(close_rows, key=lambda r: (r.get("ts") or 0)):
+        queue = opens_by_key.get((c.get("coin"), c.get("side"))) or []
+        c_ts = c.get("ts")
+        match = None
+        if c_ts:
+            # Most recent unmatched open strictly before the close (a close
+            # can never pair with an open that printed after it).
+            for o in reversed(queue):
+                if id(o) in consumed:
+                    continue
+                if (o.get("ts") or 0) <= int(c_ts):
+                    match = o
+                    break
+        if match is None:
+            continue
+        consumed.add(id(match))
+        pair_id = f"{match['coin']}-{match['side']}-{match.get('ts')}"
+        match["pair_id"] = pair_id
+        match["close_ts"] = c_ts
+        c["pair_id"] = pair_id
+        c["open_ts"] = match.get("ts")
+        if c.get("hold_minutes") is None and match.get("ts") and c_ts:
+            c["hold_minutes"] = round((int(c_ts) - int(match["ts"])) / 60000.0, 2)
+
+    timeline: list[dict[str, Any]] = list(close_rows)
+    timeline.extend(o for q in opens_by_key.values() for o in q)
+    timeline.sort(key=lambda r: -(r.get("ts") or 0))
+    return timeline
+
+
+def _trades_payload(limit: int = 20) -> list[dict[str, Any]]:
+    """Unified fills timeline (opens + closes, newest-first).
+
+    Close rows are deduped exactly as in ``_closed_trades_payload`` and capped
+    at `limit`; the latest unmatched opens are appended so open history is
+    never hidden. The resulting timeline may therefore hold up to ~2×limit
+    rows. Open rows carry ``kind="open"``; close rows ``kind="close"``.
+    """
+    events = _read_log_lines()
+    cfg_leverage: list[int] = []
+
+    def _estimate_leverage(coin: str) -> int:
+        return _estimate_close_leverage(coin, cfg_leverage)
+
+    rows: list[dict[str, Any]] = []
+    for i in range(len(events) - 1, -1, -1):
+        parser = _SESSION_CLOSE_PARSERS.get(events[i].get("event"))
+        if parser is not None:
+            rows.append(parser(events[i], events, i, _estimate_leverage))
+    for rec in _read_outcome_lines():
+        if rec.get("event") == "close":
+            rows.append(_row_from_outcome_close(rec, _estimate_leverage))
+        elif rec.get("event") == "dsl_exit":
+            rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
+
+    dedup_window_ms = int(_dashboard_equity_params()["dedup_window_ms"])
+    close_rows = _deduplicate_close_rows(rows, dedup_window_ms)[:limit]
+    return _pair_opens_and_closes(close_rows, events)
 
 
 # A heartbeat that momentarily failed to fetch a HIP-3 dex reports equity far
