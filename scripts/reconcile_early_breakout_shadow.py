@@ -29,14 +29,14 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config_store import cfg_get, read_agent_config  # noqa
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.client.hl_client import fetch_hl_candles
 
 SHADOW_FILE = os.environ.get(
     "HERMES_EARLY_BREAKOUT_SHADOW_FILE",
