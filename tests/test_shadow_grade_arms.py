@@ -162,12 +162,19 @@ def test_collecting_when_rate_too_low_to_matter(sg):
 
 
 def test_enforce_arm_never_promotes(sg):
-    # An arm already in enforce must never be told PROMOTE (nothing to promote to).
+    # An arm already in enforce must never be told PROMOTE (nothing to promote
+    # to). Audit 2026-09-10 (M1): with data and no health alarm it now gets the
+    # dedicated ENFORCE_MAINTAIN health verdict instead of the promotion-oriented
+    # COLLECTING wording.
     now = 1_700_000_000_000.0
     recs = [_rec(now, would_block=(i < 7)) for i in range(70)]
     out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
                        now_ms=now, records=recs)
-    assert out["verdict"] == sg.COLLECTING
+    assert out["verdict"] == sg.MAINTAIN
+    # Below the sample floor it still reports collecting.
+    few = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=[_rec(now, would_block=True)] * 10)
+    assert few["verdict"] == sg.COLLECTING
 
 
 # ── verdict: REVIEW (backfilled counterfactual outcomes) ──────────────────────
@@ -237,17 +244,49 @@ def test_change_arm_promote_reason_reports_arm_beneficial_rate(sg):
     for i in range(3):
         recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
                          outcome="win", pnl_usd=0.5))
+    # M2 (2026-09-10): every changed record is a >1% notional change. Add a
+    # substantial non-change tail so hit rate stays under 50% and the test
+    # isolates the beneficial-rate label, not the width rule.
     for i in range(40):
         recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0))
+    for i in range(180):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=100.2))
+    # Mature set stays exactly the 25 outcomes above (backfill 25/245=10% is
+    # below the M4 floor); assert the low-confidence COLLECTING path explicitly
+    # instead, and keep the beneficial-rate label pinned below in the
+    # sufficient-backfill variant.
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.COLLECTING  # M4: 10% backfill blocks promotion
+    assert any("回填率仅 10.2%" in w for w in out.get("warnings", []))
+
+
+def test_change_arm_promote_shows_beneficial_rate_when_backfilled(sg):
+    # Same 22/25 beneficial mature set but with ≥20% backfill: the arm-beneficial
+    # rate (88%) must appear in the PROMOTE reason.
+    now = 1_700_000_000_000.0
+    recs = []
+    for i in range(22):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="loss", pnl_usd=-1.0))
+    for i in range(3):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="win", pnl_usd=0.5))
+    # 25 more mature beneficial outcomes on changed rows → hit set 50 mature
+    # with 3 harmful = 6% harmful / 94% beneficial; overall hit rate 50/100.
+    for i in range(25):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="loss", pnl_usd=-1.0))
+    # 50 non-change mature tail → backfill 100%, hit rate 50% (not >50%).
+    for i in range(50):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=100.2,
+                         outcome="loss"))
     out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.PROMOTE
     assert out["kind"] == "change"
-    # The arm-beneficial rate (22/25 = 88%) must be shown, and the misleading
-    # bare "回填胜率" phrasing must NOT appear for a change arm.
-    assert "臂有益率" in out["reason"]
-    assert "88%" in out["reason"]
-    assert "回填胜率" not in out["reason"]
+    assert "臂有益率 94%" in out["reason"]
+    assert out["hit_set_mature"] == 50
 
 
 def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
@@ -516,3 +555,500 @@ def test_report_renders_and_contains_all_verdicts(sg):
     assert "DATA_GAP" not in report  # Chinese label used, not the raw token
     assert "采数缺口" in report
     assert "可考虑升enforce" in report
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Audit 2026-09-10 — mechanism-defect remediation (M1/M2/M3/M4/M8/M12/M13/M14)
+# ════════════════════════════════════════════════════════════════════════════
+
+H = 3600 * 1000
+
+
+# ── ta_late_entry 命中率口径修正：prefilter 观察流不污染 gate 宽度 ──────────
+
+def test_ta_prefilter_only_records_do_not_inflate_hit_rate(sg):
+    # 生产实况：~26k 条全是 prefilter 层（只记拦截，天然 100% blocked），
+    # 真实 gate 层 348 次仅拦 1 次。宽度必须只数 gate 层 → 0.3%，不触发
+    # too_wide，enforce 臂应判 MAINTAIN。
+    now = 1_700_000_000_000.0
+    recs = []
+    # 200 条 prefilter 拦截观察（每条都带反事实 outcome，模拟已回填）
+    for _ in range(200):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="loss"))
+    # gate 层：300 次真实决策，只拦 1 次
+    for _ in range(299):
+        recs.append(_rec(now, layer="gate", blocked=False))
+    recs.append(_rec(now, layer="gate", blocked=True))
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    long = out["windows"][0]
+    assert long["decision_scope"] == "gate_layer"
+    assert long["total"] == 500          # 全量观察仍计入 total
+    assert long["decisions"] == 300      # 命中率分母只含 gate
+    assert long["hits"] == 1
+    assert long["hit_rate"] < 0.01
+    assert out["verdict"] == sg.MAINTAIN
+    assert "下单闸门" in out["reason"]
+
+
+def test_ta_legacy_records_without_layer_count_as_gate(sg):
+    # 8-29 前旧记录无 layer 字段，按 gate 语义计入命中率分母。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, blocked=True) for _ in range(40)]
+    recs += [_rec(now, blocked=False) for _ in range(20)]
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    long = out["windows"][0]
+    assert long["decisions"] == 60 and long["hits"] == 40
+    # 40/60 = 66.7% > 50% → 真实 gate 太宽，仍应触发降级复核
+    assert out["verdict"] == sg.DEGRADED_REVIEW
+
+
+def test_other_arms_hit_rate_unaffected_by_layer_scope(sg):
+    # 非 ta_late_entry 臂维持全记录口径，decision_scope=all_records。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, layer="prefilter", would_block=True) for _ in range(10)]
+    s = sg._window_stats(recs, "block", 168, now, arm="daily_extension_cap")
+    assert s["decision_scope"] == "all_records"
+    assert s["decisions"] == 10 and s["hits"] == 10
+
+
+# ── M1: enforce arms get a health verdict, never a promotion-oriented one ─────
+
+def test_enforce_high_hit_rate_triggers_degraded_review(sg):
+    # ta_late_entry production profile: 97% hit rate, mature harm rate 37%.
+    # Width alone (>50%) must raise ENFORCE_DEGRADED_REVIEW, not a benign
+    # "collecting/maintain" verdict.
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, blocked=True) for _ in range(60)]
+    recs += [_rec(now, blocked=False) for _ in range(2)]
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.DEGRADED_REVIEW
+    assert "拦/改太宽" in out["reason"]
+
+
+def test_enforce_harmful_rate_triggers_degraded_review(sg):
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(15):  # 60% harmful, moderate 30% hit rate
+        recs.append(_rec(now, would_block=True, outcome="win"))
+    for _ in range(10):
+        recs.append(_rec(now, would_block=True, outcome="loss"))
+    for _ in range(35):
+        recs.append(_rec(now, would_block=False))
+    out = sg.grade_arm("daily_extension_cap", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.DEGRADED_REVIEW
+    assert "臂有害率" in out["reason"]
+
+
+def test_enforce_healthy_arm_maintains(sg):
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(5):
+        recs.append(_rec(now, would_block=True, outcome="win"))
+    for _ in range(20):
+        recs.append(_rec(now, would_block=True, outcome="loss"))
+    for _ in range(45):
+        recs.append(_rec(now, would_block=False))
+    out = sg.grade_arm("reentry_cap", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.MAINTAIN
+    assert "维持" in out["reason"]
+
+
+# ── M2: shadow arms with >50% hit rate are REVIEW (too wide) ─────────────────
+
+def test_shadow_too_wide_with_no_outcomes_is_review(sg):
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - H, would_block=True) for _ in range(60)]
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.REVIEW
+    assert "太宽" in out["reason"]
+
+
+def test_shadow_wide_but_healthy_outcomes_still_review(sg):
+    # 90% hit rate, harm rate only 10%: healthy effectiveness, but width alone
+    # blocks promotion pending human review.
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_change=True, outcome="win") for _ in range(5)]
+    recs += [_rec(now, would_change=True, outcome="loss") for _ in range(45)]
+    recs += [_rec(now, would_change=False, outcome="loss") for _ in range(10)]
+    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.REVIEW
+    assert out["windows"][-1]["decisions"] == 60
+
+
+# ── M3: PROMOTE requires ≤40% harm rate safety margin ────────────────────────
+
+def test_promote_grey_zone_45pct_harm_is_collecting(sg):
+    # confidence_decay production profile: 45.1% harm rate, healthy backfill.
+    now = 1_700_000_000_000.0
+    recs = []
+    # 45% harm rate (45 wins / 100 mature) on hit records. All 400 records are
+    # mature (100% backfill clears M4); only the first 100 are hits so the
+    # overall hit rate is 25% (under the too-wide line).
+    for _ in range(45):
+        recs.append(_rec(now, would_block_gate=True, outcome="win"))
+    for _ in range(55):
+        recs.append(_rec(now, would_block_gate=True, outcome="loss"))
+    for _ in range(300):
+        recs.append(_rec(now, would_block_gate=False, outcome="loss"))
+    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.COLLECTING
+    assert "安全余量" in out["reason"]
+
+
+def test_promote_at_40pct_or_below_harm_passes(sg):
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_block=True, outcome="win") for _ in range(8)]
+    recs += [_rec(now, would_block=True, outcome="loss") for _ in range(17)]
+    recs += [_rec(now, would_block=False, outcome="loss") for _ in range(40)]
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.PROMOTE
+
+
+# ── M4: low backfill → low-confidence REVIEW / blocked PROMOTE ───────────────
+
+def test_low_backfill_harmful_review_is_flagged_low_confidence(sg):
+    # atr_regime_calib profile: 325 records, 25 mature, 22 wins (88%), 7.7%.
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_change=True, outcome="win") for _ in range(22)]
+    recs += [_rec(now, would_change=True, outcome="loss") for _ in range(3)]
+    recs += [_rec(now, would_change=(i < 0)) for i in range(300)]
+    out = sg.grade_arm("atr_regime_calib", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.REVIEW
+    assert "低置信" in out["reason"]
+    assert any("回填率仅 7.7%" in w for w in out["warnings"])
+    assert any("独立场景" in w for w in out["warnings"])
+    assert out["backfill_rate"] == sg.pytest.approx(25 / 325, abs=0.001) \
+        if hasattr(sg, "pytest") else out["backfill_rate"] > 0
+
+
+def test_low_backfill_healthy_arm_collecting_not_promote(sg):
+    now = 1_700_000_000_000.0
+    # 60 records, 20 mature all beneficial → healthy but 33% backfill is above
+    # 20% floor here; use 10 mature to land below floor with healthy rates.
+    recs = [_rec(now, would_block=True, outcome="loss") for _ in range(10)]
+    recs += [_rec(now, would_block=False) for _ in range(50)]
+    # 10 mature < MIN_MATURE_OUTCOMES(20) → falls in the "not yet reconciled"
+    # promote branch. To exercise the mature≥20 low-confidence path instead:
+    recs = [_rec(now, would_block=True, outcome="loss") for _ in range(20)]
+    recs += [_rec(now, would_block=False) for _ in range(180)]  # 10% backfill
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.COLLECTING
+    assert any("回填率" in w for w in out["warnings"])
+
+
+# ── M8: signal arms expose a manual harmful-rate note, never auto-REVIEW ─────
+
+def test_signal_arm_harmful_outcomes_get_manual_note_only(sg):
+    now = 1_700_000_000_000.0
+    # 100% harmful signal arm: signal arms have no auto-REVIEW channel, so it
+    # must NOT be REVIEW, but the human reviewer must see the rate explicitly.
+    recs = [_rec(now, is_candidate=True, outcome="win") for _ in range(25)]
+    recs += [_rec(now, is_candidate=False) for _ in range(35)]
+    out = sg.grade_arm("xs_reversal", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] != sg.REVIEW
+    assert "signal_harmful_rate_note" in out
+    assert "100%" in out["signal_harmful_rate_note"]
+    assert any("无自动有害率 REVIEW 通道" in w for w in out["warnings"])
+
+
+# ── M12: zero-outcome backfill diagnostic ────────────────────────────────────
+
+def test_zero_backfill_with_volume_warns(sg):
+    now = 1_700_000_000_000.0
+    # block arm: 70 fired records, zero outcomes → promotion-pending, but the
+    # reconcile coverage warning must still be attached.
+    recs = [_rec(now - 2 * H, would_block=True) for _ in range(70)]
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert any("回填为 0" in w for w in out["warnings"])
+
+
+def test_zero_backfill_below_promote_threshold_still_warns(sg):
+    # M12：pullback 实测 42 条（< MIN_SAMPLES_PROMOTE=60）且全周零 outcome，
+    # 诊断门槛独立为 ZERO_BACKFILL_MIN_SAMPLES=30，不能因样本<60 长期沉默。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 2 * H, tripped=True) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == "INSUFFICIENT_DATA"
+    assert any("回填为 0/42" in w for w in out["warnings"])
+
+
+def test_zero_backfill_under_min_samples_silent(sg):
+    # 30 以下 = 刚上线噪音区间，不触发零回填告警。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 2 * H, tripped=True) for _ in range(20)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert not any("回填为 0" in w for w in (out.get("warnings") or []))
+
+
+# ── M13: collection stall (records exist but none in 24h) ────────────────────
+
+def test_collection_stall_flagged(sg):
+    now = 1_700_000_000_000.0
+    # 13 records all ~6 days old, nothing in the trailing 24h window.
+    recs = [_rec(now - 6 * 24 * H, tripped=True) for _ in range(13)]
+    out = sg.grade_arm("market_circuit", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs)
+    assert out["collection_stalled"] is not None
+    assert out["collection_stalled"]["window_h"] == 24
+    assert any("采数停滞" in w for w in out["warnings"])
+    # Verdict stays INSUFFICIENT (13 < 60); the stall rides alongside.
+    assert out["verdict"] == sg.INSUFFICIENT
+
+
+def test_no_stall_when_24h_has_records(sg):
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - H, tripped=True) for _ in range(13)]
+    out = sg.grade_arm("market_circuit", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs)
+    assert "collection_stalled" not in out
+
+
+def test_fresh_heartbeat_suppresses_stall_for_event_arm(sg):
+    # M13 修正：market_circuit 每 tick 写心跳、仅 trip 才落事件流。24h 无事件
+    # 但心跳只有 12s → 评估在跑，不算停滞。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 6 * 24 * H, tripped=True) for _ in range(13)]
+    out = sg.grade_arm("market_circuit", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, heartbeat_age_sec=12.0)
+    assert "collection_stalled" not in out
+    assert out["heartbeat_ok"] is True
+    assert out["heartbeat_age_sec"] == 12.0
+    assert not any("停采或写路径异常" in w for w in out.get("warnings", []))
+    assert any("心跳正常" in w and "非采数停滞" in w for w in out["warnings"])
+
+
+def test_stale_heartbeat_keeps_stall_for_event_arm(sg):
+    # 心跳陈旧（超过 30min 阈值）→ 仍然判定停滞。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 6 * 24 * H, tripped=True) for _ in range(13)]
+    out = sg.grade_arm("market_circuit", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, heartbeat_age_sec=7200.0)
+    assert "collection_stalled" in out
+    assert out["heartbeat_ok"] is False
+    assert any("采数停滞" in w for w in out["warnings"])
+
+
+def test_pullback_no_heartbeat_still_flags_stall(sg):
+    # pullback 没有每 tick 心跳（仅候选进入分支才评估），24h 无记录仍判停滞。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, heartbeat_age_sec=None)
+    assert "collection_stalled" in out
+    assert "heartbeat_ok" not in out
+
+
+# ── M16: 仅做多臂在宏观非多头期策略性不采数，不判停滞 ─────────────────────────
+
+def test_pullback_macro_down_suppresses_stall(sg):
+    # pullback 仅做多且 require_macro_uptrend：regime=down 时结构性不触发，
+    # 近 24h 零写入是策略性不采数，不出停滞告警/横幅。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, macro_regime="down")
+    assert "collection_stalled" not in out
+    assert out["macro_regime"] == "down"
+    assert out["macro_blocks_collection"] is True
+    assert not any("停采或写路径异常" in w for w in out.get("warnings", []))
+    assert any("策略性不采数" in w and "非停采" in w for w in out["warnings"])
+
+
+def test_pullback_macro_up_keeps_stall_when_no_records(sg):
+    # 宏观是 up（本应有候选）却仍 24h 零写入 → 这才是真停滞，必须报警。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, macro_regime="up")
+    assert "collection_stalled" in out
+    assert out["macro_blocks_collection"] is False
+    assert any("采数停滞" in w for w in out["warnings"])
+
+
+def test_pullback_macro_unknown_fails_open_to_stall(sg):
+    # regime 探测失败传 None：fail-open，不退化为抑制，保持停滞以免掩盖故障。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, macro_regime=None)
+    assert "collection_stalled" in out
+    assert "macro_regime" not in out
+
+
+
+# ── M6: short-window outcomes_pending marker ─────────────────────────────────
+
+def test_short_window_outcomes_pending_marker(sg):
+    now = 1_700_000_000_000.0
+    # Records inside 24h without outcomes; 168h window also has none here, so
+    # check the per-window flag directly through window stats.
+    recs = [_rec(now - H, would_block=True)]
+    s24 = sg._window_stats(recs, "block", 24, now)
+    assert s24["outcomes_pending"] is True
+    s168 = sg._window_stats(
+        [_rec(now - H, would_block=True, outcome="win")], "block", 168, now)
+    assert s168["outcomes_pending"] is False  # flag only for sub-168h windows
+
+
+# ── M9/M14: history source tagging + enriched slim snapshot ──────────────────
+
+def test_slim_snapshot_source_tag_and_harm_fields(sg):
+    d = {
+        "generated_at": "2026-09-10 00:45 UTC",
+        "windows_h": [168],
+        "arms": [{
+            "arm": "confidence_decay", "mode": "shadow", "kind": "change",
+            "verdict": "COLLECTING", "backfill_rate": 0.195,
+            "windows": [{"window_h": 168, "total": 3863, "hits": 985,
+                         "decisions": 3863, "hit_rate": 0.255,
+                         "mature_outcomes": 754, "outcome_wins": 340,
+                         "outcome_losses": 414, "pnl_usd_sum": 0.0}],
+        }],
+        "real_baseline": {"real_closes": 19, "real_win_rate": 0.5263, "note": ""},
+    }
+    cron = sg._slim_snapshot(d, source="cron")
+    assert cron["source"] == "cron" and cron["real_win_rate"] == 0.5263
+    row = cron["arms"][0]
+    assert row["outcome_wins"] == 340 and row["outcome_losses"] == 414
+    assert row["harmful_rate"] == sg.pytest.approx(340 / 754, abs=0.001) \
+        if False else abs(row["harmful_rate"] - 340 / 754) < 0.001
+    manual = sg._slim_snapshot(d, source="manual")
+    assert manual["source"] == "manual"
+
+
+def test_read_history_filters_manual_snapshots(sg, tmp_path):
+    import json
+    hist = tmp_path / "h.jsonl"
+    rows = []
+    for i, src in enumerate(["cron", "manual", "cron"]):
+        snap = {"ts": 1000 + i, "source": src, "arms": []}
+        rows.append(snap)
+    # legacy row without source → treated as cron
+    rows.append({"ts": 1004, "arms": []})
+    with open(hist, "w") as fh:
+        for r in rows:
+            fh.write(json.dumps(r) + "\n")
+    cron_only = sg.read_history(path=str(hist), source="cron")
+    assert [r["ts"] for r in cron_only] == [1000, 1002, 1004]
+    manual = sg.read_history(path=str(hist), source="manual")
+    assert [r["ts"] for r in manual] == [1001]
+    assert len(sg.read_history(path=str(hist))) == 4  # unfiltered
+
+
+def _minimal_grade_dict(verdict="COLLECTING"):
+    """最小可被 _slim_snapshot 接受的 collect_grades 载荷。"""
+    return {
+        "generated_at": "x",
+        "windows_h": [168],
+        "arms": [{
+            "arm": "confidence_decay", "mode": "shadow", "kind": "change",
+            "verdict": verdict, "backfill_rate": 0.2,
+            "windows": [{"window_h": 168, "total": 100, "hits": 20,
+                         "decisions": 100, "hit_rate": 0.2,
+                         "mature_outcomes": 20, "outcome_wins": 5,
+                         "outcome_losses": 15, "pnl_usd_sum": -1.0,
+                         "outcomes_pending": False}],
+        }],
+        "real_baseline": {"real_closes": 19, "real_win_rate": 0.5},
+    }
+
+
+def test_cron_history_same_day_upsert_not_append(sg, tmp_path, monkeypatch):
+    # M9 幂等：同一 UTC 自然日 cron 重跑只替换当日行，不堆叠多条。
+    hist = tmp_path / "h.jsonl"
+    day = 1_700_008_200_000.0
+    d1 = _minimal_grade_dict()
+    # _slim_snapshot 取 d['ts']？实际用 time.time；monkeypatch 其内部时间来源：
+    # 直接在 append 后手动改写更稳——这里用 monkeypatch 冻结 time.time。
+    import time as _t
+    monkeypatch.setattr(_t, "time", lambda: day / 1000.0)
+    assert sg.append_history(d1, path=str(hist), source="cron")
+    # 同日晚些时候重跑（同自然日，秒级不同）
+    monkeypatch.setattr(_t, "time", lambda: (day + 5 * 3600_000) / 1000.0)
+    d2 = _minimal_grade_dict("REVIEW")
+    sg.append_history(d2, path=str(hist), source="cron")
+    rows = sg.read_history(path=str(hist))
+    assert len(rows) == 1, "同日 cron 必须去重为 1 条"
+    assert rows[0]["arms"][0]["verdict"] == "REVIEW", "应保留最新载荷"
+
+
+def test_cron_history_distinct_days_keep_both(sg, tmp_path, monkeypatch):
+    import time as _t
+    hist = tmp_path / "h.jsonl"
+    day = 1_700_008_200_000.0
+    monkeypatch.setattr(_t, "time", lambda: day / 1000.0)
+    sg.append_history(_minimal_grade_dict(), path=str(hist), source="cron")
+    monkeypatch.setattr(_t, "time", lambda: (day + 86_400_000) / 1000.0)
+    sg.append_history(_minimal_grade_dict(), path=str(hist), source="cron")
+    assert len(sg.read_history(path=str(hist))) == 2
+
+
+def test_manual_history_not_deduped_against_cron(sg, tmp_path, monkeypatch):
+    # manual 行不替换当日 cron 行，二者并存（趋势默认只读 cron）。
+    import time as _t
+    hist = tmp_path / "h.jsonl"
+    day = 1_700_008_200_000.0
+    monkeypatch.setattr(_t, "time", lambda: day / 1000.0)
+    sg.append_history(_minimal_grade_dict(), path=str(hist), source="cron")
+    sg.append_history(_minimal_grade_dict(), path=str(hist), source="manual")
+    allrows = sg.read_history(path=str(hist))
+    cron = sg.read_history(path=str(hist), source="cron")
+    assert len(allrows) == 2 and len(cron) == 1
+
+
+# ── 分母修正（2026-09-10）：harm rate denominator = hit-and-mature set ───────
+
+def test_harm_rate_uses_hit_set_denominator(sg):
+    # confidence_decay production profile: 754 mature overall but only the
+    # would_block_gate=True rows are the arm's decisions. 340/754 = 45% on all
+    # records; on the hit set it is much higher. Non-hit outcomes must not
+    # dilute the rate.
+    now = 1_700_000_000_000.0
+    recs = []
+    # Hit set: 200 mature, 45% harmful (90 win / 110 loss).
+    for _ in range(90):
+        recs.append(_rec(now, would_block_gate=True, outcome="win"))
+    for _ in range(110):
+        recs.append(_rec(now, would_block_gate=True, outcome="loss"))
+    # Non-hit mature tail (the gate didn't act, outcomes irrelevant) +
+    # non-mature records to mirror the real long tail.
+    for _ in range(554):
+        recs.append(_rec(now, would_block_gate=False, outcome="loss"))
+    for _ in range(3109):
+        recs.append(_rec(now, would_block_gate=False))
+    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    # All-records win rate would be 90/754 = 12%; hit-set rate is 45%.
+    assert out["hit_set_harmful_rate"] == sg.pytest.approx(0.45, abs=0.001) \
+        if hasattr(sg, "pytest") else abs(out["hit_set_harmful_rate"] - 0.45) < 0.001
+    assert out["harmful_rate_basis"] == "hit_set"
+    assert out["verdict"] == sg.COLLECTING  # 45% grey zone, not PROMOTE
+    assert "45%" in out["reason"]
+
+
+def test_hit_set_below_min_falls_back_with_warning(sg):
+    # Plenty of overall mature outcomes but only a few on hit rows → fall back
+    # to all-records rate and warn the rate may understate harm.
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_block=True, outcome="win") for _ in range(5)]
+    recs += [_rec(now, would_block=False, outcome="loss") for _ in range(55)]
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["harmful_rate_basis"] == "all_records"
+    assert any("命中集成熟样本仅 5" in w
+               for w in out.get("warnings", []))

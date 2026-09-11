@@ -47,8 +47,53 @@ import shadow_progress as sp  # noqa: E402
 MIN_SAMPLES_PROMOTE = 60     # 168h 窗口内至少这么多条记录才谈晋升
 MIN_SAMPLES_REVIEW = 30      # 达到这个量且回填结果差，才提示 REVIEW
 MIN_MATURE_OUTCOMES = 20     # 反事实 outcome 至少这么多条才纳入盈亏判定
+# M12：零回填诊断门槛。比 MIN_SAMPLES_PROMOTE 低——pullback 实测全周 42 条
+# 且 outcome 恒为 0，若门槛挂在 60 上，这类「永远等不到判定」的臂会长期沉默，
+# 审计明确点名其 reconcile 链路可能从未覆盖。30 条足够排除「刚上线」噪音。
+ZERO_BACKFILL_MIN_SAMPLES = 30
 MIN_BLOCK_RATE = 0.03        # 拦截率低于此值 = 几乎从不触发，晋升无意义
-MAX_FUTILE_BLOCK_RATE = 0.5  # 拦截命中率>此值 = 拦太宽，先复核别升级
+# Audit 2026-09-10 (M2/M2′)：拆分为两个语义独立的常量。
+#   旧 MAX_FUTILE_BLOCK_RATE=0.5 同时被用于「有害率红线」与「拦太宽」两种完全
+#   不同的判定，导致命中率 97% 的 enforce 臂没有任何宽度告警（M2），而命中率
+#   80% 的 change 臂宽度信号又与有害率混为一谈。
+MAX_HARMFUL_RATE = 0.5       # outcome win 率（=臂有害率）红线：超过即 REVIEW
+MAX_HIT_RATE_TOO_WIDE = 0.5  # 命中率（命中/决策）>此值 = 拦/改太宽，必须提示复核
+# Audit 2026-09-10 (M3)：PROMOTE 安全余量。旧逻辑有害率在 (0, 0.5] 整段都可
+# PROMOTE（45.1% 有害率的 confidence_decay 即被放行）。晋升建议要求有害率不
+# 高于 0.4，0.4~0.5 区间维持 COLLECTING 继续观察。
+PROMOTE_MAX_HARMFUL_RATE = 0.4
+# Audit 2026-09-10 (M4)：低回填率降级线。mature/total 低于此值时，即使有害率
+# 越线，REVIEW 结论也只标注为「低置信」；PROMOTE 则直接降 COLLECTING。
+MIN_OUTCOME_BACKFILL_RATE = 0.2
+# Audit 2026-09-10 (M13)：shadow/enforce 臂最长窗口 24h 子窗零记录即视为采数
+# 停滞（典型：单事件后停采），不改变 verdict 但必须出告警。
+STALE_WINDOW_H = 24
+# Audit 2026-09-10 (M13 修正)：部分臂是「每 tick 评估、仅在极端/候选事件发生
+# 时才往事件 JSONL 落一条」。对这类臂，事件流 24h 零写入是正常的（市场无极端
+# 行情），不能据此误报采数停滞——只要它的独立心跳文件仍在新鲜更新，就说明评估
+# 在持续运行。心跳年龄（秒）小于此阈值视为健康。
+#   market_circuit：trading_loop 每个 scan tick 都重写 /data/.market-circuit.state
+#   （clear/no_trip 也写），实测约每 12s 一次；给 30min 宽松阈值容忍重启/抖动。
+HEARTBEAT_FRESH_SEC = int(os.environ.get("HERMES_ARM_HEARTBEAT_FRESH_SEC", 1800))
+ARM_HEARTBEAT_FILE = {
+    "market_circuit": os.environ.get(
+        "HERMES_MARKET_CIRCUIT_STATE_FILE", "/data/.market-circuit.state"),
+}
+# Audit 2026-09-10 (ta_late_entry 命中率口径修正)：该臂的 shadow 流混合了两层——
+#   layer="prefilter"（TA 预筛）：仅在「拦截成立」时才写一条（放行候选不落盘），
+#       是采样偏置的观察流，blocked 天然≈100%，不能作为闸门命中率分母；
+#   layer="gate"（下单前 ta_late_entry_gate）：每次真实交易决策都写（拦/放行皆有），
+#       这才是「闸门对真实交易拦多宽」的正确分母；8-29 前的旧记录无 layer 字段且
+#       带 entry_px、blocked=False，属 gate 语义。
+# 对这些臂，命中率(decisions/hits)只统计 gate 层；total/mature/pnl 仍用全量
+# （prefilter 的反事实 outcome 是「假如拦掉会怎样」，仍有独立参考价值）。
+GATE_LAYER_DECISION_ARMS = {"ta_late_entry"}
+# Audit 2026-09-11 (M16)：仅做多、且配置 require_macro_uptrend=true 的信号臂，
+# 在宏观 regime 非 "up" 时于结构上不可能产生候选（executor fail-closed 直接
+# withhold，连 shadow 记录都不写）。这类臂近 24h 零写入是「宏观非多头期策略性
+# 不采数」，不是停采/写路径异常。collect_grades 只读探测当前宏观 regime 传入；
+# 非 up 期间把停滞告警降级为中性说明，regime=up 时仍按原逻辑报真停滞。
+MACRO_LONG_ONLY_ARMS = {"pullback"}
 
 # 评级档位
 PROMOTE = "PROMOTE_CANDIDATE"
@@ -57,6 +102,12 @@ INSUFFICIENT = "INSUFFICIENT_DATA"
 DATA_GAP = "DATA_GAP"
 REVIEW = "REVIEW"
 OFF = "OFF"
+# Audit 2026-09-10 (M1)：已在 enforce 的臂没有「晋升」语义，复用 COLLECTING
+# 会给出「继续采数、信号健康」的晋升导向文案。新增两档只服务 enforce 臂：
+#   MAINTAIN  — 已生产、证据健康，建议维持现状
+#   DEGRADED_REVIEW — 已生产但出现宽度/有害性告警，建议复核是否应降级
+MAINTAIN = "ENFORCE_MAINTAIN"
+DEGRADED_REVIEW = "ENFORCE_DEGRADED_REVIEW"
 
 _VERDICT_CN = {
     PROMOTE: "可考虑升enforce(待人工拍板)",
@@ -65,6 +116,8 @@ _VERDICT_CN = {
     DATA_GAP: "采数缺口(该采没采!)",
     REVIEW: "建议复核(疑似无效/有害)",
     OFF: "未启用(mode=off)",
+    MAINTAIN: "enforce·维持",
+    DEGRADED_REVIEW: "enforce·建议复核降级",
 }
 
 # 臂分类：决定统计哪个"命中"字段。
@@ -464,6 +517,55 @@ def _read_jsonl(path: str) -> list[dict]:
     return out
 
 
+def _heartbeat_age_sec(arm: str, now_ms: float | None = None) -> float | None:
+    """Return age (seconds) of an arm's independent heartbeat state file, or None
+    when the arm has no heartbeat / it is unreadable/missing a ts.
+
+    M13 修正专用：事件型闸门（如 market_circuit）每个评估 tick 都重写心跳，
+    但只在真正 trip 时才往事件 JSONL 落一条。用事件流判活会在平稳行情下永久误报
+    停滞；心跳年龄才是「评估是否在跑」的可靠信号。只读，绝不写。"""
+    hb_path = ARM_HEARTBEAT_FILE.get(arm)
+    if not hb_path or not os.path.exists(hb_path):
+        return None
+    try:
+        with open(hb_path, "r", encoding="utf-8", errors="replace") as fh:
+            d = json.load(fh)
+        ts = float(d.get("ts")) if isinstance(d, dict) else None
+    except (OSError, ValueError, TypeError):
+        return None
+    if ts is None or ts <= 0:
+        return None
+    now_ms = now_ms if now_ms is not None else time.time() * 1000.0
+    # 心跳文件 ts 是 epoch 秒（time.time()），now_ms 是毫秒。
+    return max(0.0, now_ms / 1000.0 - ts)
+
+
+def _current_macro_regime() -> str | None:
+    """只读探测当前 BTC 宏观 regime（up/down/neutral/chop），供 M16 判定仅做多臂
+    在宏观非多头期的「策略性不采数」。独立 CLI/cron 进程内为进程内缓存未命中，
+    会触发一次带 TTL 缓存的 K 线拉取。任何异常都回退 None —— 调用方据此
+    fail-open（不抑制停滞告警），绝不因探测失败而掩盖真实停采。绝不写配置/状态。"""
+    try:
+        from hermes_trader.agents.market_regime import detect_regime
+        regime = detect_regime("BTC")
+        return str(regime) if regime else None
+    except Exception as e:  # pragma: no cover - 网络/环境相关
+        print(f"[warn] 宏观 regime 只读探测失败（pullback 停滞按原逻辑判定）：{e}",
+              file=sys.stderr)
+        return None
+
+
+def _is_gate_layer_record(rec: dict) -> bool:
+    """ta_late_entry：该记录是否属于真实下单闸门（gate）层。
+
+    layer="gate" 显式为 gate；无 layer 字段的 8-29 前旧记录带真实 entry_px 且
+    blocked=False，亦为 gate 语义。layer="prefilter" 被排除（只记拦截的观察流）。"""
+    layer = rec.get("layer")
+    if layer is not None:
+        return layer == "gate"
+    return True
+
+
 def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
                   arm: str = "") -> dict:
     """Aggregate hit/outcome stats for records within the trailing window."""
@@ -473,37 +575,85 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
     decisions = 0
     outcomes = []          # backfilled counterfactual outcomes: win/loss strings
     pnl_usd = []
+    # ta_late_entry：命中率只统计真实下单闸门层（gate），排除 prefilter 采样偏置。
+    gate_only_decisions = arm in GATE_LAYER_DECISION_ARMS
     for rec in records:
         ts = _record_ts_ms(rec)
         if ts is not None and ts < cutoff:
             continue
         total += 1
-        hit = _hit_field(rec, kind, arm)
-        if hit is not None:
-            decisions += 1
-            if hit:
-                hits += 1
+        if (not gate_only_decisions) or _is_gate_layer_record(rec):
+            hit = _hit_field(rec, kind, arm)
+            if hit is not None:
+                decisions += 1
+                if hit:
+                    hits += 1
         oc = rec.get("outcome")
         if oc in ("win", "loss"):
             outcomes.append(oc)
         p = rec.get("pnl_usd")
         if isinstance(p, (int, float)):
             pnl_usd.append(float(p))
+    mature = len(outcomes)
     return {
         "window_h": window_h, "total": total, "hits": hits, "decisions": decisions,
         "hit_rate": round(hits / decisions, 4) if decisions else 0.0,
-        "mature_outcomes": len(outcomes),
+        "mature_outcomes": mature,
         "outcome_wins": outcomes.count("win"),
         "outcome_losses": outcomes.count("loss"),
         "pnl_usd_sum": round(sum(pnl_usd), 4) if pnl_usd else 0.0,
         "has_pnl": bool(pnl_usd),
+        # ta_late_entry：决策命中率分母只含 gate 层；total 仍为全量（含 prefilter）。
+        "decision_scope": "gate_layer" if gate_only_decisions else "all_records",
+        # M6/M10：outcome 由 reconcile 按原始记录 ts 事后回填，短窗口成熟数结构
+        # 性偏低（不是样本少，是回填滞后+归窗口径）。短窗 mature=0 而长窗有
+        # 成熟样本时打标，供面板/报告标注「短窗 outcome 不可用，只采信最长窗」。
+        "outcomes_pending": bool(
+            window_h < 168 and mature == 0 and total > 0),
     }
 
 
+def _backfill_rate(s: dict) -> float:
+    """mature outcome 回填率 = mature/total（M4：低回填率臂结论置信弱）。"""
+    return s["mature_outcomes"] / s["total"] if s["total"] else 0.0
+
+
+def _independent_outcomes(records: list[dict], window_ms: float,
+                          now_ms: float) -> int:
+    """M4：按 (coin, 自然日UTC) 去重后的成熟 outcome 近似独立场景数。
+
+    实测 atr_regime_calib 25 条 mature 中 18 条为同一币种同日的连续序列
+    （同 cf 场景的重复评估），直接按行数算 win 率会高估置信度。这里只做
+    保守的「有效样本数」提示，不改变 outcome_wins 的原始计数（判定仍以原始
+    mature 为准，避免静默改判）。"""
+    cut = now_ms - window_ms
+    scenes = set()
+    for r in records:
+        ts = _record_ts_ms(r)
+        if ts is None or ts < cut or r.get("outcome") not in ("win", "loss"):
+            continue
+        day = int(ts // 86_400_000)
+        scenes.add((str(r.get("coin") or "-"), day))
+    return len(scenes)
+
+
 def grade_arm(arm: str, mode: str, path: str, windows: list[int],
-              now_ms: float | None = None, records: list[dict] | None = None) -> dict:
+              now_ms: float | None = None,
+              records: list[dict] | None = None,
+              heartbeat_age_sec: float | None = None,
+              macro_regime: str | None = None) -> dict:
     """Grade one arm purely from its records + mode. Pure function (no I/O when
-    `records` is supplied) so it is unit-testable."""
+    ``records`` is supplied) so it is unit-testable.
+
+    Audit 2026-09-10 additions (warnings never change the INERT posture):
+      * M1  enforce 臂独立健康档 MAINTAIN / DEGRADED_REVIEW；
+      * M2  命中率 > MAX_HIT_RATE_TOO_WIDE = 拦/改太宽 → REVIEW/降级复核；
+      * M3  PROMOTE 要求有害率 ≤ 0.4 安全余量（0.4~0.5 降 COLLECTING）；
+      * M4  低回填率标注低置信（附 (币,日) 去重独立场景数）；
+      * M8  signal 臂有害率人工通道字段；M12 outcome 零回填诊断；
+      * M13 近 24h 零写入的采数停滞告警——但事件型闸门（仅 trip 才落事件流、
+            每 tick 写独立心跳）若心跳新鲜，则不算停滞（见 heartbeat_age_sec）。
+    """
     now_ms = now_ms if now_ms is not None else time.time() * 1000.0
     kind = ARM_KIND.get(arm, "block")
     if records is None:
@@ -511,12 +661,73 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     stats = [_window_stats(records, kind, w, now_ms, arm) for w in windows]
     w_long = max(windows)
     longest = next((s for s in stats if s["window_h"] == w_long), stats[-1])
+    warnings: list[str] = []
+
+    backfill = _backfill_rate(longest)
+    # M13：采数停滞（最长窗有记录但近 STALE_WINDOW_H 子窗为 0）。
+    # M13 修正：事件型闸门（market_circuit 等）只在真正触发时才写事件流，平稳
+    # 行情下 24h 零事件是正常的；若其独立心跳仍在新鲜更新（评估在持续运行），
+    # 不判停滞，只给中性说明。心跳缺失/陈旧时才维持停滞告警。
+    stale = None
+    heartbeat_ok = (heartbeat_age_sec is not None
+                    and heartbeat_age_sec >= 0
+                    and heartbeat_age_sec <= HEARTBEAT_FRESH_SEC)
+    # M16：仅做多且要求宏观多头的臂，regime 非 up 时结构性不触发（executor
+    # fail-closed withhold，不写 shadow）。None 表示无法判定（探测失败/未提供），
+    # 不退化为抑制，保持原停滞告警以免掩盖真故障。
+    macro_long_only = arm in MACRO_LONG_ONLY_ARMS
+    macro_blocks = (macro_long_only and macro_regime is not None
+                    and macro_regime != "up")
+    if mode in ("shadow", "enforce") and longest["total"] > 0:
+        short = next((s for s in stats if s["window_h"] == STALE_WINDOW_H), None)
+        if short is not None and short["total"] == 0:
+            ts_all = [t for t in (_record_ts_ms(r) for r in records) if t]
+            newest = max(ts_all) if ts_all else None
+            age_h = (now_ms - newest) / 3_600_000 if newest is not None else None
+            if heartbeat_ok:
+                # 评估在跑、只是无极端事件：健康，不算停滞，不出 ⚠ 告警。
+                warnings.append(
+                    f"事件型闸门心跳正常（{heartbeat_age_sec:.0f}s 前仍在评估），"
+                    f"近 {STALE_WINDOW_H}h 无事件落盘属正常（无触发条件），"
+                    "非采数停滞")
+            elif macro_blocks:
+                # M16：宏观非多头期，仅做多臂策略性不采数，属正常而非故障。
+                warnings.append(
+                    f"宏观 regime={macro_regime or 'unknown'}（非 up），本臂仅做多且"
+                    "要求宏观多头，此期间 executor fail-closed 不产生候选也不写影子"
+                    f"记录，近 {STALE_WINDOW_H}h 0 条属策略性不采数，非停采/写路径异常"
+                    + (f"；最新记录距今 {age_h:.0f}h" if age_h is not None else ""))
+            else:
+                stale = {"stale_hours": round(age_h, 1) if age_h is not None else None,
+                         "window_h": STALE_WINDOW_H}
+                warnings.append(
+                    f"采数停滞：近 {STALE_WINDOW_H}h 0 条"
+                    + (f"，最新记录距今 {age_h:.0f}h" if age_h is not None else "")
+                    + "，疑似事件驱动型闸门停采或写路径异常")
+
+    # M12：样本够但 outcome 回填恒为 0 → 永远无法进入有效性判定。
+    if mode in ("shadow", "enforce") and longest["total"] >= ZERO_BACKFILL_MIN_SAMPLES \
+            and longest["mature_outcomes"] == 0:
+        warnings.append(
+            f"outcome 回填为 0/{longest['total']}：reconcile 链路可能未覆盖本臂，"
+            "样本再多也无法验证有效性，请排查回填")
+
+    # M8：signal 臂无自动有害率 REVIEW 通道，成熟 outcome 出现时必须把人工
+    # 判定所需的有害率显式带出（不改判，仅提示）。
+    signal_note = None
+    if kind == "signal" and longest["mature_outcomes"] > 0:
+        swr = longest["outcome_wins"] / longest["mature_outcomes"]
+        signal_note = (
+            "signal 臂无自动有害率 REVIEW 通道，需人工判定：臂有害率(win) "
+            f"{swr:.0%}（{longest['outcome_wins']}/{longest['mature_outcomes']}）")
+        warnings.append(signal_note)
 
     # DATA_GAP: configured to collect but the file yields nothing in the longest
     # window. Distinguish "never triggered / path blind" from "no opportunity".
     if mode in ("shadow", "enforce") and longest["total"] == 0:
         verdict = DATA_GAP
-        reason = f"mode={mode} 但 {w_long}h 窗口内 0 条记录（未触发或路径写不进）"
+        reason = (f"mode={mode} 但 {w_long}h 窗口内 0 条记录"
+                  "（未触发或路径写不进，闸门变盲）")
     elif mode == "off":
         # Arm disabled → nothing is expected; report honestly instead of
         # implying data collection is underway (never pushed to Feishu).
@@ -525,66 +736,230 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     elif longest["total"] < MIN_SAMPLES_PROMOTE:
         verdict = INSUFFICIENT if mode == "shadow" else COLLECTING
         reason = (f"{w_long}h 仅 {longest['total']} 条 (<{MIN_SAMPLES_PROMOTE})，"
-                  f"继续累积样本")
-    elif longest["mature_outcomes"] >= MIN_MATURE_OUTCOMES:
-        # Backfilled counterfactual results are available → judge effectiveness.
-        wr = longest["outcome_wins"] / max(1, longest["mature_outcomes"])
-        if longest["has_pnl"] and longest["pnl_usd_sum"] > 0 and longest["hits"] > 0:
-            verdict = REVIEW
-            reason = (f"拦截/调整命中 {longest['hits']} 次，但回填反事实合计 "
-                      f"${longest['pnl_usd_sum']:.2f} 为正 —— 闸门可能误伤盈利交易")
-        elif wr > MAX_FUTILE_BLOCK_RATE and kind in ("block", "change"):
-            # Audit 2026-09-08 (CS-C change-arm gate fix): outcome "win" means
-            # arm-HARMFUL for ALL arms. For a change arm wr is therefore the
-            # arm-HARMFUL rate, not a block win-rate — the same futile/harmful
-            # threshold must gate change arms too, or a harmful change arm
-            # (e.g. confidence_decay / atr_regime_calib, which never write
-            # pnl_usd and so cannot be caught by the sum branch above) would
-            # be mislabelled PROMOTE_CANDIDATE.
-            verdict = REVIEW
-            if kind == "change":
-                reason = (f"回填反事实 {longest['mature_outcomes']} 条中臂有害率 "
-                          f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— "
-                          f"调整/跳过反而放弃盈利，疑似有害，勿升级")
-            else:
-                reason = (f"被拦信号 {longest['mature_outcomes']} 条中胜率 "
-                          f"{wr:.0%} > {MAX_FUTILE_BLOCK_RATE:.0%} —— 拦太宽，疑似误伤")
-        else:
-            verdict = PROMOTE if mode == "shadow" else COLLECTING
-            if kind == "change":
-                # Audit 2026-09-08 (change-arm label fix): outcome "win" is
-                # encoded for ALL arms as "counterfactual pnl > 0 => the arm
-                # foregoes profit / hurts". For a change arm that means win =
-                # arm-HARMFUL and loss = arm-BENEFICIAL, so the raw win-rate is
-                # inverted vs the plain reading. Report the arm-beneficial rate
-                # (1 - wr) instead to avoid misleading the rollout decision.
-                reason = (f"{w_long}h {longest['total']} 条、命中率 "
-                          f"{longest['hit_rate']:.1%}、反事实臂有益率 "
-                          f"{1 - wr:.0%}（outcome 负={longest['outcome_losses']}/"
-                          f"{longest['mature_outcomes']}），信号健康")
-            else:
-                reason = (f"{w_long}h {longest['total']} 条、命中率 "
-                          f"{longest['hit_rate']:.1%}、回填胜率 {wr:.0%}，信号健康")
+                  f"继续累积样本；命中率 {longest['hit_rate']:.1%}")
+    elif mode == "enforce":
+        verdict, reason = _enforce_verdict(
+            arm, kind, longest, w_long, records, now_ms, backfill, warnings)
     else:
-        # Enough records but no backfilled outcomes yet.
-        rate = longest["hit_rate"]
-        if longest["decisions"] > 0 and rate < MIN_BLOCK_RATE and kind in ("block", "change"):
-            verdict = COLLECTING
-            reason = (f"{w_long}h {longest['total']} 条但命中率仅 {rate:.2%} "
-                      f"(<{MIN_BLOCK_RATE:.0%})，闸门几乎不触发，先继续观察")
-        else:
-            verdict = PROMOTE if mode == "shadow" else COLLECTING
-            reason = (f"{w_long}h {longest['total']} 条、命中率 {rate:.1%}；"
-                      f"尚无回填 outcome，建议跑 reconcile 后再定")
+        verdict, reason = _shadow_verdict(
+            arm, kind, longest, w_long, records, now_ms, backfill, warnings)
+
     out = {"arm": arm, "mode": mode, "kind": kind, "path": path,
            "verdict": verdict, "verdict_cn": _VERDICT_CN[verdict],
-           "reason": reason, "windows": stats}
+           "reason": reason, "windows": stats,
+           "backfill_rate": round(backfill, 4)}
+    # 命中集有害率（分母修正）：面板与 API 可直接展示，不依赖 reason 文案。
+    if longest["mature_outcomes"] >= MIN_MATURE_OUTCOMES:
+        _w: list[str] = []
+        eff_wr, denom_note, _, hit_mature = _effective_harm(
+            arm, kind, longest, records, w_long, now_ms, _w)
+        out["hit_set_mature"] = hit_mature
+        out["hit_set_harmful_rate"] = round(eff_wr, 4) if hit_mature else None
+        out["harmful_rate_basis"] = ("hit_set" if hit_mature >= MIN_MATURE_OUTCOMES
+                                     else "all_records")
+        if verdict in (REVIEW, DEGRADED_REVIEW, PROMOTE, COLLECTING, MAINTAIN):
+            # 合并：预览调用产生的命中集口径告警 + grade_arm 主链路告警。
+            for _line in _w:
+                if _line not in warnings:
+                    warnings.append(_line)
+    if warnings:
+        out["warnings"] = warnings
+    if stale:
+        out["collection_stalled"] = stale
+    if heartbeat_age_sec is not None:
+        out["heartbeat_age_sec"] = round(heartbeat_age_sec, 1)
+        out["heartbeat_ok"] = heartbeat_ok
+    if macro_long_only and macro_regime is not None:
+        out["macro_regime"] = macro_regime
+        out["macro_blocks_collection"] = bool(macro_blocks)
+    if signal_note:
+        out["signal_harmful_rate_note"] = signal_note
     # CS-G §8.1：sizing_v2 成本上限六条件（独立 168h 只读闸门，不改上面的
     # 臂级 verdict；仅供晋升时与 §4 闸门并列人工核对）。
     if arm == "sizing_v2":
         out["sv2_cost"] = grade_sizing_v2_cost(
             records, window_h=SV2_COST_WINDOW_H, now_ms=now_ms)
     return out
+
+
+def _harmful_rate(s: dict) -> float:
+    """outcome win 占比 = 臂有害率（win=反事实为正=该臂拦掉/改掉了本可盈利
+    的交易）。block/change/signal 语义一致。"""
+    return s["outcome_wins"] / s["mature_outcomes"] if s["mature_outcomes"] else 0.0
+
+
+def _low_backfill_warning(s: dict, longest_h: int, records: list[dict],
+                          now_ms: float, backfill: float) -> str:
+    indep = _independent_outcomes(records, longest_h * 3_600_000, now_ms)
+    return (f"outcome 回填率仅 {backfill:.1%}"
+            f"（<{MIN_OUTCOME_BACKFILL_RATE:.0%}），(币,日) 去重后约 {indep} "
+            "个独立场景，有害率结论为低置信")
+
+
+def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
+                    w_long: int, now_ms: float,
+                    warnings: list[str]) -> tuple[float, str, bool, int]:
+    """Audit 2026-09-10 (分母修正)：有害率/反事实 pnl 的正确分母是「命中
+    （拦/改发生）的成熟样本」，不是全部记录——未命中的记录本就不受闸门影响，
+    计入会系统性稀释有害率（confidence_decay 实测全记录 8.8% vs 命中集
+    45.1%，差约 5 倍）。
+
+    命中集成熟样本 ≥ MIN_MATURE_OUTCOMES 时用命中集口径；否则回退全记录口径
+    并追加一条「可能低估真实误伤」告警。signal 臂不在有害率自动判定范围内
+    （M8），其调用方不使用 harmful_signal。"""
+    mature = s["mature_outcomes"]
+    wr = _harmful_rate(s)
+    hit_wins = hit_mature = 0
+    hit_pnl_sum = 0.0
+    hit_has_pnl = False
+    cut = now_ms - w_long * 3_600_000
+    for r in records:
+        ts = _record_ts_ms(r)
+        if ts is None or ts < cut or r.get("outcome") not in ("win", "loss"):
+            continue
+        if _hit_field(r, kind, arm) is not True:
+            continue
+        hit_mature += 1
+        if r["outcome"] == "win":
+            hit_wins += 1
+        p = r.get("pnl_usd")
+        if isinstance(p, (int, float)):
+            hit_has_pnl = True
+            hit_pnl_sum += float(p)
+    if hit_mature >= MIN_MATURE_OUTCOMES:
+        eff_wr = hit_wins / hit_mature
+        denom_note = f"命中集 {hit_wins}/{hit_mature}"
+        harmful_signal = (
+            (hit_has_pnl and hit_pnl_sum > 0 and hit_wins > 0)
+            or (eff_wr > MAX_HARMFUL_RATE and kind in ("block", "change")))
+    else:
+        eff_wr = wr
+        denom_note = f"全记录 {s['outcome_wins']}/{mature}"
+        harmful_signal = (
+            (s["has_pnl"] and s["pnl_usd_sum"] > 0 and s["outcome_wins"] > 0)
+            or (wr > MAX_HARMFUL_RATE and kind in ("block", "change")))
+    if hit_mature < MIN_MATURE_OUTCOMES and mature >= MIN_MATURE_OUTCOMES:
+        warnings.append(
+            f"命中集成熟样本仅 {hit_mature}（<{MIN_MATURE_OUTCOMES}），"
+            "有害率按全记录口径计算，可能低估真实误伤")
+    return eff_wr, denom_note, harmful_signal, hit_mature
+
+
+def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
+                     records: list[dict], now_ms: float, backfill: float,
+                     warnings: list[str]) -> tuple[str, str]:
+    """M1：enforce 臂独立健康档。已生产的臂不需要「继续采数/晋升」导向文案，
+    只输出「维持」或「建议复核降级」。命中宽度与有害率任一越线即降级复核。"""
+    mature = s["mature_outcomes"]
+    wr = _harmful_rate(s)
+    too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
+                and kind in ("block", "change"))
+    low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
+    if low_conf:
+        warnings.append(_low_backfill_warning(s, w_long, records, now_ms, backfill))
+    eff_wr, denom_note, harmful_signal, hit_mature = _effective_harm(
+        arm, kind, s, records, w_long, now_ms, warnings)
+    harmful = mature >= MIN_MATURE_OUTCOMES and harmful_signal
+    # ta_late_entry 命中率只数真实下单闸门（gate）层；total 含仅记拦截的
+    # prefilter 观察流，文案需显式区分，避免把 26k 观察记录误读成交易决策。
+    scope_note = "（仅下单闸门层；prefilter 观察流不计宽度）" \
+        if s.get("decision_scope") == "gate_layer" else ""
+    if harmful or too_wide:
+        parts = []
+        if too_wide:
+            parts.append(f"命中率 {s['hit_rate']:.1%}"
+                         f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽{scope_note}")
+        if harmful:
+            parts.append(f"臂有害率 {eff_wr:.0%}（{denom_note}）"
+                         f"超红线 {MAX_HARMFUL_RATE:.0%}")
+        if low_conf:
+            parts.append("回填不足，结论低置信")
+        return DEGRADED_REVIEW, (
+            f"已在 enforce 但出现健康告警：{'；'.join(parts)}。"
+            "建议复核闸门配置/考虑降级 shadow（仅建议，不自动执行）")
+    tail = (f"、臂有害率 {eff_wr:.0%}（{denom_note}）未越线" if mature
+            else "（反事实 outcome 回填中）")
+    return MAINTAIN, (
+        f"已在 enforce：{w_long}h {s['total']} 条观察、下单闸门命中 {s['hits']}"
+        f"/{s['decisions']}（{s['hit_rate']:.1%}）{scope_note}、回填 {mature} 条{tail}，"
+        "运行正常建议维持")
+
+
+def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
+                    records: list[dict], now_ms: float, backfill: float,
+                    warnings: list[str]) -> tuple[str, str]:
+    """shadow 臂判定（total≥60）。M2/M3/M4 修订点见函数内注释。"""
+    mature = s["mature_outcomes"]
+    wr = _harmful_rate(s)
+    too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
+                and kind in ("block", "change"))
+    low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
+    if low_conf:
+        warnings.append(_low_backfill_warning(s, w_long, records, now_ms, backfill))
+
+    if mature >= MIN_MATURE_OUTCOMES:
+        # 分母修正（见 _effective_harm）：以命中集成熟样本为有效有害率。
+        eff_wr, denom_note, harmful, hit_mature = _effective_harm(
+            arm, kind, s, records, w_long, now_ms, warnings)
+        if harmful:
+            conf = "（低置信，回填不足）" if low_conf else ""
+            if kind == "change":
+                # change 臂：win = v1 优于 v2 = 采纳变更反而少赚（臂有害）。
+                return REVIEW, (
+                    f"臂有害率 {eff_wr:.0%}（{denom_note}）> "
+                    f"{MAX_HARMFUL_RATE:.0%} —— 调整/跳过反而放弃盈利，"
+                    f"疑似有害，勿升级{conf}")
+            pnl_part = (f"，反事实合计 ${s['pnl_usd_sum']:.2f} 为正"
+                        if s["has_pnl"] else "")
+            return REVIEW, (
+                f"被拦命中样本误伤率 {eff_wr:.0%}（{denom_note}）"
+                f" > {MAX_HARMFUL_RATE:.0%}{pnl_part} —— 拦太宽，疑似误伤"
+                f"{conf}")
+        # M2：有害率没越线但命中率太宽（几乎每条都动作），同样不能晋升。
+        if too_wide:
+            return REVIEW, (
+                f"{w_long}h 命中率 {s['hit_rate']:.1%}"
+                f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽（几乎每条都动作），"
+                f"先复核宽度再谈晋升；命中集臂有害率 {eff_wr:.0%}（{denom_note}）")
+        # M3：健康臂也要求有害率安全余量（≤0.4）才能 PROMOTE。
+        # M4：低回填率时即使数字健康也继续采数。
+        if kind == "change":
+            healthy_txt = (f"反事实臂有益率 {1 - eff_wr:.0%}"
+                           f"（{denom_note}）")
+        else:
+            healthy_txt = f"命中集误伤率 {eff_wr:.0%}（{denom_note}）"
+        if eff_wr > PROMOTE_MAX_HARMFUL_RATE:
+            return COLLECTING, (
+                f"{w_long}h {s['total']} 条、命中率 {s['hit_rate']:.1%}、"
+                f"{healthy_txt}；但臂有害率 {eff_wr:.0%} 高于晋升安全余量 "
+                f"{PROMOTE_MAX_HARMFUL_RATE:.0%}（40%~50% 灰区），"
+                "维持 shadow 继续采数，暂不建议晋升")
+        if low_conf:
+            return COLLECTING, (
+                f"{w_long}h {s['total']} 条、{healthy_txt} 看似健康，"
+                f"但回填率仅 {backfill:.1%}（<{MIN_OUTCOME_BACKFILL_RATE:.0%}），"
+                "证据覆盖不足，继续采数后再议晋升")
+        return PROMOTE, (
+            f"{w_long}h {s['total']} 条、命中率 {s['hit_rate']:.1%}、"
+            f"{healthy_txt}（臂有害率 {eff_wr:.0%} ≤ "
+            f"{PROMOTE_MAX_HARMFUL_RATE:.0%} 安全余量），信号健康，"
+            "可考虑升 enforce（待人工拍板）")
+
+    # Enough records but no backfilled outcomes yet.
+    rate = s["hit_rate"]
+    if s["decisions"] > 0 and rate < MIN_BLOCK_RATE and kind in ("block", "change"):
+        return COLLECTING, (
+            f"{w_long}h {s['total']} 条但命中率仅 {rate:.2%}"
+            f"(<{MIN_BLOCK_RATE:.0%})，闸门几乎不触发，晋升无意义，先继续观察")
+    if too_wide:
+        return REVIEW, (
+            f"{w_long}h {s['total']} 条、命中率 {rate:.1%}"
+            f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽，"
+            f"且回填 outcome 仅 {mature} 条尚无法证伪，先复核宽度，暂不晋升")
+    return PROMOTE, (
+        f"{w_long}h {s['total']} 条、命中率 {rate:.1%}；"
+        f"尚无回填 outcome（{mature}/{MIN_MATURE_OUTCOMES}），"
+        "建议跑 reconcile 后再定")
 
 
 def collect_grades(windows: list[int]) -> dict:
@@ -598,15 +973,28 @@ def collect_grades(windows: list[int]) -> dict:
               file=sys.stderr)
 
     now_ms = time.time() * 1000.0
+    # M16：只读探测一次当前 BTC 宏观 regime，供仅做多且 require_macro_uptrend
+    # 的臂（pullback）判定「宏观非多头期策略性不采数」。独立 CLI 进程内会触发
+    # 一次带缓存的 K 线拉取；任何失败都回退 None（不抑制停滞告警，fail-open）。
+    macro_regime = _current_macro_regime()
     arms = []
     for label, blk_name, env_file, default_name, mode_key, path_key in sp.ARMS:
         mode = sp._arm_mode(cfg, blk_name, env_file, mode_key)
         path = sp._arm_path(cfg, blk_name, env_file, default_name, path_key)
-        arms.append(grade_arm(label, mode, path, windows, now_ms=now_ms))
+        # M13 修正：事件型闸门用心跳判活（心跳新鲜则 24h 无事件不判停滞）。
+        hb_age = _heartbeat_age_sec(label, now_ms) if label in ARM_HEARTBEAT_FILE else None
+        arm_macro = macro_regime if label in MACRO_LONG_ONLY_ARMS else None
+        arms.append(grade_arm(label, mode, path, windows, now_ms=now_ms,
+                              heartbeat_age_sec=hb_age, macro_regime=arm_macro))
 
     baseline = {"real_closes": 0, "real_win_rate": None, "note": ""}
     try:
         from hermes_trader.agents.memory import memory
+        # Audit 2026-09-10 (M5)：独立 CLI/cron 进程里 memory 单例启动时不会自动
+        # hydrate（只有 server/trading_loop 主流程显式调 load()），不显式 load
+        # 会让夜间快照的 real_closes 恒为 0（与运行中进程、events.jsonl 真相
+        # 不符）。load() 幂等（_initialized 后为 no-op），对服务进程安全。
+        memory.load()
         ps = memory.get_payoff_stats(limit=500)
         baseline["real_closes"] = int(ps.get("n", 0))
         wr = memory.get_win_rate()
@@ -627,10 +1015,15 @@ def _fmt_report(d: dict) -> str:
              "=" * 100,
              f"{'臂':20s} {'mode':8s} {'类型':6s} {'评级':28s} 说明",
              "-" * 100]
-    order = {DATA_GAP: 0, REVIEW: 1, PROMOTE: 2, INSUFFICIENT: 3, COLLECTING: 4, OFF: 5}
+    order = {DATA_GAP: 0, DEGRADED_REVIEW: 1, REVIEW: 2, PROMOTE: 3,
+             INSUFFICIENT: 4, COLLECTING: 5, MAINTAIN: 6, OFF: 7}
     for a in sorted(d["arms"], key=lambda x: order.get(x["verdict"], 9)):
         lines.append(f"{a['arm']:20s} {a['mode']:8s} {a['kind']:6s} "
                      f"{a['verdict_cn']:28s} {a['reason']}")
+        # M2/M4/M8/M12/M13：warnings（宽度/低回填/停滞/零回填/signal 人工通道）
+        # 紧随该臂主行输出，避免只看 verdict 漏掉侧信号。
+        for w in a.get("warnings", []):
+            lines.append(f"{'':36s}⚠ {w}")
         # Audit 2026-09-08 (change-arm label fix): outcome win/loss is encoded
         # for all arms as "win = counterfactual pnl>0 => the arm foregoes profit
         # (arm hurts)". For change arms a "win" therefore means arm-HARMFUL;
@@ -640,10 +1033,11 @@ def _fmt_report(d: dict) -> str:
         else:
             oc_good, oc_bad = "胜", "负"
         for s in a["windows"]:
+            pend = "  [短窗 outcome 回填滞后，结论只采信最长窗]" if s.get("outcomes_pending") else ""
             lines.append(f"{'':36s}{s['window_h']:>4d}h: {s['total']:>5d} 条  "
                          f"命中 {s['hits']:>4d}/{s['decisions']:<4d} "
                          f"({s['hit_rate']:.1%})  回填 outcome {s['mature_outcomes']} "
-                         f"({oc_good}{s['outcome_losses']}/{oc_bad}{s['outcome_wins']})")
+                         f"({oc_good}{s['outcome_losses']}/{oc_bad}{s['outcome_wins']}){pend}")
         cost = a.get("sv2_cost")
         if cost:
             _COST_CN = {
@@ -669,9 +1063,14 @@ def _fmt_report(d: dict) -> str:
     n_gap = sum(1 for a in d["arms"] if a["verdict"] == DATA_GAP)
     n_prom = sum(1 for a in d["arms"] if a["verdict"] == PROMOTE)
     n_rev = sum(1 for a in d["arms"] if a["verdict"] == REVIEW)
+    n_deg = sum(1 for a in d["arms"] if a["verdict"] == DEGRADED_REVIEW)
+    n_maintain = sum(1 for a in d["arms"] if a["verdict"] == MAINTAIN)
+    n_stall = sum(1 for a in d["arms"] if a.get("collection_stalled"))
     lines.append("-" * 100)
-    lines.append(f"汇总：采数缺口 {n_gap} / 可考虑升级 {n_prom} / 建议复核 {n_rev}。"
-                 f"所有 PROMOTE_CANDIDATE 均需人工 reconcile + config_store 权威写后才生效。")
+    lines.append(f"汇总：采数缺口 {n_gap} / 建议复核 {n_rev + n_deg}"
+                 f"（含 enforce 降级复核 {n_deg}）/ 可考虑升级 {n_prom}"
+                 f" / enforce 维持 {n_maintain} / 采数停滞 {n_stall}。"
+                 "所有 PROMOTE_CANDIDATE 均需人工 reconcile + config_store 权威写后才生效。")
     return "\n".join(lines)
 
 
@@ -684,22 +1083,33 @@ def _push_feishu(d: dict) -> None:
         print(f"[warn] notify 不可用，跳过飞书推送：{e}", file=sys.stderr)
         return
     gaps = [a for a in d["arms"] if a["verdict"] == DATA_GAP]
-    reviews = [a for a in d["arms"] if a["verdict"] == REVIEW]
+    reviews = [a for a in d["arms"] if a["verdict"] in (REVIEW, DEGRADED_REVIEW)]
     promos = [a for a in d["arms"] if a["verdict"] == PROMOTE]
+    # M13：采数停滞（近24h零写入）也必须上卡，旧逻辑里这类臂只显示样本不足。
+    stalled = [a for a in d["arms"] if a.get("collection_stalled")]
     cost_blocks = [a for a in d["arms"]
                    if a.get("sv2_cost") and a["sv2_cost"]["n"] > 0
                    and not a["sv2_cost"]["all_pass"]]
-    if not (gaps or reviews or promos or cost_blocks):
+    if not (gaps or reviews or promos or stalled or cost_blocks):
         return
     fields = {
         "采数缺口(门变盲)": f"{len(gaps)} 条：{', '.join(a['arm'] for a in gaps) or '无'}",
         "建议复核": f"{len(reviews)} 条：{', '.join(a['arm'] for a in reviews) or '无'}",
         "可考虑升级(待人工)": f"{len(promos)} 条：{', '.join(a['arm'] for a in promos) or '无'}",
+        "采数停滞": f"{len(stalled)} 条：{', '.join(a['arm'] for a in stalled) or '无'}",
         "真实成交数": str(d["real_baseline"]["real_closes"]),
     }
     md_lines = ["**评级器只读建议，不会自动改任何闸门/配置。**", ""]
     for a in gaps + reviews + promos:
         md_lines.append(f"- `{a['arm']}` ({a['mode']}) → **{a['verdict_cn']}**：{a['reason']}")
+        for w in a.get("warnings", []):
+            md_lines.append(f"    - ⚠ {w}")
+    for a in stalled:
+        if a["verdict"] in (DATA_GAP, REVIEW, DEGRADED_REVIEW, PROMOTE):
+            continue
+        md_lines.append(f"- `{a['arm']}` ({a['mode']}) → **采数停滞**：{a['reason']}")
+        for w in a.get("warnings", []):
+            md_lines.append(f"    - ⚠ {w}")
     # CS-G §8.1：已有 v2_cost 样本但六条件未全过 → 明确阻断晋升（零样本不告警）。
     for a in d["arms"]:
         cost = a.get("sv2_cost")
@@ -717,22 +1127,30 @@ def _push_feishu(d: dict) -> None:
     )
 
 
-def _slim_snapshot(d: dict) -> dict:
+def _slim_snapshot(d: dict, source: str = "cron") -> dict:
     """Project a full grade report down to one slim, JSONL-friendly history
     line: per-arm verdict/mode + per-window counts the trend chart needs
     (total/hits/decisions/hit_rate/mature_outcomes). Audit 2026-09-08 (CS-C
     window-scoped history): all windows are kept under `windows` so the 24h/72h
     trend survives the nightly snapshot; the flat longest-window fields are
-    retained for older readers / pre-CS-C history rows."""
+    retained for older readers / pre-CS-C history rows.
+
+    Audit 2026-09-10 (M9/M14):
+      * ``source`` = "cron" | "manual" so trend views can exclude hand-run CLI
+        snapshots (实测 16 条历史中 13 条是手工 CLI 副产物)；
+      * 每臂补 outcome_wins / outcome_losses / backfill_rate / 有害率所需字段，
+        否则历史趋势无法回溯有害率，只能看到 verdict 翻转。"""
     w_long = max(d.get("windows_h") or [168])
     _WIN_KEYS = ("window_h", "total", "hits", "decisions", "hit_rate",
-                 "mature_outcomes")
+                 "mature_outcomes", "outcome_wins", "outcome_losses",
+                 "pnl_usd_sum", "outcomes_pending")
     arms = []
     for a in d.get("arms", []):
         longest = next((s for s in a.get("windows", [])
                         if s.get("window_h") == w_long), {})
         windows = [{k: s.get(k, 0) for k in _WIN_KEYS}
                    for s in a.get("windows", [])]
+        mature = longest.get("mature_outcomes", 0) or 0
         row = {
             "arm": a.get("arm"),
             "mode": a.get("mode"),
@@ -742,7 +1160,17 @@ def _slim_snapshot(d: dict) -> dict:
             "hits": longest.get("hits", 0),
             "decisions": longest.get("decisions", 0),
             "hit_rate": longest.get("hit_rate", 0.0),
-            "mature_outcomes": longest.get("mature_outcomes", 0),
+            "mature_outcomes": mature,
+            "outcome_wins": longest.get("outcome_wins", 0),
+            "outcome_losses": longest.get("outcome_losses", 0),
+            "pnl_usd_sum": longest.get("pnl_usd_sum", 0.0),
+            "backfill_rate": a.get("backfill_rate",
+                                   (mature / longest["total"]
+                                    if longest.get("total") else 0.0)),
+            "harmful_rate": round(longest.get("outcome_wins", 0) / mature, 4)
+                             if mature else None,
+            "warnings": a.get("warnings", []),
+            "collection_stalled": a.get("collection_stalled"),
             "windows": windows,
         }
         cost = a.get("sv2_cost")
@@ -759,27 +1187,89 @@ def _slim_snapshot(d: dict) -> dict:
         "ts": int(time.time() * 1000),
         "generated_at": d.get("generated_at"),
         "window_h": w_long,
+        "source": d.get("_history_source", source),
         "real_closes": (d.get("real_baseline") or {}).get("real_closes", 0),
+        "real_win_rate": (d.get("real_baseline") or {}).get("real_win_rate"),
         "arms": arms,
     }
 
 
-def append_history(d: dict, path: str | None = None) -> bool:
+def append_history(d: dict, path: str | None = None,
+                   source: str = "cron") -> bool:
     """Best-effort: append one slim snapshot line to the nightly grade history.
     Returns True on success. Never raises — the grader must stay read-only
     with respect to trading and a history write failure must not affect the
-    report or the cron exit code."""
+    report or the cron exit code.
+
+    Audit 2026-09-10 (M9)：``source`` 区分 cron 夜间快照与手工 CLI 运行；
+    趋势结论默认只采信 source="cron"。历史无此字段的旧行按 cron 对待。"""
     path = path or HISTORY_FILE
     try:
-        rec = _slim_snapshot(d)
+        rec = _slim_snapshot(d, source=source)
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        # M9 幂等补强：cron 每自然日（UTC）只允许一条快照。cron 重跑/容器重建后
+        # 补跑/并发触发若在同一日再写，用新快照「替换」当日旧 cron 行而非追加，
+        # 从根上杜绝趋势图同日多条堆叠（09/08 曾出现 9 条、09/10 同刻 2 条）。
+        # manual 行不参与替换，保留手工重评的独立痕迹（趋势默认也不读它）。
+        if source == "cron":
+            rec = _upsert_history_line(path, rec)
+        else:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
         _trim_history(path)
         return True
     except Exception as e:  # pragma: no cover - best-effort side channel
         print(f"[warn] 评级历史落盘失败（不影响评级）：{e}", file=sys.stderr)
         return False
+
+
+def _same_day_ms(a: float, b: float) -> bool:
+    """两个 epoch-ms 是否落在同一 UTC 自然日。"""
+    return (int(a) // 86_400_000) == (int(b) // 86_400_000)
+
+
+def _upsert_history_line(path: str, rec: dict) -> dict:
+    """写入 cron 快照并替换当日已存在的 cron 行（按 UTC 自然日去重）。
+
+    返回最终落盘的 rec（若命中当日已有行，保留旧 ts 以维持时间序，仅更新
+    载荷）。文件缺失或损坏时退化为纯追加。"""
+    new_line = json.dumps(rec, ensure_ascii=False)
+    try:
+        existing: list[str] = []
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8", errors="replace") as fh:
+                existing = fh.readlines()
+    except OSError:
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(new_line + "\n")
+        return rec
+
+    replaced = False
+    kept: list[str] = []
+    for ln in existing:
+        s = ln.strip()
+        if not s:
+            continue
+        try:
+            old = json.loads(s)
+        except (json.JSONDecodeError, ValueError):
+            kept.append(s)
+            continue
+        is_cron = old.get("source", "cron") == "cron"
+        old_ts = old.get("ts")
+        if (not replaced and is_cron and isinstance(old_ts, (int, float))
+                and _same_day_ms(float(old_ts), float(rec["ts"]))):
+            # 命中当日 cron 行：沿用旧 ts（顺序稳定），载荷整体替换为最新评级。
+            rec["ts"] = old_ts
+            kept.append(json.dumps(rec, ensure_ascii=False))
+            replaced = True
+        else:
+            kept.append(s)
+    if not replaced:
+        kept.append(new_line)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(kept) + "\n")
+    return rec
 
 
 def _trim_history(path: str) -> None:
@@ -797,9 +1287,12 @@ def _trim_history(path: str) -> None:
 
 
 def read_history(path: str | None = None, since_ms: float | None = None,
-                 limit: int = 365) -> list[dict]:
+                 limit: int = 365, source: str | None = None) -> list[dict]:
     """Read nightly grade snapshots (oldest first), newest `limit` kept and an
-    optional `since_ms` lower bound. Best-effort: missing/corrupt file → []."""
+    optional `since_ms` lower bound. Best-effort: missing/corrupt file → [].
+
+    Audit 2026-09-10 (M9)：``source="cron"`` 时只返回夜间 cron 快照（手工 CLI
+    快照 source="manual" 被排除）；旧行无 source 字段时按 cron 对待。"""
     path = path or HISTORY_FILE
     out: list[dict] = []
     if not os.path.exists(path):
@@ -813,6 +1306,8 @@ def read_history(path: str | None = None, since_ms: float | None = None,
                 try:
                     rec = json.loads(ln)
                 except (json.JSONDecodeError, ValueError):
+                    continue
+                if source is not None and rec.get("source", "cron") != source:
                     continue
                 if since_ms is not None and isinstance(rec.get("ts"), (int, float)) \
                         and rec["ts"] < since_ms:
@@ -830,7 +1325,14 @@ def main() -> int:
     ap.add_argument("--json", action="store_true", help="机读 JSON 输出")
     ap.add_argument("--push", action="store_true", help="推送飞书风险卡片（不抛异常）")
     ap.add_argument("--windows", type=int, nargs="+", default=[24, 72, 168],
-                    help="统计窗口（小时），默认 24 72 168")
+                    help="统计窗口（小时），默认 24 72 168（空格分隔）")
+    # Audit 2026-09-10 (M9)：CLI 手工运行默认标记 manual，避免污染夜间趋势；
+    # cron 包装脚本（cron_shadow_grade.sh）显式传 --history-source=cron。
+    ap.add_argument("--history-source", choices=("cron", "manual"),
+                    default=os.environ.get("HERMES_SHADOW_GRADE_SOURCE", "manual"),
+                    help="历史快照来源标记（手工 CLI 默认 manual；cron 用 cron）")
+    ap.add_argument("--no-history", action="store_true",
+                    help="只输出评级，不向 history 追加快照（零污染复核用）")
     args = ap.parse_args()
 
     d = collect_grades(args.windows)
@@ -838,7 +1340,9 @@ def main() -> int:
         _push_feishu(d)
     # Audit 2026-09-07 (M1): persist the nightly snapshot for the dashboard
     # trend view. Best-effort; only the cron/main path writes history.
-    append_history(d)
+    # Audit 2026-09-10 (M9): source-tagged so hand runs can't fake nightly data.
+    if not args.no_history:
+        append_history(d, source=args.history_source)
     if args.json:
         print(json.dumps(d, ensure_ascii=False, indent=2))
     else:

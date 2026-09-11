@@ -39,7 +39,11 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
 
   # --push sends the risk card (best-effort, never raises); the grader is
   # read-only regardless. Word-splitting WINDOWS is intentional.
-  docker exec "$CONTAINER" python /app/scripts/shadow_grade.py --push --windows $WINDOWS
+  # Audit 2026-09-10 (M9): explicit --history-source=cron so the snapshot is
+  # distinguishable from hand-run CLI invocations (which default to "manual");
+  # the portal trend view filters to source=cron.
+  docker exec "$CONTAINER" python /app/scripts/shadow_grade.py --push \
+    --history-source cron --windows $WINDOWS
   rc=$?
   echo "$(ts) shadow_grade exit=$rc"
   echo

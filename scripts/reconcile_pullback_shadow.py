@@ -32,9 +32,14 @@ from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.models.types import Candle
 
+# Audit 2026-09-10 (M12): default to the writable /data path the runtime actually
+# writes (shadow_log reroutes the read-only ~/.hermes-trading home to /data in
+# container). Overridable via HERMES_PULLBACK_SHADOW_FILE or --file.
 SHADOW_FILE = os.environ.get(
     "HERMES_PULLBACK_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/pullback_shadow.jsonl"),
+    os.path.expanduser("~/.hermes-trading/pullback_shadow.jsonl")
+    if os.access(os.path.expanduser("~/.hermes-trading"), os.W_OK)
+    else "/data/pullback_shadow.jsonl",
 )
 ROUND_TRIP_FEE_BPS = 5.0
 
@@ -102,10 +107,41 @@ def main() -> int:
         print(f"shadow file not found: {args.file}")
         return 1
 
-    with open(args.file, encoding="utf-8") as f:
-        records = [json.loads(line) for line in f if line.strip()]
+    # Audit 2026-09-10 (M12 fix): shadow_log rotates the active file daily into
+    # ``<file>.1``..``<file>.5``. The grader merges them, so reconciliation must
+    # too — reading only the active file left all rotated pullback records
+    # permanently outcome-less (42 records, 0 outcomes). We load the active file
+    # plus siblings, remember each record's origin file, and write outcomes back
+    # to that same origin so the rotation layout is preserved. The active file is
+    # loaded FIRST (then older siblings .1..5); whole-line dedup below keeps the
+    # first occurrence, so a record present in both is taken from the newest
+    # active file rather than an older rotated copy.
+    rotation_files = [args.file] + [
+        f"{args.file}.{i}" for i in range(1, 6) if os.path.exists(f"{args.file}.{i}")
+    ]
+    # Origin map keyed by id(record) -> file path, set while loading.
+    records: List[Dict[str, Any]] = []
+    origin: Dict[int, str] = {}
+    seen_raw: set[str] = set()
+    for fp in rotation_files:
+        try:
+            with open(fp, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line in seen_raw:
+                        continue
+                    seen_raw.add(line)
+                    r = json.loads(line)
+                    records.append(r)
+                    origin[id(r)] = fp
+        except (OSError, json.JSONDecodeError) as e:
+            print(f"  warn: could not read {fp}: {e}")
 
-    pending = [r for r in records if r.get("outcome") is None]
+    # M15: records previously tagged "no_entry_px" by the pre-candle guard are
+    # retried too — they were mis-classified before the bar-open fallback.
+    # Genuine terminal states (win/loss/no_future_bars/bad_timestamp) are kept.
+    _RETRYABLE = {None, "no_entry_px"}
+    pending = [r for r in records if r.get("outcome") in _RETRYABLE]
     cutoff = datetime.now(timezone.utc).timestamp() - args.window_hours * 3600
     # Reconcile signals whose timestamp is old enough to have matured.
     mature = []
@@ -115,7 +151,8 @@ def main() -> int:
             mature.append(r)
 
     print(f"total records: {len(records)}  pending: {len(pending)}  "
-          f"mature (>= {args.window_hours}h): {len(mature)}")
+          f"mature (>= {args.window_hours}h): {len(mature)}  "
+          f"files: {len(rotation_files)}")
 
     live = read_agent_config()
     dsl_cfg = live.get("dsl_exit", {}) or {}
@@ -125,9 +162,6 @@ def main() -> int:
     for r in mature:
         coin = r["coin"]
         entry_px = float(r.get("entry_px") or 0)
-        if entry_px <= 0:
-            r["outcome"] = "no_entry_px"
-            continue
         after_ts = _parse_iso(r["timestamp"])
         if after_ts is None:
             r["outcome"] = "bad_timestamp"
@@ -141,8 +175,19 @@ def main() -> int:
         if idx < 0 or idx >= len(candles) - 2:
             r["outcome"] = "no_future_bars"
             continue
-        # Use the actual recorded entry_px (mid at signal time); if zero, use bar open.
+        # Audit 2026-09-11 (M15): pullback shadow records are written at the
+        # pre-trade runner gate, where no fill/mid exists, so entry_px is
+        # persistently 0. The previous guard marked every such record
+        # "no_entry_px" *before* fetching candles, making the bar-open fallback
+        # below unreachable and leaving the arm with zero counterfactual
+        # outcomes forever. For a pure paper reconciliation the correct
+        # hypothetical entry is the 1h bar open at/after the signal timestamp.
         ep = entry_px if entry_px > 0 else candles[idx].o
+        if ep <= 0:
+            r["outcome"] = "no_entry_px"
+            continue
+        if entry_px <= 0:
+            r["entry_px_source"] = "signal_bar_open"
         exit_px, reason, exit_idx = _simulate_exit(ep, idx, candles, dsl_cfg)
         gross_pct = (exit_px - ep) / ep  # long only
         pnl_pct = gross_pct - fee_pct
@@ -175,10 +220,21 @@ def main() -> int:
                   f"pnl={r['pnl_pct']:+.2f}%  [{r['outcome']}/{r['exit_reason']}]")
 
     if args.write:
-        with open(args.file, "w", encoding="utf-8") as f:
-            for r in records:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"\nOutcomes written back to {args.file}")
+        # Write each (possibly updated) record back to the exact file it came
+        # from, preserving per-file order. Mature records were mutated in place,
+        # so regrouping by origin persists only the newly computed outcomes while
+        # leaving the daily-rotation layout intact.
+        by_file: Dict[str, List[Dict[str, Any]]] = {}
+        for r in records:
+            by_file.setdefault(origin.get(id(r), args.file), []).append(r)
+        for fp, rows in by_file.items():
+            tmp = f"{fp}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                for r in rows:
+                    f.write(json.dumps(r, ensure_ascii=False) + "\n")
+            os.replace(tmp, fp)
+            print(f"  wrote {len(rows)} records -> {fp}")
+        print(f"\nOutcomes written back across {len(by_file)} file(s)")
     else:
         print("\n(dry-run; pass --write to persist outcomes into the JSONL)")
     return 0

@@ -163,8 +163,9 @@ class _StubGrader:
             "real_baseline": {"real_closes": 0, "real_win_rate": None, "note": ""},
         }
 
-    def read_history(self, since_ms=None, limit=365):
+    def read_history(self, since_ms=None, limit=365, source=None):
         self.history_calls += 1
+        self.last_source = source
         return [{"ts": 1_700_000_000_000, "arms": [{"arm": "x", "verdict": "OFF"}]}]
 
 
@@ -212,6 +213,21 @@ def test_grade_history_endpoint(client):
     assert data["count"] == 1
     assert data["snapshots"][0]["arms"][0]["verdict"] == "OFF"
     assert stub.history_calls == 1
+    assert stub.last_source is None
+
+
+def test_grade_history_source_filter_passthrough(client):
+    # M9：趋势视图只看 cron 快照，source 参数透传到 read_history
+    c, stub = client
+    r = c.get("/api/dashboard/shadow-arms/grade-history?days=30&source=cron")
+    assert r.status_code == 200
+    assert stub.last_source == "cron"
+
+
+def test_grade_history_bad_source_422(client):
+    c, _ = client
+    r = c.get("/api/dashboard/shadow-arms/grade-history?source=everything")
+    assert r.status_code == 422
 
 
 def test_refresh_requires_operator_token(client):

@@ -47,6 +47,19 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --window-hours "${HERMES_CHANGE_ARM_WINDOW:-30}" --write
   echo "$(ts) change-arm shadow backfill exit=$?"
 
+  # Audit 2026-09-10 (M12 fix): pullback-long shadow backfill. This arm's
+  # reconcile script existed but was NEVER scheduled, and its default path
+  # (~/.hermes-trading) is read-only in-container, so production records live in
+  # /data and all 42 historical signals stayed outcome-less forever. Pass the
+  # /data path explicitly and let the script merge daily rotations .1..5. Mature
+  # window 48h (pullback outcomes need two+ days of 1h bars). Pure paper, best-
+  # effort: never masks the fills reconcile exit code above.
+  echo "$(ts) pullback shadow backfill start (window=${HERMES_PULLBACK_WINDOW:-48}h)"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_pullback_shadow.py \
+    --file "${HERMES_PULLBACK_SHADOW_FILE:-/data/pullback_shadow.jsonl}" \
+    --window-hours "${HERMES_PULLBACK_WINDOW:-48}" --write
+  echo "$(ts) pullback shadow backfill exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1

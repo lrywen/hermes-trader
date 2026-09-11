@@ -180,6 +180,10 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
     async def shadow_arms_grade_history(
         days: int = Query(30, ge=1, le=400),
         limit: int = Query(400, ge=1, le=400),
+        source: str | None = Query(
+            None, pattern="^(cron|manual)$",
+            description="M9：按快照来源过滤；趋势视图传 cron 以排除手工重评污染",
+        ),
     ) -> JSONResponse:
         """Nightly verdict snapshots (oldest first) for the trend view."""
         try:
@@ -189,7 +193,7 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
         since_ms = time.time() * 1000.0 - days * 86400.0 * 1000.0
 
         def _read() -> list[dict]:
-            return sg.read_history(since_ms=since_ms, limit=limit)
+            return sg.read_history(since_ms=since_ms, limit=limit, source=source)
 
         snaps = await asyncio.to_thread(_read)
         return JSONResponse({"snapshots": snaps, "count": len(snaps), "days": days})
