@@ -5952,6 +5952,7 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                                 f"[risk] STOP OVERRUN {coin}: realized {_spot_loss_pct:.3f}% "
                                 f"vs cap {_cfg_cap:.3f}% → +{_overrun:.1f}% (>10% alarm)")
                             try:
+                                from hermes_trader import notify
                                 notify.send_card(
                                     title="🚨 实际止损超限告警 (STOP OVERRUN)",
                                     level="danger",
