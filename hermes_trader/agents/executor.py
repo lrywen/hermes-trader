@@ -832,6 +832,39 @@ _SHORT_ONLY_SHADOW_FILE = os.environ.get(
 )
 
 
+def _record_per_coin_regime_probe(analysis: dict[str, Any],
+                                  config: dict[str, Any],
+                                  *, runner_block: str) -> None:
+    """探针前移：在 runner entry gate 处采样 per-coin regime 影子记录。
+
+    该探针原先挂在 risk_gates.eval_all_gates 里，但 ~86%（近几日 98.5%）的
+    候选在到达 eval_all_gates 之前就被 runner gate 拦掉了，导致影子样本
+    积累速率只有 3~29 行/天，凑够可判定的 demote 样本要按年计。挪到这里后
+    覆盖 100% 的已评估候选，代价是样本里混入大量不会成交的候选 —— 用
+    detail.runner_block 区分（空串 = 通过 runner gate 的真候选）。
+
+    Shadow-only，永不抛异常、永不改变执行决策。
+    """
+    try:
+        from hermes_trader.agents.market_regime import detect_regime_with_score
+        from hermes_trader.agents.per_coin_regime_shadow import (
+            record_per_coin_regime_shadow)
+        coin = analysis.get("coin") or ""
+        regime, score = detect_regime_with_score(coin)
+        record_per_coin_regime_shadow(
+            coin=coin,
+            side=(analysis.get("side") or "long").lower(),
+            confidence=analysis.get("confidence"),
+            composite_score=analysis.get("composite_score"),
+            market_regime_result={"regime": regime, "trend_score": score,
+                                  "via": "probe:runner_gate"},
+            analysis=analysis, config=config,
+            trace_id=str(analysis.get("id") or ""),
+            extra_detail={"runner_block": runner_block})
+    except Exception:
+        pass
+
+
 def _record_short_only_shadow(analysis: dict[str, Any], gate: dict[str, Any],
                               *, reason: str) -> None:
     """Record a short candidate that the operator's allow_shorts=false switch
@@ -3224,10 +3257,13 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     if not _sidestep_bypasses_runner:
         runner_block = _runner_entry_block_reason(analysis, config)
         if runner_block:
+            _record_per_coin_regime_probe(analysis, config,
+                                          runner_block=runner_block)
             return {
                 "executed": False, "mode": mode,
                 "analysis_id": analysis["id"], "reason": runner_block,
             }
+    _record_per_coin_regime_probe(analysis, config, runner_block="")
 
     # Loss cooldown: refuse re-entry on a coin whose last close was a LOSS and
     # whose extended block hasn't expired (armed in close_position_market).

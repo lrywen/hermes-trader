@@ -121,6 +121,10 @@ class Trade:
     # O-7 (supplemental audit 2026-08-30): in-sample vs out-of-sample tag for
     # walk-forward validation. A trade entered on/after the split bar is OOS.
     in_sample: bool = True
+    # Optional macro×own regime quadrant tag attached at entry (per-coin
+    # overlay analysis). None unless a caller supplies regime_tag_fn; never
+    # read by the entry/exit logic, so it cannot change the simulation.
+    regime_tag: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -264,7 +268,8 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
               exit_slip_bps: float = DEFAULT_EXIT_SLIP_BPS,
               stop_delay_slip_bps: float = DEFAULT_STOP_DELAY_SLIP_BPS,
               fee_bps: float = ROUND_TRIP_FEE_BPS,
-              oos_split_bar: Optional[int] = None) -> List[Trade]:
+              oos_split_bar: Optional[int] = None,
+              regime_tag_fn: Optional[Any] = None) -> List[Trade]:
     trades: List[Trade] = []
     open_t: Optional[Trade] = None
     open_dsl: Optional[DSL] = None
@@ -368,8 +373,18 @@ def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
         # short SELL fills below). The stop/trail ladder anchors on the FILLED
         # price, matching live dsl_exit which tracks the actual entry price.
         entry_px = _fill(next_bar.o, side == "long", entry_slip_bps)
+        rtag = None
+        if regime_tag_fn is not None:
+            try:
+                # Same closed-bar information set as the late-entry gate: the
+                # decision is made at bar i's close (filled at i+1 open), so
+                # only higher-TF bars fully closed by bar.t+sim_ms are visible.
+                rtag = regime_tag_fn(coin, side, bar.t + sim_ms)
+            except Exception:
+                rtag = None
         open_t = Trade(coin=coin, side=side, entry_bar=i + 1, entry_px=entry_px,
-                       notional=notional, margin=margin, leverage=lev)
+                       notional=notional, margin=margin, leverage=lev,
+                       regime_tag=rtag)
         # ATR-stop mode: stop width = atr_mult × ATR% at entry, clamped — mirrors
         # the live dsl_exit.atr_stop feature. atr_mult=0 keeps the fixed stop.
         eff_max_loss = max_loss_pct

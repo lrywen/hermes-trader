@@ -143,11 +143,22 @@ def record_per_coin_regime_shadow(*, coin: str, side: str,
                                   market_regime_result: dict[str, Any],
                                   analysis: Optional[dict[str, Any]],
                                   config: dict[str, Any],
-                                  trace_id: str = "") -> None:
-    """Append a per-coin direction shadow record for a macro-ALIGNED gate pass.
+                                  trace_id: str = "",
+                                  extra_detail: Optional[dict[str, Any]] = None,
+                                  ) -> None:
+    """Append a per-coin direction shadow record.
 
     Shadow-only: gated by per_coin_regime_shadow.shadow_mode (default False so
     the probe is inert until explicitly enabled). Never raises.
+
+    Coverage (probe-idle fix): historically this returned early unless the
+    trade was macro-ALIGNED, so during long non-aligned stretches the file
+    stayed empty and the overlay could never accumulate a reconciliation
+    sample. With record_all_quadrants (default True) it now records EVERY
+    evaluated crypto candidate with its macro×own quadrant; macro-ALIGNED rows
+    carry the actionable would=demote/pass label, while non-aligned rows are
+    tagged would="n/a_non_aligned" (the existing gate already owns those).
+    Set record_all_quadrants=false to restore the aligned-only behaviour.
     """
     try:
         blk = (config or {}).get("per_coin_regime_shadow") or {}
@@ -156,9 +167,11 @@ def record_per_coin_regime_shadow(*, coin: str, side: str,
         if not isinstance(market_regime_result, dict):
             return
         regime = str(market_regime_result.get("regime") or "")
-        # Only shadow the failure mode: macro says aligned/free-pass. A trade
-        # already blocked or counter-trend is not the BTC-proxy leak.
-        if not _macro_aligned(regime, side):
+        aligned = _macro_aligned(regime, side)
+        # Default True: keep recording across non-aligned stretches so the
+        # probe no longer idles. An explicit false restores aligned-only.
+        record_all = bool(blk.get("record_all_quadrants", True))
+        if not aligned and not record_all:
             return
         require_adx = _f(blk.get("require_own_adx"))
         div = own_4h_divergence(side, analysis,
@@ -183,13 +196,16 @@ def record_per_coin_regime_shadow(*, coin: str, side: str,
             strong_score=strong_score if strong_score is not None else 0.65,
             mid_score=mid_score if mid_score is not None else 0.55)
 
+        would = ("demote_to_weak_aligned" if div["would_demote"] else "pass") \
+            if aligned else "n/a_non_aligned"
         rec = {
             "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
             "trace_id": trace_id or "",
             "rule": "per_coin_regime",
             "coin": coin,
             "side": str(side or "").lower(),
-            "would": "demote_to_weak_aligned" if div["would_demote"] else "pass",
+            "macro_aligned": aligned,
+            "would": would,
             "detail": {
                 "macro_regime": regime,
                 "macro_trend_score": (round(macro_score, 3)
@@ -203,6 +219,7 @@ def record_per_coin_regime_shadow(*, coin: str, side: str,
                 "quadrant_tier": quad["tier"],
                 "tier_would": quad["would"],
                 **div,
+                **(extra_detail or {}),
             },
             "outcome": None,    # filled by offline reconciliation
             "exit_px": None,
@@ -211,7 +228,11 @@ def record_per_coin_regime_shadow(*, coin: str, side: str,
         from hermes_trader.shadow_log import append_jsonl
         path = _shadow_file(blk)
         if append_jsonl(path, rec, stream="per_coin_regime"):
-            logger.info(
+            # Macro-aligned rows are the actionable failure mode → INFO. The
+            # expanded non-aligned coverage only feeds reconciliation, so keep
+            # it at DEBUG so a busy tape doesn't flood the log.
+            _log = logger.info if aligned else logger.debug
+            _log(
                 "[risk_gates] per-coin-regime SHADOW for %s: would=%s tier=%s "
                 "(macro=%s/%s own1h=%s/%s own4h=%s gap=%s%%) -> %s",
                 coin, rec["would"], quad["tier"], regime, macro_score,

@@ -118,7 +118,7 @@ def test_record_inert_when_shadow_disabled(tmp_path):
     assert not path.exists()
 
 
-def test_record_writes_only_for_macro_aligned(tmp_path, monkeypatch):
+def test_record_writes_for_all_quadrants_by_default(tmp_path, monkeypatch):
     # Avoid any network: own 1h detector is TTL-cached/mocked.
     monkeypatch.setattr(
         "hermes_trader.agents.market_regime.detect_own_regime_with_score",
@@ -126,20 +126,23 @@ def test_record_writes_only_for_macro_aligned(tmp_path, monkeypatch):
     path = tmp_path / "s.jsonl"
     cfg = {"per_coin_regime_shadow": {"shadow_mode": True,
                                       "shadow_log_path": str(path)}}
-    # counter-trend macro (down + long) must not be shadowed by this probe
+    # counter-trend macro (down + long): with the probe-idle fix this is now
+    # recorded too, but tagged n/a_non_aligned so it never reads as actionable.
     pcrs.record_per_coin_regime_shadow(
         coin="ZEC", side="long", confidence=0.7, composite_score=40,
         market_regime_result=_mr(regime="down", via="blocked_bypass"),
         analysis=_analysis(99, 100, 30), config=cfg)
-    assert not path.exists()
     # macro up + long + own down -> writes a demote record (weak_review tier)
     pcrs.record_per_coin_regime_shadow(
         coin="ZEC", side="long", confidence=0.7, composite_score=40,
         market_regime_result=_mr(), analysis=_analysis(99, 100, 30),
         config=cfg)
     rows = [json.loads(l) for l in path.read_text().splitlines()]
-    assert len(rows) == 1
-    r = rows[0]
+    assert len(rows) == 2
+    assert rows[0]["macro_aligned"] is False
+    assert rows[0]["would"] == "n/a_non_aligned"
+    assert rows[1]["macro_aligned"] is True
+    r = rows[1]
     assert r["rule"] == "per_coin_regime"
     assert r["would"] == "demote_to_weak_aligned"
     assert r["detail"]["macro_regime"] == "up"
@@ -147,6 +150,42 @@ def test_record_writes_only_for_macro_aligned(tmp_path, monkeypatch):
     assert r["detail"]["own_1h_regime"] == "down"
     assert r["detail"]["quadrant_tier"] == "weak_review"
     assert r["detail"]["tier_would"] == "counter_review"
+
+
+def test_record_aligned_only_when_record_all_disabled(tmp_path, monkeypatch):
+    # Explicit opt-out restores the historical aligned-only coverage.
+    monkeypatch.setattr(
+        "hermes_trader.agents.market_regime.detect_own_regime_with_score",
+        lambda coin, force=False: ("down", 0.40))
+    path = tmp_path / "s.jsonl"
+    cfg = {"per_coin_regime_shadow": {
+        "shadow_mode": True, "record_all_quadrants": False,
+        "shadow_log_path": str(path)}}
+    pcrs.record_per_coin_regime_shadow(
+        coin="ZEC", side="long", confidence=0.7, composite_score=40,
+        market_regime_result=_mr(regime="down", via="blocked_bypass"),
+        analysis=_analysis(99, 100, 30), config=cfg)
+    assert not path.exists()
+
+
+def test_record_merges_extra_detail(tmp_path, monkeypatch):
+    # 探针前移后，调用方用 extra_detail 携带 runner_block 以区分
+    # "通过 runner gate 的真候选"（空串）和"被拦下的候选"（拦截原因）。
+    monkeypatch.setattr(
+        "hermes_trader.agents.market_regime.detect_own_regime_with_score",
+        lambda coin, force=False: ("down", 0.40))
+    path = tmp_path / "s.jsonl"
+    cfg = {"per_coin_regime_shadow": {"shadow_mode": True,
+                                      "shadow_log_path": str(path)}}
+    pcrs.record_per_coin_regime_shadow(
+        coin="ZEC", side="long", confidence=0.7, composite_score=40,
+        market_regime_result=_mr(), analysis=_analysis(99, 100, 30),
+        config=cfg, extra_detail={"runner_block": "shorts disabled"})
+    rows = [json.loads(l) for l in path.read_text().splitlines()]
+    assert len(rows) == 1
+    assert rows[0]["detail"]["runner_block"] == "shorts disabled"
+    # 既有字段不被覆盖
+    assert rows[0]["detail"]["macro_regime"] == "up"
 
 
 # ── quadrant / 3-tier pure classification ──────────────────────────────────
