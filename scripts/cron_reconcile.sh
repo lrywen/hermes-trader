@@ -60,6 +60,19 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --window-hours "${HERMES_PULLBACK_WINDOW:-48}" --write
   echo "$(ts) pullback shadow backfill exit=$?"
 
+  # Audit 2026-09-11 (xs_reversal outcome gap): this arm's reconcile script
+  # existed but was NEVER scheduled, so all shadow rows stayed outcome-less and
+  # the 00:45 grader reported "outcome 回填 0/44". The script also emitted the
+  # legacy vocabulary "winner"/"loser", which the grader does not count (it only
+  # counts win/loss); both are fixed together. No --max-age-hours: grade every
+  # rotated row; grade() itself skips signals whose 72h bar has not printed
+  # (immature). Pure paper, best-effort: never masks the fills reconcile exit.
+  echo "$(ts) xs_reversal shadow backfill start"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_xs_reversal_shadow.py \
+    --file "${HERMES_XS_REVERSAL_SHADOW_FILE:-/data/xs_reversal_shadow.jsonl}" \
+    --write
+  echo "$(ts) xs_reversal shadow backfill exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1
