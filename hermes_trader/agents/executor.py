@@ -954,6 +954,142 @@ def _record_short_only_shadow(analysis: dict[str, Any], gate: dict[str, Any],
         logger.debug(f"[runner_gate] short-only shadow record failed: {e}")
 
 
+_EARLY_BREAKOUT_SHADOW_FILE = os.environ.get(
+    "HERMES_EARLY_BREAKOUT_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/early_breakout_shadow.jsonl"),
+)
+
+
+def _early_breakout_candidate(analysis: dict[str, Any], gate: dict[str, Any],
+                              *, fresh_impulse: bool, score: float,
+                              rsi4h: Any) -> tuple[bool, str]:
+    """Pure predicate: is this LONG a *fresh volume breakout in its first leg*
+    that the strict confidence/structure gate is about to reject?
+
+    The NEAR 2026-09-11 case: at 12:30 the coin printed a 5.6x-volume breakout
+    but composite was only 12.6 / confidence 0.60, so it was rejected; by the
+    time structure confirmed at ~14:10 the entry was 7.4% higher and then it
+    had to clear the anti-chase veto. This predicate identifies exactly those
+    first-leg impulses so their counter-factual EV (early half-size + tight
+    ATR stop) can be measured BEFORE relaxing the live gate.
+
+    Conditions (all required, deliberately conservative):
+      * a real fresh impulse (breakout, or volume+burst),
+      * NOT already extended (4h extension under a cap, RSI not overbought),
+      * composite below the live admission score (otherwise it's admitted
+        anyway and needs no early lane).
+    Returns (is_candidate, reason). No side effects.
+    """
+    cfg = gate.get("early_breakout_shadow") or {}
+    if not bool(cfg.get("shadow_mode", False)):
+        return False, "shadow_off"
+    if not fresh_impulse:
+        return False, "no_fresh_impulse"
+    ext_cap = float(cfg.get("max_extension_atr", 1.5))
+    extension = analysis.get("extension_atr")
+    if extension is None:
+        # fall back to a carried 4h extension if present, else treat unknown
+        extension = analysis.get("atr_extension_4h")
+    try:
+        if extension is not None and float(extension) > ext_cap:
+            return False, f"extended {float(extension):.2f}>{ext_cap}"
+    except (TypeError, ValueError):
+        pass
+    ob = float(gate.get("rsi_overbought", 75.0))
+    try:
+        if rsi4h is not None and float(rsi4h) > ob:
+            return False, f"rsi {float(rsi4h):.0f}>{ob:.0f}"
+    except (TypeError, ValueError):
+        pass
+    min_score = float(gate.get("min_composite", 30.0))
+    if score >= min_score:
+        return False, "score_already_admittable"
+    return True, "fresh_first_leg_low_score"
+
+
+def _record_early_breakout_shadow(analysis: dict[str, Any],
+                                  gate: dict[str, Any], *, block: str,
+                                  fresh_impulse: bool, score: float,
+                                  gate_conf: float) -> None:
+    """Record one early-breakout counter-factual. Shadow-only; never places an
+    order and never changes the live block. Carries the early-lane sizing/stop
+    parameters the offline grader replays (fractional notional + tight ATR
+    stop). Best-effort: never raises."""
+    try:
+        from datetime import datetime, timezone
+
+        def _f(v):
+            try:
+                x = float(v)
+                return x if x == x else None
+            except (TypeError, ValueError):
+                return None
+
+        coin = analysis.get("coin") or ""
+        cfg = gate.get("early_breakout_shadow") or {}
+        entry_px = (_f(analysis.get("mid")) or _f(analysis.get("price"))
+                    or _f(analysis.get("entry_px")))
+        atr4h = _f(analysis.get("atr4h"))
+        atr_pct = (_f(analysis.get("atr4h_pct"))
+                   or ((atr4h / entry_px * 100.0)
+                       if atr4h and entry_px else None))
+        stop_mult = float(cfg.get("early_stop_atr_mult", 1.2))
+        size_frac = float(cfg.get("early_size_fraction", 0.5))
+        macro_regime = macro_score = None
+        try:
+            from hermes_trader.agents.market_regime import (
+                detect_regime_with_score)
+            macro_regime, macro_score = detect_regime_with_score(coin)
+        except Exception:
+            pass
+        rec = {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "trace_id": str(analysis.get("trace_id") or analysis.get("id") or ""),
+            "rule": "early_breakout_entry",
+            "coin": coin,
+            "side": "long",
+            "would": "early_half_size_if_lane_enabled",
+            "live_block": block,
+            "detail": {
+                "confidence": _f(analysis.get("ai_confidence_raw")
+                                 or analysis.get("confidence"))
+                              or gate_conf,
+                "composite_score": score,
+                "entry_px": entry_px,
+                "rsi4h": _f(analysis.get("rsi4h")),
+                "adx4h": _f(analysis.get("adx4h")),
+                "atr4h_pct": round(atr_pct, 4) if atr_pct is not None else None,
+                "volume_spike": bool(analysis.get("volume_spike_fired")),
+                "breakout": bool(analysis.get("breakout_fired")),
+                "burst": bool(analysis.get("momentum_burst_fired")),
+                "uptrend": bool(analysis.get("uptrend_momentum_fired")),
+                "slow_burn_count": int(analysis.get("slow_burn_count", 0) or 0),
+                "fresh_impulse": bool(fresh_impulse),
+                "early_size_fraction": size_frac,
+                "early_stop_atr_mult": stop_mult,
+                "min_composite_live": float(gate.get("min_composite", 30.0)),
+                "min_confidence_live": float(gate.get("min_confidence", 0.70)),
+                "macro_regime": macro_regime,
+                "macro_trend_score": (round(macro_score, 3)
+                                      if macro_score is not None else None),
+            },
+            "outcome": None,
+            "exit_px": None,
+            "pnl_usd": None,
+        }
+        from hermes_trader.shadow_log import append_jsonl
+        path = str(cfg.get("shadow_log_path") or "").strip() \
+            or _EARLY_BREAKOUT_SHADOW_FILE
+        if append_jsonl(path, rec, stream="early_breakout"):
+            logger.info(
+                f"[runner_gate] early-breakout SHADOW for {coin}: "
+                f"conf={rec['detail']['confidence']} score={score:.0f} "
+                f"fresh={int(fresh_impulse)} block='{block[:40]}' -> {path}")
+    except Exception as e:
+        logger.debug(f"[runner_gate] early-breakout shadow record failed: {e}")
+
+
 # ── Dynamic exchange-SL mover (Phase 2 trailing coordination) ───────────────
 # When the DSL floor ratchets tighter in Phase 2, move the exchange backup SL
 # to trail just behind the floor so a server-side stop can still cap gap-
@@ -5094,7 +5230,17 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
 
     if gate_conf < min_conf:
         logger.info(f"[runner_gate] {coin} BLOCKED: confidence {gate_conf:.2f} < {min_conf:.2f}")
-        return f"runner_gate_blocked (confidence {gate_conf:.2f} < {min_conf:.2f})"
+        _block = f"confidence {gate_conf:.2f} < {min_conf:.2f}"
+        if side == "long":
+            _is_early, _ = _early_breakout_candidate(
+                analysis, gate, fresh_impulse=fresh_impulse, score=score,
+                rsi4h=analysis.get("rsi4h"))
+            if _is_early:
+                _record_early_breakout_shadow(
+                    analysis, gate, block=_block,
+                    fresh_impulse=fresh_impulse, score=score,
+                    gate_conf=gate_conf)
+        return f"runner_gate_blocked ({_block})"
 
     # --- Late-entry veto: RSI extremes + over-extension from EMA21 (4h) ---
     # These catch the "buying the top tick / selling the bottom tick" failure
@@ -5402,8 +5548,16 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
 
     if not (structured_runner or structured_daily_mover):
         logger.info(f"[runner_gate] {coin} BLOCKED: needs fresh impulse + structure (score={score:.0f}, slow={slow_count}, fresh={int(fresh_impulse)})")
-        return (f"runner_gate_blocked (needs fresh breakout/burst and structure; "
-                f"score={score:.0f}, slow={slow_count})")
+        _block = (f"needs fresh breakout/burst and structure; "
+                  f"score={score:.0f}, slow={slow_count}")
+        _is_early, _ = _early_breakout_candidate(
+            analysis, gate, fresh_impulse=fresh_impulse, score=score,
+            rsi4h=rsi4h)
+        if _is_early:
+            _record_early_breakout_shadow(
+                analysis, gate, block=_block,
+                fresh_impulse=fresh_impulse, score=score, gate_conf=gate_conf)
+        return (f"runner_gate_blocked ({_block})")
 
     logger.info(
         f"[runner_gate] {coin} long ADMITTED: score={score:.0f}, slow={slow_count}, "

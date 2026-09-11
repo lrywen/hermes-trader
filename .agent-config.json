@@ -130,6 +130,13 @@
     "short_only_shadow": {
       "shadow_mode": false,
       "shadow_log_path": ""
+    },
+    "early_breakout_shadow": {
+      "shadow_mode": false,
+      "shadow_log_path": "",
+      "max_extension_atr": 1.5,
+      "early_stop_atr_mult": 1.2,
+      "early_size_fraction": 0.5
     }
   },
   "momentum_continuation": {
