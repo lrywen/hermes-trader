@@ -2624,3 +2624,71 @@ def _prune_snapshots_nolock() -> None:
             logger.info(f"[config] pruned old snapshot {old}")
         except OSError:
             pass
+
+
+# ── Effective-config inspection CLI (audit 2026-09-11, Q14) ─────────────────
+# Values can come from several layers (HERMES_CFG_* env, the mounted JSON file,
+# CANONICAL_DEFAULTS, or a caller default) and the live file differs from the
+# in-repo one, so "which value is actually in effect and why" previously needed
+# manual source archaeology. This reuses the exact cfg_get resolution path.
+def _resolve_provenance(dotted_key: str) -> tuple[Any, str]:
+    """Return (effective_value, source) for one dotted key without changing any
+    resolution semantics. Source is one of cfg_env/file/default/unknown."""
+    env_raw = _env_override(dotted_key)
+    if env_raw is not None:
+        try:
+            type_hint = type(_lookup_default(dotted_key))
+        except KeyError:
+            type_hint = str
+        return _coerce(env_raw, type_hint), "cfg_env"
+    raw = _read_raw_config()
+    if raw is not None:
+        try:
+            return _lookup_in_dict(raw, dotted_key), "file"
+        except KeyError:
+            pass
+    try:
+        return _lookup_default(dotted_key), "default"
+    except KeyError:
+        return None, "unknown"
+
+
+def _iter_dotted_leaves(node: dict[str, Any], prefix: str = ""):
+    for k, v in node.items():
+        key = f"{prefix}.{k}" if prefix else str(k)
+        if isinstance(v, dict):
+            yield from _iter_dotted_leaves(v, key)
+        else:
+            yield key
+
+
+def _config_cli(argv: list[str]) -> int:
+    import json as _json
+    if len(argv) >= 2 and argv[1] == "explain" and len(argv) == 3:
+        key = argv[2]
+        env_name = "HERMES_CFG_" + key.upper().replace(".", "__")
+        value, source = _resolve_provenance(key)
+        print(f"key            : {key}")
+        print(f"effective value: {value!r}")
+        print(f"source         : {source}")
+        print(f"cfg env name   : {env_name}")
+        print(f"config file    : {CONFIG_PATH}")
+        # cfg_get result is the source of truth for the running process.
+        print(f"cfg_get()      : {cfg_get(key, '<no-default>')!r}")
+        return 0
+    if len(argv) == 2 and argv[1] == "--dump-effective":
+        out: dict[str, dict[str, Any]] = {}
+        for key in _iter_dotted_leaves(CANONICAL_DEFAULTS):
+            value, source = _resolve_provenance(key)
+            out[key] = {"value": value, "source": source}
+        print(_json.dumps(out, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print("usage:\n"
+          "  python -m hermes_trader.agents.config_store explain <dotted.key>\n"
+          "  python -m hermes_trader.agents.config_store --dump-effective")
+    return 2
+
+
+if __name__ == "__main__":
+    import sys
+    raise SystemExit(_config_cli(sys.argv))

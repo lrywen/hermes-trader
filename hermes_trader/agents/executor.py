@@ -262,7 +262,12 @@ def _resolve_sl_width_config(config: dict[str, Any], coin: str) -> dict[str, flo
         if _coin_floor is not None:
             sl_floor_pct = float(_coin_floor)
     except Exception:
-        pass
+        try:
+            from hermes_trader.metrics import SWALLOWED_ERRORS
+            SWALLOWED_ERRORS.labels(func="sl_coin_floor_override").inc()
+        except Exception:
+            pass
+        logger.warning("[executor] coin SL floor override unreadable for %s", coin, exc_info=True)
     # C4-3: trigger-limit worst-case band. 0 (default) = market-on-trigger; a
     # positive value arms trigger LIMIT orders (see _DEFAULT_SL_LIMIT_BAND_PCT).
     # Negative / non-finite values are ignored (market), never inverted.
@@ -290,6 +295,17 @@ _SIZING_V2_BORROW_BPS = 0.0
 # Pending SL retry queue — positions whose server-side SL failed twice
 # and need aggressive retry at sub-60s intervals.
 _pending_sl_retries: dict[str, dict[str, Any]] = {}
+
+# Q7 (audit 2026-09-11): sizing-vs-DSL core-stop drift tiers. The two core
+# stops are computed from the same source pre-fill (they only differ by the
+# mid->fill slippage ATR base), so this check lives AFTER the fill and cannot
+# block the current order — but a gross divergence means the two risk formulas
+# have desynced and further entries are unsafe. warn tier keeps the existing
+# Feishu alert; critical tier additionally trips a short global halt so no NEW
+# position opens while the logic is suspect (manual resume after investigation).
+_STOP_DRIFT_WARN_PCT = 5.0
+_STOP_DRIFT_CRITICAL_PCT = 25.0
+_STOP_DRIFT_CRITICAL_HALT_MIN = 60
 
 # ── Pending-SL queue persistence (audit 2026-09-11, Q6/Q8) ─────────────────
 # The queue was purely in-memory: after a process restart (crash / watchdog /
@@ -849,7 +865,12 @@ def _record_short_only_shadow(analysis: dict[str, Any], gate: dict[str, Any],
             macro_regime, macro_score = detect_regime_with_score(coin)
             own_regime, own_score = detect_own_regime_with_score(coin)
         except Exception:
-            pass
+            try:
+                from hermes_trader.metrics import SWALLOWED_ERRORS
+                SWALLOWED_ERRORS.labels(func="regime_detection").inc()
+            except Exception:
+                pass
+            logger.warning("[executor] regime detection failed for %s", coin, exc_info=True)
         rec = {
             "timestamp": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"),
@@ -1425,7 +1446,12 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
                     "effective": env_mode,
                 })
             except Exception:  # audit must never break sizing
-                pass
+                try:
+                    from hermes_trader.metrics import SWALLOWED_ERRORS
+                    SWALLOWED_ERRORS.labels(func="config_env_drift_audit").inc()
+                except Exception:
+                    pass
+                logger.warning("[executor] config_env_drift audit append failed", exc_info=True)
     return {"mode": mode, "block": blk}
 
 
@@ -2534,29 +2560,67 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
                     SIZING_DSL_DEVIATION.set(_dev_pct)
                 except Exception:
                     pass
-                if _sizing_core > 0 and _dev_pct > 5.0:
+                if _sizing_core > 0 and _dev_pct > _STOP_DRIFT_WARN_PCT:
+                    _critical = _dev_pct > _STOP_DRIFT_CRITICAL_PCT
                     logger.warning(
                         f"[sizing-v2] STOP DRIFT {coin}: sizing_core={_sizing_core:.4f}% "
-                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.1f}% (>5%) — "
+                        f"dsl_core={_dsl_core:.4f}% dev={_dev_pct:.1f}% "
+                        f"(>{'CRITICAL' if _critical else 'warn'} "
+                        f"{_STOP_DRIFT_CRITICAL_PCT if _critical else _STOP_DRIFT_WARN_PCT:g}%) — "
                         f"sizing/DSL logic desynced, investigate")
                     try:
                         from hermes_trader import notify
                         notify.send_card(
-                            title="⚠️ 仓位止损偏差告警 (STOP DRIFT)",
+                            title=("🚨 仓位止损偏差严重脱钩 (STOP DRIFT CRITICAL)"
+                                   if _critical else
+                                   "⚠️ 仓位止损偏差告警 (STOP DRIFT)"),
                             level="danger",
                             category="risk",
                             fields={
                                 "币种": coin,
                                 "Sizing核心止损": f"{_sizing_core:.4f}%",
                                 "DSL核心止损": f"{_dsl_core:.4f}%",
-                                "偏差": f"{_dev_pct:.1f}% (阈值 5%)",
+                                "偏差": (f"{_dev_pct:.1f}% (严重阈值 "
+                                       f"{_STOP_DRIFT_CRITICAL_PCT:g}%，已全局暂停开仓 "
+                                       f"{_STOP_DRIFT_CRITICAL_HALT_MIN} 分钟)"
+                                       if _critical else
+                                       f"{_dev_pct:.1f}% (阈值 "
+                                       f"{_STOP_DRIFT_WARN_PCT:g}%)"),
                             },
-                            markdown="仓位 sizing 与 DSL 三层风控止损偏差超 5%，"
-                                     "存在风控逻辑漂移脱钩风险，请核查。",
-                            dedup_key=f"stop_drift:{coin}",
+                            markdown=("仓位 sizing 与 DSL 三层风控止损偏差超过严重阈值，"
+                                      "风控逻辑疑似脱钩，已暂停后续开仓，请立即核查并手动恢复。"
+                                      if _critical else
+                                      "仓位 sizing 与 DSL 三层风控止损偏差超 5%，"
+                                      "存在风控逻辑漂移脱钩风险，请核查。"),
+                            dedup_key=f"stop_drift:{coin}:{'crit' if _critical else 'warn'}",
                         )
                     except Exception as _ne:
                         logger.warning(f"[sizing-v2] drift notify failed for {coin}: {_ne}")
+                    # Q7 critical tier: the current fill can't be undone, but a
+                    # >25% core-stop divergence means the two independent risk
+                    # formulas disagree badly. Trip a short GLOBAL halt (the
+                    # existing kill-switch the gates already consume) so no NEW
+                    # position opens while the logic is suspect.
+                    if _critical:
+                        try:
+                            _halt_until = int(time.time() * 1000
+                                              + _STOP_DRIFT_CRITICAL_HALT_MIN * 60_000)
+                            memory.set_global_halt(_halt_until)
+                            logger.critical(
+                                f"[sizing-v2] STOP DRIFT CRITICAL {coin} dev={_dev_pct:.1f}% "
+                                f"-> GLOBAL HALT {_STOP_DRIFT_CRITICAL_HALT_MIN}min")
+                            try:
+                                from hermes_trader import notify
+                                notify.send_text(
+                                    f"🚨 {coin} 止损逻辑严重脱钩 dev={_dev_pct:.1f}%\n"
+                                    f"已全局暂停新开仓 {_STOP_DRIFT_CRITICAL_HALT_MIN} 分钟，"
+                                    f"核查 sizing/DSL 止损公式后手动恢复。",
+                                    category="risk")
+                            except Exception as _he:
+                                logger.warning(
+                                    f"[sizing-v2] drift halt alert failed for {coin}: {_he}")
+                        except Exception as _hh:
+                            logger.error(f"[sizing-v2] critical-drift halt failed: {_hh!r}")
                 else:
                     logger.info(
                         f"[sizing-v2] drift check {coin}: sizing_core={_sizing_core:.4f}% "

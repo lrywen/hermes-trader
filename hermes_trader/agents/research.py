@@ -477,15 +477,42 @@ def _fetch_funding_rate(coin: str) -> str:
             lookback_h = 24
     except (TypeError, ValueError):
         lookback_h = 24
+
+    # Q15 (audit 2026-09-11): the C10 funding wall-clock bounds used to be hard
+    # constants. Expose them under research_llm-free canonical keys with the
+    # SAME defaults so proxy/network tuning needs no code change; behavior is
+    # byte-identical unless explicitly configured.
+    try:
+        _attempt_to = float(cfg_get("funding_fetch.attempt_timeout_s",
+                                    _FUNDING_ATTEMPT_TIMEOUT_S))
+    except (TypeError, ValueError):
+        _attempt_to = _FUNDING_ATTEMPT_TIMEOUT_S
+    try:
+        _total_cap = float(cfg_get("funding_fetch.total_cap_s",
+                                   _FUNDING_TOTAL_CAP_S))
+    except (TypeError, ValueError):
+        _total_cap = _FUNDING_TOTAL_CAP_S
+    try:
+        _max_attempts = int(cfg_get("funding_fetch.max_attempts",
+                                    _FUNDING_MAX_ATTEMPTS))
+    except (TypeError, ValueError):
+        _max_attempts = _FUNDING_MAX_ATTEMPTS
+    if _attempt_to <= 0:
+        _attempt_to = _FUNDING_ATTEMPT_TIMEOUT_S
+    if _total_cap <= 0:
+        _total_cap = _FUNDING_TOTAL_CAP_S
+    if _max_attempts <= 0:
+        _max_attempts = _FUNDING_MAX_ATTEMPTS
+
     start_time = int(time.time() * 1000) - lookback_h * 3_600_000
 
     _wall_t0 = time.monotonic()
     _last_err = ""
-    for _attempt in range(1, _FUNDING_MAX_ATTEMPTS + 1):
-        _remaining_cap = _FUNDING_TOTAL_CAP_S - (time.monotonic() - _wall_t0)
+    for _attempt in range(1, _max_attempts + 1):
+        _remaining_cap = _total_cap - (time.monotonic() - _wall_t0)
         if _remaining_cap <= 0:
             break
-        _wait = min(_FUNDING_ATTEMPT_TIMEOUT_S, _remaining_cap)
+        _wait = min(_attempt_to, _remaining_cap)
         _fut = _funding_pool.submit(fetch_funding_history, coin, start_time)
         try:
             history = _fut.result(timeout=_wait)
@@ -494,13 +521,13 @@ def _fetch_funding_rate(coin: str) -> str:
             _fut.cancel()
             logger.warning(
                 f"[research] {coin}: funding fetch attempt {_attempt}/"
-                f"{_FUNDING_MAX_ATTEMPTS} {_last_err} (C10 budget)")
+                f"{_max_attempts} {_last_err} (C10 budget)")
             continue
         except Exception as _fe:
             _last_err = f"{type(_fe).__name__}: {_fe}"
             logger.warning(
                 f"[research] {coin}: funding fetch attempt {_attempt}/"
-                f"{_FUNDING_MAX_ATTEMPTS} failed: {_last_err}")
+                f"{_max_attempts} failed: {_last_err}")
             continue
         if history:
             try:

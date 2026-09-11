@@ -149,6 +149,18 @@ PENDING_SL_REARM_FAILURES = Counter(
     "ambiguous openOrders lookups and in-backoff skips).",
 )
 
+# Audit 2026-09-11 (Q9): a bounded counter for best-effort NON-metric code
+# branches that deliberately swallow an exception (config parse, regime
+# detection, audit fork) so a silent failure is at least countable instead of
+# buried in log noise. Pure Prometheus metric guards intentionally do NOT use
+# this (instrumenting an instrumentation failure adds no signal).
+SWALLOWED_ERRORS = Counter(
+    "hermes_swallowed_errors_total",
+    "Best-effort non-metric branch swallowed an exception, labelled by a "
+    "bounded call-site name.",
+    ["func"],
+)
+
 # ── P3-1: full-chain instrumentation (2026-08-27) ──────────────────────
 # Every hot-path metric follows the existing contract:
 #   * imported lazily inside the calling function and wrapped in
