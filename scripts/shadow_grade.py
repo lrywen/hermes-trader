@@ -724,7 +724,20 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
 
     # DATA_GAP: configured to collect but the file yields nothing in the longest
     # window. Distinguish "never triggered / path blind" from "no opportunity".
-    if mode in ("shadow", "enforce") and longest["total"] == 0:
+    # M13 扩展：事件型闸门（market_circuit 等）只在真正 trip 时才往事件 JSONL
+    # 落一条，平稳行情下最长窗 0 事件是正常的——只要其独立心跳仍在新鲜更新
+    # （评估每 tick 在跑），就不是「闸门盲跑」，降级为样本不足而非 DATA_GAP。
+    # 心跳缺失/陈旧（评估真的停了/写路径真坏）时仍判 DATA_GAP。
+    if (mode in ("shadow", "enforce") and longest["total"] == 0 and heartbeat_ok
+            and arm in ARM_HEARTBEAT_FILE):
+        verdict = INSUFFICIENT if mode == "shadow" else COLLECTING
+        reason = (f"{w_long}h 窗口内 0 条事件，但事件型闸门心跳正常"
+                  f"（{heartbeat_age_sec:.0f}s 前仍在评估）：无极端行情触发，"
+                  "非采数缺口，继续等待触发累积样本")
+        warnings.append(
+            f"事件型闸门心跳正常（{heartbeat_age_sec:.0f}s 前仍在评估），"
+            f"{w_long}h 0 事件属正常（无触发条件），非闸门盲跑/写路径异常")
+    elif mode in ("shadow", "enforce") and longest["total"] == 0:
         verdict = DATA_GAP
         reason = (f"mode={mode} 但 {w_long}h 窗口内 0 条记录"
                   "（未触发或路径写不进，闸门变盲）")

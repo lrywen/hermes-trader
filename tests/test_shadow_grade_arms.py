@@ -122,6 +122,57 @@ def test_off_arm_with_no_records_is_reported_off_not_data_gap(sg):
     assert out["verdict"] == sg.OFF
 
 
+def test_event_arm_fresh_heartbeat_zero_events_is_insufficient_not_data_gap(sg):
+    # M13 extension: an event-only arm (market_circuit) writes a heartbeat every
+    # tick but only appends to the event JSONL on a real trip. Zero events in
+    # the longest window with a FRESH heartbeat means the evaluator is running
+    # and the market simply never tripped — not a blind gate. shadow ->
+    # INSUFFICIENT_DATA (keep collecting), and it must not look like a gap.
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("market_circuit", "shadow", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       heartbeat_age_sec=12.0)
+    assert out["verdict"] == sg.INSUFFICIENT
+    assert "heartbeat_ok" in out and out["heartbeat_ok"] is True
+    assert "collection_stalled" not in out
+
+
+def test_event_arm_fresh_heartbeat_enforce_zero_events_is_collecting(sg):
+    # enforce arm with a fresh heartbeat and zero trip events is still healthy
+    # but unproven -> COLLECTING, never DATA_GAP.
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("market_circuit", "enforce", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       heartbeat_age_sec=300.0)
+    assert out["verdict"] == sg.COLLECTING
+    assert out["verdict"] != sg.DATA_GAP
+
+
+def test_event_arm_stale_heartbeat_zero_events_is_real_data_gap(sg):
+    # Heartbeat beyond the freshness threshold => the evaluator really stopped
+    # (or the write path broke). Zero events with a stale/missing heartbeat must
+    # stay DATA_GAP — the exemption must not mask a genuine blind gate.
+    now = 1_700_000_000_000.0
+    out_stale = sg.grade_arm("market_circuit", "shadow", "/nonexistent.jsonl",
+                             [24, 72, 168], now_ms=now, records=[],
+                             heartbeat_age_sec=7200.0)
+    assert out_stale["verdict"] == sg.DATA_GAP
+    out_none = sg.grade_arm("market_circuit", "shadow", "/nonexistent.jsonl",
+                            [24, 72, 168], now_ms=now, records=[],
+                            heartbeat_age_sec=None)
+    assert out_none["verdict"] == sg.DATA_GAP
+
+
+def test_non_heartbeat_arm_zero_events_still_data_gap_even_if_age_passed(sg):
+    # The exemption applies ONLY to arms registered in ARM_HEARTBEAT_FILE. A
+    # plain block arm that somehow receives a heartbeat age must NOT be exempt.
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("ta_late_entry", "shadow", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       heartbeat_age_sec=1.0)
+    assert out["verdict"] == sg.DATA_GAP
+
+
 # ── verdict: INSUFFICIENT_DATA / COLLECTING (sample count) ────────────────────
 
 def test_insufficient_for_shadow_below_promote_threshold(sg):
