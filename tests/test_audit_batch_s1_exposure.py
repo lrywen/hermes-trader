@@ -21,6 +21,7 @@ pinned by a source guard on the deployed config path when present.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -104,9 +105,9 @@ def test_metrics_route_uses_loopback_gate_not_internal():
         encoding="utf-8")
 
 
-def test_nginx_trader_prefix_is_allowlist_when_config_present():
-    # The deployed nginx config lives outside this repo; assert the allowlist
-    # shape only when that path is available on this host (no-op in plain CI).
+def _deployed_nginx_conf() -> Path:
+    # The deployed nginx config lives outside this repo; assert its shape only
+    # when that path is available on this host (no-op in plain CI).
     candidates = [
         Path("/home/ldy/hermes-portal/nginx/nginx.conf"),
         Path(__file__).resolve().parents[2] / "hermes-portal" / "nginx" / "nginx.conf",
@@ -114,7 +115,11 @@ def test_nginx_trader_prefix_is_allowlist_when_config_present():
     conf = next((p for p in candidates if p.exists()), None)
     if conf is None:
         pytest.skip("deployed nginx.conf not present in this environment")
-    text = conf.read_text(encoding="utf-8")
+    return conf
+
+
+def test_nginx_trader_prefix_is_allowlist_when_config_present():
+    text = _deployed_nginx_conf().read_text(encoding="utf-8")
     # Wildcard proxy_pass at /trader/ root must be gone.
     assert "proxy_pass http://trader_backend/;" not in text
     # Only the postmortem allowlist may proxy under /trader/.
@@ -122,3 +127,43 @@ def test_nginx_trader_prefix_is_allowlist_when_config_present():
     assert "proxy_pass http://trader_backend/postmortems/" in text
     # Everything else under /trader/ is explicitly refused.
     assert "location ^~ /trader/" in text
+
+
+def test_nginx_bare_trader_paths_are_private_network_only():
+    """Q2 remainder: /api/dashboard/ and /api/feed/ bypass the portal BFF and
+    reach trader directly, where public.py / shadow.py / audit.py read routes are
+    anonymous by design (their RBAC lives in the BFF's _PATH_RULES). Those two
+    locations must therefore stay reachable from the LAN only, never from the
+    public edge on 0.0.0.0:8443."""
+    text = _deployed_nginx_conf().read_text(encoding="utf-8")
+    blocks = _location_bodies(text)
+    for path in ("/api/dashboard/", "/api/feed/"):
+        body = blocks.get(path)
+        assert body is not None, f"location {path} missing from deployed config"
+        for rule in (
+            "allow 127.0.0.1;",
+            "allow 10.0.0.0/8;",
+            "allow 172.16.0.0/12;",
+            "allow 192.168.0.0/16;",
+            "deny  all;",
+        ):
+            assert rule in body, f"{path} lost allowlist rule {rule!r}"
+        # deny must come last, otherwise the allowlist is a no-op.
+        assert body.index("deny  all;") > body.index("allow 192.168.0.0/16;")
+
+
+def _location_bodies(text: str) -> dict[str, str]:
+    """Map ``location <path>`` -> raw body text for simple one-level blocks."""
+    bodies: dict[str, str] = {}
+    for match in re.finditer(r"location\s+([^\s{]+)\s*\{", text):
+        start = match.end()
+        depth = 1
+        idx = start
+        while idx < len(text) and depth:
+            if text[idx] == "{":
+                depth += 1
+            elif text[idx] == "}":
+                depth -= 1
+            idx += 1
+        bodies[match.group(1)] = text[start : idx - 1]
+    return bodies
