@@ -2127,8 +2127,7 @@ def eval_all_gates(
     # hysteresis counter multiple times on the same cached reading.
     _mc_base = int(cfg_get("max_concurrent", config=config))
     try:
-        from hermes_trader.agents.regime_overlay import (
-            evaluate_risk_overlay, resolve_applied_knobs)
+        from hermes_trader.agents.regime_overlay import evaluate_risk_overlay, resolve_applied_knobs
         _ov_snap = evaluate_risk_overlay(config)
         _ov_knobs = resolve_applied_knobs(
             {"max_concurrent": _mc_base}, config, _ov_snap)
