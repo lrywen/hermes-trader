@@ -77,6 +77,7 @@ from hermes_trader.dashboard import (
     _require_operator,
     consume_force_confirm_token,
     require_operator_or_internal,
+    require_operator_or_loopback,
     require_operator_write,
     updates_arm_force_override,
 )
@@ -2296,11 +2297,14 @@ async def ready() -> Response:
     return JSONResponse(status_code=200, content=body)
 
 
-@app.get("/metrics", dependencies=[Depends(require_operator_or_internal)])
+@app.get("/metrics", dependencies=[Depends(require_operator_or_loopback)])
 async def metrics() -> Response:
-    """Prometheus scrape target. L-2: open to LAN/loopback scrapers without a
-    token (Prometheus runs inside the network); external clients must present
-    a valid operator token. Reads local state only — never hits HL."""
+    """Prometheus scrape target. Audit 2026-09-11 (Q3): operator token OR a true
+    loopback peer only — NOT a generic RFC-1918 peer, since behind hermes-nginx
+    every remote caller shares nginx's private bridge IP and the old internal
+    gate therefore served metrics unauthenticated at 0.0.0.0:8443/trader/metrics.
+    A same-network scraper should hit trader:8000 directly or present a token.
+    Reads local state only — never hits HL."""
     body, content_type = render_metrics()
     return Response(content=body, media_type=content_type)
 

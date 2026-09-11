@@ -1917,6 +1917,41 @@ def _is_internal_ip(ip: str) -> bool:
     return addr.is_loopback or addr.is_private or addr.is_link_local
 
 
+def require_operator_or_loopback(request: Request) -> None:
+    """Gate read-only diagnostic endpoints that must NOT be reachable through a
+    reverse proxy without a token.
+
+    Audit 2026-09-11 (Q3): ``require_operator_or_internal`` trusts any RFC-1918
+    peer, but when traffic arrives via hermes-nginx the socket peer is nginx's
+    own private bridge IP — so an UNAUTHENTICATED external caller to
+    ``0.0.0.0:8443/trader/metrics`` was seen as "internal" and served. /metrics
+    has no token-free remote consumer (no scraper is deployed; the in-container
+    healthcheck hits loopback), so tighten it to operator-token OR true loopback
+    peer. Feishu postmortems keep the broader internal gate (that token-free LAN
+    path is an explicit product requirement).
+    """
+    if _request_has_operator_creds(request):
+        _require_operator(request)  # raises 401/429/503 on bad creds
+        return
+    ip = _client_ip(request)
+    if ip in ("127.0.0.1", "::1", "localhost", "testclient"):
+        return
+    mapped = ip.removeprefix("::ffff:")
+    is_loop = False
+    try:
+        import ipaddress
+        is_loop = ipaddress.ip_address(mapped).is_loopback
+    except ValueError:
+        is_loop = False
+    if is_loop:
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="operator token or loopback origin required",
+        headers={"WWW-Authenticate": 'Bearer realm="hermes-trader"'},
+    )
+
+
 # D-FCFG-3: short-lived SSE feed tickets. The browser EventSource API cannot
 # set request headers, so the operator token (Authorization/X-Operator-Token)
 # cannot ride the stream connection directly. Instead an authenticated UI
