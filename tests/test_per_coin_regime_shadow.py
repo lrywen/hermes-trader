@@ -69,7 +69,10 @@ def test_missing_readings_fail_open():
 # ── own-1h detector: independent cache, no proxy substitution ─────────────
 
 def test_detect_own_uses_coin_and_separate_cache(monkeypatch):
+    # hermetic: this test asserts on the shared macro cache below, so clear both
+    # caches — other suite members may have populated the BTC macro entry.
     mr._own_regime_cache.clear()
+    mr._regime_cache.clear()
     calls = []
 
     def _fake_detect(proxy):
@@ -87,6 +90,7 @@ def test_detect_own_uses_coin_and_separate_cache(monkeypatch):
     # macro BTC cache stays untouched by the own lookup
     assert "BTC" not in mr._regime_cache
     mr._own_regime_cache.clear()
+    mr._regime_cache.clear()
 
 
 def test_detect_own_failure_degrades(monkeypatch):
