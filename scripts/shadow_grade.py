@@ -65,6 +65,14 @@ PROMOTE_MAX_HARMFUL_RATE = 0.4
 # Audit 2026-09-10 (M4)：低回填率降级线。mature/total 低于此值时，即使有害率
 # 越线，REVIEW 结论也只标注为「低置信」；PROMOTE 则直接降 COLLECTING。
 MIN_OUTCOME_BACKFILL_RATE = 0.2
+# Audit 2026-09-12 (评级口径修正)：纯胜率对「高频小赢、低频大亏」凸性分布会
+# 系统性误判——sizing_v2 实测命中集 166 win / 27 loss（win 率 86%），但 win 笔
+# 中位反事实仅 +$0.06（手续费/点差级噪声，名义本金中位约 $80、往返 5bps 成本
+# 约 $0.04/边），少数大额 loss 使金额合计 −$30.85（v2 净优），旧 OR 分支只看
+# 胜率仍把它打成 REVIEW。有金额维度（pnl_usd）的命中集改以「金额合计正负」为
+# 主条款，win 率分母只统计 |反事实 pnl| ≥ 此阈值的实质性笔；atr_regime_calib /
+# confidence_decay 等只写 pnl_pct 的臂无金额维度，保留原全样本胜率规则。
+MIN_MATERIAL_PNL_USD = 0.5
 # Audit 2026-09-10 (M13)：shadow/enforce 臂最长窗口 24h 子窗零记录即视为采数
 # 停滞（典型：单事件后停采），不改变 verdict 但必须出告警。
 STALE_WINDOW_H = 24
@@ -736,10 +744,12 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     # 判定所需的有害率显式带出（不改判，仅提示）。
     signal_note = None
     if kind == "signal" and longest["mature_outcomes"] > 0:
+        # signal 臂的 win=做多信号反事实为正=信号有效，与 block/change 臂
+        # 「win=臂有害」语义相反，故用中性「成熟胜率」表述，不再称有害率。
         swr = longest["outcome_wins"] / longest["mature_outcomes"]
-        signal_note = (
-            "signal 臂无自动有害率 REVIEW 通道，需人工判定：臂有害率(win) "
-            f"{swr:.0%}（{longest['outcome_wins']}/{longest['mature_outcomes']}）")
+        n_w, n_m = longest["outcome_wins"], longest["mature_outcomes"]
+        tail = "初步有效，待更多样本确认" if swr >= 0.5 else "尚未验证有效，继续累积样本"
+        signal_note = f"信号成熟胜率 {swr:.0%}（{n_w}/{n_m}），{tail}"
         warnings.append(signal_note)
 
     # DATA_GAP: configured to collect but the file yields nothing in the longest
@@ -784,12 +794,20 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     # 命中集有害率（分母修正）：面板与 API 可直接展示，不依赖 reason 文案。
     if longest["mature_outcomes"] >= MIN_MATURE_OUTCOMES:
         _w: list[str] = []
-        eff_wr, denom_note, _, hit_mature = _effective_harm(
+        eh = _effective_harm(
             arm, kind, longest, records, w_long, now_ms, _w)
-        out["hit_set_mature"] = hit_mature
-        out["hit_set_harmful_rate"] = round(eff_wr, 4) if hit_mature else None
-        out["harmful_rate_basis"] = ("hit_set" if hit_mature >= MIN_MATURE_OUTCOMES
-                                     else "all_records")
+        out["hit_set_mature"] = eh["hit_mature"]
+        # 金额维度臂 eff_wr 为实质性笔胜率（可能为 None：无任何实质性笔）；
+        # pct-only 臂为全样本胜率。
+        out["hit_set_harmful_rate"] = (
+            round(eh["eff_wr"], 4) if eh["eff_wr"] is not None else None)
+        out["harmful_rate_basis"] = eh["basis"]
+        out["harmful_rate_money_basis"] = eh["has_money"]
+        if eh["hit_pnl_sum"] is not None:
+            out["hit_set_pnl_sum"] = eh["hit_pnl_sum"]
+        if eh["material_pnl_sum"] is not None:
+            out["hit_set_material_pnl_sum"] = eh["material_pnl_sum"]
+            out["hit_set_material_n"] = eh["material_n"]
         if verdict in (REVIEW, DEGRADED_REVIEW, PROMOTE, COLLECTING, MAINTAIN):
             # 合并：预览调用产生的命中集口径告警 + grade_arm 主链路告警。
             for _line in _w:
@@ -831,51 +849,132 @@ def _low_backfill_warning(s: dict, longest_h: int, records: list[dict],
 
 def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
                     w_long: int, now_ms: float,
-                    warnings: list[str]) -> tuple[float, str, bool, int]:
+                    warnings: list[str]) -> dict:
     """Audit 2026-09-10 (分母修正)：有害率/反事实 pnl 的正确分母是「命中
     （拦/改发生）的成熟样本」，不是全部记录——未命中的记录本就不受闸门影响，
     计入会系统性稀释有害率（confidence_decay 实测全记录 8.8% vs 命中集
     45.1%，差约 5 倍）。
 
+    Audit 2026-09-12 (口径修正)：纯胜率对「高频小赢、低频大亏」分布系统性
+    误判（sizing_v2 实测 win 率 86% 但 win 笔中位仅 +$0.06、金额合计 −$30.85）。
+    故：
+      * 命中集有金额维度（存在 pnl_usd 字段）——以实质性笔（|pnl| ≥
+        MIN_MATERIAL_PNL_USD）金额合计正负为主条款，win 率分母也只含实质性笔；
+        被滤掉的小额噪声笔数进 denom_note / 告警。
+      * 无金额维度（atr/confidence 等 pct-only 臂）——保留原全样本 win 率规则。
     命中集成熟样本 ≥ MIN_MATURE_OUTCOMES 时用命中集口径；否则回退全记录口径
-    并追加一条「可能低估真实误伤」告警。signal 臂不在有害率自动判定范围内
-    （M8），其调用方不使用 harmful_signal。"""
+    并追加「可能低估真实误伤」告警。signal 臂不在有害率自动判定范围内（M8），
+    其调用方不使用 harmful_signal。"""
     mature = s["mature_outcomes"]
-    wr = _harmful_rate(s)
-    hit_wins = hit_mature = 0
-    hit_pnl_sum = 0.0
-    hit_has_pnl = False
     cut = now_ms - w_long * 3_600_000
+
+    def _empty_bucket() -> dict:
+        return {"n": 0, "wins": 0, "pnl_sum": 0.0, "has_pnl": False,
+                "mat_n": 0, "mat_wins": 0, "mat_pnl_sum": 0.0}
+
+    def _tally(bucket: dict, r: dict) -> None:
+        bucket["n"] += 1
+        if r["outcome"] == "win":
+            bucket["wins"] += 1
+        p = r.get("pnl_usd")
+        if isinstance(p, (int, float)):
+            pf = float(p)
+            bucket["has_pnl"] = True
+            bucket["pnl_sum"] += pf
+            if abs(pf) >= MIN_MATERIAL_PNL_USD:
+                bucket["mat_n"] += 1
+                bucket["mat_pnl_sum"] += pf
+                if r["outcome"] == "win":
+                    bucket["mat_wins"] += 1
+
+    hit, allr = _empty_bucket(), _empty_bucket()
     for r in records:
         ts = _record_ts_ms(r)
         if ts is None or ts < cut or r.get("outcome") not in ("win", "loss"):
             continue
-        if _hit_field(r, kind, arm) is not True:
-            continue
-        hit_mature += 1
-        if r["outcome"] == "win":
-            hit_wins += 1
-        p = r.get("pnl_usd")
-        if isinstance(p, (int, float)):
-            hit_has_pnl = True
-            hit_pnl_sum += float(p)
-    if hit_mature >= MIN_MATURE_OUTCOMES:
-        eff_wr = hit_wins / hit_mature
-        denom_note = f"命中集 {hit_wins}/{hit_mature}"
-        harmful_signal = (
-            (hit_has_pnl and hit_pnl_sum > 0 and hit_wins > 0)
-            or (eff_wr > MAX_HARMFUL_RATE and kind in ("block", "change")))
+        _tally(allr, r)
+        if _hit_field(r, kind, arm) is True:
+            _tally(hit, r)
+
+    if hit["n"] >= MIN_MATURE_OUTCOMES:
+        b, basis = hit, "hit_set"
+        denom_prefix = "命中集"
     else:
-        eff_wr = wr
-        denom_note = f"全记录 {s['outcome_wins']}/{mature}"
+        b, basis = allr, "all_records"
+        denom_prefix = "全记录"
+    has_money = b["has_pnl"]
+    if has_money:
+        eff_wr = (b["mat_wins"] / b["mat_n"]) if b["mat_n"] else None
+        dust = b["n"] - b["mat_n"]
+        denom_note = (
+            f"{denom_prefix}实质性 {b['mat_wins']}/{b['mat_n']}"
+            f"（|pnl|≥${MIN_MATERIAL_PNL_USD:.2f}；合计 ${b['mat_pnl_sum']:.2f}）")
+        if dust:
+            denom_note += f"，{dust} 笔小额噪声不计胜率"
+        # 金额维度：实质性笔金额合计为主条款；实质性 win 率红线为辅。
         harmful_signal = (
-            (s["has_pnl"] and s["pnl_usd_sum"] > 0 and s["outcome_wins"] > 0)
-            or (wr > MAX_HARMFUL_RATE and kind in ("block", "change")))
-    if hit_mature < MIN_MATURE_OUTCOMES and mature >= MIN_MATURE_OUTCOMES:
+            (b["mat_pnl_sum"] > 0 and b["mat_wins"] > 0)
+            or (eff_wr is not None and eff_wr > MAX_HARMFUL_RATE
+                and kind in ("block", "change")))
+    else:
+        eff_wr = b["wins"] / b["n"] if b["n"] else 0.0
+        denom_note = f"{denom_prefix} {b['wins']}/{b['n']}"
+        harmful_signal = (
+            eff_wr > MAX_HARMFUL_RATE and kind in ("block", "change"))
+
+    if hit["n"] < MIN_MATURE_OUTCOMES and mature >= MIN_MATURE_OUTCOMES:
         warnings.append(
-            f"命中集成熟样本仅 {hit_mature}（<{MIN_MATURE_OUTCOMES}），"
+            f"命中集成熟样本仅 {hit['n']}（<{MIN_MATURE_OUTCOMES}），"
             "有害率按全记录口径计算，可能低估真实误伤")
-    return eff_wr, denom_note, harmful_signal, hit_mature
+    if has_money and hit["n"] >= MIN_MATURE_OUTCOMES and basis == "hit_set":
+        dust = hit["n"] - hit["mat_n"]
+        if dust >= 10 and dust / hit["n"] >= 0.5:
+            warnings.append(
+                f"命中集 {dust}/{hit['n']} 笔成熟命中 |反事实 pnl|"
+                f"<${MIN_MATERIAL_PNL_USD:.2f}（手续费/点差级噪声），"
+                "已从小额过滤后的金额/胜率口径评级，原始笔数胜率不具参考性")
+    return {
+        "eff_wr": eff_wr, "denom_note": denom_note,
+        "harmful_signal": harmful_signal, "hit_mature": hit["n"],
+        "basis": basis, "has_money": has_money,
+        "hit_pnl_sum": round(hit["pnl_sum"], 4) if hit["has_pnl"] else None,
+        "material_n": hit["mat_n"] if basis == "hit_set" else b["mat_n"],
+        "material_pnl_sum": (round(b["mat_pnl_sum"], 4)
+                             if has_money else None),
+        "material_wins": b["mat_wins"] if has_money else None,
+    }
+
+
+def _harm_reason_fragment(eh: dict) -> str:
+    """有害已坐实时的原因片段（enforce 降级 / shadow REVIEW 共用）。
+
+    金额维度：主因是实质性笔金额合计为正（v1 净占便宜=采纳臂净亏钱），辅以
+    实质性 win 率；pct-only：原始 win 率超红线。"""
+    note = eh["denom_note"]
+    if eh["has_money"]:
+        mat_sum = eh["material_pnl_sum"]
+        wr = eh["eff_wr"]
+        if mat_sum is not None and mat_sum > 0 and (eh["material_wins"] or 0) > 0:
+            lead = (f"实质性反事实合计 ${mat_sum:.2f} 为正（{note}）"
+                    "——采纳该臂净亏钱")
+        else:
+            lead = (f"实质性臂有害率 {wr:.0%}（{note}）"
+                    f"超红线 {MAX_HARMFUL_RATE:.0%}")
+        return lead
+    return (f"臂有害率 {eh['eff_wr']:.0%}（{note}）"
+            f"超红线 {MAX_HARMFUL_RATE:.0%}")
+
+
+def _harm_health_fragment(eh: dict) -> str:
+    """未坐实有害时的健康描述片段（MAINTAIN / 宽度复核文案共用）。"""
+    if eh["has_money"]:
+        wr = eh["eff_wr"]
+        mat_sum = eh["material_pnl_sum"]
+        sum_txt = f"、实质性合计 ${mat_sum:.2f}" if mat_sum is not None else ""
+        if wr is None:
+            return f"无实质性笔（{eh['denom_note']}）{sum_txt}"
+        return f"实质性臂有害率 {wr:.0%}（{eh['denom_note']}）{sum_txt}"
+    return f"臂有害率 {eh['eff_wr']:.0%}（{eh['denom_note']}）"
 
 
 def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
@@ -884,15 +983,14 @@ def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
     """M1：enforce 臂独立健康档。已生产的臂不需要「继续采数/晋升」导向文案，
     只输出「维持」或「建议复核降级」。命中宽度与有害率任一越线即降级复核。"""
     mature = s["mature_outcomes"]
-    wr = _harmful_rate(s)
     too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
                 and kind in ("block", "change"))
     low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
     if low_conf:
         warnings.append(_low_backfill_warning(s, w_long, records, now_ms, backfill))
-    eff_wr, denom_note, harmful_signal, hit_mature = _effective_harm(
+    eh = _effective_harm(
         arm, kind, s, records, w_long, now_ms, warnings)
-    harmful = mature >= MIN_MATURE_OUTCOMES and harmful_signal
+    harmful = mature >= MIN_MATURE_OUTCOMES and eh["harmful_signal"]
     # ta_late_entry 命中率只数真实下单闸门（gate）层；total 含仅记拦截的
     # prefilter 观察流，文案需显式区分，避免把 26k 观察记录误读成交易决策。
     scope_note = "（仅下单闸门层；prefilter 观察流不计宽度）" \
@@ -903,14 +1001,13 @@ def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
             parts.append(f"命中率 {s['hit_rate']:.1%}"
                          f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽{scope_note}")
         if harmful:
-            parts.append(f"臂有害率 {eff_wr:.0%}（{denom_note}）"
-                         f"超红线 {MAX_HARMFUL_RATE:.0%}")
+            parts.append(_harm_reason_fragment(eh))
         if low_conf:
             parts.append("回填不足，结论低置信")
         return DEGRADED_REVIEW, (
             f"已在 enforce 但出现健康告警：{'；'.join(parts)}。"
             "建议复核闸门配置/考虑降级 shadow（仅建议，不自动执行）")
-    tail = (f"、臂有害率 {eff_wr:.0%}（{denom_note}）未越线" if mature
+    tail = (f"、{_harm_health_fragment(eh)}未越线" if mature
             else "（反事实 outcome 回填中）")
     return MAINTAIN, (
         f"已在 enforce：{w_long}h {s['total']} 条观察、下单闸门命中 {s['hits']}"
@@ -923,7 +1020,6 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
                     warnings: list[str]) -> tuple[str, str]:
     """shadow 臂判定（total≥60）。M2/M3/M4 修订点见函数内注释。"""
     mature = s["mature_outcomes"]
-    wr = _harmful_rate(s)
     too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
                 and kind in ("block", "change"))
     low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
@@ -932,28 +1028,33 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
 
     if mature >= MIN_MATURE_OUTCOMES:
         # 分母修正（见 _effective_harm）：以命中集成熟样本为有效有害率。
-        eff_wr, denom_note, harmful, hit_mature = _effective_harm(
+        eh = _effective_harm(
             arm, kind, s, records, w_long, now_ms, warnings)
+        eff_wr, denom_note = eh["eff_wr"], eh["denom_note"]
+        harmful = eh["harmful_signal"]
         if harmful:
             conf = "（低置信，回填不足）" if low_conf else ""
             if kind == "change":
                 # change 臂：win = v1 优于 v2 = 采纳变更反而少赚（臂有害）。
                 return REVIEW, (
-                    f"臂有害率 {eff_wr:.0%}（{denom_note}）> "
-                    f"{MAX_HARMFUL_RATE:.0%} —— 调整/跳过反而放弃盈利，"
-                    f"疑似有害，勿升级{conf}")
-            pnl_part = (f"，反事实合计 ${s['pnl_usd_sum']:.2f} 为正"
-                        if s["has_pnl"] else "")
+                    f"{_harm_reason_fragment(eh)}"
+                    f" —— 调整/跳过反而放弃盈利，疑似有害，勿升级{conf}")
             return REVIEW, (
-                f"被拦命中样本误伤率 {eff_wr:.0%}（{denom_note}）"
-                f" > {MAX_HARMFUL_RATE:.0%}{pnl_part} —— 拦太宽，疑似误伤"
-                f"{conf}")
+                f"被拦命中样本{_harm_reason_fragment(eh)}"
+                f" —— 拦太宽，疑似误伤{conf}")
         # M2：有害率没越线但命中率太宽（几乎每条都动作），同样不能晋升。
         if too_wide:
             return REVIEW, (
                 f"{w_long}h 命中率 {s['hit_rate']:.1%}"
                 f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽（几乎每条都动作），"
-                f"先复核宽度再谈晋升；命中集臂有害率 {eff_wr:.0%}（{denom_note}）")
+                f"先复核宽度再谈晋升；{_harm_health_fragment(eh)}")
+        # 金额维度但无任何实质性笔（全部是手续费级噪声）：无法证伪，继续采数。
+        if eh["has_money"] and eff_wr is None:
+            return COLLECTING, (
+                f"{w_long}h {s['total']} 条、命中率 {s['hit_rate']:.1%}、"
+                f"命中集成熟 {eh['hit_mature']} 笔但 |反事实 pnl| 全部 "
+                f"<${MIN_MATERIAL_PNL_USD:.2f}（噪声级），无实质性盈亏证据，"
+                "维持 shadow 继续采数，暂不建议晋升")
         # M3：健康臂也要求有害率安全余量（≤0.4）才能 PROMOTE。
         # M4：低回填率时即使数字健康也继续采数。
         if kind == "change":

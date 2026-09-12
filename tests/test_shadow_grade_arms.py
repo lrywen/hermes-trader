@@ -366,6 +366,80 @@ def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
     assert "80%" in out["reason"]
 
 
+# ── Audit 2026-09-12 (评级口径修正)：金额维度臂以实质性笔金额合计为主条款 ──
+# sizing_v2 实测「高频小赢、低频大亏」：166 win / 27 loss（原始 win 率 86%），
+# 但 win 笔中位反事实仅 +$0.06（手续费/点差级噪声），少数大额 loss 使合计
+# −$30.85（v2 净优）。旧 OR 纯胜率条款把它误判 REVIEW。修复后 |pnl_usd|≥$0.5
+# 的实质性笔才进胜率分母，金额合计正负为主条款。
+
+def test_change_arm_skewed_dust_wins_material_losses_is_not_review(sg):
+    # 命中集 40 笔：30 笔 win 但反事实仅 +$0.1（< $0.5 噪声），10 笔大额 loss
+    # −$5.0。原始 win 率 75% 会被旧纯胜率条款打成 REVIEW；修复后实质性笔 0/10、
+    # 实质性合计 −$50（v2 净优），臂健康 → PROMOTE，并产出小额噪声告警。
+    now = 1_700_000_000_000.0
+    recs = []
+    for i in range(30):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="win", pnl_usd=0.1))
+    for i in range(10):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="loss", pnl_usd=-5.0))
+    # 40 条非命中尾：命中率压到 50%（不触发宽度规则）、回填率 100%。
+    for i in range(40):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=100.2,
+                         outcome="loss"))
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.PROMOTE
+    assert out["harmful_rate_money_basis"] is True
+    assert out["hit_set_material_n"] == 10
+    assert out["hit_set_harmful_rate"] == 0.0
+    assert out["hit_set_material_pnl_sum"] == pytest.approx(-50.0)
+    assert "小额噪声" in out["reason"]
+    assert any("原始笔数胜率不具参考性" in w
+               for w in out.get("warnings", []))
+
+
+def test_change_arm_material_positive_sum_still_review(sg):
+    # 反向守护：实质性笔（|pnl|≥$0.5）金额合计为正时仍须 REVIEW，且原因文案
+    # 直接引用「实质性反事实合计」，不能被小额噪声逻辑洗成健康。
+    now = 1_700_000_000_000.0
+    recs = []
+    for i in range(20):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="win", pnl_usd=5.0))
+    for i in range(5):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="loss", pnl_usd=-1.0))
+    for i in range(40):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=100.2,
+                         outcome="loss"))
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.REVIEW
+    assert out["hit_set_material_pnl_sum"] == pytest.approx(95.0)
+    assert "实质性反事实合计" in out["reason"]
+
+
+def test_change_arm_all_dust_no_material_outcomes_keeps_collecting(sg):
+    # 零实质性笔（全部 |pnl|<$0.5）时无盈亏证据：即使原始 win 率 100% 也不能
+    # 判有害（REVIEW）也不能晋升，走 COLLECTING 继续采数。
+    now = 1_700_000_000_000.0
+    recs = []
+    for i in range(25):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=200.0,
+                         outcome="win", pnl_usd=0.1))
+    for i in range(40):
+        recs.append(_rec(now, v1_notional_usd=100.0, v2_notional_usd=100.2,
+                         outcome="loss"))
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.COLLECTING
+    assert out["hit_set_harmful_rate"] is None
+    assert out["hit_set_material_n"] == 0
+    assert "无实质性盈亏证据" in out["reason"]
+
+
 def test_change_arm_report_lines_label_outcomes_arm_beneficial(sg):
     d = {
         "generated_at": "2026-09-08 00:00 UTC",
@@ -811,7 +885,8 @@ def test_signal_arm_harmful_outcomes_get_manual_note_only(sg):
     assert out["verdict"] != sg.REVIEW
     assert "signal_harmful_rate_note" in out
     assert "100%" in out["signal_harmful_rate_note"]
-    assert any("无自动有害率 REVIEW 通道" in w for w in out["warnings"])
+    # signal 臂 win=信号有效，文案用中性「成熟胜率」，不再称「有害率」。
+    assert any("信号成熟胜率" in w for w in out["warnings"])
 
 
 # ── M12: zero-outcome backfill diagnostic ────────────────────────────────────
