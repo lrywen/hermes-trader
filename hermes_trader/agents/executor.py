@@ -352,6 +352,15 @@ def _persist_pending_sl() -> None:
             os.replace(tmp, _PENDING_SL_FILE)
     except Exception as e:
         logger.error("[executor] pending-SL queue persist failed: %r", e)
+        # The cross-restart insurance for naked positions (no server-side SL)
+        # is now memory-only: a restart would silently drop the retry queue.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "pending_sl_persist", "stage": "persist",
+                "error": repr(e)})
+        except Exception as _ev_e:
+            logger.error("[executor] pending_sl_persist event log failed: %r", _ev_e)
 
 
 def load_pending_sl() -> int:
@@ -388,6 +397,15 @@ def load_pending_sl() -> int:
         return restored
     except Exception as e:
         logger.error("[executor] pending-SL queue load failed: %r", e)
+        # A corrupt/unreadable queue restored ZERO entries, which otherwise
+        # reads as "no naked positions across the restart". Make it loud.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "pending_sl_persist", "stage": "load",
+                "error": repr(e)})
+        except Exception as _ev_e:
+            logger.error("[executor] pending_sl_persist event log failed: %r", _ev_e)
         return 0
 
 
@@ -6131,6 +6149,15 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                             logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
         except Exception as _tb_e:
             logger.warning(f"[executor] tiered-breaker arm failed for {coin}: {_tb_e}")
+            # Inline twin of arm_close_tiered_breakers on the close chokepoint:
+            # its loss-streak/breaker chain did not arm, so mirror loudly.
+            try:
+                from hermes_trader import event_log
+                event_log.append("error", payload={
+                    "scope": "tiered_breaker_arm", "coin": coin,
+                    "source": "close", "error": str(_tb_e)})
+            except Exception as _ev_e:
+                logger.error("[executor] tiered_breaker_arm event log failed: %r", _ev_e)
         # C3 (HYPE RCA item 5): blow-up-level self-halt. A single closing
         # trade whose leveraged ROE loss breaches the threshold (default
         # -50%) flips the bot to OFF + risk alert. Opt-in (roe_halt_enabled),
@@ -6267,6 +6294,21 @@ def maybe_roe_blowup_halt(coin: str, realized_pnl_pct, *,
         return True
     except Exception as e:
         logger.error(f"[risk] roe blow-up halt check failed for {coin}: {e}")
+        # "Should have halted but didn't" must be at least as loud as the
+        # success path (which emits a roe_halt event). Mirror the failure to
+        # the injected sink when present, else the authoritative event feed.
+        try:
+            _err_event = {"event": "error", "scope": "roe_blowup_halt_check",
+                          "coin": coin, "error": str(e)}
+            if event_log is not None:
+                event_log(_err_event)
+            else:
+                from hermes_trader import event_log as _event_log_mod
+                _event_log_mod.append("error", payload={
+                    "scope": "roe_blowup_halt_check", "coin": coin,
+                    "error": str(e)})
+        except Exception as _ev_e:
+            logger.error("[risk] roe_blowup_halt_check event log failed: %r", _ev_e)
         return False
 
 
@@ -6359,6 +6401,15 @@ def arm_close_tiered_breakers(
         logger.warning(
             f"[executor] tiered-breaker arm failed for {coin} "
             f"(source={source}): {_tb_e}")
+        # The loss streak / coin circuit / global breaker chain never armed —
+        # the book could keep entering into a stop cascade. Mirror loudly.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "tiered_breaker_arm", "coin": coin,
+                "source": source, "error": str(_tb_e)})
+        except Exception as _ev_e:
+            logger.error("[executor] tiered_breaker_arm event log failed: %r", _ev_e)
 
 
 def retry_pending_sl(retry_interval: int = 15) -> None:

@@ -755,3 +755,199 @@ def test_h6_rehydrate_failure_is_recorded(monkeypatch):
     assert err[0]["payload"]["scope"] == "h6_rehydrate"
     assert err[0]["payload"]["coin"] == "BTC"
     assert "rehydrate exploded" in err[0]["payload"]["error"]
+
+
+# ── H. Post-close protection arms and fail-open stop builders must be loud ─
+# Q1 exception-hygiene batch 3: a failure here silently disables a fund-safety
+# protection arm (tiered loss breakers, ROE blow-up self-halt, cross-restart
+# naked-SL retry queue) or silently swaps every live stop for another set of
+# defaults (DSL policy build / bracket oid backfill). Each must mirror the
+# failure to the authoritative event feed as an ``error`` event, best-effort
+# and without changing any fail-open / control-flow behaviour.
+
+def test_tiered_breaker_arm_failure_is_recorded(monkeypatch):
+    """arm_close_tiered_breakers settles the consecutive-loss streak plus the
+    single-coin and global daily breakers after BOTH the executor close
+    chokepoint and the loop's exchange-triggered backfill. If its very first
+    step (record_loss_outcome) raises, none of the breakers arm and the book
+    can keep entering into a server-side stop cascade; a warning-only handler
+    would hide that. It must emit an ``error`` scoped ``tiered_breaker_arm``
+    while still never raising (executor.py ~:6358-6361)."""
+    from hermes_trader.agents import executor
+    from hermes_trader import event_log
+
+    def _boom(_coin, _roe):
+        raise RuntimeError("loss outcome store down")
+
+    monkeypatch.setattr(executor.memory, "record_loss_outcome", _boom)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    # Must never raise (docstring contract "Best-effort: never raises").
+    executor.arm_close_tiered_breakers("ETH", -4.0, -40.0,
+                                       source="exchange_trigger")
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "tiered_breaker_arm"
+    assert err[0]["payload"]["coin"] == "ETH"
+    assert err[0]["payload"]["source"] == "exchange_trigger"
+    assert "loss outcome store down" in err[0]["payload"]["error"]
+
+
+def test_roe_blowup_halt_check_failure_is_recorded(monkeypatch):
+    """maybe_roe_blowup_halt is the ultimate self-stop: a single trade whose
+    ROE breaches the threshold flips the bot to OFF. The SUCCESS path already
+    emits a ``roe_halt`` event; the failure path (e.g. config write raises)
+    only logged and returned False — a "should have halted but didn't" that is
+    quieter than success. It must emit an ``error`` scoped
+    ``roe_blowup_halt_check`` and still return False (executor.py ~:6268-6270).
+    """
+    from hermes_trader.agents import executor
+    from hermes_trader.agents import config_store
+
+    monkeypatch.setattr(executor, "read_agent_config",
+                        lambda: {"mode": "LIVE", "roe_halt_enabled": True,
+                                 "roe_halt_threshold_pct": -50.0})
+
+    class _BoomCtx:
+        def __enter__(self):
+            return {}
+
+        def __exit__(self, *a):
+            return False
+
+    def _boom(*a, **k):
+        raise RuntimeError("config store read-only")
+
+    monkeypatch.setattr(config_store, "update_agent_config", _boom)
+
+    written = []
+
+    def _sink(ev):
+        written.append(ev)
+
+    fired = executor.maybe_roe_blowup_halt(
+        "SOL", -252.0, source="close", event_log=_sink)
+    assert fired is False
+    err = [e for e in written if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "roe_blowup_halt_check"
+    assert err[0]["coin"] == "SOL"
+    assert "config store read-only" in err[0]["error"]
+
+
+def test_pending_sl_persist_failure_is_recorded(monkeypatch):
+    """_persist_pending_sl is the cross-restart insurance for positions
+    running with NO exchange-side stop (the retry queue). A persist failure
+    was only logged; a subsequent restart would then silently drop those
+    naked positions from the retry queue. It must emit an ``error`` scoped
+    ``pending_sl_persist`` (stage=persist) while never raising
+    (executor.py ~:353-354)."""
+    from hermes_trader.agents import executor
+    from hermes_trader import event_log
+
+    # Force json.dumps to fail inside the lock, before any filesystem I/O.
+    monkeypatch.setattr(executor, "_pending_sl_retries",
+                        {"BTC": {"unserializable": object()}})
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    executor._persist_pending_sl()  # must never raise
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "pending_sl_persist"
+    assert err[0]["payload"]["stage"] == "persist"
+    assert err[0]["payload"]["error"]
+
+
+def test_pending_sl_load_failure_is_recorded(monkeypatch, tmp_path):
+    """A corrupted queue file must not silently restore 0 entries (which reads
+    as "no naked positions across the restart"). The load failure must land in
+    events.jsonl as an ``error`` scoped ``pending_sl_persist`` (stage=load)
+    while still returning 0 and never raising (executor.py ~:389-391)."""
+    from hermes_trader.agents import executor
+    from hermes_trader import event_log
+
+    bad = tmp_path / "pending-sl.json"
+    bad.write_text("{not valid json", encoding="utf-8")
+    monkeypatch.setattr(executor, "_PENDING_SL_FILE", str(bad))
+    monkeypatch.setattr(executor, "_pending_sl_loaded", False)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    assert executor.load_pending_sl() == 0
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "pending_sl_persist"
+    assert err[0]["payload"]["stage"] == "load"
+    assert err[0]["payload"]["error"]
+
+
+def test_dsl_policy_build_failopen_is_recorded(monkeypatch):
+    """_build_policy_from_config constructs every held position's effective
+    DSL stop parameters. ANY exception previously fell back to a bare
+    ExitPolicy() with NO log at all — silently swapping live stops (and
+    disabling ATR/noise/scratch sub-protections) for all positions. It must
+    still fail open to ExitPolicy() but emit an ``error`` scoped
+    ``dsl_policy_build_failopen`` (dsl_exit.py ~:2177-2178)."""
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader.agents import config_store
+    from hermes_trader import event_log
+
+    def _boom():
+        raise RuntimeError("config store exploded")
+
+    monkeypatch.setattr(config_store, "read_agent_config", _boom)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    policy = dsl_exit._build_policy_from_config()  # must not raise
+    # Fail-open behaviour unchanged: bare dataclass defaults.
+    assert isinstance(policy, dsl_exit.ExitPolicy)
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "dsl_policy_build_failopen"
+    assert "config store exploded" in err[0]["payload"]["error"]
+
+
+def test_dsl_bracket_backfill_failure_is_recorded(monkeypatch):
+    """After a restart/rehydrate, backfill_brackets_from_exchange re-attaches
+    tracker sl_oid/tp_oid from the exchange's open orders. A failure of that
+    whole step was logged at DEBUG only, leaving positions whose exchange stop
+    is invisible/immovable. rehydrate must still return normally but emit an
+    ``error`` scoped ``dsl_bracket_backfill_fail`` (dsl_exit.py ~:2417-2421).
+    """
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader import event_log
+
+    def _boom(*a, **k):
+        raise RuntimeError("openOrders fetch exploded")
+
+    monkeypatch.setattr(dsl_exit, "backfill_brackets_from_exchange", _boom)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    # No live positions, no state load I/O concerns: the backfill step runs
+    # unconditionally when a user is supplied.
+    dropped = dsl_exit.rehydrate_from_exchange(
+        [], default_leverage=10, queried_dexes={""}, user="0xUSER")
+    assert dropped == []
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "dsl_bracket_backfill_fail"
+    assert "openOrders fetch exploded" in err[0]["payload"]["error"]

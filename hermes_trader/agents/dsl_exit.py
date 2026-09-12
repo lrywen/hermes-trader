@@ -2174,7 +2174,18 @@ def _build_policy_from_config() -> ExitPolicy:
             time_scratch_giveback_pct=float(scratch_cfg.get("giveback_pct", ExitPolicy.time_scratch_giveback_pct)),
             phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,
         )
-    except Exception:
+    except Exception as _dp_e:
+        logger.error("[dsl] exit-policy build failed, failing open to "
+                     "ExitPolicy defaults: %r", _dp_e)
+        # Fail-open silently swaps every live stop for the ExitPolicy defaults;
+        # mirror loudly so the authoritative feed records the parameter swap.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "dsl_policy_build_failopen",
+                "error": repr(_dp_e)})
+        except Exception as _ev_e:
+            logger.error("[dsl] dsl_policy_build_failopen event log failed: %r", _ev_e)
         return ExitPolicy()
 
 
@@ -2418,7 +2429,16 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
         try:
             backfill_brackets_from_exchange(user, marks=live_marks)
         except Exception as e:
-            logger.debug(f"[dsl] bracket backfill failed (non-fatal): {e}")
+            # A failed backfill leaves trackers without exchange bracket oids
+            # (cancel/move paths blind); debug-only hid it. Mirror loudly.
+            logger.error(f"[dsl] bracket backfill failed (non-fatal): {e}")
+            try:
+                from hermes_trader import event_log
+                event_log.append("error", payload={
+                    "scope": "dsl_bracket_backfill_fail",
+                    "error": repr(e)})
+            except Exception as _ev_e:
+                logger.error("[dsl] dsl_bracket_backfill_fail event log failed: %r", _ev_e)
 
     return dropped
 
