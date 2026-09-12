@@ -1479,3 +1479,292 @@ def test_close_chokepoint_roe_blowup_halt_failure_is_loud(monkeypatch, tmp_path)
     assert p["coin"] == "ETH"
     assert p["source"] == "close"
     assert "halt check exploded" in p["error"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Group K — ENTRY-path fail-open blind reads + SL-move wire exception (2026-09-12)
+#
+# Four more silent ``except`` points on the fund-safety entry/stop chain. In
+# each case the fail-open posture is the intended behaviour and MUST NOT
+# change (a candidate still trades; an SL mover still retries next cycle);
+# the contracts pin only that a scoped durable ``error`` event now lands in
+# events.jsonl instead of a debug/warning log alone:
+#   #4 sl_move_exception        executor.py ~:5057-5059  (exchange SL tighten)
+#   #5 h4_stop_distance_blind   executor.py ~:4241-4261  (liq-buffer estimate)
+#   #6 cloid_build_failed       executor.py ~:3498-3501  (idempotency key)
+#   #9 leverage_tier_blind      executor.py ~:3737-3740  (de-leverage arm)
+# ══════════════════════════════════════════════════════════════════════════
+
+def _sl_mover_env(monkeypatch):
+    """A registered long in Phase 2 with a resting exchange SL, all gates
+    stubbed so sync_exchange_sl reaches the batchModify call (mirrors the
+    mover_env fixture in test_audit_batch_a_sl_reconcile.py, self-contained
+    because tests/ is not an import package)."""
+    from hermes_trader.agents import dsl_exit, executor
+
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
+    dsl_exit._held_oids_verified = False
+    executor._sl_move_state.pop("TESTETH", None)
+
+    policy = dsl_exit.ExitPolicy(
+        max_loss_pct=2.5, protect_pct=1.5, retrace_threshold=0.30,
+        phase2_tiers=[dsl_exit.RetraceTier(1.5, 0.30)],
+        hard_timeout_minutes=1_000_000.0, stale_flat_timeout_minutes=0.0,
+        breakeven_trigger_pct=0.0, atr_stop_enabled=False,
+        consecutive_breaches_required=1, noise_band_enabled=False)
+    tracker = dsl_exit.register_position(
+        "TESTETH", "long", 100.0, policy=policy, leverage=1)
+    dsl_exit.set_bracket("TESTETH", "long", sl_oid=12345, sl_px=97.0,
+                         sl_size=1.0)
+
+    monkeypatch.setattr(executor, "_live_abs_szi", lambda coin: 1.0)
+    monkeypatch.setattr(executor, "_resolve_min_order_usd", lambda: 10.0)
+    monkeypatch.setattr(executor, "time",
+                        type("C", (), {"time": lambda s: 1000.0})())
+
+    defaults = {
+        "sl_buffer_bps": executor._SL_BUFFER_BPS,
+        "sl_move.min_bps": executor._SL_MOVE_MIN_BPS,
+        "sl_move.min_interval_sec": executor._SL_MOVE_MIN_INTERVAL_SEC,
+        "sl_limit_band_pct": 0.0,
+    }
+    monkeypatch.setattr(executor, "cfg_get",
+                        lambda key, *a, **k: defaults.get(key, 0))
+
+    tracker.check(102.0)  # ratchet the floor into Phase 2
+    return executor, dsl_exit, tracker
+
+
+def test_sl_move_wire_exception_is_loud(monkeypatch):
+    """#4: batchModify raising inside sync_exchange_sl previously left only a
+    warning and the mover silently ``continue``d — the exchange disaster-net
+    SL stayed at the old wider price with no durable trace. The retry posture
+    (no raise, next cycle retries) must NOT change; a scoped ``error``
+    ``sl_move_exception`` must now be recorded (executor.py ~:5057-5059)."""
+    from hermes_trader import event_log
+
+    executor, dsl_exit, tracker = _sl_mover_env(monkeypatch)
+
+    def _boom(**kw):
+        raise RuntimeError("batchModify wire down")
+
+    monkeypatch.setattr(executor, "modify_sl_trigger", _boom)
+    written = _event_sink(monkeypatch, event_log)
+
+    executor.sync_exchange_sl({"TESTETH": 102.0})  # must not raise
+
+    # Old oid/px untouched on failure; throttle not poisoned.
+    assert tracker.sl_oid == 12345
+    assert "TESTETH" not in executor._sl_move_state
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "sl_move_exception"
+    assert p["coin"] == "TESTETH"
+    assert "batchModify wire down" in p["error"]
+
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
+    executor._sl_move_state.pop("TESTETH", None)
+
+
+class _EntryNeutralMemory:
+    """Minimal memory stub for driving maybe_execute in SHADOW mode to the
+    sizing/entry arms without touching disk."""
+
+    def get_recent_trades(self, n=100):
+        return []
+
+    def loss_cooldown_remaining_min(self, coin):
+        return 0
+
+    def get_daily_pnl(self):
+        return 0.0
+
+    def peak_daily_pnl(self):
+        return 0.0
+
+    def daily_realized_pnl(self):
+        return 0.0
+
+    def peak_daily_realized_pnl(self):
+        return 0.0
+
+    def avg_exit_slip_bps(self, coin, days=None):
+        return 0.0
+
+    def avg_exit_slip_bps_side(self, coin, side, days=None, min_samples=None,
+                               default_bps=2.0):
+        return default_bps, "default"
+
+    def avg_hold_hours_side(self, coin, side, days=None, min_samples=None,
+                            default_hours=8.0):
+        return default_hours, "default"
+
+    def avg_round_trip_fee_bps(self, coin, days=None):
+        return 0.0
+
+    def track_daily_pnl(self, equity, net_contributions=0.0):
+        return None
+
+
+def _wire_entry_case(monkeypatch, *, tier_cfg=None, h4_raises=False):
+    """Drive maybe_execute to completion in SHADOW mode; return the captured
+    paper order kwargs. ``tier_cfg`` enables the leverage-tier arm;
+    ``h4_raises`` makes the H4 width resolver explode (the liq-buffer
+    worst-case stop estimate then fails blind)."""
+    from hermes_trader.agents import market_regime, shadow_book, executor
+
+    cfg = {
+        "mode": "SHADOW", "enable_crypto": True,
+        "leverage": 10,
+        "max_trade_notional_usd": 0,
+        "max_concurrent": 9999,
+        "min_market_volume_usd": 0,
+        "min_hip3_volume_usd": 0,
+        "min_short_volume_usd": 0,
+        "max_total_notional_pct": 50.0,
+        "max_daily_loss_usd": -1_000_000_000,
+        "min_ai_confidence": 0.0,
+        "aligned_min_conf": None,
+        "min_trend_score": 0.0,
+        "coin_allowlist": [],
+        "coin_blocklist": [],
+        "max_crypto_long_correlated": 9999,
+        "cooldown_min": 0,
+        "counter_regime_min_conf": 0.0,
+        "block_counter_trend_bypass": False,
+        "crowded_with_min_conf": 0.0,
+        "debate_gate": {"enabled": False},
+        "news_blackout": {"enabled": False},
+        "circuit_breaker": {"consecutive_loss_limit": 0,
+                            "coin_daily_loss_pct": 0.0,
+                            "max_drawdown_pct": 0.0},
+        "liquidation_maint_margin_pct": 1.0,
+        "sl_buffer_bps": 10.0,
+        "dsl_exit": {
+            "max_loss_pct": 2.5, "max_loss_roe_pct": 25.0,
+            "atr_stop": {"enabled": True, "atr_mult": 0.5,
+                         "floor_pct": 1.0, "ceiling_pct": 4.0},
+        },
+        "atr_risk_sizing": {"enabled": False},
+    }
+    if tier_cfg is not None:
+        cfg["leverage_tier_shadow"] = tier_cfg
+
+    monkeypatch.setattr(executor, "read_agent_config", lambda: dict(cfg))
+    monkeypatch.setattr(executor, "memory", _EntryNeutralMemory())
+    monkeypatch.setattr(executor, "get_max_leverage", lambda _c: 10)
+    monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
+    monkeypatch.setattr(executor, "fetch_account_state",
+                        lambda *_a, **_k: {"equity": 1000.0, "available": 900.0,
+                                           "total_ntl": 0.0, "asset_positions": []})
+    monkeypatch.setattr(executor, "get_hl_price", lambda _c: 100.0)
+    monkeypatch.setattr(executor, "get_hl_atr", lambda *_a, **_k: 2.0)
+    monkeypatch.setattr(executor, "min_entry_notional_usd", lambda _c, _m: 0.0)
+    monkeypatch.setattr(executor, "entry_size_for_notional",
+                        lambda _c, n, m: n / m)
+    monkeypatch.setattr(market_regime, "detect_regime",
+                        lambda *_a, **_k: "neutral")
+    monkeypatch.setattr(executor, "get_atr_hist_mean_pct",
+                        lambda *_a, **_k: 2.0)
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kw: None)
+    if h4_raises:
+        def _boom_width(*a, **k):
+            raise RuntimeError("sl width resolver down")
+        monkeypatch.setattr(executor, "_resolve_sl_width_config", _boom_width)
+
+    captured = {}
+    monkeypatch.setattr(shadow_book, "shadow_open",
+                        lambda **kw: captured.update(kw))
+    return executor, captured
+
+
+def _entry_analysis(aid="00000000-0000-0000-0000-000000000001"):
+    # Valid UUID by default so the Cloid arm (#6) stays quiet; only the
+    # cloid test passes a malformed id.
+    # 4h ATR% = 4.0 (> atr_pct_max 3.5) at close 100; score 26.5 (< 40):
+    # a de-leverage candidate when the tier arm is configured.
+    return {
+        "id": aid, "coin": "TEST", "action": "LONG", "side": "long",
+        "confidence": 0.9, "composite_score": 80,
+        "atr4h": 4.0, "close4h": 100.0,
+        "entry_px": 100.0, "stop_px": 99.0, "tp_px": 110.0,
+        "reasoning": "entry blind-arm test",
+    }
+
+
+def test_h4_stop_distance_blind_is_loud(monkeypatch):
+    """#5: the pre-trade worst-case stop-distance estimate feeding
+    liquidation_buffer_gate previously swallowed ANY failure at debug level
+    and left stop_distance_pct=0 (gate passes open with nothing to check).
+    The fail-open trade must still book; a scoped ``error``
+    ``h4_stop_distance_blind`` must now be recorded
+    (executor.py ~:4246-4261)."""
+    from hermes_trader import event_log
+
+    executor, captured = _wire_entry_case(monkeypatch, h4_raises=True)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.maybe_execute(_entry_analysis())
+    assert res.get("executed") is not False or captured  # fail-open booking
+    assert captured.get("leverage") == 10  # live leverage untouched
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "h4_stop_distance_blind"
+    assert p["coin"] == "TEST"
+    assert "sl width resolver down" in p["error"]
+
+
+def test_cloid_build_failure_is_loud(monkeypatch):
+    """#6: a non-UUID analysis id made Cloid.from_int raise and the code
+    silently set _cloid=None — the exchange-side idempotency key (third
+    duplicate-order defence layer) was then OFF with no durable trace. The
+    order must still proceed (fail-open); a scoped ``error``
+    ``cloid_build_failed`` must now be recorded (executor.py ~:3498-3501)."""
+    from hermes_trader import event_log
+
+    executor, captured = _wire_entry_case(monkeypatch)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.maybe_execute(_entry_analysis(aid="not-a-uuid"))
+    assert res.get("executed") is not False or captured
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "cloid_build_failed"
+    assert p["coin"] == "TEST"
+    assert "not-a-uuid" in p["error"]
+
+
+def test_leverage_tier_eval_blind_is_loud(monkeypatch):
+    """#9: ANY failure inside the leverage-tier ENFORCE arm previously logged
+    at debug and the candidate traded at the ORIGINAL high leverage (fail-
+    open) with no durable trace. Posture must NOT change, but a scoped
+    ``error`` ``leverage_tier_blind`` must now be recorded
+    (executor.py ~:3737-3740)."""
+    from hermes_trader import event_log
+
+    tier_cfg = {
+        "shadow_mode": False, "atr_pct_max": 3.5,
+        "min_composite": 40.0, "low_leverage": "boom",
+    }
+    executor, captured = _wire_entry_case(monkeypatch, tier_cfg=tier_cfg)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.maybe_execute(_entry_analysis())
+    # Fail-open: trade still booked at the original 10x.
+    assert res.get("executed") is not False or captured
+    assert captured.get("leverage") == 10
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "leverage_tier_blind"
+    assert p["coin"] == "TEST"

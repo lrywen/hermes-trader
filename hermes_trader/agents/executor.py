@@ -3497,8 +3497,21 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # duplicate instead of filling it twice.
     try:
         _cloid = Cloid.from_int(uuid.UUID(_aid).int)
-    except Exception:
+    except Exception as _cloid_e:
         _cloid = None
+        # Best-effort durable trace: without a cloid the exchange-side
+        # idempotency key (duplicate-order defence on retry) is OFF. Order
+        # still proceeds (fail-open).
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "cloid_build_failed",
+                "coin": str(analysis.get("coin") or ""),
+                "error": f"bad analysis id {_aid!r}: {_cloid_e}",
+            })
+        except Exception as _ev_e:
+            logger.error("[executor] cloid_build_failed event log failed: %r",
+                         _ev_e)
 
     user = resolve_user_address()
 
@@ -3738,6 +3751,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # 故障 fail-open（与 shadow 期行为一致），按原 leverage 继续。
         logger.debug(f"[executor] leverage-tier eval failed for "
                      f"{analysis.get('coin')} (fail-open): {_lev_e}")
+        # Best-effort durable trace: the de-leverage arm stayed blind and the
+        # candidate trades at the original high leverage.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "leverage_tier_blind",
+                "coin": str(analysis.get("coin") or ""),
+                "error": str(_lev_e),
+            })
+        except Exception as _ev_e:
+            logger.error("[executor] leverage_tier_blind event log failed: %r",
+                         _ev_e)
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
     # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
     # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
@@ -4259,6 +4284,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                 _h4_stop_distance_pct = min(_h4_width + _h4_ceiling * 0.5, _h4_ceiling * 1.5)
     except Exception as _h4_e:
         logger.debug(f"[executor] H4 stop-distance estimate failed for {coin}: {_h4_e}")
+        # Best-effort durable trace: the worst-case stop distance stays 0 and
+        # liquidation_buffer_gate opens with nothing to check (fail-open).
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "h4_stop_distance_blind",
+                "coin": coin,
+                "error": str(_h4_e),
+            })
+        except Exception as _ev_e:
+            logger.error("[executor] h4_stop_distance_blind event log failed: %r",
+                         _ev_e)
 
     ctx = GateContext(
         confidence=analysis["confidence"],
@@ -5056,6 +5093,18 @@ def sync_exchange_sl(mids: dict[str, float]) -> None:
             )
         except Exception as e:
             logger.warning(f"[sl-move] {coin} exception: {e}")
+            # Best-effort durable trace: the exchange-side SL tighten failed
+            # (next tick retries). Never mask the wire error or alter control.
+            try:
+                from hermes_trader import event_log
+                event_log.append("error", payload={
+                    "scope": "sl_move_exception",
+                    "coin": coin,
+                    "error": str(e),
+                })
+            except Exception as _ev_e:
+                logger.error("[executor] sl_move_exception event log failed: %r",
+                             _ev_e)
             continue
 
         if res.get("ok"):
