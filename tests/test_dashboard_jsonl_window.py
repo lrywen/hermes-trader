@@ -138,3 +138,96 @@ def test_keep_event_filters_incremental_appends(tmp_path: Path) -> None:
     rows = dashboard._read_jsonl_incremental(path, cache, lock, max_lines=10, keep_event=keep)
 
     assert [r["i"] for r in rows] == [0, 20]
+
+
+# ── outcome execute (long-lived open legs) whitelist + pairing ────────────
+
+def test_keep_outcome_event_retains_only_filled_executes() -> None:
+    """closes/dsl_exit always survive; execute survives only when its nested
+    payload really filled, so the thousands of unfilled attempts stay out."""
+    keep = dashboard._keep_outcome_event
+    assert keep({"event": "close", "payload": {}})
+    assert keep({"event": "dsl_exit", "payload": {}})
+    assert keep({"event": "execute", "payload": {"executed": True}})
+    assert not keep({"event": "execute", "payload": {"executed": False}})
+    assert not keep({"event": "execute", "payload": {}})
+    assert not keep({"event": "signal", "payload": {}})
+
+
+def test_open_row_from_outcome_flattens_payload_and_iso_ts() -> None:
+    rec = {
+        "event": "execute",
+        "timestamp": "2026-08-23T09:11:07Z",
+        "payload": {
+            "coin": "ETHFI", "side": "long", "executed": True,
+            "entry_px": 0.60294, "size_usd": 11.63, "stop_px": 0.58,
+            "tp_px": 0.66, "detail": "oid-1",
+        },
+    }
+    row = dashboard._open_row_from_outcome(rec)
+    assert row is not None
+    assert row["kind"] == "open"
+    assert row["coin"] == "ETHFI"
+    assert row["entry_px"] == 0.60294
+    assert row["notional_usd"] == 11.63
+    # ISO timestamp converted to epoch ms.
+    assert row["ts"] == dashboard._iso_to_ms("2026-08-23T09:11:07Z")
+
+
+def test_open_row_from_outcome_skips_unfilled() -> None:
+    rec = {"event": "execute", "timestamp": "2026-08-23T09:11:07Z",
+           "payload": {"coin": "X", "executed": False}}
+    assert dashboard._open_row_from_outcome(rec) is None
+
+
+def _close_row(ts: int, coin: str = "ETHFI", side: str = "long") -> dict:
+    return {"kind": "close", "ts": ts, "coin": coin, "side": side,
+            "source": "reconcile", "pair_id": None}
+
+
+def test_pairing_uses_outcome_open_when_session_log_rotated() -> None:
+    """An old close has no session-log execute (rotated away) but the
+    long-lived events.jsonl execute still pairs with it."""
+    open_ts = dashboard._iso_to_ms("2026-08-23T09:11:07Z")
+    close_ts = open_ts + 300_000
+    outcome = [{
+        "event": "execute",
+        "timestamp": "2026-08-23T09:11:07Z",
+        "payload": {"coin": "ETHFI", "side": "long", "executed": True,
+                    "entry_px": 0.6, "size_usd": 10.0},
+    }]
+    timeline = dashboard._pair_opens_and_closes(
+        [_close_row(close_ts)], events=[], outcome_records=outcome,
+    )
+    kinds = {r.get("kind") for r in timeline}
+    assert kinds == {"open", "close"}
+    close = next(r for r in timeline if r["kind"] == "close")
+    open_row = next(r for r in timeline if r["kind"] == "open")
+    assert close["pair_id"] is not None
+    assert close["open_ts"] == open_ts
+    assert open_row["pair_id"] == close["pair_id"]
+    assert open_row["close_ts"] == close_ts
+
+
+def test_pairing_dedups_open_present_in_both_sources() -> None:
+    """A recent open exists in both the session log (ms ts) and events.jsonl
+    (whole-second ts). It must render once, not twice."""
+    sec_ms = dashboard._iso_to_ms("2026-09-11T17:16:06Z")
+    session_ts = sec_ms + 800  # session log keeps sub-second precision
+    close_ts = session_ts + 2_000_000
+    session_event = {"event": "execute", "executed": True, "ts": session_ts,
+                     "coin": "ETHFI", "side": "long", "entry_px": 0.71,
+                     "size_usd": 30.0}
+    outcome = [{
+        "event": "execute",
+        "timestamp": "2026-09-11T17:16:06Z",
+        "payload": {"coin": "ETHFI", "side": "long", "executed": True,
+                    "entry_px": 0.71, "size_usd": 30.0},
+    }]
+    timeline = dashboard._pair_opens_and_closes(
+        [_close_row(close_ts)], events=[session_event], outcome_records=outcome,
+    )
+    opens = [r for r in timeline if r["kind"] == "open"]
+    assert len(opens) == 1
+    # Session-log twin (ms precision) wins over the whole-second outcome row.
+    assert opens[0]["ts"] == session_ts

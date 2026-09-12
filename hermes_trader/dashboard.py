@@ -382,14 +382,28 @@ _OUTCOME_CACHE_LOCK = threading.Lock()
 
 
 # Outcome events the dashboard actually consumes. events.jsonl is dominated by
-# high-volume execute/signal/ip_drift rows the dashboard never reads, but close
-# and its dsl_exit mirror are sparse and must stay visible for the FULL log
-# history (trades go back weeks). Filtering at parse time keeps those two types
-# from ever counting against the row window, so an N-row cap trims only among
-# the retained sparse events instead of silently dropping old trades behind a
-# wall of execute rows. If another consumer starts reading this log, add its
-# event type here.
+# high-volume execute/signal/ip_drift rows the dashboard never reads, but closes
+# and FILLED opens are sparse and must stay visible for the FULL log history
+# (trades go back weeks). Filtering at parse time keeps those types from ever
+# counting against the row window, so an N-row cap trims only among the retained
+# sparse events instead of silently dropping old trades behind a wall of
+# execute rows. execute is high-churn but almost every row is an unfilled attempt
+# (executed=false/None) — retain only the real fills. If another consumer starts
+# reading this log, add its event type here.
 _OUTCOME_KEEP_EVENTS = frozenset(("close", "dsl_exit"))
+
+
+def _keep_outcome_event(rec: dict[str, Any]) -> bool:
+    """Whitelist for the bounded events.jsonl read window. Keep all close /
+    dsl_exit mirrors and only FILLED execute rows (the long-lived open legs);
+    drop the thousands of unfilled execute attempts and other high-churn types.
+    """
+    ev = rec.get("event")
+    if ev in _OUTCOME_KEEP_EVENTS:
+        return True
+    if ev == "execute":
+        return bool((rec.get("payload") or {}).get("executed"))
+    return False
 
 
 def _read_outcome_lines() -> list[dict[str, Any]]:
@@ -399,7 +413,7 @@ def _read_outcome_lines() -> list[dict[str, Any]]:
     ``{event, trace_id, timestamp, payload}``. F13: reads incrementally."""
     return _read_jsonl_incremental(
         _EVENTS_PATH, _OUTCOME_CACHE, _OUTCOME_CACHE_LOCK, _OUTCOME_MAX_LINES,
-        keep_event=lambda r: r.get("event") in _OUTCOME_KEEP_EVENTS,
+        keep_event=_keep_outcome_event,
     )
 
 
@@ -1438,8 +1452,30 @@ def _open_row(e: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _open_row_from_outcome(rec: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """An events.jsonl ``execute`` record that actually FILLED → open row.
+
+    The authoritative feed nests fields as ``{event, timestamp(ISO),
+    payload:{...}}`` (the session-log execute is flat with a ms ``ts``), so
+    flatten the payload and convert the ISO timestamp before reusing
+    ``_open_row``. Returns None for non-fill / unparseable records."""
+    p = rec.get("payload") or {}
+    if not p.get("executed"):
+        return None
+    flat = dict(p)
+    flat["ts"] = _iso_to_ms(rec.get("timestamp"))
+    return _open_row(flat)
+
+
+# Cross-source identity window for the same open leg: the session log stamps
+# execute at ms precision while the events.jsonl fork truncates to whole
+# seconds, so a twin can lag by up to ~1s. Match within 2s to be safe.
+_OPEN_DEDUP_WINDOW_MS = 2000
+
+
 def _pair_opens_and_closes(
     close_rows: list[dict[str, Any]], events: list[dict[str, Any]],
+    outcome_records: Optional[list[dict[str, Any]]] = None,
 ) -> list[dict[str, Any]]:
     """Build a unified newest-first timeline of fills: real opens (execute
     executed=true) interleaved with the deduplicated close rows, and pair each
@@ -1450,12 +1486,35 @@ def _pair_opens_and_closes(
     one round trip. Opens left without a close are still listed (the open
     history the old panel hid entirely).
     """
-    # Filled opens in chronological order, grouped by (coin, side).
+    # Filled opens in chronological order, grouped by (coin, side). The
+    # session-log execute is the preferred source (ms-precision ts, full
+    # fields) but it rotates ~daily, so older opens exist only in the
+    # long-lived events.jsonl (`outcome_records`). Collect session opens first,
+    # then add each outcome open only when no session twin of the same
+    # coin+side already landed within the cross-source dedup window — this
+    # keeps recent opens from rendering twice across both feeds.
     opens_by_key: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for e in events:
         if e.get("event") == "execute" and e.get("executed"):
             row = _open_row(e)
             opens_by_key.setdefault((row["coin"], row["side"]), []).append(row)
+
+    for rec in outcome_records or []:
+        if rec.get("event") != "execute":
+            continue
+        row = _open_row_from_outcome(rec)
+        if row is None or not row.get("ts"):
+            continue
+        queue = opens_by_key.setdefault((row["coin"], row["side"]), [])
+        twin = next(
+            (o for o in queue
+             if o.get("ts") and abs(int(o["ts"]) - int(row["ts"])) <= _OPEN_DEDUP_WINDOW_MS),
+            None,
+        )
+        if twin is None:
+            queue.append(row)
+    for queue in opens_by_key.values():
+        queue.sort(key=lambda o: (o.get("ts") or 0))
 
     consumed: set[int] = set()  # id() of open rows already paired
     # Pair oldest close first so sequential round trips take opens in order
@@ -1511,7 +1570,8 @@ def _trades_payload(limit: int = 20) -> list[dict[str, Any]]:
         parser = _SESSION_CLOSE_PARSERS.get(events[i].get("event"))
         if parser is not None:
             rows.append(parser(events[i], events, i, _estimate_leverage))
-    for rec in _read_outcome_lines():
+    outcome_records = _read_outcome_lines()
+    for rec in outcome_records:
         if rec.get("event") == "close":
             rows.append(_row_from_outcome_close(rec, _estimate_leverage))
         elif rec.get("event") == "dsl_exit":
@@ -1519,7 +1579,7 @@ def _trades_payload(limit: int = 20) -> list[dict[str, Any]]:
 
     dedup_window_ms = int(_dashboard_equity_params()["dedup_window_ms"])
     close_rows = _deduplicate_close_rows(rows, dedup_window_ms)[:limit]
-    return _pair_opens_and_closes(close_rows, events)
+    return _pair_opens_and_closes(close_rows, events, outcome_records)
 
 
 # A heartbeat that momentarily failed to fetch a HIP-3 dex reports equity far
