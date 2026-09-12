@@ -45,6 +45,8 @@ from __future__ import annotations
 
 import ast
 import logging
+import time
+import types
 from pathlib import Path
 
 import pytest
@@ -571,3 +573,185 @@ def test_bm11_and_market_circuit_default_flattener_is_real_close():
                                              if d is not None]
         assert any(isinstance(a, ast.Name)
                    and a.id == "close_position_market" for a in defaults)
+
+
+# ── G. Non-guard state-consistency failures must also reach events.jsonl ───
+# Q1 exception-hygiene batch 2: these paths are not fund-safety flatten
+# guards, but a silent failure still disables a protection (anti-revenge
+# cooldown) or loses post-trade reconstruction data (perception feed, entry
+# attribution, orphan-window rehydrate). Each must mirror the failure to the
+# authoritative event feed as an ``error`` event, best-effort and without
+# changing any control flow / trading behaviour.
+
+def _main_loop_try(predicate):
+    """Find the unique Try node inside the module-level main loop for which
+    ``predicate`` holds on the node, and return a runner that execs the Try
+    (plus, when it is guarded by an enclosing If in the same suite, that If)
+    verbatim in an injected namespace."""
+    tree = ast.parse(TRADING_LOOP_SRC)
+    loop = next(n for n in tree.body if isinstance(n, ast.While))
+    matches = [(n, p) for n, p in _iter_with_parent(loop)
+               if isinstance(n, ast.Try) and predicate(n)]
+    assert len(matches) == 1, f"expected exactly one matching Try, got {len(matches)}"
+    node, holder = matches[0]
+    # When the Try is the sole body of an immediate enclosing If in the same
+    # statement suite (e.g. the ``if _net_usd < 0:`` cooldown guard), compile
+    # the If alone: its body already executes the Try, so adding the Try as a
+    # sibling module statement would run it twice.
+    top = holder if (isinstance(holder, ast.If)
+                     and holder.body == [node]) else node
+    block = ast.fix_missing_locations(
+        ast.Module(body=[top], type_ignores=[]))
+
+    def _run(ns):
+        base = {"logger": logging.getLogger("test.contract.g"),
+                "log_event": ns.pop("log_event")}
+        base.update(ns)
+        exec(compile(block, "<trading_loop g extracted>", "exec"), base)
+
+    return _run
+
+
+def test_perception_persist_failure_is_recorded():
+    """A failing memory.record_perception (per-coin, per-tick signal feed)
+    must not vanish into ``except: pass``: mirror it as an ``error`` event so
+    a broken perception/outcome store is observable, while never blocking the
+    scan (trading_loop.py ~:1837-1840)."""
+    events = []
+
+    def _boom(_perception):
+        raise RuntimeError("memory disk full")
+
+    class _Mem:
+        record_perception = staticmethod(_boom)
+
+    run = _main_loop_try(
+        lambda n: any(isinstance(s, ast.Expr)
+                      and isinstance(s.value, ast.Call)
+                      and isinstance(s.value.func, ast.Attribute)
+                      and s.value.func.attr == "record_perception"
+                      for s in n.body))
+    run({"memory": _Mem(),
+         "perception": {"coin": "BTC", "composite_score": 1},
+         "coin": "BTC",
+         "log_event": events.append})
+    err = [e for e in events if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "perception_persist"
+    assert err[0]["coin"] == "BTC"
+    assert "memory disk full" in err[0]["error"]
+
+
+def test_loss_cooldown_arm_failure_is_recorded():
+    """When the anti-revenge loss cooldown cannot be armed after an
+    exchange-triggered losing close, a warning-only handler would silently
+    leave re-entries unguarded. It must also emit an ``error`` event scoped
+    ``loss_cooldown`` (trading_loop.py ~:1484-1500)."""
+    events = []
+
+    def _boom(_coin, _until):
+        raise RuntimeError("cooldown store down")
+
+    class _Mem:
+        set_loss_cooldown = staticmethod(_boom)
+
+    run = _main_loop_try(
+        lambda n: any(
+            "loss-cooldown arm failed" in (
+                ast.get_source_segment(TRADING_LOOP_SRC, h) or "")
+            for h in n.handlers))
+    _tr = types.SimpleNamespace(coin="ETH")
+    run({
+        "_tr": _tr, "_net_usd": -5.0,
+        "cfg_get": lambda *a, **k: 30.0,
+        "read_agent_config": lambda: {},
+        "time": time,
+        "memory": _Mem(),
+        "log_event": events.append,
+    })
+    err = [e for e in events if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "loss_cooldown"
+    assert err[0]["coin"] == "ETH"
+    assert "cooldown store down" in err[0]["error"]
+
+
+def test_entry_context_capture_failure_is_recorded(monkeypatch):
+    """memory.record_entry_context feeds post-trade attribution (regime /
+    config-era / enforcement snapshot). A failure was logged at DEBUG only;
+    it must reach events.jsonl as an ``error`` scoped ``entry_context`` while
+    the fill itself still settles (executor.py ~:2856-2873)."""
+    from hermes_trader.agents import executor
+    from hermes_trader.agents import market_regime
+    from hermes_trader import event_log
+
+    monkeypatch.setattr(executor, "register_position",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(executor.memory, "record_trade", lambda t: None)
+    monkeypatch.setattr(market_regime, "detect_regime",
+                        lambda coin, *, force=False: "neutral")
+
+    def _boom(*a, **k):
+        raise RuntimeError("context store down")
+
+    monkeypatch.setattr(executor.memory, "record_entry_context", _boom)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    executor._register_filled_position(
+        analysis={"id": "a1", "coin": "BTC"}, config={},
+        order_res={"avg_px": 100.0, "total_sz": 1.0, "order_id": "O1"},
+        coin="BTC", trade_side="long", mid_price=100.0, size_in_coin=1.0,
+        atr=2.0, leverage=10, user="0xUSER", override_composite=0.0,
+        enf=None, aid="a1")
+
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "entry_context"
+    assert err[0]["payload"]["coin"] == "BTC"
+    assert "context store down" in err[0]["payload"]["error"]
+
+
+def test_h6_rehydrate_failure_is_recorded(monkeypatch):
+    """On an UNRESOLVABLE response-unknown order, the immediate rehydrate that
+    shrinks the orphan window can itself fail. That failure was only logged;
+    it must land in events.jsonl as an ``error`` scoped ``h6_rehydrate`` while
+    the streak/halt control flow is untouched (executor.py ~:2526-2537)."""
+    from hermes_trader.agents import executor
+    from hermes_trader.client import exchange
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader import event_log
+
+    monkeypatch.setattr(exchange, "reconcile_order_fill",
+                        lambda **k: {"status": "unknown",
+                                     "reason": "userFills_fetch_exception: boom"})
+    monkeypatch.setattr(executor, "fetch_account_state",
+                        lambda u, **kw: {"asset_positions": []})
+
+    def _boom_rehydrate(*a, **k):
+        raise RuntimeError("rehydrate exploded")
+
+    monkeypatch.setattr(dsl_exit, "rehydrate_from_exchange", _boom_rehydrate)
+    monkeypatch.setattr(executor.memory, "set_global_halt", lambda until: None)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    executor._reset_resp_unknown_streak()
+    out = executor._reconcile_unknown_order_result(
+        {"ok": False, "error": "conn reset", "error_code": "response_unknown"},
+        coin="BTC", is_buy=True, size_in_coin=1.0, mid_price=100.0,
+        cloid="0xcloid", config={"leverage": 10}, user="0xUSER",
+        mode="LIVE", aid="a1", gate_results=[])
+    assert out["executed"] is False
+    assert "order_response_unknown_unresolved" in out["reason"]
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    assert err[0]["payload"]["scope"] == "h6_rehydrate"
+    assert err[0]["payload"]["coin"] == "BTC"
+    assert "rehydrate exploded" in err[0]["payload"]["error"]

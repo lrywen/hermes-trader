@@ -1498,6 +1498,13 @@ while True:
                                     logger.warning(
                                         f"[executor] loss-cooldown arm failed "
                                         f"for {_tr.coin}: {_lc_e}")
+                                    try:
+                                        log_event({"event": "error",
+                                                   "scope": "loss_cooldown",
+                                                   "coin": _tr.coin,
+                                                   "error": str(_lc_e)})
+                                    except Exception:
+                                        pass
                             # P2-5: the executor chokepoint is bypassed on
                             # exchange-triggered closes, so settle the rest of
                             # the tiered-breaker chain here: loss-streak
@@ -1836,8 +1843,13 @@ while True:
             # Persist perceptions so memory/dashboard track real signal volume.
             try:
                 memory.record_perception(perception)
-            except Exception:
-                pass
+            except Exception as _pp_e:
+                logger.warning(f"[loop] perception persist failed for {coin}: {_pp_e}")
+                try:
+                    log_event({"event": "error", "scope": "perception_persist",
+                               "coin": coin, "error": str(_pp_e)})
+                except Exception:
+                    pass
 
             if coin in held_coins:
                 # Held position: research only every held_research_interval_min

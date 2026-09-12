@@ -2535,6 +2535,13 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
         )
     except Exception as _rh_e:
         logger.error(f"[executor] H6 immediate rehydrate failed: {_rh_e}")
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "h6_rehydrate", "coin": coin,
+                "error": str(_rh_e)})
+        except Exception as _ev_e:
+            logger.error("[executor] h6_rehydrate event log failed: %r", _ev_e)
     try:
         _halt_n = int(cfg_get(
             "circuit_breaker.resp_unknown_halt_n",
@@ -2870,7 +2877,14 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
                                    and "[structural override]" in (analysis.get("reasoning") or ""),
             })
         except Exception as _ec_e:
-            logger.debug(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
+            logger.warning(f"[executor] entry-context capture failed (non-fatal): {_ec_e}")
+            try:
+                from hermes_trader import event_log
+                event_log.append("error", payload={
+                    "scope": "entry_context", "coin": coin,
+                    "error": str(_ec_e)})
+            except Exception as _ev_e:
+                logger.error("[executor] entry_context event log failed: %r", _ev_e)
     except Exception as _state_e:
         logger.critical(f"[executor] LOCAL STATE WRITE FAILED after {coin} order "
                         f"placed on exchange — position is ORPHANED: {_state_e}")
