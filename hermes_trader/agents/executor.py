@@ -6176,6 +6176,21 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                                 logger.warning(f"[risk] overrun notify failed for {coin}: {_ne}")
             except Exception as _msd_e:
                 logger.debug(f"[risk] actual-stop-deviation calc failed for {coin}: {_msd_e}")
+                # Best-effort durable trace: the whole stop-overrun monitor
+                # (deviation metric + >10% STOP OVERRUN danger card) was
+                # skipped for this loss fill, so gap-through/slip went
+                # unmeasured and unalerted. Close settlement is unaffected.
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "stop_overrun_monitor_blind",
+                        "coin": coin,
+                        "source": "close",
+                        "error": str(_msd_e),
+                    })
+                except Exception as _ev_e:
+                    logger.error("[executor] stop_overrun_monitor_blind event log failed: %r",
+                                 _ev_e)
             _coin_breaker_pct = float(
                 cfg_get("circuit_breaker.single_coin_loss_pct", config=_tb_cfg, default=3.0))
             _coin_breaker_min = float(

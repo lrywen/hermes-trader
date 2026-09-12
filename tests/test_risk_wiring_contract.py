@@ -1860,3 +1860,47 @@ def test_rehydrate_record_trade_failure_is_loud(monkeypatch, tmp_path):
 
     dsl_exit._active_positions.clear()
     dsl_exit._suspect_sl_keys.clear()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group M — post-close stop-overrun monitor blind arm (2026-09-12)
+#   stop_overrun_monitor_blind  executor.py ~:6131-6178
+#     (actual-vs-configured stop deviation metric + >10% danger card)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_stop_overrun_monitor_failure_is_loud(monkeypatch, tmp_path):
+    """The post-flatten ACTUAL_STOP_DEVIATION block reconstructs the DSL cap
+    and raises the >10% STOP OVERRUN danger alert (gap-through / slip). Any
+    failure inside that whole monitor previously logged at DEBUG only, so a
+    loss fill could silently skip BOTH the overrun metric and the danger
+    card — the stop-quality protection was blind with no durable trace. The
+    close must still settle (non-fatal); a scoped ``error``
+    ``stop_overrun_monitor_blind`` (source=close) must now be recorded."""
+    from hermes_trader import event_log, metrics
+    from hermes_trader.agents import dsl_exit
+
+    executor, orders = _close_wire(monkeypatch, tmp_path)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("overrun gauge down")
+
+    # The monitor reaches ACTUAL_STOP_DEVIATION.set for a losing fill
+    # (entry 100 -> fill 94 long => -6% spot); force the metric write to fail.
+    monkeypatch.setattr(metrics.ACTUAL_STOP_DEVIATION, "set", _boom)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.close_position_market("ETH")
+    assert res.get("ok") is True  # close still settles
+    assert len(orders) == 1
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "stop_overrun_monitor_blind"
+    assert p["coin"] == "ETH"
+    assert p["source"] == "close"
+    assert "overrun gauge down" in p["error"]
+
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
