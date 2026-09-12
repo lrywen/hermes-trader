@@ -5788,6 +5788,19 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
             out["follow_filled_sz"] = _follow_filled
             out["residual_sz"] = _still_open
             out["follow_result"] = _follow
+            # Durable record in events.jsonl: a residual position is live risk
+            # that the next scan must re-detect; the log line alone can be
+            # rotated away. Best-effort — never block the close on logging.
+            try:
+                from hermes_trader import event_log
+                event_log.append(
+                    "close_partial",
+                    payload={"coin": coin, "requested_sz": _requested,
+                             "filled_sz": _filled,
+                             "follow_filled_sz": _follow_filled,
+                             "residual_sz": _still_open})
+            except Exception as _ev_e:
+                logger.error("[executor] close_partial event log failed: %r", _ev_e)
             # Skip the success-path bookkeeping: settlement, PnL record, loss
             # cooldown, breakers — those belong to a fully-flat close. The
             # residual will be re-detected on the next scan tick.
@@ -5947,6 +5960,14 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
             # undercount). Previously this was silently swallowed as a
             # warning, which is how PURR's external SL close went
             # unnoticed until manual reconciliation.
+            try:
+                from hermes_trader import event_log
+                event_log.append(
+                    "error",
+                    payload={"scope": "outcome_store", "coin": coin,
+                             "error": str(_rc_e)})
+            except Exception as _ev_e:
+                logger.error("[executor] outcome_store error event log failed: %r", _ev_e)
             try:
                 from hermes_trader import notify
                 notify.send_text(

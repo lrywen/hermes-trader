@@ -795,6 +795,7 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
                 f"[killswitch] B-M11 global halt armed ({int(_grem)}min) and "
                 f"auto_flatten_on_global_halt=ON — flattening {len(pos_coins)} "
                 f"open position(s)")
+            _gfailed = []
             for _coin in pos_coins:
                 try:
                     _res = flattener(_coin)
@@ -802,9 +803,16 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
                     flattened.add(_coin)
                 except Exception as _e:
                     logger.error(f"[killswitch] halt-flatten failed for {_coin}: {_e}")
+                    _gfailed.append(_coin)
+                    try:
+                        event_log({"event": "error", "scope": "bm11_global_halt",
+                                   "coin": _coin, "error": str(_e)})
+                    except Exception:
+                        pass
             event_log({"event": "global_halt_auto_flatten",
                        "remaining_min": round(_grem, 1),
-                       "flattened": len(flattened)})
+                       "flattened": len(flattened),
+                       "failed": _gfailed})
     if bool(cfg_get("auto_flatten_on_coin_circuit", config=cfg)):
         for _coin in pos_coins:
             if _coin in flattened:
@@ -819,14 +827,22 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
             logger.warning(
                 f"[killswitch] B-M11 coin circuit armed on {_coin} ({int(_crem)}min) "
                 f"and auto_flatten_on_coin_circuit=ON — flattening")
+            _cfailed = []
             try:
                 _res = flattener(_coin)
                 logger.warning(f"[killswitch] circuit-flatten {_coin}: ok={_res.get('ok')}")
                 flattened.add(_coin)
             except Exception as _e:
                 logger.error(f"[killswitch] circuit-flatten failed for {_coin}: {_e}")
+                _cfailed.append(_coin)
+                try:
+                    event_log({"event": "error", "scope": "bm11_coin_circuit",
+                               "coin": _coin, "error": str(_e)})
+                except Exception:
+                    pass
             event_log({"event": "coin_circuit_auto_flatten", "coin": _coin,
-                       "remaining_min": round(_crem, 1)})
+                       "remaining_min": round(_crem, 1),
+                       "failed": _cfailed})
     return flattened
 
 
@@ -908,6 +924,11 @@ def market_circuit_tick(cfg, mem, equity, positions, *,
                 logger.warning(f"[market_circuit] halt-flatten {_coin}: ok={_res.get('ok')}")
             except Exception as _e:
                 logger.error(f"[market_circuit] halt-flatten failed for {_coin}: {_e}")
+                try:
+                    event_log({"event": "error", "scope": "market_circuit",
+                               "coin": _coin, "error": str(_e)})
+                except Exception:
+                    pass
     return verdict
 
 
@@ -1261,6 +1282,11 @@ while True:
                 f"[killswitch] HARD daily-loss floor breached: PnL ${daily_pnl:.2f} "
                 f"<= ${_max_daily_loss:.0f} — flattening {len(positions)} open "
                 f"position(s) to cap the loss")
+            # Count ACTUAL successes — len(positions) would report a failed
+            # flatten as a clean exit. Every per-coin failure is mirrored to
+            # events.jsonl so the fund-safety guard never fails silently.
+            _ks_ok = 0
+            _ks_failed = []
             for _p in positions:
                 _coin = (_p.get("position") or {}).get("coin")
                 if not _coin:
@@ -1268,10 +1294,18 @@ while True:
                 try:
                     _res = close_position_market(_coin)
                     logger.warning(f"[killswitch] flattened {_coin}: ok={_res.get('ok')}")
+                    _ks_ok += 1
                 except Exception as _e:
                     logger.error(f"[killswitch] failed to flatten {_coin}: {_e}")
+                    _ks_failed.append(_coin)
+                    try:
+                        log_event({"event": "error", "scope": "hard_killswitch",
+                                   "coin": _coin, "error": str(_e)})
+                    except Exception:
+                        pass
             log_event({"event": "hard_killswitch", "daily_pnl": round(daily_pnl, 2),
-                       "limit": _max_daily_loss, "flattened": len(positions)})
+                       "limit": _max_daily_loss, "flattened": _ks_ok,
+                       "failed": _ks_failed})
 
         # ── B-M11: optional HARD flatten on circuit breakers ───────────────
         # global_halt_gate / coin_circuit_breaker_gate only block NEW entries

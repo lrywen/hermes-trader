@@ -17,7 +17,11 @@ Contracts locked here (file:line anchors in each test):
        * equity <= 0 / empty book -> never flattens (degraded-read guard)
        * above the floor -> never flattens
        * one coin's close raising never blocks the other coins
-       * emits exactly one hard_killswitch event with the USD floor
+       * emits exactly one hard_killswitch event with the USD floor;
+         ``flattened`` counts ACTUAL successes (never len(positions),
+         which would report a failed flatten as a clean exit) and a
+         per-coin close failure is mirrored to events.jsonl as an
+         ``error`` event — the fund-safety guard never fails silently
        * KNOWN P1 ASYMMETRY: it reads max_daily_loss_usd ONLY — the
          equity-% leg (daily_loss_pct) can not trip it, while the
          entry gate's effective_daily_loss_cutoff() takes the tighter
@@ -76,6 +80,25 @@ def _load_bm11(*, flattener, event_log):
     exec(compile(_extract_function("bm11_breaker_flatten"),
                  "<trading_loop extracted>", "exec"), ns)
     return ns["bm11_breaker_flatten"]
+
+
+def _load_market_circuit(*, evaluator, flattener, event_log):
+    """Compile market_circuit_tick with injected keyword defaults; its
+    internal wiring (verdict -> same-tick flatten -> event log) runs
+    verbatim."""
+    from hermes_trader.agents.config_store import cfg_get
+
+    ns = {
+        "cfg_get": cfg_get,
+        "logger": logging.getLogger("test.contract.market_circuit"),
+        "close_position_market": flattener,
+        "market_circuit_evaluate": evaluator,
+        "_market_circuit_funding": lambda c: None,
+        "log_event": event_log,
+    }
+    exec(compile(_extract_function("market_circuit_tick"),
+                 "<trading_loop extracted>", "exec"), ns)
+    return ns["market_circuit_tick"]
 
 
 def _iter_with_parent(node, parent=None):
@@ -138,7 +161,9 @@ def test_ks_breach_flattens_every_position_once_and_logs():
     ev = [e for e in events if e.get("event") == "hard_killswitch"]
     assert len(ev) == 1
     assert ev[0] == {"event": "hard_killswitch", "daily_pnl": -3.5,
-                     "limit": -3.0, "flattened": 3}
+                     "limit": -3.0, "flattened": 3, "failed": []}
+    # all-success run emits no error events
+    assert not [e for e in events if e.get("event") == "error"]
 
 
 @pytest.mark.parametrize("equity,positions,pnl", [
@@ -181,9 +206,17 @@ def test_ks_one_coin_failure_never_blocks_others():
     run({"max_daily_loss_usd": -3.0}, 100.0,
         _positions("BTC", "ETH", "SOL"), -5.0, _flattener, events)
     assert flattened == ["BTC", "SOL"]  # ETH raised; siblings still closed
-    # the block still reports the full position count and never re-raises
+    # the summary counts ACTUAL successes and names the failure — it must
+    # never report len(positions) as flattened when a close raised
     ev = next(e for e in events if e["event"] == "hard_killswitch")
-    assert ev["flattened"] == 3
+    assert ev["flattened"] == 2
+    assert ev["failed"] == ["ETH"]
+    # the failed flatten is mirrored to events.jsonl, not only to logger
+    err = [e for e in events if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "hard_killswitch"
+    assert err[0]["coin"] == "ETH"
+    assert "exchange down" in err[0]["error"]
 
 
 def test_ks_coins_without_coin_key_are_skipped():
@@ -358,6 +391,87 @@ def test_bm11_halt_flatten_through_real_close_without_live_grant(monkeypatch, tm
     assert any(e.get("event") == "global_halt_auto_flatten" for e in events)
 
 
+# ── E. Guard-flatten failures must reach events.jsonl, not only logger ─────
+
+def test_bm11_global_halt_failed_flatten_is_recorded():
+    """When a global-halt flatten raises for one coin, bm11 must (a) still
+    flatten the sibling coins, (b) report an accurate flattened count with a
+    ``failed`` list in the summary, and (c) mirror the failure as an
+    ``error`` event so a guard that could not de-risk the book is visible in
+    the authoritative outcome feed."""
+    events = []
+    done = []
+
+    def _flattener(coin):
+        if coin == "ETH":
+            raise RuntimeError("exchange down")
+        done.append(coin)
+        return {"ok": True}
+
+    bm11 = _load_bm11(flattener=_flattener, event_log=events.append)
+    out = bm11(equity=1_000.0, positions=_positions("ETH", "BTC"),
+               cfg={"auto_flatten_on_global_halt": True},
+               mem=_HaltMem(30.0))
+    assert out == {"BTC"} and done == ["BTC"]
+    summary = next(e for e in events
+                   if e["event"] == "global_halt_auto_flatten")
+    assert summary["flattened"] == 1 and summary["failed"] == ["ETH"]
+    err = [e for e in events if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "bm11_global_halt"
+    assert err[0]["coin"] == "ETH"
+    assert "exchange down" in err[0]["error"]
+
+
+class _CoinHaltMem:
+    def global_halt_remaining_min(self):
+        return 0.0
+
+    def coin_circuit_remaining_min(self, coin):
+        return 15.0 if coin == "ETH" else 0.0
+
+
+def test_bm11_coin_circuit_failed_flatten_is_recorded():
+    events = []
+
+    def _flattener(coin):
+        raise RuntimeError("exchange down")
+
+    bm11 = _load_bm11(flattener=_flattener, event_log=events.append)
+    out = bm11(equity=1_000.0, positions=_positions("ETH", "BTC"),
+               cfg={"auto_flatten_on_coin_circuit": True},
+               mem=_CoinHaltMem())
+    assert out == set()
+    summary = next(e for e in events
+                   if e["event"] == "coin_circuit_auto_flatten")
+    assert summary["failed"] == ["ETH"]
+    err = next(e for e in events if e.get("event") == "error")
+    assert err["scope"] == "bm11_coin_circuit"
+    assert err["coin"] == "ETH"
+
+
+def test_market_circuit_failed_flatten_is_recorded():
+    """market_circuit_tick's same-tick enforce flatten must mirror a failing
+    close as an ``error`` event (market_circuit scope)."""
+    events = []
+
+    def _evaluator(cfg, *, mem, funding_fetcher, notifier, event_log):
+        return {"action": "halt_armed"}
+
+    def _flattener(coin):
+        raise RuntimeError("exchange down")
+
+    tick = _load_market_circuit(evaluator=_evaluator, flattener=_flattener,
+                                event_log=events.append)
+    tick({"market_circuit": {"mode": "enforce"},
+          "auto_flatten_on_global_halt": True},
+         _HaltMem(30.0), 1_000.0, _positions("ETH"))
+    err = next(e for e in events if e.get("event") == "error")
+    assert err["scope"] == "market_circuit"
+    assert err["coin"] == "ETH"
+    assert "exchange down" in err["error"]
+
+
 # ── C. Tick ordering: exits before the OFF gate, entries after it ──────────
 
 def _line_index(marker):
@@ -387,6 +501,61 @@ def test_tick_order_scan_and_routing_after_off_gate():
     scan = _line_index("results = scan_once(")
     route = _line_index("routed = route_verdict(analysis)")
     assert off < scan < route
+
+
+# ── F. Executor close-path failures must reach events.jsonl ────────────────
+
+def test_close_partial_fill_is_durably_recorded(monkeypatch, tmp_path):
+    """A reduce-only close that leaves a residual (follow-up also partial)
+    must write a ``close_partial`` event to events.jsonl in addition to the
+    log+alert, so an un-flattened residual is reconstructible post-trade
+    (executor.py partial-fill guard ~:5764-5794)."""
+    from hermes_trader import event_log
+    executor, _orders = _close_wire(monkeypatch, tmp_path)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    def _partial_place(is_buy, size, mid_price, coin, **kw):
+        # primary fills 0.5 of 1.0; follow-up fills 0.1 of the 0.5 residual
+        filled = 0.5 if size >= 1.0 else 0.1
+        return {"ok": True, "total_sz": filled, "avg_px": 94.0}
+
+    monkeypatch.setattr(executor, "place_hl_order", _partial_place)
+    res = executor.close_position_market("ETH")
+    assert res.get("partial") is True and res.get("residual_sz") == 0.4
+    ev = next(e for e in written if e["event"] == "close_partial")
+    assert ev["payload"]["coin"] == "ETH"
+    assert ev["payload"]["residual_sz"] == 0.4
+    assert ev["payload"]["requested_sz"] == 1.0
+
+
+def test_record_close_failure_is_durably_recorded(monkeypatch, tmp_path):
+    """When memory.record_close raises (a close row would be lost from the
+    outcome store), the close must still settle and an ``error`` event must
+    land in events.jsonl — previously this existed only in logger+notify
+    (executor.py ~:5942-5958)."""
+    from hermes_trader import event_log
+    executor, orders = _close_wire(monkeypatch, tmp_path)
+
+    written = []
+    monkeypatch.setattr(event_log, "append",
+                        lambda event, payload=None, **kw: written.append(
+                            {"event": event, "payload": payload or {}}) or True)
+
+    def _boom(*a, **kw):
+        raise RuntimeError("outcome store down")
+
+    monkeypatch.setattr(executor.memory, "record_close", _boom)
+    res = executor.close_position_market("ETH")
+    # the fill itself is unaffected — the reduce-only order still went out
+    assert res.get("ok") is True and len(orders) == 1
+    err = next(e for e in written if e["event"] == "error")
+    assert err["payload"]["scope"] == "outcome_store"
+    assert err["payload"]["coin"] == "ETH"
+    assert "outcome store down" in err["payload"]["error"]
 
 
 def test_bm11_and_market_circuit_default_flattener_is_real_close():
