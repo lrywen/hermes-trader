@@ -3637,7 +3637,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # live leverage above is unchanged; we record what the tier WOULD pick.
     try:
         _lev_tier = config.get("leverage_tier_shadow") or {}
-        if bool(_lev_tier.get("shadow_mode", False)):
+        # Audit 2026-09-12: shadow_mode=true 只记录 would-deleverage；false（臂
+        # 已配置）则真正把 leverage 降到低档后继续 sizing/下单。未配置则跳过。
+        _lev_tier_shadow = bool(_lev_tier.get("shadow_mode", False))
+        if _lev_tier:
             _atr_pct = None
             try:
                 _a4 = analysis.get("atr4h")
@@ -3656,6 +3659,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             if _score6 < _score_min:
                 _reasons.append(f"score {_score6:.1f} < {_score_min:.0f}")
             if _reasons and leverage > _low_lev:
+                _proposed_lev = min(_low_lev, leverage)
                 _record_risk_tuning_shadow(
                     rule="leverage_tier",
                     coin=str(analysis.get("coin") or ""),
@@ -3663,19 +3667,29 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     would="deleverage",
                     detail={
                         "live_leverage": leverage,
-                        "proposed_leverage": min(_low_lev, leverage),
+                        "proposed_leverage": _proposed_lev,
                         "atr_pct_4h": (round(_atr_pct, 3)
                                       if _atr_pct is not None else None),
                         "composite_score": round(_score6, 4),
                         "atr_pct_max": _atr_max,
                         "min_composite": _score_min,
                         "reason": "; ".join(_reasons),
+                        "enforced": (not _lev_tier_shadow),
                     },
                     trace_id=str(analysis.get("id") or ""),
                 )
+                if not _lev_tier_shadow:
+                    # ENFORCE：真正降杠杆，后续 notional cap / sizing / 下单均按
+                    # 低档 leverage 走（shadow 记录保留用于灰度对账）。
+                    logger.warning(
+                        f"[executor] leverage_tier ENFORCE de-lever "
+                        f"{analysis.get('coin')} {leverage}x -> {_proposed_lev}x "
+                        f"({'; '.join(_reasons)})")
+                    leverage = _proposed_lev
     except Exception as _lev_e:
-        logger.debug(f"[executor] leverage-tier shadow failed for "
-                     f"{analysis.get('coin')}: {_lev_e}")
+        # 故障 fail-open（与 shadow 期行为一致），按原 leverage 继续。
+        logger.debug(f"[executor] leverage-tier eval failed for "
+                     f"{analysis.get('coin')} (fail-open): {_lev_e}")
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
     # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
     # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
@@ -5375,7 +5389,10 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     # it for `loss_cooldown_hours`. Shadow records what WOULD block; the live
     # 180-min cooldown is unchanged.
     _pc_cfg = gate.get("per_coin_cooldown") or {}
-    if bool(_pc_cfg.get("shadow_mode", False)) and side in ("long", "short"):
+    # Audit 2026-09-12: shadow_mode=true 只记录 would-block；false（臂已配置）
+    # 则真正在 runner gate 拦截。缺省/未配置该臂时整块跳过（语义同关闭）。
+    _pc_shadow = bool(_pc_cfg.get("shadow_mode", False))
+    if _pc_cfg and side in ("long", "short"):
         try:
             import time as _time
             _now_ms = int(_time.time() * 1000)
@@ -5426,9 +5443,26 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     rule="per_coin_cooldown", coin=coin, side=side,
                     would=_pc_would, detail=_pc_detail,
                     trace_id=str(analysis.get("id") or ""))
+                if not _pc_shadow:
+                    # ENFORCE：真正在 runner gate 拦截本次入场（shadow 记录保留
+                    # 用于灰度对账）。
+                    logger.info(
+                        f"[runner_gate] per-coin cooldown ENFORCE block "
+                        f"coin={coin} side={side}: {_pc_detail.get('reason')}")
+                    return (
+                        f"runner_gate_blocked (per-coin cooldown: "
+                        f"{_pc_detail.get('reason')})"
+                    )
         except Exception as _pc_e:
-            logger.debug(f"[runner_gate] per-coin cooldown shadow failed for "
-                         f"{coin}: {_pc_e}")
+            # 记忆读取等故障 fail-open（与 shadow 期行为一致），避免冻结交易；
+            # enforce 模式下提级为 warning 以便发现保护臂失效。
+            _msg = (f"[runner_gate] per-coin cooldown "
+                    f"{'shadow' if _pc_shadow else 'ENFORCE'} eval failed for "
+                    f"{coin} (fail-open, admit): {_pc_e}")
+            if _pc_shadow:
+                logger.debug(_msg)
+            else:
+                logger.warning(_msg)
 
     if is_hip3:
         en = config.get("signal_enforcement") or {}
