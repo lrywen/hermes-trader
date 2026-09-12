@@ -118,7 +118,7 @@ volumeSpike（z ≥ 2.0σ）虽然在 breakout 分支变冗余，但在另外三
 - 持有窗口 = 6h（72 根 5m K 线），同 bar 先判止损
 - 15 分钟同币去重后，11 个原始信号落到 **10 个**可模拟样本
 
-脚本：[breakout_only_forward.py](file:///home/ldy/hermes-trader/scripts/breakout_only_forward.py)，结构化结果：[breakout_forward_results.json](file:///home/ldy/hermes-trader/scripts/breakout_forward_results.json)。
+脚本 `scripts/breakout_only_forward.py` 与其结构化结果 `scripts/breakout_forward_results.json` 均为本次一次性产物，已在后续清理中从仓库移除（脚本可从历史提交 f9810bc、结果可从 6e6cae9 取回）；下方逐笔明细与结论仍保留备查。
 
 ### 3.1 逐笔明细
 
@@ -208,8 +208,8 @@ fresh_impulse 通过后，最大的可识别额外瓶颈是 [risk_gates.py:316-3
 |---|---|
 | [hermes_trader/agents/executor.py](file:///home/ldy/hermes-trader/hermes_trader/agents/executor.py) | D1 公式 L1907；D2 日志 L1909-1915 及各 BLOCKED 分支；docstring L1860-1866 |
 | [scripts/test_runner_gate_breakout.py](file:///home/ldy/hermes-trader/scripts/test_runner_gate_breakout.py) | D3 新增，11 个单测 |
-| [scripts/breakout_only_forward.py](file:///home/ldy/hermes-trader/scripts/breakout_only_forward.py) | E1 前向盈亏模拟 |
-| [scripts/breakout_forward_results.json](file:///home/ldy/hermes-trader/scripts/breakout_forward_results.json) | E1 结构化结果 |
+| `scripts/breakout_only_forward.py` | E1 前向盈亏模拟（一次性脚本，已从仓库移除，可从历史提交 f9810bc 取回） |
+| `scripts/breakout_forward_results.json` | E1 结构化结果（一次性产物，已从仓库移除，可从历史提交 6e6cae9 取回） |
 | [scripts/analyze_gate_optimization.py](file:///home/ldy/hermes-trader/scripts/analyze_gate_optimization.py) | E2 拦截统计 |
 | [scripts/analyze_gate_optimization_b.py](file:///home/ldy/hermes-trader/scripts/analyze_gate_optimization_b.py) | E2 下钻 |
 | [scripts/crowded_breakout_forward.py](file:///home/ldy/hermes-trader/scripts/crowded_breakout_forward.py) | E2 拥挤闸代价量化 |
