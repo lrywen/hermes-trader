@@ -872,6 +872,58 @@ def test_low_backfill_healthy_arm_collecting_not_promote(sg):
     assert any("回填率" in w for w in out["warnings"])
 
 
+# ── Audit 2026-09-12: terminal not_material records excluded from backfill base
+
+def test_not_material_records_excluded_from_backfill_denominator(sg):
+    # atr_regime_calib real profile revisited: of 325 records only 25 are
+    # eligible for counterfactual evaluation; the other 300 are terminal
+    # not_material (arm would never act). 24 mature + 1 still-pending must
+    # read 24/25 = 96%, not the diluted 25/325 = 7.7% false alarm.
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_change=True, outcome="win") for _ in range(22)]
+    recs += [_rec(now, would_change=True, outcome="loss") for _ in range(2)]
+    recs += [_rec(now, would_change=True)]  # 1 eligible, awaiting backfill
+    recs += [_rec(now, would_change=True, outcome="not_material")
+             for _ in range(300)]
+    stats = sg._window_stats(recs, "change", 168, now, arm="atr_regime_calib")
+    assert stats["total"] == 325
+    assert stats["not_material_outcomes"] == 300
+    assert stats["eligible_total"] == 25
+    assert sg._backfill_rate(stats) == pytest.approx(24 / 25, abs=0.001)
+    out = sg.grade_arm("atr_regime_calib", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["backfill_rate"] == pytest.approx(24 / 25, abs=0.001)
+    # 高回填率下不得出现 M4 假低回填告警
+    assert not any("回填率仅 7.7%" in w for w in out.get("warnings", []))
+
+
+def test_all_not_material_window_warns_no_sample_not_backfill_fault(sg):
+    # 全部记录为终态 not_material：分母为 0，提示"无有效性样本"，
+    # 不得误报 reconcile 回填链路故障。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_change=True, outcome="not_material")
+            for _ in range(60)]
+    out = sg.grade_arm("atr_regime_calib", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["backfill_rate"] == 0.0
+    assert any("全部为 not_material" in w and "非回填链路故障" in w
+               for w in out["warnings"])
+    assert not any("reconcile 链路可能未覆盖" in w for w in out["warnings"])
+
+
+def test_pending_records_still_count_in_backfill_denominator(sg):
+    # 无 outcome 字段的记录仍是待回填缺口（eligible），只有终态 not_material
+    # 才可剔除：25 mature / 325 total（300 条无 outcome）保持 7.7% 旧语义。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_change=True, outcome="win") for _ in range(22)]
+    recs += [_rec(now, would_change=True, outcome="loss") for _ in range(3)]
+    recs += [_rec(now, would_change=(i < 0)) for i in range(300)]
+    stats = sg._window_stats(recs, "change", 168, now, arm="atr_regime_calib")
+    assert stats["not_material_outcomes"] == 0
+    assert stats["eligible_total"] == 325
+    assert sg._backfill_rate(stats) == pytest.approx(25 / 325, abs=0.001)
+
+
 # ── M8: signal arms expose a manual harmful-rate note, never auto-REVIEW ─────
 
 def test_signal_arm_harmful_outcomes_get_manual_note_only(sg):

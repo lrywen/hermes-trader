@@ -594,6 +594,12 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
     decisions = 0
     outcomes = []          # backfilled counterfactual outcomes: win/loss strings
     pnl_usd = []
+    # Audit 2026-09-12 (回填分母修正)：not_material 是 reconcile 对「该记录根本
+    # 不会触发本臂动作（无可评估反事实）」的终态标记（如 sizing_v2 名义额变动
+    # ≤1%、atr_calib would_change=False），不是待回填缺口。计入回填分母会把
+    # atr_regime_calib 实测 24/25 可评估记录稀释成 25/325=7.7% 的假低回填率。
+    # 注意 no_coin/no_future_bars 仍是回填链路缺口，保留在分母内。
+    not_material = 0
     # ta_late_entry：命中率只统计真实下单闸门层（gate），排除 prefilter 采样偏置。
     gate_only_decisions = arm in GATE_LAYER_DECISION_ARMS
     for rec in records:
@@ -601,6 +607,8 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
         if ts is not None and ts < cutoff:
             continue
         total += 1
+        if rec.get("outcome") == "not_material":
+            not_material += 1
         if (not gate_only_decisions) or _is_gate_layer_record(rec):
             hit = _hit_field(rec, kind, arm)
             if hit is not None:
@@ -629,12 +637,20 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
         # 成熟样本时打标，供面板/报告标注「短窗 outcome 不可用，只采信最长窗」。
         "outcomes_pending": bool(
             window_h < 168 and mature == 0 and total > 0),
+        "not_material_outcomes": not_material,
+        # 回填分母：剔除终态不可评估记录后的可评估记录数。
+        "eligible_total": total - not_material,
     }
 
 
 def _backfill_rate(s: dict) -> float:
-    """mature outcome 回填率 = mature/total（M4：低回填率臂结论置信弱）。"""
-    return s["mature_outcomes"] / s["total"] if s["total"] else 0.0
+    """mature outcome 回填率 = mature/可评估记录（M4：低回填率臂结论置信弱）。
+
+    Audit 2026-09-12：not_material 终态记录无反事实可评估（本臂不会动作），
+    不属于回填缺口，须从分母剔除；否则事件量大但触发稀疏的臂回填率被系统性
+    稀释（atr_regime_calib 实测 25/325=7.7% 的假象，实际 24/25≈96%）。"""
+    eligible = s.get("eligible_total", s["total"])
+    return s["mature_outcomes"] / eligible if eligible else 0.0
 
 
 def _independent_outcomes(records: list[dict], window_ms: float,
@@ -736,9 +752,16 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     # M12：样本够但 outcome 回填恒为 0 → 永远无法进入有效性判定。
     if mode in ("shadow", "enforce") and longest["total"] >= ZERO_BACKFILL_MIN_SAMPLES \
             and longest["mature_outcomes"] == 0:
-        warnings.append(
-            f"outcome 回填为 0/{longest['total']}：reconcile 链路可能未覆盖本臂，"
-            "样本再多也无法验证有效性，请排查回填")
+        eligible = longest.get("eligible_total", longest["total"])
+        nm = longest.get("not_material_outcomes", 0)
+        if eligible == 0:
+            warnings.append(
+                f"{longest['total']} 条记录全部为 not_material（本臂不会动作、"
+                "无反事实可评估）：无有效性样本，非回填链路故障")
+        else:
+            warnings.append(
+                f"outcome 回填为 0/{eligible}（另有 {nm} 条 not_material 不可评估）："
+                "reconcile 链路可能未覆盖本臂，样本再多也无法验证有效性，请排查回填")
 
     # M8：signal 臂无自动有害率 REVIEW 通道，成熟 outcome 出现时必须把人工
     # 判定所需的有害率显式带出（不改判，仅提示）。
