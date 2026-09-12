@@ -2048,6 +2048,21 @@ def _lookup_in_dict(d: dict[str, Any], dotted_key: str) -> Any:
     return node
 
 
+def live_trading_authorized() -> bool:
+    """Explicit live-money safety gate (P0-1, 2026-09-12).
+
+    A config file with ``mode=LIVE`` alone must never be sufficient to place
+    real orders after a fresh deploy / stale mount / copied config: the
+    operator must additionally opt in via HERMES_ENABLE_LIVE=true in the
+    process environment. Fail-closed: absent or any value other than
+    1/true/yes/on (case-insensitive) denies LIVE entries. Exits (reduce-only
+    flatten, stop/trigger orders, kill-switch de-risking) never call this.
+    """
+    return str(os.environ.get("HERMES_ENABLE_LIVE", "")).strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def cfg_get(dotted_key: str, default: Any = None, *, config: Optional[dict[str, Any]] = None) -> Any:
     """Type-safe config lookup with env override and canonical fallback.
 
@@ -2661,6 +2676,93 @@ def _resolve_provenance(dotted_key: str) -> tuple[Any, str]:
         return _lookup_default(dotted_key), "default"
     except KeyError:
         return None, "unknown"
+
+
+# Legacy dedicated env switches that bypass the generic HERMES_CFG_ scheme
+# (still read by the runtime); included in the startup effective-config
+# snapshot so non-canonical overrides are visible too.
+_LEGACY_ENV_KEYS: tuple[str, ...] = (
+    "HERMES_CONFIDENCE_DECAY_MODE",
+    "HERMES_ATR_REGIME_CALIB_MODE",
+    "HERMES_SIZING_V2_MODE",
+)
+
+
+def _effective_config_snapshot_path() -> str:
+    """Destination of the startup resolved-config snapshot.
+
+    Defaults to ``runtime_config.effective.json`` next to the mounted config
+    (``/data`` in the container); override with
+    HERMES_EFFECTIVE_CONFIG_SNAPSHOT. Set to an empty string to disable.
+    """
+    return os.environ.get(
+        "HERMES_EFFECTIVE_CONFIG_SNAPSHOT",
+        os.path.join(os.path.dirname(CONFIG_PATH), "runtime_config.effective.json"),
+    )
+
+
+def build_effective_config_snapshot() -> dict[str, Any]:
+    """Resolve every canonical config key to (value, source) via the EXACT
+    cfg_get provenance path (cfg_env/file/default), plus the legacy dedicated
+    env switches and the P0-1 LIVE authorization flag. Pure read; never
+    mutates state and never raises (returns an {"error": ...} leaf instead).
+    """
+    leaves: dict[str, dict[str, Any]] = {}
+    for key in _iter_dotted_leaves(CANONICAL_DEFAULTS):
+        try:
+            value, source = _resolve_provenance(key)
+        except Exception as e:  # snapshot must never break startup
+            value, source = None, f"error:{type(e).__name__}"
+        leaves[key] = {"value": value, "source": source}
+    legacy_env = {
+        k: os.environ.get(k) for k in _LEGACY_ENV_KEYS if os.environ.get(k) is not None
+    }
+    return {
+        "generated_at_ms": int(time.time() * 1000),
+        "config_file": CONFIG_PATH,
+        "live_enabled": live_trading_authorized(),
+        "legacy_env_overrides": legacy_env,
+        "keys": leaves,
+    }
+
+
+def write_effective_config_snapshot(path: Optional[str] = None) -> Optional[str]:
+    """Atomically persist the resolved-config snapshot and log every env
+    override (generic HERMES_CFG_* and legacy) one per line. Best-effort:
+    returns the written path, None when disabled, and never raises.
+    """
+    if path is None:
+        path = _effective_config_snapshot_path()
+    if not path:
+        return None
+    try:
+        snapshot = build_effective_config_snapshot()
+        atomic_io.write_json_atomic(
+            path, snapshot, indent=2, fsync=False, ebusy_fallback=True)
+        env_keys = sorted(
+            k for k, v in snapshot["keys"].items() if v.get("source") == "cfg_env"
+        )
+        if env_keys:
+            for k in env_keys:
+                logger.warning(
+                    "[config] ENV override in effect: %s=%r (via HERMES_CFG_%s)",
+                    k, snapshot["keys"][k]["value"],
+                    k.upper().replace(".", "__"))
+        else:
+            logger.info("[config] no HERMES_CFG_* env overrides in effect")
+        if snapshot["legacy_env_overrides"]:
+            for k, v in sorted(snapshot["legacy_env_overrides"].items()):
+                logger.warning("[config] legacy ENV override in effect: %s=%r", k, v)
+        logger.info(
+            "[config] effective config snapshot written to %s "
+            "(mode=%s, live_enabled=%s, %d keys)",
+            path, snapshot["keys"].get("mode", {}).get("value"),
+            snapshot["live_enabled"], len(snapshot["keys"]))
+        return path
+    except Exception as e:
+        logger.error("[config] effective config snapshot failed: %s: %s",
+                     type(e).__name__, e)
+        return None
 
 
 def _iter_dotted_leaves(node: dict[str, Any], prefix: str = ""):

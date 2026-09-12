@@ -22,6 +22,7 @@ from hermes_trader.agents.config_store import (
     apply_coin_override,
     cfg_get,
     compute_config_era,
+    live_trading_authorized,
     read_agent_config,
 )
 from hermes_trader.agents.dsl_exit import (
@@ -3097,6 +3098,21 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         return {
             "executed": False, "mode": mode,
             "analysis_id": analysis["id"], "reason": "mode_off",
+        }
+    # P0-1 (2026-09-12): LIVE money requires an explicit process-env grant on
+    # top of mode=LIVE in the config file. Fail-closed without it so a fresh
+    # deploy / copied config can never place real orders; SHADOW/paper modes
+    # and the reduce-only exit path are unaffected (exits do not run here).
+    if mode == "LIVE" and not live_trading_authorized():
+        logger.error(
+            "[executor] LIVE entry DENIED for %s (analysis %s): mode=LIVE but "
+            "HERMES_ENABLE_LIVE is not set to true — set HERMES_ENABLE_LIVE=true "
+            "to authorize real-money entries.",
+            analysis.get("coin"), analysis.get("id"))
+        _record_decision("live_not_authorized")
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"], "reason": "live_not_authorized",
         }
     # Per-coin enabled flag (set by the portal 币种配置 module). False here
     # disables trading for THIS coin only without changing the global mode.

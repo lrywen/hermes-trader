@@ -47,7 +47,13 @@ from hyperliquid.utils.types import Cloid
 
 from hermes_trader import __version__, dashboard, session_log
 from hermes_trader.agents.config_schema import validate_config_updates
-from hermes_trader.agents.config_store import _deep_merge, read_agent_config, update_agent_config
+from hermes_trader.agents.config_store import (
+    _deep_merge,
+    live_trading_authorized,
+    read_agent_config,
+    update_agent_config,
+    write_effective_config_snapshot,
+)
 from hermes_trader.agents.executor import (
     _DEFAULT_SL_ATR_MULT,
     _DEFAULT_SL_CEILING_PCT,
@@ -159,6 +165,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Load persisted memory on startup, flush it on shutdown."""
     memory.load()
     logger.info("Hermes server started — memory loaded")
+
+    # P0-2 (2026-09-12): persist the resolved config (file + HERMES_CFG_*
+    # env + canonical defaults) next to the mounted config and log every env
+    # override, so the actually-in-effect parameters are auditable without
+    # source archaeology. Best-effort; never blocks startup.
+    write_effective_config_snapshot()
 
     # Pre-warm candle cache for top tickers in a background thread so the
     # first research request doesn't pay cold-start HTTP latency for 3 TFs.
@@ -1463,6 +1475,15 @@ async def place_order(request: Request) -> JSONResponse:
     # not become a loophole around that). Flatten/close stays allowed.
     if str(read_agent_config().get("mode", "OFF")).upper() == "OFF":
         raise HTTPException(409, f"manual order blocked: Mode=OFF (coin={coin})")
+    # P0-1 (2026-09-12): LIVE money needs an explicit HERMES_ENABLE_LIVE=true
+    # process-env grant in addition to mode=LIVE (mirrors maybe_execute).
+    # Fail-closed; flatten/close endpoints do not go through here.
+    if str(read_agent_config().get("mode", "OFF")).upper() == "LIVE" \
+            and not live_trading_authorized():
+        raise HTTPException(
+            409,
+            f"manual LIVE order blocked: HERMES_ENABLE_LIVE not set to true "
+            f"(coin={coin})")
     side_l = str(side).lower()
     if side_l not in ("long", "short", "buy", "sell"):
         raise HTTPException(400, f"invalid side '{side}' (want long/short/buy/sell)")

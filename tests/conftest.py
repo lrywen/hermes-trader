@@ -21,6 +21,13 @@ atexit.register(shutil.rmtree, _tmp, ignore_errors=True)
 os.environ["HERMES_AGENT_MEMORY_FILE"] = os.path.join(_tmp, ".agent-memory.json")
 os.environ["HERMES_AGENT_CONFIG_FILE"] = os.path.join(_tmp, ".agent-config.json")
 os.environ["HERMES_DSL_STATE_FILE"] = os.path.join(_tmp, ".dsl-state.json")
+# P0-1 (2026-09-12): production LIVE entries require the explicit
+# HERMES_ENABLE_LIVE=true grant on top of mode=LIVE. The test sandbox never
+# touches real money (all order I/O is mocked), so grant it here — mirroring
+# the deployment .env.local — so the existing LIVE-path suite exercises the
+# post-gate logic. The fail-closed default itself is covered by
+# tests/test_p0_live_gate_effective_config.py, which monkeypatch.delenv's it.
+os.environ["HERMES_ENABLE_LIVE"] = "true"
 # Redirect the authoritative event feed + operational heartbeat so tests that
 # exercise record_trade/record_close or session_log.append never touch the
 # live volume's events.jsonl / session-log.jsonl.
