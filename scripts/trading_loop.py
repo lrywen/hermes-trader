@@ -91,6 +91,7 @@ from hermes_trader.agents.executor import (
 )
 from hermes_trader.agents.market_circuit import evaluate as market_circuit_evaluate
 from hermes_trader.agents.market_circuit import record_stop as market_circuit_record_stop
+from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.research import research
@@ -1558,6 +1559,17 @@ while True:
                 market_circuit_tick(_cfg, memory, equity, positions)
             except Exception as _mc_e:
                 logger.error(f"[market_circuit] tick failed (non-fatal): {_mc_e}")
+
+            # ── E1: book-level macro regime overlay ──────────────────────────
+            # Ticked once per loop (same cadence as market_circuit), NOT only on
+            # the entry/sizer path: the overlay posture must advance (and its
+            # liveness heartbeat stay fresh) even when no candidate reaches the
+            # decision path this cycle. evaluate_risk_overlay self-throttles to
+            # one macro sample per sample_interval_s and is fully best-effort.
+            try:
+                evaluate_risk_overlay(_cfg)
+            except Exception as _ov_e:
+                logger.error(f"[regime_overlay] tick failed (non-fatal): {_ov_e}")
 
             # ── SHADOW paper-ledger mark-to-market ─────────────────────────
             # When the engine runs in mode=SHADOW, would-be fills are booked

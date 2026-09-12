@@ -48,6 +48,16 @@ _TREND = ("up", "down")
 _SHADOW_FILE_ENV = "HERMES_REGIME_OVERLAY_SHADOW_FILE"
 _SHADOW_FILE_DEFAULT = "~/.hermes-trading/regime_overlay_shadow.jsonl"
 
+# Independent liveness heartbeat (M-series observability, same pattern as
+# market_circuit / pullback). The shadow JSONL only receives a row on a
+# posture FLIP (enter/exit derisk), so it can stay empty for days in a steady
+# regime while the overlay is in fact evaluating every scan. The grader cannot
+# distinguish "healthy but no flip" from "blind/not wired" from the event
+# stream alone; the heartbeat is rewritten on every successful macro sample.
+_HEARTBEAT_FILE_ENV = "HERMES_REGIME_OVERLAY_STATE_FILE"
+_HEARTBEAT_FILE_DEFAULT = "/data/.regime-overlay.state"
+_HEARTBEAT_VERSION = 1
+
 
 @dataclass
 class HystState:
@@ -148,6 +158,40 @@ def _record_overlay(rec: dict, path: str) -> None:
     append_jsonl(path, rec, stream="regime_overlay")
 
 
+def _heartbeat_path(blk: dict) -> str:
+    return str(blk.get("heartbeat_state_path") or "").strip() or os.environ.get(
+        _HEARTBEAT_FILE_ENV, _HEARTBEAT_FILE_DEFAULT)
+
+
+def _record_heartbeat(blk: dict, *, coin: str, regime: str,
+                      snap: "OverlaySnapshot") -> None:
+    """Best-effort rewrite the liveness heartbeat after one successful sample.
+
+    Unlike the shadow JSONL (a row only on posture flip), this is rewritten on
+    every fresh macro sample so the grader can tell a healthy, steady-regime
+    arm apart from a blind/unwired one. Never raises.
+    """
+    from hermes_trader.agents.atomic_io import write_json_atomic
+
+    try:
+        payload = {
+            "version": _HEARTBEAT_VERSION,
+            "ts": time.time(),
+            "coin": str(coin or "")[:32],
+            "regime": str(regime or "")[:16],
+            "derisked": bool(snap.derisked),
+            "run_regime": str(snap.run_regime or "")[:16],
+            "run_count": int(snap.run_count or 0),
+            "shadow": bool(snap.shadow),
+            "sampled": True,
+        }
+        # Cheap, fully regenerable: atomic rename, no fsync.
+        write_json_atomic(_heartbeat_path(blk), payload,
+                          indent=None, fsync=False)
+    except Exception as e:  # never perturb the trading loop
+        logger.debug("[regime_overlay] heartbeat write failed: %s", e)
+
+
 def evaluate_risk_overlay(config: Optional[dict], coin: str = "BTC") -> OverlaySnapshot:
     """Evaluate the book-level macro overlay and advance its hysteresis state.
 
@@ -199,6 +243,10 @@ def evaluate_risk_overlay(config: Optional[dict], coin: str = "BTC") -> OverlayS
     snap.run_regime = _state.run_regime or ""
     snap.run_count = _state.run_count
     snap.applied = bool(not shadow and derisked)
+
+    # Liveness heartbeat on every successful (non-throttled, non-failed) sample,
+    # regardless of whether the posture flipped.
+    _record_heartbeat(blk, coin=coin, regime=regime, snap=snap)
 
     if derisked != before:
         event = "enter_derisk" if derisked else "exit_derisk"

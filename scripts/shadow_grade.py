@@ -74,10 +74,21 @@ STALE_WINDOW_H = 24
 # 在持续运行。心跳年龄（秒）小于此阈值视为健康。
 #   market_circuit：trading_loop 每个 scan tick 都重写 /data/.market-circuit.state
 #   （clear/no_trip 也写），实测约每 12s 一次；给 30min 宽松阈值容忍重启/抖动。
+#   pullback（M17）：仅在 runner gate 走到 pullback-long 旁路块（非结构化做多候选）
+#   时重写 /data/.pullback-gate.state，记录最近一次评估的宏观/分数/慢燃等快照。
+#   pullback 影子流极稀疏（全部合取成立才落一条），regime 翻 up 过渡期 24h 0 条是
+#   常态；心跳新鲜即证明评估路径活着，不是写路径异常。研究节流下候选评估约每分钟级，
+#   同样给 30min 阈值。
 HEARTBEAT_FRESH_SEC = int(os.environ.get("HERMES_ARM_HEARTBEAT_FRESH_SEC", 1800))
 ARM_HEARTBEAT_FILE = {
     "market_circuit": os.environ.get(
         "HERMES_MARKET_CIRCUIT_STATE_FILE", "/data/.market-circuit.state"),
+    "pullback": os.environ.get(
+        "HERMES_PULLBACK_GATE_STATE_FILE", "/data/.pullback-gate.state"),
+    #   regime_overlay：仅在宏观姿态翻转（enter/exit derisk）时落影子事件，
+    #   平稳行情可数天 0 条；心跳在每次成功宏观采样（默认 300s 限频）后重写。
+    "regime_overlay": os.environ.get(
+        "HERMES_REGIME_OVERLAY_STATE_FILE", "/data/.regime-overlay.state"),
 }
 # Audit 2026-09-10 (ta_late_entry 命中率口径修正)：该臂的 shadow 流混合了两层——
 #   layer="prefilter"（TA 预筛）：仅在「拦截成立」时才写一条（放行候选不落盘），
@@ -684,19 +695,28 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
             ts_all = [t for t in (_record_ts_ms(r) for r in records) if t]
             newest = max(ts_all) if ts_all else None
             age_h = (now_ms - newest) / 3_600_000 if newest is not None else None
-            if heartbeat_ok:
-                # 评估在跑、只是无极端事件：健康，不算停滞，不出 ⚠ 告警。
-                warnings.append(
-                    f"事件型闸门心跳正常（{heartbeat_age_sec:.0f}s 前仍在评估），"
-                    f"近 {STALE_WINDOW_H}h 无事件落盘属正常（无触发条件），"
-                    "非采数停滞")
-            elif macro_blocks:
+            if macro_blocks:
                 # M16：宏观非多头期，仅做多臂策略性不采数，属正常而非故障。
                 warnings.append(
                     f"宏观 regime={macro_regime or 'unknown'}（非 up），本臂仅做多且"
                     "要求宏观多头，此期间 executor fail-closed 不产生候选也不写影子"
                     f"记录，近 {STALE_WINDOW_H}h 0 条属策略性不采数，非停采/写路径异常"
                     + (f"；最新记录距今 {age_h:.0f}h" if age_h is not None else ""))
+            elif heartbeat_ok:
+                # M17：宏观已不阻挡，但事件型信号极稀疏（全部合取成立才落一条），
+                # 心跳新鲜说明 gate 仍在持续评估、只是没有合格候选 —— 非写路径异常。
+                if macro_long_only and macro_regime is not None:
+                    warnings.append(
+                        f"宏观 regime={macro_regime}，gate 评估心跳正常"
+                        f"（{heartbeat_age_sec:.0f}s 前仍在评估），近 {STALE_WINDOW_H}h "
+                        "无合格候选落盘（须同时满足 4h 上行+宏观多头+慢燃≥2+评分≥30+"
+                        "非新爆发行情+RSI/伸展过滤），属等待触发，非停采/写路径异常"
+                        + (f"；最新记录距今 {age_h:.0f}h" if age_h is not None else ""))
+                else:
+                    warnings.append(
+                        f"事件型闸门心跳正常（{heartbeat_age_sec:.0f}s 前仍在评估），"
+                        f"近 {STALE_WINDOW_H}h 无事件落盘属正常（无触发条件），"
+                        "非采数停滞")
             else:
                 stale = {"stale_hours": round(age_h, 1) if age_h is not None else None,
                          "window_h": STALE_WINDOW_H}

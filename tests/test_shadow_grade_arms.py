@@ -895,7 +895,8 @@ def test_stale_heartbeat_keeps_stall_for_event_arm(sg):
 
 
 def test_pullback_no_heartbeat_still_flags_stall(sg):
-    # pullback 没有每 tick 心跳（仅候选进入分支才评估），24h 无记录仍判停滞。
+    # M17：pullback 有 gate 评估心跳，但调用方未取得心跳（文件缺失/陈旧传 None）
+    # 且 24h 无记录时仍判停滞 —— 写路径故障不能被静默。
     now = 1_700_000_000_000.0
     recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
     out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
@@ -939,6 +940,48 @@ def test_pullback_macro_unknown_fails_open_to_stall(sg):
                        now_ms=now, records=recs, macro_regime=None)
     assert "collection_stalled" in out
     assert "macro_regime" not in out
+
+
+# ── M17: pullback gate 评估心跳判活（regime=up 过渡期 0 条不属停滞）─────────────
+
+def test_pullback_fresh_heartbeat_macro_up_suppresses_stall(sg):
+    # 宏观 up 不再阻挡，但 pullback 合取极严、过渡期无合格候选是常态；gate 心跳
+    # 新鲜（200s 前刚评估过）→ 不算停滞，不出横幅，给等待触发的中性说明。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs,
+                       heartbeat_age_sec=200.0, macro_regime="up")
+    assert "collection_stalled" not in out
+    assert out["heartbeat_ok"] is True
+    assert out["heartbeat_age_sec"] == 200.0
+    assert out["macro_blocks_collection"] is False
+    w = " ".join(out["warnings"])
+    assert "gate 评估心跳正常" in w and "无合格候选" in w and "非停采" in w
+
+
+def test_pullback_stale_heartbeat_macro_up_keeps_stall(sg):
+    # 宏观 up 但心跳陈旧（2h > 30min 阈值）→ gate 评估真的停了，维持真停滞告警。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs,
+                       heartbeat_age_sec=7200.0, macro_regime="up")
+    assert "collection_stalled" in out
+    assert out["heartbeat_ok"] is False
+
+
+def test_pullback_macro_down_takes_precedence_over_heartbeat(sg):
+    # 宏观 down 时旁路块根本不评估（overlay/base 关闭），即使心跳文件存在且
+    # 陈旧（遗留自上一个 up 期），也以宏观抑制为准，不产生停滞。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H, composite_score=50.0) for _ in range(42)]
+    out = sg.grade_arm("pullback", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs,
+                       heartbeat_age_sec=7200.0, macro_regime="down")
+    assert "collection_stalled" not in out
+    assert out["macro_blocks_collection"] is True
+    assert any("策略性不采数" in w for w in out["warnings"])
 
 
 

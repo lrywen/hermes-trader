@@ -87,6 +87,14 @@ def _read_jsonl(path):
         return []
 
 
+def _read_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+
+
 @pytest.fixture(autouse=True)
 def _reset_state():
     ro.reset_overlay_state()
@@ -297,7 +305,106 @@ def test_evaluate_singleton_persists_across_calls(monkeypatch):
     assert r3.derisked is True  # 状态在调用间累计（同一进程单例）
 
 
-# ── 4. 配置登记 ─────────────────────────────────────────────────────────────
+# ── 4. 判活心跳（事件型臂可观测性） ─────────────────────────────────────────
+
+
+def test_heartbeat_rewritten_on_every_successful_sample(tmp_path, monkeypatch):
+    _set_series(monkeypatch, ["up", "chop", "neutral"])
+    hb = str(tmp_path / "overlay.state")
+    cfg = _cfg(heartbeat_state_path=hb)
+    ts0 = None
+    for i, exp_regime in enumerate(("up", "chop", "neutral")):
+        r = ro.evaluate_risk_overlay(cfg, coin="BTC")
+        assert r.sampled is True
+        st = _read_state(hb)
+        assert st is not None
+        assert st["version"] == ro._HEARTBEAT_VERSION
+        assert st["sampled"] is True
+        assert st["regime"] == exp_regime
+        assert st["derisked"] == r.derisked
+        assert st["run_regime"] == r.run_regime
+        assert st["run_count"] == r.run_count
+        assert st["shadow"] is True
+        if i == 0:
+            ts0 = st["ts"]
+        else:
+            assert st["ts"] >= ts0
+
+
+def test_heartbeat_rewritten_even_without_posture_flip(tmp_path, monkeypatch):
+    # 平稳趋势中无翻转（0 条 JSONL 事件），心跳仍每次重写——这正是评级器
+    # 区分「健康无触发」与「盲跑」所依赖的契约。
+    _set_series(monkeypatch, ["up"] * 5)
+    hb = str(tmp_path / "overlay.state")
+    log = str(tmp_path / "overlay.jsonl")
+    cfg = _cfg(heartbeat_state_path=hb, shadow_log_path=log)
+    for _ in range(5):
+        ro.evaluate_risk_overlay(cfg, coin="BTC")
+    assert _read_state(hb) is not None
+    assert _read_jsonl(log) == []
+
+
+def test_heartbeat_not_written_when_throttled(tmp_path, monkeypatch):
+    _set_series(monkeypatch, ["up"] * 5)
+    hb = str(tmp_path / "overlay.state")
+    cfg = _cfg(heartbeat_state_path=hb, sample_interval_s=3600.0)
+    r1 = ro.evaluate_risk_overlay(cfg, coin="BTC")
+    assert r1.sampled is True
+    assert _read_state(hb) is not None
+    # 第二次落在节流窗内：不采样、不重写心跳。
+    r2 = ro.evaluate_risk_overlay(cfg, coin="BTC")
+    assert r2.sampled is False
+    st = _read_state(hb)
+    assert st["run_count"] == 1  # 仍是第一次采样的快照
+
+
+def test_heartbeat_not_written_on_lookup_error(tmp_path, monkeypatch):
+    _set_series(monkeypatch, [RuntimeError("boom")] * 3)
+    hb = str(tmp_path / "overlay.state")
+    cfg = _cfg(heartbeat_state_path=hb)
+    for _ in range(3):
+        r = ro.evaluate_risk_overlay(cfg, coin="BTC")
+        assert r.sampled is True
+    # 查询全失败：心跳只证明成功评估，失败不写。
+    assert _read_state(hb) is None
+
+
+def test_heartbeat_not_written_when_disabled(tmp_path, monkeypatch):
+    _set_series(monkeypatch, ["up"])
+    hb = str(tmp_path / "overlay.state")
+    cfg = _cfg(enabled=False, heartbeat_state_path=hb)
+    ro.evaluate_risk_overlay(cfg, coin="BTC")
+    assert _read_state(hb) is None
+
+
+def test_heartbeat_path_env_override(tmp_path, monkeypatch):
+    _set_series(monkeypatch, ["up"])
+    hb = str(tmp_path / "env.state")
+    monkeypatch.setenv("HERMES_REGIME_OVERLAY_STATE_FILE", hb)
+    # 配置块不给 heartbeat_state_path → 走 env 覆盖。
+    ro.evaluate_risk_overlay(_cfg(), coin="BTC")
+    assert _read_state(hb) is not None
+
+
+def test_heartbeat_failure_never_perturbs_eval(tmp_path, monkeypatch):
+    _set_series(monkeypatch, ["chop"] * 3)
+
+    def _boom(*_a, **_kw):
+        raise OSError("disk gone")
+
+    import hermes_trader.agents.atomic_io as aio
+    monkeypatch.setattr(aio, "write_json_atomic", _boom)
+    hb = str(tmp_path / "overlay.state")
+    cfg = _cfg(heartbeat_state_path=hb)
+    # 心跳写失败被吞掉：状态机照常推进、不抛异常。
+    r = None
+    for _ in range(3):
+        r = ro.evaluate_risk_overlay(cfg, coin="BTC")
+    assert r.derisked is True
+    assert r.applied is False
+
+
+# ── 5. 配置登记 ─────────────────────────────────────────────────────────────
 
 
 def test_e1_canonical_block_registered():

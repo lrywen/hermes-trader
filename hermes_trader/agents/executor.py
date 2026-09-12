@@ -5525,6 +5525,19 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             and (rsi4h is None or float(rsi4h) < pb_max_rsi)
             and (pb_extension is None or pb_extension < pb_max_ext)
         )
+        # Audit 2026-09-12 (M17)：旁路每次被评估都重写只读心跳，供评级中心在
+        # 事件流 24h 0 条时区分「写路径死了」与「在跑但无合格候选」（regime 翻
+        # up 过渡期极常见）。纯可观测性，best-effort，绝不影响下面的放行/拦截。
+        try:
+            from hermes_trader.agents.pullback_gate_state import record_evaluation
+            record_evaluation(
+                coin=coin, macro_regime=pb_macro_regime, macro_up=pb_macro_up,
+                score=score, slow_count=slow_count, rsi4h=rsi4h,
+                extension_atr=pb_extension, uptrend=uptrend,
+                admitted=bool(pullback_long))
+        except Exception as _pb_hb_e:
+            logger.debug("[runner_gate] pullback heartbeat write failed "
+                         "for %s: %s", coin, _pb_hb_e)
         if pullback_long:
             if bool(pb_cfg.get("shadow_mode", False)):
                 _record_pullback_shadow(

@@ -44,6 +44,10 @@ os.environ["HERMES_MARKET_CIRCUIT_SHADOW_FILE"] = os.path.join(
 # (or pass path=) to their own tmp_path; the env var is read once at import.
 os.environ["HERMES_MARKET_CIRCUIT_STATE_FILE"] = os.path.join(
     _tmp, ".market-circuit.state")
+# M17：同样把 pullback gate 评估心跳重定向到临时目录（默认 /data 在开发机
+# 不可写）。需要断言心跳内容的测试自行传 path=/monkeypatch。
+os.environ["HERMES_PULLBACK_GATE_STATE_FILE"] = os.path.join(
+    _tmp, ".pullback-gate.state")
 # Audit 2026-09-07 (test isolation): the remaining ten shadow arms were NOT
 # redirected here, so a gate/shadow test that omitted an explicit path
 # appended synthetic rows (e.g. coin "TESTCOIN") to the developer's REAL
