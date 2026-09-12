@@ -1495,12 +1495,19 @@ def test_close_chokepoint_roe_blowup_halt_failure_is_loud(monkeypatch, tmp_path)
 #   #9 leverage_tier_blind      executor.py ~:3737-3740  (de-leverage arm)
 # ══════════════════════════════════════════════════════════════════════════
 
-def _sl_mover_env(monkeypatch):
+def _sl_mover_env(monkeypatch, tmp_path):
     """A registered long in Phase 2 with a resting exchange SL, all gates
     stubbed so sync_exchange_sl reaches the batchModify call (mirrors the
     mover_env fixture in test_audit_batch_a_sl_reconcile.py, self-contained
     because tests/ is not an import package)."""
     from hermes_trader.agents import dsl_exit, executor
+
+    # Isolate persisted DSL state: register_position/check/set_bracket call
+    # _save_state(), which would otherwise clobber the real on-disk tracker
+    # state and leak TESTETH into later rehydrate-based tests in-process.
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE",
+                        str(tmp_path / "mover-dsl.json"))
+    monkeypatch.setattr(dsl_exit, "_loaded_from_disk", True)
 
     dsl_exit._active_positions.clear()
     dsl_exit._suspect_sl_keys.clear()
@@ -1536,7 +1543,7 @@ def _sl_mover_env(monkeypatch):
     return executor, dsl_exit, tracker
 
 
-def test_sl_move_wire_exception_is_loud(monkeypatch):
+def test_sl_move_wire_exception_is_loud(monkeypatch, tmp_path):
     """#4: batchModify raising inside sync_exchange_sl previously left only a
     warning and the mover silently ``continue``d — the exchange disaster-net
     SL stayed at the old wider price with no durable trace. The retry posture
@@ -1544,7 +1551,7 @@ def test_sl_move_wire_exception_is_loud(monkeypatch):
     ``sl_move_exception`` must now be recorded (executor.py ~:5057-5059)."""
     from hermes_trader import event_log
 
-    executor, dsl_exit, tracker = _sl_mover_env(monkeypatch)
+    executor, dsl_exit, tracker = _sl_mover_env(monkeypatch, tmp_path)
 
     def _boom(**kw):
         raise RuntimeError("batchModify wire down")
@@ -1768,3 +1775,88 @@ def test_leverage_tier_eval_blind_is_loud(monkeypatch):
     p = errs[0]["payload"]
     assert p["scope"] == "leverage_tier_blind"
     assert p["coin"] == "TEST"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Group L — dsl_exit blind fail-open points (2026-09-12)
+#   #15 index_price_lookup_blind  dsl_exit.py ~:2502-2505
+#                                   (oracle floor-crosscheck import arm)
+#   #8  rehydrate_record_trade     dsl_exit.py ~:2393-2396
+#                                   (outcome-store open row for synth tracker)
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_index_price_lookup_import_failure_is_loud(monkeypatch):
+    """#15: ``get_index_prices`` starts by importing ``_http_post`` from
+    hl_client; an import failure previously ``return out`` (empty dict) with
+    NO log at all, so check_all_positions silently degraded every floor
+    breach to mid-only — the A-F5 index/oracle wick cross-check (an
+    anti-wick exit confirmation on the capital-protection path) was OFF with
+    no trace. The empty-dict posture must NOT change; a scoped ``error``
+    ``index_price_lookup_blind`` must now be recorded."""
+    import hermes_trader.client.hl_client as hl_client
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader import event_log
+
+    written = _event_sink(monkeypatch, event_log)
+    monkeypatch.delattr(hl_client, "_http_post", raising=True)
+    dsl_exit._IDX_CACHE.clear()
+
+    # Must not raise; callers degrade to mid-only via the empty dict.
+    assert dsl_exit.get_index_prices({"ETH"}) == {}
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "index_price_lookup_blind"
+    assert p["coin"] == "ETH"
+
+
+def test_rehydrate_record_trade_failure_is_loud(monkeypatch, tmp_path):
+    """#8: after synthesizing a tracker for an exchange-held position with no
+    in-memory tracker, rehydrate records the open in the outcome store so the
+    later close joins an open row. A record_trade failure previously logged
+    only a warning — the close would then arrive with NO matching open
+    (broken trades↔closes join, win-rate stats) with no durable trace. The
+    synth tracker must still be created (non-fatal); a scoped ``error``
+    ``rehydrate_record_trade`` must now be recorded."""
+    from hermes_trader.agents import dsl_exit
+    from hermes_trader.agents import market_regime
+    from hermes_trader.agents.memory import memory as _mem
+    from hermes_trader import event_log
+
+    # Reuse the rehydrate test's hermetic setup inline (tests/ is not a
+    # package, so its fixture cannot be imported).
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {}})
+    monkeypatch.setattr(dsl_exit, "_POLICY_CACHE", None)
+    monkeypatch.setattr(dsl_exit, "_POLICY_CACHE_TS", 0.0)
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE", str(tmp_path / "dsl.json"))
+    monkeypatch.setattr(dsl_exit, "_loaded_from_disk", False)
+    monkeypatch.setattr(market_regime, "detect_regime",
+                        lambda coin, *, force=False: "neutral")
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()
+
+    written = _event_sink(monkeypatch, event_log)
+
+    def _boom(*_a, **_k):
+        raise RuntimeError("outcome store down")
+
+    monkeypatch.setattr(_mem, "record_trade", _boom)
+
+    positions = [{"position": {"coin": "ETH", "szi": "1",
+                               "entryPx": "200.0"}}]
+    # Must not raise; the synth tracker is still registered.
+    dsl_exit.rehydrate_from_exchange(positions)
+    assert "ETH_long" in dsl_exit._active_positions
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "rehydrate_record_trade"
+    assert p["coin"] == "ETH"
+
+    dsl_exit._active_positions.clear()
+    dsl_exit._suspect_sl_keys.clear()

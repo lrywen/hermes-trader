@@ -2394,6 +2394,19 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
                 logger.warning(
                     f"[dsl] rehydrate record_trade failed for {key} "
                     f"(non-fatal): {_rt_e}")
+                # Best-effort durable trace: the synth tracker exists but the
+                # outcome store has no open row, so the later close joins
+                # nothing (broken trades↔closes join / win-rate stats).
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "rehydrate_record_trade",
+                        "coin": coin,
+                        "error": str(_rt_e),
+                    })
+                except Exception as _ev_e:
+                    logger.error("[dsl] rehydrate_record_trade event log "
+                                 "failed: %r", _ev_e)
 
     def _key_in_queried_scope(k: str) -> bool:
         """True iff the dex behind this tracker key was queried this cycle.
@@ -2501,7 +2514,23 @@ def get_index_prices(coins: set[str]) -> dict[str, float]:
             dexes.add(c.split(":", 1)[0])
     try:
         from hermes_trader.client.hl_client import _http_post
-    except Exception:
+    except Exception as _ip_e:
+        # Best-effort durable trace: without the HTTP helper every floor
+        # breach this pass degrades to mid-only — the A-F5 index/oracle wick
+        # cross-check is OFF. Empty-dict posture (caller degradation) is
+        # unchanged.
+        logger.error("[dsl] A-F5 index-price client import failed "
+                     "(degrading to mid-only): %r", _ip_e)
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "index_price_lookup_blind",
+                "coin": ",".join(sorted(coins)),
+                "error": repr(_ip_e),
+            })
+        except Exception as _ev_e:
+            logger.error("[dsl] index_price_lookup_blind event log failed: %r",
+                         _ev_e)
         return out
     for dex in dexes:
         cache_key = dex or ""
