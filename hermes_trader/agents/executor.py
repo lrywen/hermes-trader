@@ -6053,6 +6053,16 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                                 f"{lc_min:.0f}min (closed {out['realized_pnl_pct']:.2f}%)")
             except Exception as e:
                 logger.warning(f"[executor] loss-cooldown arm failed for {coin}: {e}")
+                # The anti-revenge re-entry block did not arm; mirror the
+                # failure durably so a blind cooldown is visible (same scope
+                # as the external-fill backfill twin in trading_loop).
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "loss_cooldown", "coin": coin,
+                        "source": "close", "error": str(e)})
+                except Exception as _ev_e:
+                    logger.error("[executor] loss_cooldown event log failed: %r", _ev_e)
 
         # ── Tiered circuit breakers (sizing/risk-overhaul 2026-08-26) ──
         # Above the legacy loss cooldown: (1) a single-coin per-trade
@@ -6198,6 +6208,16 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
             maybe_roe_blowup_halt(coin, out.get("realized_pnl_pct"), source="close")
         except Exception as _rh_e:
             logger.warning(f"[executor] roe blow-up halt check failed for {coin}: {_rh_e}")
+            # The catastrophic single-trade self-halt was not verified; mirror
+            # the failure durably (same scope/source convention as the
+            # tiered-breaker arm above and the backfill twin in trading_loop).
+            try:
+                from hermes_trader import event_log
+                event_log.append("error", payload={
+                    "scope": "roe_blowup_halt_arm", "coin": coin,
+                    "source": "close", "error": str(_rh_e)})
+            except Exception as _ev_e:
+                logger.error("[executor] roe_blowup_halt_arm event log failed: %r", _ev_e)
         # C-M6: full settlement finished — record the dedupe signature so a
         # rapid repeat close for the SAME position skips record_close / loss
         # streak / breaker arming. A genuinely new position (different entry

@@ -1521,6 +1521,18 @@ while True:
                                 logger.warning(
                                     f"[outcome-store] tiered-breaker backfill "
                                     f"failed for {_tr.coin}: {_tb_e}")
+                                # Tiered breaker chain did not arm on this
+                                # exchange-triggered loss; mirror durably with
+                                # the same scope/source as the executor
+                                # chokepoint twin.
+                                try:
+                                    log_event({"event": "error",
+                                               "scope": "tiered_breaker_arm",
+                                               "coin": _tr.coin,
+                                               "source": "exchange_trigger",
+                                               "error": str(_tb_e)})
+                                except Exception:
+                                    pass
                             # C3 (HYPE RCA item 5): blow-up self-halt also
                             # covers exchange-triggered closes (server-side SL
                             # fill / liquidation) — the executor chokepoint is
@@ -1537,10 +1549,34 @@ while True:
                                 logger.warning(
                                     f"[outcome-store] roe blow-up halt check "
                                     f"failed for {_tr.coin}: {_rh_e}")
+                                # The halt function raised at the call site, so
+                                # its internal event never fired; mirror the
+                                # blind arm durably (same scope as the executor
+                                # chokepoint twin).
+                                try:
+                                    log_event({"event": "error",
+                                               "scope": "roe_blowup_halt_arm",
+                                               "coin": _tr.coin,
+                                               "source": "exchange_trigger",
+                                               "error": str(_rh_e)})
+                                except Exception:
+                                    pass
                         except Exception as _dc_e:
                             logger.warning(
                                 f"[outcome-store] drop-backfill failed for "
                                 f"{_tr.coin}: {_dc_e}")
+                            # The whole per-fill segment (fill lookup ->
+                            # record_close -> protection arms) failed; this
+                            # dropped tracker may be wholly unbackfilled, so
+                            # leave a durable trace rather than a warning only.
+                            try:
+                                log_event({"event": "error",
+                                           "scope": "external_close_backfill",
+                                           "coin": _tr.coin,
+                                           "oid": getattr(_tr, "oid", None),
+                                           "error": str(_dc_e)})
+                            except Exception:
+                                pass
                 except Exception as _bf_e:
                     logger.warning(
                         f"[outcome-store] external-close backfill setup "

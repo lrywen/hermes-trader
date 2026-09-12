@@ -1254,3 +1254,228 @@ def test_market_circuit_enforce_trip_arm_failure_is_truthful(caplog, tmp_path):
     msg = critical[0]
     assert "armed for" not in msg
     assert "FAIL" in msg.upper()
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Group J — close-path protection arms must be LOUD on both settlement paths
+# (Q1 batch 5)
+#
+# The three post-close protection arms (loss cooldown / tiered breaker /
+# ROE blow-up halt) are settled on TWO paths: the executor close chokepoint
+# (_close_position_market_locked) and the external-fill backfill block inside
+# the trading loop (exchange-side SL/TP, manual close, liquidation). Their
+# failure handlers were loud on some arms but only logged a warning on others,
+# so a protection arm that failed to engage could leave no durable trace in
+# events.jsonl. The fail-open / best-effort control flow MUST NOT change (a
+# bookkeeping failure never blocks exit monitoring); these contracts only pin
+# that each blind arm emits a scoped flat ``error`` event.
+#
+# The three loop-body sites live inside the module-level ``while True`` (import
+# runs the loop), so like Group A the REAL production ``for _tr in dropped``
+# body is AST-extracted and executed verbatim with stubbed I/O edges. The two
+# executor sites run the real close function through the _close_wire harness.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _load_backfill_for():
+    """Extract the real ``for _tr in dropped`` backfill body from the main
+    while-loop. Located structurally (the for-loop whose iter is the Name
+    ``dropped``) so it survives harmless line drift."""
+    tree = ast.parse(TRADING_LOOP_SRC)
+    loop = next(n for n in tree.body if isinstance(n, ast.While))
+    for_node = next(
+        n for n in ast.walk(loop)
+        if isinstance(n, ast.For)
+        and isinstance(n.iter, ast.Name) and n.iter.id == "dropped")
+    return ast.fix_missing_locations(
+        ast.Module(body=[for_node], type_ignores=[]))
+
+
+def _run_backfill(*, dropped, fill=None, resolve_raises=None,
+                  set_cooldown=None, arm_breaker=None, roe_halt=None,
+                  record_stop=None, cfg=None):
+    """Execute the extracted backfill for-body once with controlled edges.
+
+    Returns the flat event list. Each protection arm is injected so a test
+    can force it to raise; default arms are no-ops (a healthy run)."""
+    from hermes_trader.agents.dsl_exit import DSLTracker
+
+    events = []
+
+    class _Mem:
+        def record_close(self, row):
+            return None
+
+        def set_loss_cooldown(self, coin, until):
+            if set_cooldown is not None:
+                return set_cooldown(coin, until)
+
+    def _resolve(user, coin, side, since_ts=None):
+        if resolve_raises is not None:
+            raise resolve_raises
+        return fill
+
+    ns = {
+        "logger": logging.getLogger("test.contract.backfill"),
+        "time": time,
+        "memory": _Mem(),
+        "log_event": lambda e: events.append(e),
+        "resolve_close_fill": _resolve,
+        "market_circuit_record_stop":
+            record_stop or (lambda coin, ts: None),
+        "arm_close_tiered_breakers":
+            arm_breaker or (lambda *a, **k: None),
+        "maybe_roe_blowup_halt":
+            roe_halt or (lambda *a, **k: None),
+        "cfg_get": lambda key, config=None: (config or {}).get(key, 0),
+        "read_agent_config": lambda: cfg or {},
+        "user": "0xUSER",
+        "dropped": dropped,
+    }
+    exec(compile(_load_backfill_for(),
+                 "<trading_loop backfill extracted>", "exec"), ns)
+    return events
+
+
+def _losing_external_fill():
+    """A losing reducing fill for an ETH long entered @100: exit @94, matching
+    the _close_wire chokepoint fixture (spot -6%, ROE deeply negative)."""
+    return {"px": 94.0, "sz": 1.0, "fee": 0.02, "closedPnl": -5.0,
+            "oid": "oid-ext-1", "time": int(time.time() * 1000)}
+
+
+def _errors(events):
+    return [e for e in events if e.get("event") == "error"]
+
+
+def test_backfill_tiered_breaker_arm_failure_is_loud():
+    """External-fill path (#1): arm_close_tiered_breakers raising previously
+    left only a warning — the tiered breaker chain silently did not engage for
+    an exchange-triggered loss. The backfill must continue (fail-open) but emit
+    a flat error scoped tiered_breaker_arm/source=exchange_trigger, aligned
+    with the executor chokepoint's scope (trading_loop.py ~:1513-1523)."""
+    from hermes_trader.agents.dsl_exit import DSLTracker
+
+    tr = DSLTracker("ETH", "long", 100.0, time.time() / 1000.0,
+                    leverage=10)
+
+    def _boom(*a, **k):
+        raise RuntimeError("breaker store down")
+
+    events = _run_backfill(dropped=[tr], fill=_losing_external_fill(),
+                           arm_breaker=_boom)
+
+    errs = _errors(events)
+    assert len(errs) == 1
+    assert errs[0]["scope"] == "tiered_breaker_arm"
+    assert errs[0]["coin"] == "ETH"
+    assert errs[0]["source"] == "exchange_trigger"
+    assert "breaker store down" in errs[0]["error"]
+
+
+def test_backfill_roe_blowup_halt_failure_is_loud():
+    """External-fill path (#2): if maybe_roe_blowup_halt itself raises at the
+    call site, the halt function's own internal event never fires and the only
+    trace was a warning. Must keep best-effort flow and emit a flat error scoped
+    roe_blowup_halt_arm/source=exchange_trigger
+    (trading_loop.py ~:1529-1539)."""
+    from hermes_trader.agents.dsl_exit import DSLTracker
+
+    tr = DSLTracker("ETH", "long", 100.0, time.time() / 1000.0,
+                    leverage=10)
+
+    def _boom(*a, **k):
+        raise RuntimeError("halt store down")
+
+    events = _run_backfill(dropped=[tr], fill=_losing_external_fill(),
+                           roe_halt=_boom)
+
+    errs = _errors(events)
+    assert len(errs) == 1
+    assert errs[0]["scope"] == "roe_blowup_halt_arm"
+    assert errs[0]["coin"] == "ETH"
+    assert errs[0]["source"] == "exchange_trigger"
+    assert "halt store down" in errs[0]["error"]
+
+
+def test_backfill_per_fill_outer_failure_is_loud():
+    """External-fill path (#7): the per-fill outer except wraps the whole
+    resolve_close_fill -> record_close -> protection-arm segment. A failure
+    there (e.g. the fill lookup itself exploding) previously produced only a
+    warning, so one dropped tracker could be wholly unbackfilled with no
+    durable trace. Must keep iterating and emit a flat error scoped
+    external_close_backfill with coin/oid context (trading_loop.py
+    ~:1540-1543). Distinct from the setup-level except (_bf_e), which is not
+    in scope here."""
+    from hermes_trader.agents.dsl_exit import DSLTracker
+
+    tr = DSLTracker("ETH", "long", 100.0, time.time() / 1000.0,
+                    leverage=10)
+
+    events = _run_backfill(
+        dropped=[tr],
+        resolve_raises=RuntimeError("userFills fetch exploded"))
+
+    errs = _errors(events)
+    assert len(errs) == 1
+    assert errs[0]["scope"] == "external_close_backfill"
+    assert errs[0]["coin"] == "ETH"
+    assert "userFills fetch exploded" in errs[0]["error"]
+
+
+def test_close_chokepoint_loss_cooldown_arm_failure_is_loud(monkeypatch, tmp_path):
+    """Executor chokepoint (#12): on a losing close, memory.set_loss_cooldown
+    raising previously left only a warning — the anti-revenge cooldown was
+    silently not armed with no events.jsonl trace, while the twin external-fill
+    path already emitted scope=loss_cooldown. The close must still succeed and
+    emit the same scoped error (executor.py ~:6046-6055)."""
+    from hermes_trader import event_log
+
+    executor, orders = _close_wire(monkeypatch, tmp_path)
+    monkeypatch.setattr(executor, "read_agent_config",
+                        lambda: {"loss_cooldown_min": 30})
+
+    def _boom(coin, until):
+        raise RuntimeError("cooldown store down")
+
+    monkeypatch.setattr(executor.memory, "set_loss_cooldown", _boom)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.close_position_market("ETH")
+    assert res.get("ok") is True
+    assert len(orders) == 1
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "loss_cooldown"
+    assert p["coin"] == "ETH"
+    assert "cooldown store down" in p["error"]
+
+
+def test_close_chokepoint_roe_blowup_halt_failure_is_loud(monkeypatch, tmp_path):
+    """Executor chokepoint (#14): maybe_roe_blowup_halt raising at the call
+    site previously left only a warning — the catastrophic single-trade
+    self-halt was silently unverified. The close must still succeed and emit a
+    scoped error aligned with the backfill path: roe_blowup_halt_arm/
+    source=close (executor.py ~:6197-6200)."""
+    from hermes_trader import event_log
+
+    executor, orders = _close_wire(monkeypatch, tmp_path)
+
+    def _boom(*a, **k):
+        raise RuntimeError("halt check exploded")
+
+    monkeypatch.setattr(executor, "maybe_roe_blowup_halt", _boom)
+    written = _event_sink(monkeypatch, event_log)
+
+    res = executor.close_position_market("ETH")
+    assert res.get("ok") is True
+    assert len(orders) == 1
+
+    errs = [e for e in written if e["event"] == "error"]
+    assert len(errs) == 1
+    p = errs[0]["payload"]
+    assert p["scope"] == "roe_blowup_halt_arm"
+    assert p["coin"] == "ETH"
+    assert p["source"] == "close"
+    assert "halt check exploded" in p["error"]
