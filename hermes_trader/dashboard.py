@@ -293,6 +293,7 @@ def _read_jsonl_incremental(
     cache: dict[str, Any],
     lock: "threading.Lock",
     max_lines: int,
+    keep_event: Optional[Callable[[dict[str, Any]], bool]] = None,
 ) -> list[dict[str, Any]]:
     """F13: incremental JSONL reader. Keeps the parsed lines plus the byte
     offset / inode of the previous read; on the next call only newly appended
@@ -303,7 +304,14 @@ def _read_jsonl_incremental(
     Bounded cache: only the newest ``max_lines`` parsed rows are retained so a
     long-running dashboard cannot grow the parsed heap without limit. Trimming
     the in-memory head never rewinds the byte ``offset`` — the next call still
-    seeks to the file tail and parses only newly appended bytes."""
+    seeks to the file tail and parses only newly appended bytes.
+
+    Event filter: when ``keep_event`` is given, parsed rows it rejects never
+    enter the cache or count against ``max_lines``. This lets a log dominated by
+    high-frequency events retain the full history of a few sparse event types
+    (e.g. events.jsonl keeps every close/dsl_exit while dropping thousands of
+    execute/signal/ip_drift rows), so the row window cannot truncate old trades
+    out of visibility."""
     if not path.exists():
         with lock:
             cache.update(lines=[], inode=None, size=-1, offset=0)
@@ -328,12 +336,14 @@ def _read_jsonl_incremental(
             if not line:
                 continue
             try:
-                new_lines.append(json.loads(line))
+                parsed = json.loads(line)
             except json.JSONDecodeError:
                 # A partially-flushed last line: keep the old offset so it is
                 # re-read (and completed) on the next call.
                 new_offset = offset + tail.rfind(line)
                 break
+            if keep_event is None or keep_event(parsed):
+                new_lines.append(parsed)
     except OSError:
         with lock:
             return cache.get("lines", [])
@@ -371,6 +381,17 @@ _OUTCOME_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offse
 _OUTCOME_CACHE_LOCK = threading.Lock()
 
 
+# Outcome events the dashboard actually consumes. events.jsonl is dominated by
+# high-volume execute/signal/ip_drift rows the dashboard never reads, but close
+# and its dsl_exit mirror are sparse and must stay visible for the FULL log
+# history (trades go back weeks). Filtering at parse time keeps those two types
+# from ever counting against the row window, so an N-row cap trims only among
+# the retained sparse events instead of silently dropping old trades behind a
+# wall of execute rows. If another consumer starts reading this log, add its
+# event type here.
+_OUTCOME_KEEP_EVENTS = frozenset(("close", "dsl_exit"))
+
+
 def _read_outcome_lines() -> list[dict[str, Any]]:
     """Read events.jsonl — the authoritative outcome log that holds reconciled
     `close` events (exchange-triggered / manual-backfill) which may never appear
@@ -378,6 +399,7 @@ def _read_outcome_lines() -> list[dict[str, Any]]:
     ``{event, trace_id, timestamp, payload}``. F13: reads incrementally."""
     return _read_jsonl_incremental(
         _EVENTS_PATH, _OUTCOME_CACHE, _OUTCOME_CACHE_LOCK, _OUTCOME_MAX_LINES,
+        keep_event=lambda r: r.get("event") in _OUTCOME_KEEP_EVENTS,
     )
 
 
