@@ -5510,7 +5510,22 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             if _pc_shadow:
                 logger.debug(_msg)
             else:
+                # Q1 batch 4: an ENFORCE arm that cannot read memory is BLIND
+                # (admitting with the cooldown protection off). Warning log is
+                # not durable enough for live 10x — mirror to events.jsonl so
+                # the blind-arm window is alertable. Best-effort, never blocks.
                 logger.warning(_msg)
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "per_coin_cooldown_enforce_failopen",
+                        "coin": coin,
+                        "error": repr(_pc_e),
+                    })
+                except Exception as _pc_ev_e:
+                    logger.error(
+                        "[runner_gate] per-coin cooldown fail-open event write "
+                        "failed for %s: %r", coin, _pc_ev_e)
 
     if is_hip3:
         en = config.get("signal_enforcement") or {}
@@ -5537,7 +5552,22 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     else:
                         return f"runner_gate_blocked ({why})"
             except Exception as e:
-                logger.debug(f"[executor] GEX entry veto check failed for {coin}: {e}")
+                # Q1 batch 4: the options-wall veto is silently OFF for this
+                # signal on any check error; keep fail-open admission but make
+                # the blind veto durable (was debug-only). Best-effort.
+                logger.warning(f"[executor] GEX entry veto check failed for "
+                               f"{coin} (fail-open, admit): {e}")
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "gex_veto_check_fail",
+                        "coin": coin,
+                        "error": repr(e),
+                    })
+                except Exception as _gex_ev_e:
+                    logger.error(
+                        "[executor] GEX veto fail-open event write failed for "
+                        "%s: %r", coin, _gex_ev_e)
     if is_hip3 and score < min_hip3_score:
         logger.info(f"[runner_gate] {coin} BLOCKED: HIP-3 composite {score:.0f} < {min_hip3_score:.0f}")
         return (f"runner_gate_blocked (HIP-3 composite {score:.0f} "

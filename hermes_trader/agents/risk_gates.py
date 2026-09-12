@@ -2024,9 +2024,19 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
                "state": "data_missing", "openings": None,
                "reentry_would_block": None}
         _record_gate_shadow(rec, path, "reentry_cap")
-        logger.debug(
-            "[risk][gates] reentry_cap state read failed for %s — fail-open: %s",
-            ctx.coin, e)
+        # Q1 batch 4: align with the sibling memory-backed gates
+        # (coin_circuit/global_halt/...): a blind reentry cap used to be a
+        # bare debug log — no metric, no card, no SSE event. Fail-open return
+        # below is unchanged; only the loudness triplet is added.
+        logger.error("[risk][gates] reentry_cap state read failed for %s — "
+                     "cap BLIND, failing open (pass=True): %s", ctx.coin, e)
+        try:
+            from hermes_trader import metrics
+            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="reentry_cap").inc()
+        except Exception as metric_e:
+            logger.error("[risk] MEMORY_GATE_READ_ERRORS metric failed for "
+                         "reentry_cap: %r", metric_e)
+        _alert_memory_gate_blind("reentry_cap", ctx, e)
         return {"pass": True, "via": "reentry_cap_data_missing",
                 "reason": f"reentry cap unavailable ({type(e).__name__})"}
 

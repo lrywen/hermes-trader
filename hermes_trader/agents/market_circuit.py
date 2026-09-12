@@ -429,9 +429,19 @@ def evaluate(cfg: dict[str, Any], *,
                 armed = True
             except Exception as e:
                 logger.error("[market_circuit] set_global_halt failed: %s", e)
-        logger.critical(
-            "[market_circuit] ENFORCE trip (%s) — global halt armed for %.0f min: %s",
-            trigger, halt_min, reasons)
+        if armed:
+            logger.critical(
+                "[market_circuit] ENFORCE trip (%s) — global halt armed for "
+                "%.0f min: %s", trigger, halt_min, reasons)
+        else:
+            # Q1 batch 4: set_global_halt failed (or no mem wired) — the old
+            # message unconditionally claimed "halt armed", which actively
+            # misreported an UNARMED breaker during a crash. The halt event
+            # below carries authoritative armed=False; say so here too.
+            logger.critical(
+                "[market_circuit] ENFORCE trip (%s) — global halt ARM FAILED, "
+                "protection NOT armed (halt intended %.0f min): %s",
+                trigger, halt_min, reasons)
         _metric(mode, "trip")
         rec["action"] = "halt_armed"
         rec["halt_minutes"] = halt_min
@@ -462,4 +472,16 @@ def evaluate(cfg: dict[str, Any], *,
         exc_mode = str(cfg.get("mode", "off") if isinstance(cfg, dict) else "off")
         _metric(exc_mode, "data_missing")
         _heartbeat(safe, exc_mode, "data_missing")
+        # Q1 batch 4: a whole-tick failure means the market breaker was BLIND
+        # for this tick; the log alone is not durable enough for live 10x.
+        # Mirror a flat error event through the injected loop sink (the same
+        # channel/style as the market_circuit_tick wrapper). Best-effort.
+        if event_log is not None:
+            try:
+                event_log({"event": "error",
+                           "scope": "market_circuit_evaluate_failopen",
+                           "error": f"{type(e).__name__}: {e}"})
+            except Exception as ev_e:
+                logger.error(
+                    "[market_circuit] fail-open event write failed: %s", ev_e)
         return safe

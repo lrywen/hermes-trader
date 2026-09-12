@@ -951,3 +951,306 @@ def test_dsl_bracket_backfill_failure_is_recorded(monkeypatch):
     assert len(err) == 1
     assert err[0]["payload"]["scope"] == "dsl_bracket_backfill_fail"
     assert "openOrders fetch exploded" in err[0]["payload"]["error"]
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Group I — blind/fail-open risk arms must be LOUD (Q1 batch 4)
+#
+# Four places where a risk protection arm silently degrades to fail-open on a
+# state-read/evaluate error (debug/warning log only, no durable event). The
+# fail-open control flow (pass=True / admit / return safe verdict) is the
+# intended posture and MUST NOT change; the contracts below only pin that the
+# degradation is durably visible: scoped ``error`` events for the
+# executor/market_circuit channels, and the shared LOUD blind-gate triplet
+# (error log + metric + risk_gate_blind SSE event) for risk_gates.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _runner_gate_cfg(coin="ZEC", **gate_over):
+    g = {
+        "enabled": True,
+        "min_confidence": 0.62,
+        "min_composite": 45,
+        "min_hip3_composite": 50,
+    }
+    g.update(gate_over)
+    cfg = {"runner_entry_gate": g}
+    return cfg, coin
+
+
+def _event_sink(monkeypatch, event_log_module):
+    written = []
+    monkeypatch.setattr(
+        event_log_module, "append",
+        lambda event, payload=None, **kw: written.append(
+            {"event": event, "payload": payload or {}}) or True)
+    return written
+
+
+def test_per_coin_cooldown_enforce_failopen_is_recorded(monkeypatch):
+    """ENFORCE per-coin cooldown arm: a memory read failure previously only
+    produced a warning log and the candidate was admitted silently — live
+    10x entries then flow with the cooldown arm blind and no durable trace.
+    Fail-open admission must NOT change, but an ``error`` scoped
+    ``per_coin_cooldown_enforce_failopen`` must land in events.jsonl
+    (executor.py ~:5504-5513). The shadow arm stays quiet by design."""
+    from hermes_trader.agents import executor
+    from hermes_trader import event_log
+
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kw: None)
+
+    class _BoomMem:
+        def get_closes(self, limit=200):
+            raise RuntimeError("memory get_closes down")
+
+        def consecutive_losses(self, coin):
+            return 0
+
+    monkeypatch.setattr(executor, "memory", _BoomMem())
+    cfg, _ = _runner_gate_cfg(per_coin_cooldown={
+        "shadow_mode": False, "window_hours": 24,
+        "repeat_min_composite": 45, "max_consecutive_losses": 2})
+
+    a = {
+        "id": "a1", "coin": "ZEC", "side": "long",
+        "confidence": 0.65, "ai_confidence_raw": 0.65,
+        "composite_score": 60.0,
+        "breakout_fired": False,
+        "volume_spike_fired": True,
+        "momentum_burst_fired": True,
+        "slow_burn_count": 1,
+        "mid": 1252.4, "price": 1252.4,
+    }
+
+    written = _event_sink(monkeypatch, event_log)
+
+    # Fail-open posture unchanged: otherwise-admitted candidate is admitted.
+    assert executor._runner_entry_block_reason(a, cfg) == ""
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    p = err[0]["payload"]
+    assert p["scope"] == "per_coin_cooldown_enforce_failopen"
+    assert p["coin"] == "ZEC"
+    assert "memory get_closes down" in p["error"]
+
+    # Shadow-mode read failure is intentionally quiet (no error event).
+    shadow_cfg, _ = _runner_gate_cfg(per_coin_cooldown={
+        "shadow_mode": True, "window_hours": 24,
+        "repeat_min_composite": 45, "max_consecutive_losses": 2})
+    written.clear()
+    assert executor._runner_entry_block_reason(a, shadow_cfg) == ""
+    assert [e for e in written if e["event"] == "error"] == []
+
+
+def test_reentry_cap_read_failure_is_loud_but_fails_open(monkeypatch, tmp_path):
+    """reentry_cap is the one memory-backed gate whose data-missing branch was
+    still a bare debug log (its sibling gates — coin_circuit/global_halt/... —
+    log at error, bump MEMORY_GATE_READ_ERRORS and fire _alert_memory_gate_blind).
+    A persistently blind reentry cap therefore emits neither Feishu card,
+    metric, nor the risk_gate_blind SSE event. The fail-open return must NOT
+    change (pass=True/via=reentry_cap_data_missing); only the loudness triplet
+    is added (risk_gates.py ~:2021-2031)."""
+    from hermes_trader.agents import risk_gates
+    from hermes_trader import metrics
+    from hermes_trader import notify
+    from hermes_trader import session_log
+
+    import hermes_trader.agents.memory as memory_mod
+
+    class _BoomMem:
+        def count_openings_since(self, coin, since_ms):
+            raise RuntimeError("memory down")
+
+    monkeypatch.setattr(memory_mod, "memory", _BoomMem())
+
+    # Feishu card channel: must be attempted, outcome irrelevant to the gate.
+    cards = []
+    monkeypatch.setattr(notify, "send_card",
+                        lambda *a, **kw: cards.append((a, kw)))
+    # SSE mirror capture.
+    feed = []
+    monkeypatch.setattr(session_log, "append", lambda ev: feed.append(ev))
+    # Metric counter capture.
+    incs = []
+
+    class _FakeCounter:
+        def inc(self):
+            incs.append("reentry_cap")
+
+    def _labels(**kw):
+        assert kw.get("gate") == "reentry_cap"
+        return _FakeCounter()
+
+    monkeypatch.setattr(metrics.MEMORY_GATE_READ_ERRORS, "labels", _labels)
+
+    ctx = risk_gates.GateContext(
+        confidence=0.9, current_positions=[], trade_notional_usd=50,
+        daily_pnl=0, market_volume_24h_usd=1e8, coin="ETH",
+        trade_side="long", has_binary_news_risk=False, equity=1000.0,
+        total_open_notional=0)
+    cfg = {"reentry_cap": {
+        "mode": "enforce", "max_per_coin": 2, "window_hours": 24,
+        "shadow_log_path": str(tmp_path / "reentry.jsonl")}}
+
+    r = risk_gates.reentry_cap_gate(ctx, cfg)
+
+    # Fail-open contract unchanged.
+    assert r["pass"] is True
+    assert r["via"] == "reentry_cap_data_missing"
+    # LOUD triplet: metric + Feishu card + SSE blind-gate event.
+    assert incs == ["reentry_cap"]
+    assert cards and cards[0][1]["dedup_key"] == "mem_gate_blind:reentry_cap"
+    assert len(feed) == 1
+    ev = feed[0]
+    assert ev["event"] == "risk_gate_blind"
+    assert ev["gate"] == "reentry_cap"
+    assert ev["coin"] == "ETH"
+    assert ev["posture"] == "fail-open"
+    assert "memory down" in ev["error"]
+
+
+def test_gex_veto_check_failure_is_recorded(monkeypatch):
+    """The HIP-3 GEX veto arm catches ANY exception from
+    gex_override_caution at debug level only and then admits the entry — the
+    options-wall veto is silently OFF for that signal. Admission must remain
+    fail-open, but an ``error`` scoped ``gex_veto_check_fail`` must be durably
+    recorded (executor.py ~:5539-5540)."""
+    from hermes_trader.agents import executor
+    from hermes_trader.agents import options_gex
+    from hermes_trader import event_log
+
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kw: None)
+
+    class _CleanMem:
+        def get_closes(self, limit=200):
+            return []
+
+        def consecutive_losses(self, coin):
+            return 0
+
+    monkeypatch.setattr(executor, "memory", _CleanMem())
+
+    def _boom(*a, **k):
+        raise RuntimeError("gex wall fetch exploded")
+
+    monkeypatch.setattr(options_gex, "gex_override_caution", _boom)
+
+    cfg, _ = _runner_gate_cfg()
+    cfg["signal_enforcement"] = {"enabled": True}
+    a = {
+        "id": "h1", "coin": "ETH:PERP", "side": "long",
+        "confidence": 0.65, "ai_confidence_raw": 0.65,
+        "composite_score": 60.0,
+        "breakout_fired": True,
+        "volume_spike_fired": False,
+        "momentum_burst_fired": False,
+        "slow_burn_count": 1,
+        "mid": 2500.0, "price": 2500.0,
+    }
+
+    written = _event_sink(monkeypatch, event_log)
+
+    assert executor._runner_entry_block_reason(a, cfg) == ""
+    err = [e for e in written if e["event"] == "error"]
+    assert len(err) == 1
+    p = err[0]["payload"]
+    assert p["scope"] == "gex_veto_check_fail"
+    assert p["coin"] == "ETH:PERP"
+    assert "gex wall fetch exploded" in p["error"]
+
+
+def test_market_circuit_evaluate_outer_failure_is_recorded(monkeypatch, tmp_path):
+    """The outer ``except`` in market_circuit.evaluate is the last-resort
+    fail-open for ANY error not caught per-coin (e.g. decide() itself
+    exploding). It returned the safe verdict with only a logger.error — the
+    loop's events.jsonl showed no trace that the whole market breaker had been
+    blind for the tick. The safe verdict must not change; an injected flat
+    ``error`` event scoped ``market_circuit_evaluate_failopen`` must be emitted
+    best-effort (market_circuit.py ~:460-465)."""
+    from types import SimpleNamespace
+    from hermes_trader.agents import market_circuit as mc
+
+    def _calm_fetcher(*_a, **_k):
+        return [SimpleNamespace(h=100.0, c=100.0),
+                SimpleNamespace(h=100.1, c=100.0),
+                SimpleNamespace(h=100.1, c=99.9)]
+
+    def _passthrough_filter(raw, interval):
+        return raw, False
+
+    def _boom_decide(*a, **k):
+        raise RuntimeError("decide exploded")
+
+    monkeypatch.setattr(mc, "decide", _boom_decide)
+
+    events = []
+    cfg = {"mode": "enforce", "halt_minutes": 30.0, "cooldown_minutes": 60.0,
+           "shadow_log_path": str(tmp_path / "mc_shadow.jsonl")}
+
+    v = mc.evaluate(
+        cfg, mem=object(),
+        candle_fetcher=_calm_fetcher, closed_filter=_passthrough_filter,
+        event_log=lambda e: events.append(e), stop_events=[])
+
+    # Safe fail-open verdict unchanged.
+    assert v["tripped"] is False
+    assert v["data_ok"] is False
+    assert v["action"] == "error"
+
+    err = [e for e in events if e.get("event") == "error"]
+    assert len(err) == 1
+    assert err[0]["scope"] == "market_circuit_evaluate_failopen"
+    assert "decide exploded" in err[0]["error"]
+
+
+def test_market_circuit_enforce_trip_arm_failure_is_truthful(caplog, tmp_path):
+    """On an ENFORCE trip where mem.set_global_halt raises, armed stays False
+    but the critical log unconditionally announced "global halt armed for N
+    min" — the one message an operator greps during a crash actively lied that
+    protection was armed. The halt event already carries the authoritative
+    armed=False; the critical log must say the arm FAILED instead
+    (market_circuit.py ~:425-434)."""
+    from types import SimpleNamespace
+    from hermes_trader.agents import market_circuit as mc
+
+    def _crash_fetcher(*_a, **_k):
+        # peak 100 then close ~3% under -> index_crash trip
+        return [SimpleNamespace(h=100.0, c=100.0),
+                SimpleNamespace(h=100.0, c=99.0),
+                SimpleNamespace(h=98.0, c=97.0)]
+
+    def _passthrough_filter(raw, interval):
+        return raw, False
+
+    class _ArmFailMem:
+        def global_halt_remaining_min(self):
+            return 0.0
+
+        def set_global_halt(self, until_ms):
+            raise RuntimeError("halt store unwritable")
+
+    events = []
+    cfg = {"mode": "enforce", "halt_minutes": 30.0, "cooldown_minutes": 60.0,
+           "shadow_log_path": str(tmp_path / "mc_shadow.jsonl")}
+
+    with caplog.at_level(logging.CRITICAL,
+                         logger="hermes_trader.agents.market_circuit"):
+        v = mc.evaluate(
+            cfg, mem=_ArmFailMem(),
+            candle_fetcher=_crash_fetcher, closed_filter=_passthrough_filter,
+            event_log=lambda e: events.append(e), stop_events=[])
+
+    assert v["tripped"] is True
+    assert v.get("armed") is False
+    halt = [e for e in events if e.get("event") == "market_circuit_halt"]
+    assert len(halt) == 1 and halt[0]["armed"] is False
+
+    critical = [r.getMessage() for r in caplog.records
+                if r.levelno >= logging.CRITICAL
+                and r.name == "hermes_trader.agents.market_circuit"
+                and "ENFORCE trip" in r.getMessage()]
+    assert len(critical) == 1
+    msg = critical[0]
+    assert "armed for" not in msg
+    assert "FAIL" in msg.upper()
