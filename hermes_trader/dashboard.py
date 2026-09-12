@@ -288,12 +288,22 @@ def _ttl_cached(key: str, ttl: float, fn: Callable[[], Any]) -> Any:
             done.set()
 
 
-def _read_jsonl_incremental(path: Path, cache: dict[str, Any], lock: "threading.Lock") -> list[dict[str, Any]]:
+def _read_jsonl_incremental(
+    path: Path,
+    cache: dict[str, Any],
+    lock: "threading.Lock",
+    max_lines: int,
+) -> list[dict[str, Any]]:
     """F13: incremental JSONL reader. Keeps the parsed lines plus the byte
     offset / inode of the previous read; on the next call only newly appended
     bytes are parsed. Truncation/rotation (inode change or size shrink) resets
     to a full read. A stat() per call is far cheaper than re-reading the whole
-    log on every 2s poll."""
+    log on every 2s poll.
+
+    Bounded cache: only the newest ``max_lines`` parsed rows are retained so a
+    long-running dashboard cannot grow the parsed heap without limit. Trimming
+    the in-memory head never rewinds the byte ``offset`` — the next call still
+    seeks to the file tail and parses only newly appended bytes."""
     if not path.exists():
         with lock:
             cache.update(lines=[], inode=None, size=-1, offset=0)
@@ -328,6 +338,10 @@ def _read_jsonl_incremental(path: Path, cache: dict[str, Any], lock: "threading.
         with lock:
             return cache.get("lines", [])
     lines.extend(new_lines)
+    if len(lines) > max_lines:
+        # Keep only the newest rows; offset stays at the file tail so the head
+        # rows that fell out of the window are never re-parsed.
+        lines = lines[-max_lines:]
     with lock:
         cache.update(lines=lines, inode=st.st_ino, size=st.st_size, offset=new_offset)
     return lines
@@ -336,9 +350,20 @@ def _read_jsonl_incremental(path: Path, cache: dict[str, Any], lock: "threading.
 _LOG_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
 _LOG_CACHE_LOCK = threading.Lock()
 
+# Bounded parsed-row windows. The session log rotates at ~24h/20MB/100k lines
+# (observed ~35k rows/22h); 60000 keeps the full 24h equity-curve window with
+# headroom while capping the worst-case parsed heap. The outcome log is
+# dominated by high-volume execute/signal/ip_drift rows while the dashboard
+# consumers only need recent closes plus a short open-matching history, so its
+# window is much tighter. Both are env-overridable.
+_LOG_MAX_LINES = int(os.environ.get("HERMES_DASH_LOG_MAX_LINES", "60000"))
+_OUTCOME_MAX_LINES = int(os.environ.get("HERMES_DASH_OUTCOME_MAX_LINES", "4000"))
+
 
 def _read_log_lines() -> list[dict[str, Any]]:
-    return _read_jsonl_incremental(_LOG_PATH, _LOG_CACHE, _LOG_CACHE_LOCK)
+    return _read_jsonl_incremental(
+        _LOG_PATH, _LOG_CACHE, _LOG_CACHE_LOCK, _LOG_MAX_LINES,
+    )
 
 
 _EVENTS_PATH = Path(event_log.EVENTS_FILE)
@@ -351,7 +376,9 @@ def _read_outcome_lines() -> list[dict[str, Any]]:
     `close` events (exchange-triggered / manual-backfill) which may never appear
     in the high-frequency session-log. Each record is nested as
     ``{event, trace_id, timestamp, payload}``. F13: reads incrementally."""
-    return _read_jsonl_incremental(_EVENTS_PATH, _OUTCOME_CACHE, _OUTCOME_CACHE_LOCK)
+    return _read_jsonl_incremental(
+        _EVENTS_PATH, _OUTCOME_CACHE, _OUTCOME_CACHE_LOCK, _OUTCOME_MAX_LINES,
+    )
 
 
 def _iso_to_ms(ts: Any) -> Optional[int]:
