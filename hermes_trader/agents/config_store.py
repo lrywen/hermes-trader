@@ -592,6 +592,29 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "whale_scan_bypass": False,
     # 持仓评分变化豁免研判冷却
     "research_rescore_delta": 0.0,  # F4: float per schema (supplemental audit 2026-08-31)
+    # Audit 2026-09-12 (#8 majors-missed-surge): adaptive re-research cooldown.
+    # In a hot σ burst the long calm cooldown window locks research out of the
+    # fastest part of a BTC/ETH surge. shadow_mode records would-admits but keeps
+    # the long window; enforce actually admits the re-research after active_min.
+    # Default SHADOW — observation only until the gray-release JSONL accrues.
+    "research_cooldown_adaptive": {
+        "enabled": True,
+        "shadow_mode": True,
+        "active_min": 2,
+        "pct_sigma_min": 3.0,
+        "vol_sigma_min": 5.0,
+    },
+    # Audit 2026-09-12 (#4 majors-missed-surge): σ-burst surfacing gate. A coin
+    # that prints a large return/volume σ spike but falls short of the composite
+    # gate (54) may surface for research at a lower effective gate. shadow_mode
+    # records would-surface but still drops; enforce surfaces. Default SHADOW.
+    "sigma_burst_gate": {
+        "enabled": True,
+        "shadow_mode": True,
+        "pct_sigma_min": 3.0,
+        "vol_sigma_min": 5.0,
+        "gate_override": 45.0,
+    },
     # 资金轮动（弱势仓换强势标的）
     "capital_rotation": {
         "enabled": False,
@@ -1228,6 +1251,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "fetch_bars": 100,
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
+        # Audit 2026-09-12 (#7): high-quality confirmed breakout exemption.
+        # A fired breakout with RVOL >= require_rvol that trips the late-entry
+        # veto is downgraded instead of prefilter-REJECTed. shadow_mode records
+        # the would-downgrade but still REJECTs; enforce passes through (the
+        # order-time ta_late_entry_gate still applies). Default SHADOW.
+        "breakout_exemption": {
+            "enabled": True,
+            "shadow_mode": True,
+            "require_rvol": 4.0,
+        },
     },
     # R13-A1: perception scan-tick block (TRIGGER_CONFIG["scan"], perception.py
     # L216-269). Previously implicit: the keys lived only in the module-level

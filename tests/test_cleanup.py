@@ -128,10 +128,21 @@ def test_triggers_return_shape():
         volume_spike,
     )
     cs = _candles(150)
-    for fn in (pct_move_spike, volume_spike, breakout, range_compression, trend_strength):
+    # Audit 2026-09-12: pct_move_spike/volume_spike additionally carry a
+    # structured `z` (and pct_move_spike a `direction`) for the σ-burst gate;
+    # every trigger still has the four core keys. Assert the common core plus
+    # the spike-specific extras rather than one shared exact shape.
+    core = {"name", "score", "reason", "fired"}
+    for fn in (breakout, range_compression, trend_strength):
         h = fn(cs)
-        assert set(h) == {"name", "score", "reason", "fired"}
+        assert set(h) == core
         assert isinstance(h["fired"], bool)
+    for fn in (pct_move_spike, volume_spike):
+        h = fn(cs)
+        assert core <= set(h)
+        assert isinstance(h["fired"], bool)
+        assert isinstance(h["z"], float)
+    assert "direction" in pct_move_spike(cs)
 
 
 def test_composite_score_in_range():

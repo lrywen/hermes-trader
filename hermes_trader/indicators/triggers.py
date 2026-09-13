@@ -16,7 +16,8 @@ from hermes_trader.models.types import Candle, TriggerHit
 def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHit:
     """Current-bar return z-score vs trailing 96-bar std."""
     if len(candles) < 3:
-        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
+                "z": 0.0, "direction": "flat"}
 
     returns = []
     for i in range(1, len(candles)):
@@ -26,14 +27,16 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
     prior = returns[:-1][-96:]  # up to 96 trailing bars
 
     if len(prior) < 2:
-        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
+                "z": 0.0, "direction": "flat"}
 
     mean = sum(prior) / len(prior)
     variance = sum((v - mean) ** 2 for v in prior) / len(prior)
     std = variance ** 0.5
 
     if std == 0:
-        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
+                "z": 0.0, "direction": "flat"}
 
     z_score = abs(current_return - mean) / std
     fired = z_score >= sigma_threshold
@@ -45,6 +48,11 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
         "score": score if fired else 0,
         "reason": f"{z_score:.1f}σ return spike {direction}" if fired else "flat",
         "fired": fired,
+        # Audit 2026-09-12 (sigma_burst_gate): structured z so downstream
+        # gray-release gates need not regex-parse the reason string. Carried
+        # whether fired or not; does NOT change score/fired/reason.
+        "z": round(float(z_score), 3),
+        "direction": direction,
     }
 
 
@@ -52,7 +60,8 @@ def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHi
     """Current volume z-score vs 20-bar rolling window."""
     vols = [candle_val(c, "v") for c in candles]
     if len(vols) < 21:
-        return {"name": "volumeSpike", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "volumeSpike", "score": 0, "reason": "flat", "fired": False,
+                "z": 0.0}
 
     window = vols[-21:-1]
     current_vol = vols[-1]
@@ -60,14 +69,16 @@ def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHi
     # Skip if >50% of volume samples are 0 (sparse market)
     zero_count = sum(1 for v in window if v == 0)
     if zero_count > len(window) * 0.5:
-        return {"name": "volumeSpike", "score": 0, "reason": "sparse", "fired": False}
+        return {"name": "volumeSpike", "score": 0, "reason": "sparse", "fired": False,
+                "z": 0.0}
 
     mean = sum(window) / len(window)
     variance = sum((v - mean) ** 2 for v in window) / len(window)
     std = variance ** 0.5
 
     if std == 0:
-        return {"name": "volumeSpike", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "volumeSpike", "score": 0, "reason": "flat", "fired": False,
+                "z": 0.0}
 
     z_score = abs(current_vol - mean) / std
     fired = z_score >= sigma_threshold
@@ -78,6 +89,8 @@ def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHi
         "score": score if fired else 0,
         "reason": f"{z_score:.1f}σ volume spike" if fired else "flat",
         "fired": fired,
+        # Audit 2026-09-12 (sigma_burst_gate): structured z (see pctMoveSpike).
+        "z": round(float(z_score), 3),
     }
 
 

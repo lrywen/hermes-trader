@@ -755,6 +755,12 @@ def _burst_fired(perception):
                for t in perception.get("triggers", []))
 
 
+# Audit 2026-09-12 (#8 research_cooldown_adaptive): hot-state classifier moved
+# to the import-safe helper module (this script runs the loop at import time
+# and cannot itself be imported by tests). Re-exported under the old name.
+from hermes_trader.agents.cooldown_adaptive import coin_is_hot as _coin_is_hot
+
+
 # B-M11 (deep audit 2026-08-28): optional HARD flatten on breakers.
 # Extracted as a pure helper so the breaker→flatten mapping is unit-testable
 # without driving the whole loop.
@@ -1962,6 +1968,47 @@ while True:
                         and _prev_score is not None
                         and (float(score) - _prev_score) >= _rescore_delta
                     )
+                    # Audit 2026-09-12 (#8): adaptive cooldown — in a hot σ
+                    # burst the long 10-min window locks us out of the fastest
+                    # part of a majors surge. shadow_mode records what the short
+                    # window WOULD have admitted but keeps throttling; enforce
+                    # actually shortens the window for this coin. Fail-safe: any
+                    # error leaves the configured (long) window in force.
+                    _rca = _cfg_cd.get("research_cooldown_adaptive") or {}
+                    try:
+                        _rca_on = bool(_rca.get("enabled"))
+                        _rca_shadow = bool(_rca.get("shadow_mode", True))
+                        _hot, _hot_dbg = _coin_is_hot(perception, _rca)
+                        _elapsed_min = (now_ms - last_research) / 60_000
+                        if _rca_on and _hot:
+                            _active_min = float(_rca.get("active_min", 2))
+                            # Inside the (calm,long] window but past the short
+                            # (active) window → the long throttle is what blocks.
+                            _would_admit = (
+                                _elapsed_min >= _active_min and not _jumped)
+                            if _would_admit:
+                                if _rca_shadow:
+                                    log_event({"event": "risk_tuning_shadow",
+                                               "rule": "research_cooldown_adaptive",
+                                               "coin": coin,
+                                               "would": "re_research",
+                                               "detail": {
+                                                   "elapsed_min": round(_elapsed_min, 2),
+                                                   "calm_min": float(
+                                                       _cfg_cd.get("research_cooldown_min", 15)),
+                                                   "active_min": _active_min,
+                                                   "score": round(float(score), 2),
+                                                   **_hot_dbg,
+                                                   "enforced": False}})
+                                else:
+                                    logger.info(
+                                        f"{coin}: adaptive cooldown ENFORCE "
+                                        f"re-research after {_elapsed_min:.1f}min "
+                                        f"(hot burst {_hot_dbg}) — bypass long window")
+                                    _jumped = True  # admit through the bypass branch
+                    except Exception as _rca_e:
+                        logger.debug(f"[cooldown-adaptive] eval failed for "
+                                     f"{coin} (fail-safe, keep long window): {_rca_e}")
                     if _jumped:
                         logger.info(
                             f"{coin}: re-research throttle BYPASSED — composite "

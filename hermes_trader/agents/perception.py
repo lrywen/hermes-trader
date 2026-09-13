@@ -200,6 +200,76 @@ def _age_decay_metric(mode: str, outcome: str) -> None:
     except Exception:
         pass
 
+
+# Audit 2026-09-12 (sigma_burst_gate): counter-factual surfacing records for a
+# large σ return/volume spike that falls short of the composite gate. Shares
+# the same risk-tuning JSONL + rotating writer as the executor gray-release
+# arms (HERMES_RISK_TUNING_SHADOW_FILE). Observation-only in shadow_mode: the
+# coin is still dropped; enforce additionally surfaces it for research. Never
+# raises into the scan hot path.
+_SIGMA_BURST_SHADOW_FILE = os.environ.get(
+    "HERMES_RISK_TUNING_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"),
+)
+
+
+def _record_sigma_burst_shadow(rec: dict[str, Any]) -> None:
+    try:
+        from datetime import datetime, timezone
+        from hermes_trader.shadow_log import append_jsonl
+
+        rec = {
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "rule": "sigma_burst_gate",
+            "would": "surface",
+            **rec,
+        }
+        append_jsonl(_SIGMA_BURST_SHADOW_FILE, rec, stream="risk_tuning")
+    except Exception as _e:
+        logger.debug(f"[sigma-burst] shadow record failed: {_e}")
+
+
+def _sigma_burst_params(config: dict[str, Any]) -> dict[str, Any]:
+    """Resolve the sigma_burst_gate block; absent/disabled → feature off."""
+    try:
+        blk = config.get("sigma_burst_gate") or {}
+        return blk if isinstance(blk, dict) else {}
+    except Exception:
+        return {}
+
+
+def _sigma_burst_decision(score: float, min_score: float,
+                          hits: list[dict[str, Any]], blk: dict[str, Any]):
+    """Pure decision for #4. Returns (qualifies, info_dict).
+
+    `qualifies` means a σ return/volume spike is strong enough AND the composite
+    sits in [gate_override, min_score), i.e. the coin would surface if enforce.
+    Read faults/garbled input → (False, {}) (fail-open to the single gate).
+    """
+    try:
+        if not isinstance(blk, dict) or not blk.get("enabled"):
+            return False, {}
+        if not (float(score) < float(min_score)):
+            return False, {}
+        eff_gate = float(blk.get("gate_override", min_score))
+        if float(score) < eff_gate:
+            return False, {}
+        pct_z = next((float(h.get("z") or 0.0) for h in hits
+                      if h.get("name") == "pctMoveSpike"), 0.0)
+        vol_z = next((float(h.get("z") or 0.0) for h in hits
+                      if h.get("name") == "volumeSpike"), 0.0)
+        burst = (pct_z >= float(blk.get("pct_sigma_min", 3.0))
+                 or vol_z >= float(blk.get("vol_sigma_min", 5.0)))
+        if not burst:
+            return False, {}
+        return True, {"score": round(float(score), 2),
+                      "gate": float(min_score), "eff_gate": eff_gate,
+                      "pct_z": round(pct_z, 2), "vol_z": round(vol_z, 2),
+                      "fired_triggers": [h.get("name") for h in hits
+                                         if h.get("fired")]}
+    except Exception:
+        return False, {}
+
 # ── Candle cache (module-level, shared across ticks) ──────────────────────────
 # Per-coin TTL cache backed by the shared _Cache abstraction (LRU + TTL). The
 # 5m interval uses the short scan TTL; the 1h interval uses a longer TTL so
@@ -699,8 +769,40 @@ def _scan_single_market(
         pattern_bypass = bool(_cp.get("enabled")) and any(
             h["name"] in ("bearishReversalCandle", "bullishReversalCandle") and h["fired"] for h in hits)
         daily_mover_bypass = any(h["name"] == "dailyMover" and h["fired"] for h in hits)
+        # Audit 2026-09-12 (#4 sigma_burst_gate): a large σ return/volume spike
+        # that nonetheless scores below the composite gate (the majors-missed-
+        # surge case: BTC/ETH print 3-11σ but the %‑weighted composite stalls at
+        # ~45-52). When configured, lower the *effective* gate for that coin to
+        # gate_override. shadow_mode records the would-surface but still drops;
+        # enforce surfaces. Whole arm fails OPEN: any malformed config / missing
+        # z leaves the original gate behaviour untouched.
+        _sb = _sigma_burst_params(config)
+        sigma_burst_bypass = False
+        try:
+            _qualifies, _sb_info = _sigma_burst_decision(
+                float(score), float(min_score), hits, _sb)
+            if _qualifies:
+                _sb_shadow = bool(_sb.get("shadow_mode", True))
+                _record_sigma_burst_shadow({
+                    "coin": market["coin"],
+                    "side": "",
+                    "detail": {**_sb_info, "enforced": not _sb_shadow},
+                })
+                if not _sb_shadow:
+                    logger.info(
+                        f"[sigma-burst] {market['coin']} ENFORCE surface "
+                        f"score={_sb_info['score']:.1f} (gate {min_score}->"
+                        f"{_sb_info['eff_gate']}, pct_z={_sb_info['pct_z']:.1f} "
+                        f"vol_z={_sb_info['vol_z']:.1f})")
+                    sigma_burst_bypass = True
+        except Exception as _sb_e:
+            # Fail-open to the original single-gate behaviour.
+            logger.debug(f"[sigma-burst] eval failed for "
+                         f"{market.get('coin', '?')} (fail-open): {_sb_e}")
+            sigma_burst_bypass = False
         if (score < min_score and not burst_fired and not whale_bypass
-                and not trend_bypass and not pattern_bypass and not daily_mover_bypass):
+                and not trend_bypass and not pattern_bypass and not daily_mover_bypass
+                and not sigma_burst_bypass):
             # Near-miss observability: always persist coins that scored at 70%+
             # of the gate so surge postmortems and daily reports can reconstruct
             # the score trajectory of coins that almost made it. Independent of

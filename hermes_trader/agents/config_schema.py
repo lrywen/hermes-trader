@@ -336,6 +336,14 @@ class _ConfigPatch(BaseModel):
     # (off|shadow|enforce; enforce is record-only in M2).
     xs_reversal: dict[str, Any] = Field(default_factory=lambda: _dict_default("xs_reversal"))
 
+    # Audit 2026-09-12 (majors-missed-surge): σ-burst surfacing gate (#4) and
+    # adaptive re-research cooldown (#8). Both default to SHADOW (observation
+    # only) via canonical defaults.
+    sigma_burst_gate: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("sigma_burst_gate"))
+    research_cooldown_adaptive: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("research_cooldown_adaptive"))
+
 
 # Keys whose out-of-range message predates the generic bounds table and is
 # asserted on by operators/tests — keep the historical wording verbatim.
@@ -559,6 +567,29 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "min_bars_15m": ("int", 5, 500),
         "fetch_bars": ("int", 30, 1000),
         "shadow_log_path": ("str",),
+        # Audit 2026-09-12 (#7): high-quality confirmed breakout exemption from
+        # the late-entry prefilter veto. Nested dict leaf (deep-validated).
+        "breakout_exemption": ("dict", {
+            "enabled": ("bool",),
+            "shadow_mode": ("bool",),
+            "require_rvol": _num_leaf(0.0, 1000.0),
+        }),
+    },
+    # Audit 2026-09-12 (#4 majors-missed-surge): σ-burst surfacing gate.
+    "sigma_burst_gate": {
+        "enabled": ("bool",),
+        "shadow_mode": ("bool",),
+        "pct_sigma_min": _num_leaf(0.0, 1000.0),
+        "vol_sigma_min": _num_leaf(0.0, 1000.0),
+        "gate_override": _num_leaf(0.0, 1000.0),
+    },
+    # Audit 2026-09-12 (#8 majors-missed-surge): adaptive research cooldown.
+    "research_cooldown_adaptive": {
+        "enabled": ("bool",),
+        "shadow_mode": ("bool",),
+        "active_min": _num_leaf(0.0, 60.0),
+        "pct_sigma_min": _num_leaf(0.0, 1000.0),
+        "vol_sigma_min": _num_leaf(0.0, 1000.0),
     },
     # roadmap §3 (2026-09-04): market-level tail-risk circuit breaker. All
     # leaves scalar; mode is the off/shadow/enforce gray-release switch.

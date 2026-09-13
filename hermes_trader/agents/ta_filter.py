@@ -661,6 +661,40 @@ def relax_tier_check(
     return result
 
 
+# Audit 2026-09-12 (#7 breakout_exemption): classify a HIGH-QUALITY confirmed
+# breakout from the perception's triggers, without refetching candles. Pure +
+# side-effect-free so it is unit-testable. Reads:
+#   - the breakout trigger must be fired (already implies held N bars + RVOL at
+#     its own configured thresholds), and
+#   - the structured RVOL value is parsed from its reason ("... RVOL 4.18x...")
+#     when the stricter require_rvol is requested.
+# Returns (qualifies, info_dict). Any parse failure → (False, {}) (fail-safe:
+# the normal REJECTED veto stays in force).
+def _high_quality_breakout(perception: dict[str, Any], blk: dict[str, Any]):
+    try:
+        if not isinstance(blk, dict) or not blk.get("enabled"):
+            return False, {}
+        req_rvol = float(blk.get("require_rvol", 4.0))
+        for t in perception.get("triggers", []) or []:
+            if t.get("name") != "breakout" or not t.get("fired"):
+                continue
+            rvol = None
+            reason = str(t.get("reason", ""))
+            # Prefer a structured field if present; else parse the reason.
+            if isinstance(t.get("rvol"), (int, float)):
+                rvol = float(t["rvol"])
+            else:
+                import re
+                m = re.search(r"RVOL\s*([0-9]*\.?[0-9]+)\s*x", reason)
+                if m:
+                    rvol = float(m.group(1))
+            if rvol is not None and rvol >= req_rvol:
+                return True, {"rvol": round(rvol, 2)}
+        return False, {}
+    except Exception:
+        return False, {}
+
+
 def _late_entry_params() -> dict[str, Any]:
     """ta_late_entry config block for the shared late-entry veto.
 
@@ -782,6 +816,60 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
             from hermes_trader.agents.perception import _drop_forming_bar
             c4h_closed, _ = _drop_forming_bar(c4h, "4h")
             le = late_entry_check(c4h_closed, None, le_side, le_params)
+            if le.get("block"):
+                # Audit 2026-09-12 (#7 breakout_exemption): a high-quality
+                # confirmed breakout (fired + strong RVOL) that trips the
+                # late-entry overbought veto is the exact "real impulse the
+                # veto was not meant to kill" case. shadow_mode records the
+                # would-downgrade into the SAME late-entry shadow JSONL but
+                # still REJECTs; enforce downgrades the REJECT to a tagged
+                # pass-through (the order-time runner/ta_late_entry gate still
+                # applies, and sizing may tighten on the hot flag). Fail-safe:
+                # any error keeps the REJECT.
+                _be = _late_entry_params().get("breakout_exemption") or {}
+                try:
+                    _be_on = bool(_be.get("enabled"))
+                    _be_shadow = bool(_be.get("shadow_mode", True))
+                    _hq, _hq_info = _high_quality_breakout(perception, _be)
+                    if _be_on and _hq:
+                        from datetime import datetime, timezone
+                        from hermes_trader.agents.risk_gates import (
+                            _record_late_entry_shadow,
+                            late_entry_shadow_path,
+                        )
+                        _be_rec = {
+                            "timestamp": datetime.now(timezone.utc).strftime(
+                                "%Y-%m-%dT%H:%M:%SZ"),
+                            "coin": coin,
+                            "side": le_side,
+                            "mode": "shadow" if _be_shadow else "enforce",
+                            "layer": "prefilter_breakout_exemption",
+                            "blocked": True,
+                            "reason": le.get("reason", ""),
+                            "rsi4h": le.get("rsi4h"),
+                            "adx4h": le.get("adx4h"),
+                            "extension": le.get("extension"),
+                            "rsi15m": None,
+                            "relaxed_by_trend": le.get("relaxed_by_trend"),
+                            "mtf_passed": None,
+                            "trend_direction": le.get("trend_direction"),
+                            "enforced": not _be_shadow,
+                            "breakout_rvol": _hq_info.get("rvol"),
+                            "would": "downgrade_reject",
+                        }
+                        _record_late_entry_shadow(
+                            _be_rec, late_entry_shadow_path(le_params))
+                        if not _be_shadow:
+                            logger.info(
+                                f"[ta_filter] {coin} breakout_exemption ENFORCE: "
+                                f"downgrade late-entry REJECT (rvol={_hq_info.get('rvol')})")
+                            # Fall through to normal alignment scoring instead
+                            # of returning REJECTED; tag the result downstream.
+                            le = {**le, "block": False,
+                                  "breakout_exempt": True}
+                except Exception as _be_e:
+                    logger.debug(f"[ta_filter] breakout_exemption failed for "
+                                 f"{coin} (fail-safe, keep REJECT): {_be_e}")
             if le.get("block"):
                 logger.info(f"[ta_filter] {coin} -> REJECTED ({le['reason']})")
                 # P0-4 (audit R4): prefilter vetoes land in the SAME shadow
