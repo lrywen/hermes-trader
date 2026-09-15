@@ -12,6 +12,7 @@ snapshotting and the blind-gate SSE mirror:
     ``risk_gate_blind`` session-log (SSE) event while still never raising.
 """
 import importlib.util
+import json as _json
 import os
 
 import pytest
@@ -111,9 +112,8 @@ def test_read_history_since_filter(sg, tmp_path):
     new = sg._slim_snapshot(_fake_report())
     new["ts"] = 2_000
     with open(hist, "w", encoding="utf-8") as fh:
-        import json
-        fh.write(json.dumps(old) + "\n")
-        fh.write(json.dumps(new) + "\n")
+        fh.write(_json.dumps(old) + "\n")
+        fh.write(_json.dumps(new) + "\n")
     rows = sg.read_history(path=str(hist), since_ms=1_500)
     assert len(rows) == 1 and rows[0]["ts"] == 2_000
 
@@ -121,12 +121,11 @@ def test_read_history_since_filter(sg, tmp_path):
 def test_trim_history_caps_lines(sg, tmp_path):
     hist = tmp_path / "h.jsonl"
     sg.HISTORY_MAX_LINES = 3
-    import json
     for i in range(5):
         snap = sg._slim_snapshot(_fake_report())
         snap["ts"] = i
         with open(hist, "a", encoding="utf-8") as fh:
-            fh.write(json.dumps(snap) + "\n")
+            fh.write(_json.dumps(snap) + "\n")
     sg._trim_history(str(hist))
     rows = sg.read_history(path=str(hist))
     assert len(rows) == 3
@@ -275,6 +274,176 @@ def test_endpoint_503_when_grader_unavailable(monkeypatch):
     assert c.get("/api/dashboard/shadow-arms/grade-history").status_code == 503
     r = c.post("/api/dashboard/shadow-arms/refresh", json={}, headers=_auth())
     assert r.status_code == 503
+
+
+# ── backfill summary (historical backtest evidence surface) ──────────────────
+
+
+def _write_jsonl(path, rows):
+    with open(path, "w", encoding="utf-8") as fh:
+        for r in rows:
+            fh.write(_json.dumps(r) + "\n")
+
+
+@pytest.fixture()
+def make_backfill_client(tmp_path, monkeypatch):
+    """Factory for a TestClient wired to HERMES_BACKFILL_DIR=tmp_path with the
+    grader stubbed and the TTL cache cleared. Callers write artifact files
+    into tmp_path first, then call the factory to build the client."""
+    def _make():
+        monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
+        monkeypatch.setenv("HERMES_BACKFILL_DIR", str(tmp_path))
+        from hermes_trader import dashboard
+        from hermes_trader.dashboard_routes import shadow_arms
+        monkeypatch.setattr(shadow_arms, "_load_shadow_grade", lambda: _StubGrader())
+        dashboard._TTL_CACHE.clear()
+        app = FastAPI()
+        register_routes(app)
+        return TestClient(app, raise_server_exceptions=False)
+    return _make
+
+
+@pytest.fixture()
+def backfill_client(tmp_path, make_backfill_client):
+    _write_jsonl(tmp_path / "ta_late_entry_shadow.backfill.jsonl", [
+        {"side": "long", "outcome": "win", "pnl_pct": 4.0},
+        {"side": "long", "outcome": "loss", "pnl_pct": -2.0},
+        {"side": "short", "outcome": "win", "pnl_pct": 3.0},
+    ])
+    _write_jsonl(tmp_path / "xs_reversal_shadow.backfill.jsonl", [
+        {"is_candidate": True, "forward": {"fwd24h_pct": -8.0, "fwd72h_pct": -7.0}},
+        {"is_candidate": False, "forward": {"fwd24h_pct": -4.0, "fwd72h_pct": None}},
+    ])
+    _write_jsonl(tmp_path / "atr_regime_calib_shadow.backfill.jsonl", [
+        {"would_change": True, "cf_v1_pnl_pct": -3.0, "cf_v2_pnl_pct": -3.6,
+         "pnl_pct": 0.6, "outcome": "win"},
+        {"would_change": True, "cf_v1_pnl_pct": -2.0, "cf_v2_pnl_pct": -1.8,
+         "pnl_pct": -0.2, "outcome": "loss"},
+        {"would_change": False, "cf_v1_pnl_pct": 1.0, "cf_v2_pnl_pct": 1.0},
+    ])
+    _write_jsonl(tmp_path / "per_coin_regime_backfill.jsonl", [
+        {"would": "pass", "outcome": "sim_winner"},
+        {"would": "demote_to_weak_aligned", "outcome": None},
+        {"would": "n/a_non_aligned", "outcome": "tier_na"},
+    ])
+    _write_jsonl(tmp_path / "relax_tier_shadow.backfill.jsonl", [
+        # ta_late records graded with rt_*-prefixed fields; bare outcome/pnl
+        # keys stay None and must not leak into the summary.
+        {"side": "long", "outcome": None, "pnl_usd": None,
+         "rt_pnl_pct": 5.0, "rt_outcome": "win", "rt_graded": True},
+        {"side": "short", "outcome": None, "pnl_usd": None,
+         "rt_pnl_pct": -3.0, "rt_outcome": "loss", "rt_graded": True},
+        {"side": "long", "outcome": None, "pnl_usd": None},
+    ])
+    # pullback + the two remaining artifact-less arms are deliberately absent.
+    return make_backfill_client()
+
+
+def test_backfill_summary_aggregates_present_files(backfill_client):
+    from hermes_trader.dashboard_routes import shadow_arms
+    r = backfill_client.get("/api/dashboard/shadow-arms/backfill-summary")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["files_present"] == 5
+    by_arm = {a["arm"]: a for a in body["arms"]}
+    assert len(by_arm) == 8
+
+    ta = by_arm["ta_late_entry"]
+    assert ta["present"] is True and ta["records"] == 3
+    assert ta["pnl"]["n"] == 3
+    assert ta["pnl"]["win_rate"] == pytest.approx(2 / 3, abs=1e-4)
+    assert ta["pnl"]["avg_pct"] == pytest.approx((4.0 - 2.0 + 3.0) / 3, abs=1e-4)
+    assert ta["pnl"]["median_pct"] == 3.0
+    assert ta["by_side"]["long"]["n"] == 2
+    # even-n median = mean of the two middle values; also pin the min/max edges
+    assert ta["by_side"]["long"]["median_pct"] == pytest.approx(1.0, abs=1e-4)
+    assert ta["pnl"]["min_pct"] == -2.0 and ta["pnl"]["max_pct"] == 4.0
+    assert ta["by_side"]["short"]["win_rate"] == 1.0
+    assert ta["outcomes"] == {"win": 2, "loss": 1}
+    assert ta["mtime"]
+
+    xs = by_arm["xs_reversal"]
+    assert xs["extras"]["candidates"] == 1
+    assert xs["extras"]["forward"]["24h"]["n"] == 2
+    assert xs["extras"]["forward"]["24h"]["win_rate"] == 0.0
+    assert xs["extras"]["forward"]["72h"]["n"] == 1
+    assert xs["extras"]["forward"]["168h"] is None
+
+    atr = by_arm["atr_regime_calib"]
+    assert atr["extras"]["would_change"] == 2
+    d = atr["extras"]["calibration_delta"]
+    assert d["n"] == 2
+    assert d["avg_pct"] == pytest.approx((-0.6 + 0.2) / 2, abs=1e-4)
+    assert d["improved"] == 1
+    # change-arm: win = arm-HARMFUL, so the positive share must surface as
+    # arm_harmful_rate (never a literal win_rate) with an explicit semantics tag
+    assert atr["semantics"] == shadow_arms._COUNTERFACTUAL_SEMANTICS
+    assert "win_rate" not in atr["pnl"]
+    assert atr["pnl"]["arm_harmful_rate"] == pytest.approx(0.5, abs=1e-4)
+    assert atr["pnl"]["n"] == 2  # the not_material row carries no pnl_pct
+    assert atr["outcomes"] == {"win": 1, "loss": 1}
+
+    pcr = by_arm["per_coin_regime"]
+    assert pcr["extras"]["would"] == {
+        "pass": 1, "demote_to_weak_aligned": 1, "n/a_non_aligned": 1}
+    # ungraded rows (outcome None) must not produce a literal "None" bucket
+    assert pcr["outcomes"] == {"sim_winner": 1, "tier_na": 1}
+
+    rt = by_arm["relax_tier"]
+    assert rt["present"] is True and rt["records"] == 3
+    # rt_* field mapping: bare outcome/pnl_pct keys are None on this artifact
+    assert rt["outcomes"] == {"win": 1, "loss": 1}
+    assert rt["pnl"]["n"] == 2
+    assert "win_rate" not in rt["pnl"]  # counterfactual arm semantics
+    assert rt["pnl"]["arm_harmful_rate"] == pytest.approx(0.5, abs=1e-4)
+    assert rt["pnl"]["avg_pct"] == pytest.approx(1.0, abs=1e-4)
+    assert rt["by_side"]["long"]["n"] == 1
+    assert rt["by_side"]["short"]["arm_harmful_rate"] == 0.0
+
+    for missing in ("pullback", "daily_extension_cap", "trend_filter"):
+        assert by_arm[missing]["present"] is False
+        assert by_arm[missing]["records"] == 0
+        assert "note" in by_arm[missing]
+
+
+def test_backfill_summary_anonymous_read_and_ttl_cached(backfill_client, tmp_path):
+    c = backfill_client
+    r1 = c.get("/api/dashboard/shadow-arms/backfill-summary")  # no auth headers
+    assert r1.status_code == 200
+    assert r1.json()["files_present"] == 5
+    # A new artifact landing inside the TTL window must NOT show up...
+    _write_jsonl(tmp_path / "pullback_shadow.backfill.jsonl", [{"pnl_pct": -1.0}])
+    r2 = c.get("/api/dashboard/shadow-arms/backfill-summary")
+    assert r2.json()["files_present"] == 5
+    # ...until the cache entry is invalidated/expires.
+    from hermes_trader.dashboard import _TTL_CACHE
+    _TTL_CACHE.pop("shadow_arms_backfill_summary", None)
+    r3 = c.get("/api/dashboard/shadow-arms/backfill-summary")
+    assert r3.json()["files_present"] == 6
+    pb = {a["arm"]: a for a in r3.json()["arms"]}["pullback"]
+    assert pb["present"] is True and pb["pnl"]["n"] == 1
+
+
+def test_backfill_summary_empty_dir_is_200_not_error(make_backfill_client):
+    c = make_backfill_client()  # no artifacts written at all
+    r = c.get("/api/dashboard/shadow-arms/backfill-summary")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["files_present"] == 0
+    assert all(a["present"] is False for a in body["arms"])
+
+
+def test_backfill_summary_tolerates_torn_trailing_line(tmp_path, make_backfill_client):
+    p = tmp_path / "pullback_shadow.backfill.jsonl"
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write(_json.dumps({"pnl_pct": 1.5, "outcome": "win"}) + "\n")
+        fh.write('{"pnl_pct":')  # torn write from a killed backfiller
+    c = make_backfill_client()
+    r = c.get("/api/dashboard/shadow-arms/backfill-summary")
+    assert r.status_code == 200
+    pb = {a["arm"]: a for a in r.json()["arms"]}["pullback"]
+    assert pb["records"] == 1
+    assert pb["pnl"]["avg_pct"] == 1.5
 
 
 # ── blind-gate SSE mirror (agents/risk_gates.py) ─────────────────────────────
