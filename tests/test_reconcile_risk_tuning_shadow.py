@@ -2,7 +2,7 @@
 
 Covers: candle simulation grading of block proposals (winner vs loser),
 real-close join + leverage comparison, and stop_tuning wider-cap sim, with
-fetch_hl_candles and the memory file stubbed.
+_http_post and the memory file stubbed.
 """
 from __future__ import annotations
 
@@ -48,12 +48,19 @@ def _candles(entry_ts_iso: str, prices):
 _DSL = {"max_loss_pct": 1.0, "protect_pct": 2.5, "retrace_threshold": 0.5}
 
 
+def _serve(cands):
+    """Adapt a hand-built _C list to the raw candleSnapshot payload shape
+    served by the stubbed _http_post (absolute open times preserved)."""
+    rows = [{"t": c.t, "o": str(c.o), "h": str(c.h), "l": str(c.l),
+             "c": str(c.c), "v": "1"} for c in cands]
+    return lambda path, payload, *a, **k: rows
+
+
 def test_block_proposal_graded_as_loser(monkeypatch):
     entry = 100.0
     # price immediately drops through the 1% stop → counter-factual loss
     cands = _candles(_iso(48), [100, 99.5, 98.5, 97])
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", _serve(cands))
     r = {"timestamp": _iso(48), "rule": "breakout_score_floor",
          "coin": "AAA", "side": "long",
          "detail": {"entry_px": entry}, "outcome": None}
@@ -67,7 +74,7 @@ def test_block_proposal_graded_as_winner(monkeypatch):
     entry = 100.0
     # climbs to +4% then holds above trailing → counter-factual gain
     cands = _candles(_iso(48), [100, 101, 102, 103, 104, 103.9, 103.8])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", _serve(cands))
     r = {"timestamp": _iso(48), "rule": "per_coin_cooldown",
          "coin": "BBB", "side": "long",
          "detail": {"entry_px": entry}, "outcome": None}
@@ -113,7 +120,7 @@ def test_stop_tuning_wider_cap_no_network_flags(tmp_path, monkeypatch):
     series = [(100, 100), (99.0, 100), (101, 101), (102.5, 102.5), (103, 103)]
     for i, (lo, c) in enumerate(series):
         cands.append(_C(t0 + i*3600_000, c, c, lo, c))
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", _serve(cands))
 
     cfg = {"max_loss_pct": 0.8, "protect_pct": 2.5, "retrace_threshold": 0.5}
     r = {"timestamp": sig, "rule": "stop_tuning", "coin": "ADA",

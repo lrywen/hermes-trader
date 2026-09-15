@@ -2,7 +2,7 @@
 
 Covers: short candle walk (win as price falls, stop as it rises), real-close
 join with sign flip, the Tier-A admittable predicate (confidence + structure),
-Tier A/B split, and pending on fetch error. fetch_hl_candles / memory stubbed.
+Tier A/B split, and pending on fetch error. _http_post / memory stubbed.
 """
 from __future__ import annotations
 
@@ -41,6 +41,13 @@ def _candles(entry_ts_iso: str, prices):
         out.append(_C(base + i * 3600_000, px, max(px, p), min(px, p), p))
         px = p
     return out
+
+
+def _post_from(candles):
+    """Convert _C candle objects to candleSnapshot response dicts (the
+    _fetch_window supply path after the 2026-09-15 anchor fix)."""
+    return [{"t": c.t, "o": str(c.o), "h": str(c.h), "l": str(c.l),
+             "c": str(c.c), "v": "1"} for c in candles]
 
 
 _CFG = {
@@ -95,8 +102,9 @@ def test_admittable_via_fresh_burst_and_score():
 # ── grading: sim + real close ──────────────────────────────────────────────
 
 def test_short_sim_winner_when_price_falls(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: _candles(_iso(48), [100, 99, 98, 97]))
+    monkeypatch.setattr(mod, "_http_post",
+                        lambda *a, **k: _post_from(
+                            _candles(_iso(48), [100, 99, 98, 97])))
     r = _rec(_detail())
     assert mod.grade_record(r, _DSL, _CFG, {}) is True
     assert r["admittable_if_enabled"] is True
@@ -104,9 +112,10 @@ def test_short_sim_winner_when_price_falls(monkeypatch):
 
 
 def test_short_sim_loser_when_price_rises(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: _candles(_iso(48),
-                                                 [100, 100.5, 100.9, 101.5, 102]))
+    monkeypatch.setattr(mod, "_http_post",
+                        lambda *a, **k: _post_from(
+                            _candles(_iso(48),
+                                     [100, 100.5, 100.9, 101.5, 102])))
     r = _rec(_detail())
     assert mod.grade_record(r, _DSL, _CFG, {}) is True
     assert r["outcome"] == "sim_loser" and r["pnl_pct"] < 0
@@ -123,7 +132,7 @@ def test_real_close_short_flips_sign():
 
 
 def test_fetch_error_pending(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
+    monkeypatch.setattr(mod, "_http_post",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     r = _rec(_detail())
     assert mod.grade_record(r, _DSL, _CFG, {}) is False
@@ -131,11 +140,12 @@ def test_fetch_error_pending(monkeypatch):
 
 
 def test_tier_split_and_stats(monkeypatch, capsys):
-    win = _candles(_iso(48), [100, 98, 97, 96, 95])
-    lose = _candles(_iso(48), [100, 100.5, 101, 102, 103])
-    def fetch(coin, interval, n):
+    win = _post_from(_candles(_iso(48), [100, 98, 97, 96, 95]))
+    lose = _post_from(_candles(_iso(48), [100, 100.5, 101, 102, 103]))
+    def _post(path, payload, *a, **k):
+        coin = (payload.get("req") or {}).get("coin")
         return win if coin == "AAA" else lose
-    monkeypatch.setattr(mod, "fetch_hl_candles", fetch)
+    monkeypatch.setattr(mod, "_http_post", _post)
     rows = [_rec(_detail(conf=0.71, downtrend=True)),                    # A win
             {**_rec(_detail(conf=0.60, downtrend=True)), "coin": "BBB"}]  # B
     rows[1]["detail"]["entry_px"] = 100.0

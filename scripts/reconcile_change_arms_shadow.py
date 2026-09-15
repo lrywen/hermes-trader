@@ -85,7 +85,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
+from hermes_trader.client.hl_client import _http_post  # noqa: E402
 from hermes_trader.models.types import Candle  # noqa: E402
 import shadow_progress as sp  # noqa: E402
 
@@ -93,6 +93,33 @@ import shadow_progress as sp  # noqa: E402
 ROUND_TRIP_FEE_BPS = 5.0
 HOLD_BARS = 24          # 1h bars to hold the counterfactual trade (~24h)
 FETCH_COUNT = 300       # 1h candles fetched per coin (enough headroom)
+BAR_MS = 3600_000       # 1h
+
+
+def _fetch_window(coin: str, t0_ms: int) -> List[Candle]:
+    """Explicit time-anchored candle window around the signal.
+
+    Audit 2026-09-15: replaces ``fetch_hl_candles(coin, "1h", 300)``. The
+    "latest N bars" call silently mis-anchored any signal older than the
+    300-bar window: ``_find_entry_bar`` only checks ``t > signal``, so the
+    window's FIRST bar matched and the whole counterfactual ran on the wrong
+    tape (29/100 live outcomes disagreed with the PIT-anchored replay). We
+    request exactly [grid0-1h, grid0+(HOLD_BARS+4)h] so the signal bar is
+    always at the head of the returned tape.
+    """
+    grid0 = t0_ms - (t0_ms % BAR_MS)
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "1h",
+        "startTime": grid0 - BAR_MS,
+        "endTime": grid0 + (HOLD_BARS + 4) * BAR_MS,
+    }}
+    raw = _http_post("/info", payload)
+    if not isinstance(raw, list) or not raw:
+        return []
+    rows = sorted(raw, key=lambda c: int(c["t"]))
+    return [Candle(t=int(c["t"]), o=float(c["o"]), h=float(c["h"]),
+                   l=float(c["l"]), c=float(c["c"]), v=float(c["v"]))
+            for c in rows]
 
 # arm -> (grader label used in ARMS, env file var, default jsonl name)
 CHANGE_ARMS = {
@@ -330,7 +357,7 @@ def reconcile_arm(arm: str, records: List[Dict[str, Any]], fee_pct: float,
     place (sets outcome / pnl fields); returns the list of settled records."""
     cutoff_ms = time.time() * 1000.0 - window_hours * 3600.0 * 1000.0
     settled: List[Dict[str, Any]] = []
-    cache: Dict[str, List[Candle]] = {}
+    cache: Dict[tuple, List[Candle]] = {}
 
     for rec in records:
         if rec.get("outcome") in ("win", "loss"):
@@ -355,17 +382,26 @@ def reconcile_arm(arm: str, records: List[Dict[str, Any]], fee_pct: float,
             rec["outcome"] = "not_material"
             continue
 
-        if coin not in cache:
+        grid0 = int(ts_ms) - (int(ts_ms) % BAR_MS)
+        cache_key = (coin, grid0)   # window is signal-anchored; never share
+                                    # one tape across different signal times
+        if cache_key not in cache:
             try:
-                cache[coin] = fetch_hl_candles(coin, "1h", FETCH_COUNT)
+                cache[cache_key] = _fetch_window(coin, int(ts_ms))
             except Exception as e:  # network / rate-limit: leave for next run
                 print(f"  {coin}: fetch error: {e}")
-                cache[coin] = []
-        candles = cache[coin]
+                cache[cache_key] = []
+        candles = cache[cache_key]
         if not candles:
             continue
         idx = _find_entry_bar(candles, ts_ms)
         if idx < 0 or idx + hold_bars >= len(candles):
+            rec["outcome"] = "no_future_bars"
+            continue
+        # Anchoring guard (audit 2026-09-15): a first match beyond one bar
+        # step of the signal bar means the tape does not cover the signal
+        # (head gap) — refuse to settle on the wrong tape.
+        if candles[idx].t > grid0 + BAR_MS:
             rec["outcome"] = "no_future_bars"
             continue
 

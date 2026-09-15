@@ -46,7 +46,8 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
-from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.hl_client import _http_post
+from hermes_trader.models.types import Candle
 
 SHADOW_FILE = os.environ.get(
     "HERMES_RISK_TUNING_SHADOW_FILE",
@@ -72,6 +73,35 @@ def _parse_iso(ts: str) -> Optional[datetime]:
         return datetime.fromisoformat(ts.replace("Z", "+00:00"))
     except (ValueError, TypeError):
         return None
+
+
+BAR_MS = 3600_000  # 1h
+
+
+def _fetch_window(coin: str, t0_ms: int) -> List[Candle]:
+    """Explicit time-anchored candle window around the signal.
+
+    Audit 2026-09-15: replaces ``fetch_hl_candles(coin, "1h", 300)``. The
+    "latest N bars" call silently mis-anchored any signal older than the
+    300-bar window: ``_find_entry_bar`` only checks ``t >= signal``, so the
+    window's FIRST bar matched and the whole DSL walk ran on the wrong tape
+    (29/100 live outcomes disagreed with the PIT-anchored replay). We request
+    exactly [grid0-1h, grid0+(SIM_BARS+4)h] so the signal bar is always at
+    the head of the returned tape.
+    """
+    grid0 = t0_ms - (t0_ms % BAR_MS)
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "1h",
+        "startTime": grid0 - BAR_MS,
+        "endTime": grid0 + (SIM_BARS + 4) * BAR_MS,
+    }}
+    raw = _http_post("/info", payload)
+    if not isinstance(raw, list) or not raw:
+        return []
+    rows = sorted(raw, key=lambda c: int(c["t"]))
+    return [Candle(t=int(c["t"]), o=float(c["o"]), h=float(c["h"]),
+                   l=float(c["l"]), c=float(c["c"]), v=float(c["v"]))
+            for c in rows]
 
 
 def _find_entry_bar(candles, after_ts: datetime) -> int:
@@ -163,9 +193,15 @@ def grade_record(r: dict, dsl_cfg: dict, closes_by_coin: Dict[str, list]) -> boo
         cap = detail.get("candidate_max_loss_pct")
         if entry_px > 0 and cap:
             try:
-                candles = fetch_hl_candles(coin, "1h", 300)
+                candles = _fetch_window(coin, int(signal_ms))
                 idx = _find_entry_bar(candles, after_ts)
-                if 0 <= idx < len(candles) - 2:
+                # Anchoring guard folded into the condition: a first match
+                # beyond the signal bar means the tape does not cover the
+                # signal (head gap) — skip the sim fields, never walk the
+                # wrong tape. The outcome below is still written.
+                grid0 = int(signal_ms) - (int(signal_ms) % BAR_MS)
+                anchored = 0 <= idx and candles[idx].t <= grid0 + BAR_MS
+                if anchored and idx < len(candles) - 2:
                     live_cap = float(detail.get("live_spot_cap_pct") or
                                      cfg_get("dsl_exit.max_loss_pct",
                                              config=dsl_cfg))
@@ -233,13 +269,19 @@ def grade_record(r: dict, dsl_cfg: dict, closes_by_coin: Dict[str, list]) -> boo
 
     # Candle simulation for block proposals and unmatched leverage signals.
     try:
-        candles = fetch_hl_candles(coin, "1h", 300)
+        candles = _fetch_window(coin, int(signal_ms))
     except Exception as e:
         r["sim_error"] = f"fetch: {e}"
         return False
     idx = _find_entry_bar(candles, after_ts)
     if idx < 0 or idx >= len(candles) - 2:
         return False  # not enough future bars yet; leave pending
+    # Anchoring guard: a first match beyond the signal bar means the tape
+    # does not cover the signal (head gap) — leave pending, never walk the
+    # wrong tape.
+    grid0 = int(signal_ms) - (int(signal_ms) % BAR_MS)
+    if candles[idx].t > grid0 + BAR_MS:
+        return False
 
     max_loss = float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg))
     protect = float(cfg_get("dsl_exit.protect_pct", config=dsl_cfg))

@@ -45,7 +45,7 @@ os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.hl_client import _http_post
 from hermes_trader.models.types import Candle
 
 SHADOW_FILE = os.environ.get(
@@ -56,6 +56,35 @@ SHADOW_FILE = os.environ.get(
 ROUND_TRIP_FEE_BPS = 5.0
 HOLD_BARS = 2
 FETCH_COUNT = 200
+BAR_MS = 4 * 3600_000  # 4h
+
+
+def _fetch_window(coin: str, t0_ms: int) -> List[Candle]:
+    """Explicit time-anchored candle window around the signal.
+
+    Audit 2026-09-15: replaces ``fetch_hl_candles(coin, "4h", 200)``. The
+    "latest N bars" call silently mis-anchored any signal older than the
+    200-bar window: ``_find_entry_bar`` only checks ``t >= signal``, so the
+    window's FIRST bar matched and the whole counterfactual ran on the wrong
+    tape (29/100 live outcomes disagreed with the PIT-anchored replay). We
+    request exactly [grid0-8h, grid0+(HOLD_BARS+5)*4h] so the signal bar is
+    always at the head of the returned tape; the 2-bar lead guarantees
+    ``candles[idx-1]`` (B0, still forming at signal time) exists for the
+    entry-px fallback.
+    """
+    grid0 = t0_ms - (t0_ms % BAR_MS)
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "4h",
+        "startTime": grid0 - 2 * BAR_MS,
+        "endTime": grid0 + (1 + HOLD_BARS + 4) * BAR_MS,
+    }}
+    raw = _http_post("/info", payload)
+    if not isinstance(raw, list) or not raw:
+        return []
+    rows = sorted(raw, key=lambda c: int(c["t"]))
+    return [Candle(t=int(c["t"]), o=float(c["o"]), h=float(c["h"]),
+                   l=float(c["l"]), c=float(c["c"]), v=float(c["v"]))
+            for c in rows]
 
 
 def _parse_iso(ts: str) -> Optional[datetime]:
@@ -169,13 +198,22 @@ def main() -> int:
             r["outcome"] = "bad_timestamp"
             continue
         try:
-            candles = fetch_hl_candles(coin, "4h", FETCH_COUNT)
+            candles = _fetch_window(coin, int(after_ts.timestamp() * 1000))
         except Exception as e:
             print(f"  {coin}: fetch error: {e}")
             continue
         idx = _find_entry_bar(candles, after_ts)
         if idx < 1 or idx - 2 + args.hold_bars >= len(candles) \
                 or idx - 2 + args.hold_bars < 0:
+            r["outcome"] = "no_future_bars"
+            continue
+        # Anchoring guard (audit 2026-09-15): the first bar to open at/after
+        # the signal must be within one 4h step of the signal bar; a later
+        # match means the tape does not cover the signal (head gap) — refuse
+        # to grade rather than walk the wrong tape.
+        grid0 = int(after_ts.timestamp() * 1000)
+        grid0 -= grid0 % BAR_MS
+        if candles[idx].t > grid0 + BAR_MS:
             r["outcome"] = "no_future_bars"
             continue
         entry_px = float(r.get("entry_px") or 0)

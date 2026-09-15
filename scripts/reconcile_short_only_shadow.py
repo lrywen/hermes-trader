@@ -45,7 +45,8 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config  # noqa
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
+from hermes_trader.client.hl_client import _http_post  # noqa: E402
+from hermes_trader.models.types import Candle  # noqa: E402
 
 SHADOW_FILE = os.environ.get(
     "HERMES_SHORT_ONLY_SHADOW_FILE",
@@ -69,6 +70,33 @@ def _parse_iso(ts: str) -> Optional[datetime]:
         return datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
     except (TypeError, ValueError):
         return None
+
+
+BAR_MS = 3600_000  # 1h
+
+
+def _fetch_window(coin: str, t0_ms: int):
+    """Explicit time-anchored candle window around the signal.
+
+    Audit 2026-09-15: replaces ``fetch_hl_candles(coin, "1h", 300)`` — the
+    "latest N bars" call silently mis-anchored any signal older than the
+    window: ``_find_entry_bar`` only checks ``t >= signal``, so the window's
+    FIRST bar matched and the walk ran on the wrong tape. We request exactly
+    [grid0-1h, grid0+(SIM_BARS+4)h] so the signal bar is always covered.
+    """
+    grid0 = t0_ms - (t0_ms % BAR_MS)
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "1h",
+        "startTime": grid0 - BAR_MS,
+        "endTime": grid0 + (SIM_BARS + 4) * BAR_MS,
+    }}
+    raw = _http_post("/info", payload)
+    if not isinstance(raw, list) or not raw:
+        return []
+    rows = sorted(raw, key=lambda c: int(c["t"]))
+    return [Candle(t=int(c["t"]), o=float(c["o"]), h=float(c["h"]),
+                   l=float(c["l"]), c=float(c["c"]), v=float(c["v"]))
+            for c in rows]
 
 
 def _find_entry_bar(candles, after_ts: datetime) -> int:
@@ -178,12 +206,21 @@ def grade_record(r: dict, dsl_cfg: dict, cfg: dict,
     if not isinstance(entry_px, (int, float)) or entry_px <= 0:
         entry_px = None      # fall back to the signal-bar open below
     try:
-        candles = fetch_hl_candles(coin, "1h", 300)
+        candles = _fetch_window(coin, int(signal_ms))
     except Exception as e:
         r["sim_error"] = f"fetch: {e}"
         return False
     idx = _find_entry_bar(candles, after_ts)
     if idx < 0 or idx >= len(candles) - 2:
+        r["outcome"] = "no_future_bars"
+        return True
+    # Anchoring guard: the entry bar must open within one step of the
+    # signal bar. A later first match means the returned tape does not
+    # actually cover the signal (head gap) — grade no_future_bars rather
+    # than silently walking the wrong tape.
+    grid0 = int(signal_ms)
+    grid0 -= grid0 % BAR_MS
+    if candles[idx].t > grid0 + BAR_MS:
         r["outcome"] = "no_future_bars"
         return True
     if entry_px is None:

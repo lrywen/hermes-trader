@@ -19,9 +19,7 @@ sys.modules["reconcile_early"] = mod
 _spec.loader.exec_module(mod)
 
 
-class _C:
-    def __init__(self, t, o, h, l, c):
-        self.t, self.o, self.h, self.l, self.c = t, o, h, l, c
+BAR = 3600_000
 
 
 def _iso(h):
@@ -29,15 +27,23 @@ def _iso(h):
             ).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _candles(iso_ts, prices):
-    t0 = datetime.fromisoformat(iso_ts.replace("Z", "+00:00"))
-    base = int(t0.timestamp() * 1000) - 3600_000
-    out = []
-    px = prices[0]
-    for i, p in enumerate(prices):
-        out.append(_C(base + i * 3600_000, px, max(px, p), min(px, p), p))
-        px = p
-    return out
+def _serve(ohlc, drop=()):
+    """Fake _http_post: bars open on exact hour boundaries from the
+    request's startTime (like the real API). The entry bar is tape index 2
+    (grid0+1h) for a non-integral signal ts and the walk starts at index 3,
+    so tapes pad two leading bars before the price action."""
+    def _post(path, payload, *a, **k):
+        req = payload.get("req", {})
+        start = int(req["startTime"])
+        first = -(-start // BAR) * BAR
+        out = []
+        for i, (o, h, l, c) in enumerate(ohlc):
+            if i in drop:
+                continue
+            out.append({"t": first + i * BAR, "o": str(o), "h": str(h),
+                        "l": str(l), "c": str(c), "v": "1"})
+        return out
+    return _post
 
 
 _DSL = {"dsl_exit": {"protect_pct": 1.5, "retrace_threshold": 0.5}}
@@ -56,10 +62,11 @@ def _rec(detail=None, ts=None):
 
 
 def test_tight_stop_when_price_drops(monkeypatch):
-    # stop = 1.2 * 1% = 1.2%; a bar dipping -1.5% stops out (losing, half size)
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: _candles(_iso(48),
-                                                 [100, 99.5, 98.4, 98.0]))
+    # stop = 1.2 * 1% = 1.2%; a bar dipping -1.6% stops out (losing, half size)
+    monkeypatch.setattr(mod, "_http_post",
+                        _serve([(100, 100, 100, 100)] * 3
+                               + [(100, 100, 98.4, 98.4)]
+                               + [(100, 100, 100, 100)] * 4))
     r = _rec()
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["exit_reason"] == "tight_stop"
@@ -69,9 +76,11 @@ def test_tight_stop_when_price_drops(monkeypatch):
 
 
 def test_winner_half_size(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: _candles(_iso(48),
-                                                 [100, 102, 103, 104]))
+    monkeypatch.setattr(mod, "_http_post",
+                        _serve([(100, 100, 100, 100)] * 3
+                               + [(100, 101, 100, 101), (101, 102, 101, 102),
+                                  (102, 103, 102, 103), (103, 104, 103, 104),
+                                  (104, 104, 104, 104)]))
     r = _rec()
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["early_pnl_pct"] > 0 and r["mfe_pct"] > 3
@@ -95,7 +104,7 @@ def test_no_atr_pending_field():
 
 
 def test_fetch_error_returns_false(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
+    monkeypatch.setattr(mod, "_http_post",
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError("x")))
     r = _rec()
     assert mod.grade_record(r, _DSL, {}) is False
@@ -104,9 +113,9 @@ def test_fetch_error_returns_false(monkeypatch):
 
 def test_signal_bar_open_fallback(monkeypatch):
     d = _detail(entry=None)
-    monkeypatch.setattr(mod, "fetch_hl_candles",
-                        lambda *a, **k: _candles(_iso(48),
-                                                 [100, 102, 103, 104]))
+    monkeypatch.setattr(mod, "_http_post",
+                        _serve([(100, 100, 100, 100)] * 2
+                               + [(123, 123, 123, 123)] * 6))
     r = _rec(d)
     assert mod.grade_record(r, _DSL, {}) is True
     assert r.get("entry_px_source") == "signal_bar_open"

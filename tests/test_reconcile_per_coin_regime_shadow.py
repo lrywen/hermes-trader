@@ -6,7 +6,7 @@ Covers:
   * quadrant tier + soft-demotion aggregation stats,
   * terminal buckets (tier_na / no_side / no_future_bars) and pending when
     candles are still missing.
-fetch_hl_candles and the memory file are stubbed.
+_http_post (candleSnapshot) and the memory file are stubbed.
 """
 from __future__ import annotations
 
@@ -48,6 +48,12 @@ def _candles(entry_ts_iso: str, prices):
     return out
 
 
+def _snapshot(cands):
+    """Adapt _C bars to the candleSnapshot shape served by _http_post."""
+    return [{"t": c.t, "o": str(c.o), "h": str(c.h), "l": str(c.l),
+             "c": str(c.c), "v": "1"} for c in cands]
+
+
 _DSL = {"max_loss_pct": 0.8, "protect_pct": 1.5, "retrace_threshold": 0.5}
 
 
@@ -63,7 +69,7 @@ def _rec(side="long", tier="weak_review", would="pass", ts=None):
 
 def test_long_weak_tier_graded_loser(monkeypatch):
     cands = _candles(_iso(48), [100, 99.4, 98.5, 97])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", lambda *a, **k: _snapshot(cands))
     r = _rec("long", "weak_review")
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["outcome"] == "sim_loser"
@@ -73,7 +79,7 @@ def test_long_weak_tier_graded_loser(monkeypatch):
 def test_short_side_grades_winner_when_price_falls(monkeypatch):
     # short profits as price drops below entry
     cands = _candles(_iso(48), [100, 99, 98, 97, 96.5])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", lambda *a, **k: _snapshot(cands))
     r = _rec("short", "strong")
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["outcome"] == "sim_winner"
@@ -82,7 +88,7 @@ def test_short_side_grades_winner_when_price_falls(monkeypatch):
 
 def test_short_side_stops_when_price_rises(monkeypatch):
     cands = _candles(_iso(48), [100, 100.9, 101.5, 102])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", lambda *a, **k: _snapshot(cands))
     r = _rec("short", "weak_review")
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["outcome"] == "sim_loser"
@@ -91,7 +97,7 @@ def test_short_side_stops_when_price_rises(monkeypatch):
 def test_pending_when_no_future_bars(monkeypatch):
     # entry lands at/after the last candle -> terminal no_future_bars
     cands = _candles(_iso(0), [100, 101])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", lambda *a, **k: _snapshot(cands))
     r = _rec("long", "mid", ts=_iso(0))
     assert mod.grade_record(r, _DSL, {}) is True
     assert r["outcome"] == "no_future_bars"
@@ -100,7 +106,7 @@ def test_pending_when_no_future_bars(monkeypatch):
 def test_fetch_error_leaves_pending(monkeypatch):
     def _boom(*a, **k):
         raise RuntimeError("net down")
-    monkeypatch.setattr(mod, "fetch_hl_candles", _boom)
+    monkeypatch.setattr(mod, "_http_post", _boom)
     r = _rec("long", "mid")
     assert mod.grade_record(r, _DSL, {}) is False
     assert r.get("outcome") is None and "sim_error" in r
@@ -109,7 +115,7 @@ def test_fetch_error_leaves_pending(monkeypatch):
 # ── real-close join preferred ──────────────────────────────────────────────
 
 def test_real_close_long_preferred(monkeypatch):
-    monkeypatch.setattr(mod, "fetch_hl_candles",
+    monkeypatch.setattr(mod, "_http_post",
                         lambda *a, **k: pytest.fail("should not fetch"))
     sig_ms = datetime.now(timezone.utc).timestamp() * 1000 - 48 * 3600_000
     closes = {"AAA": [{"closed_at": sig_ms + 1000, "side": "long",
@@ -135,7 +141,7 @@ def test_real_close_short_flips_sign():
 def test_real_close_side_mismatch_skipped(monkeypatch):
     # a long close must not join a short candidate; falls through to sim
     cands = _candles(_iso(48), [100, 99, 98, 97])
-    monkeypatch.setattr(mod, "fetch_hl_candles", lambda *a, **k: cands)
+    monkeypatch.setattr(mod, "_http_post", lambda *a, **k: _snapshot(cands))
     sig_ms = datetime.now(timezone.utc).timestamp() * 1000 - 48 * 3600_000
     closes = {"AAA": [{"closed_at": sig_ms, "side": "long", "spot_pct": 3.0}]}
     r = _rec("short", "strong")

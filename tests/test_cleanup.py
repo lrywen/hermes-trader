@@ -5284,6 +5284,14 @@ def _recon_candles(prices, bar_ms=4 * 3600_000, t0=0):
             for i, p in enumerate(prices)]
 
 
+def _recon_serve(cands):
+    """Adapt hand-built candle objects to the raw candleSnapshot payload
+    served by the stubbed _http_post (absolute open times preserved)."""
+    rows = [{"t": int(c.t), "o": str(c.o), "h": str(c.h), "l": str(c.l),
+             "c": str(c.c), "v": str(c.v)} for c in cands]
+    return lambda path, payload, *a, **k: rows
+
+
 def test_reconcile_score_hold_semantics():
     """hold_bars=2 exits at B1.close (2nd bar to close after the signal,
     ~8h); scores are side-aware, fee-netted, and MAE tracks adverse closes."""
@@ -5355,8 +5363,7 @@ def test_reconcile_main_dry_run_scores_mature_vetoes(monkeypatch, tmp_path, caps
     prices = [100, 101, 102, 103, 104, 105, 106, 107]
     candles = [_mk_candle(bucket - 4 * BAR + i * BAR, p, p + 0.1, p - 0.1, p, 1000.0)
                for i, p in enumerate(prices)]
-    monkeypatch.setattr(rc, "fetch_hl_candles",
-                        lambda coin, interval, count: candles)
+    monkeypatch.setattr(rc, "_http_post", _recon_serve(candles))
     monkeypatch.setattr(sys, "argv",
                         ["reconcile", "--file", str(log), "--window-hours", "8"])
     assert rc.main() == 0
@@ -5398,8 +5405,7 @@ def test_reconcile_main_write_persists_outcomes(monkeypatch, tmp_path):
     prices = [100, 101, 102, 103, 104, 105, 106, 107]
     candles = [_mk_candle(bucket - 4 * BAR + i * BAR, p, p + 0.1, p - 0.1, p, 1000.0)
                for i, p in enumerate(prices)]
-    monkeypatch.setattr(rc, "fetch_hl_candles",
-                        lambda coin, interval, count: candles)
+    monkeypatch.setattr(rc, "_http_post", _recon_serve(candles))
     monkeypatch.setattr(sys, "argv",
                         ["reconcile", "--file", str(log), "--write"])
     assert rc.main() == 0
