@@ -36,7 +36,9 @@ def register_operator_routes(app: FastAPI) -> None:
     @app.get("/api/dashboard/operator/config")
     async def operator_config(request: Request) -> JSONResponse:
         _require_operator(request)
-        return JSONResponse(read_agent_config())
+        # Off the event loop: read_agent_config takes a flock on the config
+        # lock file; a held LOCK_EX elsewhere would freeze the loop here.
+        return JSONResponse(await asyncio.to_thread(read_agent_config))
 
     @app.post("/api/dashboard/operator/feed-ticket")
     async def operator_feed_ticket(request: Request) -> JSONResponse:

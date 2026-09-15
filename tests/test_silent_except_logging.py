@@ -357,12 +357,11 @@ def test_r12_b1_iso_ts_parse_logs_debug(caplog):
 
 
 def test_r12_b1_live_positions_logs_warning(monkeypatch, caplog):
-    """dashboard.py:449 — the live-fetch fallback inside
-    _positions_payload_uncached used to swallow fetch_account_state
-    failures and return []. The raw _live_positions() helper itself has
-    no try/except (it raises by design — callers decide the fallback);
-    the silent branch lives in _positions_payload_uncached, so we
-    force the live-fetch path: snapshot missing + user present."""
+    """dashboard.py:701 — R12-B1's fallback landed in _positions_payload
+    (the caller), not in _positions_payload_uncached: the uncached live
+    fetch raises by design so the caller can serve the last good payload
+    (stale-if-error) instead of a fake-flat []. With an empty cache the
+    payload degrades to [] plus a WARNING alerters can see."""
     from hermes_trader import dashboard
 
     def _explode(*_a, **_kw):
@@ -375,15 +374,17 @@ def test_r12_b1_live_positions_logs_warning(monkeypatch, caplog):
                         lambda max_age_s=120.0: None)
     monkeypatch.setattr(dashboard, "resolve_user_address", lambda: "0xabc")
     monkeypatch.setattr(dashboard, "fetch_account_state", _explode)
+    # Force the refresh path past the TTL gate, with no last-good payload.
+    monkeypatch.setitem(dashboard._POSITIONS_CACHE, "ts", 0.0)
+    monkeypatch.setitem(dashboard._POSITIONS_CACHE, "data", [])
     with caplog.at_level(logging.WARNING, logger=_DASH_LOGGER):
-        out = dashboard._positions_payload_uncached()
+        out = dashboard._positions_payload()
 
     assert out == []
     assert any(
-        "_live_positions" in rec.message
-        and "fetch_account_state failed" in rec.message
+        "positions refresh failed" in rec.message
         for rec in caplog.records
-    ), f"expected [dashboard] _live_positions warning, got: {[r.message for r in caplog.records]}"
+    ), f"expected [dashboard] positions-refresh warning, got: {[r.message for r in caplog.records]}"
 
 
 def test_r12_b1_cfg_leverage_hardcode_fallback(monkeypatch, caplog):

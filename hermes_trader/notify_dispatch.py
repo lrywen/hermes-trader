@@ -53,6 +53,8 @@ def dispatch(record: dict[str, Any]) -> None:
             _on_research(record)
         elif event == "error":
             _on_error(record)
+        elif event == "dsl_monitor_recovered":
+            _on_dsl_monitor_recovered(record)
         elif event == "loop_start":
             _on_loop_start(record)
         elif event == "loop_stop":
@@ -234,6 +236,24 @@ def _on_research(r: dict[str, Any]) -> None:
 def _on_error(r: dict[str, Any]) -> None:
     scope = r.get("scope") or r.get("coin") or "loop"
     fields = {"来源": scope, "错误": r.get("error")}
+    # Network outages (proxy/link failures) are edge-notified by the loop:
+    # one "outage started/ongoing" card plus a recovery card. Mark them
+    # warn rather than danger — server-side backup SLs still protect
+    # positions while the REST feed is unavailable.
+    error_kind = str(r.get("error_kind") or "")
+    if error_kind == "network" and scope == "dsl_monitor":
+        outage = str(r.get("outage") or "")
+        if outage == "ongoing":
+            fields = {
+                "来源": scope,
+                "状态": "网络中断持续中",
+                "累计失败": f"{r.get('failure_count', '—')} 次",
+                "最近错误": r.get("error"),
+            }
+        notify.send_card("DSL 行情接口网络中断（已聚合告警）", fields=fields,
+                         category="system", level="warn",
+                         dedup_key="error:dsl_monitor:network")
+        return
     # Watchdog hangs and DSL monitor failures are the most dangerous runtime
     # faults (no stop protection / stuck process) — mark them danger.
     danger_scopes = {"watchdog", "dsl_monitor"}
@@ -243,6 +263,17 @@ def _on_error(r: dict[str, Any]) -> None:
                      dedup_key=f"error:{scope}")
     if level == "danger":
         _mirror_secondary(f"系统错误 — {scope}", fields, "danger")
+
+
+def _on_dsl_monitor_recovered(r: dict[str, Any]) -> None:
+    fields = {
+        "来源": r.get("scope", "dsl_monitor"),
+        "中断时长": f"{r.get('outage_minutes', '—')} 分钟",
+        "累计失败": f"{r.get('failure_count', '—')} 次",
+    }
+    notify.send_card("DSL 行情接口已恢复", fields=fields,
+                     category="system", level="success",
+                     dedup_key="error:dsl_monitor:recovered")
 
 
 def _on_loop_start(r: dict[str, Any]) -> None:

@@ -738,6 +738,90 @@ def test_other_arms_hit_rate_unaffected_by_layer_scope(sg):
     assert s["decisions"] == 10 and s["hits"] == 10
 
 
+# ── 2026-09-14 有害率口径修正：prefilter 观察流不得作为 gate 误伤证据 ────────
+
+def test_ta_prefilter_win_outcomes_do_not_trigger_enforce_degrade(sg):
+    # 生产误报复现：168h 真实 gate 决策 64 次全放行（0 拦截、0 gate 回填），
+    # prefilter 观察流 ~4k 条天然 blocked 且回填后 win 率 ~53%。旧逻辑把
+    # prefilter 命中集当成「闸门误伤 55%」误报降级；修复后必须 MAINTAIN。
+    now = 1_700_000_000_000.0
+    recs = []
+    # 2304 win + 2009 loss 的 prefilter 观察（只取少量代表，数量级即可触发旧逻辑）
+    for _ in range(23):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="win"))
+    for _ in range(20):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="loss"))
+    # gate 层：64 次真实决策全部放行，无成熟反事实
+    for _ in range(64):
+        recs.append(_rec(now, layer="gate", blocked=False))
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    long = out["windows"][0]
+    assert long["total"] == 107
+    assert long["decisions"] == 64 and long["hits"] == 0
+    assert long["mature_outcomes"] == 43           # 全量 mature（含 prefilter）
+    assert long["gate_mature_outcomes"] == 0       # gate 层零成熟
+    assert out["verdict"] == sg.MAINTAIN
+    assert "降级" not in out["reason"]
+    # 面板 hit_set 有害率也不得来自 prefilter
+    assert out.get("hit_set_mature") == 0
+    assert any("prefilter" in w for w in out.get("warnings", []))
+
+
+def test_ta_gate_layer_harmful_outcomes_still_triggers_degrade(sg):
+    # 反向保障：若 gate 层真有 ≥20 条成熟命中且 win 率越红线，必须照常报警，
+    # 修复不能放过真实闸门误伤。
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(15):  # 60% gate 误伤
+        recs.append(_rec(now, layer="gate", blocked=True, outcome="win"))
+    for _ in range(10):
+        recs.append(_rec(now, layer="gate", blocked=True, outcome="loss"))
+    for _ in range(35):
+        recs.append(_rec(now, layer="gate", blocked=False))
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    long = out["windows"][0]
+    assert long["gate_mature_outcomes"] == 25
+    assert out["verdict"] == sg.DEGRADED_REVIEW
+    assert "臂有害率" in out["reason"]
+
+
+def test_ta_gate_layer_healthy_outcomes_maintain_even_with_prefilter_noise(sg):
+    # gate 层成熟命中以 loss（成功避损）为主时判 MAINTAIN；混入高 win 率
+    # prefilter 噪声不影响结论。
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(50):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="win"))
+    for _ in range(22):
+        recs.append(_rec(now, layer="gate", blocked=True, outcome="loss"))
+    for _ in range(3):
+        recs.append(_rec(now, layer="gate", blocked=True, outcome="win"))
+    for _ in range(35):
+        recs.append(_rec(now, layer="gate", blocked=False))
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.MAINTAIN
+    assert out["hit_set_mature"] == 25
+
+
+def test_ta_prefilter_win_outcomes_do_not_trigger_shadow_review(sg):
+    # shadow 灰度期同样不得因 prefilter 命中集 win 率而判 REVIEW。
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(25):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="win"))
+    for _ in range(20):
+        recs.append(_rec(now, layer="prefilter", blocked=True, outcome="loss"))
+    for _ in range(30):
+        recs.append(_rec(now, layer="gate", blocked=False))
+    out = sg.grade_arm("ta_late_entry", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["windows"][0]["gate_mature_outcomes"] == 0
+    assert out["verdict"] != sg.REVIEW
+
+
 # ── M1: enforce arms get a health verdict, never a promotion-oriented one ─────
 
 def test_enforce_high_hit_rate_triggers_degraded_review(sg):

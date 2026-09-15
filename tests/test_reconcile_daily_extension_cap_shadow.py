@@ -24,17 +24,20 @@ sys.modules["reconcile_daily_ext"] = mod
 _spec.loader.exec_module(mod)
 
 
-def _serve(prices):
-    """Fake _http_post: closes[i] is signal-relative bar (i-1); index 0 pre-bar.
+def _serve(prices, drop=()):
+    """Fake _http_post serving 1h closes == `prices`, boundary-aligned.
 
-    The grader requests startTime = t0-1h, so row 0 is the pre-bar and row 1 is
-    the signal bar (the would-be chase entry).
+    Bars open on exact hour boundaries (like the real API): the first bar is
+    the first hour boundary >= startTime. With an unaligned t0 that is the
+    signal bar itself; with an aligned t0 it is the pre-bar. Indices in `drop`
+    are omitted to simulate holes; remaining bars keep their absolute times.
     """
     def _post(path, payload, *a, **k):
         req = payload.get("req", {})
         start = int(req["startTime"])
-        return [{"t": start + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
-                 "v": "1"} for i, p in enumerate(prices)]
+        first = -(-start // 3600_000) * 3600_000
+        return [{"t": first + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
+                 "v": "1"} for i, p in enumerate(prices) if i not in drop]
     return _post
 
 
@@ -74,8 +77,8 @@ def test_signal_ms_parses_iso_and_epoch():
 
 def test_win_when_72h_forward_up(monkeypatch):
     prices = [100.0] * 200
-    # signal-bar entry = index 1 = 100; 72h forward close = index 73
-    prices[73] = 106.0
+    # unaligned t0: index 0 = signal bar (entry); 72h forward close = index 72
+    prices[72] = 106.0
     monkeypatch.setattr(mod, "_http_post", _serve(prices))
     r = _rec()
     assert mod.grade(r) == "win"
@@ -85,7 +88,7 @@ def test_win_when_72h_forward_up(monkeypatch):
 
 def test_loss_when_72h_forward_down(monkeypatch):
     prices = [100.0] * 200
-    prices[73] = 92.0
+    prices[72] = 92.0
     monkeypatch.setattr(mod, "_http_post", _serve(prices))
     r = _rec()
     assert mod.grade(r) == "loss"
@@ -93,15 +96,35 @@ def test_loss_when_72h_forward_down(monkeypatch):
 
 
 def test_extended_chase_entry_uses_signal_bar_close(monkeypatch):
-    # pre-bar (idx0) != signal bar (idx1): entry must be the signal-bar close,
-    # i.e. the price at the moment the gate fired (the chase), not the prior bar.
-    prices = [100.0] + [130.0] + [130.0] * 198
+    # t0 exactly on the hour: the tape includes the pre-bar at index 0 and the
+    # signal bar at index 1. Entry must be the signal-bar close (the chase),
+    # never the pre-bar close.
+    prices = [100.0] + [130.0] * 199
     prices[73] = 143.0   # +10% off the 130 chase entry
     monkeypatch.setattr(mod, "_http_post", _serve(prices))
     r = _rec(change=45.0)
+    aligned = int(time.time()) - 100 * 3600
+    aligned -= aligned % 3600
+    r["timestamp"] = _iso_ms(aligned * 1000)
     assert mod.grade(r) == "win"
     assert r["entry_px"] == pytest.approx(130.0)
     assert r["pnl_pct"] == pytest.approx(10.0, abs=0.01)
+
+
+def test_missing_signal_bar_is_no_entry_not_fallback(monkeypatch):
+    # A hole at the signal bar must yield no_entry_px — never fall back to a
+    # neighbouring bar's close.
+    monkeypatch.setattr(mod, "_http_post", _serve([100.0] * 200, drop={0}))
+    assert mod.grade(_rec()) == "no_entry_px"
+
+
+def test_mid_window_gap_does_not_shift_grid(monkeypatch):
+    prices = [100.0] * 200
+    prices[72] = 106.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={7, 33}))
+    r = _rec()
+    assert mod.grade(r) == "win"
+    assert r["forward"]["fwd72h_px"] == pytest.approx(106.0)
 
 
 def test_immature_when_72h_bar_missing(monkeypatch):
@@ -148,8 +171,8 @@ def _run_main(monkeypatch, file_path, write=False):
 
 def test_main_writes_win_loss_and_skips_graded(tmp_path, monkeypatch):
     # Two rows: one would-block chase (up -> win), one below-cap (down -> loss).
-    up = [100.0] * 200; up[73] = 110.0
-    down = [100.0] * 200; down[73] = 90.0
+    up = [100.0] * 200; up[72] = 110.0
+    down = [100.0] * 200; down[72] = 90.0
 
     calls = {"n": 0}
     tapes = [up, down]
@@ -158,8 +181,9 @@ def test_main_writes_win_loss_and_skips_graded(tmp_path, monkeypatch):
         # Distinguish by coin: AAA -> up tape, BBB -> down tape.
         tape = tapes[0] if payload["req"]["coin"] == "AAA" else tapes[1]
         start = int(payload["req"]["startTime"])
+        first = -(-start // 3600_000) * 3600_000
         calls["n"] += 1
-        return [{"t": start + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
+        return [{"t": first + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
                  "v": "1"} for i, p in enumerate(tape)]
 
     monkeypatch.setattr(mod, "_http_post", _post)

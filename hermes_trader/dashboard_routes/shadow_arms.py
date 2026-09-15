@@ -187,7 +187,9 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
     ) -> JSONResponse:
         """Nightly verdict snapshots (oldest first) for the trend view."""
         try:
-            sg = _load_shadow_grade()
+            # Off the event loop: _load_shadow_grade exec_module's the grader
+            # source; blocking import work must not freeze the loop.
+            sg = await asyncio.to_thread(_load_shadow_grade)
         except Exception as e:
             raise HTTPException(503, f"shadow-arm grader unavailable: {e}")
         since_ms = time.time() * 1000.0 - days * 86400.0 * 1000.0

@@ -23,17 +23,20 @@ sys.modules["reconcile_xs"] = mod
 _spec.loader.exec_module(mod)
 
 
-def _serve(prices):
+def _serve(prices, drop=()):
     """Return a fake _http_post serving candles whose closes == `prices`.
 
-    The grader requests startTime = t0-1h, so index 0 is the pre-bar and
-    closes[i] corresponds to signal-relative bar (i-1).
+    Bars open on exact hour boundaries (like the real API): the first bar is
+    the first hour boundary >= startTime. Indices in `drop` are omitted to
+    simulate holes/head offsets; the remaining bars keep their absolute open
+    times, so a well-anchored grader must not shift.
     """
     def _post(path, payload, *a, **k):
         req = payload.get("req", {})
         start = int(req["startTime"])
-        return [{"t": start + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
-                 "v": "1"} for i, p in enumerate(prices)]
+        first = -(-start // 3600_000) * 3600_000
+        return [{"t": first + i * 3600_000, "o": p, "h": p, "l": p, "c": p,
+                 "v": "1"} for i, p in enumerate(prices) if i not in drop]
     return _post
 
 
@@ -62,8 +65,8 @@ def test_signal_ms_accepts_millis_and_iso():
 
 def test_win_when_72h_up(monkeypatch):
     prices = [100.0] * 200
-    # index 73 = the 72h forward close (index 0 is pre-bar)
-    prices[73] = 105.0
+    # index 72 = the close of the bar opening at grid0 + 72h
+    prices[72] = 105.0
     monkeypatch.setattr(mod, "_http_post", _serve(prices))
     r = _rec()
     assert mod.grade(r) == "win"
@@ -74,11 +77,48 @@ def test_win_when_72h_up(monkeypatch):
 
 def test_loss_when_72h_down(monkeypatch):
     prices = [100.0] * 200
-    prices[73] = 94.0
+    prices[72] = 94.0
     monkeypatch.setattr(mod, "_http_post", _serve(prices))
     r = _rec()
     assert mod.grade(r) == "loss"
     assert r["pnl_pct"] == pytest.approx(-6.0, abs=0.01)
+
+
+def test_head_offset_does_not_shift_grid(monkeypatch):
+    # A missing head bar must not shift the forward grid (the live defect
+    # this fix addresses): same absolute tape, with and without bar 0.
+    prices = [100.0] * 200
+    prices[24] = 102.0
+    prices[72] = 105.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices))
+    r = _rec()
+    assert mod.grade(r) == "win"
+    base = dict(r["forward"])
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={0}))
+    r2 = _rec()
+    assert mod.grade(r2) == "win"
+    assert r2["forward"] == base
+
+
+def test_mid_window_gap_does_not_shift_grid(monkeypatch):
+    prices = [100.0] * 200
+    prices[72] = 105.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={10, 50}))
+    r = _rec()
+    assert mod.grade(r) == "win"
+    assert r["forward"]["fwd72h_px"] == pytest.approx(105.0)
+
+
+def test_missing_primary_bar_is_immature_not_shifted(monkeypatch):
+    # A hole exactly at the 72h bar must grade immature — never borrow a
+    # neighbouring bar's close.
+    prices = [100.0] * 200
+    prices[24] = 102.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={72}))
+    r = _rec()
+    assert mod.grade(r) == "immature"
+    assert r["forward"]["fwd72h_pct"] is None
+    assert r["forward"]["fwd24h_pct"] == pytest.approx(2.0, abs=0.01)
 
 
 def test_mature_vocabulary_matches_grader():

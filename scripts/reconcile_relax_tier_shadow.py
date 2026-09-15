@@ -85,12 +85,8 @@ def _signal_ms(rec: dict[str, Any]) -> Optional[int]:
     return None
 
 
-def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float]]:
-    """4h closes from one bar before the signal through start+hours.
-
-    Index 0 is the 4h bar whose open is at/just before t0 (B0, forming at
-    signal); the n-hours forward close lives at index n//4 + 1.
-    """
+def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[dict[int, float]]:
+    """4h closes keyed by bar-open ms, from one bar before the signal."""
     bar_ms = 4 * 3600_000
     end = start_ms + (hours + 8) * 3600_000
     payload = {"type": "candleSnapshot", "req": {
@@ -99,8 +95,7 @@ def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float
     raw = _http_post("/info", payload)
     if not isinstance(raw, list) or not raw:
         return None
-    rows = sorted(raw, key=lambda c: int(c["t"]))
-    return [float(c["c"]) for c in rows]
+    return {int(c["t"]): float(c["c"]) for c in raw}
 
 
 def grade(rec: dict[str, Any]) -> str:
@@ -119,26 +114,32 @@ def grade(rec: dict[str, Any]) -> str:
     if not t0:
         return "bad_timestamp"
 
-    closes = _forward_closes(coin, t0, max(FWD_HOURS))
-    if not closes:
+    bars = _forward_closes(coin, t0, max(FWD_HOURS))
+    if not bars:
         return "no_future_bars"
 
     sign = 1.0 if side == "long" else -1.0
     fee_pct = ROUND_TRIP_FEE_BPS / 100.0
+    # Timestamp-anchored grid: B0 is the 4h bar whose OPEN is the 4h boundary
+    # containing t0; the forward-h close is the close of the bar opening
+    # (h//4 + 1) bars after B0 (preserves the legacy grid geometry).
+    bar_ms = 4 * 3600_000
+    g0 = t0 - (t0 % bar_ms)
     grid: dict[str, Any] = {}
-    # closes[0] = B0 (forming at signal); n-hours close = index n//4 + 1.
     for h in FWD_HOURS:
-        idx = h // 4 + 1
-        if idx >= len(closes):
+        px = bars.get(g0 + (h // 4 + 1) * bar_ms)
+        if px is None:
             grid[f"fwd{h}h_pct"] = None
             continue
-        px = closes[idx]
         net = sign * (px - entry) / entry * 100.0 - fee_pct
         grid[f"fwd{h}h_pct"] = round(net, 4)
         grid[f"fwd{h}h_px"] = px
-    # Worst adverse side-aware close across the whole matured window.
+    # Worst adverse side-aware close across the window from B0 onward.
+    window = [c for t, c in bars.items() if t >= g0]
+    if not window:
+        return "no_future_bars"
     grid["mae_pct"] = round(
-        min(sign * (c - entry) / entry * 100.0 - fee_pct for c in closes), 4)
+        min(sign * (c - entry) / entry * 100.0 - fee_pct for c in window), 4)
 
     rec["rt_forward"] = grid
     primary = grid.get(f"fwd{PRIMARY_HOURS}h_pct")

@@ -25,6 +25,7 @@ from hermes_trader.dashboard import (
     _equity_curve_payload,
     _http_cache_params,
     _positions_payload,
+    _positions_served_stale,
     _public_config_project,
     _public_feed_filter,
     _redact,
@@ -176,7 +177,13 @@ def register_public_routes(app: FastAPI) -> None:
         # ~1.3s on testnet). Run in a worker thread so the event loop stays
         # responsive to / and SSE while the live fetch is in flight.
         payload = await asyncio.to_thread(_positions_payload)
-        return JSONResponse(payload)
+        resp = JSONResponse(payload)
+        if _positions_served_stale():
+            # Upstream HL read failed and this is the last good snapshot —
+            # flag it so the UI can mark the table as dated instead of
+            # presenting it as live.
+            resp.headers["X-Positions-Stale"] = "1"
+        return resp
 
     @app.get("/api/dashboard/risk-status")
     async def dashboard_risk_status() -> JSONResponse:

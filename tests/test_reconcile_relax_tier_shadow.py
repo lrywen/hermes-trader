@@ -27,18 +27,20 @@ _spec.loader.exec_module(mod)
 BAR = 4 * 3600_000
 
 
-def _serve(prices):
+def _serve(prices, drop=()):
     """Fake _http_post serving 4h candles whose closes == `prices`.
 
-    The grader requests startTime = t0 - one 4h bar, so closes[0] is B0
-    (the bar forming at signal) and the n-hours forward close is at
-    index n//4 + 1.
+    Bars open on exact 4h boundaries (like the real API): the first bar is
+    the first 4h boundary >= startTime. With an unaligned t0 that is B0 (the
+    bar forming at signal); with an aligned t0 it is the pre-bar. Indices in
+    `drop` are omitted to simulate holes; remaining bars keep absolute times.
     """
     def _post(path, payload, *a, **k):
         req = payload.get("req", {})
         start = int(req["startTime"])
-        return [{"t": start + i * BAR, "o": p, "h": p, "l": p, "c": p,
-                 "v": "1"} for i, p in enumerate(prices)]
+        first = -(-start // BAR) * BAR
+        return [{"t": first + i * BAR, "o": p, "h": p, "l": p, "c": p,
+                 "v": "1"} for i, p in enumerate(prices) if i not in drop]
     return _post
 
 
@@ -103,6 +105,41 @@ def test_immature_when_72h_bar_missing(monkeypatch):
 def test_no_future_bars_on_empty_fetch(monkeypatch):
     monkeypatch.setattr(mod, "_http_post", lambda *a, **k: [])
     assert mod.grade(_rec(rt_no_adx20_would_block=True)) == "no_future_bars"
+
+
+def test_aligned_signal_includes_pre_bar_without_shift(monkeypatch):
+    # t0 exactly on a 4h boundary: the tape gains a pre-bar at index 0; the
+    # grid must stay anchored (fwd72h = index 20 here, not 19).
+    prices = [100.0] * 60
+    prices[20] = 106.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices))
+    r = _rec(rt_no_adx20_would_block=True)
+    t0 = int(time.time() * 1000) - 100 * 3600_000
+    r["timestamp"] = t0 - (t0 % BAR)
+    assert mod.grade(r) == "win"
+    assert r["rt_pnl_pct"] == pytest.approx(5.95, abs=0.01)
+
+
+def test_head_gap_does_not_shift_grid(monkeypatch):
+    # B0 missing entirely: the forward grid must still anchor by timestamp.
+    prices = [100.0] * 60
+    prices[19] = 106.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={0}))
+    r = _rec(rt_no_adx20_would_block=True)
+    assert mod.grade(r) == "win"
+    assert r["rt_forward"]["fwd72h_px"] == pytest.approx(106.0)
+
+
+def test_missing_primary_bar_is_immature_not_shifted(monkeypatch):
+    # A hole exactly at the 72h bar must grade immature — never borrow a
+    # neighbouring bar's close.
+    prices = [100.0] * 60
+    prices[7] = 103.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices, drop={19}))
+    r = _rec(rt_no_adx20_would_block=True)
+    assert mod.grade(r) == "immature"
+    assert r["rt_forward"]["fwd72h_pct"] is None
+    assert r["rt_forward"]["fwd24h_pct"] == pytest.approx(2.95, abs=0.01)
 
 
 def test_guards_bad_record():

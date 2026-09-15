@@ -65,8 +65,8 @@ def _signal_ms(rec: dict[str, Any]) -> Optional[int]:
     return None
 
 
-def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float]]:
-    """1h closes from the signal bar through start+hours (inclusive)."""
+def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[dict[int, float]]:
+    """1h closes keyed by bar-open ms, from start-1h through start+hours."""
     end = start_ms + (hours + 4) * 3600_000
     payload = {"type": "candleSnapshot", "req": {
         "coin": coin, "interval": "1h",
@@ -74,8 +74,7 @@ def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float
     raw = _http_post("/info", payload)
     if not isinstance(raw, list) or not raw:
         return None
-    rows = sorted(raw, key=lambda c: int(c["t"]))
-    return [float(c["c"]) for c in rows]
+    return {int(c["t"]): float(c["c"]) for c in raw}
 
 
 def grade(rec: dict[str, Any]) -> str:
@@ -94,18 +93,22 @@ def grade(rec: dict[str, Any]) -> str:
     if not t0:
         return "bad_timestamp"
 
-    closes = _forward_closes(coin, t0, max(FWD_HOURS))
-    if not closes:
+    bars = _forward_closes(coin, t0, max(FWD_HOURS))
+    if not bars:
         return "no_future_bars"
 
-    # closes[0] is the bar at/just before t0; forward H-bar close = index H+1.
+    # Timestamp-anchored grid: the forward-h close is the close of the bar
+    # whose OPEN time is grid0 + h*step (grid0 = signal floored to the hour).
+    # The old positional read (closes[h+1]) silently shifted the whole grid
+    # whenever the API window had a head gap or an extra leading bar.
+    step = 3600_000
+    grid0 = t0 - (t0 % step)
     grid: dict[str, Any] = {}
     for h in FWD_HOURS:
-        idx = h + 1
-        if idx >= len(closes):
+        px = bars.get(grid0 + h * step)
+        if px is None:
             grid[f"fwd{h}h_pct"] = None
             continue
-        px = closes[idx]
         pct = (px - entry) / entry * 100.0
         grid[f"fwd{h}h_pct"] = round(pct, 4)
         grid[f"fwd{h}h_px"] = px

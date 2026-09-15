@@ -677,7 +677,7 @@ def _risk_status_payload() -> dict[str, Any]:
     return out
 
 
-_POSITIONS_CACHE: dict[str, Any] = {"ts": 0.0, "data": []}
+_POSITIONS_CACHE: dict[str, Any] = {"ts": 0.0, "data": [], "stale": False}
 # F26: acceptable staleness for the display positions endpoint (env-overridable).
 _POSITIONS_CACHE_TTL_S = float(os.environ.get("HERMES_POSITIONS_CACHE_TTL_S", "5.0"))
 
@@ -689,14 +689,44 @@ def _positions_payload() -> list[dict[str, Any]]:
     fetch_account_state(include_hip3=True) — each call is ~9 HTTP POSTs
     (1 main + 8 HIP-3 dexes) even with the parallel fan-out. Cache TTL
     is short enough that the position table never feels stuck.
+
+    Stale-if-error: when a refresh fails (HL unreachable / degraded proxy),
+    serve the last good payload instead of a fake-flat [] — a transient
+    upstream outage must not empty the operator's position table. The
+    endpoint marks that response X-Positions-Stale so the UI can flag it.
     """
     now = time.time()
     if now - _POSITIONS_CACHE["ts"] < _POSITIONS_CACHE_TTL_S:
         return _POSITIONS_CACHE["data"]
-    data = _positions_payload_uncached()
-    _POSITIONS_CACHE["ts"] = now
+    try:
+        data = _positions_payload_uncached()
+    except Exception as e:
+        # R12-B1: silent fallback to [] used to make a working dashboard
+        # look "flat" the moment the HL account-state fetch started
+        # throwing — the operator had no signal that the live read path
+        # was bypassed. Warning so alerters see the failure; then serve
+        # the last good payload, negative-cached for the TTL so a degraded
+        # upstream doesn't make every poll eat the full timeout chain.
+        logger.warning(
+            "[dashboard] positions refresh failed; serving last good: %s: %s",
+            type(e).__name__, e,
+        )
+        if _POSITIONS_CACHE["ts"] > 0:
+            _POSITIONS_CACHE["ts"] = now
+            _POSITIONS_CACHE["stale"] = True
+            return _POSITIONS_CACHE["data"]
+        return []
+    # Timestamp at completion, not start: a slow refresh must not burn
+    # part of its own TTL before the data is even served.
+    _POSITIONS_CACHE["ts"] = time.time()
     _POSITIONS_CACHE["data"] = data
+    _POSITIONS_CACHE["stale"] = False
     return data
+
+
+def _positions_served_stale() -> bool:
+    """True when the latest _positions_payload() served the stale fallback."""
+    return bool(_POSITIONS_CACHE.get("stale"))
 
 
 def _positions_payload_uncached() -> list[dict[str, Any]]:
@@ -714,22 +744,11 @@ def _positions_payload_uncached() -> list[dict[str, Any]]:
     user = resolve_user_address()
     if not user:
         return []
-    try:
-        # include_hip3=True so xyz:MU / vntl:* positions appear in the
-        # dashboard list alongside main-dex positions; HIP-3 dexes are
-        # separate clearinghouses that the default fetch ignores.
-        state = fetch_account_state(user, include_hip3=True)
-    except Exception as e:
-        # R12-B1: silent fallback to [] used to make a working dashboard
-        # look "flat" the moment the HL account-state fetch started
-        # throwing — the operator had no signal that the live read path
-        # was bypassed. Warning so alerters see the failure, but the
-        # dashboard still renders the rest of the read paths.
-        logger.warning(
-            "[dashboard] _live_positions fetch_account_state failed: %s: %s",
-            type(e).__name__, e,
-        )
-        return []
+    # include_hip3=True so xyz:MU / vntl:* positions appear in the
+    # dashboard list alongside main-dex positions; HIP-3 dexes are
+    # separate clearinghouses that the default fetch ignores. Failures
+    # propagate to _positions_payload's stale-if-error fallback.
+    state = fetch_account_state(user, include_hip3=True)
     return _rows_from_state(state)
 
 

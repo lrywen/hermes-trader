@@ -594,6 +594,13 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
     decisions = 0
     outcomes = []          # backfilled counterfactual outcomes: win/loss strings
     pnl_usd = []
+    # Audit 2026-09-14 (有害率口径修正)：gate-only 臂（ta_late_entry）的
+    # prefilter 是「只记拦截」的采样偏置观察流（天然 blocked≈100%、无真实
+    # entry/notional、按 bar open 做假设反事实）。它既不能做宽度分母，也不能
+    # 做「闸门是否误伤真实交易」的有害率证据。单独累计 gate 层 outcome，供
+    # _effective_harm / 回填门限只在真实下单闸门层上判定。
+    gate_mature = 0
+    gate_eligible = 0
     # Audit 2026-09-12 (回填分母修正)：not_material 是 reconcile 对「该记录根本
     # 不会触发本臂动作（无可评估反事实）」的终态标记（如 sizing_v2 名义额变动
     # ≤1%、atr_calib would_change=False），不是待回填缺口。计入回填分母会把
@@ -618,6 +625,11 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
         oc = rec.get("outcome")
         if oc in ("win", "loss"):
             outcomes.append(oc)
+        if gate_only_decisions and _is_gate_layer_record(rec):
+            if oc != "not_material":
+                gate_eligible += 1
+            if oc in ("win", "loss"):
+                gate_mature += 1
         p = rec.get("pnl_usd")
         if isinstance(p, (int, float)):
             pnl_usd.append(float(p))
@@ -638,6 +650,10 @@ def _window_stats(records: list[dict], kind: str, window_h: int, now_ms: float,
         "outcomes_pending": bool(
             window_h < 168 and mature == 0 and total > 0),
         "not_material_outcomes": not_material,
+        # gate-only 臂：真实下单闸门层的成熟/可评估 outcome 数（不含 prefilter
+        # 观察流）。gate_mature=0 时对该臂不存在任何「闸门误伤」证据。
+        "gate_mature_outcomes": gate_mature,
+        "gate_eligible_total": gate_eligible,
         # 回填分母：剔除终态不可评估记录后的可评估记录数。
         "eligible_total": total - not_material,
     }
@@ -651,6 +667,16 @@ def _backfill_rate(s: dict) -> float:
     稀释（atr_regime_calib 实测 25/325=7.7% 的假象，实际 24/25≈96%）。"""
     eligible = s.get("eligible_total", s["total"])
     return s["mature_outcomes"] / eligible if eligible else 0.0
+
+
+def _gate_backfill_rate(s: dict) -> float:
+    """gate-only 臂的真实下单闸门层回填率 = gate_mature/gate_eligible。
+
+    prefilter 观察流的回填与「闸门对真实交易的有效性」无关，gate 层自己的
+    回填覆盖才决定有害率结论的置信度。gate 层尚无可评估记录时返回 0.0
+    （调用方应同时看 gate_mature 是否达到判定门限，而非仅凭低回填率报警）。"""
+    elig = s.get("gate_eligible_total", 0)
+    return (s.get("gate_mature_outcomes", 0) / elig) if elig else 0.0
 
 
 def _independent_outcomes(records: list[dict], window_ms: float,
@@ -890,6 +916,12 @@ def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
     其调用方不使用 harmful_signal。"""
     mature = s["mature_outcomes"]
     cut = now_ms - w_long * 3_600_000
+    # Audit 2026-09-14：gate-only 臂（ta_late_entry）的有害率只采信真实下单
+    # 闸门层。prefilter 是「只记拦截」的采样偏置观察流（天然 blocked≈100%、
+    # 按 bar open 做假设反事实、同信号每轮扫描重复落盘），把它的反事实 win 率
+    # 当成「闸门误伤率」会把生产实测 64 次 gate 决策零拦截的健康臂误判成 55%
+    # 有害。gate_only=True 时非 gate 层记录一律不进命中集/全记录桶。
+    gate_only = arm in GATE_LAYER_DECISION_ARMS
 
     def _empty_bucket() -> dict:
         return {"n": 0, "wins": 0, "pnl_sum": 0.0, "has_pnl": False,
@@ -915,6 +947,8 @@ def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
         ts = _record_ts_ms(r)
         if ts is None or ts < cut or r.get("outcome") not in ("win", "loss"):
             continue
+        if gate_only and not _is_gate_layer_record(r):
+            continue
         _tally(allr, r)
         if _hit_field(r, kind, arm) is True:
             _tally(hit, r)
@@ -925,6 +959,11 @@ def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
     else:
         b, basis = allr, "all_records"
         denom_prefix = "全记录"
+    # gate-only 臂：gate 层成熟样本（命中或放行后被回填的真实决策）不足时，
+    # 没有任何关于真实闸门误伤率的证据——prefilter 已在上方排除，此处必须
+    # 显式「证据不足、不判有害」，而不是拿 0 个 gate 样本算出 0% 或借用全量。
+    gate_evidence = (not gate_only) or (
+        hit["n"] + allr["n"] >= MIN_MATURE_OUTCOMES)
     has_money = b["has_pnl"]
     if has_money:
         eff_wr = (b["mat_wins"] / b["mat_n"]) if b["mat_n"] else None
@@ -935,20 +974,30 @@ def _effective_harm(arm: str, kind: str, s: dict, records: list[dict],
         if dust:
             denom_note += f"，{dust} 笔小额噪声不计胜率"
         # 金额维度：实质性笔金额合计为主条款；实质性 win 率红线为辅。
-        harmful_signal = (
+        harmful_signal = gate_evidence and (
             (b["mat_pnl_sum"] > 0 and b["mat_wins"] > 0)
             or (eff_wr is not None and eff_wr > MAX_HARMFUL_RATE
                 and kind in ("block", "change")))
     else:
         eff_wr = b["wins"] / b["n"] if b["n"] else 0.0
         denom_note = f"{denom_prefix} {b['wins']}/{b['n']}"
-        harmful_signal = (
-            eff_wr > MAX_HARMFUL_RATE and kind in ("block", "change"))
+        harmful_signal = (gate_evidence
+                          and eff_wr > MAX_HARMFUL_RATE
+                          and kind in ("block", "change"))
 
     if hit["n"] < MIN_MATURE_OUTCOMES and mature >= MIN_MATURE_OUTCOMES:
-        warnings.append(
-            f"命中集成熟样本仅 {hit['n']}（<{MIN_MATURE_OUTCOMES}），"
-            "有害率按全记录口径计算，可能低估真实误伤")
+        if gate_only:
+            # gate-only 臂的 mature 几乎全部来自 prefilter 观察流；显式说明
+            # 为何不据此判有害，避免运维误读为「评级器漏算」。
+            warnings.append(
+                f"真实下单闸门层成熟样本仅 {hit['n'] + allr['n']}"
+                f"（<{MIN_MATURE_OUTCOMES}）；prefilter 观察流 "
+                f"{mature} 条反事实为采样偏置（只记拦截、按 bar open 假设入场），"
+                "不作为闸门误伤率证据，继续等待 gate 层回填")
+        else:
+            warnings.append(
+                f"命中集成熟样本仅 {hit['n']}（<{MIN_MATURE_OUTCOMES}），"
+                "有害率按全记录口径计算，可能低估真实误伤")
     if has_money and hit["n"] >= MIN_MATURE_OUTCOMES and basis == "hit_set":
         dust = hit["n"] - hit["mat_n"]
         if dust >= 10 and dust / hit["n"] >= 0.5:
@@ -1006,14 +1055,21 @@ def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
     """M1：enforce 臂独立健康档。已生产的臂不需要「继续采数/晋升」导向文案，
     只输出「维持」或「建议复核降级」。命中宽度与有害率任一越线即降级复核。"""
     mature = s["mature_outcomes"]
+    # gate-only 臂：宽度、有害率、回填置信全部只看真实下单闸门层。prefilter
+    # 的 4k+ 条反事实既不代表闸门决策量，也不代表误伤证据（2026-09-14 误报根因）。
+    gate_only = s.get("decision_scope") == "gate_layer"
+    eff_mature = s.get("gate_mature_outcomes", mature) if gate_only else mature
+    eff_backfill = (_gate_backfill_rate(s) if gate_only else backfill)
     too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
                 and kind in ("block", "change"))
-    low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
+    low_conf = eff_mature >= MIN_MATURE_OUTCOMES and \
+        eff_backfill < MIN_OUTCOME_BACKFILL_RATE
     if low_conf:
-        warnings.append(_low_backfill_warning(s, w_long, records, now_ms, backfill))
+        warnings.append(_low_backfill_warning(s, w_long, records, now_ms,
+                                              eff_backfill))
     eh = _effective_harm(
         arm, kind, s, records, w_long, now_ms, warnings)
-    harmful = mature >= MIN_MATURE_OUTCOMES and eh["harmful_signal"]
+    harmful = eff_mature >= MIN_MATURE_OUTCOMES and eh["harmful_signal"]
     # ta_late_entry 命中率只数真实下单闸门（gate）层；total 含仅记拦截的
     # prefilter 观察流，文案需显式区分，避免把 26k 观察记录误读成交易决策。
     scope_note = "（仅下单闸门层；prefilter 观察流不计宽度）" \
@@ -1030,11 +1086,13 @@ def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
         return DEGRADED_REVIEW, (
             f"已在 enforce 但出现健康告警：{'；'.join(parts)}。"
             "建议复核闸门配置/考虑降级 shadow（仅建议，不自动执行）")
-    tail = (f"、{_harm_health_fragment(eh)}未越线" if mature
-            else "（反事实 outcome 回填中）")
+    tail = (f"、{_harm_health_fragment(eh)}未越线" if eff_mature
+            else "（gate 层反事实 outcome 回填中；prefilter 观察流不作闸门误伤证据）"
+            if gate_only else "（反事实 outcome 回填中）")
     return MAINTAIN, (
         f"已在 enforce：{w_long}h {s['total']} 条观察、下单闸门命中 {s['hits']}"
-        f"/{s['decisions']}（{s['hit_rate']:.1%}）{scope_note}、回填 {mature} 条{tail}，"
+        f"/{s['decisions']}（{s['hit_rate']:.1%}）{scope_note}、gate 层回填 "
+        f"{eff_mature} 条{tail}，"
         "运行正常建议维持")
 
 
@@ -1043,13 +1101,19 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
                     warnings: list[str]) -> tuple[str, str]:
     """shadow 臂判定（total≥60）。M2/M3/M4 修订点见函数内注释。"""
     mature = s["mature_outcomes"]
+    # gate-only 臂：有害率/回填置信只看真实下单闸门层（同 _enforce_verdict）。
+    gate_only = s.get("decision_scope") == "gate_layer"
+    eff_mature = s.get("gate_mature_outcomes", mature) if gate_only else mature
+    eff_backfill = (_gate_backfill_rate(s) if gate_only else backfill)
     too_wide = (s["decisions"] > 0 and s["hit_rate"] > MAX_HIT_RATE_TOO_WIDE
                 and kind in ("block", "change"))
-    low_conf = mature >= MIN_MATURE_OUTCOMES and backfill < MIN_OUTCOME_BACKFILL_RATE
+    low_conf = eff_mature >= MIN_MATURE_OUTCOMES and \
+        eff_backfill < MIN_OUTCOME_BACKFILL_RATE
     if low_conf:
-        warnings.append(_low_backfill_warning(s, w_long, records, now_ms, backfill))
+        warnings.append(_low_backfill_warning(s, w_long, records, now_ms,
+                                              eff_backfill))
 
-    if mature >= MIN_MATURE_OUTCOMES:
+    if eff_mature >= MIN_MATURE_OUTCOMES:
         # 分母修正（见 _effective_harm）：以命中集成熟样本为有效有害率。
         eh = _effective_harm(
             arm, kind, s, records, w_long, now_ms, warnings)
@@ -1094,7 +1158,7 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
         if low_conf:
             return COLLECTING, (
                 f"{w_long}h {s['total']} 条、{healthy_txt} 看似健康，"
-                f"但回填率仅 {backfill:.1%}（<{MIN_OUTCOME_BACKFILL_RATE:.0%}），"
+                f"但回填率仅 {eff_backfill:.1%}（<{MIN_OUTCOME_BACKFILL_RATE:.0%}），"
                 "证据覆盖不足，继续采数后再议晋升")
         return PROMOTE, (
             f"{w_long}h {s['total']} 条、命中率 {s['hit_rate']:.1%}、"
@@ -1112,10 +1176,16 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
         return REVIEW, (
             f"{w_long}h {s['total']} 条、命中率 {rate:.1%}"
             f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽，"
-            f"且回填 outcome 仅 {mature} 条尚无法证伪，先复核宽度，暂不晋升")
+            f"且回填 outcome 仅 {eff_mature} 条尚无法证伪，先复核宽度，暂不晋升")
+    if gate_only:
+        return PROMOTE, (
+            f"{w_long}h {s['total']} 条观察（其中下单闸门决策 {s['decisions']}）、"
+            f"命中率 {rate:.1%}；gate 层尚无回填 outcome"
+            f"（{eff_mature}/{MIN_MATURE_OUTCOMES}，prefilter 反事实不作闸门误伤证据），"
+            "建议跑 reconcile 后再定")
     return PROMOTE, (
         f"{w_long}h {s['total']} 条、命中率 {rate:.1%}；"
-        f"尚无回填 outcome（{mature}/{MIN_MATURE_OUTCOMES}），"
+        f"尚无回填 outcome（{eff_mature}/{MIN_MATURE_OUTCOMES}），"
         "建议跑 reconcile 后再定")
 
 

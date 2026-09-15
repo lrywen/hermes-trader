@@ -247,6 +247,99 @@ def _beat(stage: str) -> None:
 _EXIT_CHECKPOINT_MIN_INTERVAL_S = _rt["exit_checkpoint_min_interval_s"]
 _last_exit_checkpoint_ts = 0.0
 
+# ── dsl_monitor 网络故障告警降噪 ─────────────────────────────────────────────
+# 代理链路中断时（如 2026-09-13 上游代理 192.168.124.36:8899 拒连 3 小时），
+# DSL monitor 每 ~8 分钟失败一次，飞书逐张刷屏。网络错误是瞬态/环境类故障，
+# 聚合成「中断开始（含累计次数/首次时间）」+「已恢复」两条边沿通知；
+# 非网络类错误（代码/数据问题）保持每次必报，不做聚合。
+_DSL_NET_ERR_MARKERS = (
+    "SSLError", "SSL EOF", "UNEXPECTED_EOF", "Max retries exceeded",
+    "ConnectionError", "Connection refused", "connection reset",
+    "ConnectTimeoutError", "ReadTimeoutError", "TimeoutError",
+    "timed out", "NameResolutionError", "Temporary failure in name resolution",
+    "ProxyError", "TunnelConnectionError", "RemoteDisconnected",
+    "ServerDisconnected", "BadStatusLine", "i/o timeout",
+    "no route to host", "network is unreachable",
+)
+_dsl_net_outage: dict = {"active": False, "count": 0, "first_ts": 0.0,
+                         "last_err": "", "last_update_ts": 0.0}
+# During a long outage, at most one follow-up card per this interval.
+_DSL_NET_OUTAGE_UPDATE_S = 1800.0
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """True when ``exc`` looks like a transient transport/proxy failure."""
+    import requests
+
+    text = str(exc)
+    if any(m.lower() in text.lower() for m in _DSL_NET_ERR_MARKERS):
+        return True
+    # SSLError/ConnectionError/Timeout all derive from RequestException;
+    # HTTPError (bad status) does NOT count — a 4xx/5xx is a real fault.
+    return isinstance(exc, (requests.exceptions.SSLError,
+                            requests.exceptions.ConnectionError,
+                            requests.exceptions.Timeout))
+
+
+def _report_dsl_monitor_failure(exc: BaseException) -> None:
+    """Edge-based notification for DSL monitor failures (never raises).
+
+    Network/transport errors during an outage are collapsed into one
+    "outage started" card (with running count + first-seen time) and one
+    "outage recovered" card on the next clean pass. Non-network errors are
+    emitted immediately every time (dedup_key still absorbs same-card
+    repeats inside notify's 10-min window).
+    """
+    now = time.time()
+    is_net = _is_network_error(exc)
+    if is_net:
+        if not _dsl_net_outage["active"]:
+            _dsl_net_outage.update(
+                active=True, count=1, first_ts=now, last_err=str(exc),
+                last_update_ts=now)
+            log_event({
+                "event": "error", "scope": "dsl_monitor",
+                "error": (f"行情接口网络中断（代理/链路故障），已开始聚合后续同类错误。"
+                          f"首次错误: {exc}"),
+                "outage": "started", "error_kind": "network",
+            })
+        else:
+            _dsl_net_outage["count"] += 1
+            _dsl_net_outage["last_err"] = str(exc)
+            # Long outages: one follow-up per 30 min with the running tally
+            # so silence never exceeds half an hour, without per-cycle spam.
+            if (now - _dsl_net_outage["last_update_ts"]) \
+                    >= _DSL_NET_OUTAGE_UPDATE_S:
+                _dsl_net_outage["last_update_ts"] = now
+                mins = (now - _dsl_net_outage["first_ts"]) / 60.0
+                log_event({
+                    "event": "error", "scope": "dsl_monitor",
+                    "error": (f"行情接口网络中断仍在持续（{mins:.0f} 分钟，"
+                              f"累计 {_dsl_net_outage['count']} 次失败）。"
+                              f"最近错误: {exc}"),
+                    "outage": "ongoing", "error_kind": "network",
+                    "failure_count": _dsl_net_outage["count"],
+                })
+        return
+    # Non-network error: report every time.
+    log_event({"event": "error", "scope": "dsl_monitor", "error": str(exc)})
+
+
+def _report_dsl_monitor_recovery() -> None:
+    """Emit one recovery card when a network outage clears (never raises)."""
+    if not _dsl_net_outage["active"]:
+        return
+    mins = (time.time() - _dsl_net_outage["first_ts"]) / 60.0
+    count = _dsl_net_outage["count"]
+    _dsl_net_outage.update(
+        active=False, count=0, first_ts=0.0, last_err="", last_update_ts=0.0)
+    log_event({
+        "event": "dsl_monitor_recovered",
+        "scope": "dsl_monitor",
+        "outage_minutes": round(mins, 1),
+        "failure_count": count,
+    })
+
 
 def _process_exits(exits, *, source: str = "dsl") -> int:
     """Market-close every DSL exit verdict and emit telemetry.
@@ -1721,7 +1814,11 @@ while True:
                 logger.error(f"[dsl] retry_pending_sl failed (non-fatal): {_rsl_e}")
         except Exception as e:
             logger.error(f"[dsl] monitor pass failed: {e}")
-            log_event({"event": "error", "scope": "dsl_monitor", "error": str(e)})
+            _report_dsl_monitor_failure(e)
+        else:
+            # Clean pass — close any open network-outage alert with a single
+            # recovery card (no-op when no outage was active).
+            _report_dsl_monitor_recovery()
 
         _beat("dsl_exit")
 

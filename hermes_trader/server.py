@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import faulthandler
+import gc
 import json
 import logging
 import math
 import os
+import threading
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -158,6 +161,82 @@ _last_scan_at: float = 0
 _SCAN_MIN_SECONDS = 30
 
 
+# ── P2 loop observability + GC hardening (2026-09-15 post-incident) ───────────
+# The 2026-09-15 incident froze the uvicorn event loop for 35.5s and left NO
+# forensic evidence: no slow-callback log, no stack dump, only absent access
+# logs. These hooks make the next stall self-describing.
+
+
+def _setup_loop_observability() -> None:
+    """Slow-callback logging + a whole-loop stall watchdog with stack dumps.
+
+    Two complementary detectors:
+      * asyncio debug mode + slow_callback_duration logs any single callback
+        exceeding the threshold ("Executing ... took ... seconds").
+      * the watchdog thread catches stalls that emit NO callback log (a
+        blocking C-level call — e.g. a gen2 GC pass — is not a callback): it
+        watches a 1s loop heartbeat and, past the stall threshold, dumps every
+        thread's stack via faulthandler so the culprit frame lands in the logs.
+
+    Env: HERMES_ASYNCIO_DEBUG=0 to disable debug mode (default on),
+    HERMES_SLOW_CALLBACK_S (0.5), HERMES_LOOP_STALL_S (5.0),
+    HERMES_LOOP_STALL_DUMP_COOLDOWN_S (60).
+    """
+    loop = asyncio.get_running_loop()
+    if os.environ.get("HERMES_ASYNCIO_DEBUG", "1").strip() not in ("0", "false", "no"):
+        loop.set_debug(True)
+    loop.slow_callback_duration = float(os.environ.get("HERMES_SLOW_CALLBACK_S", "0.5"))
+
+    stall_s = float(os.environ.get("HERMES_LOOP_STALL_S", "5.0"))
+    cooldown_s = float(os.environ.get("HERMES_LOOP_STALL_DUMP_COOLDOWN_S", "60"))
+    # tick only advances when the loop processes callbacks — its age IS the stall.
+    tick = {"t": time.monotonic(), "last_dump_at": 0.0}
+
+    def _beat() -> None:
+        tick["t"] = time.monotonic()
+        loop.call_later(1.0, _beat)
+
+    def _watch() -> None:
+        while True:
+            time.sleep(1.0)
+            lag = time.monotonic() - tick["t"]
+            if lag >= stall_s and time.monotonic() - tick["last_dump_at"] >= cooldown_s:
+                tick["last_dump_at"] = time.monotonic()
+                logger.critical(
+                    "[loop-watchdog] event loop stalled %.1fs (threshold %.1fs) "
+                    "— dumping all thread stacks below", lag, stall_s,
+                )
+                faulthandler.dump_traceback()  # all threads, to stderr
+
+    loop.call_soon(_beat)
+    threading.Thread(target=_watch, daemon=True, name="loop-watchdog").start()
+
+
+def _gc_freeze_startup() -> None:
+    """Freeze the startup object graph out of gen2 GC scans.
+
+    CPython's gen2 collection walks every tracked container object; with a
+    long-lived process's import/config/caches graph it is the prime suspect
+    for multi-second whole-loop pauses (the 2026-09-15 freeze). gc.freeze()
+    moves everything allocated so far into the permanent generation — gen2
+    then only walks post-startup allocations, a tiny fraction. Also raises the
+    gen2 threshold as a second lever (gen2 runs every N gen1 passes).
+    HERMES_GC_FREEZE=0 disables; HERMES_GC_GEN2_THRESHOLD=50 default, 0 keeps.
+    """
+    if os.environ.get("HERMES_GC_FREEZE", "1").strip() in ("0", "false", "no"):
+        return
+    gc.collect()
+    gc.freeze()
+    gen2 = int(os.environ.get("HERMES_GC_GEN2_THRESHOLD", "50"))
+    if gen2 > 0:
+        t = gc.get_threshold()
+        gc.set_threshold(t[0], t[1], gen2)
+    logger.info(
+        "[gc] startup freeze: %d objects pinned to permanent generation; thresholds=%s",
+        gc.get_freeze_count(), gc.get_threshold(),
+    )
+
+
 # ── Lifespan ───────────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -205,6 +284,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     import threading
     threading.Thread(target=_warm_candles, daemon=True, name="candle-prewarm").start()
+
+    # P2 (2026-09-15): arm loop observability + GC freeze after heavy startup
+    # objects exist, right before serving traffic.
+    _setup_loop_observability()
+    _gc_freeze_startup()
 
     yield
     memory.flush()
@@ -910,7 +994,11 @@ async def run_scan(request: Request) -> JSONResponse:
     _last_scan_at = time.time()
     try:
         try:
-            universe = get_universe(include_hip3=_hip3_on())
+            # Off the event loop: _hip3_on reads the flocked config and
+            # get_universe hits the HL API — both are blocking I/O.
+            universe = await asyncio.to_thread(
+                lambda: get_universe(include_hip3=_hip3_on())
+            )
         except Exception as e:
             logger.exception("[scan] /api/agent/scan universe prefetch failed: %s", e)
             raise HTTPException(502, detail={
@@ -919,7 +1007,11 @@ async def run_scan(request: Request) -> JSONResponse:
                 "detail": str(e),
             })
         try:
-            perceptions = scan_once(universe=universe, min_score=min_score, coin=coin)
+            # Off the event loop: scan_once sweeps the whole market (many
+            # blocking HL calls) and would freeze the loop for its duration.
+            perceptions = await asyncio.to_thread(
+                scan_once, universe=universe, min_score=min_score, coin=coin
+            )
         except Exception as e:
             stage = getattr(e, "scan_stage", None) or "markets.scan"
             logger.exception("[scan] /api/agent/scan failed at stage=%s: %s", stage, e)
@@ -1266,7 +1358,9 @@ async def agent_stop(request: Request) -> JSONResponse:
 @app.get("/api/agent/config", dependencies=[Depends(_require_operator)])
 async def get_config() -> JSONResponse:
     """GET /api/agent/config — read the agent config."""
-    return JSONResponse(content=read_agent_config())
+    # Off the event loop: read_agent_config takes a flock on the config lock
+    # file; a held LOCK_EX elsewhere would freeze the loop here.
+    return JSONResponse(content=await asyncio.to_thread(read_agent_config))
 
 
 @app.post("/api/agent/config", dependencies=[Depends(require_operator_write)])
@@ -2296,7 +2390,9 @@ async def ready() -> Response:
     if _READINESS_REQUIRE_LOOP:
         uptime_s = time.time() - _PROCESS_START_TS
         try:
-            risk = dashboard._risk_status_payload()
+            # Off the event loop: the payload builder does synchronous file
+            # I/O (heartbeat/session-log reads) that must not freeze a probe.
+            risk = await asyncio.to_thread(dashboard._risk_status_payload)
             feed_status = risk.get("feed_status", "offline")
             feed_age_s = risk.get("feed_age_s")
             checks["feed_status"] = feed_status
@@ -2553,11 +2649,23 @@ if __name__ == "__main__":
     # .env.local is already loaded by _load_env_local_early() at the top of
     # this file — done before hermes_trader imports so module-level env reads
     # (notably PRIVATE_KEY_HEX in client/exchange.py) capture real values.
+    import copy
+
     import uvicorn
+    from uvicorn.config import LOGGING_CONFIG
     port = int(os.environ.get("HERMES_PORT", 8000))
     # H-P2: bind loopback by default. Container deployments (Fly/k8s) must set
     # HERMES_HOST=0.0.0.0 explicitly so the change cannot silently expose a
     # bare-metal/portal-bridge install to the LAN.
     host = os.environ.get("HERMES_HOST", "127.0.0.1").strip() or "127.0.0.1"
     logger.info(f"Starting Hermes server on {host}:{port}")
-    uvicorn.run("hermes_trader.server:app", host=host, port=port, reload=False)
+    # P2 (2026-09-15): uvicorn's own loggers (notably uvicorn.access) have no
+    # timestamp by default — during the 35.5s loop freeze the missing access
+    # logs could not even be placed on a timeline. Prefix every formatter with
+    # %(asctime)s. uvicorn's LOGGING_CONFIG uses disable_existing_loggers:
+    # False, so it coexists with the module-level basicConfig above.
+    log_config = copy.deepcopy(LOGGING_CONFIG)
+    for _fmt in log_config["formatters"].values():
+        _fmt["fmt"] = "%(asctime)s " + _fmt["fmt"]
+    uvicorn.run("hermes_trader.server:app", host=host, port=port, reload=False,
+                log_config=log_config)

@@ -72,8 +72,8 @@ def _signal_ms(rec: dict[str, Any]) -> Optional[int]:
     return None
 
 
-def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float]]:
-    """1h closes beginning at the signal bar (index 0 = signal bar close)."""
+def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[dict[int, float]]:
+    """1h closes keyed by bar-open ms, from start-1h through start+hours."""
     end = start_ms + (hours + 4) * 3600_000
     payload = {"type": "candleSnapshot", "req": {
         "coin": coin, "interval": "1h",
@@ -81,8 +81,7 @@ def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[list[float
     raw = _http_post("/info", payload)
     if not isinstance(raw, list) or not raw:
         return None
-    rows = sorted(raw, key=lambda c: int(c["t"]))
-    return [float(c["c"]) for c in rows]
+    return {int(c["t"]): float(c["c"]) for c in raw}
 
 
 def grade(rec: dict[str, Any]) -> str:
@@ -100,28 +99,27 @@ def grade(rec: dict[str, Any]) -> str:
     if rec.get("state") == "data_missing" or rec.get("daily_change_pct") is None:
         return "data_missing"
 
-    closes = _forward_closes(coin, t0, max(FWD_HOURS))
-    if not closes:
+    bars = _forward_closes(coin, t0, max(FWD_HOURS))
+    if not bars:
         return "no_future_bars"
 
-    # closes[0] is the pre-bar (startTime = t0-1h); the signal bar close is
-    # index 1 and is the would-be chase entry. Fall back to closes[0] only if
-    # the exchange returned a single bar (degenerate, but still an entry).
-    if len(closes) >= 2:
-        entry = closes[1]
-    else:
-        entry = closes[0]
+    # Timestamp-anchored grid: the signal bar is the 1h bar whose OPEN time is
+    # the hour containing t0; its close is the would-be chase entry. The
+    # forward-h close is the close of the bar opening h hours after grid0.
+    step = 3600_000
+    grid0 = t0 - (t0 % step)
+    entry = bars.get(grid0)
     if not entry or entry <= 0:
         return "no_entry_px"
     rec["entry_px"] = entry
 
     grid: dict[str, Any] = {}
     for h in FWD_HOURS:
-        idx = h + 1                    # signal bar is index 1
-        if idx < len(closes) and closes[idx] > 0:
-            pct = (closes[idx] - entry) / entry * 100.0
+        px = bars.get(grid0 + h * step)
+        if px is not None and px > 0:
+            pct = (px - entry) / entry * 100.0
             grid[f"fwd{h}h_pct"] = round(pct, 4)
-            grid[f"fwd{h}h_px"] = closes[idx]
+            grid[f"fwd{h}h_px"] = px
         else:
             grid[f"fwd{h}h_pct"] = None
     rec["forward"] = grid

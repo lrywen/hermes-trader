@@ -29,7 +29,7 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
-from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.hl_client import _http_post
 from hermes_trader.models.types import Candle
 
 # Audit 2026-09-10 (M12): default to the writable /data path the runtime actually
@@ -53,6 +53,36 @@ def _parse_iso(ts: str) -> Optional[datetime]:
         return None
 
 
+BAR_MS = 3600_000  # 1h
+HARD_TIMEOUT_BARS = 180
+
+
+def _fetch_window(coin: str, t0_ms: int) -> List[Candle]:
+    """Explicit time-anchored candle window around the signal.
+
+    Audit 2026-09-15: replaces ``fetch_hl_candles(coin, "1h", 300)``. The
+    "latest N bars" call silently mis-anchored any signal older than the
+    300-bar window: ``_find_entry_bar`` only checks ``t >= signal``, so the
+    window's FIRST bar matched and the whole DSL walk ran on the wrong tape
+    (29/100 live outcomes disagreed with the PIT-anchored replay). We request
+    exactly [grid0-1h, grid0+(180+4)h] so the signal bar is always at the
+    head of the returned tape.
+    """
+    grid0 = t0_ms - (t0_ms % BAR_MS)
+    payload = {"type": "candleSnapshot", "req": {
+        "coin": coin, "interval": "1h",
+        "startTime": grid0 - BAR_MS,
+        "endTime": grid0 + (HARD_TIMEOUT_BARS + 4) * BAR_MS,
+    }}
+    raw = _http_post("/info", payload)
+    if not isinstance(raw, list) or not raw:
+        return []
+    rows = sorted(raw, key=lambda c: int(c["t"]))
+    return [Candle(t=int(c["t"]), o=float(c["o"]), h=float(c["h"]),
+                   l=float(c["l"]), c=float(c["c"]), v=float(c["v"]))
+            for c in rows]
+
+
 def _find_entry_bar(candles: List[Candle], after_ts: datetime) -> int:
     """Index of the first candle whose open time >= after_ts."""
     for i, c in enumerate(candles):
@@ -73,7 +103,7 @@ def _simulate_exit(entry_px: float, entry_idx: int,
     max_loss = float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg))
     protect = float(cfg_get("dsl_exit.protect_pct", config=dsl_cfg))
     retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl_cfg))
-    hard_timeout = 180
+    hard_timeout = HARD_TIMEOUT_BARS
     peak = entry_px
     for j in range(entry_idx + 1, min(entry_idx + 1 + hard_timeout, len(candles))):
         bar = candles[j]
@@ -167,12 +197,21 @@ def main() -> int:
             r["outcome"] = "bad_timestamp"
             continue
         try:
-            candles = fetch_hl_candles(coin, "1h", hard_timeout_bars := 300)
+            candles = _fetch_window(coin, int(after_ts.timestamp() * 1000))
         except Exception as e:
             print(f"  {coin}: fetch error: {e}")
             continue
         idx = _find_entry_bar(candles, after_ts)
         if idx < 0 or idx >= len(candles) - 2:
+            r["outcome"] = "no_future_bars"
+            continue
+        # Anchoring guard: the entry bar must open within one step of the
+        # signal bar. A later first match means the returned tape does not
+        # actually cover the signal (head gap) — grade no_future_bars rather
+        # than silently walking the wrong tape.
+        grid0 = int(after_ts.timestamp() * 1000)
+        grid0 -= grid0 % BAR_MS
+        if candles[idx].t > grid0 + BAR_MS:
             r["outcome"] = "no_future_bars"
             continue
         # Audit 2026-09-11 (M15): pullback shadow records are written at the
