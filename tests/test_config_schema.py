@@ -239,6 +239,10 @@ def test_cli_style_json_list_update_passes_validation(monkeypatch):
      "atr_risk_sizing.coin_overrides: expected object"),
     ("atr_risk_sizing", {"sneaky_key": True},
      "atr_risk_sizing.sneaky_key: unknown key"),
+    # P1-4 Phase 1 step 5: the legacy boolean was retired; the enum mode is
+    # the only switch, so the old leaf is now rejected as unknown.
+    ("atr_risk_sizing", {"sizing_v2_enabled": True},
+     "atr_risk_sizing.sizing_v2_enabled: unknown key"),
     # signal_enforcement
     ("signal_enforcement", {"boost_bar_delta": 1.5},
      "signal_enforcement.boost_bar_delta"),
@@ -273,7 +277,7 @@ def test_nested_risk_block_deep_validation_rejects(block, patch, needle):
     ("dsl_exit", {"regime_aware": {"enabled": False}}),
     ("atr_risk_sizing", {"enabled": False}),
     ("atr_risk_sizing", {"sizing_basis": "dsl_stop"}),
-    ("atr_risk_sizing", {"sizing_v2_enabled": True, "sizing_v2_cap_pct": 0.1}),
+    ("atr_risk_sizing", {"sizing_v2_mode": "shadow", "sizing_v2_cap_pct": 0.1}),
     # coin_overrides: unknown extension leaves (documented plugin channel,
     # e.g. atr_stop_floor_pct in RISK_OVERHAUL_2026-08-26) are ignored,
     # while the known leaf is still type/range checked.
