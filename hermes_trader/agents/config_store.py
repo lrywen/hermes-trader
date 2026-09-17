@@ -267,6 +267,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "enabled": False,
             "atr_mult": 1.0,
         },
+        # Audit 2026-09-10 (risk-tuning shadow 3): record whether a wider
+        # max-loss cap / lower breakeven trigger would have mattered; live
+        # stop behaviour is unchanged. shadow_mode=true = record-only
+        # (dsl_exit._record_stop_tuning_shadow). The two candidate percents
+        # default to None semantics at the read site, but explicit 0.0 values
+        # are inert (no wider cap, no lower breakeven) so the synthesised
+        # default block records nothing new.
+        "stop_tuning_shadow": {
+            "shadow_mode": True,
+            "candidate_max_loss_pct": 0.0,
+            "candidate_breakeven_trigger_pct": 0.0,
+        },
         # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor transition.
         # Ramps the phase-2 floor from the hard stop up to the full trailing
         # floor across a peak-profit band of width band_pct instead of snapping
@@ -446,6 +458,37 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             # pre-E2 behaviour (4h uptrend only).
             "require_macro_uptrend": True,
         },
+        # Audit 2026-09-10 (risk-tuning shadow): record-only counter-factual
+        # arms in executor.py's runner gate. shadow_mode=true = observation
+        # only (never blocks live admission); per_coin_cooldown is the one
+        # exception where false ENFORCES a runner-gate block, so its default
+        # is true (record-only) to keep a synthesised default block inert.
+        # The production file sets per_coin_cooldown.shadow_mode=false and
+        # the deep merge preserves it.
+        "breakout_score_floor": {
+            "shadow_mode": True,
+            # min_composite falls back to min_score*0.7 at the read site;
+            # mirror that conservative floor as the canonical default.
+            "min_composite": 21.0,
+        },
+        "early_breakout_shadow": {
+            "shadow_mode": True,
+            "shadow_log_path": "",
+            "max_extension_atr": 1.5,
+            "early_stop_atr_mult": 1.2,
+            "early_size_fraction": 0.5,
+        },
+        "per_coin_cooldown": {
+            "shadow_mode": True,
+            "window_hours": 24,
+            "repeat_min_composite": 45.0,
+            "max_consecutive_losses": 2,
+            "loss_cooldown_hours": 24,
+        },
+        "short_only_shadow": {
+            "shadow_mode": True,
+            "shadow_log_path": "",
+        },
     },
     "plan_b": {
         "enabled": True,
@@ -462,6 +505,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # Safe default "off", identical to the accessor's fallback; the
         # legacy boolean sizing_v2_enabled was retired in Phase 1 step 5.
         "sizing_v2_mode": "off",
+        # P1-4 Phase 3 batch 2: gray-release cap (0-1) scaling the v2
+        # notional. 1.0 mirrors executor.py's .get(..., 1.0) fallback so a
+        # key-absent config behaves identically (no scale-down).
+        "sizing_v2_cap_pct": 1.0,
         # R12-C1: per-coin overrides for the ATR sizing / SL floor params
         # (e.g. {"HYPE": {"sl_floor_pct": 1.5}}). Empty by default; was
         # implicit via .get("coin_overrides", {}) in executor.

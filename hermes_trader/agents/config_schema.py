@@ -456,6 +456,13 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "enabled": ("bool",),
         "atr_mult": _num_leaf(0.0, 20.0),
     },
+    # Audit 2026-09-10 (risk-tuning shadow 3): record-only wider-cap /
+    # lower-breakeven counter-factual; live stop behaviour unchanged.
+    "stop_tuning_shadow": {
+        "shadow_mode": ("bool",),
+        "candidate_max_loss_pct": _num_leaf(0.0, 25.0),
+        "candidate_breakeven_trigger_pct": _num_leaf(0.0, 50.0),
+    },
     # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor ramp. Default OFF
     # (inert); band_pct is the peak-profit % width over which the floor ramps
     # hard-stop → full trailing floor.
@@ -546,6 +553,54 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "dsl_exit": _DSL_EXIT_SPEC,
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
+    "runner_entry_gate": {
+        # Admission thresholds (executor.py runner gate). Confidence leaves
+        # are 0-1; composite score leaves are 0-100.
+        "enabled": ("bool",),
+        "allow_shorts": ("bool",),
+        "bypass_sidestep_overrides": ("bool",),
+        "min_confidence": _num_leaf(0.0, 1.0),
+        "min_composite": _num_leaf(0.0, 100.0),
+        "min_hip3_composite": _num_leaf(0.0, 100.0),
+        "min_short_confidence": _num_leaf(0.0, 1.0),
+        "min_short_composite": _num_leaf(0.0, 100.0),
+        "mover_min_confidence": _num_leaf(0.0, 1.0),
+        "mover_min_composite": _num_leaf(0.0, 100.0),
+        "pullback_long": {
+            "enabled": ("bool",),
+            "min_composite": _num_leaf(0.0, 100.0),
+            "max_rsi": _num_leaf(0.0, 100.0),
+            "max_extension_atr": _num_leaf(0.0, 50.0),
+            "min_slow_burn": ("int", 0, 1000),
+            "shadow_mode": ("bool",),
+            "require_macro_uptrend": ("bool",),
+        },
+        # Audit 2026-09-10 (risk-tuning shadow): the four runner-gate
+        # counter-factual arms. breakout/early/short_only are record-only;
+        # per_coin_cooldown.shadow_mode=false ENFORCES a real block.
+        "breakout_score_floor": {
+            "shadow_mode": ("bool",),
+            "min_composite": _num_leaf(0.0, 100.0),
+        },
+        "early_breakout_shadow": {
+            "shadow_mode": ("bool",),
+            "shadow_log_path": ("str",),
+            "max_extension_atr": _num_leaf(0.0, 100.0),
+            "early_stop_atr_mult": _num_leaf(0.0, 50.0),
+            "early_size_fraction": _num_leaf(0.0, 1.0),
+        },
+        "per_coin_cooldown": {
+            "shadow_mode": ("bool",),
+            "window_hours": _num_leaf(0.0, 100_000.0),
+            "repeat_min_composite": _num_leaf(0.0, 100.0),
+            "max_consecutive_losses": ("int", 0, 1000),
+            "loss_cooldown_hours": _num_leaf(0.0, 100_000.0),
+        },
+        "short_only_shadow": {
+            "shadow_mode": ("bool",),
+            "shadow_log_path": ("str",),
+        },
+    },
     "ta_late_entry": {
         # off = gate absent; enforce = late entries are blocked (DEFAULT, and
         # mode-independent — it enforces identically in SHADOW and LIVE). The
