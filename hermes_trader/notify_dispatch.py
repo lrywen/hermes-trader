@@ -276,6 +276,22 @@ def _on_dsl_monitor_recovered(r: dict[str, Any]) -> None:
                      dedup_key="error:dsl_monitor:recovered")
 
 
+def _surge_score_text(r: dict[str, Any]) -> str:
+    """Render the effective surge threshold carried on the loop_start event.
+
+    P1-4 Phase 2.3: the primary source is the loop_runtime effective value the
+    loop actually runs on (emitted by trading_loop). The legacy env remains a
+    fallback only for records from older emitters, mirroring loop_runtime's
+    own resolution precedence. Integral floats render without a trailing .0.
+    """
+    v = r.get("surge_min_score")
+    if v is None or v == "":
+        return os.environ.get("HERMES_SURGE_MIN_SCORE", "40")
+    if isinstance(v, float) and v.is_integer():
+        return str(int(v))
+    return str(v)
+
+
 def _on_loop_start(r: dict[str, Any]) -> None:
     cfg = r.get("config") or {}
     scan = cfg.get("scan") or {}
@@ -285,7 +301,7 @@ def _on_loop_start(r: dict[str, Any]) -> None:
         "模式": mode_cn,
         "扫描间隔": f"{r.get('scan_interval')}s" if r.get("scan_interval") else "—",
         "交易门槛分": _v(scan.get("minCompositeScore")),
-        "暴涨通知分": os.environ.get("HERMES_SURGE_MIN_SCORE", "40"),
+        "暴涨通知分": _surge_score_text(r),
     }
     notify.send_card("Hermes 交易系统已启动", fields=fields,
                      category="system", level="info")

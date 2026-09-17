@@ -835,6 +835,10 @@ log_event({
     "event": "loop_start",
     "scan_interval": scan_interval,
     "min_score": min_score,
+    # P1-4 Phase 2.3: the resolved loop_runtime effective value (legacy env >
+    # agent-config > default), so notify cards render the same value the loop
+    # runs on instead of re-reading HERMES_SURGE_MIN_SCORE themselves.
+    "surge_min_score": _rt["surge_min_score"],
     # Full config snapshot at startup so the feed shows exactly what the bot
     # is configured to do — useful for postmortems ("what was the cap when
     # this trade happened?") and for the operator UI to surface drift.
