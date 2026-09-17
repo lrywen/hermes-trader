@@ -16,6 +16,7 @@ import logging
 import os
 import shutil
 import time
+from datetime import datetime, timezone
 
 from prometheus_client import (
     CONTENT_TYPE_LATEST,
@@ -32,6 +33,16 @@ logger = logging.getLogger(__name__)
 # redirect them at a tmp data dir and a fake /proc.
 _WRITABLE_DATA_DIR = "/data"
 _PROC_ROOT = "/proc"
+# P0-2 gap audit: local roots for the feed/brain heartbeat (loop process)
+# and the ip-drift supervisor watchdog. Resolved at scrape time so tests can
+# redirect them; defaults live on the shared /data volume.
+_LOOP_OBS_STATE_FILE = os.environ.get(
+    "HERMES_LOOP_OBSERVABILITY_STATE_FILE",
+    "/data/.loop-observability.state",
+)
+_IP_DRIFT_STATE_FILE = os.environ.get(
+    "HERMES_IP_DRIFT_STATE_FILE", "/data/ip_drift_state.json"
+)
 
 # Explicit "no source / never ran" sentinels. A plain Gauge exports 0.0 even
 # when never set, so absent_over_time() / age alerts cannot tell a healthy
@@ -40,6 +51,9 @@ _AGE_NO_SOURCE = 1e9  # heartbeat state file missing/corrupt
 _AGE_NEVER_RAN = 1e6  # nightly job has never produced output
 _RSS_ABSENT = -1.0  # process not found in /proc
 _BACKUP_MARKER_ABSENT = -1.0  # no verified pre-deploy backup marker
+# P0-2 gap audit: feed/brain source has never been published by the loop
+# (distinct from a real, healthy 0 / ready=1 — -1 means "no signal yet").
+_OBS_SOURCE_ABSENT = -1.0
 
 EQUITY = Gauge("hermes_equity_usd", "Last known account equity in USD")
 OPEN_POSITIONS = Gauge(
@@ -656,6 +670,41 @@ PROCESS_RSS = Gauge(
     ["role"],
 )
 
+# ── P0-2 remaining failure-mode gauges (2026-09-18 gap audit) ──────────
+# These close the four missing Pathiel-aligned failure modes. All are
+# refreshed network-free from local cross-process state under /data:
+# feed gap/trustworthy + ai_brain from the loop's observability heartbeat
+# (loop_observability_state), supervisor age from the ip-drift watchdog,
+# alerts_firing by aggregating the local hard breakers (memory + circuit).
+FEED_GAP_FRACTION = Gauge(
+    "hermes_feed_gap_fraction",
+    "Fraction of recent cold candleSnapshot fetches whose quality report "
+    "flagged bar gaps (bounded rolling window in the loop process); "
+    "-1 sentinel when the loop has never published the observability state.",
+)
+FEED_TRUSTWORTHY = Gauge(
+    "hermes_feed_trustworthy",
+    "1 when the loop's market data is complete with no rolling-window gaps, "
+    "0 when untrusted (data missing / gaps present); -1 when never published.",
+)
+SUPERVISOR_AGE = Gauge(
+    "hermes_supervisor_age_seconds",
+    "Seconds since the safety supervisor (ip-drift watchdog) last wrote its "
+    "heartbeat; 1e9 sentinel when its state file is missing or corrupt.",
+)
+ALERTS_FIRING = Gauge(
+    "hermes_alerts_firing",
+    "Count of hard risk controls currently firing (global halt + armed "
+    "per-coin circuits + a tripped market circuit), aggregated network-free "
+    "from local breaker state.",
+)
+AI_BRAIN_READY = Gauge(
+    "hermes_ai_brain_ready",
+    "1 when the AI research brain is usable (LLM API key configured and the "
+    "research circuit breaker is closed), 0 when not ready; -1 when the loop "
+    "has never published brain state.",
+)
+
 
 def _to_float(value: object) -> float:
     try:
@@ -698,6 +747,63 @@ def _read_snapshot_saved_at(path: str) -> float | None:
         return None
     saved_at_ms = _to_float(data.get("saved_at"))
     return saved_at_ms / 1000.0 if saved_at_ms > 0 else None
+
+
+def _read_loop_observability(path: str) -> dict | None:
+    """Return the loop observability heartbeat payload, or None.
+
+    Never raises: missing/corrupt/non-dict files yield None so the caller
+    emits the explicit never-published sentinel.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _parse_iso8601_z(value: object) -> float | None:
+    """Parse an ISO-8601 timestamp (``...Z``) to epoch seconds, or None."""
+    if not isinstance(value, str) or not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.timestamp()
+
+
+def _read_ip_drift_age_seconds(path: str) -> float | None:
+    """Age in seconds of the ip-drift supervisor heartbeat, or None.
+
+    The watchdog writes ``updated_at`` as an ISO-8601 Z string. Missing,
+    corrupt, unparseable or non-positive ages all yield None.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ts = _parse_iso8601_z(data.get("updated_at"))
+    return max(0.0, time.time() - ts) if ts and ts > 0 else None
+
+
+def _circuit_snapshot_for_metrics() -> dict:
+    """Read-only local hard-breaker view (global_halt / armed coin count).
+
+    Thin indirection so tests can stub it without touching memory I/O.
+    """
+    from hermes_trader.agents.memory import memory
+
+    return memory.circuit_snapshot()
 
 
 def _read_vmrss_bytes(proc_root: str, pid: object) -> float | None:
@@ -1033,6 +1139,67 @@ def _refresh() -> None:
         )
     except Exception as e:
         logger.debug(f"[metrics] process rss read failed: {e}")
+
+    # P0-2 gap audit: feed gap/trustworthy + AI-brain readiness from the
+    # loop's cross-process observability heartbeat. A missing source emits
+    # the -1 sentinel (never a misleading healthy 0 / ready=1).
+    try:
+        obs = _read_loop_observability(_LOOP_OBS_STATE_FILE)
+        if obs is None:
+            FEED_GAP_FRACTION.set(_OBS_SOURCE_ABSENT)
+            FEED_TRUSTWORTHY.set(_OBS_SOURCE_ABSENT)
+            AI_BRAIN_READY.set(_OBS_SOURCE_ABSENT)
+        else:
+            gap = obs.get("feed_gap_fraction")
+            FEED_GAP_FRACTION.set(
+                _to_float(gap) if isinstance(gap, (int, float)) else _OBS_SOURCE_ABSENT
+            )
+            FEED_TRUSTWORTHY.set(
+                1.0 if bool(obs.get("feed_trustworthy")) else 0.0
+            )
+            brain = obs.get("ai_brain")
+            if isinstance(brain, dict):
+                ready = bool(brain.get("key_configured")) and not bool(
+                    brain.get("circuit_open"))
+                AI_BRAIN_READY.set(1.0 if ready else 0.0)
+            else:
+                AI_BRAIN_READY.set(_OBS_SOURCE_ABSENT)
+    except Exception as e:
+        logger.debug(f"[metrics] loop observability read failed: {e}")
+
+    # P0-2 gap audit: safety-supervisor heartbeat (ip-drift watchdog). It
+    # runs on a ~5min cadence; a 1e9 sentinel marks a missing/corrupt file.
+    try:
+        age = _read_ip_drift_age_seconds(_IP_DRIFT_STATE_FILE)
+        SUPERVISOR_AGE.set(age if age is not None else _AGE_NO_SOURCE)
+    except Exception as e:
+        logger.debug(f"[metrics] supervisor age read failed: {e}")
+
+    # P0-2 gap audit: count currently-firing hard controls from local state
+    # (global halt, armed per-coin circuits, a tripped market circuit). Each
+    # source degrades independently so one failed read can't zero the count.
+    try:
+        firing = 0.0
+        try:
+            cs = _circuit_snapshot_for_metrics()
+            if bool(cs.get("global_halt")):
+                firing += 1.0
+            firing += float(max(0, int(cs.get("armed_coins", 0))))
+        except Exception as e:
+            logger.debug(f"[metrics] breaker snapshot read failed: {e}")
+        try:
+            from hermes_trader.agents.market_circuit_state import read_state
+
+            mc = read_state()
+            if isinstance(mc, dict) and (
+                bool(mc.get("tripped")) or int(mc.get("state", 0)) == 1
+            ):
+                firing += 1.0
+        except Exception as e:
+            logger.debug(f"[metrics] market circuit state read failed: {e}")
+        ALERTS_FIRING.set(firing)
+    except Exception as e:
+        logger.debug(f"[metrics] alerts firing read failed: {e}")
 
 
 def render_metrics() -> tuple[bytes, str]:

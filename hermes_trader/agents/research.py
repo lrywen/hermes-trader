@@ -378,6 +378,15 @@ def _llm_record_success() -> None:
             metrics.LLM_CIRCUIT_STATE.set(0.0)
     except Exception:
         pass
+    # P0-2: publish brain liveness for the cross-process ai_brain_ready gauge.
+    try:
+        from hermes_trader.agents.loop_observability_state import (
+            note_llm_success,
+        )
+
+        note_llm_success()
+    except Exception:
+        pass
 
 
 def _llm_record_failure() -> None:
@@ -394,6 +403,15 @@ def _llm_record_failure() -> None:
                 "[research] LLM circuit OPEN for %.0fs after %d consecutive failures",
                 cooldown, threshold,
             )
+    # P0-2: surface the breaker to the cross-process ai_brain_ready gauge.
+    try:
+        from hermes_trader.agents.loop_observability_state import (
+            note_llm_failure,
+        )
+
+        note_llm_failure(circuit_open=tripped)
+    except Exception:
+        pass
     if tripped:
         # P3-1: count trips and flip the state gauge outside the lock.
         try:

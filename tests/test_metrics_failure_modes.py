@@ -289,3 +289,117 @@ def test_scrape_never_issues_http(monkeypatch):
     body, content_type = metrics.render_metrics()
     assert b"hermes_loop_heartbeat_age_seconds" in body
     assert content_type  # non-empty content type
+
+
+# ── P0-2 remaining failure-mode gauges (2026-09-18 gap audit) ──────────
+# feed gap/trustworthy + ai_brain come from the loop-process observability
+# state file (loop_observability_state); supervisor age from the ip-drift
+# watchdog heartbeat; alerts_firing aggregates the local hard breakers.
+# All reads are local and network-free.
+
+def test_feed_gauges_from_loop_observability(rendered, tmp_path, monkeypatch):
+    state = tmp_path / ".loop-observability.state"
+    monkeypatch.setattr(metrics, "_LOOP_OBS_STATE_FILE", str(state))
+    state.write_text(json.dumps({
+        "version": 1,
+        "ts": time.time(),
+        "cold_fetches": 10,
+        "cold_with_gap": 2,
+        "feed_gap_fraction": 0.2,
+        "feed_trustworthy": True,
+        "ai_brain": {"key_configured": True, "circuit_open": False,
+                     "last_success_ts": time.time()},
+    }))
+
+    s = rendered()
+    assert _value(s, "hermes_feed_gap_fraction") == pytest.approx(0.2)
+    assert _value(s, "hermes_feed_trustworthy") == 1.0
+    assert _value(s, "hermes_ai_brain_ready") == 1.0
+
+
+def test_feed_untrustworthy_and_brain_circuit_open(rendered, tmp_path, monkeypatch):
+    state = tmp_path / ".loop-observability.state"
+    monkeypatch.setattr(metrics, "_LOOP_OBS_STATE_FILE", str(state))
+    state.write_text(json.dumps({
+        "version": 1, "ts": time.time(),
+        "cold_fetches": 4, "cold_with_gap": 4,
+        "feed_gap_fraction": 1.0, "feed_trustworthy": False,
+        "ai_brain": {"key_configured": True, "circuit_open": True,
+                     "last_success_ts": 0.0},
+    }))
+    s = rendered()
+    assert _value(s, "hermes_feed_trustworthy") == 0.0
+    assert _value(s, "hermes_ai_brain_ready") == 0.0
+
+
+def test_feed_gauges_missing_source_sentinel(rendered, tmp_path, monkeypatch):
+    state = tmp_path / ".loop-observability.state"
+    monkeypatch.setattr(metrics, "_LOOP_OBS_STATE_FILE", str(state))
+    # No file → never-published sentinels, not a misleading healthy value.
+    s = rendered()
+    assert _value(s, "hermes_feed_gap_fraction") == -1.0
+    assert _value(s, "hermes_feed_trustworthy") == -1.0
+    assert _value(s, "hermes_ai_brain_ready") == -1.0
+
+    state.write_text("{corrupt")
+    s = rendered()
+    assert _value(s, "hermes_feed_gap_fraction") == -1.0
+
+
+def test_ai_brain_not_ready_without_key(rendered, tmp_path, monkeypatch):
+    state = tmp_path / ".loop-observability.state"
+    monkeypatch.setattr(metrics, "_LOOP_OBS_STATE_FILE", str(state))
+    state.write_text(json.dumps({
+        "version": 1, "ts": time.time(),
+        "cold_fetches": 0, "cold_with_gap": 0,
+        "feed_gap_fraction": 0.0, "feed_trustworthy": True,
+        "ai_brain": {"key_configured": False, "circuit_open": False,
+                     "last_success_ts": time.time()},
+    }))
+    s = rendered()
+    assert _value(s, "hermes_ai_brain_ready") == 0.0
+
+
+def test_supervisor_age_from_ip_drift_heartbeat(rendered, tmp_path, monkeypatch):
+    state = tmp_path / "ip_drift_state.json"
+    monkeypatch.setattr(metrics, "_IP_DRIFT_STATE_FILE", str(state))
+    # updated_at is an ISO-8601 Z timestamp (ip_drift_watch writes it).
+    fresh = (time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                           time.gmtime(time.time() - 60)))
+    state.write_text(json.dumps({"ip": "1.2.3.4", "updated_at": fresh}))
+    s = rendered()
+    assert 0.0 <= _value(s, "hermes_supervisor_age_seconds") <= 70.0
+
+
+def test_supervisor_age_missing_corrupt_sentinel(rendered, tmp_path, monkeypatch):
+    state = tmp_path / "ip_drift_state.json"
+    monkeypatch.setattr(metrics, "_IP_DRIFT_STATE_FILE", str(state))
+    s = rendered()
+    assert _value(s, "hermes_supervisor_age_seconds") == 1e9
+
+    state.write_text("{garbage")
+    s = rendered()
+    assert _value(s, "hermes_supervisor_age_seconds") == 1e9
+
+
+def test_alerts_firing_counts_local_breakers(rendered, monkeypatch):
+    # global_halt + 2 armed coins + market_circuit tripped = 4 firing.
+    monkeypatch.setattr(metrics, "_circuit_snapshot_for_metrics",
+                        lambda: {"global_halt": True, "armed_coins": 2})
+    import hermes_trader.agents.market_circuit_state as mcs
+    monkeypatch.setattr(
+        mcs, "read_state",
+        lambda *a, **k: {"state": 1, "tripped": True, "ts": time.time()})
+    s = rendered()
+    assert _value(s, "hermes_alerts_firing") == 4.0
+
+
+def test_alerts_firing_zero_when_clear(rendered, monkeypatch):
+    monkeypatch.setattr(metrics, "_circuit_snapshot_for_metrics",
+                        lambda: {"global_halt": False, "armed_coins": 0})
+    import hermes_trader.agents.market_circuit_state as mcs
+    monkeypatch.setattr(
+        mcs, "read_state",
+        lambda *a, **k: {"state": 0, "tripped": False, "ts": time.time()})
+    s = rendered()
+    assert _value(s, "hermes_alerts_firing") == 0.0

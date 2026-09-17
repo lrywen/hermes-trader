@@ -309,6 +309,15 @@ def _heartbeat(verdict: dict[str, Any], mode: str, verdict_label: str) -> None:
         record_evaluation(verdict, mode=mode, verdict_label=verdict_label)
     except Exception:
         pass
+    # P0-2: this is the single per-tick, all-path convergence point (every
+    # verdict including the exception/data_missing branches lands here), so
+    # flush the loop-process feed-gap / AI-brain accumulators to the
+    # cross-process state file the web /metrics process reads. Best-effort.
+    try:
+        from hermes_trader.agents.loop_observability_state import flush as _obs_flush
+        _obs_flush(bool(verdict.get("data_ok", False)))
+    except Exception:
+        pass
 
 
 def evaluate(cfg: dict[str, Any], *,

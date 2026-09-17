@@ -467,3 +467,120 @@ spec:
               research/LLM path, or a market regime with no qualifying setups.
               Confirm via ``hermes_executor_decisions_total`` and the per-coin
               cooldown/circuit counters before assuming "no signal".
+
+        # ── P0-2 remaining failure-mode gauges (2026-09-18 gap audit) ──────
+        # feed gap/trustworthy + ai_brain are published by the trading loop to
+        # /data/.loop-observability.state and exported by the web process;
+        # supervisor age comes from the ip-drift watchdog. -1 / 1e9 are the
+        # explicit "no source" sentinels (see metrics.py).
+        - alert: HermesFeedGapHigh
+          # Fraction of recent cold candleSnapshot fetches flagged with bar
+          # gaps. >10% with gaps means the market feed is degraded ahead of
+          # any fail-closed gate trip. Exclude the -1 never-published
+          # sentinel (covered by HermesFeedObservabilityAbsent).
+          expr: hermes_feed_gap_fraction >= 0 and hermes_feed_gap_fraction > 0.1
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: market_feed
+          annotations:
+            summary: "Market feed gap fraction high ({{ $value | printf \"%.2f\" }})"
+            description: |
+              ``hermes_feed_gap_fraction`` (share of recent cold candleSnapshot
+              fetches flagged with bar gaps over the loop's rolling window) has
+              exceeded 0.1 for 10+ minutes. The Hyperliquid candle feed is
+              gappy (429 storm / upstream outage). Risk gates that re-fetch
+              candles may begin to fail-closed. Check candle quality counters
+              and HL rate-limit gauges.
+
+        - alert: HermesFeedUntrustworthy
+          # 0 = the loop's market-data verdict is not trustworthy (data
+          # missing or gaps present). -1 = the loop has never published the
+          # observability state; alert only on the explicit untrusted value.
+          expr: hermes_feed_trustworthy == 0
+          for: 5m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: market_feed
+          annotations:
+            summary: "Market feed is NOT trustworthy"
+            description: |
+              ``hermes_feed_trustworthy`` has been 0 for 5+ minutes — the
+              trading loop's market data is incomplete (market_circuit data
+              missing or rolling-window bar gaps). Orders evaluated against
+              this data are unsafe. Check the market_circuit heartbeat and
+              candle feed before assuming risk gates see the true tape.
+
+        - alert: HermesFeedObservabilityAbsent
+          # -1 = the loop has never written (or stopped writing) the
+          # observability state; distinct from a real trustworthy=0.
+          expr: hermes_feed_trustworthy == -1
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: market_feed
+          annotations:
+            summary: "Loop observability state absent (feed/AI-brain blind)"
+            description: |
+              ``hermes_feed_trustworthy`` has been -1 for 10+ minutes — the
+              trading loop is not publishing /data/.loop-observability.state.
+              The feed-gap and AI-brain gauges are blind. Check that the
+              trading-loop process is alive and /data is shared.
+
+        - alert: HermesSupervisorStale
+          # ip-drift watchdog heartbeat age. It runs on a ~5min cadence;
+          # >15min (or the 1e9 missing-file sentinel) means the safety
+          # supervisor sidecar is dead/unscheduled.
+          expr: hermes_supervisor_age_seconds > 900
+          for: 5m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: supervisor
+          annotations:
+            summary: "Safety supervisor heartbeat stale ({{ $value | printf \"%.0f\" }}s)"
+            description: |
+              ``hermes_supervisor_age_seconds`` (time since the ip-drift
+              watchdog last wrote its heartbeat) has exceeded 900s for 5+
+              minutes, or the state file is missing (1e9 sentinel). The
+              egress-IP drift supervisor is not running. Confirm the
+              ip_drift_watch sidecar/container and HERMES_IP_DRIFT_WATCH=1.
+
+        - alert: HermesAlertsFiring
+          # Count of currently-firing hard controls (global halt + armed
+          # per-coin circuits + a tripped market circuit).
+          expr: hermes_alerts_firing > 0
+          for: 1m
+          labels:
+            severity: critical
+            service: hermes-trader
+            component: trade_risk
+          annotations:
+            summary: "{{ $value }} hard risk control(s) currently firing"
+            description: |
+              ``hermes_alerts_firing`` aggregates the global halt, armed
+              per-coin circuits and a tripped market circuit. A positive
+              value means hard risk controls are actively blocking trading.
+              Inspect the dashboard risk-status card for the specific
+              breaker and the market_circuit state.
+
+        - alert: HermesAIBrainNotReady
+          # 0 = key missing or research circuit breaker open; -1 = loop has
+          # never published brain state (covered by FeedObservabilityAbsent).
+          expr: hermes_ai_brain_ready == 0
+          for: 10m
+          labels:
+            severity: warning
+            service: hermes-trader
+            component: research
+          annotations:
+            summary: "AI research brain not ready"
+            description: |
+              ``hermes_ai_brain_ready`` has been 0 for 10+ minutes — the
+              research LLM is unusable (OPENROUTER_API_KEY not configured, or
+              the research circuit breaker is open after consecutive
+              failures). AI-perspective signals are degraded to their empty
+              fallback. Check the LLM gateway counters and upstream status.

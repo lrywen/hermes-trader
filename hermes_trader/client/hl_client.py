@@ -421,6 +421,17 @@ def _candle_quality_metric(
             label = issue if issue in _CANDLE_QUALITY_ISSUES else "other"
             metrics.CANDLE_QUALITY_ISSUES.labels(interval=interval,
                                                  issue=label).inc()
+        # P0-2: feed the loop-process gap window so the cross-process
+        # feed_gap_fraction gauge (served by the web process) can see it.
+        # In-process accumulator only — no I/O on the fetch path.
+        try:
+            from hermes_trader.agents.loop_observability_state import (
+                note_cold_fetch,
+            )
+
+            note_cold_fetch(quality.get("issues") or ())
+        except Exception:
+            pass
         for cause, n in dropped.items():
             if cause in _CANDLE_PARSE_CAUSES and n > 0:
                 metrics.CANDLE_PARSE_DROPPED.labels(
