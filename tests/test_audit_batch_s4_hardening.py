@@ -23,12 +23,19 @@ def test_swallowed_metric_defined():
 @pytest.mark.parametrize("label", [
     "sl_coin_floor_override",
     "regime_detection",
-    "config_env_drift_audit",
 ])
 def test_executor_silent_branches_are_instrumented(label):
     import inspect
     src = inspect.getsource(executor)
     assert f'labels(func="{label}")' in src
+
+
+def test_config_env_drift_audit_instrumented_in_config_store():
+    # P1-4 Phase 0: the sizing-only drift alarm was generalized to all four
+    # gray-release modes and centralized in config_store.report_legacy_mode_drift.
+    import inspect
+    src = inspect.getsource(config_store)
+    assert 'labels(func="config_env_drift_audit")' in src
 
 
 # ── Q7: drift tiers + critical global halt

@@ -24,6 +24,7 @@ from hermes_trader.agents.config_store import (
     compute_config_era,
     live_trading_authorized,
     read_agent_config,
+    report_legacy_mode_drift,
 )
 from hermes_trader.agents.dsl_exit import (
     ExitPolicy,
@@ -1470,12 +1471,20 @@ def _atr_calib_config(config: dict[str, Any]) -> dict[str, Any]:
     env override for the mode (gray-release flip without a file write).
     Invalid modes fall back to off."""
     blk = config.get("atr_regime_calibration") or {}
-    mode = str(blk.get("mode") or "").strip().lower()
+    file_mode = str(blk.get("mode") or "").strip().lower()
+    if file_mode not in _ATR_CALIB_MODES:
+        file_mode = "off"
     env_mode = str(os.environ.get("HERMES_ATR_REGIME_CALIB_MODE") or "").strip().lower()
-    if env_mode:
-        mode = env_mode
+    mode = env_mode if env_mode else file_mode
     if mode not in _ATR_CALIB_MODES:
         mode = "off"
+    report_legacy_mode_drift(
+        env_name="HERMES_ATR_REGIME_CALIB_MODE",
+        env_mode=env_mode,
+        file_key="atr_regime_calibration.mode",
+        file_mode=file_mode,
+        valid_modes=_ATR_CALIB_MODES,
+    )
     return {"mode": mode, "block": blk}
 
 
@@ -1600,13 +1609,10 @@ def _atr_calib_apply(
 #             sizing_v2_enabled=true behavior).
 _SIZING_V2_MODES = ("off", "shadow", "enforce")
 
-# CS-A (2026-09-08): warn once per process when an env gray-release override
-# disagrees with the persisted config. The env wins by design (deliberate
-# emergency flip), but a persistent mismatch means a container recreated
-# without the env (or a stale config value) would silently change behavior —
-# the operator needs an explicit, visible signal rather than two "sources of
-# truth" drifting apart.
-_SIZING_V2_MISMATCH_WARNED = False
+# CS-A (2026-09-08) / P1-4 Phase 0 (2026-09-17): the one-time env-vs-config
+# drift alarm for gray-release MODE env vars lives in
+# config_store.report_legacy_mode_drift, shared by all four mode accessors
+# (atr_regime_calibration / sizing_v2 / confidence_decay / signal_age_decay).
 
 
 def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -1617,50 +1623,25 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
     the merged agent config, then the legacy boolean
     ``atr_risk_sizing.sizing_v2_enabled`` (true → enforce, for backward
     compatibility). Invalid values fall back to off."""
-    global _SIZING_V2_MISMATCH_WARNED
     blk = config.get("atr_risk_sizing") or {}
-    mode = ""
-    env_mode = str(os.environ.get("HERMES_SIZING_V2_MODE") or "").strip().lower()
-    if env_mode:
-        mode = env_mode
+    blk_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
+    if blk_mode in _SIZING_V2_MODES:
+        file_mode = blk_mode
+    elif bool(blk.get("sizing_v2_enabled", False)):
+        file_mode = "enforce"
     else:
-        blk_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
-        if blk_mode:
-            mode = blk_mode
-        elif bool(blk.get("sizing_v2_enabled", False)):
-            mode = "enforce"
+        file_mode = "off"
+    env_mode = str(os.environ.get("HERMES_SIZING_V2_MODE") or "").strip().lower()
+    mode = env_mode if env_mode else file_mode
     if mode not in _SIZING_V2_MODES:
         mode = "off"
-    # CS-A: one-time env-vs-config drift alarm (env wins; config is stale).
-    if not _SIZING_V2_MISMATCH_WARNED:
-        cfg_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
-        if cfg_mode and env_mode and env_mode in _SIZING_V2_MODES and cfg_mode != env_mode:
-            _SIZING_V2_MISMATCH_WARNED = True
-            logger.warning(
-                "[config] sizing v2 mode drift: HERMES_SIZING_V2_MODE=%r "
-                "(env, ACTIVE) differs from atr_risk_sizing.sizing_v2_mode=%r "
-                "(config file). Env override wins, but the persisted config is "
-                "stale — reconcile .env.local vs .agent-config.json so a "
-                "container recreate without the env does not silently change "
-                "sizing behavior.",
-                env_mode, cfg_mode,
-            )
-            try:
-                from hermes_trader import session_log
-                session_log.append({
-                    "event": "config_env_drift",
-                    "key": "atr_risk_sizing.sizing_v2_mode",
-                    "env_value": env_mode,
-                    "config_value": cfg_mode,
-                    "effective": env_mode,
-                })
-            except Exception:  # audit must never break sizing
-                try:
-                    from hermes_trader.metrics import SWALLOWED_ERRORS
-                    SWALLOWED_ERRORS.labels(func="config_env_drift_audit").inc()
-                except Exception:
-                    pass
-                logger.warning("[executor] config_env_drift audit append failed", exc_info=True)
+    report_legacy_mode_drift(
+        env_name="HERMES_SIZING_V2_MODE",
+        env_mode=env_mode,
+        file_key="atr_risk_sizing.sizing_v2_mode",
+        file_mode=file_mode,
+        valid_modes=_SIZING_V2_MODES,
+    )
     return {"mode": mode, "block": blk}
 
 
@@ -1728,12 +1709,20 @@ def _confidence_decay_config(config: dict[str, Any]) -> dict[str, Any]:
     merged agent config. Invalid values fall back to off (safe default).
     """
     blk = config.get("confidence_decay") or {}
-    mode = str(blk.get("mode") or "").strip().lower()
+    file_mode = str(blk.get("mode") or "").strip().lower()
+    if file_mode not in _CONFIDENCE_DECAY_MODES:
+        file_mode = "off"
     env_mode = str(os.environ.get("HERMES_CONFIDENCE_DECAY_MODE") or "").strip().lower()
-    if env_mode:
-        mode = env_mode
+    mode = env_mode if env_mode else file_mode
     if mode not in _CONFIDENCE_DECAY_MODES:
         mode = "off"
+    report_legacy_mode_drift(
+        env_name="HERMES_CONFIDENCE_DECAY_MODE",
+        env_mode=env_mode,
+        file_key="confidence_decay.mode",
+        file_mode=file_mode,
+        valid_modes=_CONFIDENCE_DECAY_MODES,
+    )
     try:
         halflife_s = max(0.0, float(blk.get("halflife_s", _CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S)))
     except (TypeError, ValueError):

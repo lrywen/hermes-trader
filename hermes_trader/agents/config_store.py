@@ -2712,14 +2712,84 @@ def _resolve_provenance(dotted_key: str) -> tuple[Any, str]:
         return None, "unknown"
 
 
-# Legacy dedicated env switches that bypass the generic HERMES_CFG_ scheme
-# (still read by the runtime); included in the startup effective-config
-# snapshot so non-canonical overrides are visible too.
-_LEGACY_ENV_KEYS: tuple[str, ...] = (
+# Gray-release MODE switches that bypass the generic HERMES_CFG_ scheme
+# (each is read by its own module accessor: executor._atr_calib_config /
+# _sizing_v2_config / _confidence_decay_config and perception._age_decay_config).
+# Included in the startup effective-config snapshot so non-canonical overrides
+# are visible too. P1-4 Phase 0: the 4th mode (signal_age_decay) was previously
+# missing and silently invisible.
+_GRAY_MODE_ENV_KEYS: tuple[str, ...] = (
     "HERMES_CONFIDENCE_DECAY_MODE",
     "HERMES_ATR_REGIME_CALIB_MODE",
     "HERMES_SIZING_V2_MODE",
+    "HERMES_SIGNAL_AGE_DECAY_MODE",
 )
+
+# Dedicated kill/observability switches read directly by runtime modules,
+# also bypassing HERMES_CFG_ and absent from CANONICAL_DEFAULTS. Snapshotted
+# even when unset — two of these default ON, so a missing env line does not
+# mean the switch is off. (env name, effective default when unset).
+_DEDICATED_ENV_SWITCHES: tuple[tuple[str, bool], ...] = (
+    ("HERMES_HL_RATE_STATS", True),             # client/rate_limit.py
+    ("HERMES_PRICE_CROSSCHECK_ENABLED", True),  # client/price_crosscheck.py
+    ("HERMES_IP_DRIFT_WATCH", False),           # scripts/ip_drift_watch.py
+)
+
+# ── P1-4 Phase 0: gray-release mode env-vs-config drift observability ───────
+_LEGACY_MODE_DRIFT_WARNED: set[str] = set()
+
+
+def reset_legacy_mode_drift_warnings() -> None:
+    """Clear the per-process one-time drift alarms (tests / explicit reset)."""
+    _LEGACY_MODE_DRIFT_WARNED.clear()
+
+
+def report_legacy_mode_drift(
+    *,
+    env_name: str,
+    env_mode: str,
+    file_key: str,
+    file_mode: str,
+    valid_modes: tuple[str, ...],
+) -> None:
+    """One-time alarm when a dedicated gray-release MODE env var actively
+    overrides the persisted config (env wins; a container recreate without the
+    env silently reverts to the file value). ``file_mode`` must be the fully
+    resolved file value ("off" when absent/invalid, including legacy-bool
+    fallbacks). Observability only: logs once per process and appends a
+    config_env_drift session event; never raises and never affects resolution.
+    """
+    if env_name in _LEGACY_MODE_DRIFT_WARNED:
+        return
+    if not env_mode or env_mode not in valid_modes or file_mode == env_mode:
+        return
+    _LEGACY_MODE_DRIFT_WARNED.add(env_name)
+    logger.warning(
+        "[config] gray-release mode drift: %s=%r (env, ACTIVE) differs from "
+        "%s=%r (config file). Env override wins, but a container recreate "
+        "without the env silently reverts to the file value — reconcile "
+        ".env.local vs .agent-config.json.",
+        env_name, env_mode, file_key, file_mode or "<unset>",
+    )
+    try:
+        from hermes_trader import session_log
+
+        session_log.append({
+            "event": "config_env_drift",
+            "key": file_key,
+            "env_name": env_name,
+            "env_value": env_mode,
+            "config_value": file_mode,
+            "effective": env_mode,
+        })
+    except Exception:  # audit must never break the caller
+        try:
+            from hermes_trader.metrics import SWALLOWED_ERRORS
+            SWALLOWED_ERRORS.labels(func="config_env_drift_audit").inc()
+        except Exception:
+            pass
+        logger.warning("[config] config_env_drift audit append failed",
+                       exc_info=True)
 
 
 def _effective_config_snapshot_path() -> str:
@@ -2735,11 +2805,55 @@ def _effective_config_snapshot_path() -> str:
     )
 
 
+def _accessor_effective_view() -> dict[str, Any]:
+    """Resolve knobs that bypass the generic provenance walk through their
+    REAL module accessors (P1-4 Phase 0 / P0-3). The canonical cfg_env/file/
+    default walk cannot see (a) the nineteen loop_runtime HERMES_* legacy env
+    vars or (b) the four dedicated gray-release MODE env vars — this view
+    reports what the running loop actually gets. Lazy imports keep the
+    config_store ← executor/perception/loop_runtime edge cycle-free. Pure
+    read; a failing section becomes an {"error": ...} leaf, never raises.
+    """
+    view: dict[str, Any] = {}
+    try:
+        from hermes_trader import loop_runtime
+
+        view["loop_runtime"] = loop_runtime.loop_runtime_params()
+    except Exception as e:
+        view["loop_runtime"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.agents import executor, perception
+
+        cfg = read_agent_config()
+        view["gray_modes"] = {
+            "atr_regime_calibration.mode":
+                executor._atr_calib_config(cfg)["mode"],
+            "confidence_decay.mode":
+                executor._confidence_decay_config(cfg)["mode"],
+            "atr_risk_sizing.sizing_v2_mode":
+                executor._sizing_v2_config(cfg)["mode"],
+            "signal_age_decay.mode":
+                perception._age_decay_config(cfg)["mode"],
+        }
+    except Exception as e:
+        view["gray_modes"] = {"error": f"{type(e).__name__}: {e}"}
+    return view
+
+
 def build_effective_config_snapshot() -> dict[str, Any]:
     """Resolve every canonical config key to (value, source) via the EXACT
     cfg_get provenance path (cfg_env/file/default), plus the legacy dedicated
     env switches and the P0-1 LIVE authorization flag. Pure read; never
     mutates state and never raises (returns an {"error": ...} leaf instead).
+
+    P1-4 Phase 0 additions:
+      * legacy_env_overrides now covers all FOUR gray-release MODE env vars
+        (signal_age_decay was previously missing);
+      * env_switches lists the dedicated kill/observability switches even
+        when unset, alongside their default-when-unset (two default ON);
+      * accessor_effective resolves loop_runtime knobs and the four gray
+        modes through their real module accessors — the only place legacy
+        env overrides of those paths are visible.
     """
     leaves: dict[str, dict[str, Any]] = {}
     for key in _iter_dotted_leaves(CANONICAL_DEFAULTS):
@@ -2749,13 +2863,20 @@ def build_effective_config_snapshot() -> dict[str, Any]:
             value, source = None, f"error:{type(e).__name__}"
         leaves[key] = {"value": value, "source": source}
     legacy_env = {
-        k: os.environ.get(k) for k in _LEGACY_ENV_KEYS if os.environ.get(k) is not None
+        k: os.environ.get(k) for k in _GRAY_MODE_ENV_KEYS
+        if os.environ.get(k) is not None
+    }
+    env_switches = {
+        name: {"env": os.environ.get(name), "default_when_unset": default}
+        for name, default in _DEDICATED_ENV_SWITCHES
     }
     return {
         "generated_at_ms": int(time.time() * 1000),
         "config_file": CONFIG_PATH,
         "live_enabled": live_trading_authorized(),
         "legacy_env_overrides": legacy_env,
+        "env_switches": env_switches,
+        "accessor_effective": _accessor_effective_view(),
         "keys": leaves,
     }
 

@@ -19,7 +19,7 @@ from contextlib import contextmanager
 from typing import Any, Callable, Iterator, Optional
 
 from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
-from hermes_trader.agents.config_store import cfg_get
+from hermes_trader.agents.config_store import cfg_get, report_legacy_mode_drift
 from hermes_trader.client.cache import _Cache
 from hermes_trader.client.hl_client import fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
@@ -108,12 +108,20 @@ def _age_decay_config(config: dict[str, Any]) -> dict[str, Any]:
     override for the mode (gray-release flip without a file write). Invalid
     values fall back to safe defaults."""
     blk = config.get("signal_age_decay") or {}
-    mode = str(blk.get("mode") or "").strip().lower()
+    file_mode = str(blk.get("mode") or "").strip().lower()
+    if file_mode not in _AGE_DECAY_MODES:
+        file_mode = "off"
     env_mode = str(os.environ.get("HERMES_SIGNAL_AGE_DECAY_MODE") or "").strip().lower()
-    if env_mode:
-        mode = env_mode
+    mode = env_mode if env_mode else file_mode
     if mode not in _AGE_DECAY_MODES:
         mode = "off"
+    report_legacy_mode_drift(
+        env_name="HERMES_SIGNAL_AGE_DECAY_MODE",
+        env_mode=env_mode,
+        file_key="signal_age_decay.mode",
+        file_mode=file_mode,
+        valid_modes=_AGE_DECAY_MODES,
+    )
     return {"mode": mode, "block": blk}
 
 
