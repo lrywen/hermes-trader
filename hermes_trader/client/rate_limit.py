@@ -397,7 +397,10 @@ class SharedTokenBucket:
         stats_on = _rate_stats_enabled()
         with self._thread_lock:
             try:
-                fd = os.open(self._path, os.O_RDWR)
+                # O_CREAT: recreate the state file if it was deleted
+                # mid-run (tmpfs eviction, operator cleanup) instead of
+                # silently degrading every limiter call to fail-open.
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
             except OSError:
                 # Can't lock — grant rather than hard-block the trade path.
                 return True, 0.0
@@ -444,7 +447,7 @@ class SharedTokenBucket:
 
         def _bump() -> None:
             try:
-                fd = os.open(self._path, os.O_RDWR)
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
             except OSError:
                 return
             try:
@@ -484,7 +487,7 @@ class SharedTokenBucket:
             return empty
         try:
             with self._thread_lock:
-                fd = os.open(self._path, os.O_RDWR)
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
                 try:
                     import fcntl
                     fcntl.flock(fd, fcntl.LOCK_SH)
@@ -528,7 +531,7 @@ class SharedTokenBucket:
 
         def _drain() -> None:
             try:
-                fd = os.open(self._path, os.O_RDWR)
+                fd = os.open(self._path, os.O_RDWR | os.O_CREAT, 0o600)
             except OSError:
                 return
             try:

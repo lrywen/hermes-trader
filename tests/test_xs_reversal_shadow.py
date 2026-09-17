@@ -15,6 +15,7 @@
 """
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
@@ -454,3 +455,101 @@ def test_gather_short_side_returns_none_without_fetch(monkeypatch, tmp_path):
     import hermes_trader.client.hl_client as hl_client
     monkeypatch.setattr(hl_client, "fetch_hl_candles", _boom)
     assert xs.gather_xs_reversal("BTC", "short", config=_cfg(tmp_path)) is None
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 心跳日志（区分「没评估」vs「评估了没触发」）
+# ══════════════════════════════════════════════════════════════════════════
+def test_no_trigger_heartbeat_logged(monkeypatch, tmp_path, caplog):
+    # Flat series: ext_pct ~ 0 everywhere -> pctile ~ 1.0, never in the
+    # bottom tail -> evaluation happens but no trigger fires.
+    _patch_fetch(monkeypatch, _series(1200, crash_len=0))
+    cfg = _cfg(tmp_path, mode="shadow")
+    with caplog.at_level(logging.INFO, logger="hermes_trader.agents.xs_reversal"):
+        rec = xs.gather_xs_reversal("FLAT", "long", config=cfg)
+    assert rec is None
+    beats = [r for r in caplog.records if "no-trigger" in r.getMessage()]
+    assert beats, "expected a no-trigger heartbeat log line"
+    msg = beats[0].getMessage()
+    assert beats[0].levelno == logging.INFO
+    assert "FLAT" in msg and "pctile=" in msg and "ext=" in msg
+    # Nothing written to the shadow log (no trigger, no record).
+    assert _read_jsonl(cfg["xs_reversal"]["shadow_log_path"]) == []
+
+
+def test_no_candles_heartbeat_logged(monkeypatch, tmp_path, caplog):
+    _patch_fetch(monkeypatch, [])
+    cfg = _cfg(tmp_path, mode="shadow")
+    with caplog.at_level(logging.DEBUG, logger="hermes_trader.agents.xs_reversal"):
+        rec = xs.gather_xs_reversal("NODATA", "long", config=cfg)
+    assert rec is None
+    beats = [r for r in caplog.records
+             if "no-candles" in r.getMessage() and "NODATA" in r.getMessage()]
+    assert beats, "expected a no-candles heartbeat log line"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# 心跳状态文件（M13 停滞检测豁免：shadow_grade 读 ts 判活，不看影子流）
+# ══════════════════════════════════════════════════════════════════════════
+def _read_state(cfg) -> dict:
+    p = Path(cfg["xs_reversal"]["state_file"])
+    assert p.exists(), "heartbeat state file must be written on every evaluation"
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def test_state_heartbeat_written_on_no_trigger(monkeypatch, tmp_path):
+    # Flat series -> evaluated, no trigger. State must prove the path ran.
+    _patch_fetch(monkeypatch, _series(1200, crash_len=0))
+    cfg = _cfg(tmp_path, mode="shadow",
+               state_file=str(tmp_path / ".xs-reversal.state"))
+    before = time.time()
+    rec = xs.gather_xs_reversal("FLAT", "long", config=cfg)
+    assert rec is None
+    d = _read_state(cfg)
+    assert d["version"] == 1 and d["mode"] == "shadow" and d["coin"] == "FLAT"
+    assert d["data_ok"] is True and d["triggered"] is False
+    assert before <= d["ts"] <= time.time()
+    assert "pctile" in d and "ext_pct" in d
+    # No trigger -> nothing in the shadow stream.
+    assert _read_jsonl(cfg["xs_reversal"]["shadow_log_path"]) == []
+
+
+def test_state_heartbeat_written_on_trigger(monkeypatch, tmp_path):
+    _patch_fetch(monkeypatch, _series(xs.MIN_BARS + 2))
+    cfg = _cfg(tmp_path, mode="shadow",
+               state_file=str(tmp_path / ".xs-reversal.state"))
+    rec = xs.gather_xs_reversal("SOL", "long", config=cfg)
+    assert rec is not None
+    d = _read_state(cfg)
+    assert d["data_ok"] is True and d["triggered"] is True
+    assert d["coin"] == "SOL"
+    assert d["pctile"] == pytest.approx(rec["ext_percentile"])
+    assert d["ext_pct"] == pytest.approx(rec["ext_pct"])
+
+
+def test_state_heartbeat_written_on_fetch_failure(monkeypatch, tmp_path):
+    # Even a failed evaluation rewrites ts: liveness = "the dispatch path
+    # ran", not "the fetch succeeded" (fetch failure is alerted elsewhere).
+    _patch_fetch(monkeypatch, [])
+    cfg = _cfg(tmp_path, mode="shadow",
+               state_file=str(tmp_path / ".xs-reversal.state"))
+    before = time.time()
+    rec = xs.gather_xs_reversal("NODATA", "long", config=cfg)
+    assert rec is None
+    d = _read_state(cfg)
+    assert d["data_ok"] is False and d["triggered"] is False
+    assert before <= d["ts"] <= time.time()
+
+
+def test_state_heartbeat_written_on_exception(monkeypatch, tmp_path):
+    def _boom(*_a, **_k):
+        raise RuntimeError("simulated fetch explosion")
+    import hermes_trader.client.hl_client as hl_client
+    monkeypatch.setattr(hl_client, "fetch_hl_candles", _boom)
+    cfg = _cfg(tmp_path, mode="shadow",
+               state_file=str(tmp_path / ".xs-reversal.state"))
+    rec = xs.gather_xs_reversal("BOOM", "long", config=cfg)
+    assert rec is None
+    d = _read_state(cfg)
+    assert d["data_ok"] is False and d["triggered"] is False
+    assert "simulated fetch explosion" in d["error"]

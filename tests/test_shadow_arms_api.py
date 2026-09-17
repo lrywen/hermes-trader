@@ -446,6 +446,226 @@ def test_backfill_summary_tolerates_torn_trailing_line(tmp_path, make_backfill_c
     assert pb["pnl"]["avg_pct"] == 1.5
 
 
+# ── regen replay report (long-horizon signal-regen backtest surface) ─────────
+
+_REGEN_REPORT = {
+    "generated_at": "2026-09-15T08:36:28Z",
+    "days": 120,
+    "hold_bars": 2,
+    "coins": ["BTC/USDT:USDT", "ETH/USDT:USDT"],
+    "window": {"t_min": 1779105600000, "t_max": 1789459200000,
+               "train_end": 1785317760000, "val_end": 1787388480000},
+    "n_candidates": 167580,
+    "n_candidates_long72": 81886,
+    "params_baseline": {"rsi_ob": 75.0, "ext_ob": 2.5},
+    "plateau_picks": {"rsi_ob": None, "ext_ob": None, "adx_floor": None},
+    "axis_curves": {"rsi_ob": [
+        {"axis": 70.0, "ev": 0.46, "evs": {"train": -0.18, "val": 0.46, "test": -0.11},
+         "n": 4679, "sign_consistent": False},
+    ]},
+    "overlap": {"live_rows": 35242, "matched": 35241, "block_agree_rate": 0.9999},
+    "relax_tier": [{"probe": "rt_relax45"}],
+    "trend_filter_sweep": [{"params": {"enabled": True}}],
+    "daily_ext_cap_sweep": [{"params": {"cap": 2}}],
+    "ta_late_entry_sweep": [
+        {"params": {"rsi_ob": 70.0},
+         "val": {"blocked": {"n": 100}, "avoided_loss_per_block": 0.5}},
+        # tiny blocked cell: high avoided-loss must NOT head the trimmed table
+        {"params": {"rsi_ob": 71.0},
+         "val": {"blocked": {"n": 5}, "avoided_loss_per_block": 9.9}},
+        {"params": {"rsi_ob": 72.0},
+         "val": {"blocked": {"n": 40}, "avoided_loss_per_block": 0.3}},
+    ],
+}
+
+
+@pytest.fixture()
+def regen_client(tmp_path, monkeypatch):
+    """TestClient wired to HERMES_REGEN_REPORT_FILE=tmp report, grader stubbed,
+    TTL cache + regen run state reset."""
+    report_path = tmp_path / "regen_report.json"
+    report_path.write_text(_json.dumps(_REGEN_REPORT), encoding="utf-8")
+    monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
+    monkeypatch.setenv("HERMES_REGEN_REPORT_FILE", str(report_path))
+    from hermes_trader import dashboard
+    from hermes_trader.dashboard_routes import shadow_arms
+    monkeypatch.setattr(shadow_arms, "_load_shadow_grade", lambda: _StubGrader())
+    dashboard._TTL_CACHE.clear()
+    shadow_arms._REGEN_RUN_STATE.update({
+        "running": False, "started_at": None, "finished_at": None,
+        "exit_code": None, "days": None, "cmd": None, "error": None,
+    })
+    app = FastAPI()
+    register_routes(app)
+    return TestClient(app, raise_server_exceptions=False), report_path
+
+
+def _wait_regen_done(c, timeout_s=5.0):
+    import time as _t
+    deadline = _t.time() + timeout_s
+    while _t.time() < deadline:
+        s = c.get("/api/dashboard/shadow-arms/regen-status").json()
+        if not s["running"]:
+            return s
+        _t.sleep(0.05)
+    raise AssertionError("regen run did not finish in time")
+
+
+def test_regen_report_presents_trimmed_payload(regen_client):
+    c, _ = regen_client
+    r = c.get("/api/dashboard/shadow-arms/regen-report")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["present"] is True
+    assert body["generated_at"] == "2026-09-15T08:36:28Z"  # backtest time, not fetch time
+    assert body["days"] == 120 and body["hold_bars"] == 2
+    assert body["n_candidates"] == 167580 and body["n_candidates_long72"] == 81886
+    assert body["n_coins"] == 2 and "coins" not in body  # symbol list not copied
+    assert body["mtime"] and body["cache_ttl_s"] == 60.0
+    assert body["window"]["train_end"] == 1785317760000
+    assert body["plateau_picks"] == {"rsi_ob": None, "ext_ob": None, "adx_floor": None}
+    assert body["axis_curves"]["rsi_ob"][0]["n"] == 4679
+    assert body["overlap"]["block_agree_rate"] == 0.9999
+    assert body["trend_filter_sweep"] == [{"params": {"enabled": True}}]
+    assert body["daily_ext_cap_sweep"] == [{"params": {"cap": 2}}]
+    assert body["relax_tier"] == [{"probe": "rt_relax45"}]
+    # full grid is capped to a ranked top table: tiny blocked cells rank last
+    assert "ta_late_entry_sweep" not in body
+    assert body["ta_late_entry_sweep_rows"] == 3
+    top = body["ta_late_entry_sweep_top"]
+    assert [row["params"]["rsi_ob"] for row in top] == [70.0, 72.0, 71.0]
+
+
+def test_regen_report_missing_file_is_200(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_REGEN_REPORT_FILE", str(tmp_path / "nope.json"))
+    from hermes_trader import dashboard
+    dashboard._TTL_CACHE.clear()
+    app = FastAPI()
+    register_routes(app)
+    c = TestClient(app, raise_server_exceptions=False)
+    r = c.get("/api/dashboard/shadow-arms/regen-report")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["present"] is False and "note" in body
+
+
+def test_regen_report_unreadable_json_is_200(regen_client):
+    c, report_path = regen_client
+    report_path.write_text('{"days":', encoding="utf-8")  # torn write
+    from hermes_trader.dashboard import _TTL_CACHE
+    _TTL_CACHE.pop("shadow_arms_regen_report", None)
+    r = c.get("/api/dashboard/shadow-arms/regen-report")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["present"] is False and "unreadable" in body["note"]
+
+
+def test_regen_report_ttl_cached_then_reflects_new_file(regen_client):
+    c, report_path = regen_client
+    assert c.get("/api/dashboard/shadow-arms/regen-report").json()["days"] == 120
+    # A re-run lands within the TTL window: still served from cache...
+    new = dict(_REGEN_REPORT, days=180, generated_at="2026-09-16T00:00:00Z")
+    report_path.write_text(_json.dumps(new), encoding="utf-8")
+    assert c.get("/api/dashboard/shadow-arms/regen-report").json()["days"] == 120
+    # ...until the cache entry lapses/is invalidated — then the fresh replay shows.
+    from hermes_trader.dashboard import _TTL_CACHE
+    _TTL_CACHE.pop("shadow_arms_regen_report", None)
+    body = c.get("/api/dashboard/shadow-arms/regen-report").json()
+    assert body["days"] == 180 and body["generated_at"] == "2026-09-16T00:00:00Z"
+
+
+def test_regen_refresh_requires_operator_token(regen_client):
+    c, _ = regen_client
+    r = c.post("/api/dashboard/shadow-arms/regen-refresh", json={"days": 120})
+    assert r.status_code == 401
+
+
+def test_regen_refresh_validates_body(regen_client):
+    c, _ = regen_client
+    for bad in ({"days": 10}, {"days": 500}, {"days": "abc"}, {"days": True},
+                {"days": 120, "coins": "BTC; rm -rf /"}):
+        r = c.post("/api/dashboard/shadow-arms/regen-refresh", json=bad, headers=_auth())
+        assert r.status_code == 422, bad
+    # no run was started by the rejected bodies
+    assert c.get("/api/dashboard/shadow-arms/regen-status").json()["running"] is False
+
+
+def test_regen_refresh_runs_and_drops_report_cache(regen_client, monkeypatch):
+    c, report_path = regen_client
+    from hermes_trader.dashboard_routes import shadow_arms
+    from hermes_trader import session_log
+    captured = []
+    monkeypatch.setattr(session_log, "append", lambda ev: captured.append(ev))
+
+    async def _fake_exec(cmd):
+        new = dict(_REGEN_REPORT, days=90, generated_at="2026-09-16T00:00:00Z")
+        report_path.write_text(_json.dumps(new), encoding="utf-8")
+        return 0
+    monkeypatch.setattr(shadow_arms, "_exec_regen", _fake_exec)
+
+    # warm the report cache with the OLD file first
+    assert c.get("/api/dashboard/shadow-arms/regen-report").json()["days"] == 120
+
+    r = c.post("/api/dashboard/shadow-arms/regen-refresh",
+               json={"days": 90}, headers=_auth())
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is True and body["running"] is True and body["days"] == 90
+    assert "--days 90" in body["cmd"] and "--write" in body["cmd"]
+    assert str(report_path) in body["cmd"]  # --out matches the env override
+
+    st = _wait_regen_done(c)
+    assert st["exit_code"] == 0 and st["finished_at"] and st["error"] is None
+    # success dropped the TTL cache: the fresh replay is visible at once
+    assert c.get("/api/dashboard/shadow-arms/regen-report").json()["days"] == 90
+    # audited: start + completion events (the completion event is appended from
+    # the background task's finally block, just after running flips False)
+    import time as _t
+    deadline = _t.time() + 2.0
+    while _t.time() < deadline:
+        events = [e.get("event") for e in captured]
+        if "shadow_arms_regen_refresh_done" in events:
+            break
+        _t.sleep(0.05)
+    assert "shadow_arms_regen_refresh" in events
+    done = next(e for e in captured if e.get("event") == "shadow_arms_regen_refresh_done")
+    assert done["exit_code"] == 0 and done["via"] == "web"
+
+
+def test_regen_refresh_singleflight_409(regen_client):
+    # Deterministic guard: simulate an in-flight run by pre-setting running=True.
+    # (A real concurrent run can't be tested here — TestClient cancels per-request
+    # background tasks on response, a test-harness artifact; production uvicorn's
+    # event loop persists, so fire-and-forget create_task works fine there.)
+    c, _ = regen_client
+    from hermes_trader.dashboard_routes import shadow_arms
+    shadow_arms._REGEN_RUN_STATE["running"] = True
+
+    r = c.post("/api/dashboard/shadow-arms/regen-refresh",
+               json={"days": 120}, headers=_auth())
+    assert r.status_code == 409
+
+
+def test_regen_refresh_failed_run_keeps_state(regen_client, monkeypatch):
+    c, _ = regen_client
+    from hermes_trader.dashboard_routes import shadow_arms
+
+    async def _boom(cmd):
+        raise RuntimeError("spawn blew up")
+    monkeypatch.setattr(shadow_arms, "_exec_regen", _boom)
+
+    r = c.post("/api/dashboard/shadow-arms/regen-refresh",
+               json={"days": 60}, headers=_auth())
+    assert r.status_code == 200
+    st = _wait_regen_done(c)
+    assert st["running"] is False and "spawn blew up" in st["error"]
+    # a failure must not wedge the singleflight: the next trigger is accepted
+    r2 = c.post("/api/dashboard/shadow-arms/regen-refresh",
+                json={"days": 60}, headers=_auth())
+    assert r2.status_code == 200
+    _wait_regen_done(c)
+
+
 # ── blind-gate SSE mirror (agents/risk_gates.py) ─────────────────────────────
 
 def test_alert_memory_gate_blind_emits_sse_event(monkeypatch):

@@ -72,6 +72,13 @@ class GateContext:
     # fallback verdict is never mislabelled "debate_consensus" in the gate
     # result / execute event. Observability only — it never changes pass/fail.
     debate_used: bool = False
+    # per_coin_regime 坑1 (shadow-audited 2026-09-15): the coin's OWN 4h
+    # close-vs-EMA21 extension, side-adjusted so >0 means stretched IN the
+    # trade direction (long: close above ema; short: close below). The
+    # market_regime gate demotes an aligned free-pass whose own gap exceeds
+    # own_gap_demote_pct to the counter-trend bar. 0.0 = no data / no demote
+    # (fail open; manual path and stale analysis land here).
+    own_gap_pct: float = 0.0
 
     def __post_init__(self) -> None:
         def _num(v: Any) -> float:
@@ -111,6 +118,8 @@ class GateContext:
         self.has_binary_news_risk = bool(self.has_binary_news_risk)
         # S3: coerce research-verdict provenance to a strict bool.
         self.debate_used = bool(self.debate_used)
+        # 坑1: 0.0 = no reading / not applicable → own-gap demote stays inert.
+        self.own_gap_pct = _num(self.own_gap_pct)
         # The headline + matched term that tripped the binary-news gate, for
         # log visibility ("which article blocked this?").
         self.binary_news_match = str(self.binary_news_match or "")
@@ -735,9 +744,12 @@ def opposite_direction_guard(ctx: GateContext) -> GateResult:
 # Audit 2026-09-06 (C12): default coin pool only — the effective pool is config
 # (canonical key correlation_crypto_coins); eval_all_gates resolves it and passes
 # it in. An empty/missing config pool falls back to this built-in set.
+# Delisted/migrated tickers removed: MATIC (→ POL) and FTM (→ S) no longer
+# trade under those symbols; keeping them would let the fallback pool miss
+# correlation exposure booked under the new tickers.
 _CRYPTO_COINS = frozenset([
-    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC", "LINK",
-    "DOT", "UNI", "ATOM", "NEAR", "FTM", "APT", "ARB", "OP", "INJ", "TIA",
+    "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "POL", "LINK",
+    "DOT", "UNI", "ATOM", "NEAR", "S", "APT", "ARB", "OP", "INJ", "TIA",
     "SUI", "SEI", "WIF", "PEPE", "BONK", "FLOKI", "TRX", "LTC", "BCH", "ETC",
     "XLM", "ALGO", "AAVE", "MKR", "SNX", "CRV", "COMP", "YFI", "SUSHI", "1INCH",
 ])
@@ -900,10 +912,27 @@ def _counter_trend_decision(ctx: GateContext, base: dict[str, Any],
     }
 
 
+def side_adjusted_own_gap(side: str, close4h: Any,
+                          ema21_4h: Any) -> float:
+    """坑1 own-gap demote input: the coin's OWN 4h close-vs-EMA21 extension
+    in percent, side-adjusted so >0 means stretched IN the trade direction
+    (long: close above EMA; short: close below). Missing/non-positive
+    readings -> 0.0 (fail open: the demote never fires on no data)."""
+    try:
+        c, e = float(close4h), float(ema21_4h)
+    except (TypeError, ValueError):
+        return 0.0
+    if not (c > 0 and e > 0) or c != c or e != e:
+        return 0.0
+    raw = (c - e) / e * 100.0
+    return raw if str(side or "").lower() == "long" else -raw
+
+
 def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
                        block_counter_trend_bypass: bool = False,
                        crowded_with_min_conf: float = 0.0,
                        min_trend_score: float = 0.0,
+                       own_gap_demote_pct: float = 0.0,
                        config: Optional[dict[str, Any]] = None) -> GateResult:
     """Block counter-regime trades unless conviction OR own-coin signal clears the bar.
 
@@ -1016,6 +1045,14 @@ def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
     # can still clear it but a weak free-pass no longer does. min_trend_score=0
     # disables the overlay (reverts to the original always-pass-aligned behavior).
     weak_aligned = aligned and min_trend_score > 0 and trend_score < min_trend_score
+    # 坑1 own-gap demote (shadow-audited 2026-09-15, n=32+: WR 18.8% when the
+    # own 4h close is stretched >=15% past EMA21 in the trade direction vs
+    # 48.6% for pullback entries): an aligned free-pass chasing an exhausted
+    # move faces the counter-trend bar instead. own_gap_demote_pct<=0 disables.
+    if (aligned and not weak_aligned and own_gap_demote_pct > 0
+            and ctx.own_gap_pct >= own_gap_demote_pct):
+        weak_aligned = True
+        base["own_gap_demote"] = round(ctx.own_gap_pct, 2)
     if aligned and not against_funding and not weak_aligned:
         if with_crowd and crowded_with_min_conf > 0 and ctx.confidence < crowded_with_min_conf:
             return {"pass": False, "via": "crowded_squeeze",
@@ -2215,6 +2252,8 @@ def eval_all_gates(
         bool(cfg_get("block_counter_trend_bypass", config=config)),
         float(cfg_get("crowded_with_min_conf", config=config) or 0.0),
         float(cfg_get("min_trend_score", config=config) or 0.0),
+        # 坑1 (2026-09-15): own-4h gap demote threshold; 0/missing disables.
+        float(cfg_get("own_gap_demote_pct", config=config) or 0.0),
         config=config,
     )
     # 坑1 probe 已前移到 executor 的 runner entry gate 处

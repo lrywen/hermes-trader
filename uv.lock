@@ -645,14 +645,14 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "certifi", specifier = ">=2024.7.4" },
-    { name = "eth-account", specifier = ">=0.13.0" },
+    { name = "certifi", specifier = ">=2024.7.4,<2027" },
+    { name = "eth-account", specifier = ">=0.13.0,<1" },
     { name = "fastapi", specifier = ">=0.115,<1" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27,<1" },
-    { name = "hyperliquid-python-sdk", specifier = ">=0.23.0" },
-    { name = "msgpack", specifier = ">=1.1.0" },
-    { name = "prometheus-client", specifier = ">=0.20" },
-    { name = "pydantic", specifier = ">=2.0" },
+    { name = "hyperliquid-python-sdk", specifier = ">=0.23.0,<1" },
+    { name = "msgpack", specifier = ">=1.1.0,<2" },
+    { name = "prometheus-client", specifier = ">=0.20,<1" },
+    { name = "pydantic", specifier = ">=2.0,<3" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "uvicorn", extras = ["standard"], specifier = ">=0.30,<1" },

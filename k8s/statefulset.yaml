@@ -34,6 +34,13 @@ spec:
         - name: web
           image: hermes-trader:local
           imagePullPolicy: IfNotPresent
+          # P1-5: run as the image's non-root `hermes` user (uid/gid 1000).
+          # uid 1000 + pod fsGroup 1000 keeps the PVC group-writable.
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
           command: ["python3", "-m", "hermes_trader.server"]
           ports:
             - name: http
@@ -81,6 +88,11 @@ spec:
         - name: loop
           image: hermes-trader:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
           command: ["python3", "scripts/trading_loop.py"]
           envFrom:
             - configMapRef:
@@ -120,6 +132,11 @@ spec:
         - name: ipdrift
           image: hermes-trader:local
           imagePullPolicy: IfNotPresent
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            runAsGroup: 1000
+            allowPrivilegeEscalation: false
           command: ["python3", "scripts/ip_drift_watch.py"]
           envFrom:
             - configMapRef:

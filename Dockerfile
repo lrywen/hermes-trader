@@ -51,7 +51,20 @@ RUN uv sync --frozen --no-dev
 
 # State lives on a Fly volume mounted at /data; defaults are overridden via env
 # in fly.toml so the loop + server + MCP all share one source of truth.
-RUN mkdir -p /data
+# P1-5: create the unprivileged runtime user (uid/gid 1000, matching the k8s
+# pod fsGroup) and hand /app + /data to it. No `USER` directive on purpose —
+# see scripts/docker-entrypoint.sh for why privilege drop happens at runtime.
+RUN useradd --create-home --uid 1000 --shell /usr/sbin/nologin hermes \
+    && mkdir -p /data \
+    && chown -R hermes:hermes /app /data \
+    && cp scripts/docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh \
+    && chmod +x /usr/local/bin/docker-entrypoint.sh
+# P1-5 fix (2026-09-17): setpriv keeps the inherited HOME=/root, so the
+# dropped user (uid 1000) could not traverse /root (0700) and crashed at
+# import on ~/.hermes/universe_cache and ~/.hermes locks. Pin HOME to the
+# account home useradd created; the read-only shared config must therefore be
+# mounted at /home/hermes/.hermes-trading (see docker-compose.yml).
+ENV HOME=/home/hermes
 ENV SESSION_LOG_PATH=/data/session-log.jsonl \
     HERMES_DSL_STATE_FILE=/data/.dsl-state.json \
     HERMES_AGENT_CONFIG_FILE=/data/.agent-config.json \
@@ -62,4 +75,5 @@ EXPOSE 8000
 
 # Default command runs the FastAPI server (dashboard + API). The trading loop
 # runs as a separate Fly process — see [processes] in fly.toml.
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["python3", "-m", "hermes_trader.server"]

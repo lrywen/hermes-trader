@@ -155,6 +155,90 @@ def test_counter_trend_burst_passes_when_bypass_allowed(monkeypatch):
     assert r["via"] == "trigger:momentum_burst"
 
 
+# ── market_regime_gate: 坑1 own-gap demote (shadow-audited 2026-09-15) ───
+
+def test_own_gap_demote_faces_counter_trend_bar(monkeypatch):
+    # An aligned free-pass (up tape + long, strong trend score) whose own 4h
+    # close is stretched >=15% past EMA21 in the trade direction is demoted:
+    # no more via="aligned" — it faces the counter-trend bar instead. Low
+    # conf/score and no trigger → blocked.
+    _patch_regime(monkeypatch, "up", trend_score=80.0)
+    ctx = _ctx(trade_side="long", confidence=0.3, composite_score=10.0,
+               own_gap_pct=17.5)
+    r = market_regime_gate(ctx, counter_regime_min_conf=0.7,
+                           own_gap_demote_pct=15.0)
+    assert r["pass"] is False
+    assert r["via"] == "blocked"
+    assert r["counter_trend"] is True
+    assert r["weak_trend_score"] is True
+    assert r["own_gap_demote"] == 17.5
+
+
+def test_own_gap_below_threshold_keeps_free_pass(monkeypatch):
+    _patch_regime(monkeypatch, "up", trend_score=80.0)
+    ctx = _ctx(trade_side="long", confidence=0.3, composite_score=10.0,
+               own_gap_pct=14.9)
+    r = market_regime_gate(ctx, counter_regime_min_conf=0.7,
+                           own_gap_demote_pct=15.0)
+    assert r["pass"] is True
+    assert r["via"] == "aligned"
+    assert "own_gap_demote" not in r
+
+
+def test_own_gap_demote_disabled_when_threshold_zero(monkeypatch):
+    # own_gap_demote_pct<=0 disables the overlay (the revert switch): even an
+    # extreme gap keeps the aligned free-pass.
+    _patch_regime(monkeypatch, "up", trend_score=80.0)
+    ctx = _ctx(trade_side="long", confidence=0.3, composite_score=10.0,
+               own_gap_pct=42.0)
+    r = market_regime_gate(ctx, counter_regime_min_conf=0.7,
+                           own_gap_demote_pct=0.0)
+    assert r["pass"] is True
+    assert r["via"] == "aligned"
+
+
+def test_own_gap_demoted_but_conviction_clears_bar(monkeypatch):
+    # Demotion is not a hard block: real conviction still clears the bar.
+    _patch_regime(monkeypatch, "up", trend_score=80.0)
+    ctx = _ctx(trade_side="long", confidence=0.8, composite_score=10.0,
+               own_gap_pct=20.0)
+    r = market_regime_gate(ctx, counter_regime_min_conf=0.7,
+                           own_gap_demote_pct=15.0)
+    assert r["pass"] is True
+    assert r["via"] == "confidence"
+    assert r["counter_trend"] is True
+    assert r["own_gap_demote"] == 20.0
+
+
+def test_own_gap_demote_symmetric_short(monkeypatch):
+    # Down tape + short is the aligned side; a stretched gap demotes it too.
+    _patch_regime(monkeypatch, "down", trend_score=80.0)
+    ctx = _ctx(trade_side="short", confidence=0.3, composite_score=10.0,
+               own_gap_pct=16.0)
+    r = market_regime_gate(ctx, counter_regime_min_conf=0.7,
+                           own_gap_demote_pct=15.0)
+    assert r["pass"] is False
+    assert r["via"] == "blocked"
+    assert r["own_gap_demote"] == 16.0
+
+
+# ── side_adjusted_own_gap (pure function) ────────────────────────────────
+
+def test_side_adjusted_own_gap_sign_and_fail_open():
+    f = risk_gates.side_adjusted_own_gap
+    # Long stretched above EMA / short stretched below EMA → positive gap.
+    assert f("long", 105.0, 100.0) == 5.0
+    assert f("short", 95.0, 100.0) == 5.0
+    # Stretched AGAINST the trade direction → negative (never demotes).
+    assert f("long", 95.0, 100.0) == -5.0
+    assert f("short", 105.0, 100.0) == -5.0
+    # Fail open: missing / non-positive / NaN readings → 0.0 (inert).
+    assert f("long", None, 100.0) == 0.0
+    assert f("long", 105.0, None) == 0.0
+    assert f("long", 105.0, 0.0) == 0.0
+    assert f("long", float("nan"), 100.0) == 0.0
+
+
 # ── AgentMemory.track_daily_pnl / record_loss_outcome ────────────────────
 
 def _fresh_memory() -> AgentMemory:

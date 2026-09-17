@@ -88,6 +88,13 @@ STALE_WINDOW_H = 24
 #   常态；心跳新鲜即证明评估路径活着，不是写路径异常。研究节流下候选评估约每分钟级，
 #   同样给 30min 阈值。
 HEARTBEAT_FRESH_SEC = int(os.environ.get("HERMES_ARM_HEARTBEAT_FRESH_SEC", 1800))
+# 每臂独立新鲜阈值（秒），未列出的臂用 HEARTBEAT_FRESH_SEC。
+#   xs_reversal：由 executor 交易派发驱动（无派发=无评估），夜间低活动期
+#   派发间隙实测最大 5.0h（48h 窗口、220 次派发），全局 30min 阈值会在正常
+#   空窗误报停滞；给 6h——吸收全部实测静默，又能在半天内发现真断链。
+ARM_HEARTBEAT_FRESH_SEC = {
+    "xs_reversal": 21600,
+}
 ARM_HEARTBEAT_FILE = {
     "market_circuit": os.environ.get(
         "HERMES_MARKET_CIRCUIT_STATE_FILE", "/data/.market-circuit.state"),
@@ -97,6 +104,10 @@ ARM_HEARTBEAT_FILE = {
     #   平稳行情可数天 0 条；心跳在每次成功宏观采样（默认 300s 限频）后重写。
     "regime_overlay": os.environ.get(
         "HERMES_REGIME_OVERLAY_STATE_FILE", "/data/.regime-overlay.state"),
+    #   xs_reversal（M2 record-only）：executor 每次交易派发后评估，仅触发才
+    #   落影子流（一月仅数条）；心跳在每次评估后重写（含未触发/取数失败）。
+    "xs_reversal": os.environ.get(
+        "HERMES_XS_REVERSAL_STATE_FILE", "/data/.xs-reversal.state"),
 }
 # Audit 2026-09-10 (ta_late_entry 命中率口径修正)：该臂的 shadow 流混合了两层——
 #   layer="prefilter"（TA 预筛）：仅在「拦截成立」时才写一条（放行候选不落盘），
@@ -732,7 +743,8 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     stale = None
     heartbeat_ok = (heartbeat_age_sec is not None
                     and heartbeat_age_sec >= 0
-                    and heartbeat_age_sec <= HEARTBEAT_FRESH_SEC)
+                    and heartbeat_age_sec <= ARM_HEARTBEAT_FRESH_SEC.get(
+                        arm, HEARTBEAT_FRESH_SEC))
     # M16：仅做多且要求宏观多头的臂，regime 非 up 时结构性不触发（executor
     # fail-closed withhold，不写 shadow）。None 表示无法判定（探测失败/未提供），
     # 不退化为抑制，保持原停滞告警以免掩盖真故障。

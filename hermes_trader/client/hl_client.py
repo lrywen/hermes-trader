@@ -121,7 +121,15 @@ def init_info() -> None:
             from hyperliquid.info import Info
             # skip_ws=True prevents blocking WS connect + meta fetch
             # We already have meta from HTTP above
-            _info_instance = Info(skip_ws=True, base_url=HL_API, meta=perp_meta, spot_meta=spot_meta)
+            # P0-4: SDK default timeout is None = wait forever; pin the
+            # configured read timeout so a hung HL endpoint fails LOUD.
+            _info_instance = Info(
+                skip_ws=True,
+                base_url=HL_API,
+                meta=perp_meta,
+                spot_meta=spot_meta,
+                timeout=float(_HL_CLIENT_IO["sdk_timeout_s"]),
+            )
             logger.info("[hl] Info client initialized (HTTP-only)")
         except Exception as e:
             logger.warning(f"[hl] Failed to create Info: {e}")

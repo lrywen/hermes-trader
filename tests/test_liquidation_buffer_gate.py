@@ -17,7 +17,7 @@ This file pins down:
   3. ``_check_liquidation_buffer`` accepts / rejects by the right
      threshold, matching long & short positions, honoring
      ``HERMES_LIQ_BUFFER_USD=0`` as a test bypass, and NEVER raising
-     on a /info outage (fail-open with logged warning).
+    on a /info outage (fail-CLOSED with a loud risk alert).
   4. ``execute_plan`` early-returns ``liq_buffer_blocked:`` and clears
      the in-flight marker when the gate trips.
 """
@@ -284,19 +284,28 @@ class TestCheckLiquidationBuffer:
         out = executor._check_liquidation_buffer("ETH", 2000.0, "0xUSER")
         assert out["ok"] is True
 
-    def test_fetch_outage_fails_open(self, monkeypatch):
-        """A /info outage must NEVER block the main path."""
+    def test_fetch_outage_fails_closed(self, monkeypatch):
+        """A /info outage must refuse NEW exposure: with no clearinghouse
+        read we cannot prove the position is NOT next to its liquidation
+        price, so the gate fails closed (and alerts) instead of waving
+        the order through."""
+        from hermes_trader import notify
         from hermes_trader.agents import executor
         from hermes_trader.client import hl_client
         monkeypatch.setattr(executor, "_LIQ_BUFFER_USD", 10.0)
+        sent = []
+        monkeypatch.setattr(
+            notify, "send_text", lambda text, *, category="report": sent.append((text, category)) or True
+        )
         def boom(user, include_hip3=False):
             raise RuntimeError("network down")
         # Patch both: executor.py's local binding + hl_client.
         monkeypatch.setattr(hl_client, "fetch_account_state", boom)
         monkeypatch.setattr(executor, "fetch_account_state", boom)
         out = executor._check_liquidation_buffer("ETH", 2000.0, "0xUSER")
-        assert out["ok"] is True
-        assert "fetch_failed" in out["reason"]
+        assert out["ok"] is False
+        assert "liq_buffer_fetch_failed" in out["error"]
+        assert sent and sent[0][1] == "risk"
 
 
 # ── 4. execute_plan integration: gate trips → liq_buffer_blocked ──────────

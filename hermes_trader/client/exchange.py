@@ -982,11 +982,31 @@ def _ioc_cross_price(coin: str, is_buy: bool, mid_price: float) -> float:
     try:
         # Audit 2026-09-06 (F6): same bounded fetch as get_orderbook_spread.
         levels = _l2_snapshot_bounded(coin).get("levels", [])
-        bids, asks = levels[0], levels[1]
-        if is_buy and asks:
-            return float(asks[0]["px"]) * 1.01
-        if not is_buy and bids:
-            return float(bids[0]["px"]) * 0.99
+        # P0-3: validate the shape explicitly — a malformed/empty book must
+        # NOT silently fall through to the mid ±1% fallback (that fallback
+        # doubles as the slippage-check reference, so an unnoticed IndexError
+        # here would distort both the crossing price and the slippage gate).
+        if (
+            isinstance(levels, list)
+            and len(levels) >= 2
+            and isinstance(levels[0], list)
+            and isinstance(levels[1], list)
+        ):
+            bids, asks = levels[0], levels[1]
+            if is_buy and asks and asks[0].get("px") is not None:
+                return float(asks[0]["px"]) * 1.01
+            if not is_buy and bids and bids[0].get("px") is not None:
+                return float(bids[0]["px"]) * 0.99
+            logger.warning(
+                f"[aggressive_limit_px] empty {'ask' if is_buy else 'bid'} side "
+                f"for {coin} — falling back to mid ±1%"
+            )
+        else:
+            logger.warning(
+                f"[aggressive_limit_px] malformed l2 levels for {coin} "
+                f"(len={len(levels) if isinstance(levels, list) else 'n/a'}) — "
+                f"falling back to mid ±1%"
+            )
     except Exception as e:
         # Best-effort: fall back to mid ±1%. Log so a persistent l2 outage
         # is visible even though execution still succeeds.

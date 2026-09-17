@@ -1105,6 +1105,38 @@ def test_stale_heartbeat_keeps_stall_for_event_arm(sg):
     assert any("采数停滞" in w for w in out["warnings"])
 
 
+def test_xs_reversal_registered_with_relaxed_heartbeat_threshold(sg):
+    # xs_reversal 是派发驱动的事件型闸门：无派发=无评估，夜间空窗实测最大
+    # 5.0h，全局 30min 阈值会误报——必须有独立注册 + 6h 独立新鲜阈值。
+    assert "xs_reversal" in sg.ARM_HEARTBEAT_FILE
+    assert sg.ARM_HEARTBEAT_FILE["xs_reversal"].endswith(".xs-reversal.state")
+    assert sg.ARM_HEARTBEAT_FRESH_SEC["xs_reversal"] == 21600
+
+
+def test_xs_reversal_heartbeat_within_relaxed_threshold_suppresses_stall(sg):
+    # 心跳 1h 前：对 market_circuit（30min 阈值）会判停滞，但 xs_reversal
+    # 的 6h 独立阈值吸收正常夜间派发空窗 → 不判停滞。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H)]
+    out = sg.grade_arm("xs_reversal", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, heartbeat_age_sec=3600.0)
+    assert "collection_stalled" not in out
+    assert out["heartbeat_ok"] is True
+    assert out["heartbeat_age_sec"] == 3600.0
+    assert any("心跳正常" in w and "非采数停滞" in w for w in out["warnings"])
+
+
+def test_xs_reversal_heartbeat_beyond_relaxed_threshold_keeps_stall(sg):
+    # 心跳 7h 前（超过 6h 独立阈值）→ 评估路径真断了，必须维持停滞告警。
+    now = 1_700_000_000_000.0
+    recs = [_rec(now - 31 * H)]
+    out = sg.grade_arm("xs_reversal", "shadow", "p.jsonl", [24, 168],
+                       now_ms=now, records=recs, heartbeat_age_sec=25200.0)
+    assert "collection_stalled" in out
+    assert out["heartbeat_ok"] is False
+    assert any("采数停滞" in w for w in out["warnings"])
+
+
 def test_pullback_no_heartbeat_still_flags_stall(sg):
     # M17：pullback 有 gate 评估心跳，但调用方未取得心跳（文件缺失/陈旧传 None）
     # 且 24h 无记录时仍判停滞 —— 写路径故障不能被静默。

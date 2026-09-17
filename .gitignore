@@ -119,5 +119,9 @@ backtest-trades.csv
 .shadow-book.json
 .shadow-book.json.lock
 
+# Pending stop-loss retry runtime state (P0 hardening 2026-09-17)
+.pending-sl-retries.json
+.pending-sl-retries.json.lock
+
 # Local archive of removed diagnostic/backtest scripts (not part of the app)
 archive/

@@ -380,8 +380,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     #     counts long exposure against (was risk_gates._CRYPTO_COINS frozenset).
     #     Empty/None falls back to the built-in 40-coin list.
     "correlation_crypto_coins": [
-        "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "MATIC",
-        "LINK", "DOT", "UNI", "ATOM", "NEAR", "FTM", "APT", "ARB", "OP",
+        # Delisted tickers removed: MATIC (→ POL), FTM (→ S).
+        "BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX", "POL",
+        "LINK", "DOT", "UNI", "ATOM", "NEAR", "S", "APT", "ARB", "OP",
         "INJ", "TIA", "SUI", "SEI", "WIF", "PEPE", "BONK", "FLOKI", "TRX",
         "LTC", "BCH", "ETC", "XLM", "ALGO", "AAVE", "MKR", "SNX", "CRV",
         "COMP", "YFI", "SUSHI", "1INCH",

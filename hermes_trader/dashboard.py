@@ -3078,6 +3078,7 @@ def register_routes(app: FastAPI) -> None:
     from hermes_trader.dashboard_routes.config import register_config_routes
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
+    from hermes_trader.dashboard_routes.risk_tuning import register_risk_tuning_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
     from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
 
@@ -3091,6 +3092,9 @@ def register_routes(app: FastAPI) -> None:
     # reports over read-only endpoints + operator-gated refresh. Same
     # before-public ordering so /api/dashboard/shadow-arms/* is not swallowed.
     register_shadow_arms_routes(app)
+    # Audit 2026-09-12 (主流币漏抓 P0): risk-tuning 三臂 shadow 采数只读面板。
+    # Same before-public ordering so /api/dashboard/risk-tuning/* is not swallowed.
+    register_risk_tuning_routes(app)
     # Audit 2026-09-07 (M4): hash-chain verification + reconcile status read
     # endpoints. Read-only/anonymous-safe at the trader boundary; the portal
     # BFF tightens RBAC. Same before-public ordering as the other API groups.

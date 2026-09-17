@@ -30,7 +30,7 @@ from hyperliquid.info import Info
 from hyperliquid.websocket_manager import WebsocketManager
 
 from hermes_trader.agents import atomic_io
-from hermes_trader.client.hl_client import _http_post
+from hermes_trader.client.hl_client import HL_API, _http_post
 
 # R13-B13: WS tuning knobs live in canonical block hl_client_io; rate_limit
 # is a leaf (stdlib + lazy config_store only), so this import cannot cycle.
@@ -908,10 +908,15 @@ class HyperliquidWebSocket:
             raise
 
         try:
+            # P0-4: pin base_url (SDK default is mainnet — a testnet foot-gun
+            # since the WS manager below reads info.base_url) and the configured
+            # read timeout; SDK default timeout=None means wait forever.
             self._info = Info(
                 skip_ws=True,
+                base_url=HL_API,
                 meta=perp_meta,
                 spot_meta=spot_meta,
+                timeout=float(_HL_CLIENT_IO["sdk_timeout_s"]),
             )
         except Exception as e:
             logger.error(f"[ws] Failed to create Info: {e}")

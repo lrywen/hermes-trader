@@ -40,7 +40,8 @@ from hermes_trader.agents.memory import memory
 # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. regime_overlay
 # only imports market_regime (no cycle back to executor/risk_gates).
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay, resolve_applied_knobs
-from hermes_trader.agents.risk_gates import GateContext, eval_all_gates
+from hermes_trader.agents.risk_gates import (
+    GateContext, eval_all_gates, side_adjusted_own_gap)
 from hermes_trader.client.exchange import (
     HL_LEVERAGE,
     MIN_ORDER_USD,
@@ -557,9 +558,10 @@ def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[st
     Returns ``{"ok": True}`` when safe (or when the gate is disabled
     via ``HERMES_LIQ_BUFFER_USD=0``), or ``{"ok": False, "error": "...",
     "reason": "...", "liquidation_px": ..., "buffer_usd": ...}`` when
-    rejected. NEVER raises — a clearinghouse POST outage must not block
-    the main placement path; the gate is best-effort, fail-open with
-    a logged warning.
+    rejected. NEVER raises. Fail-CLOSED on fetch failure: if we cannot
+    read the clearinghouse we cannot prove the position is NOT next to
+    its liquidation price, so new exposure is refused (with a loud
+    alert) until the read succeeds again.
     """
     # R13-B4: live-resolve on every call so a config / env edit takes
     # effect on the next order (no restart). 0.0 round-trips as "gate
@@ -572,11 +574,30 @@ def _check_liquidation_buffer(coin: str, mid_price: float, user: str) -> dict[st
     try:
         st = fetch_account_state(user, include_hip3=False) or {}
     except Exception as e:
-        logger.warning(
-            f"[executor] P0-4 liq-buffer gate: fetch_account_state failed "
-            f"({e!r}); fail-open — proceeding to place"
+        # Fail-closed: with no clearinghouse read we cannot rule out a
+        # position sitting next to its liquidation price. This gate only
+        # runs on the entry path, so refusing here cannot block a
+        # reduce/close — it only stops NEW exposure while state is unknown.
+        msg = (
+            f"P0-4 liq-buffer gate: fetch_account_state failed ({e!r}); "
+            f"fail-closed — refusing new order on {coin} until account "
+            f"state is readable again"
         )
-        return {"ok": True, "reason": f"fetch_failed: {e!r}"}
+        logger.error(f"[executor] {msg}")
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"🚫 拒单 {coin}：无法读取账户状态（{e!r}），爆仓缓冲闸门 "
+                f"fail-closed，暂停新开仓直至恢复",
+                category="risk",
+            )
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
+        return {
+            "ok": False,
+            "error": f"liq_buffer_fetch_failed: {e!r}",
+            "reason": msg,
+        }
     by_coin = (st or {}).get("liquidation_px_by_coin") or {}
     # Match on the same coin OR a HIP-3 prefixed variant (xyz:BTC → BTC).
     pos = by_coin.get(coin)
@@ -4297,6 +4318,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             logger.error("[executor] h4_stop_distance_blind event log failed: %r",
                          _ev_e)
 
+    # 坑1 own-gap demote input: readings already ride on the research
+    # analysis dict (no extra fetch); 0.0 keeps the demote inert (fail open).
+    _own_gap_pct = side_adjusted_own_gap(
+        trade_side, analysis.get("close4h"), analysis.get("ema21_4h"))
+
     ctx = GateContext(
         confidence=analysis["confidence"],
         current_positions=positions,
@@ -4330,6 +4356,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # debate gate tags a single-LLM fallback verdict "single_fallback"
         # instead of mislabelling it "debate_consensus". Observability only.
         debate_used=bool(analysis.get("debate_used", False)),
+        # 坑1: side-adjusted own-4h gap for the market_regime own-gap demote.
+        own_gap_pct=_own_gap_pct,
     )
     # H3: an armed whale_regime_bypass is about to be consulted with a live
     # whale signal (it changes the counter-regime gate input) — audit it.
@@ -4667,7 +4695,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # to a coin whose existing position is already within
     # HERMES_LIQ_BUFFER_USD of notional cushion from its liquidation
     # price. Runs BEFORE place_hl_order so the exchange never sees a
-    # dangerous order. Gate is best-effort / fail-open on /info outage.
+    # dangerous order. Fail-closed on /info outage: unknown state blocks
+    # new exposure until the read recovers.
     try:
         _user_addr = resolve_user_address()
     except Exception:
@@ -6643,6 +6672,34 @@ def retry_pending_sl(retry_interval: int = 15) -> None:
                     f"(attempt {entry['retry_count']}); cloid preserved for "
                     f"reconciliation next cycle"
                 )
+            elif res.get("error_code") == "trigger_notional_below_min":
+                # Permanent failure: the stop notional is mathematically below
+                # the venue minimum, so retrying can NEVER succeed. Drop the
+                # entry to end the infinite loop and escalate loudly — the
+                # position is naked and needs manual intervention (reduce or
+                # close it so its size/price can satisfy the venue minimum).
+                logger.critical(
+                    f"[executor] Pending SL PERMANENT FAILURE for {coin}: "
+                    f"trigger notional below venue minimum (size={_retry_size:g} "
+                    f"sl_px={entry['sl_px']:g}) — retry is futile, dropping "
+                    f"entry; position has NO server-side stop, manual "
+                    f"intervention required"
+                )
+                try:
+                    from hermes_trader import notify as _notify
+                    _notify.send_text(
+                        f"🚨 SL 永久失败 {coin}: 触发单名义值低于交易所下限，"
+                        f"重试无意义，已停止重试；仓位无止损保护，请立即人工处理",
+                        category="risk",
+                    )
+                except Exception:
+                    pass
+                try:
+                    from hermes_trader import metrics as _m
+                    _m.PENDING_SL_REARM_FAILURES.inc()
+                except Exception:
+                    pass
+                del _pending_sl_retries[coin]
             else:
                 # NEVER drop. Loud error each time so the naked position is
                 # visible; capped backoff prevents log/rate-limit flooding.

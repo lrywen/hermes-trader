@@ -51,6 +51,7 @@ import threading
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents.atomic_io import write_json_atomic
 from hermes_trader.agents.config_store import cfg_get
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,14 @@ logger = logging.getLogger(__name__)
 _GATE_MODES = ("off", "shadow", "enforce")
 _MODE_ENV = "HERMES_XS_REVERSAL_MODE"
 _PATH_ENV = "HERMES_XS_REVERSAL_SHADOW_FILE"
+_STATE_ENV = "HERMES_XS_REVERSAL_STATE_FILE"
 _DEFAULT_LOG_NAME = "xs_reversal_shadow.jsonl"
+# Cross-process heartbeat state (parity with market_circuit_state): rewritten
+# after EVERY evaluation so the M13 stall monitor (scripts/shadow_grade.py
+# ARM_HEARTBEAT_FILE) can tell "evaluated, no trigger" apart from "never
+# evaluated" — this arm only appends to the shadow JSONL on a real trigger,
+# which can be weeks apart.
+_DEFAULT_STATE_PATH = "/data/.xs-reversal.state"
 _STREAM = "xs_reversal"
 
 # Fixed geometry of the signal (byte-for-byte the M1 backtest windows).
@@ -97,6 +105,48 @@ def _resolve_path(config: Optional[dict[str, Any]]) -> str:
     )
 
 
+def _resolve_state_path(config: Optional[dict[str, Any]]) -> str:
+    """Resolve the heartbeat state path (config -> env -> /data default)."""
+    blk = (config or {}).get("xs_reversal") or {}
+    return str(blk.get("state_file") or "").strip() or os.environ.get(
+        _STATE_ENV, _DEFAULT_STATE_PATH)
+
+
+def _write_heartbeat(config: Optional[dict[str, Any]], coin: str, *,
+                     data_ok: bool, triggered: bool,
+                     pctile: Optional[float] = None,
+                     ext_pct: Optional[float] = None,
+                     error: Optional[str] = None) -> None:
+    """Rewrite the heartbeat state file after one evaluation attempt.
+
+    Best-effort and NEVER raises (parity with
+    market_circuit_state.record_evaluation): observability I/O must not
+    perturb the dispatch thread. Atomic rename means the reader
+    (shadow_grade._heartbeat_age_sec) sees either the old or the new
+    payload, never a torn file. Written on EVERY exit path — including
+    fetch/indicator failure (data_ok=False) — because the liveness signal
+    is "the dispatch+evaluate path ran", not "the fetch succeeded"."""
+    try:
+        payload: dict[str, Any] = {
+            "version": 1,
+            "ts": time.time(),
+            "mode": _resolve_mode(config),
+            "coin": coin,
+            "data_ok": bool(data_ok),
+            "triggered": bool(triggered),
+        }
+        if pctile is not None and math.isfinite(pctile):
+            payload["pctile"] = round(float(pctile), 6)
+        if ext_pct is not None and math.isfinite(ext_pct):
+            payload["ext_pct"] = round(float(ext_pct), 4)
+        if error:
+            payload["error"] = str(error)[:200]
+        write_json_atomic(_resolve_state_path(config), payload,
+                          indent=None, fsync=False)
+    except Exception as e:  # never perturb the trade path
+        logger.debug(f"[xs_reversal] heartbeat state write failed ({coin}): {e}")
+
+
 def _ext_pct_series(closes: list[float], highs: list[float],
                     lookback_bars: int = LOOKBACK_BARS) -> list[float]:
     """Drawdown % from the rolling highest high of the last `lookback_bars`
@@ -119,6 +169,30 @@ def _pctile_rank(sorted_win: list[float], v: float) -> float:
     if not sorted_win:
         return float("nan")
     return bisect.bisect_right(sorted_win, v) / len(sorted_win)
+
+
+def _last_ext_percentile(candles: list) -> Optional[tuple[float, float]]:
+    """(ext_pct, pctile) at the last closed bar — heartbeat diagnostics only.
+
+    Uses the same series/window/rank primitives as evaluate_xs_reversal so
+    the log line matches the decision surface; None when undiagnosable."""
+    try:
+        if not candles:
+            return None
+        closes = [c.c for c in candles]
+        highs = [c.h for c in candles]
+        ext = _ext_pct_series(closes, highs)
+        i = len(candles) - 1
+        if not math.isfinite(ext[i]):
+            return None
+        lo = max(0, i - PCTILE_WIN + 1)
+        win = sorted(v for v in ext[lo:i + 1] if math.isfinite(v))
+        pct = _pctile_rank(win, ext[i])
+        if not math.isfinite(pct):
+            return None
+        return ext[i], pct
+    except (IndexError, TypeError, ValueError):
+        return None
 
 
 def _awake_frac(candles: list, vols: list[float], i: int,
@@ -269,6 +343,8 @@ def gather_xs_reversal(coin: str, side: str = "long", *,
         from hermes_trader.client.hl_client import fetch_hl_candles
         candles = fetch_hl_candles(coin, CANDLE_INTERVAL, FETCH_COUNT)
         if not candles:
+            logger.debug(f"[xs_reversal] heartbeat: {coin} no-candles")
+            _write_heartbeat(config, coin, data_ok=False, triggered=False)
             return None
         # Drop the still-forming last bar so the trigger evaluates the last
         # CLOSED bar (perception._drop_forming_bar parity). Inlined here to
@@ -280,6 +356,16 @@ def gather_xs_reversal(coin: str, side: str = "long", *,
             candles = candles[:-1]
         rec = evaluate_xs_reversal(candles, config=config)
         if rec is None:
+            # Heartbeat: lets monitoring tell "evaluated, no trigger" apart
+            # from "never evaluated" (the 24h-zero-write stall heuristic
+            # false-alarms on this event-driven arm otherwise).
+            diag = _last_ext_percentile(candles)
+            if diag is not None:
+                logger.info(f"[xs_reversal] heartbeat: {coin} pctile={diag[1]:.3f} "
+                            f"ext={diag[0]:.2f}% no-trigger")
+            _write_heartbeat(config, coin, data_ok=True, triggered=False,
+                             pctile=diag[1] if diag else None,
+                             ext_pct=diag[0] if diag else None)
             return None
         rec["coin"] = coin
         path = _resolve_path(config)
@@ -288,9 +374,14 @@ def gather_xs_reversal(coin: str, side: str = "long", *,
             append_jsonl(path, rec, stream=_STREAM)
         except Exception as e:  # pragma: no cover - writer never raises
             logger.debug(f"[xs_reversal] shadow write failed ({coin}): {e}")
+        _write_heartbeat(config, coin, data_ok=True, triggered=True,
+                         pctile=rec.get("ext_percentile"),
+                         ext_pct=rec.get("ext_pct"))
         return rec
     except Exception as e:
         logger.debug(f"[xs_reversal] gather failed ({coin}): {e}")
+        _write_heartbeat(config, coin, data_ok=False, triggered=False,
+                         error=str(e))
         return None
 
 

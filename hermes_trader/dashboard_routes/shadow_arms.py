@@ -6,6 +6,10 @@ dashboard API so the portal can render a per-arm grading/recommendation view:
   * GET  /api/dashboard/shadow-arms/grades        — latest arm verdicts + stats
   * POST /api/dashboard/shadow-arms/refresh       — force a regrade (operator write)
   * GET  /api/dashboard/shadow-arms/grade-history — nightly verdict trend snapshots
+  * GET  /api/dashboard/shadow-arms/backfill-summary — historical backtest aggregates
+  * GET  /api/dashboard/shadow-arms/regen-report  — long-horizon regen replay report
+  * POST /api/dashboard/shadow-arms/regen-refresh — trigger a regen replay (operator write)
+  * GET  /api/dashboard/shadow-arms/regen-status  — manual regen run state
 
 Posture (INERT red line): this is a READ/REPORT surface. The grader only rates
 arms and (via the nightly cron, --push) sends a Feishu advisory card — it never
@@ -37,6 +41,7 @@ import importlib.util
 import json
 import logging
 import os
+import re
 import sys
 import time
 
@@ -198,6 +203,157 @@ def _backfill_payload() -> dict:
         "cache_ttl_s": _BACKFILL_TTL_S,
     }
 
+
+# ── long-horizon signal-regen replay report surface ─────────────────────────
+# Surfaces the isolated report written by scripts/regen_param_sweep.py
+# (/data/regen_param_sweep_report.json): a 90-180d candidate-universe replay
+# with walk-forward 60/20/20 splits, single-axis EV curves, plateau picks and
+# a regen-vs-live overlap anchor. Same INERT posture: read/report only — the
+# manual trigger below just re-runs the offline script; it never touches
+# config, gates or orders.
+_REGEN_TTL_S = 60.0
+_REGEN_CACHE_KEY = "shadow_arms_regen_report"
+_REGEN_SWEEP_TOP_N = 20  # cap the ~150-row ta_late_entry grid on the read surface
+_REGEN_RUN_LOG = "/tmp/regen_dashboard_run.log"
+_REGEN_KLINE_CACHE = "/tmp/regen_candles_cache.json"
+
+# Manual-run state (singleflight). Polled via the regen-status endpoint.
+_REGEN_RUN_STATE: dict = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "exit_code": None,
+    "days": None,
+    "cmd": None,
+    "error": None,
+}
+_REGEN_TASKS: set = set()  # strong refs so GC never reaps a running task
+
+
+def _regen_report_file() -> str:
+    return os.environ.get("HERMES_REGEN_REPORT_FILE", "/data/regen_param_sweep_report.json")
+
+
+def _scripts_file(fname: str) -> str:
+    """Resolve a scripts/ helper by name (scripts/ is not a package; it lives at
+    /app/scripts in the image, <repo>/scripts from a checkout)."""
+    candidates = [
+        os.environ.get("HERMES_SCRIPTS_DIR"),
+        "/app/scripts",
+        os.path.join(os.path.dirname(__file__), "..", "..", "scripts"),
+    ]
+    for base in candidates:
+        if not base:
+            continue
+        cand = os.path.join(base, fname)
+        if os.path.isfile(cand):
+            return os.path.abspath(cand)
+    raise FileNotFoundError(f"scripts/{fname} not found")
+
+
+def _trim_sweep_rows(rows: list, n: int = _REGEN_SWEEP_TOP_N) -> list:
+    """Cap the full ta_late_entry grid for the read surface: rank by validation
+    avoided-loss-per-block (the arm-benefit metric), requiring a minimum
+    blocked sample so tiny cells don't head the table."""
+
+    def _key(r: dict) -> float:
+        val = r.get("val") or {}
+        blocked = val.get("blocked") or {}
+        if (blocked.get("n") or 0) < 30:
+            return float("-inf")
+        v = val.get("avoided_loss_per_block")
+        return float(v) if isinstance(v, (int, float)) else float("-inf")
+
+    return sorted(rows, key=_key, reverse=True)[:n]
+
+
+def _regen_payload() -> dict:
+    """Synchronous loader (run via asyncio.to_thread). Read/report only; a
+    missing or half-written report degrades to present:false, never a 500."""
+    path = _regen_report_file()
+    payload: dict = {
+        "present": False,
+        "report_file": path,
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "cache_ttl_s": _REGEN_TTL_S,
+    }
+    if not os.path.isfile(path):
+        payload["note"] = "no regen replay report yet (run regen_param_sweep.py --write or trigger regen-refresh)"
+        return payload
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            report = json.load(fh)
+    except (OSError, ValueError) as e:
+        payload["note"] = f"regen report unreadable: {e}"
+        return payload
+    payload["present"] = True
+    payload["mtime"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(os.path.getmtime(path)))
+    for key in (
+        "generated_at", "days", "hold_bars", "window",
+        "n_candidates", "n_candidates_long72", "params_baseline",
+        "plateau_picks", "axis_curves", "overlap", "relax_tier",
+        "trend_filter_sweep", "daily_ext_cap_sweep",
+    ):
+        if key in report:
+            payload[key] = report[key]
+    coins = report.get("coins")
+    if isinstance(coins, list):
+        payload["n_coins"] = len(coins)
+    grid = report.get("ta_late_entry_sweep")
+    if isinstance(grid, list):
+        payload["ta_late_entry_sweep_rows"] = len(grid)
+        payload["ta_late_entry_sweep_top"] = _trim_sweep_rows(grid)
+    return payload
+
+
+def _regen_cmd(days: int, coins: str | None) -> list[str]:
+    cmd = [
+        sys.executable, _scripts_file("regen_param_sweep.py"),
+        "--days", str(days), "--write",
+        # Bounded-memory mode for the 1GB container + isolated kline cache so
+        # a manual replay never perturbs the live trading caches.
+        "--evict-cache", "--cache-file", _REGEN_KLINE_CACHE,
+        "--out", _regen_report_file(),
+    ]
+    if coins:
+        cmd += ["--coins", coins]
+    return cmd
+
+
+async def _exec_regen(cmd: list[str]) -> int:
+    """Spawn the regen replay subprocess (minutes-long), streaming output to
+    the run log; returns the exit code. Seamed out so tests can fake it."""
+    with open(_REGEN_RUN_LOG, "ab") as logf:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=logf, stderr=asyncio.subprocess.STDOUT,
+        )
+        return await proc.wait()
+
+
+async def _regen_run(cmd: list[str], days: int) -> None:
+    from hermes_trader.dashboard import _TTL_CACHE
+    try:
+        rc = await _exec_regen(cmd)
+        _REGEN_RUN_STATE["exit_code"] = rc
+        if rc == 0:
+            # Fresh report on disk: drop the TTL-cached read so the next GET
+            # regen-report reflects the new replay immediately.
+            _TTL_CACHE.pop(_REGEN_CACHE_KEY, None)
+    except Exception as e:  # never let a spawn failure wedge the run state
+        logger.warning("regen replay run failed: %s", e)
+        _REGEN_RUN_STATE["error"] = str(e)
+    finally:
+        _REGEN_RUN_STATE["running"] = False
+        _REGEN_RUN_STATE["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        session_log.append({
+            "event": "shadow_arms_regen_refresh_done",
+            "ts": int(time.time() * 1000),
+            "days": days,
+            "exit_code": _REGEN_RUN_STATE.get("exit_code"),
+            "error": _REGEN_RUN_STATE.get("error"),
+            "via": "web",
+        })
+
 _shadow_grade_mod = None
 _shadow_grade_load_failed: Exception | None = None
 
@@ -358,3 +514,82 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
         except Exception as e:
             raise HTTPException(503, f"backfill summary unavailable: {e}")
         return JSONResponse(payload)
+
+    @app.get("/api/dashboard/shadow-arms/regen-report")
+    async def shadow_arms_regen_report() -> JSONResponse:
+        """Long-horizon signal-regen replay report (walk-forward 60/20/20,
+        axis curves, plateau picks, regen-vs-live overlap anchor). 60s TTL
+        cache: a re-run rewrites the JSON file and is surfaced once the cache
+        lapses — or immediately after a dashboard-triggered run, which drops
+        the cache on success. Anonymous-safe (counts/stats only)."""
+        try:
+            payload = await asyncio.to_thread(
+                _ttl_cached, _REGEN_CACHE_KEY, _REGEN_TTL_S, _regen_payload,
+            )
+        except Exception as e:
+            raise HTTPException(503, f"regen replay report unavailable: {e}")
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/shadow-arms/regen-status")
+    async def shadow_arms_regen_status() -> JSONResponse:
+        """Manual regen replay run state (polled by the portal while running)."""
+        return JSONResponse(dict(_REGEN_RUN_STATE))
+
+    @app.post("/api/dashboard/shadow-arms/regen-refresh")
+    async def shadow_arms_regen_refresh(request: Request) -> JSONResponse:
+        """Trigger a manual long-horizon regen replay (operator write).
+
+        Runs scripts/regen_param_sweep.py --write in the background (takes
+        minutes); the report endpoint picks the new file up as soon as the
+        run finishes. Singleflight: a second trigger while running gets 409.
+        Audited to the session log (start + completion)."""
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        if not isinstance(body, dict):
+            raise HTTPException(422, "invalid JSON body")
+        days_raw = body.get("days", 120)
+        try:
+            days = int(days_raw)
+        except (TypeError, ValueError):
+            raise HTTPException(422, f"invalid days {days_raw!r}; use an integer 30..365")
+        if days < 30 or days > 365:
+            raise HTTPException(422, f"days {days} out of range (30..365)")
+        coins = body.get("coins")
+        if coins is not None:
+            coins = str(coins).strip()
+            if coins and not re.fullmatch(r"[A-Za-z0-9_,.\-/]{1,300}", coins):
+                raise HTTPException(422, "invalid coins; use comma-separated symbols")
+            if not coins:
+                coins = None
+        if _REGEN_RUN_STATE.get("running"):
+            raise HTTPException(
+                409, "a regen replay is already running; poll regen-status",
+            )
+        try:
+            cmd = _regen_cmd(days, coins)
+        except FileNotFoundError as e:
+            raise HTTPException(503, str(e))
+        _REGEN_RUN_STATE.update({
+            "running": True,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "finished_at": None,
+            "exit_code": None,
+            "days": days,
+            "cmd": " ".join(cmd),
+            "error": None,
+        })
+        task = asyncio.create_task(_regen_run(cmd, days))
+        _REGEN_TASKS.add(task)
+        task.add_done_callback(_REGEN_TASKS.discard)
+        session_log.append({
+            "event": "shadow_arms_regen_refresh",
+            "ts": int(time.time() * 1000),
+            "days": days,
+            "coins": coins,
+            "via": "web",
+        })
+        logger.info("regen replay triggered via dashboard: days=%s coins=%s", days, coins)
+        return JSONResponse({"ok": True, **dict(_REGEN_RUN_STATE)})

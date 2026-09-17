@@ -11,7 +11,10 @@ which is where the ops signal matters).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
+import shutil
 import time
 
 from prometheus_client import (
@@ -24,6 +27,18 @@ from prometheus_client import (
 )
 
 logger = logging.getLogger(__name__)
+
+# P0-2: local-only roots for failure-mode gauges. Module-level so tests can
+# redirect them at a tmp data dir and a fake /proc.
+_WRITABLE_DATA_DIR = "/data"
+_PROC_ROOT = "/proc"
+
+# Explicit "no source / never ran" sentinels. A plain Gauge exports 0.0 even
+# when never set, so absent_over_time() / age alerts cannot tell a healthy
+# zero apart from a source that never wrote — these sentinels can.
+_AGE_NO_SOURCE = 1e9  # heartbeat state file missing/corrupt
+_AGE_NEVER_RAN = 1e6  # nightly job has never produced output
+_RSS_ABSENT = -1.0  # process not found in /proc
 
 EQUITY = Gauge("hermes_equity_usd", "Last known account equity in USD")
 OPEN_POSITIONS = Gauge(
@@ -582,12 +597,149 @@ HL_REST_TOKENS_AVAILABLE = Gauge(
     "Phase-4 P1).",
 )
 
+# ── P0-2 failure-mode gauges (2026-09-17 pathiel re-audit §5) ───────────
+# Every one of these is refreshed from LOCAL state only — state files under
+# the writable data dir, the positions snapshot, in-process memory and /proc.
+# A scrape must NEVER issue a network call for them.
+LOOP_HEARTBEAT_TIMESTAMP = Gauge(
+    "hermes_loop_heartbeat_timestamp_seconds",
+    "Unix epoch seconds of the trading loop's last positions snapshot "
+    "(saved_at/1000); 0 when no readable snapshot exists.",
+)
+LOOP_HEARTBEAT_AGE = Gauge(
+    "hermes_loop_heartbeat_age_seconds",
+    "Seconds since the loop's last positions snapshot; "
+    "1e9 sentinel when the snapshot is missing or corrupt.",
+)
+ARM_HEARTBEAT_TIMESTAMP = Gauge(
+    "hermes_arm_heartbeat_timestamp_seconds",
+    "Unix epoch seconds of an arm's last cross-process heartbeat.",
+    ["arm"],
+)
+ARM_HEARTBEAT_AGE = Gauge(
+    "hermes_arm_heartbeat_age_seconds",
+    "Seconds since an arm's last heartbeat; 1e9 sentinel when its state "
+    "file is missing or corrupt.",
+    ["arm"],
+)
+DATA_DISK_FREE = Gauge(
+    "hermes_data_disk_free_bytes",
+    "Free bytes on the filesystem backing the writable data dir.",
+)
+DRAWDOWN_FRACTION = Gauge(
+    "hermes_drawdown_fraction",
+    "Drawdown from memory peakEquity (1 - equity/peakEquity); 0 when "
+    "peakEquity is unavailable or non-positive.",
+)
+GRADING_AGE = Gauge(
+    "hermes_grading_age_seconds",
+    "mtime age of shadow_grade_history.jsonl; 1e6 sentinel when the "
+    "nightly shadow grader has never run.",
+)
+SESSION_LOG_BYTES = Gauge(
+    "hermes_session_log_bytes",
+    "Total bytes of the active session log plus rotated .gz files "
+    "(the .lock sidecar is excluded).",
+)
+PROCESS_RSS = Gauge(
+    "hermes_process_rss_bytes",
+    "Resident set size in bytes per role (server = this process; "
+    "loop = trading_loop located via /proc); -1 when the process is absent.",
+    ["role"],
+)
+
 
 def _to_float(value: object) -> float:
     try:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return 0.0
+
+
+def _read_json_ts_seconds(path: str) -> float | None:
+    """Return a positive epoch-seconds ``ts`` from a JSON heartbeat file.
+
+    Arm heartbeats store ``ts`` in epoch seconds. Missing/unreadable/corrupt
+    files and non-positive values all yield None so the caller can emit the
+    explicit no-source sentinel.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    ts = _to_float(data.get("ts"))
+    return ts if ts > 0 else None
+
+
+def _read_snapshot_saved_at(path: str) -> float | None:
+    """Return the positions snapshot ``saved_at`` in epoch seconds.
+
+    The snapshot stores saved_at in milliseconds. read_snapshot() drops stale
+    payloads and returns no timestamp, so the heartbeat must parse the file
+    directly: a stale loop must keep reporting a GROWING age.
+    """
+    try:
+        with open(path, "r") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    saved_at_ms = _to_float(data.get("saved_at"))
+    return saved_at_ms / 1000.0 if saved_at_ms > 0 else None
+
+
+def _read_vmrss_bytes(proc_root: str, pid: object) -> float | None:
+    """Parse ``VmRSS`` (kB) from ``<proc_root>/<pid>/status`` into bytes.
+
+    ``pid`` may be "self". Returns None when the process is gone, the file
+    is unreadable or the line is absent/malformed.
+    """
+    try:
+        with open(os.path.join(proc_root, str(pid), "status"), "r") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    return float(parts[1]) * 1024.0
+    except (OSError, ValueError, IndexError):
+        return None
+    return None
+
+
+def _scan_cmd_rss_bytes(proc_root: str, needle: str) -> float | None:
+    """Find the first process whose cmdline contains ``needle``; return RSS.
+
+    Scans ``<proc_root>/*/cmdline`` (null-separated argv). Returns None when
+    no process matches or no matching process exposes a parseable VmRSS.
+    """
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return None
+    needle_b = needle.encode()
+    for name in entries:
+        pdir = os.path.join(proc_root, name)
+        try:
+            with open(os.path.join(pdir, "cmdline"), "rb") as fh:
+                raw = fh.read()
+        except OSError:
+            continue
+        argv = [part for part in raw.split(b"\x00") if part]
+        # Only python interpreter invocations qualify. The compose/k8s launch
+        # is an inline `sh -c` script whose OWN cmdline contains the literal
+        # "trading_loop.py"; matching it would report the ~1MB shell instead of
+        # the real loop process (observed live: role="loop" RSS = 843776).
+        if not argv or not os.path.basename(argv[0]).startswith(b"python"):
+            continue
+        if needle_b not in b" ".join(argv):
+            continue
+        rss = _read_vmrss_bytes(proc_root, name)
+        if rss is not None:
+            return rss
+    return None
 
 
 def _refresh() -> None:
@@ -735,6 +887,125 @@ def _refresh() -> None:
                             ).set(_to_float(n))
     except Exception as e:
         logger.debug(f"[metrics] market_circuit state read failed: {e}")
+
+    # P0-2: trading-loop heartbeat (positions snapshot saved_at, ms). The
+    # file is parsed directly rather than via read_snapshot(), which drops
+    # stale payloads — a stale loop must keep reporting a growing age.
+    try:
+        from hermes_trader import positions_snapshot
+
+        ts = _read_snapshot_saved_at(positions_snapshot.SNAPSHOT_FILE)
+        if ts is None:
+            LOOP_HEARTBEAT_TIMESTAMP.set(0.0)
+            LOOP_HEARTBEAT_AGE.set(_AGE_NO_SOURCE)
+        else:
+            LOOP_HEARTBEAT_TIMESTAMP.set(ts)
+            LOOP_HEARTBEAT_AGE.set(max(0.0, time.time() - ts))
+    except Exception as e:
+        logger.debug(f"[metrics] loop heartbeat read failed: {e}")
+
+    # P0-2: per-arm heartbeats. Paths are resolved at scrape time (module
+    # attr for pullback, env-or-default for the other two arms) so tests can
+    # redirect them. Each arm parses independently — one corrupt/missing
+    # file yields the sentinel on that arm only. Labelled gauges are cleared
+    # and fully repopulated each scrape.
+    try:
+        from hermes_trader.agents import pullback_gate_state
+
+        arm_paths = (
+            ("pullback_gate", pullback_gate_state.STATE_FILE),
+            (
+                "regime_overlay",
+                os.environ.get(
+                    "HERMES_REGIME_OVERLAY_STATE_FILE",
+                    os.path.join(_WRITABLE_DATA_DIR, ".regime-overlay.state"),
+                ),
+            ),
+            (
+                "xs_reversal",
+                os.environ.get(
+                    "HERMES_XS_REVERSAL_STATE_FILE",
+                    os.path.join(_WRITABLE_DATA_DIR, ".xs-reversal.state"),
+                ),
+            ),
+        )
+        ARM_HEARTBEAT_TIMESTAMP.clear()
+        ARM_HEARTBEAT_AGE.clear()
+        for arm, path in arm_paths:
+            ts = _read_json_ts_seconds(path)
+            if ts is None:
+                ARM_HEARTBEAT_TIMESTAMP.labels(arm=arm).set(0.0)
+                ARM_HEARTBEAT_AGE.labels(arm=arm).set(_AGE_NO_SOURCE)
+            else:
+                ARM_HEARTBEAT_TIMESTAMP.labels(arm=arm).set(ts)
+                ARM_HEARTBEAT_AGE.labels(arm=arm).set(max(0.0, time.time() - ts))
+    except Exception as e:
+        logger.debug(f"[metrics] arm heartbeat read failed: {e}")
+
+    # P0-2: free space on the data filesystem. Exhaustion blocks every atomic
+    # state-file write (snapshot, heartbeats, session log).
+    try:
+        DATA_DISK_FREE.set(float(shutil.disk_usage(_WRITABLE_DATA_DIR).free))
+    except Exception as e:
+        logger.debug(f"[metrics] disk usage read failed: {e}")
+
+    # P0-2: drawdown vs the in-memory historical HWM (B-F7 peakEquity).
+    try:
+        from hermes_trader.agents.memory import memory
+
+        full = memory.get_full_state()
+        equity = _to_float(full.get("equity"))
+        peak = _to_float(full.get("peakEquity"))
+        DRAWDOWN_FRACTION.set(
+            max(0.0, 1.0 - equity / peak) if peak > 0 else 0.0
+        )
+    except Exception as e:
+        logger.debug(f"[metrics] drawdown read failed: {e}")
+
+    # P0-2: nightly shadow grader staleness. "Never ran" is the 1e6 sentinel,
+    # distinct from the 1e9 heartbeat-no-source sentinel.
+    try:
+        hist_path = os.path.join(_WRITABLE_DATA_DIR, "shadow_grade_history.jsonl")
+        GRADING_AGE.set(max(0.0, time.time() - os.path.getmtime(hist_path)))
+    except OSError:
+        GRADING_AGE.set(_AGE_NEVER_RAN)
+    except Exception as e:
+        logger.debug(f"[metrics] grading age read failed: {e}")
+
+    # P0-2: session log volume — active file plus rotated .gz files. The
+    # .lock sidecar does not match the ".*.gz" rotation pattern.
+    try:
+        from hermes_trader import session_log
+
+        total = 0
+        try:
+            total += os.path.getsize(session_log.SESSION_LOG_FILE)
+        except OSError:
+            pass
+        for rotated in session_log._list_rotated():
+            try:
+                total += os.path.getsize(rotated)
+            except OSError:
+                pass
+        SESSION_LOG_BYTES.set(float(total))
+    except Exception as e:
+        logger.debug(f"[metrics] session log bytes read failed: {e}")
+
+    # P0-2: per-process RSS via /proc. The server is this process; the loop
+    # is located by cmdline scan (no loop-side state-file write needed).
+    # -1 = process absent (loop died; watchdog should be restarting it).
+    try:
+        PROCESS_RSS.clear()
+        server_rss = _read_vmrss_bytes(_PROC_ROOT, "self")
+        PROCESS_RSS.labels(role="server").set(
+            server_rss if server_rss is not None else _RSS_ABSENT
+        )
+        loop_rss = _scan_cmd_rss_bytes(_PROC_ROOT, "trading_loop")
+        PROCESS_RSS.labels(role="loop").set(
+            loop_rss if loop_rss is not None else _RSS_ABSENT
+        )
+    except Exception as e:
+        logger.debug(f"[metrics] process rss read failed: {e}")
 
 
 def render_metrics() -> tuple[bytes, str]:
