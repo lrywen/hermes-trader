@@ -37,7 +37,7 @@ from datetime import datetime, timezone
 #    HERMES_TREND_FILTER_MODE（risk_gates.py），巡检表此前误写 _200MA_，
 #    导致该臂 env 覆盖路径/模式巡检失效 —— 已对齐写入侧。
 #  * sizing_v2 并非独立配置块：mode 寄生在 atr_risk_sizing.sizing_v2_mode
-#    （legacy 布尔 sizing_v2_enabled=true → enforce），路径键是
+#    （legacy 布尔 sizing_v2_enabled 已于 P1-4 Phase 1 step 5 退役），路径键是
 #    atr_risk_sizing.sizing_v2_shadow_log_path（executor.py）。此前按
 #    cfg["sizing_v2"] 解析永远读不到，巡检把它误报为 off —— 已显式指定。
 # Audit 2026-09-08 (arm registry fix):
@@ -76,8 +76,8 @@ def _arm_mode(cfg: dict, blk_name: str, env_name: str, mode_key: str = "mode") -
     """Mirror the runtime mode resolution: env override > config block > off.
 
     ``mode_key`` lets parasitic arms override the config field (sizing_v2 lives
-    under atr_risk_sizing with mode key ``sizing_v2_mode`` and a legacy boolean
-    ``sizing_v2_enabled`` that maps to enforce)."""
+    under atr_risk_sizing with mode key ``sizing_v2_mode``; its legacy boolean
+    sizing_v2_enabled was retired in P1-4 Phase 1 step 5)."""
     # Audit 2026-09-08 (arm registry fix): dual-boolean arms have no mode key
     # and no env mode override -- resolve enabled/shadow_mode exactly like the
     # runtime does.
@@ -102,9 +102,6 @@ def _arm_mode(cfg: dict, blk_name: str, env_name: str, mode_key: str = "mode") -
         m = str(blk.get(mode_key, "")).strip().lower()
         if m in ("off", "shadow", "enforce"):
             return m
-        # Legacy sizing_v2 boolean: enabled=true historically meant enforce.
-        if mode_key == "sizing_v2_mode" and bool(blk.get("sizing_v2_enabled", False)):
-            return "enforce"
         return "off"
     if isinstance(blk, bool):
         return "shadow" if blk else "off"

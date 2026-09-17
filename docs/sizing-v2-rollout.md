@@ -1,7 +1,9 @@
 # Sizing v2（ATR/DSL 对齐等风险仓位）灰度放量方案
 
 - 审计标注：Audit 2026-09-03 P2-9
-- 当前部署：`atr_risk_sizing.sizing_v2_enabled` 未设置（代码默认 **false/关闭**）；
+- 当前部署：`atr_risk_sizing.sizing_v2_mode = "shadow"`（三态开关
+  off/shadow/enforce，env `HERMES_SIZING_V2_MODE` 为应急逃生口）；
+  旧布尔 `sizing_v2_enabled` 已于 P1-4 Phase 1 step 5 退役，写入不再生效。
   SHADOW 模式运行中。
 
 ## 1. 背景：为什么需要 sizing v2
@@ -24,8 +26,8 @@ regime 探测 → ATR% → ATR 均值/尖峰调整 → 30 天平均出场滑点 
 
 | 键 | 类型 | 范围 | 默认 | 说明 |
 |----|------|------|------|------|
-| `sizing_v2_enabled` | bool | — | false | 总开关。false=旧路径 |
-| `sizing_v2_cap_pct` | float | 0.0-1.0 | 1.0 | 灰度系数：v2 名义本金 × cap_pct，日志记 `gray_NNpct` 钳制原因，metrics 记 `gray_pct` |
+| `sizing_v2_mode` | enum | off/shadow/enforce | off | 三态总开关。off=旧路径（v2 不计算）；shadow=只计算并写对比 JSONL，订单仍走 v1；enforce=应用 v2 宽度与灰度系数 |
+| `sizing_v2_cap_pct` | float | 0.0-1.0 | 1.0 | 灰度系数：v2 名义本金 × cap_pct，日志记 `gray_NNpct` 钳制原因，metrics 记 `gray_pct`（仅 enforce 生效） |
 | `risk_per_trade_pct` | float | 0.0-1.0 | 0.02 | 单笔风险占权益比（两路径共用） |
 | `sizing_basis` | enum | primary_stop/dsl_stop/atr_stop | primary_stop | v2 仅在 primary_stop/dsl_stop 分支生效 |
 
@@ -36,13 +38,13 @@ regime 探测 → ATR% → ATR 均值/尖峰调整 → 30 天平均出场滑点 
 
 ## 3. 阶段定义与放量规则
 
-| 阶段 | enabled | cap_pct | 最短运行 | 进入下一阶段条件 | 回滚条件 |
-|------|---------|---------|----------|------------------|----------|
-| 0 影子观察 | false | — | — | 代码部署 ≥3 天无异常 | — |
-| 1 首灰 | true | **0.10** | ≥7 个交易日 | 见 §4 收敛标准全部满足 | 任一 §5 条件触发即回阶段 0 |
-| 2 | true | **0.25** | ≥7 个交易日 | 同上 | 同上 |
-| 3 | true | **0.50** | ≥7 个交易日 | 同上 | 同上 |
-| 4 全量 | true | **1.00** | 持续 | — | 同上 |
+| 阶段 | mode | cap_pct | 最短运行 | 进入下一阶段条件 | 回滚条件 |
+|------|------|---------|----------|------------------|----------|
+| 0 影子观察 | shadow | — | — | 代码部署 ≥3 天无异常 | — |
+| 1 首灰 | enforce | **0.10** | ≥7 个交易日 | 见 §4 收敛标准全部满足 | 任一 §5 条件触发即回阶段 0 |
+| 2 | enforce | **0.25** | ≥7 个交易日 | 同上 | 同上 |
+| 3 | enforce | **0.50** | ≥7 个交易日 | 同上 | 同上 |
+| 4 全量 | enforce | **1.00** | 持续 | — | 同上 |
 
 说明：
 - 阶段 1 先用 0.10 而非直接 0.25——v2 算出的名义本金比旧路径**大**（修正低估），
@@ -65,7 +67,7 @@ regime 探测 → ATR% → ATR 均值/尖峰调整 → 30 天平均出场滑点 
    max_daily_loss 闸门未被逼近。
 6. **样本量**：阶段内影子成交 ≥20 笔（不足则延长，不凑数晋级）。
 
-## 5. 回滚条件（任一触发，立即 set sizing_v2_enabled=false）
+## 5. 回滚条件（任一触发，立即 set sizing_v2_mode=off）
 
 - 5% 漂移断言触发（sizing 与 DSL 止损不一致 = 风险测算失真）。
 - 出现 v2 路径专属异常：`[sizing-v2] regime detect failed` 高频出现
@@ -73,15 +75,16 @@ regime 探测 → ATR% → ATR 均值/尖峰调整 → 30 天平均出场滑点 
 - 影子组合最大回撤较阶段 0 同期扩大 >50%。
 - 任一单笔影子 ROE 损失 ≥ roe_halt_threshold_pct 的 50%（预警线）。
 
-回滚操作：`atr_risk_sizing.sizing_v2_enabled=false`（热更新，无需重启）；
-cap_pct 调小不回 false 也算部分回滚。
+回滚操作：`atr_risk_sizing.sizing_v2_mode=off`（热更新，无需重启）；
+事故场景也可临时设 env `HERMES_SIZING_V2_MODE=off`（逃生口，事后须回写文件并撤除 env）。
+cap_pct 调小不回 off 也算部分回滚。
 
 ## 6. 监控项清单
 
 - 每笔：`[sizing-v2]` 行（regime/spot_cap/roe_cap/slip/effective_stop）
 - 每笔：`clamped:` 原因分布（gray_pct / notional_cap / max_leverage）
 - 每日：影子成交笔数、止损原因分布、实际滑点中位数/P95、回撤
-- 配置：dashboard 配置转储确认 enabled/cap_pct 为预期值
+- 配置：dashboard 配置转储确认 mode/cap_pct 为预期值
 
 ## 7. 验证方式
 
@@ -92,7 +95,7 @@ python3 -m pytest tests/ -q
 docker exec hermes-trader grep -c '\[sizing-v2\]' /data/trading-loop.log
 docker exec hermes-trader grep 'clamped:.*gray' /data/trading-loop.log | tail -20
 # 配置热更新示例（阶段 1）：
-# atr_risk_sizing.sizing_v2_enabled = true, sizing_v2_cap_pct = 0.10
+# atr_risk_sizing.sizing_v2_mode = enforce, sizing_v2_cap_pct = 0.10
 ```
 
 ## 8. CS-G 空头侧与成本上限 shadow 遥测（2026-09-09）
@@ -136,7 +139,7 @@ CS-G 观察窗与既有 24/72/168h 评级并行，168h 末同时满足以下条�
    ratio>1 的系统性反向即阻断。
 5. **carry 校验**：`v2_cost_carry_pct` 与窗口内实际 funding 同号同量级，
    `v2_cost_borrow_bps=0.0` 期间结论按「未计借币」标注，不作为最终上限。
-6. **零路径副作用**：168h 内 applied 仓位零变化（v2 仍 false / cap 路径
+6. **零路径副作用**：168h 内 applied 仓位零变化（mode 仍为 shadow / cap 路径
    不变）、无 `v2_cost_*` 相关异常、§5 回滚条件零触发。
 
 口径产出仍由离线 `scripts/shadow_grade.py --json` 汇总；任何一项不满足都只

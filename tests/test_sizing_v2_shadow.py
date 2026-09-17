@@ -7,8 +7,8 @@ observe-only path. These tests cover the self-contained wrapper in
 agents.executor:
 
   * _sizing_v2_config mode resolution: env HERMES_SIZING_V2_MODE > block
-    sizing_v2_mode > legacy boolean sizing_v2_enabled (true → enforce) >
-    invalid/missing → off.
+    sizing_v2_mode > invalid/missing → off. The legacy boolean
+    sizing_v2_enabled was retired (P1-4 Phase 1 step 5) and is ignored.
   * _sizing_v2_shadow_path resolution: block > env > default.
   * _sizing_v2_record_shadow appends a JSON line.
   * Full maybe_execute wiring: in SHADOW (bot paper mode) the order keeps
@@ -34,17 +34,21 @@ def test_config_defaults_off(monkeypatch):
     monkeypatch.delenv(_ENV_MODE, raising=False)
     assert executor._sizing_v2_config({})["mode"] == "off"
     assert executor._sizing_v2_config({"atr_risk_sizing": {}})["mode"] == "off"
-    # Explicit disabled boolean stays off.
+    # Retired legacy boolean is ignored (false or true).
     assert executor._sizing_v2_config(
         {"atr_risk_sizing": {"sizing_v2_enabled": False}})["mode"] == "off"
 
 
-def test_config_legacy_boolean_true_means_enforce(monkeypatch):
+def test_config_legacy_boolean_is_retired_and_ignored(monkeypatch):
     monkeypatch.delenv(_ENV_MODE, raising=False)
-    # Backward compatibility: the old boolean on-switch is equivalent to
-    # enforce (immediate application), exactly as before the wrapper.
+    # P1-4 Phase 1 step 5: sizing_v2_mode is the only switch; the old
+    # boolean no longer flips the arm to enforce (dead knob resolves off).
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "enforce"
+        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "off"
+    # An explicit mode still wins alongside the dead boolean.
+    assert executor._sizing_v2_config(
+        {"atr_risk_sizing": {"sizing_v2_mode": "enforce",
+                             "sizing_v2_enabled": False}})["mode"] == "enforce"
 
 
 def test_config_block_mode(monkeypatch):
@@ -53,7 +57,7 @@ def test_config_block_mode(monkeypatch):
         {"atr_risk_sizing": {"sizing_v2_mode": "shadow"}})["mode"] == "shadow"
     assert executor._sizing_v2_config(
         {"atr_risk_sizing": {"sizing_v2_mode": "ENFORCE"}})["mode"] == "enforce"
-    # Explicit tri-state mode wins over the legacy boolean.
+    # Mode is the only switch; the retired boolean is ignored.
     assert executor._sizing_v2_config(
         {"atr_risk_sizing": {"sizing_v2_mode": "shadow",
                              "sizing_v2_enabled": True}})["mode"] == "shadow"
@@ -325,9 +329,10 @@ def test_enforce_applies_v2_width_and_gray_cap(monkeypatch, tmp_path):
     assert not (tmp_path / "sizing_v2_shadow.jsonl").exists()
 
 
-def test_legacy_boolean_enforce_behaves_like_enforce(monkeypatch, tmp_path):
-    """sizing_v2_enabled=true with no tri-state config is identical to the
-    explicit enforce mode (backward compatibility)."""
+def test_legacy_boolean_alone_keeps_arm_off(monkeypatch, tmp_path):
+    """With sizing_v2_mode absent, the retired sizing_v2_enabled=true must
+    NOT engage v2: the order sizes on the legacy v1 width (off behavior,
+    $800) and no v2 shadow comparison is written."""
     monkeypatch.delenv(_ENV_MODE, raising=False)
     shadow_file = str(tmp_path / "sizing_v2_shadow.jsonl")
     monkeypatch.setenv(_ENV_FILE, shadow_file)
@@ -341,7 +346,8 @@ def test_legacy_boolean_enforce_behaves_like_enforce(monkeypatch, tmp_path):
 
     res = executor.maybe_execute(_analysis())
     assert res.get("reason") == "shadow_mode_would_execute"
-    assert abs(captured["ctx"].trade_notional_usd - 100.0) < 1e-6
+    assert abs(captured["ctx"].trade_notional_usd - 800.0) < 1e-6
+    assert not (tmp_path / "sizing_v2_shadow.jsonl").exists()
 
 
 def test_enforce_gray_cap_bumps_sub_min_to_floor(monkeypatch, tmp_path):

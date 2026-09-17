@@ -1644,9 +1644,7 @@ def _atr_calib_apply(
 # code-level observe-only path. This wrapper adds the standard three-state
 # gray release, defaulting off and matching existing behavior exactly:
 #
-#   off     — v2 math never runs; sizing uses the legacy stop width. The
-#             legacy sizing_v2_enabled=true still flips to enforce (env
-#             override and the boolean both count as "on" below).
+#   off     — v2 math never runs; sizing uses the legacy stop width.
 #   shadow  — v2 math runs on every primary_stop sizing and is logged to a
 #             dedicated JSONL (v1 vs v2 stop width + notional, plus the ATR
 #             calibration observation), but the order keeps sizing on the
@@ -1666,17 +1664,12 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
 
     Sources in priority order: env ``HERMES_SIZING_V2_MODE`` (gray-release
     flip without a file write), then ``atr_risk_sizing.sizing_v2_mode`` in
-    the merged agent config, then the legacy boolean
-    ``atr_risk_sizing.sizing_v2_enabled`` (true → enforce, for backward
-    compatibility). Invalid values fall back to off."""
+    the merged agent config; invalid/missing values fall back to off.
+    The legacy boolean ``sizing_v2_enabled`` was retired in P1-4 Phase 1
+    step 5 and is ignored."""
     blk = config.get("atr_risk_sizing") or {}
     blk_mode = str(blk.get("sizing_v2_mode") or "").strip().lower()
-    if blk_mode in _SIZING_V2_MODES:
-        file_mode = blk_mode
-    elif bool(blk.get("sizing_v2_enabled", False)):
-        file_mode = "enforce"
-    else:
-        file_mode = "off"
+    file_mode = blk_mode if blk_mode in _SIZING_V2_MODES else "off"
     env_mode = str(os.environ.get("HERMES_SIZING_V2_MODE") or "").strip().lower()
     mode = env_mode if env_mode else file_mode
     if mode not in _SIZING_V2_MODES:

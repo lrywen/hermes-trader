@@ -8,8 +8,9 @@ mis-resolved two arms so its health verdicts silently lied:
     inspector table carried HERMES_TREND_FILTER_200MA_*, so an env-overridden
     path/mode was never inspected at the real file.
   * sizing_v2 — not a standalone config block: its mode lives under
-    atr_risk_sizing.sizing_v2_mode (legacy boolean sizing_v2_enabled=true ->
-    enforce) and its path under atr_risk_sizing.sizing_v2_shadow_log_path
+    atr_risk_sizing.sizing_v2_mode (the legacy sizing_v2_enabled boolean was
+    retired in P1-4 Phase 1 step 5) and its path under
+    atr_risk_sizing.sizing_v2_shadow_log_path
     (executor.py). The inspector read cfg["sizing_v2"], which is always absent,
     so the arm was perpetually reported "off" and its path defaulted to the
     read-only home mount.
@@ -85,12 +86,12 @@ def test_sizing_v2_parasitic_block_resolution(sp, monkeypatch):
     assert sp._arm_path(cfg, blk, env_file, default_name, path_key) == "/data/sv.jsonl"
 
 
-def test_sizing_v2_legacy_boolean_maps_to_enforce(sp):
-    """Legacy atr_risk_sizing.sizing_v2_enabled=true historically meant
-    enforce; the inspector must report it as active (enforce), not off."""
+def test_sizing_v2_legacy_boolean_is_retired(sp):
+    """P1-4 Phase 1 step 5: sizing_v2_enabled=true no longer maps to
+    enforce; without an explicit sizing_v2_mode the inspector reports off."""
     label, blk, env_file, default_name, mode_key, path_key = _row(sp, "sizing_v2")
     cfg = {"atr_risk_sizing": {"sizing_v2_enabled": True}}
-    assert sp._arm_mode(cfg, blk, env_file, mode_key) == "enforce"
+    assert sp._arm_mode(cfg, blk, env_file, mode_key) == "off"
 
 
 def test_sizing_v2_env_mode_override(sp, monkeypatch):

@@ -139,16 +139,18 @@ def test_p02_drift_alarm_silent_on_invalid_env(
     assert not [e for e in drift_events if e.get("event") == "config_env_drift"]
 
 
-def test_p02_sizing_v2_legacy_bool_counts_as_file_enforce(
+def test_p02_sizing_v2_legacy_bool_no_longer_counts_as_file_enforce(
         monkeypatch, caplog, drift_events):
-    """File-resolved value must account for the legacy sizing_v2_enabled
-    boolean (true → enforce), so env=shadow vs enabled=true still alarms."""
+    """P1-4 Phase 1 step 5: the retired sizing_v2_enabled boolean must not
+    count as a file-side mode; env=shadow vs bool=true reports the file
+    value as off and still alarms on the env override."""
     monkeypatch.setenv("HERMES_SIZING_V2_MODE", "shadow")
     cfg = {"atr_risk_sizing": {"sizing_v2_enabled": True}}
-    executor._sizing_v2_config(cfg)
+    effective = executor._sizing_v2_config(cfg)
+    assert effective["mode"] == "shadow"
     drift = [e for e in drift_events if e.get("event") == "config_env_drift"]
     assert len(drift) == 1
-    assert drift[0]["config_value"] == "enforce"
+    assert drift[0]["config_value"] == "off"
 
 
 # ── P0-3: accessor-effective snapshot view ─────────────────────────────────

@@ -460,8 +460,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # P1-4 Phase 1: sizing v2 gray-release mode as a canonical file
         # leaf so the truth source can move out of HERMES_SIZING_V2_MODE.
         # Safe default "off", identical to the accessor's fallback; the
-        # legacy boolean sizing_v2_enabled (true -> enforce) remains a
-        # secondary fallback until its later-cycle retirement.
+        # legacy boolean sizing_v2_enabled was retired in Phase 1 step 5.
         "sizing_v2_mode": "off",
         # R12-C1: per-coin overrides for the ATR sizing / SL floor params
         # (e.g. {"HYPE": {"sl_floor_pct": 1.5}}). Empty by default; was
