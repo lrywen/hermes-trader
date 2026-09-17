@@ -3,7 +3,8 @@
 - 审计标注：Audit 2026-09-03 P2-9
 - 当前部署：`atr_risk_sizing.sizing_v2_mode = "shadow"`（三态开关
   off/shadow/enforce，env `HERMES_SIZING_V2_MODE` 为应急逃生口）；
-  旧布尔 `sizing_v2_enabled` 已于 P1-4 Phase 1 step 5 退役，写入不再生效。
+  旧布尔 `sizing_v2_enabled` 已于 P1-4 Phase 1 step 5 退役：运行时访问器
+  语义忽略，schema 亦已摘除该叶，patch 门以 unknown key 显式拒绝写入。
   SHADOW 模式运行中。
 
 ## 1. 背景：为什么需要 sizing v2
