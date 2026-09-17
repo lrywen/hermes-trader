@@ -39,6 +39,7 @@ _PROC_ROOT = "/proc"
 _AGE_NO_SOURCE = 1e9  # heartbeat state file missing/corrupt
 _AGE_NEVER_RAN = 1e6  # nightly job has never produced output
 _RSS_ABSENT = -1.0  # process not found in /proc
+_BACKUP_MARKER_ABSENT = -1.0  # no verified pre-deploy backup marker
 
 EQUITY = Gauge("hermes_equity_usd", "Last known account equity in USD")
 OPEN_POSITIONS = Gauge(
@@ -636,6 +637,13 @@ GRADING_AGE = Gauge(
     "mtime age of shadow_grade_history.jsonl; 1e6 sentinel when the "
     "nightly shadow grader has never run.",
 )
+BACKUP_AGE = Gauge(
+    "hermes_backup_age_seconds",
+    "Age from the 'ts' field of the verified pre-deploy backup marker "
+    "(scripts/backup_state.py writes it only after every state file "
+    "passed non-empty + sha256 + JSON checks); -1 sentinel when the "
+    "marker is missing or corrupt.",
+)
 SESSION_LOG_BYTES = Gauge(
     "hermes_session_log_bytes",
     "Total bytes of the active session log plus rotated .gz files "
@@ -971,6 +979,25 @@ def _refresh() -> None:
         GRADING_AGE.set(_AGE_NEVER_RAN)
     except Exception as e:
         logger.debug(f"[metrics] grading age read failed: {e}")
+
+    # P1-6: verified pre-deploy backup staleness. The marker is written on
+    # the host by scripts/backup_state.py and bind-mounted read-only; the
+    # path is resolved at scrape time (env-or-default) so tests can redirect
+    # it. The age uses the marker's embedded 'ts', not its mtime (docker cp /
+    # file copies may preserve or alter mtime), and missing/corrupt markers
+    # emit the -1 sentinel rather than a misleading healthy zero.
+    try:
+        marker_path = os.environ.get(
+            "HERMES_BACKUP_MARKER_FILE",
+            os.path.join(_WRITABLE_DATA_DIR, ".backup-verified.json"),
+        )
+        ts = _read_json_ts_seconds(marker_path)
+        if ts is None:
+            BACKUP_AGE.set(_BACKUP_MARKER_ABSENT)
+        else:
+            BACKUP_AGE.set(max(0.0, time.time() - ts))
+    except Exception as e:
+        logger.debug(f"[metrics] backup age read failed: {e}")
 
     # P0-2: session log volume — active file plus rotated .gz files. The
     # .lock sidecar does not match the ".*.gz" rotation pattern.

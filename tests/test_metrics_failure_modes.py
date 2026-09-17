@@ -159,6 +159,45 @@ def test_grading_age_never_ran_then_fresh(rendered, tmp_path, monkeypatch):
     assert _value(s, "hermes_grading_age_seconds") == pytest.approx(3 * 3600, abs=5)
 
 
+# ── verified pre-deploy backup age (marker ts, host-mounted) ───────────
+
+def test_backup_age_fresh_from_marker_ts(rendered, tmp_path, monkeypatch):
+    marker = tmp_path / ".backup-verified.json"
+    monkeypatch.setenv("HERMES_BACKUP_MARKER_FILE", str(marker))
+    marker.write_text(json.dumps({"version": 1, "ts": time.time() - 3600}))
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == pytest.approx(3600, abs=5)
+
+
+def test_backup_age_missing_corrupt_bad_ts_sentinel(rendered, tmp_path, monkeypatch):
+    marker = tmp_path / ".backup-verified.json"
+    monkeypatch.setenv("HERMES_BACKUP_MARKER_FILE", str(marker))
+
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == -1.0
+
+    marker.write_text("{not json")
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == -1.0
+
+    marker.write_text(json.dumps({"version": 1, "ts": 0}))
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == -1.0
+
+
+def test_backup_age_defaults_under_writable_data_dir(rendered, tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_BACKUP_MARKER_FILE", raising=False)
+    monkeypatch.setattr(metrics, "_WRITABLE_DATA_DIR", str(tmp_path))
+
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == -1.0
+
+    marker = tmp_path / ".backup-verified.json"
+    marker.write_text(json.dumps({"version": 1, "ts": time.time() - 120}))
+    s = rendered()
+    assert _value(s, "hermes_backup_age_seconds") == pytest.approx(120, abs=5)
+
+
 # ── session log bytes (active + rotated gz, never the lock sidecar) ────
 
 def test_session_log_bytes(rendered, tmp_path, monkeypatch):
