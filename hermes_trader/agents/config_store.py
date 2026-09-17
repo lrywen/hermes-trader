@@ -1599,6 +1599,36 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # loop_runtime.LOOP_RUNTIME_DEFAULTS); 0 disables the cap.
         "research_max_jobs_per_scan": 8,
     },
+    # Audit 2026-09-10 (risk-tuning shadow): volatility/score de-leverage
+    # arm read by executor.py (`_lev_tier`). shadow_mode=false keeps it an
+    # inert would-deleverage probe; when the block is present with
+    # shadow_mode=false the executor may still ENFORCE the tier (its own
+    # convention), so the canonical default mirrors the production block.
+    # The values below match the production .agent-config.json verbatim.
+    "leverage_tier_shadow": {
+        "shadow_mode": False,
+        "atr_pct_max": 3.5,
+        "min_composite": 40,
+        "low_leverage": 5,
+    },
+    # 坑1 (2026-09-15): per-coin macro x own-4h-divergence shadow probe
+    # (per_coin_regime_shadow.py). shadow_mode=false = inert (the probe
+    # records nothing until explicitly enabled). record_all_quadrants /
+    # require_own_adx / strong_own_score / mid_own_score mirror the
+    # fallbacks the recorder applies with .get; shadow_log_path empty →
+    # env / container default path.
+    "per_coin_regime_shadow": {
+        "shadow_mode": False,
+        "record_all_quadrants": True,
+        "require_own_adx": 20.0,
+        "strong_own_score": 0.65,
+        "mid_own_score": 0.55,
+        "shadow_log_path": "",
+    },
+    # 坑1 (2026-09-15): own-4h gap demote threshold (%) read via cfg_get
+    # in risk_gates.market_regime_gate. 0.0 = overlay disabled (the
+    # revert switch; production runs 15).
+    "own_gap_demote_pct": 0.0,
     # 配置文件注释字段（不参与交易逻辑）
     "_comment": "",
 }

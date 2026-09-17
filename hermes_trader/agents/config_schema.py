@@ -344,6 +344,18 @@ class _ConfigPatch(BaseModel):
     research_cooldown_adaptive: dict[str, Any] = Field(
         default_factory=lambda: _dict_default("research_cooldown_adaptive"))
 
+    # P1-4 Phase 3 (2026-09-15 risk-tuning shadows): the volatility/score
+    # de-leverage arm (executor.py) and the macro x own-4h divergence probe
+    # (per_coin_regime_shadow.py), plus the own-4h gap demote threshold
+    # (risk_gates via cfg_get; 0.0 disables). Previously EXTRA keys flagged
+    # unknown by every strict whole-view validation.
+    leverage_tier_shadow: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("leverage_tier_shadow"))
+    per_coin_regime_shadow: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("per_coin_regime_shadow"))
+    own_gap_demote_pct: float = Field(
+        default=CANONICAL_DEFAULTS["own_gap_demote_pct"], ge=0.0, le=100.0)
+
 
 # Keys whose out-of-range message predates the generic bounds table and is
 # asserted on by operators/tests — keep the historical wording verbatim.
@@ -703,6 +715,29 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "awake_min_frac": _num_leaf(0.0, 1.0),
         "rsi_long": _num_leaf(0.0, 100.0),
         "rsi_floor": _num_leaf(0.0, 100.0),
+        "shadow_log_path": ("str",),
+    },
+    # P1-4 Phase 3: volatility/score de-leverage arm (executor.py
+    # `_lev_tier`). shadow_mode=true records would-deleverage only; false
+    # enforces the lower tier when the block is present. ATR% above
+    # atr_pct_max OR composite below min_composite de-levers to low_leverage.
+    "leverage_tier_shadow": {
+        "shadow_mode": ("bool",),
+        "atr_pct_max": _num_leaf(0.0, 100.0),
+        "min_composite": _num_leaf(0.0, 100.0),
+        "low_leverage": ("int", 1, 50),
+    },
+    # P1-4 Phase 3: macro x own-4h-divergence shadow probe
+    # (per_coin_regime_shadow.py). shadow_mode arms recording;
+    # record_all_quadrants keeps sampling across non-aligned stretches;
+    # require_own_adx gates trend conviction; strong/mid_own_score bucket the
+    # macro x own quadrant tier.
+    "per_coin_regime_shadow": {
+        "shadow_mode": ("bool",),
+        "record_all_quadrants": ("bool",),
+        "require_own_adx": _num_leaf(0.0, 1000.0),
+        "strong_own_score": _num_leaf(0.0, 1.0),
+        "mid_own_score": _num_leaf(0.0, 1.0),
         "shadow_log_path": ("str",),
     },
 }
