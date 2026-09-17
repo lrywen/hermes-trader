@@ -145,6 +145,52 @@ def _resolve_hl_taker_fee_pct() -> float:
     return _resolve_live_float("execution.taker_fee_pct", _HL_TAKER_FEE_PCT)
 
 
+def _resolve_max_atr_pct(
+    *, config: Optional[dict[str, Any]] = None
+) -> float:
+    """Resolve the pre-trade ATR volatility gate ceiling (percent of spot).
+
+    Legacy env ``HERMES_MAX_ATR_PCT`` stays the top-priority operator escape
+    hatch; canonical key ``max_atr_pct`` covers HERMES_CFG_* / agent-config /
+    CANONICAL_DEFAULTS. The ``or`` form preserves the historic gate expression
+    exactly (P1-4 Phase 2.2: extracted verbatim from maybe_execute).
+    """
+    return float(
+        os.environ.get("HERMES_MAX_ATR_PCT")
+        or cfg_get("max_atr_pct", config=config)
+    )
+
+
+def _resolve_max_spread_pct(
+    *, config: Optional[dict[str, Any]] = None
+) -> float:
+    """Resolve the pre-trade order-book spread gate ceiling (percent).
+
+    Legacy env ``HERMES_MAX_SPREAD_PCT`` stays the top-priority operator
+    escape hatch; canonical key ``max_spread_pct`` covers the rest. The ``or``
+    form preserves the historic gate expression exactly.
+    """
+    return float(
+        os.environ.get("HERMES_MAX_SPREAD_PCT")
+        or cfg_get("max_spread_pct", config=config)
+    )
+
+
+def _resolve_spread_gate_fail_open(
+    *, config: Optional[dict[str, Any]] = None
+) -> bool:
+    """Resolve whether an unreadable order book fails OPEN instead of closed.
+
+    Fail-closed default: only the exact env string ``"1"`` arms the legacy
+    escape hatch (other non-empty values do NOT open the gate), otherwise the
+    canonical ``spread_gate_fail_open`` value decides.
+    """
+    return (
+        os.environ.get("HERMES_SPREAD_GATE_FAIL_OPEN", "0") == "1"
+        or bool(cfg_get("spread_gate_fail_open", config=config))
+    )
+
+
 def _resolve_hl_round_trip_fills() -> int:
     """Resolve the number of taker fills modeled per round trip (entry+exit)."""
     return _resolve_live_int("execution.round_trip_fills", _HL_ROUND_TRIP_FILLS)
@@ -4515,10 +4561,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # with the new 3% ceiling clamp because a 3% stop on a 28%-ATR coin fires
     # on noise within 1-2 candles. Config key: max_atr_pct (default 15.0);
     # legacy env HERMES_MAX_ATR_PCT still honored for backward compatibility.
-    _max_atr_pct = float(
-        os.environ.get("HERMES_MAX_ATR_PCT")
-        or cfg_get("max_atr_pct", config=config)
-    )
+    _max_atr_pct = _resolve_max_atr_pct(config=config)
     _atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
     if _atr_pct > _max_atr_pct:
         logger.warning(
@@ -4559,10 +4602,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # catastrophic slippage on testnet / low-cap names.
     # Config key: max_spread_pct (default 1.0); legacy env HERMES_MAX_SPREAD_PCT
     # still honored.
-    _max_spread_pct = float(
-        os.environ.get("HERMES_MAX_SPREAD_PCT")
-        or cfg_get("max_spread_pct", config=config)
-    )
+    _max_spread_pct = _resolve_max_spread_pct(config=config)
     _ob = get_orderbook_spread(coin)
     if _ob.get("ok"):
         logger.info(
@@ -4587,10 +4627,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # 1% past best ask/ask is most dangerous. Operators may opt back into
         # the legacy fail-open behaviour via config spread_gate_fail_open=true
         # or env HERMES_SPREAD_GATE_FAIL_OPEN=1.
-        _fail_open = (
-            os.environ.get("HERMES_SPREAD_GATE_FAIL_OPEN", "0") == "1"
-            or bool(cfg_get("spread_gate_fail_open", config=config))
-        )
+        _fail_open = _resolve_spread_gate_fail_open(config=config)
         if _fail_open:
             logger.warning(
                 f"[executor] Pre-trade {coin}: orderbook unavailable "

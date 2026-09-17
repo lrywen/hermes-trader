@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import importlib
 import json
 import logging
 import os
@@ -2811,13 +2812,132 @@ def _effective_config_snapshot_path() -> str:
     )
 
 
+# ── P1-4 Phase 2.2 (plan a): D-family accessor effective-value projection ──
+# The legacy HERMES_* env vars stay the highest-priority OPERATOR EMERGENCY
+# ESCAPE HATCH for every leaf below — nothing here removes, renames or demotes
+# them. The startup effective-config snapshot is the authoritative surface
+# for the value actually in effect: each leaf projects the REAL accessor
+# output plus why it is active (env / cfg_env / file / default). Three
+# families (hl_client_io / hl_rate_limit / dsl_state_io) resolve at IMPORT
+# time with config={} into frozen module constants, so the mounted config
+# file is structurally invisible to their hot path — those leaves can never
+# be labeled "file". All helpers are pure reads and never raise.
+def _cfg_layer_source(
+    dotted: str,
+    raw: Optional[dict[str, Any]],
+    *,
+    allow_file: bool = True,
+) -> str:
+    """Label the generic cfg_get layers for one leaf: HERMES_CFG_* env wins,
+    then a key present in the mounted raw config file, else the literal."""
+    if _env_override(dotted) is not None:
+        return "cfg_env"
+    if allow_file and raw is not None:
+        try:
+            _lookup_in_dict(raw, dotted)
+            return "file"
+        except KeyError:
+            pass
+    return "default"
+
+
+def _legacy_env_accepted(raw_env: Optional[str], kind: str, min_v: float) -> bool:
+    """Mirror the spec accessors' legacy-env acceptance: strings only need to
+    be non-empty, bools accept any non-empty token, ints/floats must coerce
+    and clear the per-leaf minimum guard (a rejected env falls through)."""
+    if raw_env is None or raw_env == "":
+        return False
+    if kind in ("s", "b"):
+        return True
+    try:
+        v = int(raw_env) if kind == "i" else float(raw_env)
+    except (TypeError, ValueError):
+        return False
+    return v >= min_v
+
+
+def _env_then_cfg_source(
+    dotted: str,
+    legacy_env: Optional[str],
+    kind: str,
+    raw: Optional[dict[str, Any]],
+    *,
+    allow_file: bool = True,
+) -> str:
+    """Source for an ``os.environ.get(...) or cfg_get(...)``-style leaf
+    without a min guard: a non-empty coercible legacy env wins, else the
+    generic cfg layers."""
+    if legacy_env is not None and _legacy_env_accepted(
+        os.environ.get(legacy_env), kind, float("-inf")
+    ):
+        return "env"
+    return _cfg_layer_source(dotted, raw, allow_file=allow_file)
+
+
+def _spec_leaf_source(
+    dotted: str,
+    legacy_env: Optional[str],
+    kind: str,
+    min_v: float,
+    raw: Optional[dict[str, Any]],
+    *,
+    allow_file: bool = True,
+) -> str:
+    """Source for one spec-driven family leaf (research / hl / http /
+    memory): accepted legacy env, else the generic cfg layers."""
+    if legacy_env is not None and _legacy_env_accepted(
+        os.environ.get(legacy_env), kind, min_v
+    ):
+        return "env"
+    return _cfg_layer_source(dotted, raw, allow_file=allow_file)
+
+
+def _live_global_leaf_source(
+    dotted: str,
+    legacy_env: Optional[str],
+    kind: str,
+    min_v: float,
+    raw: Optional[dict[str, Any]],
+) -> str:
+    """Source for dashboard dip_ratio / dip_window. Unlike plain spec leaves,
+    the accessor SKIPS a cfg/file candidate equal (or uncoercible) to the
+    canonical literal — the live module global remains the active value, so
+    such candidates are labeled ``default``."""
+    if legacy_env is not None and _legacy_env_accepted(
+        os.environ.get(legacy_env), kind, min_v
+    ):
+        return "env"
+    cfg_raw = _env_override(dotted)
+    if cfg_raw is not None:
+        layer: Optional[str] = "cfg_env"
+        candidate: Any = cfg_raw
+    elif raw is not None:
+        try:
+            candidate = _lookup_in_dict(raw, dotted)
+        except KeyError:
+            return "default"
+        layer = "file"
+    else:
+        return "default"
+    try:
+        active = int(candidate) if kind == "i" else float(candidate)
+        baseline = int(_lookup_default(dotted)) if kind == "i" \
+            else float(_lookup_default(dotted))
+    except (TypeError, ValueError, KeyError):
+        return "default"
+    return layer if active != baseline else "default"
+
+
 def _accessor_effective_view() -> dict[str, Any]:
     """Resolve knobs that bypass the generic provenance walk through their
-    REAL module accessors (P1-4 Phase 0 / P0-3). The canonical cfg_env/file/
-    default walk cannot see (a) the nineteen loop_runtime HERMES_* legacy env
-    vars or (b) the four dedicated gray-release MODE env vars — this view
-    reports what the running loop actually gets. Lazy imports keep the
-    config_store ← executor/perception/loop_runtime edge cycle-free. Pure
+    REAL module accessors (P1-4 Phase 0 / P0-3 / Phase 2.2). The canonical
+    cfg_env/file/default walk cannot see (a) the nineteen loop_runtime
+    HERMES_* legacy env vars, (b) the four dedicated gray-release MODE env
+    vars, or (c) the nine D-family dual-track accessors — this view reports
+    what the running code actually gets. Legacy HERMES_* env stays the
+    operator emergency escape hatch (highest priority); this view is the
+    read-only authoritative surface for the active value and its source.
+    Lazy imports keep the config_store ← client/agent edge cycle-free. Pure
     read; a failing section becomes an {"error": ...} leaf, never raises.
     """
     view: dict[str, Any] = {}
@@ -2843,6 +2963,238 @@ def _accessor_effective_view() -> dict[str, Any]:
         }
     except Exception as e:
         view["gray_modes"] = {"error": f"{type(e).__name__}: {e}"}
+
+    # ── P1-4 Phase 2.2 (plan a): nine D-family sections. Every section
+    # projects the value the running code actually consumes (the REAL accessor
+    # output per call, or the frozen module constant for import-time families)
+    # plus a per-leaf source label. Sections are independent: each lazy-imports
+    # its own module in its own try, so one broken import degrades only that
+    # section to {"error": ...}. Legacy HERMES_* env remains the highest-
+    # priority operator escape hatch — nothing here changes resolution.
+    try:
+        raw = _read_raw_config()
+    except Exception:
+        raw = None
+    try:
+        from hermes_trader.agents import research
+
+        llm_values = research.research_llm_params()
+        view["research_llm"] = {
+            leaf: {
+                "value": llm_values[leaf],
+                "source": _spec_leaf_source(
+                    f"research_llm.{leaf}", legacy_env, kind, min_v, raw
+                ),
+            }
+            for leaf, (legacy_env, kind, min_v)
+            in research._RESEARCH_LLM_SPEC.items()
+        }
+    except Exception as e:
+        view["research_llm"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.agents import research
+
+        fetch_values = research.research_fetch_params()
+        view["research_fetch"] = {
+            leaf: {
+                "value": fetch_values[leaf],
+                "source": _spec_leaf_source(
+                    f"research_fetch.{leaf}", legacy_env, kind, min_v, raw
+                ),
+            }
+            for leaf, (legacy_env, kind, min_v)
+            in research._RESEARCH_FETCH_SPEC.items()
+        }
+    except Exception as e:
+        view["research_fetch"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.client import rate_limit
+
+        io_values = dict(rate_limit._HL_CLIENT_IO)
+        view["hl_client_io"] = {
+            leaf: {
+                "value": io_values[leaf],
+                # Frozen at import with config={}: the mounted file is
+                # structurally invisible, never label "file".
+                "source": _spec_leaf_source(
+                    f"hl_client_io.{leaf}", legacy_env, kind, min_v,
+                    None, allow_file=False,
+                ),
+            }
+            for leaf, (legacy_env, kind, min_v)
+            in rate_limit._HL_CLIENT_IO_SPEC.items()
+        }
+    except Exception as e:
+        view["hl_client_io"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.client import rate_limit
+
+        rl_values = dict(rate_limit._HL_RATE_LIMIT)
+        rl_section: dict[str, Any] = {}
+        for leaf, (legacy_env, kind, min_v) in rate_limit._HL_RATE_LIMIT_SPEC.items():
+            if leaf == "rate_per_endpoint_gate":
+                # The ONE call-time env read in the import-time families:
+                # a non-empty env (any token) wins immediately; unset/empty
+                # falls back to the frozen import-time constant.
+                gate_raw = os.environ.get("HERMES_HL_RATE_PER_ENDPOINT_GATE")
+                if gate_raw is not None and gate_raw.strip() != "":
+                    source = "env"
+                else:
+                    source = _spec_leaf_source(
+                        "hl_rate_limit.rate_per_endpoint_gate",
+                        legacy_env, kind, min_v, None, allow_file=False,
+                    )
+                value = rate_limit._per_endpoint_gate_enabled()
+            else:
+                source = _spec_leaf_source(
+                    f"hl_rate_limit.{leaf}", legacy_env, kind, min_v,
+                    None, allow_file=False,
+                )
+                value = rl_values[leaf]
+            rl_section[leaf] = {"value": value, "source": source}
+        view["hl_rate_limit"] = rl_section
+    except Exception as e:
+        view["hl_rate_limit"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader import dashboard
+
+        http_values = dashboard._http_cache_params()
+        view["http_cache"] = {
+            leaf: {
+                "value": http_values[leaf],
+                "source": _spec_leaf_source(
+                    f"http_cache.{leaf}", legacy_env, kind, min_v, raw
+                ),
+            }
+            for leaf, (legacy_env, kind, min_v)
+            in dashboard._HTTP_CACHE_SPEC.items()
+        }
+    except Exception as e:
+        view["http_cache"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        # importlib (not `from ... import`): a None sys.modules entry must
+        # reliably raise so this section alone degrades to {"error": ...}.
+        memory = importlib.import_module("hermes_trader.agents.memory")
+
+        mem_values = memory._memory_quality_params()
+        view["memory_quality"] = {
+            leaf: {
+                "value": mem_values[leaf],
+                "source": _spec_leaf_source(
+                    f"memory_quality.{leaf}", legacy_env, kind, min_v, raw
+                ),
+            }
+            for leaf, (legacy_env, kind, min_v)
+            in memory._MEMORY_QUALITY_SPEC.items()
+        }
+    except Exception as e:
+        view["memory_quality"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader import dashboard
+
+        eq_values = dashboard._dashboard_equity_params()
+        eq_section: dict[str, Any] = {}
+        for leaf, (legacy_env, kind, min_v) in dashboard._DASHBOARD_EQUITY_SPEC.items():
+            if leaf in dashboard._DASHBOARD_EQUITY_LIVE_GLOBAL_LEAVES:
+                # A cfg/file candidate equal to the canonical literal is
+                # skipped by the accessor; the live module global stays active.
+                source = _live_global_leaf_source(
+                    f"dashboard_equity.{leaf}", legacy_env, kind, min_v, raw
+                )
+            else:
+                source = _spec_leaf_source(
+                    f"dashboard_equity.{leaf}", legacy_env, kind, min_v, raw
+                )
+            eq_section[leaf] = {"value": eq_values[leaf], "source": source}
+        view["dashboard_equity"] = eq_section
+    except Exception as e:
+        view["dashboard_equity"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.agents import dsl_exit
+
+        # All six are frozen at import with config={} (allow_file=False);
+        # five keep the legacy `env or cfg_get` form, the backoff factor has
+        # no legacy env channel.
+        view["dsl_state_io"] = {
+            "save_min_interval_sec": {
+                "value": dsl_exit._MIN_SAVE_INTERVAL_SEC,
+                "source": _env_then_cfg_source(
+                    "dsl_state_io.save_min_interval_sec",
+                    "HERMES_DSL_SAVE_INTERVAL_SEC", "f", None, allow_file=False),
+            },
+            "force_load_ttl_s": {
+                "value": dsl_exit._FORCE_LOAD_TTL_S,
+                "source": _env_then_cfg_source(
+                    "dsl_state_io.force_load_ttl_s",
+                    "HERMES_DSL_FORCE_LOAD_TTL_S", "f", None, allow_file=False),
+            },
+            "policy_cache_ttl_s": {
+                "value": dsl_exit._POLICY_CACHE_TTL_S,
+                "source": _env_then_cfg_source(
+                    "dsl_state_io.policy_cache_ttl_s",
+                    "HERMES_DSL_POLICY_CACHE_TTL_S", "f", None, allow_file=False),
+            },
+            "save_max_attempts": {
+                "value": dsl_exit._SAVE_MAX_ATTEMPTS,
+                "source": _env_then_cfg_source(
+                    "dsl_state_io.save_max_attempts",
+                    "HERMES_DSL_SAVE_MAX_ATTEMPTS", "i", None, allow_file=False),
+            },
+            "save_backoff_base_sec": {
+                "value": dsl_exit._SAVE_BACKOFF_BASE_SEC,
+                "source": _env_then_cfg_source(
+                    "dsl_state_io.save_backoff_base_sec",
+                    "HERMES_DSL_SAVE_BACKOFF_BASE_SEC", "f", None,
+                    allow_file=False),
+            },
+            "save_backoff_factor": {
+                "value": dsl_exit._SAVE_BACKOFF_FACTOR,
+                "source": _cfg_layer_source(
+                    "dsl_state_io.save_backoff_factor", None, allow_file=False),
+            },
+        }
+    except Exception as e:
+        view["dsl_state_io"] = {"error": f"{type(e).__name__}: {e}"}
+    try:
+        from hermes_trader.agents import executor
+
+        # fail_open arms ONLY on the exact env string "1"; any other env
+        # value is inert and the canonical key (present in HERMES_CFG_ env or
+        # the mounted file, even when False) decides the source.
+        fail_open_source = (
+            "env" if os.environ.get("HERMES_SPREAD_GATE_FAIL_OPEN", "0") == "1"
+            else _cfg_layer_source("spread_gate_fail_open", raw)
+        )
+        view["executor"] = {
+            "max_atr_pct": {
+                "value": executor._resolve_max_atr_pct(),
+                "source": _env_then_cfg_source(
+                    "max_atr_pct", "HERMES_MAX_ATR_PCT", "f", raw),
+            },
+            "max_spread_pct": {
+                "value": executor._resolve_max_spread_pct(),
+                "source": _env_then_cfg_source(
+                    "max_spread_pct", "HERMES_MAX_SPREAD_PCT", "f", raw),
+            },
+            "spread_gate_fail_open": {
+                "value": executor._resolve_spread_gate_fail_open(),
+                "source": fail_open_source,
+            },
+            "liq_buffer_usd": {
+                "value": executor._resolve_liq_buffer_usd(),
+                # Any float-coercible env wins, including "0" (gate disabled);
+                # a non-numeric env falls through to the cfg layers.
+                "source": _env_then_cfg_source(
+                    "liq_buffer_usd", "HERMES_LIQ_BUFFER_USD", "f", raw),
+            },
+            "execution.taker_fee_pct": {
+                "value": executor._resolve_hl_taker_fee_pct(),
+                "source": _env_then_cfg_source(
+                    "execution.taker_fee_pct", "HERMES_TAKER_FEE_PCT", "f", raw),
+            },
+        }
+    except Exception as e:
+        view["executor"] = {"error": f"{type(e).__name__}: {e}"}
     return view
 
 
