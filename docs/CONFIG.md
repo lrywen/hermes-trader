@@ -319,6 +319,44 @@ Most of these knobs you set once and leave. The three you'd realistically touch:
 2. **`max_daily_loss_usd`**: drop if you want a tighter circuit breaker for the day — it is an
    ABSOLUTE-USD value; see the **Pre-LIVE equity calibration checklist** above for scaling it to the
    account (≈ -10% of equity, looser than the 8% timed halt).
-3. **`min_ai_confidence`**: raise to filter trades when the AI is being too loose; lower to accept more
+3. **`min_ai_confidence`**: raise to filter trades when the AI is being too loose; lower it to accept more
 
 Everything else is structural — change it deliberately, not reactively.
+
+---
+
+## Effective value, provenance, and `HERMES_*` escape hatches
+
+A handful of knobs are read by dedicated module accessors (research LLM/fetch
+params, HyperLiquid client IO and rate limits, HTTP cache, memory quality,
+dashboard equity dip, DSL state IO, and the executor ATR/spread gates) rather
+than through a plain config lookup. Their effective resolution is:
+
+1. **Legacy `HERMES_*` env var** — highest priority, kept deliberately as the
+   operator **emergency escape hatch** (override a bad file value or force a
+   gate without a redeploy). It is *not* the normal tuning surface; values set
+   here silently shadow the file.
+2. **`HERMES_CFG_<BLOCK>__<LEAF>` env var** (e.g.
+   `HERMES_CFG_RESEARCH_LLM__DEBATE_MAX_TOKENS`) — canonical env layer.
+3. **`.agent-config.json`** — the day-to-day truth.
+4. **`CANONICAL_DEFAULTS`** — code default.
+
+The authoritative, read-only answer to "what is the running bot actually
+using?" is the startup snapshot written to
+`/data/runtime_config.effective.json` inside the container (regenerated on
+boot). Its `accessor_effective` block projects every accessor family above as
+`{"value": <the value the running code consumes>, "source": env | cfg_env |
+file | default}`. `source=env` means a legacy escape hatch is currently
+shadowing the file — investigate before relying on file values. The generic
+`keys` block plus `legacy_env_overrides` / `env_switches` cover the remaining
+~540 canonical leaves and loop-runtime/gray-mode switches.
+
+Notes:
+- Import-time families (HyperLiquid client IO / rate limits, DSL state IO)
+  freeze their values at process start — an env or file change needs a
+  restart; their source can only be `env`, `cfg_env`, or `default`.
+- The per-endpoint rate-limit gate is the one call-time exception
+  (`HERMES_HL_RATE_PER_ENDPOINT_GATE` re-read on each check).
+- The snapshot is observability only: it never changes resolution. Keep the
+  file as the source of record; use an env override for an incident, then
+  fold the fix back into the file and remove the override.
