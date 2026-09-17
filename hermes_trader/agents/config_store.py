@@ -456,6 +456,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "risk_per_trade_pct": 0.02,
         "sizing_basis": "primary_stop",
+        # P1-4 Phase 1: sizing v2 gray-release mode as a canonical file
+        # leaf so the truth source can move out of HERMES_SIZING_V2_MODE.
+        # Safe default "off", identical to the accessor's fallback; the
+        # legacy boolean sizing_v2_enabled (true -> enforce) remains a
+        # secondary fallback until its later-cycle retirement.
+        "sizing_v2_mode": "off",
         # R12-C1: per-coin overrides for the ATR sizing / SL floor params
         # (e.g. {"HYPE": {"sl_floor_pct": 1.5}}). Empty by default; was
         # implicit via .get("coin_overrides", {}) in executor.

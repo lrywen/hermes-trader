@@ -507,6 +507,9 @@ _ATR_RISK_SIZING_SPEC: dict[str, Any] = {
     "risk_per_trade_pct": _num_leaf(0.0, 1.0),
     "sizing_basis": ("enum", ("primary_stop", "dsl_stop", "atr_stop")),
     # Sizing v2 gray-release knobs (read with .get from the same block).
+    # P1-4 Phase 1: sizing_v2_mode is the canonical gray switch; the
+    # legacy boolean stays accepted as a backward-compatible fallback.
+    "sizing_v2_mode": ("enum", ("off", "shadow", "enforce")),
     "sizing_v2_enabled": ("bool",),
     "sizing_v2_cap_pct": _num_leaf(0.0, 1.0),
     # coin_overrides.<COIN> is a free-form per-coin map; only the leaves the
