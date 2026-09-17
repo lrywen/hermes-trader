@@ -4514,7 +4514,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # ── INACTIVE: external HTA (:8766) size-veto channel retired ─────────
     # The native multi-perspective debate (research.py) replaced the external
     # HTA risk-review stream (server: "HTA risk-review streaming retired").
-    # No `hta_risk` gate is registered in eval_all_gates (22 fixed gate keys)
+    # No `hta_risk` gate is registered in eval_all_gates (25 fixed gate keys:
+    # 22 base + the Wave D Pathia-ported trend_filter_200ma /
+    # daily_extension_cap / reentry_cap; see risk_gates._GATE_KEYS)
     # and GateContext carries no hta field, so gate_output["results"] never
     # contains hta_risk and a size_factor veto here would always be None. The
     # previous block claimed "R2 fix applied" but was unreachable dead code.
