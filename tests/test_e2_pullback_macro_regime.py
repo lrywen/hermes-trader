@@ -21,9 +21,10 @@ Design contract under test:
 
 import pytest
 
-from hermes_trader.agents import executor, market_regime
+from hermes_trader.agents import market_regime
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
 from hermes_trader.agents.executor import _runner_entry_block_reason
+from hermes_trader.agents.shadow import entry_probes
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ def test_e2_macro_up_without_4h_uptrend_still_blocked(monkeypatch):
 
 def test_e2_shadow_records_when_macro_up(monkeypatch, tmp_path):
     _set_macro(monkeypatch, "up")
-    monkeypatch.setattr(executor, "_PULLBACK_SHADOW_FILE",
+    monkeypatch.setattr(entry_probes, "_PULLBACK_SHADOW_FILE",
                         str(tmp_path / "pb.jsonl"))
     cfg = _pb_config(shadow_mode=True)
     reason = _runner_entry_block_reason(_pb_analysis(), cfg)
@@ -155,7 +156,7 @@ def test_e2_shadow_records_when_macro_up(monkeypatch, tmp_path):
 def test_e2_shadow_does_not_record_when_macro_chop(monkeypatch, tmp_path):
     _set_macro(monkeypatch, "chop")
     shadow_file = tmp_path / "pb.jsonl"
-    monkeypatch.setattr(executor, "_PULLBACK_SHADOW_FILE", str(shadow_file))
+    monkeypatch.setattr(entry_probes, "_PULLBACK_SHADOW_FILE", str(shadow_file))
     cfg = _pb_config(shadow_mode=True)
     reason = _runner_entry_block_reason(_pb_analysis(), cfg)
     assert _LATE_CHASE in reason

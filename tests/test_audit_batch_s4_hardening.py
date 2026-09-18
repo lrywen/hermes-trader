@@ -26,7 +26,12 @@ def test_swallowed_metric_defined():
 ])
 def test_executor_silent_branches_are_instrumented(label):
     import inspect
-    src = inspect.getsource(executor)
+
+    from hermes_trader.agents.shadow import entry_probes
+    # The regime_detection branch lives in the short-only shadow recorder,
+    # extracted to agents/shadow/entry_probes.py in the P1-1 decomposition;
+    # sl_coin_floor_override stays in executor. Scan both owning modules.
+    src = inspect.getsource(executor) + inspect.getsource(entry_probes)
     assert f'labels(func="{label}")' in src
 
 

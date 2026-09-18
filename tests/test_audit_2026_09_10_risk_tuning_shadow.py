@@ -20,6 +20,7 @@ import types
 import pytest
 
 from hermes_trader.agents import dsl_exit, executor
+from hermes_trader.agents.shadow import entry_probes
 
 
 def _base_gate(**over):
@@ -229,8 +230,8 @@ def test_risk_tuning_shadow_writer(tmp_path, monkeypatch):
     import json as _json
     f = tmp_path / "rt.jsonl"
     monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
-    # the module-level path constant was bound at import; point both.
-    monkeypatch.setattr(executor, "_RISK_TUNING_SHADOW_FILE", str(f))
+    # The path constant is read from the owning shadow submodule's globals.
+    monkeypatch.setattr(entry_probes, "_RISK_TUNING_SHADOW_FILE", str(f))
 
     executor._record_risk_tuning_shadow(
         rule="leverage_tier", coin="ZEC", side="long", would="deleverage",
