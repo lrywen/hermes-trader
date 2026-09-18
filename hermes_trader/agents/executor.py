@@ -2438,6 +2438,66 @@ def _dispatch_entry_shadow_probes(analysis: dict[str, Any],
         logger.debug(f"[xs_reversal] dispatch failed (non-fatal): {_xs_e}")
 
 
+def _ai_zero_confidence_block(analysis: dict[str, Any],
+                              mode: str) -> dict[str, Any] | None:
+    """S3 stage of maybe_execute: the AI zero-confidence guard.
+
+    Returns an executable-style block result when a directional / PASS verdict
+    arrives at confidence 0 because the AI was DOWN or the response was
+    unparseable (neither JSON block nor NLP fallback yielded a verdict);
+    returns None to let execution continue otherwise.
+
+    confidence=0 has two meanings and only the failure one blocks:
+      (1) AI down (ai_down) or fully unparseable text — an error code, block.
+      (2) A real but low-conviction verdict (clean {"verdict":"PASS",
+          "confidence":0} JSON, or NLP-extracted prose) — a genuine opinion;
+          flow through so the override/confidence gates can judge it.
+    Records written before the parse flags existed carry neither key: absence
+    is not a parse failure, so fail open there.
+
+    ai_down + PASS is deliberately NOT blocked here: the dedicated
+    ai_verdict_pass branch downstream owns that case (more specific reason and
+    it honours override_requires_ai=false). Only a directional verdict is
+    pre-empted. Pure function of analysis/mode; extracted verbatim in the
+    P1-1 step ③ phase split.
+    """
+    _ai_conf = float(analysis.get("confidence", 0) or 0)
+    _verdict_raw = (analysis.get("verdict") or "").upper()
+    _ai_down_flag = bool(analysis.get("ai_down", False))
+    _nlp_parsed_flag = bool(analysis.get("nlp_parsed", False))
+    _json_parsed_flag = bool(analysis.get("json_parsed", False))
+    # Records written before these flags existed (and hand-built analysis dicts)
+    # carry neither. Absence is not evidence of a parse failure, so fail OPEN
+    # there and let the downstream gates judge — blocking on a missing key would
+    # silently kill every legacy record.
+    _parse_flags_present = ("json_parsed" in analysis) or ("nlp_parsed" in analysis)
+    _unparseable = _parse_flags_present and not (_json_parsed_flag or _nlp_parsed_flag)
+    if _ai_conf <= 0 and _verdict_raw in ("PASS", "LONG", "SHORT"):
+        # Genuine failure: empty response OR text that yielded no verdict.
+        #
+        # ai_down + PASS is deliberately NOT blocked here: the dedicated
+        # ai_verdict_pass branch below owns that case and reports a
+        # more specific reason (and honours override_requires_ai=false). We
+        # only pre-empt it for a directional verdict, which has no such branch.
+        _defer_to_ai_down_branch = _ai_down_flag and _verdict_raw == "PASS"
+        if (_ai_down_flag or _unparseable) and not _defer_to_ai_down_branch:
+            _why = "ai_down (empty/failed response)" if _ai_down_flag \
+                else "unparseable response (no JSON, no NLP verdict)"
+            logger.warning(
+                f"[executor] SKIP {analysis.get('coin')}: AI confidence=0 "
+                f"({_why}; verdict={_verdict_raw}, "
+                f"entry={analysis.get('entry')}, stop={analysis.get('stop')}, "
+                f"tp={analysis.get('tp')})) — not executing with default params"
+            )
+            return {
+                "executed": False, "mode": mode,
+                "analysis_id": analysis["id"],
+                "reason": f"ai_zero_confidence ({_why})",
+            }
+        # else: NLP extracted a real (low-conviction) opinion — fall through.
+    return None
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -2521,54 +2581,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
     _dispatch_entry_shadow_probes(analysis, config)
 
-    # AI zero-confidence guard.
-    #
-    # confidence=0 can mean two very different things:
-    #   (1) AI is DOWN (empty response → ai_down=True), OR the response was
-    #       unparseable prose with no extractable verdict at all (neither the
-    #       JSON block nor the NLP fallback produced one).
-    #       In both cases this PASS is an error code, not an opinion — block.
-    #   (2) AI returned a valid but low-conviction opinion — either structured
-    #       JSON ({"verdict":"PASS","confidence":0}) or prose that NLP extracted
-    #       (HTA "neutral, low confidence"). This is a real verdict; structural
-    #       override below should be allowed to upgrade strong momentum setups.
-    #
-    # We only block case (1). Case (2) flows through so the override logic and
-    # confidence gates can make an informed decision.
-    _ai_conf = float(analysis.get("confidence", 0) or 0)
-    _verdict_raw = (analysis.get("verdict") or "").upper()
-    _ai_down_flag = bool(analysis.get("ai_down", False))
-    _nlp_parsed_flag = bool(analysis.get("nlp_parsed", False))
-    _json_parsed_flag = bool(analysis.get("json_parsed", False))
-    # Records written before these flags existed (and hand-built analysis dicts)
-    # carry neither. Absence is not evidence of a parse failure, so fail OPEN
-    # there and let the downstream gates judge — blocking on a missing key would
-    # silently kill every legacy record.
-    _parse_flags_present = ("json_parsed" in analysis) or ("nlp_parsed" in analysis)
-    _unparseable = _parse_flags_present and not (_json_parsed_flag or _nlp_parsed_flag)
-    if _ai_conf <= 0 and _verdict_raw in ("PASS", "LONG", "SHORT"):
-        # Genuine failure: empty response OR text that yielded no verdict.
-        #
-        # ai_down + PASS is deliberately NOT blocked here: the dedicated
-        # ai_verdict_pass branch below owns that case and reports a
-        # more specific reason (and honours override_requires_ai=false). We
-        # only pre-empt it for a directional verdict, which has no such branch.
-        _defer_to_ai_down_branch = _ai_down_flag and _verdict_raw == "PASS"
-        if (_ai_down_flag or _unparseable) and not _defer_to_ai_down_branch:
-            _why = "ai_down (empty/failed response)" if _ai_down_flag \
-                else "unparseable response (no JSON, no NLP verdict)"
-            logger.warning(
-                f"[executor] SKIP {analysis.get('coin')}: AI confidence=0 "
-                f"({_why}; verdict={_verdict_raw}, "
-                f"entry={analysis.get('entry')}, stop={analysis.get('stop')}, "
-                f"tp={analysis.get('tp')})) — not executing with default params"
-            )
-            return {
-                "executed": False, "mode": mode,
-                "analysis_id": analysis["id"],
-                "reason": f"ai_zero_confidence ({_why})",
-            }
-        # else: NLP extracted a real (low-conviction) opinion — fall through.
+    # AI zero-confidence guard — extracted to _ai_zero_confidence_block in the
+    # P1-1 step ③ phase split (returns a block result or None to continue).
+    _ai0 = _ai_zero_confidence_block(analysis, mode)
+    if _ai0 is not None:
+        return _ai0
 
     # Structural-override: don't let a hedging AI PASS leave an objectively
     # strong accumulation setup on the table. Upgrade to LONG conf 0.70 and
