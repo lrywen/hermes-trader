@@ -2590,6 +2590,108 @@ def _reconstruct_live_positions(state: dict[str, Any],
     return positions
 
 
+def _resolve_coin_max_leverage(coin: str) -> tuple[Optional[int], Optional[str]]:
+    """S8 stage: resolve the exchange max leverage for ``coin``.
+
+    Exchange max leverage is stable for the session. ``get_max_leverage``
+    raises (ValueError) for a coin absent from the cached universe metadata;
+    an unknown exchange max leverage must FAIL CLOSED — skip the trade rather
+    than size at configured leverage and risk an over-leveraged/rejected
+    order. Returns ``(max_lev, None)`` on success or ``(None, reason)`` where
+    ``reason`` is the early-return reason string. Extracted verbatim in the
+    P1-1 step ③ phase split.
+    """
+    try:
+        return get_max_leverage(coin), None
+    except Exception as _le:
+        logger.error(f"[executor] max-leverage lookup failed for {coin} "
+                     f"— fail-closed, no order: {_le}")
+        return None, f"unknown_max_leverage_{coin}"
+
+
+def _apply_leverage_tier(leverage: int, analysis: dict[str, Any],
+                         config: dict[str, Any]) -> int:
+    """S8 stage: volatility/score leverage tier (shadow or ENFORCE).
+
+    Audit 2026-09-10: de-lever to a lower tier when 4h ATR% is above
+    ``atr_pct_max`` OR composite below ``min_composite``. In shadow_mode it
+    only records what the tier WOULD pick (live leverage unchanged); with the
+    arm configured and shadow_mode=false it genuinely returns the lower tier
+    so downstream notional cap / sizing / order all use it. Any evaluation
+    failure fails OPEN (returns the original leverage), matching the shadow
+    behaviour, with a best-effort durable ``leverage_tier_blind`` event.
+    Pure function of its inputs (only logging / shadow-trace side effects);
+    extracted verbatim in the P1-1 step ③ phase split.
+    """
+    try:
+        _lev_tier = config.get("leverage_tier_shadow") or {}
+        _lev_tier_shadow = bool(_lev_tier.get("shadow_mode", False))
+        if _lev_tier:
+            _atr_pct = None
+            try:
+                _a4 = analysis.get("atr4h")
+                _c4 = analysis.get("close4h")
+                if _a4 and _c4 and float(_c4) > 0:
+                    _atr_pct = float(_a4) / float(_c4) * 100.0
+            except (TypeError, ValueError):
+                _atr_pct = None
+            _score6 = float(analysis.get("composite_score", 0) or 0)
+            _atr_max = float(_lev_tier.get("atr_pct_max", 3.5))
+            _score_min = float(_lev_tier.get("min_composite", 40.0))
+            _low_lev = int(_lev_tier.get("low_leverage", 5))
+            _reasons = []
+            if _atr_pct is not None and _atr_pct > _atr_max:
+                _reasons.append(f"atr_pct {_atr_pct:.2f} > {_atr_max}")
+            if _score6 < _score_min:
+                _reasons.append(f"score {_score6:.1f} < {_score_min:.0f}")
+            if _reasons and leverage > _low_lev:
+                _proposed_lev = min(_low_lev, leverage)
+                _record_risk_tuning_shadow(
+                    rule="leverage_tier",
+                    coin=str(analysis.get("coin") or ""),
+                    side=str(analysis.get("side") or ""),
+                    would="deleverage",
+                    detail={
+                        "live_leverage": leverage,
+                        "proposed_leverage": _proposed_lev,
+                        "atr_pct_4h": (round(_atr_pct, 3)
+                                      if _atr_pct is not None else None),
+                        "composite_score": round(_score6, 4),
+                        "atr_pct_max": _atr_max,
+                        "min_composite": _score_min,
+                        "reason": "; ".join(_reasons),
+                        "enforced": (not _lev_tier_shadow),
+                    },
+                    trace_id=str(analysis.get("id") or ""),
+                )
+                if not _lev_tier_shadow:
+                    # ENFORCE: downstream notional cap / sizing / order use the
+                    # lower tier (shadow record retained for grayscale reconcile).
+                    logger.warning(
+                        f"[executor] leverage_tier ENFORCE de-lever "
+                        f"{analysis.get('coin')} {leverage}x -> {_proposed_lev}x "
+                        f"({'; '.join(_reasons)})")
+                    leverage = _proposed_lev
+    except Exception as _lev_e:
+        # Fail open (consistent with the shadow-period behaviour): continue at
+        # the original leverage.
+        logger.debug(f"[executor] leverage-tier eval failed for "
+                     f"{analysis.get('coin')} (fail-open): {_lev_e}")
+        # Best-effort durable trace: the de-leverage arm stayed blind and the
+        # candidate trades at the original high leverage.
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "leverage_tier_blind",
+                "coin": str(analysis.get("coin") or ""),
+                "error": str(_lev_e),
+            })
+        except Exception as _ev_e:
+            logger.error("[executor] leverage_tier_blind event log failed: %r",
+                         _ev_e)
+    return leverage
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3068,92 +3170,20 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
 
     # Exchange max leverage is stable for the session; read it once and reuse
     # across sizing so we don't hit the meta endpoint 3-4 times per candidate.
-    # Audit 2026-09-06 (C3): get_max_leverage raises ValueError for a coin
-    # absent from the (cached) universe metadata. Left uncaught it would abort
-    # the execute path mid-sizing; an unknown exchange max leverage must FAIL
-    # CLOSED by refusing the trade (skipping costs $0) rather than sizing at
-    # the configured leverage and risking an over-leveraged/rejected order.
-    try:
-        _coin_max_lev = get_max_leverage(analysis["coin"])
-    except Exception as _le:
-        logger.error(f"[executor] max-leverage lookup failed for {analysis['coin']} "
-                     f"— fail-closed, no order: {_le}")
+    # Audit 2026-09-06 (C3): an unknown exchange max leverage FAILS CLOSED
+    # (refuse the trade — skipping costs $0) rather than sizing at configured
+    # leverage. Extracted to _resolve_coin_max_leverage in the P1-1 step ③
+    # phase split.
+    _coin_max_lev, _unknown_lev_reason = _resolve_coin_max_leverage(analysis["coin"])
+    if _unknown_lev_reason is not None:
         return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
-                "reason": f"unknown_max_leverage_{analysis['coin']}"}
+                "reason": _unknown_lev_reason}
     leverage = min(int(config.get("leverage", HL_LEVERAGE)), _coin_max_lev)
 
-    # ── Shadow (6): volatility/score leverage tier ──
-    # Audit 2026-09-10 (recent trades all 10x; ZEC ATR%=4.155 stopped out by a
-    # 0.80% = 0.19-ATR cap). Proposed: de-lever to a lower tier when 4h ATR% is
-    # above `atr_pct_max` OR composite below `min_composite`. Shadow only: the
-    # live leverage above is unchanged; we record what the tier WOULD pick.
-    try:
-        _lev_tier = config.get("leverage_tier_shadow") or {}
-        # Audit 2026-09-12: shadow_mode=true 只记录 would-deleverage；false（臂
-        # 已配置）则真正把 leverage 降到低档后继续 sizing/下单。未配置则跳过。
-        _lev_tier_shadow = bool(_lev_tier.get("shadow_mode", False))
-        if _lev_tier:
-            _atr_pct = None
-            try:
-                _a4 = analysis.get("atr4h")
-                _c4 = analysis.get("close4h")
-                if _a4 and _c4 and float(_c4) > 0:
-                    _atr_pct = float(_a4) / float(_c4) * 100.0
-            except (TypeError, ValueError):
-                _atr_pct = None
-            _score6 = float(analysis.get("composite_score", 0) or 0)
-            _atr_max = float(_lev_tier.get("atr_pct_max", 3.5))
-            _score_min = float(_lev_tier.get("min_composite", 40.0))
-            _low_lev = int(_lev_tier.get("low_leverage", 5))
-            _reasons = []
-            if _atr_pct is not None and _atr_pct > _atr_max:
-                _reasons.append(f"atr_pct {_atr_pct:.2f} > {_atr_max}")
-            if _score6 < _score_min:
-                _reasons.append(f"score {_score6:.1f} < {_score_min:.0f}")
-            if _reasons and leverage > _low_lev:
-                _proposed_lev = min(_low_lev, leverage)
-                _record_risk_tuning_shadow(
-                    rule="leverage_tier",
-                    coin=str(analysis.get("coin") or ""),
-                    side=str(analysis.get("side") or ""),
-                    would="deleverage",
-                    detail={
-                        "live_leverage": leverage,
-                        "proposed_leverage": _proposed_lev,
-                        "atr_pct_4h": (round(_atr_pct, 3)
-                                      if _atr_pct is not None else None),
-                        "composite_score": round(_score6, 4),
-                        "atr_pct_max": _atr_max,
-                        "min_composite": _score_min,
-                        "reason": "; ".join(_reasons),
-                        "enforced": (not _lev_tier_shadow),
-                    },
-                    trace_id=str(analysis.get("id") or ""),
-                )
-                if not _lev_tier_shadow:
-                    # ENFORCE：真正降杠杆，后续 notional cap / sizing / 下单均按
-                    # 低档 leverage 走（shadow 记录保留用于灰度对账）。
-                    logger.warning(
-                        f"[executor] leverage_tier ENFORCE de-lever "
-                        f"{analysis.get('coin')} {leverage}x -> {_proposed_lev}x "
-                        f"({'; '.join(_reasons)})")
-                    leverage = _proposed_lev
-    except Exception as _lev_e:
-        # 故障 fail-open（与 shadow 期行为一致），按原 leverage 继续。
-        logger.debug(f"[executor] leverage-tier eval failed for "
-                     f"{analysis.get('coin')} (fail-open): {_lev_e}")
-        # Best-effort durable trace: the de-leverage arm stayed blind and the
-        # candidate trades at the original high leverage.
-        try:
-            from hermes_trader import event_log
-            event_log.append("error", payload={
-                "scope": "leverage_tier_blind",
-                "coin": str(analysis.get("coin") or ""),
-                "error": str(_lev_e),
-            })
-        except Exception as _ev_e:
-            logger.error("[executor] leverage_tier_blind event log failed: %r",
-                         _ev_e)
+    # ── Shadow (6): volatility/score leverage tier ── (shadow or ENFORCE).
+    # Extracted to _apply_leverage_tier in the P1-1 step ③ phase split.
+    leverage = _apply_leverage_tier(leverage, analysis, config)
+
     _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
     # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
     # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
