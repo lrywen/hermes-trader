@@ -14,7 +14,7 @@ import re
 import threading
 import time
 import uuid
-from typing import Any, Callable, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from hyperliquid.utils.types import Cloid
 
@@ -2692,6 +2692,70 @@ def _apply_leverage_tier(leverage: int, analysis: dict[str, Any],
     return leverage
 
 
+class _AccountStateRead(NamedTuple):
+    """S6/S7 account read result (per-target-dex clearinghouse view).
+
+    ``state`` is the full include_hip3 account-state dict; ``equity`` /
+    ``available`` are the SELECTED dex's clearinghouse values used for margin
+    sizing, while ``agg_equity`` / ``total_open_notional`` are the aggregated
+    book values that feed the exposure/concurrency gates. ``target_dex`` is
+    the HIP-3 dex prefix ("" for the main crypto clearinghouse).
+    """
+
+    state: dict[str, Any]
+    equity: float
+    available: float
+    agg_equity: float
+    total_open_notional: float
+    target_dex: str
+
+
+def _read_account_state(user: str, coin: str) -> _AccountStateRead:
+    """S6/S7 stage: read account state for the trade's clearinghouse.
+
+    include_hip3=True so the concurrency + exposure gates COUNT every open
+    position, including tokenized-equity (xyz:) HIP-3 perps. Sizing still uses
+    the selected dex's ("" main for crypto) equity/available. Each dex is a
+    separate clearinghouse, so a HIP-3 trade is margin-checked against ITS OWN
+    dex equity/available.
+
+    The per-dex endpoint flakes under burst load (several executes in one
+    cycle), briefly returning $0 MAIN equity even when funds are present; read
+    once and, on a $0 selected-dex equity, retry up to twice before believing
+    it. A genuine $0 is left for the caller to refuse (never size an unsized
+    order); a transient blip recovers. Extracted verbatim (closure collapsed
+    to explicit params) in the P1-1 step ③ phase split.
+    """
+    target_dex = coin.split(":", 1)[0] if ":" in coin else ""
+
+    def _read_once() -> tuple[dict[str, Any], float, float]:
+        st = fetch_account_state(user, include_hip3=True) or {}
+        deq = st.get("dex_equity") or {}
+        dav = st.get("dex_available") or {}
+        if target_dex:
+            eq = float(deq.get(target_dex, 0) or 0)
+            av = float(dav.get(target_dex, 0) or 0)
+        else:
+            eq = float(deq.get("", st.get("equity")) or 0)
+            av = float(dav.get("", st.get("available")) or 0)
+        return st, eq, av
+
+    state, equity, available = _read_once()
+    for _attempt in range(2):
+        if equity > 0:
+            break
+        time.sleep(0.4)
+        state, equity, available = _read_once()
+    return _AccountStateRead(
+        state=state,
+        equity=equity,
+        available=available,
+        agg_equity=float(state.get("equity") or equity),
+        total_open_notional=float(state.get("total_ntl") or 0),
+        target_dex=target_dex,
+    )
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3071,28 +3135,17 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # with "available $0.00 / equity $39.90" (main dex) while the xyz dex held
     # $59.04 free: HIP-3 entries starved whenever main margin was committed,
     # and vice versa. Main-dex (crypto) trades behave exactly as before.
-    _target_dex = analysis["coin"].split(":", 1)[0] if ":" in analysis["coin"] else ""
-
-    def _read_state() -> tuple[dict[str, Any], float, float]:
-        st = fetch_account_state(user, include_hip3=True) or {}
-        deq = st.get("dex_equity") or {}
-        dav = st.get("dex_available") or {}
-        if _target_dex:
-            eq = float(deq.get(_target_dex, 0) or 0)
-            av = float(dav.get(_target_dex, 0) or 0)
-        else:
-            eq = float(deq.get("", st.get("equity")) or 0)
-            av = float(dav.get("", st.get("available")) or 0)
-        return st, eq, av
-
-    state, equity, available = _read_state()
-    for _attempt in range(2):
-        if equity > 0:
-            break
-        time.sleep(0.4)
-        state, equity, available = _read_state()
-    agg_equity = float(state.get("equity") or equity)                # aggregated → exposure gate
-    total_open_notional = float(state.get("total_ntl") or 0)         # aggregated → notional gate
+    # Per-target-dex clearinghouse account read (include_hip3, $0-retry) is
+    # extracted to _read_account_state in the P1-1 step ③ phase split. Sizing
+    # uses the selected dex's equity/available; agg_equity / total_open_notional
+    # are the aggregated-book gate inputs.
+    _acct = _read_account_state(user, analysis["coin"])
+    state = _acct.state
+    equity = _acct.equity
+    available = _acct.available
+    agg_equity = _acct.agg_equity                         # aggregated → exposure gate
+    total_open_notional = _acct.total_open_notional      # aggregated → notional gate
+    _target_dex = _acct.target_dex
     if equity <= 0:
         # Persisted across retries — refuse rather than send an unsized order.
         return {
