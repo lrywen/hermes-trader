@@ -32,10 +32,26 @@ jobs:
       - name: Install (locked, with dev extras)
         run: uv sync --frozen --extra dev
 
+      # P1-6' hard guard (1): the offline test count must never drop below the
+      # sampled baseline (scripts/ci_test_guard.py, MIN_OFFLINE_TESTS pinned
+      # with its sampling date). This collects (~3s, no run) and fails on a
+      # missing test file, broken collection, or an over-broad deselect — so a
+      # later refactor cannot silently shed existing verification.
+      - name: "Guard: offline test count baseline (hard)"
+        run: uv run python scripts/ci_test_guard.py count
+
       # pytest's addopts deselects the `online` and `live` markers, so this runs
       # only the offline suite — no network, no real-money orders, CI-safe.
+      # --junitxml feeds the warn-only wall-time guard below.
       - name: Run offline test suite
-        run: uv run pytest
+        run: uv run pytest --junitxml=pytest-offline.xml
+
+      # P1-6' guard (2, warn-only): surface a large offline-suite wall-time
+      # regression without failing the build (shared runners are noisy). The
+      # threshold + sampling date live in scripts/ci_test_guard.py.
+      - name: "Guard: offline suite wall time (warn only)"
+        if: always()
+        run: uv run python scripts/ci_test_guard.py walltime --junitxml pytest-offline.xml
 
   # P1-2: lint quality gate. The rule set is explicitly pinned in pyproject.toml
   # ([tool.ruff]) so this is deterministic regardless of ruff's upstream defaults
