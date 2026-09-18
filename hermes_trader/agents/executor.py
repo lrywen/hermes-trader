@@ -2543,6 +2543,53 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
     }
 
 
+def _reconstruct_live_positions(state: dict[str, Any],
+                                entry_px: float) -> list[dict[str, Any]]:
+    """S7 stage: build the live positions list, restart-safe.
+
+    Defensively reads ``asset_positions`` (a single malformed row — missing
+    coin/szi, a non-dict payload from a partial read — is skipped, not allowed
+    to abort placement), then merges any coin the DSL registry tracks but the
+    live read missed: a flaky/empty read during restart's rehydration window
+    must not let the opposite-direction guard fail open and STACK a position.
+    A tracked-but-unseen coin is appended as a $0 held position (re-entry
+    backstop: skipping a trade costs $0; a silent pyramid does not).
+
+    Pure function of (state, entry_px); extracted verbatim in the P1-1
+    step ③ phase split. Keeping this in its own scope also localizes the old
+    loop's ``coin`` local, which previously leaked back into maybe_execute as
+    "the last iterated coin" until the canonical ``coin = analysis['coin']``
+    rebind downstream.
+    """
+    positions: list[dict[str, Any]] = []
+    for p in (state.get("asset_positions") or []):
+        try:
+            pos = p.get("position") if isinstance(p, dict) else None
+            if not isinstance(pos, dict):
+                continue
+            _p_coin = pos.get("coin")
+            szi = float(pos.get("szi") or 0)
+            if not _p_coin:
+                continue
+            positions.append({
+                "coin": _p_coin,
+                "side": "long" if szi > 0 else "short",
+                "size_usd": abs(szi) * entry_px,
+            })
+        except (AttributeError, TypeError, ValueError):
+            logger.warning(f"[executor] skipping malformed asset_position row: {p!r}")
+            continue
+
+    _live_coins = {p["coin"] for p in positions}
+    for _coin, _side in active_position_coins().items():
+        if _coin not in _live_coins:
+            logger.warning(
+                f"[executor] {_coin} tracked by DSL but absent from live account "
+                f"read — treating as held (re-entry backstop)")
+            positions.append({"coin": _coin, "side": _side, "size_usd": 0})
+    return positions
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3008,43 +3055,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     memory.track_daily_pnl(agg_equity, _contrib)
     daily_pnl = memory.get_daily_pnl()
 
-    # P0-2a: defensive read of the live account state — a single malformed
-    # position row (missing coin/szi, non-dict payload from a partial read) is
-    # skipped, not allowed to raise and abort the whole placement pipeline.
-    positions = []
-    _entry_px = analysis.get("entry_px") or 0
-    for p in (state.get("asset_positions") or []):
-        try:
-            pos = p.get("position") if isinstance(p, dict) else None
-            if not isinstance(pos, dict):
-                continue
-            coin = pos.get("coin")
-            szi = float(pos.get("szi") or 0)
-            if not coin:
-                continue
-            positions.append({
-                "coin": coin,
-                "side": "long" if szi > 0 else "short",
-                "size_usd": abs(szi) * _entry_px,
-            })
-        except (AttributeError, TypeError, ValueError):
-            logger.warning(f"[executor] skipping malformed asset_position row: {p!r}")
-            continue
-
-    # Restart-safe re-entry backstop: a flaky/empty live account read can drop a
-    # held position from asset_positions, letting opposite_direction_guard fail
-    # open and STACK the position (observed: xyz:SP500 pyramided to ~8x during a
-    # restart's rehydration window). The DSL registry rehydrates from disk, so
-    # merge any tracked coin the live read missed — a held position then blocks
-    # re-entry even when the API momentarily forgets it. (Skipping a trade costs
-    # $0; a silent pyramid does not.)
-    _live_coins = {p["coin"] for p in positions}
-    for _coin, _side in active_position_coins().items():
-        if _coin not in _live_coins:
-            logger.warning(
-                f"[executor] {_coin} tracked by DSL but absent from live account "
-                f"read — treating as held (re-entry backstop)")
-            positions.append({"coin": _coin, "side": _side, "size_usd": 0})
+    # P0-2a / restart-safe re-entry backstop: defensively read live positions
+    # (malformed rows skipped) and merge DSL-tracked coins the live read missed
+    # so a flaky read can't pyramid. Extracted to _reconstruct_live_positions
+    # in the P1-1 step ③ phase split.
+    positions = _reconstruct_live_positions(state, analysis.get("entry_px") or 0)
 
     # `tp_px` / `stop_px` are fallbacks for bracket calculation when ATR
     # is unavailable; the executor uses a fresh live mid as entry.
