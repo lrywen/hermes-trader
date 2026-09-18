@@ -2756,6 +2756,64 @@ def _read_account_state(user: str, coin: str) -> _AccountStateRead:
     )
 
 
+def _build_gate_context(*, analysis: dict[str, Any], config: dict[str, Any],
+                        positions: list[dict[str, Any]],
+                        trade_notional: float, daily_pnl: Any,
+                        trade_side: str, has_binary_news: bool,
+                        binary_news_match: bool, mid_price: float,
+                        leverage: float, h4_stop_distance_pct: Any,
+                        agg_equity: float,
+                        total_open_notional: float) -> "GateContext":
+    """S10 stage: assemble the GateContext for eval_all_gates.
+
+    Pure assembly of the 23 gate inputs from the already-computed scalars plus
+    four read-only lookups (24h market volume, peak/current realized daily
+    PnL) and the side-adjusted own-4h-gap demote input. No control flow and no
+    mutation; extracted verbatim in the P1-1 step ③ phase split. Feed REALIZED
+    PnL to the give-back breaker so it arms on banked profit, not an open
+    paper float; whale_signal only counts when whale_regime_bypass is armed
+    (missing config fails closed).
+    """
+    # 坑1 own-gap demote input: readings ride on the research analysis dict (no
+    # extra fetch); 0.0 keeps the demote inert (fail open).
+    _own_gap_pct = side_adjusted_own_gap(
+        trade_side, analysis.get("close4h"), analysis.get("ema21_4h"))
+    return GateContext(
+        confidence=analysis["confidence"],
+        current_positions=positions,
+        trade_notional_usd=trade_notional,
+        daily_pnl=daily_pnl,
+        market_volume_24h_usd=_get_market_volume_24h(analysis["coin"]),
+        coin=analysis["coin"],
+        trade_side=trade_side,
+        has_binary_news_risk=has_binary_news,
+        binary_news_match=binary_news_match,
+        equity=agg_equity,
+        total_open_notional=total_open_notional,
+        composite_score=float(analysis.get("composite_score", 0) or 0),
+        momentum_burst_fired=bool(analysis.get("momentum_burst_fired", False)),
+        slow_burn_fired=bool(analysis.get("slow_burn_fired", False)),
+        # whale_regime_bypass gates whether a whale signal can bypass the
+        # counter-regime gate. Missing config fails closed.
+        whale_signal_fired=bool(analysis.get("whale_signal")) and bool(config.get("whale_regime_bypass", False)),
+        peak_daily_pnl=memory.peak_daily_pnl(),
+        # (supplemental audit 2026-09-02) Feed REALIZED (locked-in) PnL to the
+        # give-back breaker so it arms only on profit actually banked, not on a
+        # transient open-position paper float.
+        daily_realized_pnl=memory.daily_realized_pnl(),
+        peak_daily_realized_pnl=memory.peak_daily_realized_pnl(),
+        # H4: pre-trade liquidation-price check inputs.
+        entry_px=mid_price if mid_price > 0 else 0.0,
+        leverage=float(leverage),
+        stop_distance_pct=h4_stop_distance_pct,
+        # S3 (RCA observation 2): research-verdict provenance so the debate
+        # gate tags a single-LLM fallback verdict "single_fallback".
+        debate_used=bool(analysis.get("debate_used", False)),
+        # 坑1: side-adjusted own-4h gap for the market_regime own-gap demote.
+        own_gap_pct=_own_gap_pct,
+    )
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3771,47 +3829,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             logger.error("[executor] h4_stop_distance_blind event log failed: %r",
                          _ev_e)
 
-    # 坑1 own-gap demote input: readings already ride on the research
-    # analysis dict (no extra fetch); 0.0 keeps the demote inert (fail open).
-    _own_gap_pct = side_adjusted_own_gap(
-        trade_side, analysis.get("close4h"), analysis.get("ema21_4h"))
-
-    ctx = GateContext(
-        confidence=analysis["confidence"],
-        current_positions=positions,
-        trade_notional_usd=trade_notional,
-        daily_pnl=daily_pnl,
-        market_volume_24h_usd=_get_market_volume_24h(analysis["coin"]),
-        coin=analysis["coin"],
-        trade_side=trade_side,
-        has_binary_news_risk=has_binary_news,
-        binary_news_match=binary_news_match,
-        equity=agg_equity,
-        total_open_notional=total_open_notional,
-        composite_score=float(analysis.get("composite_score", 0) or 0),
-        momentum_burst_fired=bool(analysis.get("momentum_burst_fired", False)),
-        slow_burn_fired=bool(analysis.get("slow_burn_fired", False)),
-        # whale_regime_bypass gates whether a whale signal can bypass the
-        # counter-regime gate. Missing config fails closed.
-        whale_signal_fired=bool(analysis.get("whale_signal")) and bool(config.get("whale_regime_bypass", False)),
-        peak_daily_pnl=memory.peak_daily_pnl(),
-        # (supplemental audit 2026-09-02) Feed REALIZED (locked-in) PnL to the
-        # give-back breaker so it arms only on profit actually banked, not on a
-        # transient open-position paper float (which marks daily_pnl/peak and
-        # previously latched the gate, blocking all fresh entries to UTC roll).
-        daily_realized_pnl=memory.daily_realized_pnl(),
-        peak_daily_realized_pnl=memory.peak_daily_realized_pnl(),
-        # H4: pre-trade liquidation-price check inputs.
-        entry_px=mid_price if mid_price > 0 else 0.0,
-        leverage=float(leverage),
-        stop_distance_pct=_h4_stop_distance_pct,
-        # S3 (RCA observation 2): carry research-verdict provenance so the
-        # debate gate tags a single-LLM fallback verdict "single_fallback"
-        # instead of mislabelling it "debate_consensus". Observability only.
-        debate_used=bool(analysis.get("debate_used", False)),
-        # 坑1: side-adjusted own-4h gap for the market_regime own-gap demote.
-        own_gap_pct=_own_gap_pct,
-    )
+    # GateContext assembly (23 inputs incl. the 坑1 own-gap demote, realized-PnL
+    # give-back fields and H4 liquidation inputs) is extracted to
+    # _build_gate_context in the P1-1 step ③ phase split.
+    ctx = _build_gate_context(
+        analysis=analysis, config=config, positions=positions,
+        trade_notional=trade_notional, daily_pnl=daily_pnl,
+        trade_side=trade_side, has_binary_news=has_binary_news,
+        binary_news_match=binary_news_match, mid_price=mid_price,
+        leverage=leverage, h4_stop_distance_pct=_h4_stop_distance_pct,
+        agg_equity=agg_equity, total_open_notional=total_open_notional)
     # H3: an armed whale_regime_bypass is about to be consulted with a live
     # whale signal (it changes the counter-regime gate input) — audit it.
     if bool(config.get("whale_regime_bypass", False)) and analysis.get("whale_signal"):
