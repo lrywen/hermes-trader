@@ -87,21 +87,29 @@ from hermes_trader.client.exchange import (
     HL_LEVERAGE,
     MIN_ORDER_USD,
     _resolve_min_order_usd,
-    cancel_open_orders_for_coin,
-    entry_size_for_notional,
-    find_open_order_by_cloid,
-    find_sl_trigger_in_open_orders,
     get_hl_atr,
     get_hl_price,
     get_max_leverage,
     get_orderbook_spread,
+)
+from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
+
+# P1-1 step ②: order placement / mutation / reconciliation now enter through
+# the execution facade (same objects client.exchange defines — re-exported,
+# zero behaviour change). Market-data reads stay imported from client.exchange
+# above. Tests monkeypatching executor.<name> keep working: the names remain
+# bound in this module's namespace.
+from hermes_trader.execution.orders import (
+    cancel_open_orders_for_coin,
+    entry_size_for_notional,
+    find_open_order_by_cloid,
+    find_sl_trigger_in_open_orders,
     min_entry_notional_usd,
     modify_sl_trigger,
     place_hl_order,
     place_hl_trigger_order,
     set_leverage,
 )
-from hermes_trader.client.hl_client import fetch_account_state, resolve_user_address
 
 logger = logging.getLogger(__name__)
 
