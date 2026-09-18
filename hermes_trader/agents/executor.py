@@ -2834,6 +2834,26 @@ def _build_gate_context(*, analysis: dict[str, Any], config: dict[str, Any],
     )
 
 
+def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
+    """S9 stage entry: fetch a fresh live mid and 4h ATR, fail CLOSED.
+
+    ATR equal-risk sizing cannot place an order without a valid live entry or
+    enough candle history to size a stop. Returns ``(mid, atr, None)`` when both
+    are positive, otherwise ``(0.0, 0.0, reason)`` where reason is the early-
+    return string (``invalid_price_for_<coin>`` or ``no_atr_no_stop ...``);
+    skipping the trade costs $0 versus sending an unsized/unstopped order.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    mid = get_hl_price(coin)
+    if mid <= 0:
+        return 0.0, 0.0, f"invalid_price_for_{coin}"
+    atr = get_hl_atr("4h", 14, coin)
+    if atr <= 0:
+        return 0.0, 0.0, (
+            f"no_atr_no_stop ({coin}: insufficient candle history to size a stop)")
+    return mid, atr, None
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3332,16 +3352,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
 
     if _atr_sizing_enabled:
         coin = analysis["coin"]
-        mid_price = get_hl_price(coin)
-        if mid_price <= 0:
+        # Fresh live mid + 4h ATR fail-closed guard, extracted to
+        # _price_atr_guard in the P1-1 step ③ phase split.
+        mid_price, atr, _price_atr_reason = _price_atr_guard(coin)
+        if _price_atr_reason is not None:
             return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
-                    "reason": f"invalid_price_for_{coin}"}
-        atr = get_hl_atr("4h", 14, coin)
-        if atr <= 0:
-            return {
-                "executed": False, "mode": mode, "analysis_id": analysis["id"],
-                "reason": f"no_atr_no_stop ({coin}: insufficient candle history to size a stop)",
-            }
+                    "reason": _price_atr_reason}
 
         from hermes_trader.agents.sizing import atr_equal_risk_notional
         _max_total_pct = float(config.get("max_total_notional_pct", 0) or 0)
