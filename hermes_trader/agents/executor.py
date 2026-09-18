@@ -2411,10 +2411,31 @@ def _dispatch_entry_shadow_probes(analysis: dict[str, Any],
     verbatim from maybe_execute in the P1-1 step ③ phase split. Imports stay
     function-local so sys.modules-based test monkeypatching keeps working.
     """
-    # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
-    # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
-    # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
-    _dispatch_entry_shadow_probes(analysis, config)
+    # Shadow-signals (free-signal suite): log what GEX / FINRA short-vol / whale /
+    # news WOULD say about this candidate, to validate them forward before any is
+    # allowed to gate entries. Fire-and-forget on a daemon thread so it can NEVER
+    # add latency or amplify the execute hot path. Gated + hot-read reversible.
+    _shadow_cfg = config.get("shadow_signals") or {}
+    if bool(_shadow_cfg.get("enabled", False)):
+        try:
+            from hermes_trader.agents.shadow_signals import run_shadow_async
+            run_shadow_async(analysis["coin"], analysis.get("side", "long"), _shadow_cfg,
+                             config=config)
+        except Exception as _sh_e:
+            logger.debug(f"[shadow-signals] dispatch failed (non-fatal): {_sh_e}")
+
+    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow probe.
+    # Fire-and-forget on a daemon thread (the evaluation fetches ~2300 1h
+    # candles — never on the hot path). The probe self-gates on its
+    # off|shadow|enforce mode (default off = no thread, no network; env
+    # HERMES_XS_REVERSAL_MODE can flip it without a config rewrite) and is
+    # LONG-only. enforce is record-only in M2 (no order effect from this arm).
+    try:
+        from hermes_trader.agents.xs_reversal import run_xs_reversal_async
+        run_xs_reversal_async(analysis["coin"], analysis.get("side", "long"),
+                              config=config)
+    except Exception as _xs_e:
+        logger.debug(f"[xs_reversal] dispatch failed (non-fatal): {_xs_e}")
 
 
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
@@ -2495,31 +2516,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "reason": "crypto_disabled (set enable_crypto=true to trade native HL perps)",
         }
 
-    # Shadow-signals (free-signal suite): log what GEX / FINRA short-vol / whale /
-    # news WOULD say about this candidate, to validate them forward before any is
-    # allowed to gate entries. Fire-and-forget on a daemon thread so it can NEVER
-    # add latency or amplify the execute hot path. Gated + hot-read reversible.
-    _shadow_cfg = config.get("shadow_signals") or {}
-    if bool(_shadow_cfg.get("enabled", False)):
-        try:
-            from hermes_trader.agents.shadow_signals import run_shadow_async
-            run_shadow_async(analysis["coin"], analysis.get("side", "long"), _shadow_cfg,
-                             config=config)
-        except Exception as _sh_e:
-            logger.debug(f"[shadow-signals] dispatch failed (non-fatal): {_sh_e}")
-
-    # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow probe.
-    # Fire-and-forget on a daemon thread (the evaluation fetches ~2300 1h
-    # candles — never on the hot path). The probe self-gates on its
-    # off|shadow|enforce mode (default off = no thread, no network; env
-    # HERMES_XS_REVERSAL_MODE can flip it without a config rewrite) and is
-    # LONG-only. enforce is record-only in M2 (no order effect from this arm).
-    try:
-        from hermes_trader.agents.xs_reversal import run_xs_reversal_async
-        run_xs_reversal_async(analysis["coin"], analysis.get("side", "long"),
-                              config=config)
-    except Exception as _xs_e:
-        logger.debug(f"[xs_reversal] dispatch failed (non-fatal): {_xs_e}")
+    # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
+    # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
+    # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
+    _dispatch_entry_shadow_probes(analysis, config)
 
     # AI zero-confidence guard.
     #
