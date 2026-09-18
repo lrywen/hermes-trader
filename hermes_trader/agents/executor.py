@@ -2498,6 +2498,51 @@ def _ai_zero_confidence_block(analysis: dict[str, Any],
     return None
 
 
+def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
+                        trade_side: str, mid_price: float, atr: float,
+                        trade_notional: float, leverage: float,
+                        gate_results: dict[str, Any]) -> dict[str, Any]:
+    """S11 stage of maybe_execute: the SHADOW-mode terminal branch.
+
+    Records the "shadow" decision and paper-books the would-be fill into the
+    isolated SHADOW ledger (no real order, no funds, no .agent-memory touch;
+    fully best-effort), then returns the non-executed shadow result. Pure
+    terminal branch extracted verbatim in the P1-1 step ③ phase split.
+    Imports stay function-local so sys.modules-based test monkeypatching of
+    shadow_book / market_regime keeps working.
+    """
+    _record_decision("shadow")
+    try:
+        from hermes_trader.agents import shadow_book
+        _sh_entry = mid_price if mid_price > 0 else 0.0
+        try:
+            _sh_atr_pct = (atr / _sh_entry * 100.0) if (_sh_entry > 0 and atr > 0) else 0.0
+        except Exception:
+            _sh_atr_pct = 0.0
+        _sh_regime = ""
+        try:
+            from hermes_trader.agents.market_regime import detect_regime
+            _sh_regime = detect_regime(coin) or ""
+        except Exception:
+            _sh_regime = ""
+        if _sh_entry > 0:
+            shadow_book.shadow_open(
+                coin=coin, side=trade_side, entry_px=_sh_entry,
+                size_usd=trade_notional, leverage=leverage,
+                entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
+                analysis_id=analysis_id,
+            )
+    except Exception as _shadow_e:
+        logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
+    return {
+        "executed": False, "mode": mode,
+        "analysis_id": analysis_id,
+        "reason": "shadow_mode_would_execute",
+        "gate_results": gate_results,
+        "size_usd": trade_notional,
+    }
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3759,39 +3804,14 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         }
 
     if shadow_mode:
-        _record_decision("shadow")
-        # Paper-book the would-be fill into the isolated SHADOW ledger so the
-        # dashboard can show what the strategy would have traded. No real order,
-        # no real funds, no touch of .agent-memory — fully best-effort.
-        try:
-            from hermes_trader.agents import shadow_book
-            _sh_entry = mid_price if mid_price > 0 else 0.0
-            try:
-                _sh_atr_pct = (atr / _sh_entry * 100.0) if (_sh_entry > 0 and atr > 0) else 0.0
-            except Exception:
-                _sh_atr_pct = 0.0
-            _sh_regime = ""
-            try:
-                from hermes_trader.agents.market_regime import detect_regime
-                _sh_regime = detect_regime(coin) or ""
-            except Exception:
-                _sh_regime = ""
-            if _sh_entry > 0:
-                shadow_book.shadow_open(
-                    coin=coin, side=trade_side, entry_px=_sh_entry,
-                    size_usd=trade_notional, leverage=leverage,
-                    entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
-                    analysis_id=analysis["id"],
-                )
-        except Exception as _shadow_e:
-            logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": "shadow_mode_would_execute",
-            "gate_results": gate_output["results"],
-            "size_usd": trade_notional,
-        }
+        # SHADOW terminal branch — paper-book the would-be fill, no real order.
+        # Extracted to _shadow_mode_result in the P1-1 step ③ phase split.
+        return _shadow_mode_result(
+            mode=mode, analysis_id=analysis["id"], coin=coin,
+            trade_side=trade_side, mid_price=mid_price, atr=atr,
+            trade_notional=trade_notional, leverage=leverage,
+            gate_results=gate_output["results"],
+        )
 
     # ── INACTIVE: external HTA (:8766) size-veto channel retired ─────────
     # The native multi-perspective debate (research.py) replaced the external
