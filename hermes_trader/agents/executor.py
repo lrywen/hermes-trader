@@ -2400,6 +2400,23 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
             "bracket_error": bracket_error}
 
 
+def _dispatch_entry_shadow_probes(analysis: dict[str, Any],
+                                  config: dict[str, Any]) -> None:
+    """Fire-and-forget the entry-path shadow probes (S2 stage of
+    maybe_execute).
+
+    Both dispatches run self-gated, fully wrapped, and on daemon threads, so
+    they never add latency to the execute hot path and never raise. They
+    return nothing and mutate neither ``analysis`` nor ``config``; extracted
+    verbatim from maybe_execute in the P1-1 step ③ phase split. Imports stay
+    function-local so sys.modules-based test monkeypatching keeps working.
+    """
+    # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
+    # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
+    # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
+    _dispatch_entry_shadow_probes(analysis, config)
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
