@@ -305,6 +305,26 @@ def _tiered_notional_cap(base_cap_usd: float, equity_usd: float,
     return max(base_cap_usd, equity_usd * tier_multiple)
 
 
+def _resolve_notional_cap(config: dict[str, Any], agg_equity: float) -> float:
+    """S9 stage: resolve the equity-tiered per-trade notional cap.
+
+    Reads the absolute ``max_trade_notional_usd`` cap and the C11-tunable tier
+    threshold/multiple, falling back to the historical constants on any
+    resolution failure, then returns the tiered cap (see
+    ``_tiered_notional_cap``). Pure leaf extracted in the P1-1 step ③ phase
+    split; the C11 ``cfg_get`` exception fallback is moved verbatim.
+    """
+    _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
+    try:
+        _tier_equity = float(
+            cfg_get("notional_cap_tier_equity_usd", _NOTIONAL_CAP_TIER_EQUITY_USD, config=config))
+        _tier_mult = float(
+            cfg_get("notional_cap_tier_multiple", _NOTIONAL_CAP_TIER_MULTIPLE, config=config))
+    except Exception:
+        _tier_equity, _tier_mult = _NOTIONAL_CAP_TIER_EQUITY_USD, _NOTIONAL_CAP_TIER_MULTIPLE
+    return _tiered_notional_cap(_notional_cap, agg_equity, _tier_equity, _tier_mult)
+
+
 def _shared_atr_stop_config(config: dict[str, Any]) -> dict[str, Any]:
     """Return the canonical dsl_exit.atr_stop block both stop layers share.
 
@@ -3295,22 +3315,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # Extracted to _apply_leverage_tier in the P1-1 step ③ phase split.
     leverage = _apply_leverage_tier(leverage, analysis, config)
 
-    _notional_cap = float(config.get("max_trade_notional_usd", 0) or 0)
-    # Audit 2026-09-04 P0-4: a single absolute USD cap crushes ATR equal-risk
-    # sizing on micro accounts (risk_pct*equity/stop_frac often >> $30), making
-    # every trade a fixed $30 and losing risk granularity. Tier the effective
-    # cap by equity (see _tiered_notional_cap): hard $30 floor below $50 equity,
-    # then scale with equity so risk_per_trade_pct binds again.
-    # Audit 2026-09-06 (C11): tier threshold/multiple are config-tunable; fall
-    # back to the historical constants on any resolution failure.
-    try:
-        _tier_equity = float(
-            cfg_get("notional_cap_tier_equity_usd", _NOTIONAL_CAP_TIER_EQUITY_USD, config=config))
-        _tier_mult = float(
-            cfg_get("notional_cap_tier_multiple", _NOTIONAL_CAP_TIER_MULTIPLE, config=config))
-    except Exception:
-        _tier_equity, _tier_mult = _NOTIONAL_CAP_TIER_EQUITY_USD, _NOTIONAL_CAP_TIER_MULTIPLE
-    _notional_cap = _tiered_notional_cap(_notional_cap, agg_equity, _tier_equity, _tier_mult)
+    # Equity-tiered per-trade notional cap (P0-4/C11): absolute floor for micro
+    # accounts, scales with equity above the tier threshold. Extracted to
+    # _resolve_notional_cap in the P1-1 step ③ phase split.
+    _notional_cap = _resolve_notional_cap(config, agg_equity)
     _atr_sizing = config.get("atr_risk_sizing", {}) or {}
     _atr_sizing_enabled = bool(_atr_sizing.get("enabled", False))
     mid_price = 0.0
