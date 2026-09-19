@@ -41,7 +41,13 @@ import math
 import random
 import statistics
 import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+# 复用内核 guard 的实盘并发硬上限（B-2），避免后处理再放宽口径。
+_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(_REPO))
+from hermes_trader.backtest import guard as kguard
 
 
 def _tstat(v: List[float]) -> float:
@@ -76,7 +82,12 @@ def _load(path: str, arms: Optional[set], notional_bt: float) -> List[Dict[str, 
 
 
 def _apply_maxc(rows: List[Dict[str, Any]], maxc: int) -> List[Dict[str, Any]]:
-    """实盘并发上限：按 entry_t 顺序执行，槽位满则丢弃该信号。"""
+    """实盘并发上限：按 entry_t 顺序执行，槽位满则丢弃该信号。
+
+    B-2：上限经内核 guard 校验，> 实盘峰值并发（2）硬拒绝——本工具不得再构造
+    比生产更宽松的并发口径（P3-4：filt 无约束 +13.86% → maxc=2 −5.20%）。
+    """
+    kguard.assert_max_concurrent_allowed(maxc)
     open_exits: List[int] = []
     keep: List[Dict[str, Any]] = []
     for r in rows:
@@ -145,7 +156,9 @@ def main() -> None:
     ap.add_argument("--notional", type=float, default=0.0,
                     help="实盘每笔名义（美元）。给定则按实盘美元口径输出")
     ap.add_argument("--equity", type=float, default=0.0, help="实盘权益（美元）")
-    ap.add_argument("--maxc", type=int, default=0, help="并发上限；>0 时叠加")
+    ap.add_argument("--maxc", type=int, default=kguard.MAX_CONCURRENT_POSITIONS,
+                    help="并发上限（B-2 默认实盘硬上限 2；显式给 1 更保守；>2 经 "
+                         "内核 guard 硬拒绝）")
     ap.add_argument("--drop-months", default="", help="逗号分隔 YYYY-MM，留一期法")
     args = ap.parse_args()
 
@@ -172,7 +185,7 @@ def main() -> None:
               f"{'回撤%':>9}{'夏普':>8}{'块自助95%CI(美元)':>26}")
         for arm in sorted(groups):
             g = groups[arm]
-            sub = _apply_maxc(g, args.maxc) if args.maxc else g
+            sub = _apply_maxc(g, args.maxc)
             if not sub:
                 continue
             lo, hi, D, _ = _block_bootstrap_usd(sub, args.notional, args.boot, args.seed)
@@ -185,7 +198,7 @@ def main() -> None:
               f"{'块自助95%CI(bps)':>26}{'宽比':>7}")
         for arm in sorted(groups):
             g = groups[arm]
-            sub = _apply_maxc(g, args.maxc) if args.maxc else g
+            sub = _apply_maxc(g, args.maxc)
             if len(sub) < 5:
                 continue
             bps = [r["_bps"] for r in sub]

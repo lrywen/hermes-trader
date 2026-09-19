@@ -29,6 +29,30 @@ from .types import Side, Signal, Trade
 
 _SIDES: tuple[Side, ...] = ("long", "short")
 
+# B-2：实盘峰值并发上限。生产 executor 同时在仓的头寸最多 2 个；旧回测路径
+# 默认不约束（实测峰值 7、均值 1.29），把 filt 从 −5.20% 高估成 +13.86%
+# （P3-4：差 19 个百分点）。所有回测路径必须按此上限调度，guard 硬拒绝 >2。
+MAX_CONCURRENT_POSITIONS = 2
+
+
+def assert_max_concurrent_allowed(n: int) -> None:
+    """Reject any backtest path that would allow more than the live cap.
+
+    The live executor holds at most :data:`MAX_CONCURRENT_POSITIONS` open
+    positions. A backtest configured with a higher ceiling is structurally
+    incomparable to production and overstates capacity (P3-4: the filter edge
+    flips sign once the cap is applied), so it is a hard error rather than a
+    warning.
+    """
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        raise ValueError(f"max_concurrent must be a positive int, got {n!r}")
+    if n > MAX_CONCURRENT_POSITIONS:
+        raise ValueError(
+            f"max_concurrent={n} exceeds the live cap "
+            f"{MAX_CONCURRENT_POSITIONS} (P3-4: uncapped backtests overstate "
+            f"capacity — filt +13.86% flips to -5.20% at maxc=2)"
+        )
+
 # 生产状态卷根（容器内命名卷 hermes-deploy_hermes_data→/data）。研究回测的
 # 落盘产物只能写仓库 logs/（gitignored）等研究路径，禁止写入生产卷，避免
 # 研究 JSONL 与生产 events/session/state 混杂或写满卷（评估报告 R2）。
