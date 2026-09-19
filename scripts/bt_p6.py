@@ -605,7 +605,7 @@ _OPP = {"long": "short", "short": "long"}
 
 # 实验臂 → 信号源臂（baseline 派生）与 DSL 键（main 注入 dsls dict）
 DERIVED_ARMS = ["dsl_t1", "dsl_t2", "fade_live", "fade_tuned",
-                "filt", "filt_s60", "pullback"]
+                "filt", "filt_s60", "pullback", "filt_ld"]
 PULLBACK_PCT = 0.4   # 限价回撤幅度（%）
 PULLBACK_BARS = 24   # 挂单有效期（5m 根数 = 2h）
 
@@ -689,6 +689,7 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                 # 过滤臂
                 if _passes_filter(cand):
                     per_arm["filt"].append((i, replace(cand, arm="filt")))
+                    per_arm["filt_ld"].append((i, replace(cand, arm="filt_ld")))
                     if cand.score >= 60:
                         per_arm["filt_s60"].append(
                             (i, replace(cand, arm="filt_s60")))
@@ -753,7 +754,8 @@ ARMS = [("baseline", "baseline（live ≥54+旁路）"),
         ("fade_tuned", "E2b fade 反向(降档DSL)"),
         ("filt", "E3a 过滤(禁short/relaxed/黑)"),
         ("filt_s60", "E3b 过滤+score≥60"),
-        ("pullback", "E4 限价-0.4%挂单(24根)")]
+        ("pullback", "E4 限价-0.4%挂单(24根)"),
+        ("filt_ld", "E3c 过滤+实盘DSL出场")]
 
 
 def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
@@ -880,7 +882,7 @@ def main() -> None:
         "fade_live": live_dsl,
         "dsl_t1": tuned, "dsl_t2": tuned_ts,
         "fade_tuned": tuned, "filt": tuned, "filt_s60": tuned,
-        "pullback": tuned,
+        "pullback": tuned, "filt_ld": live_dsl,
     }
 
     now_ms = int(time.time() * 1000)

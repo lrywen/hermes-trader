@@ -605,7 +605,7 @@ _OPP = {"long": "short", "short": "long"}
 
 # 实验臂 → 信号源臂（baseline 派生）与 DSL 键（main 注入 dsls dict）
 DERIVED_ARMS = ["dsl_t1", "dsl_t2", "fade_live", "fade_tuned",
-                "filt", "filt_s60", "pullback"]
+                "filt", "filt_s60", "pullback", "filt_ld", "filt_ra"]
 PULLBACK_PCT = 0.4   # 限价回撤幅度（%）
 PULLBACK_BARS = 24   # 挂单有效期（5m 根数 = 2h）
 
@@ -651,6 +651,33 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
         return trades, funnel
     ts_1h = [c.t for c in c1h_all]
     ts_4h = [c.t for c in c4h_all]
+
+    # ── P6-RA：实盘 regime 用 BTC 1h 代理（market_regime.CRYPTO_PROXY="BTC"），
+    # 全局共享、与当前币无关。回测若用「当前币的 1h」判 regime 就是代理失真。
+    try:
+        _btc_1h = fetch("BTC", "1h", start_ms - 170 * MS_1H, end_ms, MS_1H)
+        _btc_ts = [c.t for c in _btc_1h]
+    except Exception:
+        _btc_1h, _btc_ts = [], []
+
+    def _regime_at(decision_ms: int) -> str:
+        """复现 detect_regime_with_score('BTC')：取末 100 根【已收盘】1h →
+        classify_candles（与实盘同一函数、同一参数）。"""
+        if len(_btc_1h) < 100:
+            return "neutral"
+        k = bisect.bisect_right(_btc_ts, decision_ms - MS_1H)
+        if k < 100:
+            return "neutral"
+        sl = _btc_1h[k - 100:k]
+        try:
+            rg = P["regime"]
+            return classify_candles(sl, fast_p=rg.get("fast_ema"),
+                                    slow_p=rg.get("slow_ema"),
+                                    slope_up=rg.get("slope_threshold"),
+                                    adx_max=rg.get("chop_adx_max"))
+        except Exception:
+            return "neutral"
+
     if len(bars) < 60:
         print(f"  [skip] {coin}: 5m 数据不足（{len(bars)} 根）")
         return trades, funnel
@@ -689,6 +716,9 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                 # 过滤臂
                 if _passes_filter(cand):
                     per_arm["filt"].append((i, replace(cand, arm="filt")))
+                    per_arm["filt_ld"].append((i, replace(cand, arm="filt_ld")))
+                    # P6-RA：同信号、同过滤，出场按 BTC regime 动态切换
+                    per_arm["filt_ra"].append((i, replace(cand, arm="filt_ra")))
                     if cand.score >= 60:
                         per_arm["filt_s60"].append(
                             (i, replace(cand, arm="filt_s60")))
@@ -702,7 +732,14 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
             if i <= open_until:
                 funnel["skip_open_pos"] += 1
                 continue
-            tr = _simulate_trade(cand, bars, i, arm_dsl, notional,
+            _dsl = arm_dsl
+            if arm == "filt_ra":
+                # P6-RA：复现 select_exit_params —— trend(up/down) 走 trend_ride
+                # （宽追踪 + 0.8% 止损），neutral/chop 走 scalp（+0.4% 止损）。
+                _dsl = (dsls["ra_trend"]
+                        if _regime_at(bars[i].t + MS_5M) in ("up", "down")
+                        else dsls["ra_nontrend"])
+            tr = _simulate_trade(cand, bars, i, _dsl, notional,
                                  e_slip, x_slip, stop_delay, coin, **pb_kw)
             if tr is None:
                 continue
@@ -753,7 +790,9 @@ ARMS = [("baseline", "baseline（live ≥54+旁路）"),
         ("fade_tuned", "E2b fade 反向(降档DSL)"),
         ("filt", "E3a 过滤(禁short/relaxed/黑)"),
         ("filt_s60", "E3b 过滤+score≥60"),
-        ("pullback", "E4 限价-0.4%挂单(24根)")]
+        ("pullback", "E4 限价-0.4%挂单(24根)"),
+        ("filt_ld", "E3c 过滤+实盘DSL出场"),
+        ("filt_ra", "E3d 过滤+regime感知出场")]
 
 
 def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
@@ -880,8 +919,38 @@ def main() -> None:
         "fade_live": live_dsl,
         "dsl_t1": tuned, "dsl_t2": tuned_ts,
         "fade_tuned": tuned, "filt": tuned, "filt_s60": tuned,
-        "pullback": tuned,
+        "pullback": tuned, "filt_ld": live_dsl,
     }
+
+    # ── P6-RA：复现实盘 select_exit_params（regime_aware.enabled=True）──
+    # 实盘出场是 regime 相关的：trend(up/down) → trend_ride（protect 2.5 /
+    # retrace 0.4 / 止损 0.8%）；non_trend(neutral/chop) → scalp（顶层
+    # protect/retrace + 止损 0.4%）。顶层 max_loss_pct=1 在 regime_aware
+    # 开启时【永远用不到】——A 组（全程 1%）与 B 组（全程 0.4%）都是极端假设。
+    # clocks.enabled=False → hard/stale 用顶层全局值。
+    _dx = cfg.get("dsl_exit", {}) or {}
+    _ra = _dx.get("regime_aware", {}) or {}
+    _tr = _ra.get("trend_ride", {}) or {}
+    _ml = _ra.get("max_loss", {}) or {}
+    _tr_ml = _ml.get("trend", {}) or {}
+    _nt_ml = _ml.get("non_trend", {}) or {}
+    _tr_tiers = sorted(
+        (float(t["pct_above_entry"]), float(t["retrace_threshold"]))
+        for t in (_tr.get("phase2_tiers") or [])) or None
+    dsls["ra_trend"] = DslParams(
+        max_loss_pct=float(_tr_ml.get("max_loss_pct", 0.8)),
+        protect_pct=float(_tr.get("protect_pct", 2.5)),
+        retrace_threshold=float(_tr.get("retrace_threshold", 0.4)),
+        hard_timeout_minutes=float(_dx.get("hard_timeout_minutes", 600)),
+        breakeven_trigger_pct=float(_dx.get("breakeven_trigger_pct", 2.5)),
+        breakeven_lock_pct=float(_dx.get("breakeven_lock_pct", 0.3)),
+        stale_flat_timeout_minutes=float(_dx.get("stale_flat_timeout_minutes", 240)),
+        phase2_tiers=_tr_tiers or live_dsl.phase2_tiers,
+    )
+    # non_trend = 顶层 protect/retrace/tiers，仅覆盖 max_loss
+    dsls["ra_nontrend"] = replace(
+        live_dsl, max_loss_pct=float(_nt_ml.get("max_loss_pct", 0.4)))
+    dsls["filt_ra"] = dsls["ra_nontrend"]  # 兜底；实际在调用点按 regime 选
 
     now_ms = int(time.time() * 1000)
     end_ms = args.end_ms or (now_ms // MS_5M) * MS_5M - MS_5M

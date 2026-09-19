@@ -88,10 +88,49 @@ from hermes_trader.agents.ta_filter import (
 )
 from hermes_trader.data.historical_candles import fetch_candle_range
 from hermes_trader.indicators import triggers as trig
+from hermes_trader.indicators.math import atr as _atr_series
 from hermes_trader.models.types import Candle
 
 # executor.py:1144-1147 —— 主流币池（8 币）。
 MAJORS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"]
+
+# ── P6b-1a：交易所侧触发单参数（实盘 executor.py 的两条挂单路径）───────────
+# 实盘开仓时会挂：
+#   ① 备用 SL   _place_backup_sl(executor.py:1584)
+#        atr_stop_pct = (atr_4h/entry_px)*sl_atr_mult*100
+#        sl_width_pct = clamp(atr_stop_pct, sl_floor_pct, sl_ceiling_pct)
+#        sl_px = entry_px ∓ entry_px*sl_width_pct/100
+#   ② TP 分批   _place_tp_scale_out(executor.py:1732)
+#        tp_px = entry_px ± atr_4h*tp_atr_mult
+#        tp_size = size*tp_scale_fraction，若 tp_notional < min_order_usd 则
+#          UPSIZE 到最小额（占仓位 ≥90% 时 SKIP）
+# 关键：ATR 用的是【4h ATR(14)】（_price_atr_guard → get_hl_atr("4h",14,coin)）。
+# 回测此前【完全没有建模这两条路径】—— 这是回测与实盘出场机制正交的根因。
+EXCH_DEFAULTS = {
+    "sl_atr_mult": 1.2,
+    "sl_floor_pct": 1.2,
+    "sl_ceiling_pct": 3.0,
+    "tp_atr_mult": 2.0,
+    "tp_scale_fraction": 0.4,
+    "min_order_usd": 10.5,
+    "skip_threshold": 0.90,
+}
+
+
+def _exch_params(cfg: Dict[str, Any]) -> Dict[str, float]:
+    """从权威配置解析交易所侧触发单参数（顶层键）。"""
+    out = dict(EXCH_DEFAULTS)
+    for k in ("sl_atr_mult", "sl_floor_pct", "sl_ceiling_pct",
+              "tp_atr_mult", "tp_scale_fraction", "min_order_usd"):
+        if k in cfg:
+            try:
+                v = float(cfg[k])
+                if v == v:  # 非 NaN
+                    out[k] = v
+            except (TypeError, ValueError):
+                pass
+    return out
+
 
 MS_5M = 5 * 60_000
 MS_1H = 60 * 60_000
@@ -171,6 +210,8 @@ def _resolve_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "trend_surface_enabled": bool(cfg.get("trend_surface_enabled", True)),
         "regime": regime,
         "dsl": dsl,
+        # P6b-1a：交易所侧触发单参数（顶层键）
+        "exch": _exch_params(cfg),
     }
 
 
@@ -498,12 +539,25 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
                     entry_slip: float, exit_slip: float,
                     stop_delay: float, coin: str,
                     pullback_pct: float = 0.0,
-                    pullback_bars: int = 0) -> Optional[Trade]:
+                    pullback_bars: int = 0,
+                    exch: Optional[Dict[str, float]] = None,
+                    atr_abs: float = 0.0,
+                    sizing: Optional[Dict[str, float]] = None) -> Optional[Trade]:
     """bar i 收盘出信号，bar i+1 开盘成交，逐 bar 跑 dsl_exit 阶梯。
 
     pullback_pct>0：改为限价挂单 —— 参考价 = bar i+1 开盘，
     限价 = ref*(1-sgn*pct%)，pullback_bars 根内触及则成交（gap 有利按
-    开盘价），否则撤单返回 None。"""
+    开盘价），否则撤单返回 None。
+
+    exch 非 None（P6b-1a）：额外建模实盘开仓时挂的**交易所侧触发单** ——
+      ① 备用 SL（_place_backup_sl）：宽度 clamp(atr4h%*sl_atr_mult,
+         sl_floor_pct, sl_ceiling_pct)，价格在 entry 不利侧
+      ② TP 分批（_place_tp_scale_out）：tp_px = entry ± atr4h*tp_atr_mult，
+         平 tp_scale_fraction；意图额 < min_order_usd 时 UPSIZE 到最小额
+         （占仓位 >= skip_threshold 则 SKIP）
+    交易所单是 tick 级挂单，**同一 5m bar 内先于 DSL 的收盘检查**触发。
+    atr_abs 必须是【4h ATR(14)】的绝对值（复现 get_hl_atr("4h",14,coin)）。
+    """
     j = i + 1
     if j >= len(bars):
         return None
@@ -526,6 +580,21 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
     else:
         entry_px = bars[j].o * (1 + sgn * entry_slip / 1e4)
         entry_t = bars[j].t
+    # ── P6b-1a：逐笔 notional（复现实盘 atr_equal_risk_notional + tiered cap）──
+    # 实盘 notional = risk_per_trade_pct*equity / ((sl_atr_mult*atr4h)/entry_px)，
+    # 再被 max_trade_notional_usd 截顶（_tiered_notional_cap：equity<50 → base）。
+    # $30 账户下：高波动币 → $1.75，低波动币 → $30（截顶）。
+    # 【关键】notional 决定交易所侧 TP 腿是否被 UPSIZE。回测若用固定 $10,000，
+    # TP 意图额 = $4,000 >> $10.5 最小额，upsize 永不触发 → 实盘 52.6% 的
+    # exchange_trigger 在回测里退化成 0。**这是「notional 规模」影响出场机制
+    # 的具体通路**，不是单纯的仓位大小差异。
+    if sizing is not None and atr_abs > 0:
+        _stop_frac = (float(sizing.get("sl_atr_mult", 1.2)) * atr_abs) / entry_px
+        if _stop_frac > 0:
+            notional = min(
+                float(sizing.get("risk_per_trade_pct", 0.026))
+                * float(sizing.get("equity", 30.58)) / _stop_frac,
+                float(sizing.get("max_notional_usd", 30.0)))
     tr = Trade(coin=coin, side=cand.side, arm=cand.arm, entry_t=entry_t,
                entry_px=entry_px, notional=notional, score=cand.score,
                fired=cand.fired, meta=cand.meta)
@@ -537,26 +606,79 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
     eff_max_loss = dsl.max_loss_pct
     stop_px = entry_px * (1 - sgn * eff_max_loss / 100.0)
 
+    # ── P6b-1a：交易所侧触发单价格 ────────────────────────────────
+    ex_sl_px: Optional[float] = None
+    ex_tp_px: Optional[float] = None
+    tp_frac_eff = 0.0
+    min_order = 0.0
+    if exch is not None and atr_abs > 0:
+        min_order = float(exch.get("min_order_usd", 10.5))
+        atr_pct = atr_abs / entry_px * 100.0
+        _w = atr_pct * float(exch.get("sl_atr_mult", 1.2))
+        _w = min(max(_w, float(exch.get("sl_floor_pct", 1.2))),
+                 float(exch.get("sl_ceiling_pct", 3.0)))
+        ex_sl_px = entry_px * (1 - sgn * _w / 100.0)
+        ex_tp_px = entry_px * (
+            1 + sgn * atr_pct * float(exch.get("tp_atr_mult", 2.0)) / 100.0)
+        _f = float(exch.get("tp_scale_fraction", 0.4))
+        _intended = notional * _f
+        if _intended < min_order:
+            _up = (min_order / notional) if notional > 0 else 1.0
+            tp_frac_eff = (0.0 if _up >= float(exch.get("skip_threshold", 0.9))
+                           else _up)
+        else:
+            tp_frac_eff = _f
+
     def _fill(raw_stop: float, bar: Candle) -> float:
         """止损/地板成交：gap 穿过则按开盘价成交（不利方向）。"""
         return bar.o if (bar.o - raw_stop) * sgn < 0 else raw_stop
 
     def _close(exit_t: int, raw_px: float, reason: str, k: int,
-               is_stop: bool) -> Trade:
+               is_stop: bool, realized: float = 0.0,
+               size_left: float = 1.0) -> Trade:
+        """realized / size_left：交易所侧 TP 分批已实现部分 + 剩余仓位比例。"""
         slip = exit_slip + (stop_delay if is_stop else 0.0)
         tr.exit_t = exit_t
         tr.exit_px = raw_px * (1 - sgn * slip / 1e4)
         tr.exit_reason = reason
         tr.hold_bars = k - j + 1
         tr.peak_pct = sgn * (peak - entry_px) / entry_px * 100.0
-        tr.pnl_gross = sgn * (tr.exit_px - entry_px) / entry_px * notional
+        tr.pnl_gross = (realized
+                        + sgn * (tr.exit_px - entry_px) / entry_px
+                        * notional * size_left)
         tr.pnl_net = tr.pnl_gross - notional * ROUND_TRIP_FEE_BPS / 1e4
         return tr
 
+    realized = 0.0
+    size_left = 1.0
     for k in range(j, len(bars)):
         b = bars[k]
         elapsed_min = (b.t + MS_5M - entry_t) / 60_000.0
         peak_pct = sgn * (peak - entry_px) / entry_px * 100.0  # 截至 k-1 收盘
+
+        # ── P6b-1a：交易所侧触发单（tick 级挂单 → 同一 bar 内先于 DSL）──
+        if ex_sl_px is not None:
+            hit_ex_sl = (b.l <= ex_sl_px) if sgn > 0 else (b.h >= ex_sl_px)
+            hit_ex_tp = (b.h >= ex_tp_px) if sgn > 0 else (b.l <= ex_tp_px)
+            if hit_ex_sl:
+                # SL 与 TP 同 bar 都触及 → bar 级无法判先后，保守取 SL（不利）
+                return _close(b.t + MS_5M, _fill(ex_sl_px, b),
+                              "exchange_trigger", k, True,
+                              realized=realized, size_left=size_left)
+            if hit_ex_tp and tp_frac_eff > 0:
+                _part = tp_frac_eff * size_left
+                realized += (sgn * (ex_tp_px - entry_px) / entry_px
+                             * notional * _part)
+                size_left -= _part
+                if size_left * notional < min_order:
+                    # 剩余仓位低于交易所最小额 → 无法主动平仓（reduce_only 同样
+                    # 受 min-size 限制）→ 整仓最终由交易所侧了结
+                    realized += (sgn * (ex_tp_px - entry_px) / entry_px
+                                 * notional * size_left)
+                    return _close(b.t + MS_5M, ex_tp_px,
+                                  "exchange_trigger", k, False,
+                                  realized=realized, size_left=0.0)
+                tp_frac_eff = 0.0  # 剩余仓位继续走 DSL
 
         # check() 优先级链（dsl_exit :970-1187）：
         # 0) time_scratch(实验) → 1) stale_flat → 2) hard_timeout →
@@ -564,17 +686,21 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
         if (dsl.time_scratch_minutes > 0
                 and elapsed_min >= dsl.time_scratch_minutes
                 and peak_pct < dsl.time_scratch_min_peak):
-            return _close(b.t + MS_5M, b.c, "time_scratch", k, False)
+            return _close(b.t + MS_5M, b.c, "time_scratch", k, False,
+                          realized=realized, size_left=size_left)
         if (dsl.stale_flat_timeout_minutes > 0
                 and elapsed_min >= dsl.stale_flat_timeout_minutes
                 and peak_pct < dsl.protect_pct):
-            return _close(b.t + MS_5M, b.c, "stale_flat_timeout", k, False)
+            return _close(b.t + MS_5M, b.c, "stale_flat_timeout", k, False,
+                          realized=realized, size_left=size_left)
         if (dsl.hard_timeout_minutes > 0
                 and elapsed_min >= dsl.hard_timeout_minutes):
-            return _close(b.t + MS_5M, b.c, "hard_timeout", k, False)
+            return _close(b.t + MS_5M, b.c, "hard_timeout", k, False,
+                          realized=realized, size_left=size_left)
         hit_stop = (b.l <= stop_px) if sgn > 0 else (b.h >= stop_px)
         if hit_stop:
-            return _close(b.t + MS_5M, _fill(stop_px, b), "max_loss", k, True)
+            return _close(b.t + MS_5M, _fill(stop_px, b), "max_loss", k, True,
+                          realized=realized, size_left=size_left)
         # phase 2：arm 基于 PEAK ≥ protect（:1182）
         if peak_pct >= dsl.protect_pct:
             retrace = _active_tier(dsl, peak_pct)
@@ -588,13 +714,16 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
             prev_floor = floor
             breached = (b.l < floor) if sgn > 0 else (b.h > floor)
             if breached:
-                return _close(b.t + MS_5M, _fill(floor, b), "floor_breach", k, False)
+                return _close(b.t + MS_5M, _fill(floor, b), "floor_breach", k,
+                              False, realized=realized, size_left=size_left)
         # peak 收盘后推进 —— 杜绝 bar 内前视
         peak = max(peak, b.h) if sgn > 0 else min(peak, b.l)
 
     # 数据末端仍持仓 → 按末根收盘价平仓
     k = len(bars) - 1
-    return _close(bars[k].t + MS_5M, bars[k].c, "end_of_data", k, False)
+    return _close(bars[k].t + MS_5M, bars[k].c, "end_of_data", k, False,
+                  realized=realized, size_left=size_left)
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -605,7 +734,8 @@ _OPP = {"long": "short", "short": "long"}
 
 # 实验臂 → 信号源臂（baseline 派生）与 DSL 键（main 注入 dsls dict）
 DERIVED_ARMS = ["dsl_t1", "dsl_t2", "fade_live", "fade_tuned",
-                "filt", "filt_s60", "pullback"]
+                "filt", "filt_s60", "pullback", "filt_ld", "filt_ra",
+                "filt_exch", "filt_ra_exch"]
 PULLBACK_PCT = 0.4   # 限价回撤幅度（%）
 PULLBACK_BARS = 24   # 挂单有效期（5m 根数 = 2h）
 
@@ -651,6 +781,46 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
         return trades, funnel
     ts_1h = [c.t for c in c1h_all]
     ts_4h = [c.t for c in c4h_all]
+    # P6b-1a：交易所侧触发单用【4h ATR(14)】（executor._price_atr_guard →
+    # get_hl_atr("4h",14,coin)）。用 5m ATR 会把止损宽度和 TP 目标都算错。
+    _atr4h = _atr_series(c4h_all, 14) if c4h_all else []
+
+    # ── P6-RA：实盘 regime 用 BTC 1h 代理（market_regime.CRYPTO_PROXY="BTC"），
+    # 全局共享、与当前币无关。回测若用「当前币的 1h」判 regime 就是代理失真。
+    try:
+        _btc_1h = fetch("BTC", "1h", start_ms - 170 * MS_1H, end_ms, MS_1H)
+        _btc_ts = [c.t for c in _btc_1h]
+    except Exception:
+        _btc_1h, _btc_ts = [], []
+
+    def _regime_at(decision_ms: int) -> str:
+        """复现 detect_regime_with_score('BTC')：取末 100 根【已收盘】1h →
+        classify_candles（与实盘同一函数、同一参数）。"""
+        if len(_btc_1h) < 100:
+            return "neutral"
+        k = bisect.bisect_right(_btc_ts, decision_ms - MS_1H)
+        if k < 100:
+            return "neutral"
+        sl = _btc_1h[k - 100:k]
+        try:
+            rg = P["regime"]
+            return classify_candles(sl, fast_p=rg.get("fast_ema"),
+                                    slow_p=rg.get("slow_ema"),
+                                    slope_up=rg.get("slope_threshold"),
+                                    adx_max=rg.get("chop_adx_max"))
+        except Exception:
+            return "neutral"
+
+    def _atr4h_at(decision_ms: int) -> float:
+        """复现 get_hl_atr("4h", 14, coin)：最后一根【已收盘】4h bar 的 ATR。"""
+        if not _atr4h:
+            return 0.0
+        k = bisect.bisect_right(ts_4h, decision_ms - MS_4H)
+        if k < 15 or k > len(_atr4h):
+            return 0.0
+        v = _atr4h[k - 1]
+        return v if (v == v and v > 0) else 0.0  # NaN / 非正 → 0
+
     if len(bars) < 60:
         print(f"  [skip] {coin}: 5m 数据不足（{len(bars)} 根）")
         return trades, funnel
@@ -689,6 +859,14 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                 # 过滤臂
                 if _passes_filter(cand):
                     per_arm["filt"].append((i, replace(cand, arm="filt")))
+                    per_arm["filt_ld"].append((i, replace(cand, arm="filt_ld")))
+                    # P6-RA：同信号、同过滤，出场按 BTC regime 动态切换
+                    per_arm["filt_ra"].append((i, replace(cand, arm="filt_ra")))
+                    # P6b-1a：同信号、同过滤，额外建模交易所侧 SL/TP 触发单
+                    per_arm["filt_exch"].append(
+                        (i, replace(cand, arm="filt_exch")))
+                    per_arm["filt_ra_exch"].append(
+                        (i, replace(cand, arm="filt_ra_exch")))
                     if cand.score >= 60:
                         per_arm["filt_s60"].append(
                             (i, replace(cand, arm="filt_s60")))
@@ -702,8 +880,22 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
             if i <= open_until:
                 funnel["skip_open_pos"] += 1
                 continue
-            tr = _simulate_trade(cand, bars, i, arm_dsl, notional,
-                                 e_slip, x_slip, stop_delay, coin, **pb_kw)
+            _dsl = arm_dsl
+            if arm in ("filt_ra", "filt_ra_exch"):
+                # P6-RA：复现 select_exit_params —— trend(up/down) 走 trend_ride
+                # （宽追踪 + 0.8% 止损），neutral/chop 走 scalp（+0.4% 止损）。
+                _dsl = (dsls["ra_trend"]
+                        if _regime_at(bars[i].t + MS_5M) in ("up", "down")
+                        else dsls["ra_nontrend"])
+            # P6b-1a：交易所侧触发单（仅 *_exch 臂）
+            _exch = (P.get("exch")
+                     if arm in ("filt_exch", "filt_ra_exch") else None)
+            _atr_abs = _atr4h_at(bars[i].t + MS_5M) if _exch else 0.0
+            _sizing = P.get("sizing") if _exch else None
+            tr = _simulate_trade(cand, bars, i, _dsl, notional,
+                                 e_slip, x_slip, stop_delay, coin,
+                                 exch=_exch, atr_abs=_atr_abs,
+                                 sizing=_sizing, **pb_kw)
             if tr is None:
                 continue
             trades.append(tr)
@@ -753,7 +945,11 @@ ARMS = [("baseline", "baseline（live ≥54+旁路）"),
         ("fade_tuned", "E2b fade 反向(降档DSL)"),
         ("filt", "E3a 过滤(禁short/relaxed/黑)"),
         ("filt_s60", "E3b 过滤+score≥60"),
-        ("pullback", "E4 限价-0.4%挂单(24根)")]
+        ("pullback", "E4 限价-0.4%挂单(24根)"),
+        ("filt_ld", "E3c 过滤+实盘DSL出场"),
+        ("filt_ra", "E3d 过滤+regime感知出场"),
+        ("filt_exch", "E3e 过滤+tuned+交易所侧单"),
+        ("filt_ra_exch", "E3f 过滤+regime+交易所侧单")]
 
 
 def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
@@ -845,6 +1041,18 @@ def main() -> None:
     ap.add_argument("--end-ms", type=int, default=None,
                     help="窗口结束 anchor（默认=当前最近已收盘 5m bar open）")
     ap.add_argument("--notional", type=float, default=10_000.0)
+    # ── P6b-1a：实盘逐笔 sizing（*_exch 臂）──────────────────────────
+    # 固定 $10,000 会让交易所侧 TP 腿的 upsize 永不触发（意图额 $4,000 远大于
+    # 最小额 $10.5），从而把实盘 52.6% 的 exchange_trigger 抹成 0。
+    ap.add_argument("--live-sizing", action="store_true",
+                    help="*_exch 臂改用实盘逐笔 notional"
+                         "（atr_equal_risk_notional + tiered cap）")
+    ap.add_argument("--equity", type=float, default=30.58,
+                    help="实盘净值，默认 $30.58")
+    ap.add_argument("--risk-per-trade-pct", type=float, default=0.026,
+                    help="atr_risk_sizing.risk_per_trade_pct，默认 0.026")
+    ap.add_argument("--max-notional", type=float, default=30.0,
+                    help="max_trade_notional_usd（tiered cap base），默认 30")
     ap.add_argument("--fee-bps", type=float, default=ROUND_TRIP_FEE_BPS,
                     help="往返手续费（bps）。默认 8.64 = 链上实测 HL IOC taker 4.32×2")
     ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
@@ -866,6 +1074,13 @@ def main() -> None:
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     cfg, cfg_src = _load_config(args.config)
     P = _resolve_params(cfg)
+    # P6b-1a：实盘逐笔 sizing（--live-sizing 时对 *_exch 臂生效）
+    P["sizing"] = ({
+        "risk_per_trade_pct": float(args.risk_per_trade_pct),
+        "equity": float(args.equity),
+        "max_notional_usd": float(args.max_notional),
+        "sl_atr_mult": float(P["exch"].get("sl_atr_mult", 1.2)),
+    } if args.live_sizing else None)
     live_dsl = DslParams.from_config(P["dsl"])
     tuned = replace(
         live_dsl,
@@ -880,8 +1095,41 @@ def main() -> None:
         "fade_live": live_dsl,
         "dsl_t1": tuned, "dsl_t2": tuned_ts,
         "fade_tuned": tuned, "filt": tuned, "filt_s60": tuned,
-        "pullback": tuned,
+        "pullback": tuned, "filt_ld": live_dsl,
+        # P6b-1a：与 filt / filt_ra 同出场，仅多一层交易所侧触发单
+        # （filt_ra_exch 的出场在调用点按 regime 覆盖）
+        "filt_exch": tuned, "filt_ra_exch": tuned,
     }
+
+    # ── P6-RA：复现实盘 select_exit_params（regime_aware.enabled=True）──
+    # 实盘出场是 regime 相关的：trend(up/down) → trend_ride（protect 2.5 /
+    # retrace 0.4 / 止损 0.8%）；non_trend(neutral/chop) → scalp（顶层
+    # protect/retrace + 止损 0.4%）。顶层 max_loss_pct=1 在 regime_aware
+    # 开启时【永远用不到】——A 组（全程 1%）与 B 组（全程 0.4%）都是极端假设。
+    # clocks.enabled=False → hard/stale 用顶层全局值。
+    _dx = cfg.get("dsl_exit", {}) or {}
+    _ra = _dx.get("regime_aware", {}) or {}
+    _tr = _ra.get("trend_ride", {}) or {}
+    _ml = _ra.get("max_loss", {}) or {}
+    _tr_ml = _ml.get("trend", {}) or {}
+    _nt_ml = _ml.get("non_trend", {}) or {}
+    _tr_tiers = sorted(
+        (float(t["pct_above_entry"]), float(t["retrace_threshold"]))
+        for t in (_tr.get("phase2_tiers") or [])) or None
+    dsls["ra_trend"] = DslParams(
+        max_loss_pct=float(_tr_ml.get("max_loss_pct", 0.8)),
+        protect_pct=float(_tr.get("protect_pct", 2.5)),
+        retrace_threshold=float(_tr.get("retrace_threshold", 0.4)),
+        hard_timeout_minutes=float(_dx.get("hard_timeout_minutes", 600)),
+        breakeven_trigger_pct=float(_dx.get("breakeven_trigger_pct", 2.5)),
+        breakeven_lock_pct=float(_dx.get("breakeven_lock_pct", 0.3)),
+        stale_flat_timeout_minutes=float(_dx.get("stale_flat_timeout_minutes", 240)),
+        phase2_tiers=_tr_tiers or live_dsl.phase2_tiers,
+    )
+    # non_trend = 顶层 protect/retrace/tiers，仅覆盖 max_loss
+    dsls["ra_nontrend"] = replace(
+        live_dsl, max_loss_pct=float(_nt_ml.get("max_loss_pct", 0.4)))
+    dsls["filt_ra"] = dsls["ra_nontrend"]  # 兜底；实际在调用点按 regime 选
 
     now_ms = int(time.time() * 1000)
     end_ms = args.end_ms or (now_ms // MS_5M) * MS_5M - MS_5M
@@ -945,6 +1193,7 @@ def main() -> None:
                     "exit_t": t.exit_t, "exit_px": t.exit_px,
                     "exit_reason": t.exit_reason, "pnl_gross": round(t.pnl_gross, 4),
                     "pnl_net": round(t.pnl_net, 4), "hold_bars": t.hold_bars,
+                    "notional": round(t.notional, 4),
                     "peak_pct": round(t.peak_pct, 4), "score": t.score,
                     "fired": t.fired, "meta": t.meta,
                 }) + "\n")
