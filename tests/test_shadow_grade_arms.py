@@ -191,16 +191,71 @@ def test_collecting_for_enforce_below_threshold(sg):
     assert out["verdict"] == sg.COLLECTING
 
 
-# ── verdict: PROMOTE_CANDIDATE (enough samples, healthy, no outcomes yet) ─────
-
-def test_promote_candidate_when_enough_samples_and_meaningful_rate(sg):
+# ── verdict: INERT (D-6, 2026-09-19) ────────────────────────────────────────
+# 旧行为：样本够 + 命中率有意义 + 零回填 outcome -> PROMOTE_CANDIDATE。
+# 缺陷：理由文案写着「建议跑 reconcile 后再定」却给出晋升档，自相矛盾；
+# 实测 /data/shadow_grade_history.jsonl 384 条 arm 记录中 11 条 PROMOTE 的
+# mature_outcomes=0（confidence_decay 4 / atr_regime_calib 3 / sizing_v2 3 /
+# trend_filter_200ma 1），其中 confidence_decay 正是 0.3 §6 记载有害率
+# 45.1% 的那条。无成熟样本 = 无证据，不能读成「可晋升」。
+def test_inert_when_samples_enough_but_no_mature_outcomes(sg):
     now = 1_700_000_000_000.0
     # 70 records, ~10% block rate, no backfilled outcomes.
     recs = [_rec(now, would_block=(i < 7)) for i in range(70)]
     out = sg.grade_arm("ta_late_entry", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
-    assert out["verdict"] == sg.PROMOTE
+    assert out["verdict"] == sg.INERT
     assert out["windows"][-1]["total"] == 70
+    assert out["windows"][-1]["mature_outcomes"] == 0
+    # 文案不得残留任何晋升导向措辞
+    assert "可考虑升 enforce" not in out["reason"]
+    assert "不作晋升评价" in out["reason"]
+
+
+def test_zero_hit_gate_is_inert_not_collecting(sg):
+    """0.3 §5 缺陷 2：168h 内一次都没触发的闸门不产生任何信息，
+    判 INERT，而不是「继续采数」——采集预算不该养空转臂。
+    实测 reentry_cap 83 次决策 / 0 命中，旧逻辑给 COLLECTING。"""
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_block=False) for _ in range(83)]
+    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.INERT
+    assert out["windows"][-1]["hits"] == 0
+    assert "零触发" in out["reason"]
+
+
+def test_rarely_hit_gate_still_collecting(sg):
+    """护栏：hits>0 但命中率过低仍应保留 COLLECTING，不被一刀切改判。"""
+    now = 1_700_000_000_000.0
+    recs = [_rec(now, would_block=(i == 0)) for i in range(70)]
+    out = sg.grade_arm("ta_late_entry", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.COLLECTING
+    assert out["windows"][-1]["hits"] == 1
+
+
+def test_promote_still_reachable_when_mature_outcomes_present(sg):
+    """D-6 回归护栏：INERT 只针对无成熟样本；有 >=20 条成熟样本且健康
+    的臂仍必须能走到 PROMOTE，否则修复就是一刀切地把晋升通道关死。"""
+    now = 1_700_000_000_000.0
+    recs = []
+    for i in range(22):
+        recs.append(_rec(now, would_block=True, outcome="loss", pnl_usd=-4.0))
+    for i in range(3):
+        recs.append(_rec(now, would_block=True, outcome="win", pnl_usd=1.0))
+    for i in range(45):
+        recs.append(_rec(now, would_block=False))
+    out = sg.grade_arm("ta_late_entry", "shadow", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["windows"][-1]["mature_outcomes"] >= sg.MIN_MATURE_OUTCOMES
+    assert out["verdict"] == sg.PROMOTE
+
+
+def test_inert_has_cn_label_and_no_keyerror(sg):
+    """_VERDICT_CN[verdict] 是硬索引，INERT 缺项会让整个评分器 KeyError。"""
+    assert sg.INERT in sg._VERDICT_CN
+    assert sg._VERDICT_CN[sg.INERT]
 
 
 def test_collecting_when_rate_too_low_to_matter(sg):
@@ -471,8 +526,9 @@ def test_signal_arm_grades_on_candidate_field(sg):
             for i in range(70)]
     out = sg.grade_arm("xs_reversal", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
-    # signal arms are not subject to the block-rate floor; healthy count → PROMOTE
-    assert out["verdict"] == sg.PROMOTE
+    # signal arms are not subject to the block-rate floor; decisions/hits
+    # are counted off is_candidate. D-6: 仍然零成熟样本 -> INERT，不是 PROMOTE。
+    assert out["verdict"] == sg.INERT
     assert out["kind"] == "signal"
     assert out["windows"][-1]["decisions"] == 70
     assert out["windows"][-1]["hits"] == 10

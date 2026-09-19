@@ -41,7 +41,7 @@ from datetime import datetime, timezone
 
 # 复用同目录 shadow_progress 的臂表与解析逻辑（路径已在 Audit 2026-09-07 修正）。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import shadow_progress as sp  # noqa: E402
+import shadow_progress as sp
 
 # ── 评级阈值（保守；只决定"建议"，不自动执行任何动作）───────────────────────
 MIN_SAMPLES_PROMOTE = 60     # 168h 窗口内至少这么多条记录才谈晋升
@@ -127,6 +127,10 @@ MACRO_LONG_ONLY_ARMS = {"pullback"}
 
 # 评级档位
 PROMOTE = "PROMOTE_CANDIDATE"
+# D-6 (2026-09-19)：无成熟样本的臂单独成档。旧逻辑在「尚无回填 outcome」
+# 分支直接 return PROMOTE，理由却写着「建议跑 reconcile 后再定」——文案与
+# 结论自相矛盾。无证据不等于健康，必须显式区分，否则会被读成晋升建议。
+INERT = "INERT"
 COLLECTING = "COLLECTING"
 INSUFFICIENT = "INSUFFICIENT_DATA"
 DATA_GAP = "DATA_GAP"
@@ -142,6 +146,7 @@ DEGRADED_REVIEW = "ENFORCE_DEGRADED_REVIEW"
 _VERDICT_CN = {
     PROMOTE: "可考虑升enforce(待人工拍板)",
     COLLECTING: "继续采数",
+    INERT: "无成熟样本·不评价(未回填/闸门未触发)",
     INSUFFICIENT: "样本不足",
     DATA_GAP: "采数缺口(该采没采!)",
     REVIEW: "建议复核(疑似无效/有害)",
@@ -869,7 +874,8 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
         if eh["material_pnl_sum"] is not None:
             out["hit_set_material_pnl_sum"] = eh["material_pnl_sum"]
             out["hit_set_material_n"] = eh["material_n"]
-        if verdict in (REVIEW, DEGRADED_REVIEW, PROMOTE, COLLECTING, MAINTAIN):
+        if verdict in (REVIEW, DEGRADED_REVIEW, PROMOTE, COLLECTING, INERT,
+                       MAINTAIN):
             # 合并：预览调用产生的命中集口径告警 + grade_arm 主链路告警。
             for _line in _w:
                 if _line not in warnings:
@@ -1181,6 +1187,16 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
     # Enough records but no backfilled outcomes yet.
     rate = s["hit_rate"]
     if s["decisions"] > 0 and rate < MIN_BLOCK_RATE and kind in ("block", "change"):
+        # D-6 附（0.3 §5 缺陷 2）：真正零触发的闸门不该判 COLLECTING。
+        # 「继续采数」对一条 168h 内一次都没动作的臂没有意义 —— 它不产生
+        # 任何正反证据，只是在消耗采集预算。实测 reentry_cap 83 次决策 /
+        # 0 次命中，旧逻辑给「先继续观察」，属误导。零触发 = INERT。
+        # 仅当确有极少量命中（hits>0）时才保留「继续观察」语义。
+        if s["hits"] == 0:
+            return INERT, (
+                f"{w_long}h {s['total']} 条但闸门零触发（hits=0/"
+                f"{s['decisions']} 次决策），无任何正反证据，不作晋升评价；"
+                "先确认该臂配置是否真的生效")
         return COLLECTING, (
             f"{w_long}h {s['total']} 条但命中率仅 {rate:.2%}"
             f"(<{MIN_BLOCK_RATE:.0%})，闸门几乎不触发，晋升无意义，先继续观察")
@@ -1189,16 +1205,21 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
             f"{w_long}h {s['total']} 条、命中率 {rate:.1%}"
             f"（>{MAX_HIT_RATE_TOO_WIDE:.0%}）=拦/改太宽，"
             f"且回填 outcome 仅 {eff_mature} 条尚无法证伪，先复核宽度，暂不晋升")
+    # D-6 (2026-09-19)：成熟样本不足时不得输出 PROMOTE_CANDIDATE。
+    # 实测 /data/shadow_grade_history.jsonl 384 条 arm 记录中，11 条 PROMOTE
+    # 的 mature_outcomes=0（confidence_decay 4 / atr_regime_calib 3 /
+    # sizing_v2 3 / trend_filter_200ma 1）—— 其中 confidence_decay 正是
+    # 0.3 §6 记录的有害率 45.1% 那条，本不该被判为可晋升。
     if gate_only:
-        return PROMOTE, (
+        return INERT, (
             f"{w_long}h {s['total']} 条观察（其中下单闸门决策 {s['decisions']}）、"
-            f"命中率 {rate:.1%}；gate 层尚无回填 outcome"
-            f"（{eff_mature}/{MIN_MATURE_OUTCOMES}，prefilter 反事实不作闸门误伤证据），"
-            "建议跑 reconcile 后再定")
-    return PROMOTE, (
+            f"命中率 {rate:.1%}；gate 层成熟 outcome 仅 "
+            f"{eff_mature}/{MIN_MATURE_OUTCOMES}（prefilter 反事实不作闸门误伤证据），"
+            "无有效证据，不作晋升评价；先跑 reconcile 补回填")
+    return INERT, (
         f"{w_long}h {s['total']} 条、命中率 {rate:.1%}；"
-        f"尚无回填 outcome（{eff_mature}/{MIN_MATURE_OUTCOMES}），"
-        "建议跑 reconcile 后再定")
+        f"成熟 outcome 仅 {eff_mature}/{MIN_MATURE_OUTCOMES}，"
+        "无有效证据，不作晋升评价；先跑 reconcile 补回填")
 
 
 def collect_grades(windows: list[int]) -> dict:
@@ -1255,7 +1276,7 @@ def _fmt_report(d: dict) -> str:
              f"{'臂':20s} {'mode':8s} {'类型':6s} {'评级':28s} 说明",
              "-" * 100]
     order = {DATA_GAP: 0, DEGRADED_REVIEW: 1, REVIEW: 2, PROMOTE: 3,
-             INSUFFICIENT: 4, COLLECTING: 5, MAINTAIN: 6, OFF: 7}
+             INSUFFICIENT: 4, COLLECTING: 5, INERT: 6, MAINTAIN: 7, OFF: 8}
     for a in sorted(d["arms"], key=lambda x: order.get(x["verdict"], 9)):
         lines.append(f"{a['arm']:20s} {a['mode']:8s} {a['kind']:6s} "
                      f"{a['verdict_cn']:28s} {a['reason']}")
@@ -1304,11 +1325,13 @@ def _fmt_report(d: dict) -> str:
     n_rev = sum(1 for a in d["arms"] if a["verdict"] == REVIEW)
     n_deg = sum(1 for a in d["arms"] if a["verdict"] == DEGRADED_REVIEW)
     n_maintain = sum(1 for a in d["arms"] if a["verdict"] == MAINTAIN)
+    n_inert = sum(1 for a in d["arms"] if a["verdict"] == INERT)
     n_stall = sum(1 for a in d["arms"] if a.get("collection_stalled"))
     lines.append("-" * 100)
     lines.append(f"汇总：采数缺口 {n_gap} / 建议复核 {n_rev + n_deg}"
                  f"（含 enforce 降级复核 {n_deg}）/ 可考虑升级 {n_prom}"
-                 f" / enforce 维持 {n_maintain} / 采数停滞 {n_stall}。"
+                 f" / enforce 维持 {n_maintain} / 无证据不评价 {n_inert}"
+                 f" / 采数停滞 {n_stall}。"
                  "所有 PROMOTE_CANDIDATE 均需人工 reconcile + config_store 权威写后才生效。")
     return "\n".join(lines)
 
