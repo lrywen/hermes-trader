@@ -41,7 +41,10 @@ import xml.etree.ElementTree as ET
 # `pytest --collect-only -q` reports 4089 offline tests (14 online/live
 # deselected by the default addopts). The guard allows the count to GROW
 # freely but never to SHRINK below this floor.
-MIN_OFFLINE_TESTS = 4089
+#
+# W0 M0 冻结门（2026-09-19）上抬至实测值 4380（P4 统一回测内核 + 数据层 +
+# P5-1bd 工具链新增测试落库后）。上抬后 CI 不再容忍净删 287 个测试不报警。
+MIN_OFFLINE_TESTS = 4380
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

@@ -19,13 +19,45 @@ verify TA math, only that nothing could have peeked at future bars.
 """
 from __future__ import annotations
 
+import os
 from collections.abc import Sequence
+from pathlib import Path
 
 from hermes_trader.models.types import Candle
 
 from .types import Side, Signal, Trade
 
 _SIDES: tuple[Side, ...] = ("long", "short")
+
+# 生产状态卷根（容器内命名卷 hermes-deploy_hermes_data→/data）。研究回测的
+# 落盘产物只能写仓库 logs/（gitignored）等研究路径，禁止写入生产卷，避免
+# 研究 JSONL 与生产 events/session/state 混杂或写满卷（评估报告 R2）。
+PRODUCTION_DATA_ROOTS: tuple[str, ...] = ("/data",)
+
+
+def research_output_path_safe(path: str | os.PathLike[str]) -> bool:
+    """Return True when a research output ``path`` is NOT under a production卷.
+
+    The check resolves the path and tests whether it lives inside any
+    :data:`PRODUCTION_DATA_ROOTS`. Reading the authoritative config from
+    ``/data/.agent-config.json`` is fine — this guard is for OUTPUT paths only.
+    """
+    resolved = Path(path).expanduser().resolve()
+    for root in PRODUCTION_DATA_ROOTS:
+        root_p = Path(root).resolve()
+        if resolved == root_p or root_p in resolved.parents:
+            return False
+    return True
+
+
+def assert_research_output_safe(path: str | os.PathLike[str]) -> None:
+    """Raise ``PermissionError`` when a research output targets the production卷."""
+    if not research_output_path_safe(path):
+        raise PermissionError(
+            f"research output path {str(path)!r} resolves under a production "
+            f"data root {PRODUCTION_DATA_ROOTS}; write research artifacts to a "
+            f"research dir (e.g. the repo's gitignored logs/) instead"
+        )
 
 
 def check_signals_pit(signals: Sequence[Signal], *, n_bars: int) -> list[str]:

@@ -86,6 +86,7 @@ from hermes_trader.agents.ta_filter import (
     _high_quality_breakout,
     late_entry_check,
 )
+from hermes_trader.backtest.guard import assert_research_output_safe
 from hermes_trader.data.historical_candles import fetch_candle_range
 from hermes_trader.indicators import triggers as trig
 from hermes_trader.models.types import Candle
@@ -923,6 +924,8 @@ def main() -> None:
 
     if args.write:
         out_path = Path(args.out)
+        # R2：研究产物禁止写入生产状态卷（容器 /data）；默认落仓库 logs/。
+        assert_research_output_safe(out_path)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with out_path.open("w") as f:
             f.write(json.dumps({

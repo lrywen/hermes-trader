@@ -231,3 +231,17 @@ def test_replay_signal_output_is_pit_clean() -> None:
     )
     assert len(signals) == 1
     guard.assert_signals_pit(signals, n_bars=n)
+
+
+# ── research output path guard (R2: never write research artifacts to /data) ─
+
+def test_research_output_under_repo_logs_is_safe(tmp_path) -> None:
+    assert guard.research_output_path_safe(tmp_path / "logs" / "run.jsonl")
+    guard.assert_research_output_safe(tmp_path / "logs" / "run.jsonl")  # no raise
+
+
+def test_research_output_under_data_root_rejected() -> None:
+    assert not guard.research_output_path_safe("/data/bt_out_x/run.jsonl")
+    assert not guard.research_output_path_safe("/data/run.jsonl")
+    with pytest.raises(PermissionError, match="production"):
+        guard.assert_research_output_safe("/data/bt_out_x/run.jsonl")
