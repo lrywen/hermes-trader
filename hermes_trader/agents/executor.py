@@ -1918,6 +1918,48 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
     }
 
 
+def _verify_post_placement(*, order_res: dict[str, Any], coin: str,
+                           cloid: Any = None) -> bool:
+    """S13-15 tail: best-effort post-place exchange reconciliation (P0-6).
+
+    place_hl_order returned ok=True, but a real orphan (exchange has the
+    position, our tracker doesn't) appears when the response shape lied about
+    the fill. Cross-check openOrders + userFills; if neither confirms the
+    order, alert category=risk and return ``True`` (unverified) so callers can
+    stamp the result. This MUST NOT block the main path — the order was
+    submitted and a tracker already exists; verify is a smoke test, not a
+    gate. Never raises and never touches the entry flock / in-flight markers.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    _unverified = False
+    try:
+        _oid = str(order_res.get("order_id") or "")
+        _cloid_str = str(order_res.get("cloid") or "")
+        if not _cloid_str and cloid is not None:
+            _cloid_str = str(cloid)
+        if _oid or _cloid_str:
+            from hermes_trader.client.exchange import verify_order_exists
+            _vre = verify_order_exists(coin=coin, oid=_oid or None, cloid=_cloid_str or None)
+            if not _vre.get("verified", True):
+                _unverified = True
+                try:
+                    from hermes_trader import notify
+                    notify.send_text(
+                        f"⚠️ 下单响应未在交易所核对: {coin} oid={_oid} cloid={_cloid_str}；"
+                        f"可能孤儿仓位，需人工查 openOrders/userFills",
+                        category="risk")
+                except Exception as _alert_e:
+                    logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
+                logger.error(
+                    f"[executor] execute_plan {coin} order NOT verified on "
+                    f"exchange (oid={_oid} cloid={_cloid_str}): {_vre.get('reason')}"
+                )
+    except Exception as _verify_e:
+        # verify failure must never block placement
+        logger.warning(f"[executor] verify_order_exists best-effort failed: {_verify_e!r}")
+    return _unverified
+
+
 def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any],
                               order_res: dict[str, Any], coin: str,
                               trade_side: str, mid_price: float,
@@ -4424,33 +4466,8 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # category=risk and stamp the result with unverified=True so a
     # background reconciler can pick it up. This MUST NOT block the main
     # path — the order was submitted, we already have a tracker; verify is
-    # a smoke test, not a gate.
-    _unverified = False
-    try:
-        _oid = str(order_res.get("order_id") or "")
-        _cloid_str = str(order_res.get("cloid") or "")
-        if not _cloid_str and _cloid is not None:
-            _cloid_str = str(_cloid)
-        if _oid or _cloid_str:
-            from hermes_trader.client.exchange import verify_order_exists
-            _vre = verify_order_exists(coin=coin, oid=_oid or None, cloid=_cloid_str or None)
-            if not _vre.get("verified", True):
-                _unverified = True
-                try:
-                    from hermes_trader import notify
-                    notify.send_text(
-                        f"⚠️ 下单响应未在交易所核对: {coin} oid={_oid} cloid={_cloid_str}；"
-                        f"可能孤儿仓位，需人工查 openOrders/userFills",
-                        category="risk")
-                except Exception as _alert_e:
-                    logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
-                logger.error(
-                    f"[executor] execute_plan {coin} order NOT verified on "
-                    f"exchange (oid={_oid} cloid={_cloid_str}): {_vre.get('reason')}"
-                )
-    except Exception as _verify_e:
-        # verify failure must never block placement
-        logger.warning(f"[executor] verify_order_exists best-effort failed: {_verify_e!r}")
+    # a smoke test, not a gate. Leaf extracted to _verify_post_placement.
+    _verify_post_placement(order_res=order_res, coin=coin, cloid=_cloid)
 
     _fill = _register_filled_position(
         analysis=analysis, config=config, order_res=order_res, coin=coin,
