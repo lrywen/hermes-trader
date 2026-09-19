@@ -1372,6 +1372,63 @@ def _already_executed_block(*, aid: str, mode: str) -> dict[str, Any] | None:
     }
 
 
+def _min_equity_floor_block(*, aid: str, mode: str, config: dict[str, Any],
+                            agg_equity: float) -> dict[str, Any] | None:
+    """Audit 2026-09-06 (C11) stage of maybe_execute: hard equity floor.
+
+    Below ``min_tradable_equity_usd`` there is not enough book to size any
+    trade above exchange min-notional with meaningful stop room; the gate
+    fails CLOSED. Threshold 0 (or absent) disables it (inert for legacy
+    deployments; canonical default pins a conservative $10 floor). A
+    non-numeric configured value falls back to the $10 default. Returns an
+    executable-style block result, or None when the gate is disabled /
+    satisfied (continue executing).
+
+    Pure decision leaf on already-read account state: no I/O, no locks, no
+    mutation. Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    try:
+        _min_tradable_equity = float(
+            cfg_get("min_tradable_equity_usd", 10.0, config=config) or 0.0)
+    except (TypeError, ValueError):
+        _min_tradable_equity = 10.0
+    if _min_tradable_equity > 0 and agg_equity > 0 and agg_equity < _min_tradable_equity:
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": aid,
+            "reason": (f"below_min_tradable_equity (aggregate equity ${agg_equity:.2f} "
+                       f"< floor ${_min_tradable_equity:.2f}) — fail-closed, no new entries"),
+        }
+    return None
+
+
+def _free_margin_floor_block(*, aid: str, mode: str, config: dict[str, Any],
+                             equity: float, available: float,
+                             target_dex: Optional[str]) -> dict[str, Any] | None:
+    """Free-margin floor stage of maybe_execute.
+
+    Leave headroom for maintenance margin + slippage so the exchange doesn't
+    reject mid-pipeline with "Insufficient margin". The gate compares the
+    selected dex's available margin against its equity (sizing uses the
+    same main-dex clearinghouse values). Returns an executable-style block
+    result, or None when equity is non-positive / the ratio clears the floor
+    (continue executing).
+
+    Pure decision leaf on already-read account state: no I/O, no locks, no
+    mutation. Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    min_avail_pct = float(config.get("min_available_margin_pct", 0.10))
+    if equity > 0 and (available / equity) < min_avail_pct:
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": aid,
+            "reason": (f"insufficient_free_margin on dex '{target_dex or 'main'}' "
+                       f"(available ${available:.2f} / equity ${equity:.2f} = "
+                       f"{100*available/equity:.1f}%, floor {100*min_avail_pct:.0f}%)"),
+        }
+    return None
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -3635,30 +3692,20 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # room (Pathia carries an equivalent $12 floor; Hermes lacked it). Fail
     # CLOSED. Threshold 0 (or absent) disables the gate (inert by default for
     # existing deployments; canonical default pins a conservative $10 floor).
-    try:
-        _min_tradable_equity = float(
-            cfg_get("min_tradable_equity_usd", 10.0, config=config) or 0.0)
-    except (TypeError, ValueError):
-        _min_tradable_equity = 10.0
-    if _min_tradable_equity > 0 and agg_equity > 0 and agg_equity < _min_tradable_equity:
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": (f"below_min_tradable_equity (aggregate equity ${agg_equity:.2f} "
-                       f"< floor ${_min_tradable_equity:.2f}) — fail-closed, no new entries"),
-        }
+    # Pure decision leaf extracted to _min_equity_floor_block.
+    _floor = _min_equity_floor_block(aid=analysis["id"], mode=mode, config=config,
+                                     agg_equity=agg_equity)
+    if _floor is not None:
+        return _floor
 
     # Free-margin floor: leave headroom for maintenance + slippage so HL
-    # doesn't reject mid-pipeline with "Insufficient margin".
-    min_avail_pct = float(config.get("min_available_margin_pct", 0.10))
-    if equity > 0 and (available / equity) < min_avail_pct:
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": (f"insufficient_free_margin on dex '{_target_dex or 'main'}' "
-                       f"(available ${available:.2f} / equity ${equity:.2f} = "
-                       f"{100*available/equity:.1f}%, floor {100*min_avail_pct:.0f}%)"),
-        }
+    # doesn't reject mid-pipeline with "Insufficient margin". Pure decision
+    # leaf extracted to _free_margin_floor_block.
+    _margin = _free_margin_floor_block(aid=analysis["id"], mode=mode, config=config,
+                                       equity=equity, available=available,
+                                       target_dex=_target_dex)
+    if _margin is not None:
+        return _margin
 
     # Track daily PnL off the AGGREGATE equity (main + HIP-3), not main-dex-only
     # `equity` (which is kept main-only for margin sizing). Using main-only here
