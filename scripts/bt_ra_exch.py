@@ -165,6 +165,18 @@ PER_COIN_SLIP_BPS: Dict[str, float] = {
     "XRP": 0.35, "DOGE": 0.06, "ADA": 0.45, "AVAX": 0.63,
 }
 
+# B-4：逐币半价差扩到 81 币池（2026-09-19 l2Book 顶档 3 次中位）。数据随包
+# 分发，含采集元数据；缺失时回退上面的 8 majors 硬编码表。
+_HALF_SPREAD_JSON = _REPO / "hermes_trader" / "data" / "per_coin_half_spread_bps.json"
+try:
+    _hs = json.loads(_HALF_SPREAD_JSON.read_text())
+    PER_COIN_SLIP_BPS = {
+        **{k: float(v) for k, v in (_hs.get("half_spread_bps") or {}).items()},
+        **PER_COIN_SLIP_BPS,  # 8 majors 硬编码值优先（历史实测，保持口径稳定）
+    }
+except (OSError, ValueError):
+    pass
+
 
 def _slip_for(coin: str, flat_bps: float, per_coin: bool) -> float:
     """按币解析半价差滑点；per_coin=False 时退化为 flat_bps（兼容旧扫描口径）。"""
