@@ -2834,6 +2834,26 @@ def _build_gate_context(*, analysis: dict[str, Any], config: dict[str, Any],
     )
 
 
+def _sizing_exposure_cap(config: dict[str, Any], agg_equity: float,
+                         total_open_notional: float,
+                         base_cap: float) -> float:
+    """S9 stage: shrink the per-trade cap by remaining aggregate exposure room.
+
+    When ``max_total_notional_pct`` is set, the book has
+    ``pct*agg_equity - total_open_notional`` of aggregate exposure headroom;
+    the effective cap is the tighter of the (equity-tiered) per-trade cap and
+    that room. A disabled pct (0), non-positive room, or zero room leaves the
+    base cap unchanged. Pure leaf extracted in the P1-1 step ③ phase split.
+    """
+    max_total_pct = float(config.get("max_total_notional_pct", 0) or 0)
+    room = ((max_total_pct * agg_equity - total_open_notional)
+            if max_total_pct > 0 else 0.0)
+    cap = base_cap
+    if room > 0:
+        cap = min(cap, room) if cap > 0 else room
+    return cap
+
+
 def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
     """S9 stage entry: fetch a fresh live mid and 4h ATR, fail CLOSED.
 
@@ -3360,11 +3380,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     "reason": _price_atr_reason}
 
         from hermes_trader.agents.sizing import atr_equal_risk_notional
-        _max_total_pct = float(config.get("max_total_notional_pct", 0) or 0)
-        _room = (_max_total_pct * agg_equity - total_open_notional) if _max_total_pct > 0 else 0.0
-        _cap = _notional_cap
-        if _room > 0:
-            _cap = min(_cap, _room) if _cap > 0 else _room
+        # Aggregate-exposure room shrinks the per-trade cap; extracted to
+        # _sizing_exposure_cap in the P1-1 step ③ phase split.
+        _cap = _sizing_exposure_cap(config, agg_equity, total_open_notional,
+                                    _notional_cap)
         _risk_pct = float(_atr_sizing.get("risk_per_trade_pct", 0.02))
         _sizing_basis = str(_atr_sizing.get("sizing_basis", "atr_stop") or "atr_stop").lower()
         if _sizing_basis in ("primary_stop", "dsl_stop"):
