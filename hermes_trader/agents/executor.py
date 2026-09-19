@@ -3276,6 +3276,54 @@ def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
     return mid, atr, None
 
 
+def _price_divergence_veto(*, coin: str, mid_price: float, aid: str) -> tuple[bool, str, dict[str, Any]]:
+    """S13-15 tail: H-6 cross-source price veto, decision/notification leaf.
+
+    Every gate and the order itself price off the single Hyperliquid mid (WS
+    allMids / same-origin REST); a stale or manipulated feed cannot be detected
+    from inside HL. Compare against Binance spot right before placing: a
+    BLOCK-level divergence refuses the ENTRY (exits are never gated here).
+    Fail-open when the secondary source is unavailable/unsupported — it is a
+    safety net, not a hard dependency.
+
+    Returns ``(block, reason, px_check)``. ``block`` is True only for a checked
+    BLOCK-level divergence; ``reason`` defaults to "price divergence" and
+    ``px_check`` is the raw cross-check dict (also returned on fail-open so the
+    caller can echo it back). This leaf ONLY decides and notifies: it never
+    takes/releases the entry flock and never touches in-flight markers — the
+    caller owns the lock-paired block exit. Never raises.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    try:
+        from hermes_trader.client.price_crosscheck import crosscheck_price
+        _px_check = crosscheck_price(coin, mid_price)
+    except Exception as _px_e:
+        logger.warning(f"[executor] H-6 price cross-check raised (fail-open): {_px_e!r}")
+        _px_check = {"ok": True, "checked": False, "reason": f"exception:{_px_e!r}"}
+    if _px_check.get("checked") and not _px_check.get("ok"):
+        _reason = _px_check.get("reason", "price divergence")
+        if _px_check.get("action") == "block":
+            logger.error(
+                f"[executor] H-6 BLOCK {coin} entry: {_reason} (analysis {aid}).")
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"🚫 H-6 跨源价格偏离否决开仓 {coin}: {_reason}",
+                    category="risk")
+            except Exception as _alert_e:
+                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
+            return True, _reason, _px_check
+        logger.warning(f"[executor] H-6 price divergence alert (proceeding): {_reason}")
+        try:
+            from hermes_trader import notify
+            notify.send_text(
+                f"⚠️ H-6 跨源价格偏离告警 {coin}: {_reason}（未超过否决阈值，继续开仓）",
+                category="risk")
+        except Exception as _alert_e:
+            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
+    return False, "", _px_check
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -4393,49 +4441,24 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "gate_results": gate_output["results"],
         }
 
-    # H-6 (supplemental audit 2026-08-30): cross-source price veto. Every gate
-    # and the order itself price off the single Hyperliquid mid (WS allMids /
-    # same-origin REST); a stale or manipulated feed cannot be detected from
-    # inside HL. Compare against Binance spot right before placing: a BLOCK-
-    # level divergence refuses the ENTRY (exits are never gated here). Fail-open
-    # when the secondary source is unavailable/unsupported — it is a safety net,
-    # not a hard dependency.
-    try:
-        from hermes_trader.client.price_crosscheck import crosscheck_price
-        _px_check = crosscheck_price(coin, mid_price)
-    except Exception as _px_e:
-        logger.warning(f"[executor] H-6 price cross-check raised (fail-open): {_px_e!r}")
-        _px_check = {"ok": True, "checked": False, "reason": f"exception:{_px_e!r}"}
-    if _px_check.get("checked") and not _px_check.get("ok"):
-        _reason = _px_check.get("reason", "price divergence")
-        if _px_check.get("action") == "block":
-            logger.error(
-                f"[executor] H-6 BLOCK {coin} entry: {_reason} (analysis {_aid}).")
-            try:
-                from hermes_trader import notify
-                notify.send_text(
-                    f"🚫 H-6 跨源价格偏离否决开仓 {coin}: {_reason}",
-                    category="risk")
-            except Exception as _alert_e:
-                logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
-            with _EXEC_LOCK:
-                _IN_FLIGHT_ANALYSES.discard(_aid)
-                _IN_FLIGHT_COINS.discard(coin)
-            _ENTRY_LOCK.release()
-            return {
-                "executed": False, "mode": mode, "analysis_id": analysis["id"],
-                "reason": f"price_divergence_blocked: {_reason}",
-                "price_check": _px_check,
-                "gate_results": gate_output["results"],
-            }
-        logger.warning(f"[executor] H-6 price divergence alert (proceeding): {_reason}")
-        try:
-            from hermes_trader import notify
-            notify.send_text(
-                f"⚠️ H-6 跨源价格偏离告警 {coin}: {_reason}（未超过否决阈值，继续开仓）",
-                category="risk")
-        except Exception as _alert_e:
-            logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
+    # H-6 (supplemental audit 2026-08-30): cross-source price veto. The
+    # decision/notification leaf is extracted to _price_divergence_veto; it
+    # never touches the flock or markers. The BLOCK exit below stays inline
+    # because its lock release must stay paired with every other post-lock
+    # return. Fail-open on an unavailable/unsupported secondary source.
+    _px_block, _px_reason, _px_check = _price_divergence_veto(
+        coin=coin, mid_price=mid_price, aid=_aid)
+    if _px_block:
+        with _EXEC_LOCK:
+            _IN_FLIGHT_ANALYSES.discard(_aid)
+            _IN_FLIGHT_COINS.discard(coin)
+        _ENTRY_LOCK.release()
+        return {
+            "executed": False, "mode": mode, "analysis_id": analysis["id"],
+            "reason": f"price_divergence_blocked: {_px_reason}",
+            "price_check": _px_check,
+            "gate_results": gate_output["results"],
+        }
 
     order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
