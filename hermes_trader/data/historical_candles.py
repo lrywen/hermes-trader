@@ -26,7 +26,6 @@ import math
 import os
 import threading
 import time
-from pathlib import Path
 from typing import Any, Optional
 
 from hermes_trader.client.hl_client import _http_post
