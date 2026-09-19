@@ -1514,6 +1514,30 @@ def _h4_worst_case_stop_pct(*, mid_price: float, atr: float,
     return min(_width + sl_ceiling_pct * 0.5, sl_ceiling_pct * 1.5)
 
 
+def _spread_width_block(*, aid: str, mode: str,
+                        spread_pct: float, max_spread_pct: float
+                        ) -> dict[str, Any] | None:
+    """Pre-trade order-book spread gate on a successfully read book.
+
+    Skip coins whose top-of-book spread exceeds the ceiling: crossing a wide
+    market on a testnet or low-cap name is catastrophic slippage. Strict
+    greater-than. Returns an executable-style block result, or None when the
+    spread clears the ceiling (continue executing).
+
+    Pure decision leaf on the already-fetched order-book snapshot: no I/O, no
+    locks, no mutation. The ceiling is resolved by the caller
+    (_resolve_max_spread_pct), and an unreadable book (the fail-closed/fail-open
+    H3 branch) is handled by the caller, so this leaf only sees an ``ok`` read.
+    Extracted verbatim in the P1-1 step (3) phase split.
+    """
+    if spread_pct > max_spread_pct:
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": f"spread_too_wide ({spread_pct:.2f}% > {max_spread_pct:.1f}%)",
+        }
+    return None
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -4425,16 +4449,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             f"ask_depth=${_ob['ask_depth_1pct_usd']:,.0f}, "
             f"notional=${trade_notional:,.0f}"
         )
-        if _ob["spread_pct"] > _max_spread_pct:
+        # Pure decision leaf extracted to _spread_width_block.
+        _spread_block = _spread_width_block(
+            aid=analysis["id"], mode=mode,
+            spread_pct=_ob["spread_pct"], max_spread_pct=_max_spread_pct)
+        if _spread_block is not None:
             logger.warning(
                 f"[executor] SKIPPING {coin}: spread {_ob['spread_pct']:.3f}% "
                 f"> {_max_spread_pct:.1f}% max (bid={_ob['best_bid']}, ask={_ob['best_ask']})"
             )
-            return {
-                "executed": False, "mode": mode,
-                "analysis_id": analysis["id"],
-                "reason": f"spread_too_wide ({_ob['spread_pct']:.2f}% > {_max_spread_pct:.1f}%)",
-            }
+            return _spread_block
     else:
         # Fail CLOSED by default: an unreadable order book is exactly the
         # condition (liquidity drought / API outage / delisting) where crossing
