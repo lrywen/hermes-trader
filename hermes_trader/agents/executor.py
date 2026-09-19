@@ -1492,6 +1492,28 @@ def _atr_volatility_block(*, aid: str, mode: str,
     return None
 
 
+def _h4_worst_case_stop_pct(*, mid_price: float, atr: float,
+                            sl_atr_mult: float, sl_floor_pct: float,
+                            sl_ceiling_pct: float) -> float:
+    """Estimate the planned worst-case backup-SL distance in spot percent.
+
+    Mirrors the _place_backup_sl resolution (C4-2, shared dsl_exit.atr_stop
+    block) so the pre-trade H4 estimate matches what the post-fill backup SL
+    clamps to: the ATR-scaled width is clamped to [floor, ceiling], then the
+    slip widen adds at most 0.5x ceiling and the whole result caps at 1.5x
+    ceiling.
+
+    Pure calculation leaf on already-fetched ATR/mid and already-resolved SL
+    width params: no I/O, no locks, no mutation. The caller guards positive
+    mid/atr and positive multiplier/ceiling (a failed or blind read leaves the
+    distance at 0, which opens liquidation_buffer_gate fail-open). Extracted
+    verbatim in the P1-1 step (3) phase split.
+    """
+    _width = min(max((atr / mid_price) * sl_atr_mult * 100.0, sl_floor_pct),
+                 sl_ceiling_pct)
+    return min(_width + sl_ceiling_pct * 0.5, sl_ceiling_pct * 1.5)
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -4179,8 +4201,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             _h4_floor = _h4_w["sl_floor_pct"]
             _h4_ceiling = _h4_w["sl_ceiling_pct"]
             if _h4_mult > 0 and _h4_ceiling > 0:
-                _h4_width = min(max((_h4_atr / _h4_mid) * _h4_mult * 100.0, _h4_floor), _h4_ceiling)
-                _h4_stop_distance_pct = min(_h4_width + _h4_ceiling * 0.5, _h4_ceiling * 1.5)
+                # Pure calculation leaf extracted to _h4_worst_case_stop_pct.
+                _h4_stop_distance_pct = _h4_worst_case_stop_pct(
+                    mid_price=_h4_mid, atr=_h4_atr,
+                    sl_atr_mult=_h4_mult, sl_floor_pct=_h4_floor,
+                    sl_ceiling_pct=_h4_ceiling)
     except Exception as _h4_e:
         logger.debug(f"[executor] H4 stop-distance estimate failed for {coin}: {_h4_e}")
         # Best-effort durable trace: the worst-case stop distance stays 0 and
