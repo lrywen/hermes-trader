@@ -86,6 +86,7 @@ from hermes_trader.agents.ta_filter import (
     _high_quality_breakout,
     late_entry_check,
 )
+from hermes_trader.backtest.stop_model import effective_stop_pct
 from hermes_trader.data.historical_candles import fetch_candle_range
 from hermes_trader.indicators import triggers as trig
 from hermes_trader.indicators.math import atr as _atr_series
@@ -114,6 +115,7 @@ EXCH_DEFAULTS = {
     "tp_scale_fraction": 0.4,
     "min_order_usd": 10.5,
     "skip_threshold": 0.90,
+    "sl_buffer_bps": 10.0,  # B-1a-改①：Phase2 镜像落后 DSL floor 的缓冲
 }
 
 
@@ -121,7 +123,8 @@ def _exch_params(cfg: Dict[str, Any]) -> Dict[str, float]:
     """从权威配置解析交易所侧触发单参数（顶层键）。"""
     out = dict(EXCH_DEFAULTS)
     for k in ("sl_atr_mult", "sl_floor_pct", "sl_ceiling_pct",
-              "tp_atr_mult", "tp_scale_fraction", "min_order_usd"):
+              "tp_atr_mult", "tp_scale_fraction", "min_order_usd",
+              "sl_buffer_bps"):
         if k in cfg:
             try:
                 v = float(cfg[k])
@@ -473,6 +476,26 @@ class DslParams:
     phase2_tiers: List[Tuple[float, float]]  # (pct_above_entry, retrace) 升序
     time_scratch_minutes: float = 0.0   # >0: 持仓超时且 peak<min_peak → 平仓
     time_scratch_min_peak: float = 0.3
+    # B-1a-改③④：逐笔有效现货止损 = min(spot_cap, max_loss_roe_pct/lev)，
+    # ATR 分支 clamp(atr*mult,floor,ceiling) 只能放宽到 regime cap。lev=1 时
+    # 回退到旧行为（恒取 max_loss_pct），保证不带杠杆的对照臂口径不变。
+    leverage: float = 1.0
+    max_loss_roe_pct: float = 0.0       # 0 → ROE cap 不绑定
+    atr_stop_enabled: bool = False
+    entry_atr_pct: float = 0.0
+    atr_mult: float = 1.5
+    atr_floor_pct: float = 1.0
+    atr_ceiling_pct: float = 4.0
+
+    def effective_max_loss_pct(self) -> float:
+        """逐笔带杠杆/ATR 的有效现货止损（与实盘 _effective_max_loss 同源）。"""
+        return effective_stop_pct(
+            max_loss_pct=self.max_loss_pct, leverage=self.leverage,
+            max_loss_roe_pct=self.max_loss_roe_pct,
+            atr_stop_enabled=self.atr_stop_enabled,
+            entry_atr_pct=self.entry_atr_pct, atr_mult=self.atr_mult,
+            atr_floor_pct=self.atr_floor_pct,
+            atr_ceiling_pct=self.atr_ceiling_pct).spot_pct
 
     @classmethod
     def from_config(cls, blk: Dict[str, Any]) -> "DslParams":
@@ -501,6 +524,14 @@ class DslParams:
                 if (blk.get("time_scratch") or {}).get("enabled") else 0.0),
             time_scratch_min_peak=float(
                 (blk.get("time_scratch") or {}).get("min_peak_pct", 0.3)),
+            # B-1a-改③④：ROE cap 与 ATR 止损参数（生产权威默认：leverage 在
+            # main 从顶层注入，roe=15，atr_stop.enabled=false）。
+            leverage=float(blk.get("_leverage", 1.0)),
+            max_loss_roe_pct=float(blk.get("max_loss_roe_pct", 0.0)),
+            atr_stop_enabled=bool((blk.get("atr_stop") or {}).get("enabled", False)),
+            atr_mult=float((blk.get("atr_stop") or {}).get("atr_mult", 1.5)),
+            atr_floor_pct=float((blk.get("atr_stop") or {}).get("floor_pct", 1.0)),
+            atr_ceiling_pct=float((blk.get("atr_stop") or {}).get("ceiling_pct", 4.0)),
         )
 
 
@@ -601,9 +632,13 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
 
     peak = entry_px
     prev_floor: Optional[float] = None
-    # lev=1 → effective_max_loss = min(max_loss_pct, roe_cap/lev)（:866-896，
-    # atr_stop off）。roe cap 15/1=15 ≥ 1 → 恒取 max_loss_pct。
-    eff_max_loss = dsl.max_loss_pct
+    # B-1a-改③④：逐笔带杠杆的有效现货止损 min(spot_cap, roe_cap/lev)，ATR 分支
+    # 只放宽到 regime cap。entry_atr_pct 逐笔捕获（本币 4h ATR / entry），与实盘
+    # 注册仓位时锁定一致；用 replace 构造逐笔副本，不污染共享的 dsl。
+    # lev=1 且 roe/atr 缺省时退化为旧的 max_loss_pct，对照臂口径不变。
+    if dsl.atr_stop_enabled and atr_abs > 0 and entry_px > 0:
+        dsl = replace(dsl, entry_atr_pct=atr_abs / entry_px * 100.0)
+    eff_max_loss = dsl.effective_max_loss_pct()
     stop_px = entry_px * (1 - sgn * eff_max_loss / 100.0)
 
     # ── P6b-1a：交易所侧触发单价格 ────────────────────────────────
@@ -655,6 +690,22 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
         b = bars[k]
         elapsed_min = (b.t + MS_5M - entry_t) / 60_000.0
         peak_pct = sgn * (peak - entry_px) / entry_px * 100.0  # 截至 k-1 收盘
+
+        # ── B-1a-改①：Phase2 交易所镜像 SL = DSL floor × (1 − 10bps) ──
+        # 进 Phase2（上一根已 ratchet 出 prev_floor）后，把交易所 Stop Market
+        # 从初始静态 SL 收为追踪 DSL floor 的镜像，落后 sl_buffer_bps（实盘=10），
+        # 永远在 floor 的不利侧 → 正常回调 DSL 先触发，快速下挫（软件 ~15s 轮询
+        # 来不及）镜像先触发（标签 exchange_trigger，实为 floor 镜像）。
+        # 用上一根收盘确定的 prev_floor（PIT），单调只收紧。
+        if (exch is not None and prev_floor is not None
+                and peak_pct >= dsl.protect_pct):
+            _buf = float(exch.get("sl_buffer_bps", 10.0))
+            mirror = prev_floor * (1 - sgn * _buf / 1e4)
+            if ex_sl_px is None:
+                ex_sl_px = mirror
+            else:  # long 只上移、short 只下移（只收紧）
+                ex_sl_px = max(ex_sl_px, mirror) if sgn > 0 \
+                    else min(ex_sl_px, mirror)
 
         # ── P6b-1a：交易所侧触发单（tick 级挂单 → 同一 bar 内先于 DSL）──
         if ex_sl_px is not None:
@@ -1081,7 +1132,12 @@ def main() -> None:
         "max_notional_usd": float(args.max_notional),
         "sl_atr_mult": float(P["exch"].get("sl_atr_mult", 1.2)),
     } if args.live_sizing else None)
-    live_dsl = DslParams.from_config(P["dsl"])
+    # B-1a-改③：逐笔带杠杆。实盘权威配置顶层 leverage（生产=10），ROE cap 在
+    # dsl_exit.max_loss_roe_pct（生产=15）；注入副本供 DslParams.from_config 读取。
+    _live_leverage = float(cfg.get("leverage", 1) or 1)
+    _dsl_cfg_for_params = dict(P["dsl"])
+    _dsl_cfg_for_params["_leverage"] = _live_leverage
+    live_dsl = DslParams.from_config(_dsl_cfg_for_params)
     tuned = replace(
         live_dsl,
         protect_pct=0.8,
@@ -1125,6 +1181,14 @@ def main() -> None:
         breakeven_lock_pct=float(_dx.get("breakeven_lock_pct", 0.3)),
         stale_flat_timeout_minutes=float(_dx.get("stale_flat_timeout_minutes", 240)),
         phase2_tiers=_tr_tiers or live_dsl.phase2_tiers,
+        # B-1a-改③④：杠杆/ROE/ATR 与 live 同源（只 regime cap 不同）
+        leverage=live_dsl.leverage,
+        max_loss_roe_pct=live_dsl.max_loss_roe_pct,
+        atr_stop_enabled=live_dsl.atr_stop_enabled,
+        entry_atr_pct=live_dsl.entry_atr_pct,
+        atr_mult=live_dsl.atr_mult,
+        atr_floor_pct=live_dsl.atr_floor_pct,
+        atr_ceiling_pct=live_dsl.atr_ceiling_pct,
     )
     # non_trend = 顶层 protect/retrace/tiers，仅覆盖 max_loss
     dsls["ra_nontrend"] = replace(
