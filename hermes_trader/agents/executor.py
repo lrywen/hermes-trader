@@ -2868,141 +2868,28 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     return min(max_loss, max_roe / lev) / 100.0
 
 
-def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
-    """S9 stage entry: fetch a fresh live mid and 4h ATR, fail CLOSED.
+def _structural_override_path(analysis: dict[str, Any], config: dict[str, Any],
+                              mode: str, override_strong: bool,
+                              od: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """S4 stage: structural-override decision and PASS→LONG upgrade.
 
-    ATR equal-risk sizing cannot place an order without a valid live entry or
-    enough candle history to size a stop. Returns ``(mid, atr, None)`` when both
-    are positive, otherwise ``(0.0, 0.0, reason)`` where reason is the early-
-    return string (``invalid_price_for_<coin>`` or ``no_atr_no_stop ...``);
-    skipping the trade costs $0 versus sending an unsized/unstopped order.
-    Extracted verbatim in the P1-1 step ③ phase split.
+    Runs the AI-down block, signal VETO and the PASS→LONG upgrade in place
+    (mutating ``analysis``). Returns a block-result dict for the two early-
+    exit cases (ai_verdict_pass / signal_veto) or ``None`` to continue. The
+    ``od`` mapping comes straight from ``_evaluate_force_override``; the six
+    trigger booleans are re-unpacked here (only the caller keeps ``enf`` and
+    ``bar`` because the order tail audits them). Extracted verbatim in the
+    P1-1 step ③ phase split.
     """
-    mid = get_hl_price(coin)
-    if mid <= 0:
-        return 0.0, 0.0, f"invalid_price_for_{coin}"
-    atr = get_hl_atr("4h", 14, coin)
-    if atr <= 0:
-        return 0.0, 0.0, (
-            f"no_atr_no_stop ({coin}: insufficient candle history to size a stop)")
-    return mid, atr, None
+    _enf = od["enf"]
+    override_composite = od["bar"]
+    override_min_slow_burn = od["min_slow_burn"]
+    whale_fired = od["whale"]
+    slow_burn_strong = od["slow_burn"]
+    breakout_strong = od["breakout"]
+    composite_strong = od["composite_strong"]
+    ta_sidestep_strong = od["ta_sidestep"]
 
-
-def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
-    """Execute an analysis through risk gates and into the market.
-
-    `_rotation_retry` is set on the single self-retry after capital rotation
-    closed a weak position to free room — it blocks a second rotation so we can
-    never loop.
-    """
-    # Defensive shallow copy: maybe_execute mutates `analysis` in place
-    # (verdict/side/confidence on override, _sizing_v2_* on the LONG path,
-    # signal_veto on GEX shadow). Without this, the caller's dict — which may
-    # be the shared perception/loop object — gets silently polluted and a
-    # later consumer sees the rewritten verdict. Downstream code that needs
-    # the original (route_verdict, memory, the loop) must keep seeing it.
-    analysis = dict(analysis)
-    config = read_agent_config()
-    # Per-coin override: deep-merge coin_overrides[<coin>] so every downstream
-    # gate/sizer/exit policy reads the coin-specific values transparently.
-    # This is the single chokepoint for 币种配置 isolation.
-    _coin = analysis.get("coin")
-    config = apply_coin_override(config, _coin)
-    mode = str(config.get("mode", "OFF")).upper()
-
-    if mode == "OFF":
-        _record_decision("mode_off")
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"], "reason": "mode_off",
-        }
-    # P0-1 (2026-09-12): LIVE money requires an explicit process-env grant on
-    # top of mode=LIVE in the config file. Fail-closed without it so a fresh
-    # deploy / copied config can never place real orders; SHADOW/paper modes
-    # and the reduce-only exit path are unaffected (exits do not run here).
-    if mode == "LIVE" and not live_trading_authorized():
-        logger.error(
-            "[executor] LIVE entry DENIED for %s (analysis %s): mode=LIVE but "
-            "HERMES_ENABLE_LIVE is not set to true — set HERMES_ENABLE_LIVE=true "
-            "to authorize real-money entries.",
-            analysis.get("coin"), analysis.get("id"))
-        _record_decision("live_not_authorized")
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"], "reason": "live_not_authorized",
-        }
-    # Per-coin enabled flag (set by the portal 币种配置 module). False here
-    # disables trading for THIS coin only without changing the global mode.
-    if config.get("enabled") is False:
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": f"coin_disabled ({_coin} disabled in 币种配置)",
-        }
-    shadow_mode = mode == "SHADOW"
-
-    # Roadmap §2: freshness-decay the AI confidence before any gate/sizer
-    # reads it. Off by default; shadow observes + logs, enforce multiplies.
-    # Runs while verdict is still the model's own LONG/SHORT — a PASS that the
-    # structural override below upgrades to LONG is skipped inside the helper,
-    # so override entries keep their configured floor semantics.
-    _apply_confidence_decay(analysis, config)
-
-    # Asset-class gate. Mirrors the perception-time filter so a stale
-    # perception (e.g. one re-evaluated from memory after the operator
-    # flips the flag) can't sneak through to a real trade. Crypto =
-    # native HL coin (no colon); HIP-3 = colon-namespaced (`xyz:MU`).
-    is_hip3 = ":" in (analysis.get("coin") or "")
-    if is_hip3 and not bool(config.get("enable_hip3", False)):
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": "hip3_disabled (set enable_hip3=true to trade tokenized-equity perps)",
-        }
-    if (not is_hip3) and not bool(config.get("enable_crypto", True)):
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": "crypto_disabled (set enable_crypto=true to trade native HL perps)",
-        }
-
-    # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
-    # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
-    # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
-    _dispatch_entry_shadow_probes(analysis, config)
-
-    # AI zero-confidence guard — extracted to _ai_zero_confidence_block in the
-    # P1-1 step ③ phase split (returns a block result or None to continue).
-    _ai0 = _ai_zero_confidence_block(analysis, mode)
-    if _ai0 is not None:
-        return _ai0
-
-    # Structural-override: don't let a hedging AI PASS leave an objectively
-    # strong accumulation setup on the table. Upgrade to LONG conf 0.70 and
-    # let the gates do the real risk check. Two independent triggers, both
-    # LONG-biased (we never force a SHORT):
-    #   (a) composite >= 40 AND 2+ slow-burn 1h triggers fired, OR
-    #   (b) a whale-accumulation signal fired (oi_funding_anomaly) —
-    #       whale signals get their own override because smart-money loading
-    #       (negative funding, flat price, high OI) is a high-conviction
-    #       contrarian-to-retail setup we want to capitalize on even when the
-    #       AI hedges and even against trend.
-    # Live signal enforcement (Veto + Boost, 2026-06-16): consult our free signals
-    # (GEX / FINRA short-vol / aggTrades whale / news) to gate the FORCED-OVERRIDE
-    # path. CACHE-ONLY (never fetches here — the async shadow advisor above warms
-    # the caches; cold cache => fail-open). BOOST lowers the override bar for a name
-    # with a strong catalyst (breaking news / whale buying / crowded-short squeeze)
-    # so we catch more rippers; VETO (applied below) blocks chop-traps / whales
-    # dumping. Bounded: never bypasses the risk/regime/counter-trend/kill gates.
-    override_strong, _od = _evaluate_force_override(analysis, config)
-    _enf = _od["enf"]
-    override_composite = _od["bar"]
-    override_min_slow_burn = _od["min_slow_burn"]
-    whale_fired = _od["whale"]
-    slow_burn_strong = _od["slow_burn"]
-    breakout_strong = _od["breakout"]
-    composite_strong = _od["composite_strong"]
-    ta_sidestep_strong = _od["ta_sidestep"]
     # A PASS verdict — whether from a hedged multi-agent debate (HTA) or from
     # a failed LLM call — is the AI's explicit "do not trade" signal. Upgrading
     # it to a blind LONG via structural/whale overrides means entering with no
@@ -3142,6 +3029,147 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         analysis["reasoning"] = (
             "[structural override] " + (analysis.get("reasoning", "") or "")
         )[:500]
+    return None
+
+
+def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
+    """S9 stage entry: fetch a fresh live mid and 4h ATR, fail CLOSED.
+
+    ATR equal-risk sizing cannot place an order without a valid live entry or
+    enough candle history to size a stop. Returns ``(mid, atr, None)`` when both
+    are positive, otherwise ``(0.0, 0.0, reason)`` where reason is the early-
+    return string (``invalid_price_for_<coin>`` or ``no_atr_no_stop ...``);
+    skipping the trade costs $0 versus sending an unsized/unstopped order.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    mid = get_hl_price(coin)
+    if mid <= 0:
+        return 0.0, 0.0, f"invalid_price_for_{coin}"
+    atr = get_hl_atr("4h", 14, coin)
+    if atr <= 0:
+        return 0.0, 0.0, (
+            f"no_atr_no_stop ({coin}: insufficient candle history to size a stop)")
+    return mid, atr, None
+
+
+def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
+    """Execute an analysis through risk gates and into the market.
+
+    `_rotation_retry` is set on the single self-retry after capital rotation
+    closed a weak position to free room — it blocks a second rotation so we can
+    never loop.
+    """
+    # Defensive shallow copy: maybe_execute mutates `analysis` in place
+    # (verdict/side/confidence on override, _sizing_v2_* on the LONG path,
+    # signal_veto on GEX shadow). Without this, the caller's dict — which may
+    # be the shared perception/loop object — gets silently polluted and a
+    # later consumer sees the rewritten verdict. Downstream code that needs
+    # the original (route_verdict, memory, the loop) must keep seeing it.
+    analysis = dict(analysis)
+    config = read_agent_config()
+    # Per-coin override: deep-merge coin_overrides[<coin>] so every downstream
+    # gate/sizer/exit policy reads the coin-specific values transparently.
+    # This is the single chokepoint for 币种配置 isolation.
+    _coin = analysis.get("coin")
+    config = apply_coin_override(config, _coin)
+    mode = str(config.get("mode", "OFF")).upper()
+
+    if mode == "OFF":
+        _record_decision("mode_off")
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"], "reason": "mode_off",
+        }
+    # P0-1 (2026-09-12): LIVE money requires an explicit process-env grant on
+    # top of mode=LIVE in the config file. Fail-closed without it so a fresh
+    # deploy / copied config can never place real orders; SHADOW/paper modes
+    # and the reduce-only exit path are unaffected (exits do not run here).
+    if mode == "LIVE" and not live_trading_authorized():
+        logger.error(
+            "[executor] LIVE entry DENIED for %s (analysis %s): mode=LIVE but "
+            "HERMES_ENABLE_LIVE is not set to true — set HERMES_ENABLE_LIVE=true "
+            "to authorize real-money entries.",
+            analysis.get("coin"), analysis.get("id"))
+        _record_decision("live_not_authorized")
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"], "reason": "live_not_authorized",
+        }
+    # Per-coin enabled flag (set by the portal 币种配置 module). False here
+    # disables trading for THIS coin only without changing the global mode.
+    if config.get("enabled") is False:
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"],
+            "reason": f"coin_disabled ({_coin} disabled in 币种配置)",
+        }
+    shadow_mode = mode == "SHADOW"
+
+    # Roadmap §2: freshness-decay the AI confidence before any gate/sizer
+    # reads it. Off by default; shadow observes + logs, enforce multiplies.
+    # Runs while verdict is still the model's own LONG/SHORT — a PASS that the
+    # structural override below upgrades to LONG is skipped inside the helper,
+    # so override entries keep their configured floor semantics.
+    _apply_confidence_decay(analysis, config)
+
+    # Asset-class gate. Mirrors the perception-time filter so a stale
+    # perception (e.g. one re-evaluated from memory after the operator
+    # flips the flag) can't sneak through to a real trade. Crypto =
+    # native HL coin (no colon); HIP-3 = colon-namespaced (`xyz:MU`).
+    is_hip3 = ":" in (analysis.get("coin") or "")
+    if is_hip3 and not bool(config.get("enable_hip3", False)):
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"],
+            "reason": "hip3_disabled (set enable_hip3=true to trade tokenized-equity perps)",
+        }
+    if (not is_hip3) and not bool(config.get("enable_crypto", True)):
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"],
+            "reason": "crypto_disabled (set enable_crypto=true to trade native HL perps)",
+        }
+
+    # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
+    # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
+    # to _dispatch_entry_shadow_probes in the P1-1 step ③ phase split.
+    _dispatch_entry_shadow_probes(analysis, config)
+
+    # AI zero-confidence guard — extracted to _ai_zero_confidence_block in the
+    # P1-1 step ③ phase split (returns a block result or None to continue).
+    _ai0 = _ai_zero_confidence_block(analysis, mode)
+    if _ai0 is not None:
+        return _ai0
+
+    # Structural-override: don't let a hedging AI PASS leave an objectively
+    # strong accumulation setup on the table. Upgrade to LONG conf 0.70 and
+    # let the gates do the real risk check. Two independent triggers, both
+    # LONG-biased (we never force a SHORT):
+    #   (a) composite >= 40 AND 2+ slow-burn 1h triggers fired, OR
+    #   (b) a whale-accumulation signal fired (oi_funding_anomaly) —
+    #       whale signals get their own override because smart-money loading
+    #       (negative funding, flat price, high OI) is a high-conviction
+    #       contrarian-to-retail setup we want to capitalize on even when the
+    #       AI hedges and even against trend.
+    # Live signal enforcement (Veto + Boost, 2026-06-16): consult our free signals
+    # (GEX / FINRA short-vol / aggTrades whale / news) to gate the FORCED-OVERRIDE
+    # path. CACHE-ONLY (never fetches here — the async shadow advisor above warms
+    # the caches; cold cache => fail-open). BOOST lowers the override bar for a name
+    # with a strong catalyst (breaking news / whale buying / crowded-short squeeze)
+    # so we catch more rippers; VETO (applied below) blocks chop-traps / whales
+    # dumping. Bounded: never bypasses the risk/regime/counter-trend/kill gates.
+    override_strong, _od = _evaluate_force_override(analysis, config)
+    _enf = _od["enf"]
+    override_composite = _od["bar"]
+    # Structural-override decision (AI-down block, signal VETO, PASS→LONG
+    # upgrade) — extracted to _structural_override_path in the P1-1 step ③
+    # phase split. It mutates `analysis` in place and returns a block result
+    # or None to continue. `_enf` / `override_composite` stay bound here
+    # because the order-tail _register_filled_position audits them.
+    _override_block = _structural_override_path(analysis, config, mode,
+                                                override_strong, _od)
+    if _override_block is not None:
+        return _override_block
 
     # Safety guard: a PASS that did NOT qualify for the structural override must
     # never reach order placement (trade_side defaults to "long" downstream, so
