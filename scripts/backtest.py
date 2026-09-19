@@ -1,19 +1,18 @@
 #!/usr/bin/env python3
 """Backtest the hermes-trader strategy on historical Hyperliquid candles.
 
-Walks 1h-bar history per coin, evaluates the same triggers + TA-filter
-logic as the live scanner, simulates entries with the current sizing
-formula (equity_fraction x per-coin-max leverage), and exits via the DSL
-two-phase trailing-stop engine. PnL is net of the round-trip taker fee AND
-adverse entry/exit slippage plus a stop-out delay penalty (H-7 cost model;
---no-slippage restores the fee-only baseline).
+Thin CLI over the unified P4 backtest kernel (``hermes_trader.backtest``):
+fetches candles per coin, scans the same trigger + TA-confirm logic the live
+scanner uses (``backtest.signals.heuristic_signals`` — the AI verdict is
+substituted with a deterministic rule, since replaying an LLM per historical
+bar would be too expensive), enforces the live late-entry gate, then runs the
+PRODUCTION two-phase trailing-stop engine (``DSLTracker`` via the
+``DslBarExit`` bar adapter) with the H-7 cost model (``CostModel``).
 
-The AI research step is *substituted* with a deterministic heuristic that
-mirrors the system prompt's entry rules — calling OpenRouter per signal
-over historical bars would be too expensive. The mechanical edge is
-tested; real AI judgment is not.
-
-Caveats reported in the summary so they aren't lost.
+This script owns only the research workflow concerns: CLI parsing, candle
+fetching, universe selection, per-coin memory calibration of fees/slippage,
+the late-entry veto, and reporting. Signal/PIT/exit/statistics semantics live
+in the kernel and are shared with backtest_logged.py and the tests.
 
 Usage:
     python3 scripts/backtest.py                    # defaults: 14 days, 20 coins
@@ -27,9 +26,9 @@ import bisect
 import math
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 # P3-17: mark this process as a backtest BEFORE importing any hermes_trader
 # client modules, so exchange._make_exchange() refuses to load a live mainnet
@@ -52,11 +51,16 @@ sys.path.insert(0, str(_REPO))
 
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.dsl_exit import _build_policy_from_config
 from hermes_trader.agents.ta_filter import late_entry_check
+from hermes_trader.backtest import cost as kcost
+from hermes_trader.backtest import driver as kdriver
+from hermes_trader.backtest import guard as kguard
+from hermes_trader.backtest import signals as ksig
+from hermes_trader.backtest import stats as kstats
+from hermes_trader.backtest.types import Trade
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
-from hermes_trader.indicators import math as ind
-from hermes_trader.indicators import triggers as trig
 from hermes_trader.models.types import Candle
 
 # Interval → candle duration in ms (mirrors hl_client._MS_PER_CANDLE).
@@ -105,380 +109,20 @@ DEFAULT_EXIT_SLIP_BPS = 15.0    # exits are market/stop-driven → wider
 DEFAULT_STOP_DELAY_SLIP_BPS = 10.0
 
 
-@dataclass
-class Trade:
-    coin: str
-    side: str           # "long" or "short"
-    entry_bar: int
-    entry_px: float     # filled entry price AFTER adverse entry slippage (H-7)
-    notional: float
-    margin: float
-    leverage: int
-    exit_bar: int = 0
-    exit_px: float = 0.0  # filled exit price AFTER adverse exit slippage (H-7)
-    pnl_usd: float = 0.0
-    exit_reason: str = ""
-    # O-7 (supplemental audit 2026-08-30): in-sample vs out-of-sample tag for
-    # walk-forward validation. A trade entered on/after the split bar is OOS.
-    in_sample: bool = True
-    # Optional macro×own regime quadrant tag attached at entry (per-coin
-    # overlay analysis). None unless a caller supplies regime_tag_fn; never
-    # read by the entry/exit logic, so it cannot change the simulation.
-    regime_tag: Optional[Dict[str, Any]] = None
+def _print_walk_forward(is_trades: List[Trade], oos_trades: List[Trade],
+                        equity: float) -> None:
+    """O-7: print the in-sample vs out-of-sample comparison block.
 
-
-@dataclass
-class DSL:
-    """Local re-implementation of dsl_exit's two-phase trailing stop."""
-    side: str
-    entry_px: float
-    entry_bar: int
-    peak_px: float
-    max_loss_pct: float = 2.5
-    protect_pct: float = 1.5
-    retrace_threshold: float = 0.30
-    hard_timeout_bars: int = 180
-
-    def check_bar(self, bar_idx: int, bar: Candle) -> Tuple[bool, float, str]:
-        """Did this bar trigger an exit? Stops fire intra-bar at the stop price."""
-        is_long = self.side == "long"
-        # NOTE: the peak is deliberately NOT updated before the stop checks below.
-        # Deriving this bar's trailing floor from this bar's own high, then testing
-        # it against this bar's own low, is intra-bar lookahead: as retrace -> 0 the
-        # floor -> bar.h and `bar.l <= floor` becomes unconditionally true, so the
-        # sim sells at every bar's exact high. Stops must only ever be evaluated
-        # against a floor that was already known when the bar opened; the peak is
-        # advanced at the end of the bar instead.
-
-        if bar_idx - self.entry_bar >= self.hard_timeout_bars:
-            return True, bar.c, "hard_timeout"
-
-        # Max-loss stop. On a gap through the stop the fill is the open, not the
-        # stop price -- a resting stop cannot fill better than the market.
-        max_loss_px = (self.entry_px * (1 - self.max_loss_pct / 100) if is_long
-                       else self.entry_px * (1 + self.max_loss_pct / 100))
-        if is_long and bar.l <= max_loss_px:
-            return True, min(max_loss_px, bar.o), f"max_loss {self.max_loss_pct}%"
-        if not is_long and bar.h >= max_loss_px:
-            return True, max(max_loss_px, bar.o), f"max_loss {self.max_loss_pct}%"
-
-        # Phase-2 trailing floor (only active once protect_pct profit reached).
-        # Uses the peak as of the *previous* bar's close, so the floor is knowable
-        # before this bar trades.
-        if is_long:
-            peak_profit_pct = (self.peak_px - self.entry_px) / self.entry_px * 100
-            if peak_profit_pct >= self.protect_pct:
-                profit_range = self.peak_px - self.entry_px
-                floor = self.entry_px + profit_range * (1 - self.retrace_threshold)
-                if bar.l <= floor:
-                    return True, min(floor, bar.o), "trailing_stop"
-        else:
-            peak_profit_pct = (self.entry_px - self.peak_px) / self.entry_px * 100
-            if peak_profit_pct >= self.protect_pct:
-                profit_range = self.entry_px - self.peak_px
-                ceiling = self.entry_px - profit_range * (1 - self.retrace_threshold)
-                if bar.h >= ceiling:
-                    return True, max(ceiling, bar.o), "trailing_stop"
-
-        # Bar survived: now advance the peak so the *next* bar sees this extreme.
-        if is_long and bar.h > self.peak_px:
-            self.peak_px = bar.h
-        if not is_long and bar.l < self.peak_px:
-            self.peak_px = bar.l
-
-        return False, 0.0, ""
-
-
-def _evaluate(window: List[Candle], cfg: Dict[str, Any]) -> Tuple[float, list]:
-    """Run the 6 live triggers + composite score on the trailing window."""
-    th, w = cfg["thresholds"], cfg["weights"]
-    hits = [
-        trig.pct_move_spike(window, th["sigmaThreshold"]),
-        trig.volume_spike(window, th["sigmaThreshold"]),
-        trig.breakout(
-            window, th["breakoutLookback"],
-            min_rvol=th.get("breakoutMinRvol", 1.5),
-            rvol_window=th.get("breakoutRvolWindow", 20),
-            atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
-        ),
-        trig.range_compression(window, th["bbLength"], th["bbStdDev"]),
-        trig.trend_strength(window, th["adxPeriod"]),
-        trig.momentum_burst(window, th["momentumLookback"], th["momentumPct"]),
-    ]
-    return trig.composite_score(hits, w), hits
-
-
-def _trend_and_atr_pct(window: List[Candle]) -> Tuple[Optional[bool], Optional[float], Optional[float]]:
-    """4h-style EMA trend, ATR% of price, ADX(14). None if insufficient data."""
-    closes = [c.c for c in window]
-    if len(closes) < 30:
-        return None, None, None
-    e8 = ind.ema(closes, 8)[-1]; e21 = ind.ema(closes, 21)[-1]
-    if not (math.isfinite(e8) and math.isfinite(e21)):
-        return None, None, None
-    a = ind.atr(window, 14)[-1]
-    if not math.isfinite(a) or closes[-1] == 0:
-        return None, None, None
-    atr_pct = a / closes[-1] * 100
-    adx14 = ind.adx(window, 14)[-1]
-    return e8 > e21, atr_pct, (adx14 if math.isfinite(adx14) else None)
-
-
-def _heuristic_verdict(score: float, hits, bullish: Optional[bool],
-                       atr_pct: Optional[float]) -> Optional[str]:
-    """Stand-in for AI: 'score >= 25 OR directional trend with ATR >= 0.4%'."""
-    if bullish is None:
-        return None
-    burst = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
-    score_ok = score >= 25
-    trend_ok = atr_pct is not None and atr_pct >= 0.4
-    if not (score_ok or trend_ok or burst):
-        return None
-    return "LONG" if bullish else "SHORT"
-
-
-def _ta_confirmed(bullish, atr_pct, adx14, composite: float) -> bool:
-    """Local proxy for ta_filter.analyze_perception's CONFIRMED gate (score >= 45)."""
-    if bullish is None or atr_pct is None:
-        return False
-    s = 20  # trend present
-    if 30 < (atr_pct * 10) < 700:  # very loose proxy for RSI window
-        s += 15
-    if atr_pct >= 0.5:
-        s += 15
-    if adx14 is not None and adx14 >= 25:
-        s += 15
-    s += min(15, composite / 100 * 15)
-    return s >= 45
-
-
-def _simulate(coin: str, candles: List[Candle], max_lev: int, *,
-              equity: float, equity_fraction: float, lev_ceiling: int,
-              cfg: Dict[str, Any], warmup: int = 100,
-              max_loss_pct: float = 2.5, protect_pct: float = 1.5,
-              retrace_threshold: float = 0.30,
-              atr_mult: float = 0.0, atr_floor: float = 1.0,
-              atr_ceiling: float = 4.0,
-              stop_widths: Optional[list] = None,
-              candles_4h: Optional[List[Candle]] = None,
-              candles_15m: Optional[List[Candle]] = None,
-              late_entry_params: Optional[Dict[str, Any]] = None,
-              late_vetoes: Optional[List[dict]] = None,
-              entry_slip_bps: float = DEFAULT_ENTRY_SLIP_BPS,
-              exit_slip_bps: float = DEFAULT_EXIT_SLIP_BPS,
-              stop_delay_slip_bps: float = DEFAULT_STOP_DELAY_SLIP_BPS,
-              fee_bps: float = ROUND_TRIP_FEE_BPS,
-              oos_split_bar: Optional[int] = None,
-              regime_tag_fn: Optional[Any] = None) -> List[Trade]:
-    trades: List[Trade] = []
-    open_t: Optional[Trade] = None
-    open_dsl: Optional[DSL] = None
-    # O-8 (supplemental audit 2026-08-30): fee_bps can be overridden per coin
-    # from memory.avg_round_trip_fee_bps (measured exchange fees); defaults to
-    # the conservative ROUND_TRIP_FEE_BPS constant when history is thin.
-    fee_pct = fee_bps / 10000.0
-
-    # H-7: adverse-fill helpers. A marketable IOC BUY fills ABOVE the reference
-    # price and a SELL fills BELOW; ``bps`` is the adverse fraction in bps.
-    def _fill(px: float, is_buy: bool, bps: float) -> float:
-        adj = px * bps / 10000.0
-        return px + adj if is_buy else px - adj
-
-    # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live
-    # ta_late_entry_gate re-runs late_entry_check() on FRESH 4h (+15m) candles
-    # immediately before order placement. The backtest calls the SAME pure
-    # function on only the higher-TF bars that have CLOSED by the decision
-    # instant (bar i close → fill at i+1 open), so the veto is 100% identical
-    # in rules and free of look-ahead. Backtests evaluate the FINAL rule set,
-    # so the check is enforced regardless of the live gate's gray-release
-    # mode (mode is a deployment control, not a strategy difference).
-    le_params = dict(late_entry_params or {})
-    le_enabled = bool(le_params) and candles_4h is not None
-    if le_enabled:
-        le_params.pop("mode", None)
-        le_params.pop("shadow_log_path", None)
-    sim_ms = _MS_PER.get(cfg.get("_interval", "1h"), _MS_PER["1h"])
-    t4 = [c.t for c in candles_4h] if candles_4h else []
-    t15 = [c.t for c in candles_15m] if candles_15m else []
-
-    for i in range(warmup, len(candles) - 1):
-        window = candles[: i + 1]
-        bar = candles[i]
-        next_bar = candles[i + 1]
-
-        # Manage open position
-        if open_t and open_dsl:
-            done, exit_ref, reason = open_dsl.check_bar(i, bar)
-            if done:
-                # H-7: the DSL stop price is a TRIGGER, not a fill. The live
-                # exit waits for mid-hold + oracle confirm then crosses the
-                # book with a marketable IOC — always adverse, and a stop-out
-                # in a fast move overshoots (extra delay penalty). Closing a
-                # long = SELL (fills below ref); closing a short = BUY (fills
-                # above). Trail/timeout exits pay the regular exit slip.
-                is_stop_out = reason.startswith("max_loss")
-                slip = exit_slip_bps + (stop_delay_slip_bps if is_stop_out else 0.0)
-                close_is_buy = open_t.side == "short"
-                exit_px = _fill(exit_ref, close_is_buy, slip)
-                gross_pct = ((exit_px - open_t.entry_px) / open_t.entry_px
-                             if open_t.side == "long"
-                             else (open_t.entry_px - exit_px) / open_t.entry_px)
-                open_t.exit_bar = i
-                open_t.exit_px = exit_px
-                open_t.pnl_usd = open_t.notional * (gross_pct - fee_pct)
-                open_t.exit_reason = reason
-                # O-7: classify by ENTRY bar — a position opened before the split
-                # that exits after it still belongs to the in-sample generation
-                # (the decision used only in-sample information).
-                if oos_split_bar is not None:
-                    open_t.in_sample = open_t.entry_bar < oos_split_bar
-                trades.append(open_t)
-                open_t = open_dsl = None
-            else:
-                continue   # one open trade per coin at a time
-
-        # Look for entry
-        score, hits = _evaluate(window, cfg)
-        bullish, atr_pct, adx14 = _trend_and_atr_pct(window)
-        verdict = _heuristic_verdict(score, hits, bullish, atr_pct)
-        if verdict is None:
-            continue
-        burst = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
-        if not _ta_confirmed(bullish, atr_pct, adx14, score) and not burst:
-            continue
-
-        side = "long" if verdict == "LONG" else "short"
-
-        # Live late-entry hard gate, same pure function + same closed-bar
-        # information set as the order-time recompute.
-        if le_enabled:
-            decision_ms = bar.t + sim_ms
-            w4 = _closed_slice(candles_4h, t4, decision_ms, _MS_PER["4h"])
-            w15 = _closed_slice(candles_15m, t15, decision_ms, _MS_PER["15m"])
-            le = late_entry_check(w4, w15, side, le_params)
-            if le.get("block"):
-                if late_vetoes is not None:
-                    late_vetoes.append({
-                        "coin": coin, "side": side, "bar": i,
-                        "reason": le.get("reason", ""),
-                        "rsi4h": le.get("rsi4h"), "adx4h": le.get("adx4h"),
-                        "extension": le.get("extension"),
-                    })
-                continue
-
-        lev = min(lev_ceiling, max_lev)
-        notional = equity * equity_fraction * lev
-        margin = equity * equity_fraction
-        # H-7: entry IOC fills adverse to next bar's open (long BUY fills above,
-        # short SELL fills below). The stop/trail ladder anchors on the FILLED
-        # price, matching live dsl_exit which tracks the actual entry price.
-        entry_px = _fill(next_bar.o, side == "long", entry_slip_bps)
-        rtag = None
-        if regime_tag_fn is not None:
-            try:
-                # Same closed-bar information set as the late-entry gate: the
-                # decision is made at bar i's close (filled at i+1 open), so
-                # only higher-TF bars fully closed by bar.t+sim_ms are visible.
-                rtag = regime_tag_fn(coin, side, bar.t + sim_ms)
-            except Exception:
-                rtag = None
-        open_t = Trade(coin=coin, side=side, entry_bar=i + 1, entry_px=entry_px,
-                       notional=notional, margin=margin, leverage=lev,
-                       regime_tag=rtag)
-        # ATR-stop mode: stop width = atr_mult × ATR% at entry, clamped — mirrors
-        # the live dsl_exit.atr_stop feature. atr_mult=0 keeps the fixed stop.
-        eff_max_loss = max_loss_pct
-        if atr_mult > 0 and atr_pct is not None and atr_pct > 0:
-            eff_max_loss = min(max(atr_pct * atr_mult, atr_floor), atr_ceiling)
-            if stop_widths is not None:
-                stop_widths.append(eff_max_loss)
-        open_dsl = DSL(side=side, entry_px=entry_px, entry_bar=i + 1,
-                       peak_px=entry_px, max_loss_pct=eff_max_loss,
-                       protect_pct=protect_pct, retrace_threshold=retrace_threshold)
-    return trades
-
-
-# O-7 (supplemental audit 2026-08-30): walk-forward / out-of-sample split.
-def oos_split_index(n_bars: int, warmup: int, oos_frac: float) -> int:
-    """Bar index at which the out-of-sample window starts.
-
-    Only bars in [warmup, n_bars) can generate entries (the loop decision
-    window), so the split is placed ``oos_frac`` of the way through THAT
-    window. Trades with entry_bar >= the returned index are out-of-sample.
-    The fixed ``warmup`` indicator prefix is always in-sample (no leakage —
-    indicators on OOS bars only read past bars).
+    Trades are split PER COIN (each coin's bar count/warmup gives its own
+    split bar) and aggregated by segment before scoring — identical to the
+    old per-trade in_sample tagging, but stats now come from the kernel.
     """
-    if n_bars <= warmup:
-        return n_bars  # nothing tradeable → all "in-sample"
-    return int(warmup + (n_bars - warmup) * (1.0 - oos_frac))
-
-
-def _split_metrics(trades: List[Trade], equity: float) -> Dict[str, Any]:
-    """Stats for one walk-forward segment: count, win rate, expectancy, total
-    PnL, per-trade Sharpe (365/active-days annualization), and the peak-to-trough
-    max drawdown of the cumulative-PnL path (USD)."""
-    n = len(trades)
-    out: Dict[str, Any] = {"n": n}
-    if n == 0:
-        return out
-    pnls = [t.pnl_usd for t in trades]
-    wins = sum(1 for p in pnls if p > 0)
-    total = sum(pnls)
-    out.update(
-        n=n, wins=wins, win_rate=wins / n * 100,
-        expectancy=total / n, pnl=total, pnl_pct=total / equity * 100,
-    )
-    # Per-trade Sharpe, annualized over the span the trades actually cover.
-    # One trade per coin at a time but many coins run concurrently, so the
-    # trading span is taken from first entry to last exit bar.
-    mean = total / n
-    var = sum((p - mean) ** 2 for p in pnls) / (n - 1) if n > 1 else 0.0
-    sd = math.sqrt(var)
-    span_days = 0
-    try:
-        # exit_bar - entry_bar differences are per-coin; the segment's calendar
-        # span is (last exit - first entry) of the whole merged trade list, but
-        # bars here are per-coin indices so we only use the mean holding span as
-        # a conservative per-trade horizon. Sharpe is reported for relative
-        # IS-vs-OOS comparison, not as an absolute fund Sharpe.
-        span_days = max(
-            1.0,
-            sum((t.exit_bar - t.entry_bar) for t in trades) / n / 24.0,
-        )
-    except Exception:
-        span_days = 1.0
-    if sd > 0:
-        out["sharpe"] = mean / sd * math.sqrt(365.0 / span_days)
-    else:
-        out["sharpe"] = 0.0
-    # Max drawdown over the chronological cumulative-PnL path. Trades from
-    # different coins interleave on bars; ordering by exit bar gives a close
-    # approximation of the realized equity curve (constant-equity assumption).
-    ordered = sorted(trades, key=lambda t: (t.exit_bar, t.coin))
-    peak = 0.0
-    cum = 0.0
-    mdd = 0.0
-    for t in ordered:
-        cum += t.pnl_usd
-        if cum > peak:
-            peak = cum
-        dd = peak - cum
-        if dd > mdd:
-            mdd = dd
-    out["max_dd"] = mdd
-    return out
-
-
-def _print_walk_forward(all_trades: List[Trade], equity: float) -> None:
-    """O-7: print the in-sample vs out-of-sample comparison block."""
-    is_tr = [t for t in all_trades if t.in_sample]
-    oos_tr = [t for t in all_trades if not t.in_sample]
     print("\n=== WALK-FORWARD / OUT-OF-SAMPLE (O-7) ===")
-    if not oos_tr:
+    if not oos_trades:
         print("no out-of-sample trades (raise --oos-frac or widen the window)")
         return
-    ms = _split_metrics(is_tr, equity)
-    mo = _split_metrics(oos_tr, equity)
+    ms = kstats.trade_stats(is_trades, equity=equity)
+    mo = kstats.trade_stats(oos_trades, equity=equity)
 
     print(f"  {'Segment':<22s} {'IN-SAMPLE':>14s} {'OUT-OF-SAMPLE':>14s}")
     print(f"  {'-'*22} {'-'*14} {'-'*14}")
@@ -486,26 +130,27 @@ def _print_walk_forward(all_trades: List[Trade], equity: float) -> None:
     def _line(label: str, vs: str, vo: str) -> None:
         print(f"  {label:<22s} {vs:>14s} {vo:>14s}")
 
-    _line("trades", str(ms.get("n", 0)), str(mo.get("n", 0)))
-    _line("win rate",
-          f"{ms['win_rate']:.1f}%" if ms.get("n") else "-",
-          f"{mo['win_rate']:.1f}%" if mo.get("n") else "-")
-    _line("expectancy/trade",
-          f"${ms['expectancy']:+.3f}" if ms.get("n") else "-",
-          f"${mo['expectancy']:+.3f}" if mo.get("n") else "-")
-    _line("total PnL",
-          f"${ms['pnl']:+.2f}" if ms.get("n") else "-",
-          f"${mo['pnl']:+.2f}" if mo.get("n") else "-")
+    def _pct(v: float) -> str:
+        return f"{v:.1f}%"
+
+    def _usd(v: float) -> str:
+        return f"${v:+.2f}"
+
+    _line("trades", str(ms.n), str(mo.n))
+    _line("win rate", _pct(ms.win_rate_pct) if ms.n else "-",
+          _pct(mo.win_rate_pct) if mo.n else "-")
+    _line("expectancy/trade", f"${ms.expectancy_usd:+.3f}" if ms.n else "-",
+          f"${mo.expectancy_usd:+.3f}" if mo.n else "-")
+    _line("total PnL", _usd(ms.pnl_net_usd) if ms.n else "-",
+          _usd(mo.pnl_net_usd) if mo.n else "-")
     _line("return on equity",
-          f"{ms['pnl_pct']:+.1f}%" if ms.get("n") else "-",
-          f"{mo['pnl_pct']:+.1f}%" if mo.get("n") else "-")
-    _line("Sharpe (per-trade)",
-          f"{ms['sharpe']:.2f}" if ms.get("n") else "-",
-          f"{mo['sharpe']:.2f}" if mo.get("n") else "-")
-    _line("max drawdown",
-          f"${ms['max_dd']:.2f}" if ms.get("n") else "-",
-          f"${mo['max_dd']:.2f}" if mo.get("n") else "-")
-    oos_ok = mo.get("n", 0) > 0 and mo.get("expectancy", 0.0) > 0
+          _pct(ms.pnl_pct_equity or 0.0) if ms.n else "-",
+          _pct(mo.pnl_pct_equity or 0.0) if mo.n else "-")
+    _line("Sharpe (per-trade)", f"{ms.sharpe:.2f}" if ms.n else "-",
+          f"{mo.sharpe:.2f}" if mo.n else "-")
+    _line("max drawdown", f"${ms.max_dd_usd:.2f}" if ms.n else "-",
+          f"${mo.max_dd_usd:.2f}" if mo.n else "-")
+    oos_ok = mo.n > 0 and mo.expectancy_usd > 0
     print("\n  The strategy is validated out-of-sample only when the OOS "
           "expectancy/PnL stays positive and its Sharpe is in the same "
           "ballpark as in-sample — a large IS-OOS gap means overfitting.")
@@ -513,7 +158,8 @@ def _print_walk_forward(all_trades: List[Trade], equity: float) -> None:
 
 
 def _print_summary(all_trades: List[Trade], equity: float, days: int,
-                   cost_note: str = "", oos: bool = False) -> None:
+                   *, cost_note: str = "",
+                   walk_forward: Optional[tuple[List[Trade], List[Trade]]] = None) -> None:
     print("\n=== SUMMARY ===")
     n = len(all_trades)
     if n == 0:
@@ -521,34 +167,27 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int,
         if cost_note:
             print(f"\nCaveats:\n  - {cost_note}")
         return
-    wins = [t for t in all_trades if t.pnl_usd > 0]
-    losses = [t for t in all_trades if t.pnl_usd < 0]
-    pnl_total = sum(t.pnl_usd for t in all_trades)
-    avg_win = (sum(t.pnl_usd for t in wins) / len(wins)) if wins else 0.0
-    avg_loss = (sum(t.pnl_usd for t in losses) / len(losses)) if losses else 0.0
-    expectancy = pnl_total / n
-    by_reason: Dict[str, int] = {}
-    for t in all_trades:
-        by_reason[t.exit_reason] = by_reason.get(t.exit_reason, 0) + 1
+    s = kstats.trade_stats(all_trades, equity=equity)
+    pnl_total = s.pnl_net_usd
 
-    print(f"trades        : {n}")
-    print(f"win rate      : {len(wins)}/{n} = {len(wins) / n * 100:.1f}%")
-    print(f"avg win       : ${avg_win:+.2f}")
-    print(f"avg loss      : ${avg_loss:+.2f}")
-    print(f"expectancy    : ${expectancy:+.3f} per trade")
+    print(f"trades        : {s.n}")
+    print(f"win rate      : {s.wins}/{s.n} = {s.win_rate_pct:.1f}%")
+    print(f"avg win       : ${s.avg_win_usd:+.2f}")
+    print(f"avg loss      : ${s.avg_loss_usd:+.2f}")
+    print(f"expectancy    : ${s.expectancy_usd:+.3f} per trade")
     print(f"total PnL     : ${pnl_total:+.2f}  ({pnl_total / equity * 100:+.1f}% on ${equity:.0f}, over {days} days)")
-    print(f"exit reasons  : {by_reason}")
+    print(f"exit reasons  : {s.by_reason}")
 
     # Sample worst and best
-    sorted_t = sorted(all_trades, key=lambda t: t.pnl_usd)
+    sorted_t = sorted(all_trades, key=lambda t: t.pnl_net_usd)
     print("\nworst 3       :")
     for t in sorted_t[:3]:
         print(f"  {t.coin:6} {t.side:5} bars {t.entry_bar}->{t.exit_bar}  "
-              f"${t.pnl_usd:+.2f}  {t.exit_reason}")
+              f"${t.pnl_net_usd:+.2f}  {t.reason.value}")
     print("best 3        :")
     for t in sorted_t[-3:][::-1]:
         print(f"  {t.coin:6} {t.side:5} bars {t.entry_bar}->{t.exit_bar}  "
-              f"${t.pnl_usd:+.2f}  {t.exit_reason}")
+              f"${t.pnl_net_usd:+.2f}  {t.reason.value}")
 
     print("\nCaveats:")
     print("  - AI verdict substituted with a heuristic (score / trend / burst). Real LLM not replayed.")
@@ -556,12 +195,25 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int,
         print(f"  - {cost_note}")
     print("  - One open position per coin at a time; max_concurrent cap NOT enforced across coins.")
     print("  - Equity held constant (no compounding); cooldown_min not applied.")
+    print("  - Unified P4 kernel drives the PRODUCTION DSLTracker, so semantics differ from the "
+          "old local DSL:")
+    print("    * a position still open on the last bar is CLOSED at that bar's close "
+          "(end_of_data); the old script silently dropped it;")
+    print("    * hard timeout is the production policy in real wall-clock MINUTES "
+          "(default 1800 min; 1h config), not the old local 180-bar limit — stale-flat, "
+          "time-scratch, phase-2 tiers and breakeven lock likewise apply when configured;")
+    print("    * the production leverage-aware ROE safety net (max_loss_roe_pct) caps losses "
+          "in addition to the spot stop — the old local DSL had no ROE cap;")
+    print("    * ATR stop width uses the SIM-interval ATR(14)% at the decision bar (this "
+          "script's convention), not the production 4h ATR;")
+    print("    * exit reasons are normalized to max_loss / floor_breach / hard_timeout / "
+          "stale_flat_timeout / time_scratch / end_of_data.")
     print("  - ta_late_entry hard gate is 100% aligned with live: same late_entry_check() "
           "pure function, ENFORCED (backtests evaluate the final rule set), and only "
           "4h/15m bars CLOSED by the decision instant are used — no look-ahead.")
     print("  - Past performance does NOT imply future results.")
-    if oos:
-        _print_walk_forward(all_trades, equity)
+    if walk_forward is not None:
+        _print_walk_forward(walk_forward[0], walk_forward[1], equity)
 
 
 def main() -> int:
@@ -588,7 +240,7 @@ def main() -> int:
                     help="ATR stop ceiling spot pct (default: .agent-config.json)")
     ap.add_argument("--no-late-entry", action="store_true",
                     help="disable the live ta_late_entry hard gate (default: enforced, "
-                         "100% parity with the live order-time gate)")
+                         "100%% parity with the live order-time gate)")
     ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
                     help=f"adverse entry slippage in bps (default {DEFAULT_ENTRY_SLIP_BPS})")
     ap.add_argument("--exit-slip-bps", type=float, default=DEFAULT_EXIT_SLIP_BPS,
@@ -633,6 +285,11 @@ def main() -> int:
     # order-time gate reads). The backtest ENFORCES the veto regardless of the
     # live mode (shadow/enforce is a deployment control, not a rule difference).
     late_entry_params: Dict[str, Any] = {} if args.no_late_entry else dict(live.get("ta_late_entry") or {})
+    # mode/shadow_log_path are deployment controls, not veto rules — strip them
+    # once up front so every coin calls the same pure rule parameter set.
+    le_cfg = dict(late_entry_params)
+    le_cfg.pop("mode", None)
+    le_cfg.pop("shadow_log_path", None)
 
     # H-7 cost model (see constants above). --no-slippage restores the
     # fee-only baseline; otherwise defaults are live-conservative and the
@@ -673,11 +330,26 @@ def main() -> int:
     bars_per_day = {"5m": 288, "15m": 96, "1h": 24, "4h": 6, "1d": 1}[args.interval]
     total_bars = args.days * bars_per_day + 100  # +warmup
 
+    # Trigger config is only used for the header line; the kernel's
+    # default_heuristic_config() reads the same source.
     cfg = get_config()
-    cfg["_interval"] = args.interval
     universe = get_universe()
     perps = [m for m in universe if m["type"] == "perp" and not m["coin"].startswith("@")]
     coins = sorted(perps, key=lambda m: m.get("dayNtlVlm", 0), reverse=True)[: args.coins]
+
+    # One production exit policy for the whole run, built from the live config
+    # then overlaid with the CLI knobs. The kernel adapter copies it again per
+    # position (zeroing sub-bar confirm gates), so coins never share state.
+    base_policy = replace(
+        _build_policy_from_config(),
+        max_loss_pct=max_loss,
+        protect_pct=protect,
+        retrace_threshold=retrace,
+        atr_stop_enabled=atr_mult > 0,
+        atr_stop_mult=atr_mult,
+        atr_stop_floor_pct=atr_floor,
+        atr_stop_ceiling_pct=atr_ceiling,
+    )
 
     print("=== hermes-trader backtest ===")
     print(f"period: {args.days} days   interval: {args.interval}   universe: top-{args.coins} by 24h volume")
@@ -687,6 +359,8 @@ def main() -> int:
           f"momentumPct={cfg['thresholds']['momentumPct']}\n")
 
     all_trades: List[Trade] = []
+    is_trades: List[Trade] = []
+    oos_trades: List[Trade] = []
     stop_widths: List[float] = []
     late_vetoes: List[dict] = []
     sim_ms = _MS_PER[args.interval]
@@ -736,28 +410,91 @@ def main() -> int:
                         coin_fee_bps = _mf
                 except Exception:
                     pass
-            # O-7: walk-forward split. The decision window runs from `warmup`
-            # (100) to the last candle; --oos-frac holds its tail out. The 100-
-            # bar warmup prefix is always in-sample (indicators only read the
-            # past, so it leaks nothing into OOS).
-            coin_oos_bar = (oos_split_index(len(candles), 100, args.oos_frac)
-                            if args.oos_frac > 0 else None)
-            trades = _simulate(
-                coin, candles, max_lev,
-                equity=args.equity, equity_fraction=equity_fraction,
-                lev_ceiling=leverage_ceiling, cfg=cfg,
-                max_loss_pct=max_loss, protect_pct=protect,
-                retrace_threshold=retrace,
-                atr_mult=atr_mult, atr_floor=atr_floor,
-                atr_ceiling=atr_ceiling, stop_widths=stop_widths,
-                candles_4h=candles_4h, candles_15m=candles_15m,
-                late_entry_params=late_entry_params, late_vetoes=late_vetoes,
-                entry_slip_bps=entry_slip_bps, exit_slip_bps=coin_exit_slip,
-                stop_delay_slip_bps=stop_delay_slip_bps,
-                fee_bps=coin_fee_bps, oos_split_bar=coin_oos_bar,
+
+            # Decision-time context: attach the SIM-interval ATR(14)% computed
+            # from exactly the bars closed at the decision instant (this
+            # script's convention — production registration uses 4h ATR).
+            open_times = [c.t for c in candles]
+
+            def _ctx(close_ms: int) -> tuple[float, str]:
+                # close_ms == next bar's open t, so bisect_left - 1 recovers
+                # the decision bar (bisect_right would overshoot by one).
+                j = bisect.bisect_left(open_times, close_ms) - 1
+                if j < 0:
+                    return 0.0, ""
+                _bull, atr_pct, _adx = ksig.trend_and_atr_pct(candles[: j + 1])
+                return (atr_pct or 0.0), ""
+
+            signals = ksig.heuristic_signals(
+                candles, ksig.default_heuristic_config(warmup=100),
+                context_fn=_ctx, bar_ms=sim_ms,
             )
-            pnl = sum(t.pnl_usd for t in trades)
-            w = sum(1 for t in trades if t.pnl_usd > 0)
+
+            # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live
+            # ta_late_entry_gate re-runs late_entry_check() on FRESH 4h (+15m)
+            # candles immediately before order placement. The backtest calls
+            # the SAME pure function on only the higher-TF bars that have
+            # CLOSED by the decision instant (bar i close → fill at i+1 open),
+            # so the veto is 100% identical in rules and free of look-ahead.
+            kept: List[ksig.Signal] = []
+            le_enabled = bool(le_cfg) and candles_4h is not None
+            t4 = [c.t for c in candles_4h] if candles_4h else []
+            t15 = [c.t for c in candles_15m] if candles_15m else []
+            for sig in signals:
+                if le_enabled:
+                    decision_ms = candles[sig.bar_index].t + sim_ms
+                    w4 = _closed_slice(candles_4h, t4, decision_ms, _MS_PER["4h"])
+                    w15 = _closed_slice(candles_15m, t15, decision_ms, _MS_PER["15m"])
+                    le = late_entry_check(w4, w15, sig.side, le_cfg)
+                    if le.get("block"):
+                        late_vetoes.append({
+                            "coin": coin, "side": sig.side, "bar": sig.bar_index,
+                            "reason": le.get("reason", ""),
+                            "rsi4h": le.get("rsi4h"), "adx4h": le.get("adx4h"),
+                            "extension": le.get("extension"),
+                        })
+                        continue
+                kept.append(sig)
+
+            lev = min(leverage_ceiling, max_lev)
+            notional = args.equity * equity_fraction * lev
+            cost = kcost.CostModel(
+                round_trip_fee_bps=coin_fee_bps,
+                entry_slip_bps=entry_slip_bps,
+                exit_slip_bps=coin_exit_slip,
+                stop_delay_slip_bps=stop_delay_slip_bps,
+            )
+            trades = kdriver.run(
+                candles, kept, base_policy, coin=coin, leverage=lev,
+                notional_usd=notional, cost=cost, bar_ms=sim_ms,
+            )
+            # Structural no-look-ahead invariant check on every coin.
+            kguard.assert_run_pit(candles, kept, trades)
+
+            # ATR-stop width distribution: only for signals that actually
+            # filled (the single-position kernel discards signals arriving
+            # while already in a position), matching the old script's
+            # collected-on-entry behavior.
+            entry_bars = {t.entry_bar for t in trades}
+            if atr_mult > 0:
+                for sig in kept:
+                    if sig.bar_index + 1 in entry_bars and sig.entry_atr_pct > 0:
+                        stop_widths.append(
+                            min(max(sig.entry_atr_pct * atr_mult, atr_floor),
+                                atr_ceiling)
+                        )
+
+            # O-7: split per coin on its own tradeable window, classify by
+            # ENTRY bar (a trade decided pre-split stays in-sample even if its
+            # exit lands after the split).
+            if args.oos_frac > 0:
+                split_bar = kstats.oos_split_index(len(candles), 100, args.oos_frac)
+                _is, _oos = kstats.split_trades(trades, split_bar)
+                is_trades.extend(_is)
+                oos_trades.extend(_oos)
+
+            pnl = sum(t.pnl_net_usd for t in trades)
+            w = sum(1 for t in trades if t.pnl_net_usd > 0)
             print(f"  {coin:8} {len(trades):3} trades  win {w:3}  PnL ${pnl:+7.2f}  (max_lev {max_lev}x)")
             all_trades.extend(trades)
         except Exception as e:
@@ -770,8 +507,10 @@ def main() -> int:
         if len(late_vetoes) > 8:
             print(f"  ... and {len(late_vetoes) - 8} more")
 
-    _print_summary(all_trades, args.equity, args.days, cost_note=cost_note,
-                   oos=args.oos_frac > 0)
+    _print_summary(
+        all_trades, args.equity, args.days, cost_note=cost_note,
+        walk_forward=((is_trades, oos_trades) if args.oos_frac > 0 else None),
+    )
     if stop_widths:
         sw = sorted(stop_widths)
         n = len(sw)

@@ -5068,18 +5068,49 @@ def test_backtest_closed_slice_uses_only_closed_higher_tf_bars():
     assert bt._closed_slice([], [], 12 * H, 4 * H) is None
 
 
+def _kernel_sim(coin, base, sim_ms, cfg, *, candles_4h=None, candles_15m=None,
+                late_entry_params=None):
+    """Reproduce scripts/backtest.py's thin per-coin orchestration on the
+    unified P4 kernel: heuristic signals → the live late-entry veto (same pure
+    ``late_entry_check`` on only CLOSED higher-TF bars) → ``driver.run``."""
+    from hermes_trader.agents.dsl_exit import _build_policy_from_config
+    from hermes_trader.agents.ta_filter import late_entry_check
+    from hermes_trader.backtest import driver as kdriver
+    from hermes_trader.backtest import signals as ksig
+    from hermes_trader.backtest.cost import CostModel
+
+    bt = _load_bt_module()
+    hcfg = ksig.HeuristicConfig(
+        thresholds=cfg["thresholds"], weights=cfg["weights"], warmup=100)
+    signals = ksig.heuristic_signals(base, hcfg, bar_ms=sim_ms)
+
+    vetoes: list = []
+    kept: list = []
+    le_cfg = dict(late_entry_params or {})
+    t4 = [c.t for c in candles_4h] if candles_4h else []
+    t15 = [c.t for c in candles_15m] if candles_15m else []
+    for sig in signals:
+        if le_cfg and candles_4h is not None:
+            decision_ms = base[sig.bar_index].t + sim_ms
+            w4 = bt._closed_slice(candles_4h, t4, decision_ms, 4 * 3600_000)
+            w15 = bt._closed_slice(candles_15m, t15, decision_ms, 15 * 60_000)
+            le = late_entry_check(w4, w15, sig.side, le_cfg)
+            if le.get("block"):
+                vetoes.append({"coin": coin, "side": sig.side,
+                               "bar": sig.bar_index, "reason": le.get("reason", "")})
+                continue
+        kept.append(sig)
+
+    zero = CostModel(0.0, 0.0, 0.0, 0.0)
+    trades = kdriver.run(
+        base, kept, _build_policy_from_config(), coin=coin, leverage=5,
+        notional_usd=50.0, cost=zero, bar_ms=sim_ms)
+    return trades, vetoes
+
+
 def test_backtest_simulate_enforces_late_entry_veto():
-    """_simulate blocks late entries via the SAME pure function and records
-    vetoes; without higher-TF data the run is unaffected."""
-    import importlib.util
-    import sys as _sys
-    if "bt_under_test" not in _sys.modules:
-        spec = importlib.util.spec_from_file_location(
-            "bt_under_test", str(pathlib.Path(__file__).resolve().parents[1] / "scripts" / "backtest.py"))
-        mod = importlib.util.module_from_spec(spec)
-        _sys.modules["bt_under_test"] = mod
-        spec.loader.exec_module(mod)
-    bt = _sys.modules["bt_under_test"]
+    """The thin backtest orchestration blocks late entries via the SAME pure
+    function and records vetoes; without higher-TF data the run is unaffected."""
     H = 3600_000
     # 1h base series on the SAME ms time axis as the 4h/15m series (bar open
     # t = i*1h); long flat stretch then a parabolic final ramp that makes
@@ -5101,17 +5132,14 @@ def test_backtest_simulate_enforces_late_entry_veto():
                           "breakoutAtrScoreMult": 3.0,
                           "momentumLookback": 10, "momentumPct": 2.0},
            "weights": {}}
-    vetoes: list = []
     params = {"mode": "shadow", "rsi_ob": 75, "rsi_os": 25, "ext_ob": 2.5,
               "ext_os": -2.5, "rsi_ob_relaxed": 82, "rsi_os_relaxed": 18,
               "ext_ob_relaxed": 3.5, "ext_os_relaxed": -3.5,
               "adx_trend_threshold": 35, "mtf_enabled": True}
-    trades_gated = bt._simulate(
-        "TEST", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5,
-        cfg=cfg, candles_4h=bull4h, candles_15m=hot15,
-        late_entry_params=dict(params), late_vetoes=vetoes)
-    trades_plain = bt._simulate(
-        "TEST", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5, cfg=cfg)
+    trades_gated, vetoes = _kernel_sim(
+        "TEST", base, H, cfg, candles_4h=bull4h, candles_15m=hot15,
+        late_entry_params=dict(params))
+    trades_plain, _vetoes_plain = _kernel_sim("TEST", base, H, cfg)
     # Gate vetoed at least as many entries as it removed from the trade list.
     assert len(vetoes) > 0
     assert len(trades_gated) <= len(trades_plain)
@@ -5136,19 +5164,20 @@ def _load_bt_module():
 def test_oos_split_index_holds_tail_out_after_warmup():
     """The split sits oos_frac of the way through the TRADEABLE window
     [warmup, n_bars); the warmup indicator prefix is always in-sample."""
-    bt = _load_bt_module()
+    from hermes_trader.backtest import stats as kstats
     # 100 warmup + 1000 tradeable bars, 30% OOS -> split at 100 + 700 = 800.
-    assert bt.oos_split_index(1100, 100, 0.3) == 800
+    assert kstats.oos_split_index(1100, 100, 0.3) == 800
     # 0% OOS -> split at the end (nothing is out-of-sample).
-    assert bt.oos_split_index(1100, 100, 0.0) == 1100
+    assert kstats.oos_split_index(1100, 100, 0.0) == 1100
     # Degenerate: fewer bars than warmup -> all in-sample (split == n_bars).
-    assert bt.oos_split_index(50, 100, 0.3) == 50
+    assert kstats.oos_split_index(50, 100, 0.3) == 50
 
 
 def test_oos_split_tags_trades_by_entry_bar():
-    """_simulate flags in_sample=False only for trades whose ENTRY bar is at or
-    after the split bar; the fixed warmup prefix never becomes OOS."""
-    bt = _load_bt_module()
+    """The kernel classifies trades OOS only when their ENTRY bar is at or
+    after the split bar (``split_trades``); the fixed warmup prefix is never
+    OOS. A trade decided pre-split that exits after it stays in-sample."""
+    from hermes_trader.backtest import stats as kstats
     H = 3600_000
     # Flat stretch, then ramp → crash → ramp → crash so positions actually
     # CLOSE on both sides of the split. A single steady ramp never retraces to
@@ -5180,44 +5209,48 @@ def test_oos_split_tags_trades_by_entry_bar():
                           "breakoutAtrScoreMult": 3.0,
                           "momentumLookback": 10, "momentumPct": 2.0},
            "weights": {}}
-    split_bar = bt.oos_split_index(len(base), 100, 0.3)  # 100 + 0.7*320 = 324
-    trades = bt._simulate(
-        "OOS", base, 5, equity=100, equity_fraction=0.1, lev_ceiling=5,
-        cfg=cfg, oos_split_bar=split_bar)
+    split_bar = kstats.oos_split_index(len(base), 100, 0.3)  # 100 + 0.7*320 = 324
+    trades, _vetoes = _kernel_sim("OOS", base, H, cfg)
     assert trades, "fixture should fire entries"
-    for t in trades:
-        # Classification must match the documented entry-bar rule.
-        assert t.in_sample == (t.entry_bar < split_bar)
+    is_trades, oos_trades = kstats.split_trades(trades, split_bar)
+    # Every trade's classification matches the documented entry-bar rule.
+    assert all(t.entry_bar < split_bar for t in is_trades)
+    assert all(t.entry_bar >= split_bar for t in oos_trades)
+    assert len(is_trades) + len(oos_trades) == len(trades)
     # Closed trades must exist on BOTH sides of the split.
-    assert any(t.in_sample for t in trades)
-    assert any(not t.in_sample for t in trades)
+    assert is_trades and oos_trades
     # Split sits in the tradeable region and the warmup prefix is always IS.
     assert split_bar == 324
     assert all(t.entry_bar >= 100 for t in trades)
 
 
 def test_split_metrics_reports_sharpe_and_drawdown():
-    """_split_metrics computes win rate, expectancy, Sharpe and max drawdown;
-    an empty segment degrades to just {'n': 0}."""
-    bt = _load_bt_module()
+    """``trade_stats`` computes win rate, expectancy, Sharpe and max drawdown;
+    an empty segment degrades to an all-zero Stats (n == 0)."""
+    from hermes_trader.backtest import stats as kstats
+    from hermes_trader.backtest.types import ExitReason, Trade
+
+    H = 3600_000
 
     def _tr(pnl, entry, exit_):
-        return bt.Trade(coin="X", side="long", entry_bar=entry, entry_px=100.0,
-                        notional=100.0, margin=10.0, leverage=5,
-                        exit_bar=exit_, exit_px=100.0, pnl_usd=pnl,
-                        exit_reason="x", in_sample=True)
+        return Trade(
+            coin="X", side="long", entry_bar=entry, exit_bar=exit_,
+            entry_time_ms=entry * H, exit_time_ms=exit_ * H,
+            entry_ref_px=100.0, entry_fill_px=100.0,
+            exit_ref_px=100.0, exit_fill_px=100.0,
+            reason=ExitReason.FLOOR_BREACH, notional_usd=100.0, fee_usd=0.0,
+            pnl_gross_usd=pnl, pnl_net_usd=pnl)
 
     # Equity path: +10 (peak 10), -4 (dd 4), +6 (peak 16), -10 (dd 10) -> MDD 10.
     seg = [_tr(10, 0, 1), _tr(-4, 2, 3), _tr(6, 4, 5), _tr(-10, 6, 7)]
-    m = bt._split_metrics(seg, equity=100.0)
-    assert m["n"] == 4
-    assert m["wins"] == 2
-    assert abs(m["pnl"] - 2.0) < 1e-9
-    assert abs(m["expectancy"] - 0.5) < 1e-9
-    assert abs(m["max_dd"] - 10.0) < 1e-9
-    assert m["sharpe"] != 0.0  # non-zero dispersion -> finite Sharpe
-    empty = bt._split_metrics([], equity=100.0)
-    assert empty == {"n": 0}
+    m = kstats.trade_stats(seg, equity=100.0)
+    assert m.n == 4
+    assert m.wins == 2
+    assert abs(m.pnl_net_usd - 2.0) < 1e-9
+    assert abs(m.expectancy_usd - 0.5) < 1e-9
+    assert abs(m.max_dd_usd - 10.0) < 1e-9
+    assert m.sharpe != 0.0  # non-zero dispersion -> finite Sharpe
+    assert kstats.trade_stats([], equity=100.0).n == 0
 
 
 # ── Phase 0 (R7): candle cache hit/miss Prometheus counter ─────────────────

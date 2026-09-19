@@ -12,10 +12,8 @@ that one re-asks the AI fresh; this one trusts yesterday's AI verdicts.
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import sys
-import tempfile
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -35,96 +33,93 @@ if _env.exists():
                 continue
             os.environ.setdefault(k.strip(), v.strip())
 
+from dataclasses import replace
+
 from _memory_io import load_memory
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.dsl_exit import _build_policy_from_config
 from hermes_trader.agents.sizing import atr_equal_risk_notional
+from hermes_trader.backtest import cost as kcost
+from hermes_trader.backtest.exit_dsl import DslBarExit
+from hermes_trader.backtest.types import ExitEvent, ExitReason
 from hermes_trader.client.exchange import get_max_leverage
-from hermes_trader.client.hl_client import _http_post
+from hermes_trader.data import historical_candles as hc
 from hermes_trader.indicators.math import atr as calc_atr
 from hermes_trader.models.types import Candle
 
-_INTERVAL_MS = {"5m": 300_000, "1h": 3_600_000, "4h": 14_400_000}
-_CANDLE_CACHE: Dict[Tuple[str, str, int, int], Optional[List[Candle]]] = {}
-_DISK_CANDLE_CACHE: Dict[str, Any] = {}
-_DISK_CACHE_FILE = ""
+# P4-7: this script no longer owns a candle cache. All historical bars come
+# from the shared point-in-time data layer (hermes_trader.data.historical_candles),
+# which is the same append-only (coin, interval, t) bar store that
+# `collect_candles.py` pre-warms and the backfill_* research scripts use. The
+# shims below preserve the old call surface (fetch_candles_at / _load_disk_cache
+# / _save_disk_cache) for this script and its four pf_*/signal_* descendants.
+_INTERVAL_MS = hc.INTERVAL_MS
 _API_FAILURES = 0
 _API_SLEEP_S = 0.0
-
-
-def _cache_key(coin: str, interval: str, count: int, end_ms: int) -> str:
-    return json.dumps([coin, interval, count, end_ms], separators=(",", ":"))
+_DISK_CACHE_FILE = ""
 
 
 def _load_disk_cache(path: str) -> None:
-    global _DISK_CANDLE_CACHE
-    if not path:
-        return
-    try:
-        with open(path) as f:
-            raw = json.load(f)
-        if isinstance(raw, dict):
-            _DISK_CANDLE_CACHE = raw
-    except FileNotFoundError:
-        _DISK_CANDLE_CACHE = {}
-    except Exception:
-        _DISK_CANDLE_CACHE = {}
+    """Compatibility shim: point the kernel bar store at ``path``.
+
+    The kernel lazily loads on first fetch, so this only pins the target file.
+    An empty path disables a pinned location (the kernel then falls back to its
+    HERMES_HIST_CANDLE_CACHE / /data default).
+    """
+    global _DISK_CACHE_FILE
+    _DISK_CACHE_FILE = path or ""
+    hc.set_cache_file(path or None)
 
 
-def _save_disk_cache(path: str) -> None:
-    if not path:
-        return
-    try:
-        tmp = f"{path}.tmp"
-        with open(tmp, "w") as f:
-            json.dump(_DISK_CANDLE_CACHE, f)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-def _candles_from_json(raw: Any) -> Optional[List[Candle]]:
-    if raw is None:
-        return None
-    if not isinstance(raw, list):
-        return None
-    return [Candle(t=c["t"], o=float(c["o"]), h=float(c["h"]), l=float(c["l"]),
-                   c=float(c["c"]), v=float(c.get("v", "0"))) for c in raw]
-
-
-def _candles_to_json(candles: List[Candle]) -> List[Dict[str, Any]]:
-    return [{"t": c.t, "o": c.o, "h": c.h, "l": c.l, "c": c.c, "v": c.v} for c in candles]
+def _save_disk_cache(path: str) -> bool:
+    """Compatibility shim: atomically flush newly cached kernel bars."""
+    return hc.flush_disk_cache(path or None)
 
 
 def fetch_candles_at(coin: str, interval: str, count: int, end_ms: int) -> Optional[List[Candle]]:
+    """Return the most recent ``count`` bars CLOSED at or before ``end_ms``.
+
+    Thin PIT wrapper over the shared data layer. Bar-open ``t`` of the newest
+    returned bar is ``<= end_ms - interval`` (no still-forming bar, no future
+    price). Returns ``None`` on a fetch error (legacy contract: callers skip
+    the verdict as no-data) and ``[]``-like short results when history is thin.
+    """
     global _API_FAILURES
-    key = (coin, interval, count, end_ms)
-    if key in _CANDLE_CACHE:
-        return _CANDLE_CACHE[key]
-    disk_key = _cache_key(coin, interval, count, end_ms)
-    if disk_key in _DISK_CANDLE_CACHE:
-        candles = _candles_from_json(_DISK_CANDLE_CACHE[disk_key])
-        _CANDLE_CACHE[key] = candles
-        return candles
     if _API_SLEEP_S > 0:
         time.sleep(_API_SLEEP_S)
-    step = _INTERVAL_MS[interval]
-    payload = {"type": "candleSnapshot",
-               "req": {"coin": coin, "interval": interval,
-                       "startTime": end_ms - step * count, "endTime": end_ms}}
     try:
-        raw = _http_post("/info", payload)
+        bars = hc.closed_bars_as_of(
+            coin, interval,
+            max(0, end_ms - (count + 1) * hc.INTERVAL_MS[interval]),
+            end_ms)
     except Exception:
-        raw = None
-    if not isinstance(raw, list):
         _API_FAILURES += 1
-        _CANDLE_CACHE[key] = None
         return None
-    candles = [Candle(t=c["t"], o=float(c["o"]), h=float(c["h"]), l=float(c["l"]),
-                      c=float(c["c"]), v=float(c.get("v", "0"))) for c in raw]
-    _CANDLE_CACHE[key] = candles
-    _DISK_CANDLE_CACHE[disk_key] = _candles_to_json(candles)
-    return candles
+    return bars[-count:] if len(bars) > count else bars
+
+
+def fetch_forward_bars(coin: str, interval: str,
+                       entry_ms: int, end_ms: int) -> Optional[List[Candle]]:
+    """Closed bars with bar-open ``t >= entry_ms`` grid and closed by ``end_ms``.
+
+    ``bars[0]`` is the ENTRY bar (the bar opening at/just after ``entry_ms``),
+    already closed in this offline replay — the DSL engine treats its open as
+    the fill and its high/low as intra-bar path. This is the PIT-correct
+    replacement for the old replay fetch, which could include a still-forming
+    forward bar. ``None`` on a fetch error (caller skips as no-data).
+    """
+    global _API_FAILURES
+    if _API_SLEEP_S > 0:
+        time.sleep(_API_SLEEP_S)
+    step = hc.INTERVAL_MS[interval]
+    start_grid = entry_ms - (entry_ms % step)
+    try:
+        bars = hc.fetch_candle_range(coin, interval, start_grid, end_ms)
+    except Exception:
+        _API_FAILURES += 1
+        return None
+    return [b for b in bars if b.t + step <= end_ms]
 
 
 def detect_regime_at(end_ms: int, proxy: str = "BTC") -> str:
@@ -229,47 +224,42 @@ def passes_counter_regime(side: str, regime: str, conf: float, composite: float,
     return conf >= min_conf or composite >= 50 or burst_fired or slow_fired
 
 
-def simulate_dsl_exit(entry_px: float, side: str, leverage: int,
-                      forward_5m: List[Candle], dsl_cfg: Dict[str, Any]) -> Tuple[float, str, int, float]:
-    max_loss_pct = float(cfg_get("dsl_exit.max_loss_pct", config=dsl_cfg))
-    max_loss_roe_pct = float(cfg_get("dsl_exit.max_loss_roe_pct", config=dsl_cfg))
-    protect_pct = float(cfg_get("dsl_exit.protect_pct", config=dsl_cfg))
-    retrace = float(cfg_get("dsl_exit.retrace_threshold", config=dsl_cfg))
-    hard_timeout_min = float(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg))
-    timeout_bars = int(hard_timeout_min // 5)
-    lev = max(1, leverage)
-    effective_max = min(max_loss_pct, max_loss_roe_pct / lev)
-    is_long = side == "long"
-    peak = entry_px
+def replay_exit_bars(
+    entry_px: float,
+    side: str,
+    leverage: int,
+    entry_ms: int,
+    bars_5m: List[Candle],
+    policy: Any,
+    cost: kcost.CostModel,
+    notional: float,
+    entry_atr_pct: float = 0.0,
+    entry_regime: str = "",
+) -> Tuple[str, int, float, float, float, float]:
+    """Drive the PRODUCTION DSL exit (P4 kernel) over one logged verdict.
 
-    for i, bar in enumerate(forward_5m):
-        if i >= timeout_bars:
-            spot_pct = (bar.c - entry_px)/entry_px*100 if is_long else (entry_px - bar.c)/entry_px*100
-            return (spot_pct * lev, "hard_timeout", i, bar.c)
-        loss_pct = (entry_px - bar.l)/entry_px*100 if is_long else (bar.h - entry_px)/entry_px*100
-        if loss_pct >= effective_max:
-            stop_px = entry_px * (1 - effective_max/100) if is_long else entry_px * (1 + effective_max/100)
-            return (-effective_max * lev, "max_loss", i, stop_px)
-        if is_long and bar.h > peak: peak = bar.h
-        elif not is_long and bar.l < peak: peak = bar.l
-        if is_long:
-            profit_pct = (peak - entry_px)/entry_px*100
-            if profit_pct >= protect_pct:
-                floor_px = peak - (peak - entry_px) * retrace
-                if bar.l <= floor_px:
-                    return (((floor_px - entry_px)/entry_px*100) * lev, "floor_breach", i, floor_px)
-        else:
-            profit_pct = (entry_px - peak)/entry_px*100
-            if profit_pct >= protect_pct:
-                floor_px = peak + (entry_px - peak) * retrace
-                if bar.h >= floor_px:
-                    return (((entry_px - floor_px)/entry_px*100) * lev, "floor_breach", i, floor_px)
+    ``bars_5m[0]`` is the ENTRY bar (position fills at its open); the adapter
+    feeds it as bar 0 so a same-bar gap stop is caught, then the remaining
+    forward bars. If no exit fires inside the fetched window the position is
+    marked at the last bar's close (``end_of_data``). Returns
+    ``(reason, exit_bar_index, exit_ref_px, exit_fill_px, pnl_gross, pnl_net)``.
+    """
+    engine = DslBarExit(side=side, entry_px=entry_px, entry_time_ms=entry_ms,
+                        policy=policy, leverage=max(1, leverage), coin="REPLAY",
+                        entry_atr_pct=entry_atr_pct, entry_regime=entry_regime)
+    event: Optional[ExitEvent] = None
+    for idx, bar in enumerate(bars_5m):
+        event = engine.on_bar(bar, idx)
+        if event is not None:
+            break
+    if event is None:
+        last = bars_5m[-1]
+        event = ExitEvent(len(bars_5m) - 1, ExitReason.END_OF_DATA, last.c)
 
-    if not forward_5m:
-        return (0.0, "no_data", 0, entry_px)
-    last = forward_5m[-1]
-    spot_pct = (last.c - entry_px)/entry_px*100 if is_long else (entry_px - last.c)/entry_px*100
-    return (spot_pct * lev, "end_of_window", len(forward_5m), last.c)
+    fill_entry = cost.fill_entry(entry_px, side)
+    fill_exit = cost.fill_exit(event.ref_px, side, event.reason)
+    gross, net = cost.pnl_usd(side, fill_entry, fill_exit, notional)
+    return (event.reason.value, event.bar_index, event.ref_px, fill_exit, gross, net)
 
 
 def main() -> int:
@@ -312,8 +302,10 @@ def main() -> int:
                     help="Seconds to sleep before uncached Hyperliquid candle requests")
     ap.add_argument("--summary-only", action="store_true",
                     help="Suppress per-trade rows; print only aggregate results")
-    ap.add_argument("--cache-file", default=os.path.join(tempfile.gettempdir(), "hermes_backtest_logged_candles.json"),
-                    help="Disk cache for historical candles; set empty string to disable")
+    ap.add_argument("--cache-file", default=None,
+                    help="Kernel bar-cache file (default: HERMES_HIST_CANDLE_CACHE "
+                         "or /data/.historical-candles.json, shared with collect_candles "
+                         "and backfill scripts); set empty string for the kernel default")
     ap.add_argument("--apply-runner-gate", action="store_true",
                     help="Apply executor.runner_entry_gate to admitted trades")
     ap.add_argument("--runner-min-confidence", type=float, default=None,
@@ -352,6 +344,25 @@ def main() -> int:
         dsl_cfg["protect_pct"] = args.protect
     if args.retrace:
         dsl_cfg["retrace_threshold"] = args.retrace
+    # P4 kernel: one production ExitPolicy (CLI overrides applied on top), and a
+    # single cost contract. The adapter copies the policy per trade, so no state
+    # is shared across replays. --taker-fee/--slippage map to round-trip fee +
+    # symmetric per-side slip (stop_delay=0 preserves the script's legacy
+    # uniform-slip treatment).
+    base_policy = replace(
+        _build_policy_from_config(),
+        max_loss_pct=float(dsl_cfg["max_loss_pct"]),
+        max_loss_roe_pct=float(dsl_cfg["max_loss_roe_pct"]),
+        protect_pct=float(dsl_cfg["protect_pct"]),
+        retrace_threshold=float(dsl_cfg["retrace_threshold"]),
+        hard_timeout_minutes=float(dsl_cfg["hard_timeout_minutes"]),
+    )
+    cost_model = kcost.CostModel(
+        round_trip_fee_bps=args.taker_fee_bps * 2,
+        entry_slip_bps=args.slippage_bps,
+        exit_slip_bps=args.slippage_bps,
+        stop_delay_slip_bps=0.0,
+    )
     counter_regime_min_conf = float(cfg_get("counter_regime_min_conf", config=cfg))
     equity_fraction = float(args.equity_fraction or cfg.get("equity_fraction_per_trade", 0.04))
     base_leverage = int(args.leverage or cfg_get("leverage", config=cfg))
@@ -399,6 +410,8 @@ def main() -> int:
         print(f"# Runner gate: {runner_cfg.get('runner_entry_gate', {})}")
     print(f"# DSL: max_loss={dsl_cfg.get('max_loss_pct')}% / {dsl_cfg.get('max_loss_roe_pct')}% ROE | "
           f"protect={dsl_cfg.get('protect_pct')}% | timeout={dsl_cfg.get('hard_timeout_minutes')}min")
+    print("# Exit engine: production DSLTracker via the P4 kernel adapter (live policy; entry bar "
+          "is bar 0, so a same-bar gap stop is caught; end-of-window -> end_of_data)")
     print()
 
     # Dedup window: skip same-coin within N minutes of a previous trade
@@ -520,24 +533,27 @@ def main() -> int:
             skipped_regime += 1
             continue
 
-        # Fetch the entry bar + forward 5m bars (DSL window)
+        # Fetch the entry bar + forward 5m bars (DSL window). fetch_forward_bars
+        # returns only CLOSED bars (no still-forming bar): bars[0] opens at the
+        # analysis grid and is the entry bar the DSL fills at / paths through.
         timeout_min = float(cfg_get("dsl_exit.hard_timeout_minutes", config=dsl_cfg))
         forward_end = ts + int(timeout_min * 60_000) + 600_000  # +10min padding
-        forward = fetch_candles_at(coin, "5m", int(timeout_min // 5) + 10, forward_end)
+        forward = fetch_forward_bars(coin, "5m", ts, forward_end)
         if forward is None:
             skipped_nodata += 1
             continue
-        forward = [b for b in forward if b.t >= ts]
         if not forward:
             skipped_nodata += 1
             continue
 
-        entry_px = forward[0].o  # open of the first bar after analysis
+        entry_px = forward[0].o  # open of the first bar at/after analysis
         if entry_px <= 0:
             skipped_nodata += 1
             continue
-        forward = forward[1:]  # bars STRICTLY after entry bar's open
-        if not forward:
+        # bars_5m[0] IS the entry bar; the adapter feeds it as bar 0 so a
+        # same-bar gap stop is caught (the legacy local simulator skipped it).
+        bars_5m = forward
+        if len(bars_5m) < 2:
             skipped_nodata += 1
             continue
 
@@ -555,16 +571,21 @@ def main() -> int:
             skipped_size += 1
             continue
 
-        gross_roe, reason, bars, exit_px = simulate_dsl_exit(entry_px, side, base_leverage, forward, dsl_cfg)
-        roe = gross_roe - round_trip_cost_roe
+        # Production ATR-stop scales off the 4h ATR% captured at entry; fetch it
+        # only when the live policy actually has an ATR stop enabled.
+        atr_pct = (entry_atr4h(coin, ts) / entry_px * 100.0) if base_policy.atr_stop_enabled else 0.0
+        reason, exit_bar, _exit_ref, exit_fill_px, _pnl_gross, pnl_usd = replay_exit_bars(
+            entry_px, side, base_leverage, bars_5m[0].t, bars_5m, base_policy,
+            cost_model, notional, entry_atr_pct=atr_pct, entry_regime=regime,
+        )
         margin = notional / max(1, base_leverage)
-        pnl_usd = roe / 100 * margin
+        roe = pnl_usd / margin * 100.0
         pnl_total += pnl_usd
         notionals.append(notional)
         sizing_labels[sizing_label] = sizing_labels.get(sizing_label, 0) + 1
         last_trade_by_coin[coin] = ts
         if pnl_usd < 0 and loss_cooldown_ms > 0:
-            exit_ts = ts + int(bars * 5 * 60_000)
+            exit_ts = bars_5m[0].t + int((exit_bar + 1) * 5 * 60_000)
             loss_block_until[coin] = exit_ts + loss_cooldown_ms
         (wins if pnl_usd > 0 else losses).append(pnl_usd)
         by_reason.setdefault(reason, []).append(roe)
@@ -572,7 +593,7 @@ def main() -> int:
         trades.append((ts, coin, side, conf, composite, roe, reason, pnl_usd))
         if not args.summary_only:
             print(f"  {_iso(ts)}  {coin:<14} {side:<5} conf={conf:.2f} comp={composite:>4.0f}  "
-                  f"entry={entry_px:.6g} exit={exit_px:.6g}  {reason:<14} ROE={roe:+6.1f}%  ${pnl_usd:+6.2f}")
+                  f"entry={entry_px:.6g} exit={exit_fill_px:.6g}  {reason:<18} ROE={roe:+6.1f}%  ${pnl_usd:+6.2f}")
 
     n = len(trades)
     wr = len(wins) / n if n else 0
@@ -592,7 +613,7 @@ def main() -> int:
         roes = by_reason[reason]
         avg = sum(roes)/len(roes)
         tot_pnl = sum(by_reason_pnl.get(reason, []))
-        print(f"  {reason:<14} n={len(roes):>3}  avg ROE {avg:+6.1f}%  total ${tot_pnl:+7.2f}")
+        print(f"  {reason:<18} n={len(roes):>3}  avg ROE {avg:+6.1f}%  total ${tot_pnl:+7.2f}")
     _save_disk_cache(_DISK_CACHE_FILE)
     return 0
 
