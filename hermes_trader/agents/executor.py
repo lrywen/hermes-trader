@@ -2868,6 +2868,188 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     return min(max_loss, max_roe / lev) / 100.0
 
 
+def _sizing_v2_shadow_observe(
+    *,
+    coin: str,
+    analysis: dict[str, Any],
+    leverage: float,
+    agg_equity: float,
+    memory: Any,
+    _risk_pct: float,
+    _v1_stop_frac: float,
+    _v2_stop_pct: float,
+    _atr_pct: float,
+    _atr_mean_pct: float,
+    _slip_bps: float,
+    _regime: str,
+    _eff: dict[str, Any],
+    _calib: dict[str, Any],
+    _cap: float,
+    _atr_sizing: dict[str, Any],
+    _sizing_v2_mode: str,
+    _sv2: dict[str, Any],
+) -> None:
+    """S9 stage: sizing-v2 SHADOW observation leaf (read-only).
+
+    Records the v1-vs-v2 width/notional comparison plus the CS-G short-side +
+    cost-cap model, but never mutates the applied ``_stop_frac`` or
+    ``analysis`` — the enforce path stays inline in ``maybe_execute`` because
+    it drives real notional. Best-effort: any failure is swallowed at debug
+    level exactly as the original inline block. Extracted verbatim in the
+    P1-1 step ③ phase split.
+    """
+    # Shadow: record the v1-vs-v2 comparison (width + notional)
+    # but keep sizing on the legacy v1 width. Best-effort.
+    try:
+        _v2_notional = ((_risk_pct * agg_equity) / (_v2_stop_pct / 100.0)
+                        if _v2_stop_pct > 0 else 0.0)
+        _v1_notional = ((_risk_pct * agg_equity) / _v1_stop_frac
+                        if _v1_stop_frac > 0 else 0.0)
+        # ── CS-G: short-side + cost-cap (shadow-only) ───────
+        # Denominator-widening model: expected round-trip costs
+        # are treated as EXTRA stop distance, so
+        #   notional = risk_pct*equity / (stop + costs).
+        # OBSERVATION ONLY — none of this touches the live
+        # enforce path, core_stop, effective_stop_pct, nor the
+        # existing v2 fields above.
+        _cost: dict[str, Any] = {}
+        try:
+            _cside = str(analysis.get("side", "long") or "long").lower()
+            if _cside not in ("long", "short"):
+                _cside = "long"
+            _side_sign = 1.0 if _cside == "long" else -1.0
+            # Direction-differentiated exit slip with cold-start
+            # degradation (coin+side → shared coin → global side
+            # → conservative default; never zero). The v2 stop
+            # already embeds the SHARED coin slip (_slip_pct),
+            # so only the incremental side-specific adverse slip
+            # widens the cost denominator (no double counting).
+            try:
+                _side_slip_bps, _slip_src = memory.avg_exit_slip_bps_side(
+                    coin, _cside, days=30.0)
+            except Exception:
+                _side_slip_bps, _slip_src = _slip_bps, "legacy"
+            _side_slip_extra_frac = max(
+                0.0, (_side_slip_bps - _slip_bps) / 1e4)
+            # Round-trip taker fee, spot/notional fraction. The
+            # live config constant is authoritative: in-process
+            # closes don't carry fee_actual, so the memory series
+            # is usually empty (0.0) and is logged for audit only.
+            _fee_pct = _resolve_hl_taker_fee_pct()
+            _rt_fills = _resolve_hl_round_trip_fills()
+            _fee_frac = max(0.0, float(_fee_pct) * int(_rt_fills) / 100.0)
+            try:
+                _mem_fee_bps = float(
+                    memory.avg_round_trip_fee_bps(coin, days=30.0) or 0.0)
+            except Exception:
+                _mem_fee_bps = 0.0
+            # Expected carry horizon: measured same-side mean
+            # hold, else config/conservative default.
+            try:
+                _cfg_hold = float(_atr_sizing.get(
+                    "sizing_v2_expected_hold_hours",
+                    _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS) or 0.0)
+                if _cfg_hold <= 0:
+                    _cfg_hold = _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS
+            except (TypeError, ValueError):
+                _cfg_hold = _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS
+            try:
+                _exp_hold_hrs, _hold_src = memory.avg_hold_hours_side(
+                    coin, _cside, days=30.0, default_hours=_cfg_hold)
+            except Exception:
+                _exp_hold_hrs, _hold_src = _cfg_hold, "default"
+            # Latest per-hour funding (5-min cached primitive).
+            _funding_hr = None
+            try:
+                from hermes_trader.client.hl_client import fetch_funding_history
+                try:
+                    _lb_h = int(cfg_get("funding_lookback_hours", 24))
+                    if _lb_h <= 0:
+                        _lb_h = 24
+                except (TypeError, ValueError):
+                    _lb_h = 24
+                _fh = fetch_funding_history(
+                    coin, int(time.time() * 1000) - _lb_h * 3_600_000)
+                if _fh:
+                    _r = float(_fh[-1].get("fundingRate", 0) or 0)
+                    _funding_hr = _r if _r == _r else None
+            except Exception:
+                _funding_hr = None
+            # Direction-aware signed carry; clamp at 0 so an
+            # expected carry INCOME (negative for the side) can
+            # never LEVERAGE the notional up.
+            _carry_frac = 0.0
+            if _funding_hr is not None and _exp_hold_hrs > 0:
+                _carry_frac = max(
+                    0.0,
+                    float(_funding_hr) * float(_exp_hold_hrs) * _side_sign)
+            _eff_frac = _v2_stop_pct / 100.0
+            _cost_denom = max(_eff_frac, _eff_frac + _side_slip_extra_frac
+                              + _fee_frac + _carry_frac)
+            _cost_notional = ((_risk_pct * agg_equity) / _cost_denom
+                              if _cost_denom > 0 else 0.0)
+            # Same pre-gray risk clamps the enforce path uses
+            # (lev cap + merged notional/total-room cap); the
+            # enforce-only gray throttle is intentionally not
+            # replayed here. _max_by_lev is assigned further down
+            # for the live path, so recompute the same value.
+            _cost_lev_cap = max(1, int(leverage)) * agg_equity
+            _cost_notional_clamped = _cost_notional
+            if _cost_notional_clamped > _cost_lev_cap:
+                _cost_notional_clamped = _cost_lev_cap
+            if _cap > 0 and _cost_notional_clamped > _cap:
+                _cost_notional_clamped = _cap
+            _cost = {
+                "side": _cside,
+                "v2_cost_slip_bps": round(float(_side_slip_bps), 3),
+                "v2_cost_slip_source": _slip_src,
+                "v2_cost_slip_extra_pct": round(_side_slip_extra_frac * 100.0, 4),
+                "v2_cost_fee_rt_pct": round(_fee_frac * 100.0, 4),
+                "v2_cost_fee_measured_bps": round(_mem_fee_bps, 3),
+                "v2_cost_hold_hours": round(float(_exp_hold_hrs), 3),
+                "v2_cost_hold_source": _hold_src,
+                "v2_cost_funding_rate_hr": (round(float(_funding_hr), 8)
+                                            if _funding_hr is not None else None),
+                "v2_cost_carry_pct": round(_carry_frac * 100.0, 4),
+                "v2_cost_borrow_bps": _SIZING_V2_BORROW_BPS,
+                "v2_cost_denom_pct": round(_cost_denom * 100.0, 4),
+                "v2_cost_notional_usd": round(_cost_notional, 2),
+                "v2_cost_notional_clamped_usd": round(_cost_notional_clamped, 2),
+                "v2_cost_cap_binds": bool(_cost_notional > _cost_notional_clamped),
+                "v2_cost_vs_v2_ratio": round(_cost_notional / _v2_notional, 4)
+                                        if _v2_notional > 0 else 0.0,
+            }
+        except Exception as _ce:
+            logger.debug(f"[sizing-v2] cost-cap shadow failed for {coin}: {_ce}")
+        _sizing_v2_record_shadow({
+            "ts": int(time.time() * 1000),
+            "mode": _sizing_v2_mode,
+            "coin": coin,
+            "regime": str(_regime),
+            "trend_regime": str(_eff["regime_label"]),
+            "leverage": int(leverage),
+            "equity": round(float(agg_equity), 2),
+            "risk_per_trade_pct": round(float(_risk_pct), 5),
+            "v1_stop_pct": round(_v1_stop_frac * 100.0, 4),
+            "v2_stop_pct": round(_v2_stop_pct, 4),
+            "v2_core_stop_pct": round(float(_eff["core_stop"]), 4),
+            "v1_notional_usd": round(_v1_notional, 2),
+            "v2_notional_usd": round(_v2_notional, 2),
+            "notional_ratio": round(_v2_notional / _v1_notional, 4)
+                            if _v1_notional > 0 else 0.0,
+            "atr_pct": round(_atr_pct, 4),
+            "atr_hist_mean_pct": round(_atr_mean_pct, 4),
+            "atr_spike": bool(_eff["atr_spike"]),
+            "slip_adj_pct": round(float(_eff["slip_adj_pct"]), 4),
+            "atr_calib_mode": _calib["mode"],
+            "atr_calib_regime": _calib["regime"],
+            "atr_calib_factor": round(float(_calib["factor"]), 4),
+            **_cost,
+        }, _sizing_v2_shadow_path(_sv2["block"]))
+    except Exception as _se:
+        logger.debug(f"[sizing-v2] shadow record failed for {coin}: {_se}")
+
+
 def _structural_override_path(analysis: dict[str, Any], config: dict[str, Any],
                               mode: str, override_strong: bool,
                               od: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -3500,155 +3682,28 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     analysis["_sizing_v2_breakdown"] = _eff
                 else:
                     # Shadow: record the v1-vs-v2 comparison (width + notional)
-                    # but keep sizing on the legacy v1 width. Best-effort.
-                    try:
-                        _v2_notional = ((_risk_pct * agg_equity) / (_v2_stop_pct / 100.0)
-                                        if _v2_stop_pct > 0 else 0.0)
-                        _v1_notional = ((_risk_pct * agg_equity) / _v1_stop_frac
-                                        if _v1_stop_frac > 0 else 0.0)
-                        # ── CS-G: short-side + cost-cap (shadow-only) ───────
-                        # Denominator-widening model: expected round-trip costs
-                        # are treated as EXTRA stop distance, so
-                        #   notional = risk_pct*equity / (stop + costs).
-                        # OBSERVATION ONLY — none of this touches the live
-                        # enforce path, core_stop, effective_stop_pct, nor the
-                        # existing v2 fields above.
-                        _cost: dict[str, Any] = {}
-                        try:
-                            _cside = str(analysis.get("side", "long") or "long").lower()
-                            if _cside not in ("long", "short"):
-                                _cside = "long"
-                            _side_sign = 1.0 if _cside == "long" else -1.0
-                            # Direction-differentiated exit slip with cold-start
-                            # degradation (coin+side → shared coin → global side
-                            # → conservative default; never zero). The v2 stop
-                            # already embeds the SHARED coin slip (_slip_pct),
-                            # so only the incremental side-specific adverse slip
-                            # widens the cost denominator (no double counting).
-                            try:
-                                _side_slip_bps, _slip_src = memory.avg_exit_slip_bps_side(
-                                    coin, _cside, days=30.0)
-                            except Exception:
-                                _side_slip_bps, _slip_src = _slip_bps, "legacy"
-                            _side_slip_extra_frac = max(
-                                0.0, (_side_slip_bps - _slip_bps) / 1e4)
-                            # Round-trip taker fee, spot/notional fraction. The
-                            # live config constant is authoritative: in-process
-                            # closes don't carry fee_actual, so the memory series
-                            # is usually empty (0.0) and is logged for audit only.
-                            _fee_pct = _resolve_hl_taker_fee_pct()
-                            _rt_fills = _resolve_hl_round_trip_fills()
-                            _fee_frac = max(0.0, float(_fee_pct) * int(_rt_fills) / 100.0)
-                            try:
-                                _mem_fee_bps = float(
-                                    memory.avg_round_trip_fee_bps(coin, days=30.0) or 0.0)
-                            except Exception:
-                                _mem_fee_bps = 0.0
-                            # Expected carry horizon: measured same-side mean
-                            # hold, else config/conservative default.
-                            try:
-                                _cfg_hold = float(_atr_sizing.get(
-                                    "sizing_v2_expected_hold_hours",
-                                    _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS) or 0.0)
-                                if _cfg_hold <= 0:
-                                    _cfg_hold = _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS
-                            except (TypeError, ValueError):
-                                _cfg_hold = _SIZING_V2_DEFAULT_EXPECTED_HOLD_HRS
-                            try:
-                                _exp_hold_hrs, _hold_src = memory.avg_hold_hours_side(
-                                    coin, _cside, days=30.0, default_hours=_cfg_hold)
-                            except Exception:
-                                _exp_hold_hrs, _hold_src = _cfg_hold, "default"
-                            # Latest per-hour funding (5-min cached primitive).
-                            _funding_hr = None
-                            try:
-                                from hermes_trader.client.hl_client import fetch_funding_history
-                                try:
-                                    _lb_h = int(cfg_get("funding_lookback_hours", 24))
-                                    if _lb_h <= 0:
-                                        _lb_h = 24
-                                except (TypeError, ValueError):
-                                    _lb_h = 24
-                                _fh = fetch_funding_history(
-                                    coin, int(time.time() * 1000) - _lb_h * 3_600_000)
-                                if _fh:
-                                    _r = float(_fh[-1].get("fundingRate", 0) or 0)
-                                    _funding_hr = _r if _r == _r else None
-                            except Exception:
-                                _funding_hr = None
-                            # Direction-aware signed carry; clamp at 0 so an
-                            # expected carry INCOME (negative for the side) can
-                            # never LEVERAGE the notional up.
-                            _carry_frac = 0.0
-                            if _funding_hr is not None and _exp_hold_hrs > 0:
-                                _carry_frac = max(
-                                    0.0,
-                                    float(_funding_hr) * float(_exp_hold_hrs) * _side_sign)
-                            _eff_frac = _v2_stop_pct / 100.0
-                            _cost_denom = max(_eff_frac, _eff_frac + _side_slip_extra_frac
-                                              + _fee_frac + _carry_frac)
-                            _cost_notional = ((_risk_pct * agg_equity) / _cost_denom
-                                              if _cost_denom > 0 else 0.0)
-                            # Same pre-gray risk clamps the enforce path uses
-                            # (lev cap + merged notional/total-room cap); the
-                            # enforce-only gray throttle is intentionally not
-                            # replayed here. _max_by_lev is assigned further down
-                            # for the live path, so recompute the same value.
-                            _cost_lev_cap = max(1, int(leverage)) * agg_equity
-                            _cost_notional_clamped = _cost_notional
-                            if _cost_notional_clamped > _cost_lev_cap:
-                                _cost_notional_clamped = _cost_lev_cap
-                            if _cap > 0 and _cost_notional_clamped > _cap:
-                                _cost_notional_clamped = _cap
-                            _cost = {
-                                "side": _cside,
-                                "v2_cost_slip_bps": round(float(_side_slip_bps), 3),
-                                "v2_cost_slip_source": _slip_src,
-                                "v2_cost_slip_extra_pct": round(_side_slip_extra_frac * 100.0, 4),
-                                "v2_cost_fee_rt_pct": round(_fee_frac * 100.0, 4),
-                                "v2_cost_fee_measured_bps": round(_mem_fee_bps, 3),
-                                "v2_cost_hold_hours": round(float(_exp_hold_hrs), 3),
-                                "v2_cost_hold_source": _hold_src,
-                                "v2_cost_funding_rate_hr": (round(float(_funding_hr), 8)
-                                                            if _funding_hr is not None else None),
-                                "v2_cost_carry_pct": round(_carry_frac * 100.0, 4),
-                                "v2_cost_borrow_bps": _SIZING_V2_BORROW_BPS,
-                                "v2_cost_denom_pct": round(_cost_denom * 100.0, 4),
-                                "v2_cost_notional_usd": round(_cost_notional, 2),
-                                "v2_cost_notional_clamped_usd": round(_cost_notional_clamped, 2),
-                                "v2_cost_cap_binds": bool(_cost_notional > _cost_notional_clamped),
-                                "v2_cost_vs_v2_ratio": round(_cost_notional / _v2_notional, 4)
-                                                        if _v2_notional > 0 else 0.0,
-                            }
-                        except Exception as _ce:
-                            logger.debug(f"[sizing-v2] cost-cap shadow failed for {coin}: {_ce}")
-                        _sizing_v2_record_shadow({
-                            "ts": int(time.time() * 1000),
-                            "mode": _sizing_v2_mode,
-                            "coin": coin,
-                            "regime": str(_regime),
-                            "trend_regime": str(_eff["regime_label"]),
-                            "leverage": int(leverage),
-                            "equity": round(float(agg_equity), 2),
-                            "risk_per_trade_pct": round(float(_risk_pct), 5),
-                            "v1_stop_pct": round(_v1_stop_frac * 100.0, 4),
-                            "v2_stop_pct": round(_v2_stop_pct, 4),
-                            "v2_core_stop_pct": round(float(_eff["core_stop"]), 4),
-                            "v1_notional_usd": round(_v1_notional, 2),
-                            "v2_notional_usd": round(_v2_notional, 2),
-                            "notional_ratio": round(_v2_notional / _v1_notional, 4)
-                                            if _v1_notional > 0 else 0.0,
-                            "atr_pct": round(_atr_pct, 4),
-                            "atr_hist_mean_pct": round(_atr_mean_pct, 4),
-                            "atr_spike": bool(_eff["atr_spike"]),
-                            "slip_adj_pct": round(float(_eff["slip_adj_pct"]), 4),
-                            "atr_calib_mode": _calib["mode"],
-                            "atr_calib_regime": _calib["regime"],
-                            "atr_calib_factor": round(float(_calib["factor"]), 4),
-                            **_cost,
-                        }, _sizing_v2_shadow_path(_sv2["block"]))
-                    except Exception as _se:
-                        logger.debug(f"[sizing-v2] shadow record failed for {coin}: {_se}")
+                    # but keep sizing on the legacy v1 width. Read-only leaf
+                    # extracted to _sizing_v2_shadow_observe.
+                    _sizing_v2_shadow_observe(
+                        coin=coin,
+                        analysis=analysis,
+                        leverage=leverage,
+                        agg_equity=agg_equity,
+                        memory=memory,
+                        _risk_pct=_risk_pct,
+                        _v1_stop_frac=_v1_stop_frac,
+                        _v2_stop_pct=_v2_stop_pct,
+                        _atr_pct=_atr_pct,
+                        _atr_mean_pct=_atr_mean_pct,
+                        _slip_bps=_slip_bps,
+                        _regime=_regime,
+                        _eff=_eff,
+                        _calib=_calib,
+                        _cap=_cap,
+                        _atr_sizing=_atr_sizing,
+                        _sizing_v2_mode=_sizing_v2_mode,
+                        _sv2=_sv2,
+                    )
             if agg_equity <= 0 or _risk_pct <= 0 or _stop_frac <= 0:
                 return {
                     "executed": False, "mode": mode, "analysis_id": analysis["id"],
