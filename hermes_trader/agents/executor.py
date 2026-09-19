@@ -1538,6 +1538,35 @@ def _spread_width_block(*, aid: str, mode: str,
     return None
 
 
+def _asset_class_block(*, aid: str, mode: str, coin: str,
+                       config: dict[str, Any]) -> dict[str, Any] | None:
+    """Asset-class enablement gate (HIP-3 tokenized-equity vs native crypto).
+
+    Mirrors the perception-time filter so a stale perception (e.g. one
+    re-evaluated from memory after the operator flips the flag) cannot sneak
+    through to a real trade. Crypto = native HL coin (no colon); HIP-3 =
+    colon-namespaced (``xyz:MU``). Returns an executable-style block result, or
+    None when the asset class is enabled (continue executing).
+
+    Pure decision leaf: no I/O, no locks, no mutation. The class is derived
+    from the coin substring and the two enablement flags are read straight
+    from the resolved config dict. Extracted verbatim in the P1-1 step (3)
+    phase split.
+    """
+    is_hip3 = ":" in (coin or "")
+    if is_hip3 and not bool(config.get("enable_hip3", False)):
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": "hip3_disabled (set enable_hip3=true to trade tokenized-equity perps)",
+        }
+    if (not is_hip3) and not bool(config.get("enable_crypto", True)):
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": "crypto_disabled (set enable_crypto=true to trade native HL perps)",
+        }
+    return None
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -3620,19 +3649,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # perception (e.g. one re-evaluated from memory after the operator
     # flips the flag) can't sneak through to a real trade. Crypto =
     # native HL coin (no colon); HIP-3 = colon-namespaced (`xyz:MU`).
-    is_hip3 = ":" in (analysis.get("coin") or "")
-    if is_hip3 and not bool(config.get("enable_hip3", False)):
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": "hip3_disabled (set enable_hip3=true to trade tokenized-equity perps)",
-        }
-    if (not is_hip3) and not bool(config.get("enable_crypto", True)):
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": "crypto_disabled (set enable_crypto=true to trade native HL perps)",
-        }
+    # Pure decision leaf extracted to _asset_class_block.
+    _ac_block = _asset_class_block(
+        aid=analysis["id"], mode=mode,
+        coin=(analysis.get("coin") or ""), config=config)
+    if _ac_block is not None:
+        return _ac_block
 
     # Shadow-signals (free-signal suite) + xs_reversal LONG shadow probe.
     # Both fire-and-forget on daemon threads, self-gated, non-fatal; extracted
