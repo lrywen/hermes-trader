@@ -1306,6 +1306,44 @@ def momentum_reentry_allowed(last_exit_px: Optional[float], last_side: Optional[
     return (False, "")
 
 
+def _loss_cooldown_block(*, analysis: dict[str, Any], mode: str,
+                         config: dict[str, Any]) -> dict[str, Any] | None:
+    """S5 stage of maybe_execute: anti-revenge loss cooldown gate.
+
+    Refuse re-entry on a coin whose last close was a LOSS and whose extended
+    block hasn't expired (armed in close_position_market). A momentum-
+    continuation re-entry (name reclaimed above where it stopped us, strong
+    composite) bypasses the cooldown — that is a run we got shaken out of, not
+    a falling knife. Returns an executable-style block result, or None when
+    there is no active cooldown / the bypass applies (continue executing).
+
+    Pre-lock, read-only decision leaf: it only reads the module-level memory
+    and logs; it never places orders or touches the entry flock / markers.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    _coin = analysis["coin"]
+    _lc_remaining = memory.loss_cooldown_remaining_min(_coin)
+    if _lc_remaining <= 0:
+        return None
+    # Momentum-continuation re-entry: if the name has reclaimed above where it
+    # stopped us (resumed uptrend, strong composite), bypass the anti-revenge
+    # cooldown — that's a run we got shaken out of, not a falling knife.
+    _last = memory.last_close_for(_coin) or {}
+    _mr_ok, _mr_why = momentum_reentry_allowed(
+        _last.get("exit_px"), _last.get("side"),
+        analysis.get("mid"), analysis.get("composite_score"), config)
+    if _mr_ok:
+        logger.info(f"[executor] momentum re-entry on {_coin}: "
+                    f"{_mr_why} — bypassing {_lc_remaining:.0f}min loss cooldown")
+        return None
+    return {
+        "executed": False, "mode": mode,
+        "analysis_id": analysis["id"],
+        "reason": (f"loss_cooldown ({_coin} closed at a loss recently — "
+                   f"{_lc_remaining:.0f}min remaining)"),
+    }
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -3471,26 +3509,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     _record_per_coin_regime_probe(analysis, config, runner_block="")
 
     # Loss cooldown: refuse re-entry on a coin whose last close was a LOSS and
-    # whose extended block hasn't expired (armed in close_position_market).
-    _lc_remaining = memory.loss_cooldown_remaining_min(analysis["coin"])
-    if _lc_remaining > 0:
-        # Momentum-continuation re-entry: if the name has reclaimed above where it
-        # stopped us (resumed uptrend, strong composite), bypass the anti-revenge
-        # cooldown — that's a run we got shaken out of, not a falling knife.
-        _last = memory.last_close_for(analysis["coin"]) or {}
-        _mr_ok, _mr_why = momentum_reentry_allowed(
-            _last.get("exit_px"), _last.get("side"),
-            analysis.get("mid"), analysis.get("composite_score"), config)
-        if _mr_ok:
-            logger.info(f"[executor] momentum re-entry on {analysis['coin']}: "
-                        f"{_mr_why} — bypassing {_lc_remaining:.0f}min loss cooldown")
-        else:
-            return {
-                "executed": False, "mode": mode,
-                "analysis_id": analysis["id"],
-                "reason": (f"loss_cooldown ({analysis['coin']} closed at a loss recently — "
-                           f"{_lc_remaining:.0f}min remaining)"),
-            }
+    # whose extended block hasn't expired (armed in close_position_market),
+    # unless a momentum-continuation re-entry bypasses it. Pre-lock read-only
+    # leaf extracted to _loss_cooldown_block (returns a block result or None).
+    _lc = _loss_cooldown_block(analysis=analysis, mode=mode, config=config)
+    if _lc is not None:
+        return _lc
 
     # Idempotency — fast path: a trade already recorded for this analysis in
     # persistent history means a duplicate must never place again. This is a
