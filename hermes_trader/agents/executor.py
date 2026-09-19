@@ -2854,6 +2854,20 @@ def _sizing_exposure_cap(config: dict[str, Any], agg_equity: float,
     return cap
 
 
+def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
+    """S9 stage: legacy v1 stop width as a fraction of notional.
+
+    ``min(max_loss_pct, max_loss_roe_pct / max(1, leverage)) / 100`` — the
+    top-level DSL stop (e.g. 2.5% / 25% at 10x → 2.5% stop). Computed up front
+    so the v2 shadow path can log the v1-vs-v2 comparison while still sizing on
+    v1. Pure leaf extracted in the P1-1 step ③ phase split.
+    """
+    max_loss = float(dsl.get("max_loss_pct", 0.4) or 0.4)
+    max_roe = float(dsl.get("max_loss_roe_pct", 5.0) or 5.0)
+    lev = max(1, leverage)
+    return min(max_loss, max_roe / lev) / 100.0
+
+
 def _price_atr_guard(coin: str) -> tuple[float, float, Optional[str]]:
     """S9 stage entry: fetch a fresh live mid and 4h ATR, fail CLOSED.
 
@@ -3390,11 +3404,9 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             _dsl = config.get("dsl_exit", {}) or {}
             # Legacy v1 stop width: top-level max_loss_pct/max_loss_roe
             # (2.5%/25 at 10x → 2.5% stop). Computed up front so v2 shadow can
-            # log the v1-vs-v2 comparison while still sizing on v1.
-            _max_loss = float(_dsl.get("max_loss_pct", 0.4) or 0.4)
-            _max_roe = float(_dsl.get("max_loss_roe_pct", 5.0) or 5.0)
-            _lev = max(1, leverage)
-            _v1_stop_frac = min(_max_loss, _max_roe / _lev) / 100.0
+            # log the v1-vs-v2 comparison while still sizing on v1. Extracted to
+            # _v1_stop_width in the P1-1 step ③ phase split.
+            _v1_stop_frac = _v1_stop_width(_dsl, leverage)
             _stop_frac = _v1_stop_frac
             # ── Sizing v2: regime-aware + full DSL three-layer stop ───────
             # The legacy path under-risks every trade 2.5-5x (it assumes the
