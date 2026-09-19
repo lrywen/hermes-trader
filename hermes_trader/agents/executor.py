@@ -1466,6 +1466,32 @@ def _binary_news_flags(*, news_risk: object, news_text: str) -> tuple[bool, str]
     return has_binary_news, binary_news_match
 
 
+def _atr_volatility_block(*, aid: str, mode: str,
+                          atr: float, mid_price: float,
+                          max_atr_pct: float) -> dict[str, Any] | None:
+    """Pre-trade ATR volatility gate (post-HYPE postmortem 2026-08-21).
+
+    Reject entries whose 4h ATR(14) exceeds a ceiling of spot: a high-ATR
+    name pushes the backup stop tens of points past the DSL floor and fires
+    on noise within a candle or two. Strict greater-than; a non-positive mid
+    yields a 0% reading that clears (an unreadable price is rejected
+    elsewhere). Returns an executable-style block result, or None when the
+    volatility clears the ceiling (continue executing).
+
+    Pure decision leaf on already-fetched ATR/mid: no I/O, no locks, no
+    mutation. The ceiling is resolved by the caller (_resolve_max_atr_pct)
+    so this leaf stays free of env/config reads. Extracted verbatim in the
+    P1-1 step ③ phase split.
+    """
+    atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
+    if atr_pct > max_atr_pct:
+        return {
+            "executed": False, "mode": mode, "analysis_id": aid,
+            "reason": f"atr_too_high ({atr_pct:.2f}% > {max_atr_pct:.1f}%)",
+        }
+    return None
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -4325,17 +4351,17 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # on noise within 1-2 candles. Config key: max_atr_pct (default 15.0);
     # legacy env HERMES_MAX_ATR_PCT still honored for backward compatibility.
     _max_atr_pct = _resolve_max_atr_pct(config=config)
-    _atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
-    if _atr_pct > _max_atr_pct:
+    # Pure decision leaf extracted to _atr_volatility_block.
+    _atr_block = _atr_volatility_block(
+        aid=analysis["id"], mode=mode,
+        atr=atr, mid_price=mid_price, max_atr_pct=_max_atr_pct)
+    if _atr_block is not None:
+        _atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
         logger.warning(
             f"[executor] SKIPPING {coin}: ATR% {_atr_pct:.2f}% > {_max_atr_pct:.1f}% max "
             f"(atr={atr:.6g}, mid={mid_price:.6g}, lev={leverage}x) — volatility too high for risk caps"
         )
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": analysis["id"],
-            "reason": f"atr_too_high ({_atr_pct:.2f}% > {_max_atr_pct:.1f}%)",
-        }
+        return _atr_block
 
     # P1-3a: set_leverage swallows SDK/transport errors and returns
     # {"ok": False}; the old bare call discarded the result, so sizing,
