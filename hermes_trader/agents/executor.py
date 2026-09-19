@@ -1429,6 +1429,43 @@ def _free_margin_floor_block(*, aid: str, mode: str, config: dict[str, Any],
     return None
 
 
+# News blackout trigger vocabulary: stand down only on GENUINELY adverse news.
+# The AI judges the recent (last 48h) headlines and emits news_risk; the regex
+# only surfaces a representative headline naming what tripped the stand-down.
+_BINARY_NEWS_TERM_RE = re.compile(
+    r"\b(hack|exploit|lawsuit|halt|delist|miss|crash|plunge|fraud)\w*"
+    r"|\bfomc\b|\bcpi\b|\bsec\b|\bfed(eral)?\b",
+    re.IGNORECASE,
+)
+
+
+def _binary_news_flags(*, news_risk: object, news_text: str) -> tuple[bool, str]:
+    """News-blackout stage of maybe_execute: resolve the two gate inputs.
+
+    Only a literally "negative" AI news_risk arms the stand-down; a matching
+    adverse term in the headlines is surfaced as a representative label (the
+    '|'-delimited headline containing it, else the first 140 chars), so the
+    gate result says what tripped it. A positive/beat headline never arms.
+
+    Pure decision leaf on the analysis dict: no I/O, no locks, no mutation.
+    Extracted verbatim in the P1-1 step ③ phase split.
+    """
+    has_binary_news = str(news_risk or "none").lower() == "negative"
+    binary_news_match = ""
+    if has_binary_news and news_text:
+        m = _BINARY_NEWS_TERM_RE.search(news_text)
+        if m:
+            term = m.group(0)
+            headline = next(
+                (h.strip() for h in news_text.split("|") if term.lower() in h.lower()),
+                news_text[:140],
+            )
+            binary_news_match = f"'{term}' in: {headline}"
+        else:
+            binary_news_match = news_text[:140]
+    return has_binary_news, binary_news_match
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -4082,26 +4119,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # mention of "earnings"/"SEC" etc. — an earnings BEAT is bullish and must
     # not block. Sentiment also makes the old equity-perp exemption unnecessary:
     # the AI won't flag a beat as negative, but WILL flag a miss/fraud.
-    news_text = analysis.get("news_context") or ""
-    news_risk = str(analysis.get("news_risk") or "none").lower()
-    has_binary_news = news_risk == "negative"
-    binary_news_match = ""
-    if has_binary_news and news_text:
-        # Surface a representative adverse headline so the log says what tripped it.
-        m = re.search(
-            r"\b(hack|exploit|lawsuit|halt|delist|miss|crash|plunge|fraud)\w*"
-            r"|\bfomc\b|\bcpi\b|\bsec\b|\bfed(eral)?\b",
-            news_text, re.IGNORECASE,
-        )
-        if m:
-            term = m.group(0)
-            headline = next(
-                (h.strip() for h in news_text.split("|") if term.lower() in h.lower()),
-                news_text[:140],
-            )
-            binary_news_match = f"'{term}' in: {headline}"
-        else:
-            binary_news_match = news_text[:140]
+    # Pure decision leaf extracted to _binary_news_flags.
+    has_binary_news, binary_news_match = _binary_news_flags(
+        news_risk=analysis.get("news_risk"),
+        news_text=analysis.get("news_context") or "",
+    )
 
     trade_side = analysis.get("side", "long") or "long"
 
