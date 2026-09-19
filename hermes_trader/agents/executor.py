@@ -1344,6 +1344,34 @@ def _loss_cooldown_block(*, analysis: dict[str, Any], mode: str,
     }
 
 
+def _already_executed_block(*, aid: str, mode: str) -> dict[str, Any] | None:
+    """Idempotency fast path of maybe_execute: refuse a recorded duplicate.
+
+    A trade already recorded for this analysis in persistent history means a
+    duplicate must never place again. This is only the read-only pre-filter:
+    the authoritative in-flight + history re-check still runs under the entry
+    lock immediately before placement so concurrent callers cannot both order.
+    Returns an executable-style block result, or None when the analysis has
+    no recorded fill (continue executing).
+
+    Pre-lock, read-only decision leaf: it only reads the module-level memory;
+    it never places orders or touches the entry flock / markers. Extracted
+    verbatim in the P1-1 step ③ phase split.
+    """
+    already = next(
+        (t for t in memory.get_recent_trades(100)
+         if t.get("analysis_id") == aid and t.get("size_usd", 0) > 0),
+        None,
+    )
+    if already is None:
+        return None
+    return {
+        "executed": False, "mode": mode,
+        "analysis_id": aid, "reason": "already_executed",
+        "order_id": already.get("order_id"),
+    }
+
+
 def _signed_price(base_px: float, distance: float, is_buy: bool) -> float:
     """Offset `base_px` by `distance` in the trade's protective direction.
 
@@ -3522,19 +3550,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     # under the lock immediately before order placement (after all gates) so
     # that concurrent callers cannot both pass this check and both order, and
     # so the in-flight marker cannot leak on the early gate-rejection returns
-    # below.
+    # below. Read-only leaf extracted to _already_executed_block.
     _aid = analysis["id"]
-    already = next(
-        (t for t in memory.get_recent_trades(100)
-         if t.get("analysis_id") == _aid and t.get("size_usd", 0) > 0),
-        None,
-    )
-    if already:
-        return {
-            "executed": False, "mode": mode,
-            "analysis_id": _aid, "reason": "already_executed",
-            "order_id": already.get("order_id"),
-        }
+    _dup = _already_executed_block(aid=_aid, mode=mode)
+    if _dup is not None:
+        return _dup
 
     # Deterministic exchange-side idempotency key from the analysis UUID (128
     # bits, exactly Cloid's 16-byte capacity). A retried/duplicated order for
