@@ -685,6 +685,25 @@ if _safety_errors:
             len(_safety_errors))
         sys.exit(78)  # EX_CONFIG
 logger.info("[startup safety] envelope check passed (0 breaches)")
+# B-12/B-13 (G3, 2026-09-20): LIVE acceptance gate at BOOT time, on top of the
+# per-order P0-1 env grant. B-12 logs contradictory HERMES_ENABLE_LIVE×mode
+# combos; B-13 makes mode=LIVE a hard startup refusal unless a valid §5.2
+# outcome-A acceptance record is present (判据1–5 pass + block-bootstrap CI
+# strictly > 0). This is the资金冻结纪律 and is deliberately NOT bypassable by
+# HERMES_SKIP_STARTUP_SAFETY (that ack only covers the conservative risk
+# envelope above) — the only release is a valid gate record. SHADOW/OFF pass.
+from hermes_trader.agents.live_gate import startup_live_gate_errors
+
+_gate_fatal, _gate_warnings = startup_live_gate_errors(startup_agent_config)
+for _w in _gate_warnings:
+    logger.warning("[startup gate] %s", _w)
+if _gate_fatal:
+    for _e in _gate_fatal:
+        logger.critical("[startup gate] %s", _e)
+    sys.exit(78)  # EX_CONFIG — refuse to start in LIVE without the gate
+if startup_mode == "LIVE":
+    logger.info("[startup gate] B-13 acceptance record valid — LIVE authorized")
+
 # HIP-3 toggle: this startup value only seeds the initial prefetched universe.
 # Audit 2026-09-06 (F4, engineering hygiene): the agent config is hot-reloaded
 # per cycle, and flipping enable_hip3 mid-run is detected in the per-cycle
