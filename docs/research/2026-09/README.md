@@ -56,6 +56,8 @@
 | `g2_loss_ledger_2026-09-20.md` | W3/G2 | 五段损耗瀑布（峰值毛利→出场回吐→滑点→手续费→净，加性残差 0）；L1 回吐占 88%，指向结局 B |
 | `w4_robustness_scoreboard_2026-09-20.md` | W4 | C/E/F 裁定 + bps 按天块自助；四臂 95%CI 全负不含 0，机械落定**结局 B** |
 | `c7_higher_timeframe_no_go_2026-09-20.md` | C-7 | 1h 出场独立评估，全样本/剔6月/剔9月四臂 CI 全负，**NO-GO**；瓶颈是 L1 出场回吐非成本 |
+| `pa_carry_funnel_closed_2026-09-20.md` | P-A | funding carry alpha 真实显著（5.83bps/天 CI不含0、中位年化8%、81币无负），但 perps beta 不可对冲（β自相关0.13、加权后−37%），**关闭转P-C** |
+| `pc_structured_reversal_no_edge_2026-09-20.md` | P-C | funding极值反转事件级无增量 edge（毛中位0、净CI含0/为负），小时级+16bps 是连续run中后期前视错觉，**否证关闭** |
 
 ## 找回原件的可选途径（备查，非必须）
 

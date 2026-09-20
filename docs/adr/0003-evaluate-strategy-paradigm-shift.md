@@ -1,6 +1,6 @@
 # ADR-0003：启动「换策略范式」独立评估
 
-- 状态：**Proposed → 执行中**（评估授权与四项执行参数已于 2026-09-20 评审确认；候选范式上线仍须等结局 A 证据并另立 Accepted ADR）
+- 状态：**P-A / P-C 均 Deprecated（funnel 否证，2026-09-20）**。P-A carry alpha 真实但 perps beta 不可对冲；P-C funding 极值反转事件级无增量 edge。P-B maker（本轮不投成交模型）、P-D 基差（需现货/更大资金）现工具集不可行。剩余现实选项＝注资取样或暂停研发 SHADOW 采数，**交用户决策**（见 `docs/research/2026-09/pa_carry_funnel_closed_2026-09-20.md`、`pc_structured_reversal_no_edge_2026-09-20.md`）。
 - 日期：2026-09-20
 - 决策者：操作者（2026-09-20 确认四项执行参数）；评估由当前会话连续执行
 - 关联：
