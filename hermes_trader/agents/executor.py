@@ -953,7 +953,7 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
     base_retrace = float(dsl_config.get("retrace_threshold", cfg_get("dsl_exit.retrace_threshold")))
     base_tiers = dsl_config.get("phase2_tiers")
     # A-1（2026-09-20）：生产 regime_aware.enabled=true 时 trend 用 0.8、
-    # non_trend 块显式给 0.4，故顶层 dsl_exit.max_loss_pct（=1.0）在本**出场**
+    # non_trend 块显式给 0.4，故顶层 dsl_exit.max_loss_pct（=1.0）在本出场
     # 路径不可达，仅在 non_trend 块缺省时作为回落默认。它仍被 v1 sizing 读取
     # （见 _v1_stop_width 的 A-1 注释），两处语义勿混。
     base_max_loss = float(dsl_config.get("max_loss_pct", cfg_get("dsl_exit.max_loss_pct")))
@@ -3173,7 +3173,7 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     **出场引擎**里不可达——``select_exit_params`` 在 regime_aware.enabled=true
     下恒返回 per-regime 值（trend 0.8 / non_trend 0.4），DSLTracker 从不读顶层
     值。但它在**本 v1 sizing 路径**仍然可达并被读取（实盘下单日志
-    "@ 1.00% stop"）。当前因权益极小、notional 恒被 \$30 notional_cap 钳制，
+    "@ 1.00% stop"）。当前因权益极小、notional 恒被 30 美元 notional_cap 钳制，
     该宽度不改变实际下单量；sizing_v2（shadow）转正后此值被真实 DSL 三层宽度
     取代。因此顶层 1.0 是历史手动调参遗留（2026-09-08/09 自 2.5 改为 1.0，
     无 git/审计记录），**不是**纯死值：改它会在放大资金/notional_cap 放开后
