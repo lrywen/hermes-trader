@@ -218,22 +218,35 @@ def test_cm6_different_coins_close_in_parallel(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executor, "get_hl_price", lambda c: 94.0)
 
-    def slow_place(is_buy, size, mid_price, coin, **kw):
+    # Two 0.3s sleeps: cross-coin blocking (a shared lock) costs ~0.6s;
+    # per-coin locks overlap at ~0.3s plus scheduling overhead. The old
+    # hard cutoff (<0.5s) flaked under full-suite load stalls (~0.65s while
+    # still parallel). A robust distinction measures overlap directly:
+    # both place_hl_order calls must be IN FLIGHT at the same instant, which
+    # is impossible under a shared lock regardless of machine load.
+    in_flight = {"n": 0}
+    max_overlap = {"n": 0}
+    overlap_seen = threading.Event()
+
+    def slow_place_overlap(is_buy, size, mid_price, coin, **kw):
+        in_flight["n"] += 1
+        max_overlap["n"] = max(max_overlap["n"], in_flight["n"])
+        if in_flight["n"] >= 2:
+            overlap_seen.set()
         time.sleep(0.3)  # network latency simulation
+        in_flight["n"] -= 1
         calls["place"] += 1
         return {"ok": True, "order_id": f"oid-{coin}",
                 "total_sz": float(size), "avg_px": 94.0}
 
-    monkeypatch.setattr(executor, "place_hl_order", slow_place)
+    monkeypatch.setattr(executor, "place_hl_order", slow_place_overlap)
 
-    t0 = time.time()
     t1 = threading.Thread(target=executor.close_position_market, args=("ETH",))
     t2 = threading.Thread(target=executor.close_position_market, args=("BTC",))
     t1.start(); t2.start()
     t1.join(timeout=15); t2.join(timeout=15)
-    elapsed = time.time() - t0
 
-    # Serial would be ~0.6s; parallel per-coin locks finish in ~0.3s.
-    assert elapsed < 0.5
+    assert overlap_seen.is_set(), "different-coin closes never overlapped (lock not per-coin)"
+    assert max_overlap["n"] == 2
     assert calls["place"] == 2
     assert calls["record_close"] == 2
