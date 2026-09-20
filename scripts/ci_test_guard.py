@@ -44,7 +44,11 @@ import xml.etree.ElementTree as ET
 #
 # W0 M0 冻结门（2026-09-19）上抬至实测值 4380（P4 统一回测内核 + 数据层 +
 # P5-1bd 工具链新增测试落库后）。上抬后 CI 不再容忍净删 287 个测试不报警。
-MIN_OFFLINE_TESTS = 4380
+#
+# W2 收尾（2026-09-20）上抬至实测值 4564：B-1a-改 stop_model parity（155）、
+# B-2 portfolio maxc（19）、B-4 逐币半价差（4）、B-5 成本口径（4）、guard 路径
+# 守卫（2）等本批新增测试落库；全量离线回归 4564 passed / 0 failed（422.9s）。
+MIN_OFFLINE_TESTS = 4564
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
