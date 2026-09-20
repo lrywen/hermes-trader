@@ -1,7 +1,7 @@
 # ADR-0003：启动「换策略范式」独立评估
 
-- 状态：**P-A / P-C 均 Deprecated（funnel 否证，2026-09-20）**。P-A carry alpha 真实但 perps beta 不可对冲；P-C funding 极值反转事件级无增量 edge。P-B maker（本轮不投成交模型）、P-D 基差（需现货/更大资金）现工具集不可行。剩余现实选项＝注资取样或暂停研发 SHADOW 采数，**交用户决策**（见 `docs/research/2026-09/pa_carry_funnel_closed_2026-09-20.md`、`pc_structured_reversal_no_edge_2026-09-20.md`）。
-- 日期：2026-09-20
+- 状态：**P-A / P-C / P-D 均 Deprecated，P-B 现工具集不可行（2026-09-21 更新）**。P-A carry alpha 真实但 perps beta 不可对冲；P-C funding 极值反转事件级无增量 edge；P-D 现货+空 perp 基差经预注册单一 60 天确认证伪（典型仓正、但 funding 反转肥尾主导期望，**零交易成本下均值仍 −19.8bps**，CI 下界不 >0）。P-B maker 需成交模型，历史数据无法回答。四个候选均无可行正期望路径，剩余现实选项＝注资小资金实盘取样或暂停研发 SHADOW 采数，**交用户决策**（见 `docs/research/2026-09/pa_carry_funnel_closed_2026-09-20.md`、`pc_structured_reversal_no_edge_2026-09-20.md`、`pd_basis_preregistered_no_go_2026-09-21.md`）。
+- 日期：2026-09-20（状态 2026-09-21 更新）
 - 决策者：操作者（2026-09-20 确认四项执行参数）；评估由当前会话连续执行
 - 关联：
   - `docs/research/2026-09/c7_higher_timeframe_no_go_2026-09-20.md`（5m/1h 同范式皆结局 B）
