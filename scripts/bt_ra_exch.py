@@ -585,8 +585,14 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
                     pullback_bars: int = 0,
                     exch: Optional[Dict[str, float]] = None,
                     atr_abs: float = 0.0,
-                    sizing: Optional[Dict[str, float]] = None) -> Optional[Trade]:
+                    sizing: Optional[Dict[str, float]] = None,
+                    bar_ms: int = MS_5M) -> Optional[Trade]:
     """bar i 收盘出信号，bar i+1 开盘成交，逐 bar 跑 dsl_exit 阶梯。
+
+    bar_ms：``bars`` 的真实周期。5m 回放取 MS_5M（默认，行为与历史逐字一致）；
+    C-7 的 1h 出场回放取 MS_1H —— 此时调用方负责把信号去重成「每小时一个」并
+    让 ``i`` 索引到 1h 序列（PIT 对齐，见 replay_coin）。所有墙钟量（elapsed、
+    成交时间戳、pullback 挂单有效期的调用方根数换算）都按 bar_ms 标定。
 
     pullback_pct>0：改为限价挂单 —— 参考价 = bar i+1 开盘，
     限价 = ref*(1-sgn*pct%)，pullback_bars 根内触及则成交（gap 有利按
@@ -598,7 +604,7 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
       ② TP 分批（_place_tp_scale_out）：tp_px = entry ± atr4h*tp_atr_mult，
          平 tp_scale_fraction；意图额 < min_order_usd 时 UPSIZE 到最小额
          （占仓位 >= skip_threshold 则 SKIP）
-    交易所单是 tick 级挂单，**同一 5m bar 内先于 DSL 的收盘检查**触发。
+    交易所单是 tick 级挂单，**同一根 bar 内先于 DSL 的收盘检查**触发。
     atr_abs 必须是【4h ATR(14)】的绝对值（复现 get_hl_atr("4h",14,coin)）。
     """
     j = i + 1
@@ -700,7 +706,7 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
     size_left = 1.0
     for k in range(j, len(bars)):
         b = bars[k]
-        elapsed_min = (b.t + MS_5M - entry_t) / 60_000.0
+        elapsed_min = (b.t + bar_ms - entry_t) / 60_000.0
         peak_pct = sgn * (peak - entry_px) / entry_px * 100.0  # 截至 k-1 收盘
 
         # ── B-1a-改①：Phase2 交易所镜像 SL = DSL floor × (1 − 10bps) ──
@@ -725,7 +731,7 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
             hit_ex_tp = (b.h >= ex_tp_px) if sgn > 0 else (b.l <= ex_tp_px)
             if hit_ex_sl:
                 # SL 与 TP 同 bar 都触及 → bar 级无法判先后，保守取 SL（不利）
-                return _close(b.t + MS_5M, _fill(ex_sl_px, b),
+                return _close(b.t + bar_ms, _fill(ex_sl_px, b),
                               "exchange_trigger", k, True,
                               realized=realized, size_left=size_left)
             if hit_ex_tp and tp_frac_eff > 0:
@@ -738,7 +744,7 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
                     # 受 min-size 限制）→ 整仓最终由交易所侧了结
                     realized += (sgn * (ex_tp_px - entry_px) / entry_px
                                  * notional * size_left)
-                    return _close(b.t + MS_5M, ex_tp_px,
+                    return _close(b.t + bar_ms, ex_tp_px,
                                   "exchange_trigger", k, False,
                                   realized=realized, size_left=0.0)
                 tp_frac_eff = 0.0  # 剩余仓位继续走 DSL
@@ -749,20 +755,20 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
         if (dsl.time_scratch_minutes > 0
                 and elapsed_min >= dsl.time_scratch_minutes
                 and peak_pct < dsl.time_scratch_min_peak):
-            return _close(b.t + MS_5M, b.c, "time_scratch", k, False,
+            return _close(b.t + bar_ms, b.c, "time_scratch", k, False,
                           realized=realized, size_left=size_left)
         if (dsl.stale_flat_timeout_minutes > 0
                 and elapsed_min >= dsl.stale_flat_timeout_minutes
                 and peak_pct < dsl.protect_pct):
-            return _close(b.t + MS_5M, b.c, "stale_flat_timeout", k, False,
+            return _close(b.t + bar_ms, b.c, "stale_flat_timeout", k, False,
                           realized=realized, size_left=size_left)
         if (dsl.hard_timeout_minutes > 0
                 and elapsed_min >= dsl.hard_timeout_minutes):
-            return _close(b.t + MS_5M, b.c, "hard_timeout", k, False,
+            return _close(b.t + bar_ms, b.c, "hard_timeout", k, False,
                           realized=realized, size_left=size_left)
         hit_stop = (b.l <= stop_px) if sgn > 0 else (b.h >= stop_px)
         if hit_stop:
-            return _close(b.t + MS_5M, _fill(stop_px, b), "max_loss", k, True,
+            return _close(b.t + bar_ms, _fill(stop_px, b), "max_loss", k, True,
                           realized=realized, size_left=size_left)
         # phase 2：arm 基于 PEAK ≥ protect（:1182）
         if peak_pct >= dsl.protect_pct:
@@ -777,14 +783,14 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
             prev_floor = floor
             breached = (b.l < floor) if sgn > 0 else (b.h > floor)
             if breached:
-                return _close(b.t + MS_5M, _fill(floor, b), "floor_breach", k,
+                return _close(b.t + bar_ms, _fill(floor, b), "floor_breach", k,
                               False, realized=realized, size_left=size_left)
         # peak 收盘后推进 —— 杜绝 bar 内前视
         peak = max(peak, b.h) if sgn > 0 else min(peak, b.l)
 
     # 数据末端仍持仓 → 按末根收盘价平仓
     k = len(bars) - 1
-    return _close(bars[k].t + MS_5M, bars[k].c, "end_of_data", k, False,
+    return _close(bars[k].t + bar_ms, bars[k].c, "end_of_data", k, False,
                   realized=realized, size_left=size_left)
 
 
@@ -815,11 +821,61 @@ def _passes_filter(c: Candidate) -> bool:
     return True
 
 
+def _dispatch_arms_1h(coin, per_arm, bars5m, h1, dsls, notional, e_slip,
+                      x_slip, stop_delay, P, regime_at, atr4h_at, funnel):
+    """C-7：信号去重成「每根 1h 每臂一个」后，在 1h 序列上回放出场/持仓。
+
+    与 5m 路径共用 _simulate_trade（bar_ms=MS_1H），仅 bar 序列与信号密度不同；
+    生产语义（杠杆有效止损、交易所镜像 SL/TP、逐笔 sizing、per-coin 滑点）全部不变。
+    单仓：同一臂一笔持仓未平前，后续信号跳过（复刻 5m 的 open_until 占用规则）。
+    """
+    ts1h = [c.t for c in h1]
+    trades: List[Trade] = []
+    for arm, cands in per_arm.items():
+        # 5m 决策时点 -> 成交 1h bar 索引（第一根 open >= 决策时点的 1h）。
+        # 同一成交 bar 只保留决策最晚的候选；cands 已按 i 升序，后者覆盖前者。
+        by_h: Dict[int, Any] = {}
+        for i5, cand in cands:
+            decision_ms = bars5m[i5].t + MS_5M
+            h = bisect.bisect_left(ts1h, decision_ms)  # 该 1h open >= 决策时点
+            if h >= len(h1):
+                continue
+            by_h[h] = cand  # 升序覆盖 → 保留同 bar 最晚信号
+        arm_dsl = dsls.get(arm, dsls["live"])
+        open_until_h = -1
+        for h in sorted(by_h):
+            if h <= open_until_h:
+                funnel["skip_open_pos"] += 1
+                continue
+            cand = by_h[h]
+            _dsl = arm_dsl
+            if arm in ("filt_ra", "filt_ra_exch"):
+                _dsl = (dsls["ra_trend"]
+                        if regime_at(h1[h].t) in ("up", "down")
+                        else dsls["ra_nontrend"])
+            _exch = P.get("exch") if arm in ("filt_exch", "filt_ra_exch") else None
+            _atr = atr4h_at(h1[h].t) if _exch else 0.0
+            _sizing = P.get("sizing") if _exch else None
+            # 1h 限价挂单有效期：5m 的 24 根(2h) = 2 根 1h
+            pb_kw = ({"pullback_pct": PULLBACK_PCT, "pullback_bars": 2}
+                     if arm == "pullback" else {})
+            tr = _simulate_trade(cand, h1, h - 1, _dsl, notional, e_slip,
+                                 x_slip, stop_delay, coin, exch=_exch,
+                                 atr_abs=_atr, sizing=_sizing,
+                                 bar_ms=MS_1H, **pb_kw)
+            if tr is None:
+                continue
+            trades.append(tr)
+            open_until_h = h + tr.hold_bars
+    return trades, funnel
+
+
 def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                 dsls: Dict[str, DslParams], notional: float,
                 slips: Tuple[float, float, float],
                 source: str = "hyperliquid",
                 per_coin_slip: bool = True,
+                exit_interval: str = "5m",
                 ) -> Tuple[List[Trade], Dict[str, int]]:
     funnel: Dict[str, int] = {
         "bars": 0, "fired_ge_1": 0, "surfaced": 0, "no_dir": 0,
@@ -934,6 +990,16 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                         per_arm["filt_s60"].append(
                             (i, replace(cand, arm="filt_s60")))
 
+    # ── C-7：出场/持仓迁 1h（信号仍是上面 5m 引擎的产物）──────────────────
+    # PIT 对齐：每个候选的成交 1h bar = open 时间 >= 5m 决策时点(bars[i].t+5m)
+    # 的第一根 1h（即信号确定后才开盘的那一根，绝不用包含信号前价格的当根）。
+    # 同一根成交 1h bar 内的多个 5m 信号去重，每臂只保留决策最晚的一个；
+    # _simulate_trade 约定「bar i 收盘出信号、i+1 开盘成交」，故传 h_idx-1。
+    if exit_interval == "1h":
+        return _dispatch_arms_1h(
+            coin, per_arm, bars, c1h_all, dsls, notional, e_slip, x_slip,
+            stop_delay, P, _regime_at, _atr4h_at, funnel)
+
     for arm, cands in per_arm.items():
         arm_dsl = dsls.get(arm, dsls["live"])
         pb_kw = ({"pullback_pct": PULLBACK_PCT, "pullback_bars": PULLBACK_BARS}
@@ -984,7 +1050,7 @@ def _summ(trades: List[Trade]) -> Dict[str, Any]:
         "expectancy": net / n,
         "net": net,
         "pf": (gross_w / gross_l) if gross_l > 0 else float("inf"),
-        "avg_hold_h": sum(t.hold_bars for t in trades) * 5 / 60 / n,
+        "avg_hold_h": sum(t.exit_t - t.entry_t for t in trades) / 3_600_000 / n,
         "avg_peak": sum(t.peak_pct for t in trades) / n,
     }
 
@@ -1127,6 +1193,10 @@ def main() -> None:
     ap.add_argument("--slip-mode", choices=("per-coin", "flat"), default="per-coin",
                     help="per-coin（默认）：按 PER_COIN_SLIP_BPS 逐币半价差（P5-1d）；"
                          "flat：全池统一用 --entry/exit-slip-bps（复现旧口径用）")
+    ap.add_argument("--exit-interval", choices=("5m", "1h"), default="5m",
+                    help="C-7：信号仍在 5m 引擎上生成，但出场/持仓回放迁到该周期。"
+                         "1h 时每个 1h bar 每臂只取该小时内最后一个通过过滤的 5m 信号"
+                         "（PIT 对齐，无混频未来函数），成交在下一 1h 开盘。默认 5m=历史口径。")
     ap.add_argument("--write", action="store_true",
                     help="写隔离产物 JSONL（默认 dry-run 只打印汇总）")
     ap.add_argument("--out", default=str(_REPO / "logs" / "backtest_majors_surge_experiments.jsonl"))
@@ -1232,7 +1302,8 @@ def main() -> None:
         trades, funnel = replay_coin(
             coin, start_ms, end_ms, P, dsls, args.notional,
             (args.entry_slip_bps, args.exit_slip_bps, args.stop_delay_bps),
-            source=args.source, per_coin_slip=(args.slip_mode == "per-coin"))
+            source=args.source, per_coin_slip=(args.slip_mode == "per-coin"),
+            exit_interval=args.exit_interval)
         funnels[coin] = funnel
         all_trades.extend(trades)
         n_base = sum(1 for t in trades if t.arm == "baseline")
@@ -1250,6 +1321,7 @@ def main() -> None:
             f.write(json.dumps({
                 "type": "run_meta", "config_src": cfg_src, "coins": coins,
                 "source": args.source,
+                "signal_interval": "5m", "exit_interval": args.exit_interval,
             "arms": [k for k, _ in ARMS],
                 "days": args.days, "start_ms": start_ms, "end_ms": end_ms,
                 "notional": args.notional,
