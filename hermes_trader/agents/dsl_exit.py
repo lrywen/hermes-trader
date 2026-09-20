@@ -150,6 +150,12 @@ def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         at this tick — counter-factual, not a profit claim);
       * whether the realized MFE would have armed a candidate lower breakeven.
     Live stop behaviour is unchanged. Best-effort, never raises.
+
+    E-1/E-2 否证标注（2026-09-20，W4；仅注释，不改 shadow 观测行为）：生产
+    候选 candidate_max_loss_pct=1.5 / candidate_breakeven_trigger_pct=1.0 均已被
+    证据否证，**不得转正**——E-1：放宽到 1.5 在 P4 为 −18.23 bps（方向错误）；
+    E-2：breakeven 触发降到 1.0 会把追踪止盈价值从 +218 压到 +73 bps。此函数
+    仅继续留痕供复核，任何 promote 须先有块自助正面结果（G3 门禁）。
     """
     try:
         from hermes_trader.agents.config_store import read_agent_config

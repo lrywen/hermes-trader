@@ -1195,8 +1195,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # RSI[15,35)); the probe records every xs+awake trigger with the full
     # snapshot and flags is_candidate for that cell. Default off (inert);
     # shadow via HERMES_XS_REVERSAL_MODE. enforce is record-only in M2.
+    #
+    # E-4 键名规范（2026-09-20，W4）：此臂用三态 ``mode``（off|shadow|enforce，
+    # env fail-closed，被 schema 与 test_xs_reversal_shadow 固化），它是其它臂
+    # ``enabled`` 布尔 + ``shadow_mode`` 布尔两键组合的**严格超集**——mode 单键
+    # 即可表达「关 / 只观测 / 执行」三态且不可误配成半开状态。故刻意不引入冗余
+    # ``enabled`` 键；规范上认定 mode 为本臂（及一切需 enforce 门的影子臂）的
+    # 权威启用键。纯布尔影子臂继续用 enabled/shadow_mode。
     "xs_reversal": {
-        "mode": "off",             # off | shadow | enforce (enforce=record-only)
+        "mode": "off",             # off | shadow | enforce (enforce=record-only); 权威启用键（E-4）
         "shadow_log_path": "",     # empty = ~/.hermes-trading/xs_reversal_shadow.jsonl
         "lookback_d": 3,           # rolling highest-high window (days of 1h bars)
         "top_pct": 85,             # ext_pct bottom-tail percentile (M1: 90+ halves sample)
