@@ -55,6 +55,7 @@
 | `w3_blockers_scoreboard_2026-09-20.md` | W3 | A-1~A-6 阻塞性澄清结论（max_loss_pct=1 / maxc=2 / [atr] 公式 / held 语义 / DOT cloid / TP 分批缺口） |
 | `g2_loss_ledger_2026-09-20.md` | W3/G2 | 五段损耗瀑布（峰值毛利→出场回吐→滑点→手续费→净，加性残差 0）；L1 回吐占 88%，指向结局 B |
 | `w4_robustness_scoreboard_2026-09-20.md` | W4 | C/E/F 裁定 + bps 按天块自助；四臂 95%CI 全负不含 0，机械落定**结局 B** |
+| `c7_higher_timeframe_no_go_2026-09-20.md` | C-7 | 1h 出场独立评估，全样本/剔6月/剔9月四臂 CI 全负，**NO-GO**；瓶颈是 L1 出场回吐非成本 |
 
 ## 找回原件的可选途径（备查，非必须）
 

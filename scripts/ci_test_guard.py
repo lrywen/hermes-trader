@@ -52,7 +52,11 @@ import xml.etree.ElementTree as ET
 # W3/W5 收尾（2026-09-20）上抬至实测值 4592：A-3 实盘 reason parity +4、
 # B-12/B-13 LIVE 启动验收门 live_gate +24（test_live_gate_b12_b13）；
 # 全量离线回归 4592 passed / 0 failed（376.8s）。
-MIN_OFFLINE_TESTS = 4592
+#
+# C-7 收尾（2026-09-20）上抬至实测值 4597：1h 出场周期参数化守卫
+# test_c7_exit_interval +5（PIT 去重/墙钟标定/5m 默认等价）；1h 评估裁定 NO-GO。
+# 全量离线回归 4597 passed / 0 failed（402.4s）。
+MIN_OFFLINE_TESTS = 4597
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

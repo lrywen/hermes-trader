@@ -21,4 +21,4 @@
 | ADR | 标题 | 状态 |
 |---|---|---|
 | [0001](0001-config-freeze-three-invariants.md) | 配置冻结与三条不变量（据丢失原件重建） | Accepted |
-| [0002](0002-evaluate-higher-timeframe-or-strategy.md) | 启动「换周期(1h/4h)/换策略」独立评估（C-7，结局 B 触发） | 执行中（参数已确认） |
+| [0002](0002-evaluate-higher-timeframe-or-strategy.md) | 启动「换周期(1h/4h)/换策略」独立评估（C-7，结局 B 触发） | 高周期 Deprecated（NO-GO）；换策略待新开 |
