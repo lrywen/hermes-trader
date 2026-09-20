@@ -1319,7 +1319,9 @@ def _run_backfill(*, dropped, fill=None, resolve_raises=None,
         "time": time,
         "memory": _Mem(),
         "log_event": lambda e: events.append(e),
-        "resolve_close_fill": _resolve,
+        # D-7：回填块改用聚合版 resolve_close_fills（for-body 的 from-import
+        # 保留 globals 中已注入的同名绑定，故此处注入 mock 即生效，不联网）。
+        "resolve_close_fills": _resolve,
         "market_circuit_record_stop":
             record_stop or (lambda coin, ts: None),
         "arm_close_tiered_breakers":

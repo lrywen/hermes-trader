@@ -321,6 +321,49 @@ def _fills_price_match(a: Any, b: float, rel_tol: float = 1e-4) -> bool:
         return False
 
 
+def _collect_reducing_fills(user: str, coin: str, side: str,
+                            since_ts: float) -> Optional[list[dict[str, Any]]]:
+    """Return the REDUCING fills for this position newer than ``since_ts``.
+
+    Shared backend for :func:`resolve_close_fill` (single, newest) and
+    :func:`resolve_close_fills` (aggregate, all legs). Fills come back
+    newest-first from the exchange; this preserves that order (so callers can
+    take ``[0]`` for "the most recent close") while collecting EVERY reducing
+    leg so a scaled TP (e.g. tp_scale_fraction=0.4 → a 40% leg then a 60% leg)
+    has all its realised PnL attributed rather than only the last leg.
+
+    Returns None when the lookup itself fails; an empty list when it succeeds
+    but no reducing fill exists.
+    """
+    try:
+        fills = _http_post(
+            "/info", {"type": "userFills", "user": user, "limit": 50}, timeout=8
+        )
+        if not isinstance(fills, list):
+            return None
+        want = "A" if side == "long" else "B"
+        matched: list[dict[str, Any]] = []
+        for f in fills:
+            if f.get("coin") != coin:
+                continue
+            try:
+                f_ts = int(f.get("time", 0)) / 1000.0
+            except (TypeError, ValueError):
+                continue
+            if f_ts < since_ts:
+                break  # fills are newest-first; nothing newer remains
+            try:
+                closed_pnl = float(f.get("closedPnl", 0) or 0)
+            except (TypeError, ValueError):
+                closed_pnl = 0.0
+            if f.get("side") == want or closed_pnl != 0.0:
+                matched.append(f)
+        return matched
+    except Exception as e:
+        logger.debug(f"[dsl] close-fill lookup failed for {coin} {side}: {e}")
+        return None
+
+
 def resolve_close_fill(user: str, coin: str, side: str,
                        since_ts: float) -> Optional[dict[str, Any]]:
     """Find the most recent REDUCING fill for this position after ``since_ts``.
@@ -337,32 +380,76 @@ def resolve_close_fill(user: str, coin: str, side: str,
     that carries a non-zero ``closedPnl`` (HL tags the closing leg of a round
     trip with realized PnL). Newest-first ordering means the first match is the
     close.
+
+    Note: for a SCALED close (multiple reducing legs, A-6) this returns only
+    the most recent leg and would under-report size/PnL — use
+    :func:`resolve_close_fills` (aggregate) for the backfill record.
     """
-    try:
-        fills = _http_post(
-            "/info", {"type": "userFills", "user": user, "limit": 50}, timeout=8
-        )
-        if not isinstance(fills, list):
-            return None
-        want = "A" if side == "long" else "B"
-        for f in fills:
-            if f.get("coin") != coin:
-                continue
-            try:
-                f_ts = int(f.get("time", 0)) / 1000.0
-            except (TypeError, ValueError):
-                continue
-            if f_ts < since_ts:
-                break  # fills are newest-first; nothing newer remains
-            try:
-                closed_pnl = float(f.get("closedPnl", 0) or 0)
-            except (TypeError, ValueError):
-                closed_pnl = 0.0
-            if f.get("side") == want or closed_pnl != 0.0:
-                return f
-    except Exception as e:
-        logger.debug(f"[dsl] close-fill lookup failed for {coin} {side}: {e}")
-    return None
+    matched = _collect_reducing_fills(user, coin, side, since_ts)
+    return matched[0] if matched else None
+
+
+def aggregate_close_fills(reducing_fills: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate multiple reducing legs of one position into a single fill view.
+
+    D-7 / A-6: when an exchange-side TP (or SL) closes a position in several
+    fills, the backfilled close record must represent the WHOLE exit, not just
+    the last leg. This combines them with financially-correct arithmetic:
+
+      * sz          = Σ |sz|
+      * closedPnl   = Σ closedPnl          (each leg's realised PnL)
+      * fee         = Σ fee
+      * px          = Σ(px_i·sz_i) / Σ sz_i (size-weighted average exit price)
+      * time        = time of the LAST (oldest) leg — the moment the position
+                      finished reducing; input is newest-first.
+
+    The returned dict mirrors a raw fill's keys (px/sz/time/closedPnl/fee) plus
+    ``oids`` (all leg oids) and ``legs`` (leg count). Raises ValueError on an
+    empty input.
+    """
+    if not reducing_fills:
+        raise ValueError("aggregate_close_fills requires at least one fill")
+    total_sz = 0.0
+    total_pnl = 0.0
+    total_fee = 0.0
+    px_num = 0.0
+    for f in reducing_fills:  # newest-first
+        sz = abs(float(f.get("sz") or 0.0))
+        px = float(f.get("px") or 0.0)
+        total_sz += sz
+        px_num += px * sz
+        total_pnl += float(f.get("closedPnl") or 0.0)
+        total_fee += float(f.get("fee") or 0.0)
+    oldest = reducing_fills[-1]
+    return {
+        "px": px_num / total_sz if total_sz > 0 else 0.0,
+        "sz": total_sz,
+        "time": oldest.get("time"),
+        "closedPnl": total_pnl,
+        "fee": total_fee,
+        "oid": oldest.get("oid"),
+        "oids": [f.get("oid") for f in reducing_fills],
+        "legs": len(reducing_fills),
+        "coin": oldest.get("coin"),
+        "side": oldest.get("side"),
+    }
+
+
+def resolve_close_fills(user: str, coin: str, side: str,
+                        since_ts: float) -> Optional[dict[str, Any]]:
+    """Aggregate ALL reducing fills for this position after ``since_ts``.
+
+    D-7 (backfill chokepoint): unlike :func:`resolve_close_fill` (single,
+    newest), this collects every reducing leg — covering a scaled TP's 40% then
+    60% exits — and aggregates them via :func:`aggregate_close_fills` so the
+    stored close has the correct total size, size-weighted exit price and the
+    SUM of realised PnL/fees. Returns None when the lookup fails or no reducing
+    fill exists. A single-leg close aggregates to that same leg.
+    """
+    matched = _collect_reducing_fills(user, coin, side, since_ts)
+    if not matched:
+        return None
+    return aggregate_close_fills(matched)
 
 
 def _fetch_open_orders(user: str) -> Optional[list[dict[str, Any]]]:

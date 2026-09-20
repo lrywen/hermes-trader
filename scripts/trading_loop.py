@@ -1470,10 +1470,13 @@ while True:
             # bookkeeping failure must never block exit monitoring.
             if dropped and user:
                 try:
-                    from hermes_trader.agents.dsl_exit import resolve_close_fill
+                    # D-7：用聚合版 resolve_close_fills —— 分批 TP（先 40% 再
+                    # 60%）的全部减仓 fill 合并成一条，避免只回填最后一批而
+                    # 漏记前批已实现 PnL（A-6）。单腿平仓聚合结果与原单腿一致。
+                    from hermes_trader.agents.dsl_exit import resolve_close_fills
                     for _tr in dropped:
                         try:
-                            _fill = resolve_close_fill(
+                            _fill = resolve_close_fills(
                                 user, _tr.coin, _tr.side,
                                 since_ts=_tr.entry_time - 1.0)
                             if not _fill:
@@ -1570,7 +1573,9 @@ while True:
                                 "unrealized_pct": round(_spot_pct, 4),
                                 "leveraged_pct": round(_gross_pct, 4),
                                 "executed": True,
-                                "detail": f"backfill oid={_fill.get('oid')}",
+                                "detail": (f"backfill oid={_fill.get('oid')}"
+                                           + (f" legs={_fill.get('legs')}"
+                                              if _fill.get("legs", 1) > 1 else "")),
                                 "fill_px": _exit_px,
                                 "entry_px": _tr.entry_px,
                                 "realized_spot_pct": round(_spot_pct, 4),

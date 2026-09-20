@@ -964,20 +964,28 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
         tr = ra.get("trend_ride") or {}
         ml = ra.get("max_loss") or {}
         trend_ml = ml.get("trend") or {}
-        return (float(tr.get("protect_pct", 3.0)),
-                float(tr.get("retrace_threshold", 0.55)),
-                tr.get("phase2_tiers", base_tiers),
-                float(trend_ml.get("max_loss_pct", 0.8)),
-                float(trend_ml.get("max_loss_roe_pct", 10.0)),
-                f"trend_ride({regime}-regime)")
+        _p, _rt = float(tr.get("protect_pct", 3.0)), float(tr.get("retrace_threshold", 0.55))
+        _ml_pct = float(trend_ml.get("max_loss_pct", 0.8))
+        _ml_roe = float(trend_ml.get("max_loss_roe_pct", 10.0))
+        # B-8：显式记录 regime_aware 的参数生效路径，便于回测/实盘核对"是否
+        # 真按 trend_ride 档放宽"，而非静默选档。
+        logger.debug(
+            "[regime-aware] regime=%s → trend_ride: protect=%.3f retrace=%.3f "
+            "max_loss=%.3f%% max_loss_roe=%.1f%%", regime, _p, _rt, _ml_pct, _ml_roe)
+        return (_p, _rt, tr.get("phase2_tiers", base_tiers),
+                _ml_pct, _ml_roe, f"trend_ride({regime}-regime)")
     # Non-trend (neutral/chop) or disabled: scalp exit; optional non_trend
     # max-loss override falls back to the top-level dsl_exit defaults.
     ml = ra.get("max_loss") or {}
     nt_ml = ml.get("non_trend") or {}
-    return (base_protect, base_retrace, base_tiers,
-            float(nt_ml.get("max_loss_pct", base_max_loss)),
-            float(nt_ml.get("max_loss_roe_pct", base_max_loss_roe)),
-            "scalp")
+    _ml_pct = float(nt_ml.get("max_loss_pct", base_max_loss))
+    _ml_roe = float(nt_ml.get("max_loss_roe_pct", base_max_loss_roe))
+    # B-8：记录回落（scalp）档及原因（regime_aware 关闭 / 非方向 regime）。
+    logger.debug(
+        "[regime-aware] regime=%s enabled=%s → scalp: protect=%.3f retrace=%.3f "
+        "max_loss=%.3f%% max_loss_roe=%.1f%%", regime, ra.get("enabled", False),
+        base_protect, base_retrace, _ml_pct, _ml_roe)
+    return (base_protect, base_retrace, base_tiers, _ml_pct, _ml_roe, "scalp")
 
 
 def resolve_regime_clocks(dsl_config: dict[str, Any], regime: str) -> dict[str, float]:

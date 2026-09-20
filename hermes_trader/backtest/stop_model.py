@@ -61,6 +61,10 @@ def effective_stop_pct(
     ``atr_stop_enabled`` and a positive ``entry_atr_pct`` are supplied, an ATR
     width ``clamp(atr*mult, floor, ceiling)`` may WIDEN the stop, but only up to
     the regime cap — never override a tighter regime stop.
+
+    B-11：``atr_stop_enabled`` 分支已 **DEPRECATED**（死代码）。生产数据下
+    regime cap 恒胜出、atr_cap 从不 bind（§2.7 P4，W3 A-3）；入参仅为与
+    DSLTracker 的 byte-aligned parity 而保留，禁止据此重新启用 ATR 止损。
     """
     lev = max(1.0, float(leverage))
     regime_cap = float(max_loss_pct) if float(max_loss_pct) > 0 else float("inf")

@@ -254,6 +254,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "breakeven_trigger_pct": 0.0,
         "breakeven_lock_pct": 0.0,
         "stale_flat_timeout_minutes": 480.0,
+        # B-11：atr_stop 已 DEPRECATED（死代码）。§2.7 P4 结论：8 个固定宽度
+        # 全扫均负，ATR 自适应止损被否证；`min(regime_cap, atr_cap)` 中 regime
+        # cap 恒胜出（W3 A-3 逐笔验证），启用也不会放宽实际止损。保留块仅为
+        # byte-aligned parity（stop_model.py / dsl_exit.py），禁止重新启用。
         "atr_stop": {
             "enabled": False,
             "atr_mult": 1.5,
@@ -1998,7 +2002,75 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
                     f"!= max_concurrent={live_cap} — SHADOW/LIVE position caps "
                     "diverge; delete shadow_book.max_positions so it tracks the "
                     "live cap (shadow_book.py:_max_positions)")
+
+    # B-10：noise_band 强制开启断言。统一技术改造文档 §2.7 的 13 项里，
+    # noise_band 是**唯一**经得起月度符号一致性检验的正贡献（生产权威配置
+    # /data 为 enabled=true/atr_mult=0.8）。误关会让 sub-first-tier 的回踩
+    # 直接触发退出、回测与实盘出场口径分叉。
+    #
+    # 该守卫仅在生产权威源（/data/.agent-config.json）上强制：canonical
+    # 代码默认 noise_band.enabled=false（由 /data 显式打开），本地/CI/测试
+    # 用 canonical 默认时不应报错；只防止**生产**配置把它从开启状态误关。
+    errors.extend(_production_noise_band_errors())
+
+    # B-7：配置来源强制断言。生产权威配置＝容器挂载卷 /data/.agent-config.json
+    # （2026-09 为 142 顶键）。当实际加载路径就是 /data 权威文件时，校验其
+    # 关键键齐全度，防止读到被截断/写错的配置而静默运行。非 /data 部署
+    # （本地开发/CI）不强制键数，避免误报。
+    errors.extend(_authoritative_config_errors())
     return errors
+
+
+def _running_from_data_config() -> bool:
+    return os.path.abspath(CONFIG_PATH) == "/data/.agent-config.json"
+
+
+def _production_noise_band_errors() -> list[str]:
+    """B-10：仅在生产权威 /data 源上要求 noise_band 保持开启。其它部署口径
+    （canonical 默认 enabled=false）不检查。"""
+    if not _running_from_data_config():
+        return []
+    try:
+        raw = _read_raw_config()
+        noise = ((raw or {}).get("dsl_exit") or {}).get("noise_band")
+        if isinstance(noise, dict) and noise.get("enabled", True) is False:
+            return [
+                "startup safety: dsl_exit.noise_band.enabled=false on the production "
+                "/data config — noise_band is the only validated positive-contribution "
+                "exit gate (§2.7) and must stay on; set HERMES_SKIP_STARTUP_SAFETY=1 "
+                "to deliberately override"]
+    except Exception as e:
+        logger.error("B-10 noise_band check failed (non-fatal): %s", e)
+    return []
+
+
+def _authoritative_config_errors() -> list[str]:
+    """B-7：当从生产权威路径 /data/.agent-config.json 加载时，校验文件可解析
+    且关键顶键齐全。仅在权威路径存在且为本进程 CONFIG_PATH 时生效；本地/CI
+    不挂载该路径时返回空（开发口径）。任何读取异常都降级为安全告警而非阻断，
+    以避免文件系统瞬态问题误杀启动。
+    """
+    try:
+        if not _running_from_data_config():
+            return []
+        if not os.path.exists(CONFIG_PATH):
+            return ["startup safety: authoritative config /data/.agent-config.json "
+                    "is CONFIG_PATH but missing"]
+        # 关键键：缺失任一即说明配置被截断，不能按生产风险姿态运行。
+        _REQUIRED_KEYS = (
+            "mode", "leverage", "max_concurrent", "max_trade_notional_usd",
+            "max_daily_loss_usd", "dsl_exit", "runner_entry_gate",
+        )
+        raw = _read_raw_config()
+        if not isinstance(raw, dict):
+            return ["startup safety: authoritative /data config is not a JSON object"]
+        missing = [k for k in _REQUIRED_KEYS if k not in raw]
+        if missing:
+            return [f"startup safety: authoritative /data config missing required "
+                    f"top-level keys: {', '.join(missing)}"]
+    except Exception as e:  # 读取/解析瞬态：告警但不误杀
+        logger.error("B-7 authoritative config check failed (non-fatal): %s", e)
+    return []
 
 
 def startup_safety_bypass_acked() -> bool:

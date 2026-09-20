@@ -59,6 +59,7 @@
 | `pa_carry_funnel_closed_2026-09-20.md` | P-A | funding carry alpha 真实显著（5.83bps/天 CI不含0、中位年化8%、81币无负），但 perps beta 不可对冲（β自相关0.13、加权后−37%），**关闭转P-C** |
 | `pc_structured_reversal_no_edge_2026-09-20.md` | P-C | funding极值反转事件级无增量 edge（毛中位0、净CI含0/为负），小时级+16bps 是连续run中后期前视错觉，**否证关闭** |
 | `pd_basis_preregistered_no_go_2026-09-21.md` | P-D | 现货+空perp基差经预注册单一60天确认证伪：260笔中位+39.5但均值−43、CI[−74.8,196.4]下界不>0，**零成本下均值仍−19.8**（funding反转肥尾主导，非执行问题），**否证关闭** |
+| `w6_leftovers_closure_2026-09-21.md` | W6 | v2.0 遗留项收口：B-6 币池一致性脚本、B-7/B-10 source-gated 启动守卫、B-8 选档日志、B-11 atr_stop deprecated（B-9 经查已实现），**D-7 外部平仓聚合回填修复 A-6 分批 TP 漏记**；+13 测试，全量 4610 passed |
 
 ## 找回原件的可选途径（备查，非必须）
 

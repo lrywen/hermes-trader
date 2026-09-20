@@ -56,7 +56,12 @@ import xml.etree.ElementTree as ET
 # C-7 收尾（2026-09-20）上抬至实测值 4597：1h 出场周期参数化守卫
 # test_c7_exit_interval +5（PIT 去重/墙钟标定/5m 默认等价）；1h 评估裁定 NO-GO。
 # 全量离线回归 4597 passed / 0 failed（402.4s）。
-MIN_OFFLINE_TESTS = 4597
+#
+# W6 收尾（2026-09-21）上抬至实测值 4610：B-6 币池一致性脚本、B-7/B-10
+# source-gated 启动守卫 test_b_startup_source_guards +6、D-7 外部平仓聚合回填
+# test_d7_reconcile_aggregate +7（分批 TP ∑PnL/sz 加权 px），B-8/B-11 为日志/
+# 弃用标记、B-9 notional 建模经查已在 executor/bt_ra_exch 实现；+13。
+MIN_OFFLINE_TESTS = 4610
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
