@@ -48,7 +48,11 @@ import xml.etree.ElementTree as ET
 # W2 收尾（2026-09-20）上抬至实测值 4564：B-1a-改 stop_model parity（155）、
 # B-2 portfolio maxc（19）、B-4 逐币半价差（4）、B-5 成本口径（4）、guard 路径
 # 守卫（2）等本批新增测试落库；全量离线回归 4564 passed / 0 failed（422.9s）。
-MIN_OFFLINE_TESTS = 4564
+#
+# W3/W5 收尾（2026-09-20）上抬至实测值 4592：A-3 实盘 reason parity +4、
+# B-12/B-13 LIVE 启动验收门 live_gate +24（test_live_gate_b12_b13）；
+# 全量离线回归 4592 passed / 0 failed（376.8s）。
+MIN_OFFLINE_TESTS = 4592
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
