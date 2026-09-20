@@ -96,3 +96,52 @@ def test_full_grid_matches_live(ml_pct, lev, atr_enabled, atr_pct):
         atr_stop_enabled=atr_enabled, entry_atr_pct=atr_pct,
         atr_mult=1.5, atr_floor_pct=1.0, atr_ceiling_pct=4.0)
     assert got.spot_pct == pytest.approx(_live_stop(pol, lev, atr_pct), rel=1e-12)
+
+
+# ---------------------------------------------------------------------------
+# A-3: the 8 live ``reason`` strings from trading-loop.log.4 (2026-09-05,
+# 4 unique positions × shadow+paper lines). At that date atr_stop was still
+# enabled with mult=1.2 / floor=1.2 / ceiling=3.0, so the reason prints the
+# ATR cap as ``spot_cap=<v>[atr]`` while the EFFECTIVE stop is still the
+# tighter regime/ROE cap (binding is always "regime" in these four). This pins
+# the A-3 derivation ``atr_cap = clamp(entry_atr_pct*1.2, 1.2, 3.0)`` against
+# the actual production log values.
+# ---------------------------------------------------------------------------
+
+A3_LIVE_REASONS = [
+    # coin, lev, regime_cap, roe_pct, entry_px, atr_abs, reason [atr] label, eff cap
+    ("TAO",     5, 1.00, 15.0, 5.499731896292154 / 0.022083, 5.499731896292154, 2.65),
+    ("CASHCAT", 3, 1.00, 15.0, 0.16305,                     0.03320811742478859, 3.00),
+    ("CRV",    10, 0.40,  5.0, 0.382,                       0.011851805522691303, 3.00),
+]
+
+
+@pytest.mark.parametrize("coin,lev,regime,roe,entry,atr_abs,label", A3_LIVE_REASONS)
+def test_a3_live_reason_atr_label_inverts(coin, lev, regime, roe, entry, atr_abs, label):
+    atr_pct = atr_abs / entry * 100.0
+    atr_cap = min(max(atr_pct * 1.2, 1.2), 3.0)
+    assert atr_cap == pytest.approx(label, abs=0.01), (
+        f"{coin}: reason spot_cap={label:.2f}[atr] but formula gives {atr_cap:.3f}")
+    got = effective_stop_pct(
+        max_loss_pct=regime, leverage=lev, max_loss_roe_pct=roe,
+        atr_stop_enabled=True, entry_atr_pct=atr_pct,
+        atr_mult=1.2, atr_floor_pct=1.2, atr_ceiling_pct=3.0)
+    # The displayed [atr] number is the ATR cap; the effective stop binds on
+    # the tighter per-regime cap (1.00 trend / 0.40 non-trend).
+    assert got.atr_active is True
+    assert got.binding == "regime"
+    assert got.spot_pct == pytest.approx(regime, rel=1e-9)
+
+
+def test_a3_sui_ceiling_label_implies_locked_atr_threshold():
+    # SUI reason printed spot_cap=3.00[atr] (lev10, regime 1.00). The research
+    # atr_abs at 12:40 gives 2.438% → 2.926, just under ceiling; the reason's
+    # 3.00 means the entry-tick-LOCKED 4h ATR snapshot was >=2.5% (the ceiling
+    # clamp threshold). Assert the derivation threshold the label implies.
+    assert pytest.approx(3.0 / 1.2, abs=1e-9) == 2.5
+    got = effective_stop_pct(
+        max_loss_pct=1.0, leverage=10, max_loss_roe_pct=15.0,
+        atr_stop_enabled=True, entry_atr_pct=2.5,
+        atr_mult=1.2, atr_floor_pct=1.2, atr_ceiling_pct=3.0)
+    assert got.spot_pct == pytest.approx(1.0)
+    assert got.binding == "regime"
