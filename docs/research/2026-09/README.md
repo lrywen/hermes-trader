@@ -54,6 +54,7 @@
 | `b3_81coin_scoreboard_2026-09-19.md` | W2/B-3 | 81 币 318,195 笔出场占比；filt/filt_exch 对齐实盘，filt_ra 被否证 |
 | `w3_blockers_scoreboard_2026-09-20.md` | W3 | A-1~A-6 阻塞性澄清结论（max_loss_pct=1 / maxc=2 / [atr] 公式 / held 语义 / DOT cloid / TP 分批缺口） |
 | `g2_loss_ledger_2026-09-20.md` | W3/G2 | 五段损耗瀑布（峰值毛利→出场回吐→滑点→手续费→净，加性残差 0）；L1 回吐占 88%，指向结局 B |
+| `w4_robustness_scoreboard_2026-09-20.md` | W4 | C/E/F 裁定 + bps 按天块自助；四臂 95%CI 全负不含 0，机械落定**结局 B** |
 
 ## 找回原件的可选途径（备查，非必须）
 
