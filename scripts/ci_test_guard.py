@@ -92,7 +92,9 @@ import xml.etree.ElementTree as ET
 # 新增 test_dashboard_trades_cross_rotation +2，4599 → 4601。
 # 2026-09-21 userFills 补录：本地日志全丢时从交易所重建真实成交（独立 JSONL，
 # 不轮转/不裁剪），新增 test_backfill_userfills +2，4601 → 4603。
-MIN_OFFLINE_TESTS = 4603
+# Audit 2026-09-21 (#rating)：灾难保险臂口径豁免新增 tail_insurance 测试 +1，
+# 4603 → 4604。
+MIN_OFFLINE_TESTS = 4604
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

@@ -902,10 +902,28 @@ def test_enforce_harmful_rate_triggers_degraded_review(sg):
         recs.append(_rec(now, would_block=True, outcome="loss"))
     for _ in range(35):
         recs.append(_rec(now, would_block=False))
-    out = sg.grade_arm("daily_extension_cap", "enforce", "p.jsonl", [168],
+    # 常规（非保险）block 臂仍按有害率红线降级。
+    out = sg.grade_arm("ta_late_entry", "enforce", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.DEGRADED_REVIEW
     assert "臂有害率" in out["reason"]
+
+
+def test_tail_insurance_arm_skips_harmful_rate_degrade(sg):
+    """灾难保险型 block 臂（daily_extension_cap）：即便短窗内被拦做多多数继续
+    上涨（高"有害率"），也不触发降级复核，改判 MAINTAIN 并附尾部口径说明。"""
+    now = 1_700_000_000_000.0
+    recs = []
+    for _ in range(22):  # 79% harmful under the ordinary rule
+        recs.append(_rec(now, would_block=True, outcome="win"))
+    for _ in range(6):
+        recs.append(_rec(now, would_block=True, outcome="loss"))
+    for _ in range(142):
+        recs.append(_rec(now, would_block=False))
+    out = sg.grade_arm("daily_extension_cap", "enforce", "p.jsonl", [168],
+                       now_ms=now, records=recs)
+    assert out["verdict"] == sg.MAINTAIN
+    assert any("灾难保险" in w for w in out.get("warnings", []))
 
 
 def test_enforce_healthy_arm_maintains(sg):

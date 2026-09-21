@@ -174,6 +174,13 @@ ARM_KIND = {
     "regime_overlay": "signal",
 }
 
+# Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如
+# 24h 涨幅 >30% 的抛物线顶）触发，价值是规避少数一次崩盘，而非在普通行情里
+# 提高胜率。被它拦掉的做多候选在短窗口（72h）内天然大概率继续上涨，因此用
+# 常规「臂有害率 50% 红线 / 命中率」考核会系统性误判（强势币最易触发阈值）。
+# 对这类臂不输出 DEGRADED_REVIEW，改为 MAINTAIN + 尾部口径说明（仍 INERT）。
+TAIL_INSURANCE_ARMS = frozenset(("daily_extension_cap",))
+
 _BLOCK_FIELDS = ("ext_would_block", "reentry_would_block", "trend_would_block",
                  "tight_would_block", "chase_would_block", "blocked", "would_block")
 _CHANGE_FIELDS = ("would_change", "would_block_gate", "would_block")
@@ -1088,6 +1095,14 @@ def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,
     eh = _effective_harm(
         arm, kind, s, records, w_long, now_ms, warnings)
     harmful = eff_mature >= MIN_MATURE_OUTCOMES and eh["harmful_signal"]
+    # 灾难保险臂：短窗"被拦后继续涨"不构成有害证据，绕开常规有害率降级。
+    is_tail_insurance = arm in TAIL_INSURANCE_ARMS
+    if is_tail_insurance and harmful:
+        harmful = False
+        warnings.append(
+            f"灾难保险型闸门不适用常规有害率红线：短窗内被拦做多多数继续上涨属"
+            f"正常（强势币最易触发阈值），臂价值在于规避少数一次崩盘；当前 "
+            f"{eff_mature} 条成熟样本不足以评估尾部，按保险臂口径建议维持")
     # ta_late_entry 命中率只数真实下单闸门（gate）层；total 含仅记拦截的
     # prefilter 观察流，文案需显式区分，避免把 26k 观察记录误读成交易决策。
     scope_note = "（仅下单闸门层；prefilter 观察流不计宽度）" \
