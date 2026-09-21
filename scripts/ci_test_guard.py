@@ -75,7 +75,11 @@ import xml.etree.ElementTree as ET
 # validate_outcome 复用，防漂移），test_block_bootstrap_shared +5；新增独立
 # dead-man 看门狗 hermes_trader/watchdog.py（风控第4层，供外部调度），
 # test_watchdog_deadman +7。
-MIN_OFFLINE_TESTS = 4661
+# 方案A maker 取样：post-only(Alo) 下单 + $100 名义硬护栏
+# (execution/maker.py)，test_maker_notional_guard +7；成交质量采集
+# (execution/maker_probe.py：resting/maker edge/成交后mid漂移逆向选择)，
+# test_maker_order_probe +5。本轮仅离线代码，未入金、未启动取样。
+MIN_OFFLINE_TESTS = 4673
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
