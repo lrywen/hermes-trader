@@ -300,13 +300,19 @@ def test_d2_under_cap_passes(monkeypatch):
     assert r["pass"] and r["via"] == "daily_ext_cap_ok"
 
 
-def test_d2_unknown_change_fail_open(monkeypatch):
+def test_d2_unknown_change_fail_closed(monkeypatch):
     _patch_universe(monkeypatch)  # no market
     r = rg.daily_extension_cap_gate(
         _ctx(),
         {"override_max_daily_extension_pct": 30.0,
          "daily_extension_cap": {"mode": "enforce"}})
-    assert r["pass"] and r["via"] == "daily_ext_cap_data_missing"
+    assert not r["pass"] and r["via"] == "daily_ext_cap_data_missing"
+    # fail_closed=false restores the historical fail-open.
+    r2 = rg.daily_extension_cap_gate(
+        _ctx(),
+        {"override_max_daily_extension_pct": 30.0,
+         "daily_extension_cap": {"mode": "enforce", "fail_closed": False}})
+    assert r2["pass"] and r2["via"] == "daily_ext_cap_data_missing"
 
 
 def test_d2_defaults_to_shadow_without_mode_block(monkeypatch):

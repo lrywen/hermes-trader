@@ -392,6 +392,9 @@ def _wire_leverage_case(monkeypatch, tier_cfg):
         "crowded_with_min_conf": 0.0,
         "debate_gate": {"enabled": False},
         "news_blackout": {"enabled": False},
+        # No universe snapshot is mocked; disable to avoid the (#4) fail-closed
+        # daily-cap data_missing block (unrelated to leverage-tier sizing).
+        "daily_extension_cap": {"mode": "off"},
         "circuit_breaker": {"consecutive_loss_limit": 0,
                             "coin_daily_loss_pct": 0.0,
                             "max_drawdown_pct": 0.0},

@@ -1287,6 +1287,7 @@ def ta_late_entry_gate(
             "[risk][gates] ta_late_entry fetch/compute failed for %s: %s",
             ctx.coin, e,
         )
+        fail_closed = bool(le_cfg.get("fail_closed", True))
         try:
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
@@ -1294,12 +1295,13 @@ def ta_late_entry_gate(
         except Exception:
             pass
         return _done("data_missing", {
-            "pass": True,
+            "pass": not fail_closed,
             "via": "ta_late_entry_data_missing",
             "reason": f"late-entry gate unavailable ({type(e).__name__})",
         })
 
     if not verdict.get("data_ok"):
+        fail_closed = bool(le_cfg.get("fail_closed", True))
         try:
             from hermes_trader import metrics
             metrics.TA_LATE_ENTRY_VERDICTS.labels(
@@ -1307,7 +1309,7 @@ def ta_late_entry_gate(
         except Exception:
             pass
         return _done("data_missing", {
-            "pass": True,
+            "pass": not fail_closed,
             "via": "ta_late_entry_data_missing",
             "reason": verdict.get("reason") or "insufficient 4h data",
         })
@@ -1883,14 +1885,15 @@ def daily_extension_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateRe
     path = _gate_shadow_path(blk, "HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE",
                              "daily_extension_cap_shadow.jsonl")
     if ext is None:
+        fail_closed = bool(blk.get("fail_closed", True))
         rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
                "cap_pct": cap, "state": "data_missing",
                "daily_change_pct": None, "ext_would_block": None}
         _record_gate_shadow(rec, path, "daily_ext_cap")
         logger.warning(
-            "[risk][gates] daily_extension_cap fail-OPEN %s: 24h change unknown",
-            ctx.coin)
-        return {"pass": True, "via": "daily_ext_cap_data_missing",
+            "[risk][gates] daily_extension_cap %s %s: 24h change unknown",
+            "fail-CLOSED" if fail_closed else "fail-OPEN", ctx.coin)
+        return {"pass": not fail_closed, "via": "daily_ext_cap_data_missing",
                 "reason": "daily extension cap unavailable (24h change unknown)"}
 
     over = ext > cap

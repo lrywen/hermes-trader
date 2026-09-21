@@ -4471,7 +4471,31 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "gate_results": gate_output["results"],
         }
 
-    order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
+    _maker_cfg = config.get("maker_execution") or {}
+    _maker_on = bool(_maker_cfg.get("enabled", False))
+    if _maker_on and not bool(_maker_cfg.get("resting_lifecycle_ready", False)):
+        # Fail-CLOSED scaffold guard: never submit a resting maker order before
+        # the lifecycle (fill polling / TTL cancel / DSL wiring) exists, so an
+        # operator flipping the flag cannot create an untracked resting order.
+        _ENTRY_LOCK.release()
+        return {
+            "executed": False, "mode": mode, "analysis_id": analysis["id"],
+            "reason": "maker_execution_disabled (resting lifecycle not ready)",
+            "gate_results": gate_output["results"],
+        }
+
+    if _maker_on:
+        from hermes_trader.execution.maker import place_hl_maker_order
+
+        _mk_offset = float(_maker_cfg.get("offset_bps", 5.0)) / 10_000.0
+        _mk_limit = mid_price * (
+            (1.0 - _mk_offset) if is_buy else (1.0 + _mk_offset))
+        _mk_max = float(_maker_cfg.get("max_notional_usd", 100.0))
+        order_res = place_hl_maker_order(
+            is_buy=is_buy, size=size_in_coin, limit_price=_mk_limit,
+            coin=coin, cloid=_cloid, max_notional=_mk_max)
+    else:
+        order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
 
     _order_fail = _reconcile_unknown_order_result(
         order_res, coin=coin, is_buy=is_buy, size_in_coin=size_in_coin,
@@ -5199,11 +5223,34 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                         f"{_pc_detail.get('reason')})"
                     )
         except Exception as _pc_e:
-            # 记忆读取等故障 fail-open（与 shadow 期行为一致），避免冻结交易；
-            # enforce 模式下提级为 warning 以便发现保护臂失效。
+            # shadow（观察）臂保持其"安静、不阻断"的语义；fail_closed 只作用
+            # 于真正 enforce 的保护臂。
+            _pc_fail_closed = (not _pc_shadow) and bool(
+                _pc_cfg.get("fail_closed", True))
+            # Audit 2026-09-21 (#4)：默认 fail-CLOSED，记忆读取故障时按冷却
+            # 处理并拦截；fail_closed=false 时回退旧的放行语义。
+            _posture = ("fail-CLOSED, block" if _pc_fail_closed
+                        else "fail-open, admit")
             _msg = (f"[runner_gate] per-coin cooldown "
                     f"{'shadow' if _pc_shadow else 'ENFORCE'} eval failed for "
-                    f"{coin} (fail-open, admit): {_pc_e}")
+                    f"{coin} ({_posture}): {_pc_e}")
+            if _pc_fail_closed:
+                logger.warning(_msg)
+                try:
+                    from hermes_trader import event_log
+                    event_log.append("error", payload={
+                        "scope": "per_coin_cooldown_failclosed",
+                        "coin": coin,
+                        "error": repr(_pc_e),
+                    })
+                except Exception as _pc_ev_e:
+                    logger.error(
+                        "[runner_gate] per-coin cooldown fail-closed event write "
+                        "failed for %s: %r", coin, _pc_ev_e)
+                return (
+                    "runner_gate_blocked (per-coin cooldown unavailable: "
+                    f"{type(_pc_e).__name__})"
+                )
             if _pc_shadow:
                 logger.debug(_msg)
             else:

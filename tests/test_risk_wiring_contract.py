@@ -986,15 +986,14 @@ def _event_sink(monkeypatch, event_log_module):
     return written
 
 
-def test_per_coin_cooldown_enforce_failopen_is_recorded(monkeypatch):
-    """ENFORCE per-coin cooldown arm: a memory read failure previously only
-    produced a warning log and the candidate was admitted silently — live
-    10x entries then flow with the cooldown arm blind and no durable trace.
-    Fail-open admission must NOT change, but an ``error`` scoped
-    ``per_coin_cooldown_enforce_failopen`` must land in events.jsonl
-    (executor.py ~:5504-5513). The shadow arm stays quiet by design."""
-    from hermes_trader.agents import executor
+def test_per_coin_cooldown_enforce_failclosed_is_recorded(monkeypatch):
+    """ENFORCE per-coin cooldown arm (#4, 2026-09-21): a memory read failure
+    now fails CLOSED by default — the candidate is blocked and an ``error``
+    scoped ``per_coin_cooldown_failclosed`` lands in events.jsonl. Setting
+    ``fail_closed=False`` restores the historical admit-on-blind behaviour, in
+    which case ``per_coin_cooldown_enforce_failopen`` is recorded instead."""
     from hermes_trader import event_log
+    from hermes_trader.agents import executor
 
     monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
                         lambda **kw: None)
@@ -1024,14 +1023,25 @@ def test_per_coin_cooldown_enforce_failopen_is_recorded(monkeypatch):
 
     written = _event_sink(monkeypatch, event_log)
 
-    # Fail-open posture unchanged: otherwise-admitted candidate is admitted.
-    assert executor._runner_entry_block_reason(a, cfg) == ""
+    # Default fail-CLOSED: candidate blocked with a durable error event.
+    reason = executor._runner_entry_block_reason(a, cfg)
+    assert "per-coin cooldown unavailable" in reason
     err = [e for e in written if e["event"] == "error"]
     assert len(err) == 1
     p = err[0]["payload"]
-    assert p["scope"] == "per_coin_cooldown_enforce_failopen"
+    assert p["scope"] == "per_coin_cooldown_failclosed"
     assert p["coin"] == "ZEC"
     assert "memory get_closes down" in p["error"]
+
+    # fail_closed=False restores the old admit-on-blind (fail-open) posture.
+    open_cfg, _ = _runner_gate_cfg(per_coin_cooldown={
+        "shadow_mode": False, "fail_closed": False, "window_hours": 24,
+        "repeat_min_composite": 45, "max_consecutive_losses": 2})
+    written.clear()
+    assert executor._runner_entry_block_reason(a, open_cfg) == ""
+    err2 = [e for e in written if e["event"] == "error"]
+    assert len(err2) == 1
+    assert err2[0]["payload"]["scope"] == "per_coin_cooldown_enforce_failopen"
 
     # Shadow-mode read failure is intentionally quiet (no error event).
     shadow_cfg, _ = _runner_gate_cfg(per_coin_cooldown={
@@ -1648,6 +1658,9 @@ def _wire_entry_case(monkeypatch, *, tier_cfg=None, h4_raises=False):
         "crowded_with_min_conf": 0.0,
         "debate_gate": {"enabled": False},
         "news_blackout": {"enabled": False},
+        # No universe snapshot is mocked; disable so the (#4) fail-closed
+        # daily-cap data_missing branch does not block these loudness probes.
+        "daily_extension_cap": {"mode": "off"},
         "circuit_breaker": {"consecutive_loss_limit": 0,
                             "coin_daily_loss_pct": 0.0,
                             "max_drawdown_pct": 0.0},

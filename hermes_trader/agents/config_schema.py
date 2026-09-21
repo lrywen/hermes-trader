@@ -329,6 +329,8 @@ class _ConfigPatch(BaseModel):
     # shadow_log_path leaf (D2 defaults to shadow, D1/D3 default off).
     trend_filter_200ma: dict[str, Any] = Field(default_factory=lambda: _dict_default("trend_filter_200ma"))
     daily_extension_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("daily_extension_cap"))
+    # Audit 2026-09-21 (#3): live post-only maker execution scaffold.
+    maker_execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("maker_execution"))
     reentry_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("reentry_cap"))
     # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay.
     regime_risk_overlay: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_risk_overlay"))
@@ -584,6 +586,7 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         },
         "per_coin_cooldown": {
             "shadow_mode": ("bool",),
+            "fail_closed": ("bool",),
             "window_hours": _num_leaf(0.0, 100_000.0),
             "repeat_min_composite": _num_leaf(0.0, 100.0),
             "max_consecutive_losses": ("int", 0, 1000),
@@ -597,6 +600,9 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         # SHADOW/LIVE parity; a stale "shadow" on disk is normalised to
         # "enforce" by the gate, not accepted on new updates.
         "mode": ("enum", ("off", "enforce")),
+        # Audit 2026-09-21 (#4): block on data/insufficient-data instead of the
+        # historical fail-open.
+        "fail_closed": ("bool",),
         # 4h hard veto: RSI extremes OR price extension in ATR units.
         "rsi_ob": _num_leaf(50.0, 100.0),
         "rsi_os": _num_leaf(0.0, 50.0),
@@ -735,7 +741,16 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     # gray-release mode switch (default shadow) and the shadow-log path.
     "daily_extension_cap": {
         "mode": ("enum", ("off", "shadow", "enforce")),
+        "fail_closed": ("bool",),
         "shadow_log_path": ("str",),
+    },
+    # Audit 2026-09-21 (#3): live post-only maker execution scaffold.
+    "maker_execution": {
+        "enabled": ("bool",),
+        "resting_lifecycle_ready": ("bool",),
+        "offset_bps": _num_leaf(0.0, 1000.0),
+        "ttl_seconds": ("int", 0, 100_000),
+        "max_notional_usd": _num_leaf(0.0, 1_000_000.0),
     },
     # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: per-coin rolling
     # window OPENING count. max_per_coin openings (fills, not signals) within

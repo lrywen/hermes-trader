@@ -4835,8 +4835,8 @@ def test_ta_late_entry_gate_weak_probe_disabled(monkeypatch, tmp_path):
     assert rec["counter_regime_would_block"] is True
 
 
-def test_ta_late_entry_gate_fail_open_on_fetch_error(monkeypatch):
-    """Any fetch/compute failure must PASS the order (never stall execution)."""
+def test_ta_late_entry_gate_fail_closed_on_fetch_error(monkeypatch):
+    """Default (#4): a fetch/compute failure BLOCKS the order (fail-closed)."""
     import hermes_trader.agents.ta_filter as tf
     import hermes_trader.client.hl_client as hl
 
@@ -4846,15 +4846,19 @@ def test_ta_late_entry_gate_fail_open_on_fetch_error(monkeypatch):
     monkeypatch.setattr(tf, "fetch_hl_candles", boom)
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
-    assert r["pass"] is True and r["via"] == "ta_late_entry_data_missing"
+    assert r["pass"] is False and r["via"] == "ta_late_entry_data_missing"
+    # fail_closed=false restores the historical fail-open posture.
+    r2 = ta_late_entry_gate(
+        _ctx(trade_side="long"), _le_config(mode="enforce", fail_closed=False))
+    assert r2["pass"] is True and r2["via"] == "ta_late_entry_data_missing"
 
 
-def test_ta_late_entry_gate_fail_open_on_insufficient_data(monkeypatch):
+def test_ta_late_entry_gate_fail_closed_on_insufficient_data(monkeypatch):
     from hermes_trader.agents.risk_gates import ta_late_entry_gate
     short = _trend_candles(8)
     _patch_candles(monkeypatch, short, short)
     r = ta_late_entry_gate(_ctx(trade_side="long"), _le_config(mode="enforce"))
-    assert r["pass"] is True and r["via"] == "ta_late_entry_data_missing"
+    assert r["pass"] is False and r["via"] == "ta_late_entry_data_missing"
 
 
 def test_ta_late_entry_registered_in_eval_all_gates(monkeypatch):

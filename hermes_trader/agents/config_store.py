@@ -431,6 +431,19 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "max_atr_pct": 15.0,
     "max_spread_pct": 1.0,
     "spread_gate_fail_open": False,
+    # Audit 2026-09-21 (#3): live post-only (Alo) maker execution scaffold.
+    # DEFAULT OFF — the resting-order lifecycle (fill polling / TTL cancel /
+    # post-fill DSL wiring) is not yet implemented; the executor branch is
+    # fail-CLOSED while `resting_lifecycle_ready` is false, so flipping enabled
+    # on can never produce an untracked resting order. Activate only after the
+    # lifecycle is built and validated with small funded size (ADR-0003).
+    "maker_execution": {
+        "enabled": False,
+        "resting_lifecycle_ready": False,
+        "offset_bps": 5.0,
+        "ttl_seconds": 300,
+        "max_notional_usd": 100.0,
+    },
     "runner_entry_gate": {
         "enabled": True,
         "allow_shorts": False,
@@ -477,6 +490,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         },
         "per_coin_cooldown": {
             "shadow_mode": True,
+            # Audit 2026-09-21 (#4): on a memory/history read failure, fail
+            # CLOSED (treat as cooldown) instead of admitting the re-entry.
+            "fail_closed": True,
             "window_hours": 24,
             "repeat_min_composite": 45.0,
             "max_consecutive_losses": 2,
@@ -1161,6 +1177,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # override: HERMES_DAILY_EXTENSION_CAP_MODE.
     "daily_extension_cap": {
         "mode": "shadow",
+        # Audit 2026-09-21 (#4): on a daily-change data miss, fail CLOSED.
+        "fail_closed": True,
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
     },
@@ -1268,6 +1286,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # hard-coded numbers outside this block.
     "ta_late_entry": {
         "mode": "enforce",
+        # Audit 2026-09-21 (#4): when 4h candle fetch/compute fails or data is
+        # insufficient, fail CLOSED (block the trade) instead of the historical
+        # fail-open. Set false to restore the old "blind gate passes" behaviour.
+        "fail_closed": True,
         # --- 4h hard veto thresholds (normal regime) ---
         "rsi_ob": 75,
         "rsi_os": 25,

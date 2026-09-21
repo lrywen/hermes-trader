@@ -155,6 +155,9 @@ def _wire_executor(monkeypatch, cfg_extra):
         "crowded_with_min_conf": 0.0,
         "debate_gate": {"enabled": False},
         "news_blackout": {"enabled": False},
+        # Unrelated to sizing; no universe snapshot is mocked, so disable rather
+        # than hit the (#4) fail-closed data_missing branch.
+        "daily_extension_cap": {"mode": "off"},
         "circuit_breaker": {"consecutive_loss_limit": 0,
                             "coin_daily_loss_pct": 0.0,
                             "max_drawdown_pct": 0.0},
