@@ -376,6 +376,78 @@ def _read_log_lines() -> list[dict[str, Any]]:
     )
 
 
+# 成交历史跨轮转支持：session-log 按 24h/50MB 轮转成 .gz 后，真实成交（executed
+# 的 execute、dsl_exit、close_position 等）会落到归档里，仅读当前活跃 log 会让
+# 开平仓历史"消失"。这里把活跃 log 与全部归档按时间顺序拼起来供 trades/closed
+# -trades 使用。归档内容不变，按 (路径, 大小, mtime) 缓存解析结果，仅在新增归档
+# 时才重新解析。
+_ARCHIVE_CACHE_LOCK = threading.Lock()
+_ARCHIVE_CACHE: dict[str, Any] = {"sig": None, "lines": []}
+# 跨归档只保留与成交相关的事件，避免把心跳/scan/ta_skip 等海量行也读进内存。
+_TRADE_RELEVANT_EVENTS = frozenset(
+    ("execute", "dsl_exit", "close_position", "external_close_recorded", "ai_close")
+)
+
+
+def _is_trade_relevant(rec: dict[str, Any]) -> bool:
+    if rec.get("event") not in _TRADE_RELEVANT_EVENTS:
+        return False
+    # execute 只保留真实成交（executed=true），SHADOW 未实跑的 execute 不构成历史。
+    # 归档（旧格式）executed 在顶层，新格式嵌套在 payload 下，两种都要识别。
+    if rec.get("event") == "execute":
+        executed = rec.get("executed")
+        if executed is None:
+            executed = (rec.get("payload") or {}).get("executed")
+        return bool(executed)
+    return True
+
+
+def _read_archive_lines() -> list[dict[str, Any]]:
+    """Read trade-relevant events from rotated session-log .gz archives
+    (oldest first). Cached by the rotated-file signature; archives are
+    append-only once written so they are parsed just once."""
+    import gzip
+
+    files = session_log._list_rotated()
+    try:
+        sig = tuple((f, os.path.getsize(f), int(os.path.getmtime(f))) for f in files)
+    except OSError:
+        with _ARCHIVE_CACHE_LOCK:
+            return list(_ARCHIVE_CACHE.get("lines", []))
+    with _ARCHIVE_CACHE_LOCK:
+        if _ARCHIVE_CACHE.get("sig") == sig:
+            return list(_ARCHIVE_CACHE["lines"])
+    lines: list[dict[str, Any]] = []
+    for f in files:
+        try:
+            with gzip.open(f, "rt", encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if _is_trade_relevant(rec):
+                        lines.append(rec)
+        except (OSError, EOFError):
+            # 单个归档损坏不应拖垮整段历史，跳过它继续读其余归档。
+            continue
+    with _ARCHIVE_CACHE_LOCK:
+        _ARCHIVE_CACHE.update(sig=sig, lines=lines)
+    return list(lines)
+
+
+def _read_trade_log_lines() -> list[dict[str, Any]]:
+    """轮转归档（仅真实成交）+ 完整活跃 session-log，按时间顺序（旧→新）。
+
+    归档侧用 _is_trade_relevant 过滤，只保留真实成交与平仓事件；活跃 log 侧保持
+    完整不裁剪——平仓 parser 需要回溯对应的 execute 推断 side/leverage，且
+    开/平仓是否成行由后续配对逻辑按 executed 决定，不能在此提前丢弃 execute。"""
+    return _read_archive_lines() + list(_read_log_lines())
+
+
 _EVENTS_PATH = Path(event_log.EVENTS_FILE)
 _OUTCOME_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
 _OUTCOME_CACHE_LOCK = threading.Lock()
@@ -1412,8 +1484,10 @@ def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
       - `side` and `leverage`: pulled from the event itself for new closes;
         for older events lacking those fields, walked back to the matching
         execute event (for side) and the live config (for leverage).
+
+    事件来源包含已轮转的 session-log 归档，跨越轮转边界的真实平仓仍会出现。
     """
-    events = _read_log_lines()
+    events = _read_trade_log_lines()
     cfg_leverage: list[int] = []  # lazy-fetched fallback memo
 
     def _estimate_leverage(coin: str) -> int:
@@ -1577,8 +1651,11 @@ def _trades_payload(limit: int = 20) -> list[dict[str, Any]]:
     at `limit`; the latest unmatched opens are appended so open history is
     never hidden. The resulting timeline may therefore hold up to ~2×limit
     rows. Open rows carry ``kind="open"``; close rows ``kind="close"``.
+
+    事件来源包含已轮转的 session-log 归档，因此跨越 24h/50MB 轮转边界的真实
+    成交仍会出现在时间线中。
     """
-    events = _read_log_lines()
+    events = _read_trade_log_lines()
     cfg_leverage: list[int] = []
 
     def _estimate_leverage(coin: str) -> int:

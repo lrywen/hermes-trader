@@ -88,7 +88,9 @@ import xml.etree.ElementTree as ET
 # 2026-09-21 maker 取样观测闭环：逆向选择指标（maker_edge / post_fill_drift /
 # resting_bars）落盘到 maker open fill，get_trades 增 maker_trades、maker stats
 # 增 adverse_selection 聚合，+2 测试，4597 → 4599。
-MIN_OFFLINE_TESTS = 4599
+# 2026-09-21 成交历史跨轮转：trades/closed-trades 聚合读取 session-log .gz 归档，
+# 新增 test_dashboard_trades_cross_rotation +2，4599 → 4601。
+MIN_OFFLINE_TESTS = 4601
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

@@ -1188,7 +1188,7 @@ class ShadowBook:
             "avg_win_usd": round(gross_win / len(wins), 4) if wins else 0.0,
             "avg_loss_usd": round(gross_loss / len(losses), 4) if losses else 0.0,
             "best_trade_usd": round(best, 4),
-            "worst_trade": round(worst, 4),
+            "worst_trade_usd": round(worst, 4),
             "avg_hold_minutes": round(sum(holds) / n, 2) if n else 0.0,
             "equity_usd": round(equity, 4),
             "total_return_pct": round(100.0 * (equity - start) / start, 4) if start else 0.0,
