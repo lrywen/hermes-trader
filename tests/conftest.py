@@ -33,6 +33,10 @@ os.environ["HERMES_ENABLE_LIVE"] = "true"
 # live volume's events.jsonl / session-log.jsonl.
 os.environ["HERMES_EVENTS_FILE"] = os.path.join(_tmp, "events.jsonl")
 os.environ["SESSION_LOG_PATH"] = os.path.join(_tmp, "session-log.jsonl")
+# 重定向 userFills 补录文件：否则 trades/closed-trades 测试会读到生产卷里真实的
+# /data/userfills-backfill.jsonl，污染断言。需要该源的测试用 monkeypatch 指向自己
+# 构造的文件。
+os.environ["HERMES_USERFILLS_BACKFILL_FILE"] = os.path.join(_tmp, "userfills-backfill.jsonl")
 # Redirect the ta_late_entry shadow JSONL: gate/prefilter tests that omit
 # shadow_log_path would otherwise append to the developer's real
 # ~/.hermes-trading/ta_late_entry_shadow.jsonl (late_entry_shadow_path falls

@@ -90,7 +90,9 @@ import xml.etree.ElementTree as ET
 # 增 adverse_selection 聚合，+2 测试，4597 → 4599。
 # 2026-09-21 成交历史跨轮转：trades/closed-trades 聚合读取 session-log .gz 归档，
 # 新增 test_dashboard_trades_cross_rotation +2，4599 → 4601。
-MIN_OFFLINE_TESTS = 4601
+# 2026-09-21 userFills 补录：本地日志全丢时从交易所重建真实成交（独立 JSONL，
+# 不轮转/不裁剪），新增 test_backfill_userfills +2，4601 → 4603。
+MIN_OFFLINE_TESTS = 4603
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

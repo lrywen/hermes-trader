@@ -448,6 +448,50 @@ def _read_trade_log_lines() -> list[dict[str, Any]]:
     return _read_archive_lines() + list(_read_log_lines())
 
 
+# 交易所 userFills 补录：当本地所有日志（memory 上限裁剪、session-log 轮转删除、
+# events.jsonl 路径迁移）都无法保留某段真实成交时，由 scripts/backfill_userfills.py
+# 从交易所 userFills 一次性重建到这个独立的 append-only 文件。它不参与 session-log
+# 轮转、不受 memory 保留上限影响，记录按 events.jsonl 的嵌套形态
+# {event, timestamp(ISO), payload} 存储，直接复用 outcome 的 execute/close parser。
+_BACKFILL_FILE = Path(os.environ.get("HERMES_USERFILLS_BACKFILL_FILE", "/data/userfills-backfill.jsonl"))
+_BACKFILL_CACHE_LOCK = threading.Lock()
+_BACKFILL_CACHE: dict[str, Any] = {"sig": None, "lines": []}
+
+
+def _read_backfill_lines() -> list[dict[str, Any]]:
+    """Read the exchange-userFills backfill file (cached by size/mtime).
+
+    返回的记录是 events.jsonl 嵌套形态，可直接喂给 outcome close/dsl parser 与
+    execute 开仓配对。文件缺失时返回空列表，dashboard 渲染不报错。"""
+    try:
+        sig = (_BACKFILL_FILE.stat().st_size, int(_BACKFILL_FILE.stat().st_mtime))
+    except OSError:
+        # 文件不存在/不可读：没有补录数据，返回空。绝不能回退到上一次缓存——
+        # 那可能是另一条路径（测试 monkeypatch）残留的记录，会跨用例泄漏。
+        return []
+    with _BACKFILL_CACHE_LOCK:
+        if _BACKFILL_CACHE.get("sig") == sig:
+            return list(_BACKFILL_CACHE["lines"])
+    lines: list[dict[str, Any]] = []
+    try:
+        with _BACKFILL_FILE.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("event") in ("execute", "close", "dsl_exit"):
+                    lines.append(rec)
+    except OSError:
+        pass
+    with _BACKFILL_CACHE_LOCK:
+        _BACKFILL_CACHE.update(sig=sig, lines=lines)
+    return list(lines)
+
+
 _EVENTS_PATH = Path(event_log.EVENTS_FILE)
 _OUTCOME_CACHE: dict[str, Any] = {"lines": [], "inode": None, "size": -1, "offset": 0}
 _OUTCOME_CACHE_LOCK = threading.Lock()
@@ -917,8 +961,8 @@ def _rows_from_state(state: dict[str, Any]) -> list[dict[str, Any]]:
 # ~17 such mirrors while the high-frequency session log keeps only a handful);
 # it is the strategy-reason twin of an events.jsonl `close`, so it ranks with
 # the session-log dsl rows and merges cross-source into the reconcile winner.
-_CLOSE_SOURCE_RANK = {"reconcile": 0, "external": 1, "dsl": 2, "dsl_outcome": 2,
-                      "manual": 3, "ai": 4}
+_CLOSE_SOURCE_RANK = {"reconcile": 0, "userfills_backfill": 0, "external": 1,
+                      "dsl": 2, "dsl_outcome": 2, "manual": 3, "ai": 4}
 
 
 def _find_open_side(events: list[dict[str, Any]], coin: str, before_idx: int) -> Optional[str]:
@@ -1510,6 +1554,15 @@ def _closed_trades_payload(limit: int = 20) -> list[dict[str, Any]]:
             # merges cross-source into its reconcile `close`.
             rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
 
+    # ── 交易所 userFills 补录：本地日志全丢时从交易所重建的真实平仓 ──
+    for rec in _read_backfill_lines():
+        if rec.get("event") == "close":
+            row = _row_from_outcome_close(rec, _estimate_leverage)
+            row["source"] = "userfills_backfill"
+            rows.append(row)
+        elif rec.get("event") == "dsl_exit":
+            rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
+
     # ── De-duplicate cross-source reports of the same fill (see helper) ──
     # R13-B11: window resolves through dashboard_equity.dedup_window_ms (legacy
     # HERMES_CLOSED_TRADES_DEDUP_MS env still wins; 5000ms literal as fallback).
@@ -1673,9 +1726,22 @@ def _trades_payload(limit: int = 20) -> list[dict[str, Any]]:
         elif rec.get("event") == "dsl_exit":
             rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
 
+    # 交易所 userFills 补录：close 行进时间线；execute(开仓) 并入配对记录。
+    backfill_records = _read_backfill_lines()
+    for rec in backfill_records:
+        if rec.get("event") == "close":
+            row = _row_from_outcome_close(rec, _estimate_leverage)
+            row["source"] = "userfills_backfill"
+            rows.append(row)
+        elif rec.get("event") == "dsl_exit":
+            rows.append(_row_from_outcome_dsl_exit(rec, _estimate_leverage))
+
     dedup_window_ms = int(_dashboard_equity_params()["dedup_window_ms"])
     close_rows = _deduplicate_close_rows(rows, dedup_window_ms)[:limit]
-    return _pair_opens_and_closes(close_rows, events, outcome_records)
+    pairing_records = list(outcome_records) + [
+        r for r in backfill_records if r.get("event") == "execute"
+    ]
+    return _pair_opens_and_closes(close_rows, events, pairing_records)
 
 
 # A heartbeat that momentarily failed to fetch a HIP-3 dex reports equity far
