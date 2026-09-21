@@ -67,7 +67,9 @@ import xml.etree.ElementTree as ET
 # assert_cost_table_complete（防缺币静默回退 0.31bps），并接入 bt_ra_exch main
 # 调度 chokepoint；test_b_guard_leverage_costtable +19。
 # 全量离线回归 4629 passed / 0 failed（307.8s）。
-MIN_OFFLINE_TESTS = 4629
+# T-02（GAP-VALID）：新增 hermes_trader/validation 包（CPCV 组合purged交叉验证 +
+# DSR 多重检验校正 + PBO），与 block-bootstrap 并列；test_validation_cpcv_dsr +17。
+MIN_OFFLINE_TESTS = 4646
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

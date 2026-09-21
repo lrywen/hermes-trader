@@ -63,6 +63,7 @@
 | `w7_guard_leverage_costtable_2026-09-21.md` | W7 | 回测内核 guard 补**杠杆一致性(=10)+逐币成本表齐全度**两守，接入 bt_ra_exch 调度 chokepoint（fail-closed）；B-12/13 仓库早完成待重建镜像、A 类高风险解构明确不做；+19 测试，全量 **4629 passed** |
 | `funding_independent_xcheck_pass_2026-09-21.md` | 思路4 | funding 独立交叉核对（直取 HL 官方 fundingHistory，等价 ScalarField 同源通道）：6币×远中近三窗，**覆盖时段内 0 缺失/0 数值不符 → PASS**，排除"结论由采数错误导致"；同源局限与异源校验路径已记录 |
 | `pdv2_no_same_venue_spot_no_edge_2026-09-21.md` | P-D-v2 | 高阈值 carry(≥4%)+波动率闸门 81币回放：**HL 81 perp 币无同场现货对、跨所basis噪声主导(−4.3bps年化放大)、99.9%提前出场**；30d独立块 CI 显著负[−5.23,−4.05]、剔6月仍负 → **Deprecated**。HL perp 1h 数据资产81币208d |
+| `t02_cpcv_dsr_confirm_outcome_b_2026-09-21.md` | T-02 | 新增 validation 包（CPCV+DSR+PBO，纯标准库）：b3 四臂 **15条OOS路径SR>0占比全0、中位OOS负**，最优夏普本为负、DSR P=0.0000 → 三方法一致确认 OUTCOME_B；+17 测试，floor 4646 |
 
 ## 找回原件的可选途径（备查，非必须）
 
