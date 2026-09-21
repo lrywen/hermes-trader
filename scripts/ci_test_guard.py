@@ -69,7 +69,9 @@ import xml.etree.ElementTree as ET
 # 全量离线回归 4629 passed / 0 failed（307.8s）。
 # T-02（GAP-VALID）：新增 hermes_trader/validation 包（CPCV 组合purged交叉验证 +
 # DSR 多重检验校正 + PBO），与 block-bootstrap 并列；test_validation_cpcv_dsr +17。
-MIN_OFFLINE_TESTS = 4646
+# 统一验证 CLI scripts/validate_outcome.py（三方法一次跑全+二值判定）+
+# test_validate_outcome_cli +3。
+MIN_OFFLINE_TESTS = 4649
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
