@@ -79,7 +79,10 @@ import xml.etree.ElementTree as ET
 # (execution/maker.py)，test_maker_notional_guard +7；成交质量采集
 # (execution/maker_probe.py：resting/maker edge/成交后mid漂移逆向选择)，
 # test_maker_order_probe +5。本轮仅离线代码，未入金、未启动取样。
-MIN_OFFLINE_TESTS = 4673
+# SHADOW maker 成交模拟器（零资金，execution/maker_shadow.py）：保守触及规则
+# (买单low<=limit/卖单high>=limit)、PIT不回溯挂单当根、TTL撤销、BAR_START/END
+# 口径、成交后mid漂移(逆向选择代理)；test_maker_shadow_sim +8。
+MIN_OFFLINE_TESTS = 4681
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners
