@@ -61,6 +61,69 @@ def assert_max_concurrent_allowed(n: int) -> None:
             f"capacity — filt +13.86% flips to -5.20% at maxc=2)"
         )
 
+
+# B-guard-1：生产杠杆。live executor 以 leverage=10 运行（/data 权威配置，
+# 2026-09-21 实测）。回测若用不同杠杆，其初始保证金、维持保证金与爆仓/强平
+# 口径都与生产不可比——杠杆直接决定 ROE 缩放与 max_loss_roe 的触发距离。
+# 与 MAX_CONCURRENT_POSITIONS 同性质：固化为受保护常量，而非待优化参数；改它
+# 会改变资金暴露，只能在 mode=SHADOW 下另行评估。
+LIVE_LEVERAGE = 10
+
+
+def assert_leverage_allowed(leverage: int) -> None:
+    """Reject a backtest run whose leverage differs from the live value.
+
+    Margin/liquidation math and the ROE-scaled stop distance all depend on
+    leverage; a run at a different multiple is structurally incomparable to
+    the live account, so divergence is a hard error (like the concurrent
+    position cap), not a silent discrepancy.
+    """
+    if not isinstance(leverage, int) or isinstance(leverage, bool) or leverage <= 0:
+        raise ValueError(f"leverage must be a positive int, got {leverage!r}")
+    if leverage != LIVE_LEVERAGE:
+        raise ValueError(
+            f"backtest leverage={leverage} != live leverage={LIVE_LEVERAGE} — "
+            "margin/liquidation and ROE stop distance would be incomparable; "
+            "evaluate a leverage change under mode=SHADOW rather than silently "
+            "replaying at a different multiple"
+        )
+
+
+# B-guard-2：逐币成本表齐全度。生产回测的单边滑点取自
+# hermes_trader/data/per_coin_half_spread_bps.json 的 81 币半价差；币不在表中
+# 时会静默回退到 flat/0.31bps（bt_ra_exch._slip_for），使该币成本被低估或
+# 错配而不报错。任何回测路径在调度前必须确认其币池被成本表完整覆盖。
+COST_TABLE_FALLBACK_BPS = 0.31
+
+
+def check_cost_table_coverage(
+    coins: Sequence[str], covered_coins: Sequence[str]
+) -> list[str]:
+    """Return the backtest coins missing from the per-coin cost table.
+
+    Empty list means every coin has an explicit half-spread entry. A coin in
+    the replay universe but absent from ``covered_coins`` (the keys of
+    per_coin_half_spread_bps.json) would otherwise silently fall back to
+    :data:`COST_TABLE_FALLBACK_BPS`, understating its cost.
+    """
+    covered = {str(c).upper() for c in covered_coins}
+    return [str(c) for c in coins if str(c).upper() not in covered]
+
+
+def assert_cost_table_complete(
+    coins: Sequence[str], covered_coins: Sequence[str]
+) -> None:
+    """Raise ``ValueError`` listing any replay coin lacking a cost entry."""
+    missing = check_cost_table_coverage(coins, covered_coins)
+    if missing:
+        preview = ", ".join(missing[:10]) + (f" …(+{len(missing)-10})"
+                                             if len(missing) > 10 else "")
+        raise ValueError(
+            f"per-coin cost table missing {len(missing)} replay coin(s): {preview} "
+            f"— they would silently fall back to {COST_TABLE_FALLBACK_BPS}bps; "
+            "extend per_coin_half_spread_bps.json or shrink the backtest universe"
+        )
+
 # 生产状态卷根（容器内命名卷 hermes-deploy_hermes_data→/data）。研究回测的
 # 落盘产物只能写仓库 logs/（gitignored）等研究路径，禁止写入生产卷，避免
 # 研究 JSONL 与生产 events/session/state 混杂或写满卷（评估报告 R2）。

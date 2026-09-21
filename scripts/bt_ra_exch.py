@@ -1207,6 +1207,12 @@ def main() -> None:
     coins = [c.strip().upper() for c in args.coins.split(",") if c.strip()]
     cfg, cfg_src = _load_config(args.config)
     P = _resolve_params(cfg)
+
+    # B-guard：回测生产可比性，调度前硬校验（不满足直接报错退出，不产结果）。
+    # ① 成本表齐全度：币池必须全部有逐币半价差，否则缺失币静默回退 0.31bps
+    #    低估成本；② 杠杆一致性：回测杠杆必须等于生产 leverage。
+    from hermes_trader.backtest import guard as _guard
+    _guard.assert_cost_table_complete(coins, list(PER_COIN_SLIP_BPS.keys()))
     # P6b-1a：实盘逐笔 sizing（--live-sizing 时对 *_exch 臂生效）
     P["sizing"] = ({
         "risk_per_trade_pct": float(args.risk_per_trade_pct),
@@ -1217,6 +1223,10 @@ def main() -> None:
     # B-1a-改③：逐笔带杠杆。实盘权威配置顶层 leverage（生产=10），ROE cap 在
     # dsl_exit.max_loss_roe_pct（生产=15）；注入副本供 DslParams.from_config 读取。
     _live_leverage = float(cfg.get("leverage", 1) or 1)
+    # B-guard② 杠杆一致性：配置杠杆须为生产整数倍且等于 LIVE_LEVERAGE。
+    if _live_leverage != int(_live_leverage):
+        raise ValueError(f"config leverage={_live_leverage} 非整数倍，无法对齐生产口径")
+    _guard.assert_leverage_allowed(int(_live_leverage))
     _dsl_cfg_for_params = dict(P["dsl"])
     _dsl_cfg_for_params["_leverage"] = _live_leverage
     live_dsl = DslParams.from_config(_dsl_cfg_for_params)
