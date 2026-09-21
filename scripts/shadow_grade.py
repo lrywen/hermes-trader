@@ -1264,17 +1264,20 @@ def collect_grades(windows: list[int]) -> dict:
 
     baseline = {"real_closes": 0, "real_win_rate": None, "note": ""}
     try:
-        from hermes_trader.agents.memory import memory
-        # Audit 2026-09-10 (M5)：独立 CLI/cron 进程里 memory 单例启动时不会自动
-        # hydrate（只有 server/trading_loop 主流程显式调 load()），不显式 load
-        # 会让夜间快照的 real_closes 恒为 0（与运行中进程、events.jsonl 真相
-        # 不符）。load() 幂等（_initialized 后为 no-op），对服务进程安全。
-        memory.load()
-        ps = memory.get_payoff_stats(limit=500)
-        baseline["real_closes"] = int(ps.get("n", 0))
-        wr = memory.get_win_rate()
-        if wr.get("total"):
-            baseline["real_win_rate"] = round(wr.get("rate", 0.0), 4)
+        # Audit 2026-09-22：real_closes 口径与 dashboard 平仓时间线统一。
+        # 此前仅取 memory 单例的 _closes，而 _rebuild_from_events() 只 replay
+        # 主文件 events.jsonl，既不读轮转文件（events.jsonl.1）也不读交易所
+        # userFills 回填文件，导致跨轮转/回填的真实平仓被漏算（页面显示 1，
+        # 实际更多）。这里改用 dashboard 已去重的跨源合并（session-log +
+        # events 主/轮转 + userfills-backfill），净杠杆后 pnl_pct 与 memory 的
+        # realized_pnl_pct 同口径。
+        from hermes_trader.dashboard import _closed_trades_payload
+        rows = _closed_trades_payload(limit=500)
+        scored = [r for r in rows if r.get("pnl_pct") is not None]
+        baseline["real_closes"] = len(rows)
+        if scored:
+            wins = sum(1 for r in scored if r.get("pnl_pct") > 0)
+            baseline["real_win_rate"] = round(wins / len(scored), 4)
         if baseline["real_closes"] == 0:
             baseline["note"] = "SHADOW 模式无真实成交，forward ledger 为空 —— 评级仅基于 shadow 采数，缺真钱对照"
     except Exception as e:  # pragma: no cover
