@@ -94,7 +94,9 @@ import xml.etree.ElementTree as ET
 # 不轮转/不裁剪），新增 test_backfill_userfills +2，4601 → 4603。
 # Audit 2026-09-21 (#rating)：灾难保险臂口径豁免新增 tail_insurance 测试 +1，
 # 4603 → 4604。
-MIN_OFFLINE_TESTS = 4604
+# Audit 2026-09-22 (#backtest)：backtest_short_regime 重写为统一内核，新增
+# variant 准入 + 扫描/内核连线测试 +2，4604 → 4606。
+MIN_OFFLINE_TESTS = 4606
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

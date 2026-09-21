@@ -19,23 +19,25 @@ parity via the shared late_entry_check() pure function on closed 4h bars):
   E  + composite  : D with composite >= MIN_SCORE, swept over SCAN_SCORES to
                     calibrate runner_entry_gate.min_short_composite.
 
+Implementation note (Audit 2026-09-22): this script no longer re-implements a
+local DSL/Trade loop. It scans base short candidates once with the shared
+``hermes_trader.backtest.signals`` helpers, then runs each variant through the
+UNIFIED P4 kernel (``backtest.driver.run``) — the SAME production DSLTracker +
+H-7 CostModel ``scripts/backtest.py`` uses — so exit/cost semantics match the
+main backtest exactly.
+
 Anti-look-ahead: entries decide on 1h bar i close and fill at bar i+1 open;
 the 4h series is sliced to bars fully closed by the decision instant; the
-macro regime at bar i uses only BTC closes up to that bar (EMA is causal,
-so the full-length EMA array indexed at i equals the prefix EMA — identical
-math to trend_from_closes on the prefix).
+macro regime at bar i uses only BTC closes up to that bar (EMA is causal).
 
-Caveats: the AI verdict is substituted by the same deterministic heuristic
-as scripts/backtest.py, so min_short_confidence (an LLM output) CANNOT be
-replayed — the composite score stands in for min_short_composite only; the
-$50M volume floor uses TODAY's dayNtlVlm snapshot (survivorship bias); one
-open position per coin; equity held constant; DSL modelled with the base
-3-param ladder (max_loss/protect/retrace — the live phase2_tiers /
-regime_aware refinements are not replayed).
+Caveats: the AI verdict is substituted by a deterministic heuristic, so
+min_short_confidence (an LLM output) CANNOT be replayed — the composite score
+stands in for min_short_composite only; the $50M volume floor uses TODAY's
+dayNtlVlm snapshot (survivorship bias); one open position per coin; equity
+held constant.
 
 Usage:
-    HERMES_AGENT_CONFIG_FILE=/tmp/hermes-agent-config.json \
-        python3 scripts/backtest_short_regime.py --days 180 --coins 20
+    python3 scripts/backtest_short_regime.py --days 180 --coins 20
 """
 from __future__ import annotations
 
@@ -61,22 +63,40 @@ if _env.is_file():
                 continue
             os.environ.setdefault(_k.strip(), _v.strip())
 sys.path.insert(0, str(_REPO))
-sys.path.insert(0, str(_REPO / "scripts"))
 
-import backtest as bt  # noqa: E402  (Trade/DSL/_evaluate/_closed_slice/...)
-from hermes_trader.agents.config import get_config  # noqa: E402
-from hermes_trader.agents.config_store import cfg_get, read_agent_config  # noqa: E402
-from hermes_trader.agents.ta_filter import late_entry_check  # noqa: E402
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
-from hermes_trader.indicators import math as ind  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
+from hermes_trader.agents.config import get_config
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.ta_filter import late_entry_check
+from hermes_trader.backtest import cost as kcost
+from hermes_trader.backtest import driver as kdriver
+from hermes_trader.backtest import signals as ksig
+from hermes_trader.backtest import stats as kstats
+from hermes_trader.backtest.types import Signal, Trade
+from hermes_trader.client.hl_client import fetch_hl_candles
+from hermes_trader.client.universe import get_universe
+from hermes_trader.indicators import math as ind
+from hermes_trader.models.types import Candle
 
-WINDOW = 150       # trailing 1h indicator window (suffix; all triggers used
-                   # here have <= ~60-bar memory or decaying EMA memory with
-                   # <1% residual weight past 150 bars) — keeps the scan O(n)
+_MS_PER: Dict[str, int] = {
+    "5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000,
+    "4h": 4 * 60_000, "1d": 24 * 60_000,
+}
+
 W4_WINDOW = 60     # trailing 4h suffix fed to late_entry_check
 SCAN_SCORES = (20.0, 25.0, 30.0, 40.0)  # variant-E min_short_composite sweep
+
+
+def _closed_slice(series: Optional[List[Candle]], ts_ms: List[int],
+                  decision_ms: int, tf_ms: int) -> Optional[List[Candle]]:
+    """Prefix of a higher-TF series FULLY CLOSED at the decision instant.
+
+    Mirrors scripts/backtest.py::_closed_slice (no look-ahead).
+    """
+    if not series:
+        return None
+    cutoff = decision_ms - tf_ms
+    j = bisect.bisect_right(ts_ms, cutoff)
+    return series[:j] if j > 0 else None
 
 
 def _macro_regime_series(closes: List[float], fast_p: int, slow_p: int,
@@ -107,12 +127,13 @@ def _macro_regime_series(closes: List[float], fast_p: int, slow_p: int,
 def _scan_candidates(coin: str, candles: List[Candle],
                      candles_4h: Optional[List[Candle]],
                      macro_ts: List[int], macro_regime: List[str],
-                     cfg: Dict[str, Any], le_params: Dict[str, Any],
+                     th: Dict[str, Any], weights: Dict[str, float],
+                     le_params: Dict[str, Any],
                      warmup: int, sim_ms: int) -> tuple:
-    """Pass 1 (run ONCE per coin): every bar where the BASE short signal
-    fires — bearish heuristic verdict + ta_confirmed proxy + live ta_late
-    short-mirror hard gate. Records the per-variant filter inputs so the
-    variants can replay without rescanning indicators."""
+    """Pass 1 (run ONCE per coin): every bar where the BASE short signal fires
+    — bearish heuristic verdict + ta_confirmed proxy + live ta_late short
+    hard gate. Records the per-variant filter inputs so variants can replay
+    through the kernel without rescanning indicators."""
     t4 = [c.t for c in candles_4h] if candles_4h else []
     closes4 = [c.c for c in candles_4h] if candles_4h else []
     ema8_4 = ind.ema(closes4, 8) if len(closes4) >= 8 else []
@@ -120,25 +141,24 @@ def _scan_candidates(coin: str, candles: List[Candle],
     cands: List[Dict[str, Any]] = []
     stats = {"bearish": 0, "signal": 0, "ta_conf": 0, "late_veto": 0}
     for i in range(warmup, len(candles) - 1):
-        bar = candles[i]
-        window = candles[max(0, i + 1 - WINDOW): i + 1]
-        score, hits = bt._evaluate(window, cfg)
-        bullish, atr_pct, adx14 = bt._trend_and_atr_pct(window)
+        window = candles[: i + 1]
+        score, hits = ksig.evaluate_window(window, th, weights)
+        bullish, atr_pct, adx14 = ksig.trend_and_atr_pct(window)
         if bullish is None or bullish:
             continue  # shorts only; None = insufficient data
         stats["bearish"] += 1
-        verdict = bt._heuristic_verdict(score, hits, bullish, atr_pct)
-        if verdict != "SHORT":
+        verdict = ksig.heuristic_verdict(score, hits, bullish, atr_pct)
+        if verdict != "short":
             continue
         stats["signal"] += 1
         burst = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
-        if not bt._ta_confirmed(bullish, atr_pct, adx14, score) and not burst:
+        if not ksig.ta_confirmed(bullish, atr_pct, adx14, score) and not burst:
             continue
         stats["ta_conf"] += 1
-        decision_ms = bar.t + sim_ms
+        decision_ms = candles[i].t + sim_ms
         # Live ta_late_entry hard gate (short mirror), closed 4h bars only.
         if le_params and candles_4h:
-            w4 = bt._closed_slice(candles_4h, t4, decision_ms, bt._MS_PER["4h"])
+            w4 = _closed_slice(candles_4h, t4, decision_ms, _MS_PER["4h"])
             if w4:
                 w4 = w4[-W4_WINDOW:]
             le = late_entry_check(w4, None, "short", le_params)
@@ -146,69 +166,17 @@ def _scan_candidates(coin: str, candles: List[Candle],
                 stats["late_veto"] += 1
                 continue
         # Variant-B input: own 4h downtrend on closed bars (EMA8 < EMA21).
-        j4 = bisect.bisect_right(t4, decision_ms - bt._MS_PER["4h"])
+        j4 = bisect.bisect_right(t4, decision_ms - _MS_PER["4h"])
         own_down = False
         if j4 >= 22 and ema8_4 and ema21_4:
             e8, e21 = ema8_4[j4 - 1], ema21_4[j4 - 1]
             own_down = math.isfinite(e8) and math.isfinite(e21) and e8 < e21
         # Variant-C input: macro regime from the last CLOSED BTC 1h bar.
-        jm = bisect.bisect_right(macro_ts, bar.t) - 1
+        jm = bisect.bisect_right(macro_ts, candles[i].t) - 1
         macro = macro_regime[jm] if 0 <= jm < len(macro_regime) else "neutral"
         cands.append({"bar": i, "score": score, "own_down": own_down,
                       "macro": macro, "atr_pct": atr_pct})
     return cands, stats
-
-
-def _simulate_shorts(coin: str, candles: List[Candle],
-                     cands: List[Dict[str, Any]], max_lev: int, *,
-                     equity: float, equity_fraction: float, lev_ceiling: int,
-                     max_loss_pct: float, protect_pct: float,
-                     retrace_threshold: float,
-                     admit: Callable[[Dict[str, Any]], bool],
-                     entry_slip_bps: float, exit_slip_bps: float,
-                     stop_delay_slip_bps: float) -> List[bt.Trade]:
-    """Pass 2: DSL position management over the admitted candidates. Mirrors
-    backtest._simulate's short branch exactly (entry at next bar open with
-    adverse slip, H-7 exit costs, ROUND_TRIP_FEE_BPS)."""
-    by_bar = {c["bar"]: c for c in cands}
-    fee_pct = bt.ROUND_TRIP_FEE_BPS / 10000.0
-
-    def _fill(px: float, is_buy: bool, bps: float) -> float:
-        adj = px * bps / 10000.0
-        return px + adj if is_buy else px - adj
-
-    trades: List[bt.Trade] = []
-    open_t: Optional[bt.Trade] = None
-    open_dsl: Optional[bt.DSL] = None
-    for i in range(len(candles) - 1):
-        bar = candles[i]
-        if open_t is not None and open_dsl is not None:
-            done, exit_ref, reason = open_dsl.check_bar(i, bar)
-            if done:
-                is_stop = reason.startswith("max_loss")
-                slip = exit_slip_bps + (stop_delay_slip_bps if is_stop else 0.0)
-                exit_px = _fill(exit_ref, True, slip)  # closing a short = BUY
-                gross = (open_t.entry_px - exit_px) / open_t.entry_px
-                open_t.exit_bar = i
-                open_t.exit_px = exit_px
-                open_t.pnl_usd = open_t.notional * (gross - fee_pct)
-                open_t.exit_reason = reason
-                trades.append(open_t)
-                open_t = open_dsl = None
-                continue
-        if open_t is None and i in by_bar and admit(by_bar[i]):
-            next_bar = candles[i + 1]
-            lev = min(lev_ceiling, max_lev)
-            notional = equity * equity_fraction * lev
-            entry_px = _fill(next_bar.o, False, entry_slip_bps)  # SELL below
-            open_t = bt.Trade(coin=coin, side="short", entry_bar=i + 1,
-                              entry_px=entry_px, notional=notional,
-                              margin=equity * equity_fraction, leverage=lev)
-            open_dsl = bt.DSL(side="short", entry_px=entry_px, entry_bar=i + 1,
-                              peak_px=entry_px, max_loss_pct=max_loss_pct,
-                              protect_pct=protect_pct,
-                              retrace_threshold=retrace_threshold)
-    return trades
 
 
 def _variant_admit(name: str, min_score: float = 0.0
@@ -227,53 +195,47 @@ def _variant_admit(name: str, min_score: float = 0.0
     raise ValueError(name)
 
 
-def _window_metrics(trades: List[bt.Trade], candles: List[Candle],
-                    days: int, equity: float) -> Dict[str, Any]:
-    """Stats restricted to trades ENTERED within the trailing `days` window."""
+def _run_variant(candles: List[Candle], cands: List[Dict[str, Any]],
+                 policy, admit: Callable[[Dict[str, Any]], bool], *,
+                 coin: str, leverage: int, notional: float,
+                 cost: kcost.CostModel, sim_ms: int) -> List[Trade]:
+    """Turn admitted base candidates into short Signals and run them through
+    the unified kernel (production DSL + H-7 cost)."""
+    signals = [Signal(c["bar"], "short") for c in cands if admit(c)]
+    return kdriver.run(
+        candles, signals, policy, coin=coin, leverage=leverage,
+        notional_usd=notional, cost=cost, bar_ms=sim_ms,
+    )
+
+
+def _window_trades(trades: List[Trade], candles: List[Candle],
+                   days: int) -> List[Trade]:
+    """Trades ENTERED within the trailing `days` window."""
     cutoff = candles[-1].t - days * 86_400_000
-    sub = [t for t in trades if candles[t.entry_bar].t >= cutoff]
-    m = bt._split_metrics(sub, equity)
-    reasons: Dict[str, int] = {}
-    for t in sub:
-        reasons[t.exit_reason] = reasons.get(t.exit_reason, 0) + 1
-    m["reasons"] = reasons
-    return m
+    return [t for t in trades if candles[t.entry_bar].t >= cutoff]
 
 
-def _merge_metrics(per_coin: List[Dict[str, Any]], equity: float) -> Dict[str, Any]:
-    """Merge per-coin _window_metrics dicts into portfolio-level stats."""
-    n = sum(m.get("n", 0) for m in per_coin)
-    out: Dict[str, Any] = {"n": n}
-    if n == 0:
-        return out
-    wins = sum(m.get("wins", 0) for m in per_coin)
-    pnl = sum(m.get("pnl", 0.0) for m in per_coin)
-    out.update(n=n, wins=wins, win_rate=wins / n * 100, pnl=pnl,
-               expectancy=pnl / n, pnl_pct=pnl / equity * 100,
-               max_dd=sum(m.get("max_dd", 0.0) for m in per_coin))
-    reasons: Dict[str, int] = {}
-    for m in per_coin:
-        for k, v in (m.get("reasons") or {}).items():
-            reasons[k] = reasons.get(k, 0) + v
-    out["reasons"] = reasons
-    return out
-
-
-def _print_variant(label: str, desc: str, merged: Dict[int, Dict[str, Any]],
-                   windows: tuple) -> None:
+def _print_variant(label: str, desc: str,
+                   trades_by_window: Dict[int, List[Trade]],
+                   windows: tuple, equity: float) -> List[tuple]:
     print(f"\n--- Variant {label}: {desc} ---")
-    hdr = f"  {'window':<7s} {'n':>4s} {'win%':>6s} {'exp/trade':>10s} " \
-          f"{'PnL':>9s} {'ret%':>7s} {'maxDD':>8s}  exits"
-    print(hdr)
+    print(f"  {'window':<7s} {'n':>4s} {'win%':>6s} {'exp/trade':>10s} "
+          f"{'PnL':>9s} {'ret%':>7s} {'maxDD':>8s}  exits")
+    rows = []
     for d in windows:
-        m = merged.get(d) or {}
-        if not m.get("n"):
+        sub = trades_by_window.get(d) or []
+        s = kstats.trade_stats(sub, equity=equity)
+        rows.append((label, d, s.n, s.win_rate_pct, s.expectancy_usd,
+                     s.pnl_net_usd, s.max_dd_usd))
+        if not s.n:
             print(f"  {d}d{'':<4s} {'0':>4s} {'-':>6s} {'-':>10s} "
                   f"{'-':>9s} {'-':>7s} {'-':>8s}  -")
             continue
-        print(f"  {d}d{'':<4s} {m['n']:>4d} {m['win_rate']:>5.1f}% "
-              f"${m['expectancy']:>+8.3f} ${m['pnl']:>+8.2f} "
-              f"{m['pnl_pct']:>+6.1f}% ${m['max_dd']:>7.2f}  {m['reasons']}")
+        print(f"  {d}d{'':<4s} {s.n:>4d} {s.win_rate_pct:>5.1f}% "
+              f"${s.expectancy_usd:>+8.3f} ${s.pnl_net_usd:>+8.2f} "
+              f"{s.pnl_pct_equity:>+6.1f}% ${s.max_dd_usd:>7.2f}  "
+              f"{s.by_reason}")
+    return rows
 
 
 def main() -> int:
@@ -284,10 +246,12 @@ def main() -> int:
     ap.add_argument("--equity", type=float, default=100.0)
     ap.add_argument("--min-vol", type=float, default=50e6,
                     help="24h notional volume floor for the universe (USD)")
-    ap.add_argument("--entry-slip-bps", type=float, default=bt.DEFAULT_ENTRY_SLIP_BPS)
-    ap.add_argument("--exit-slip-bps", type=float, default=bt.DEFAULT_EXIT_SLIP_BPS)
+    ap.add_argument("--entry-slip-bps", type=float,
+                    default=kcost.DEFAULT_ENTRY_SLIP_BPS)
+    ap.add_argument("--exit-slip-bps", type=float,
+                    default=kcost.DEFAULT_EXIT_SLIP_BPS)
     ap.add_argument("--stop-delay-slip-bps", type=float,
-                    default=bt.DEFAULT_STOP_DELAY_SLIP_BPS)
+                    default=kcost.DEFAULT_STOP_DELAY_SLIP_BPS)
     args = ap.parse_args()
 
     live = read_agent_config()
@@ -312,12 +276,24 @@ def main() -> int:
     live_min_short_conf = float(gate.get("min_short_confidence", 0.68))
 
     interval = "1h"
-    sim_ms = bt._MS_PER[interval]
+    sim_ms = _MS_PER[interval]
     total_bars = args.days * 24 + 100  # + warmup
-    need_4h = math.ceil(total_bars * sim_ms / bt._MS_PER["4h"]) + 40
+    need_4h = math.ceil(total_bars * sim_ms / _MS_PER["4h"]) + 40
 
+    # Trigger thresholds/weights the live scanner uses.
     cfg = get_config()
-    cfg["_interval"] = interval
+    th = dict(cfg["thresholds"])
+    weights = dict(cfg["weights"])
+
+    # Production exit policy: base 3-param ladder (see module docstring caveat).
+    from dataclasses import replace
+
+    from hermes_trader.agents.dsl_exit import _build_policy_from_config
+    policy = replace(
+        _build_policy_from_config(),
+        max_loss_pct=max_loss, protect_pct=protect,
+        retrace_threshold=retrace,
+    )
 
     print("=== hermes-trader SHORT re-enable backtest ===")
     print(f"period: {args.days}d (also split at 90d)   interval: {interval}   "
@@ -330,7 +306,7 @@ def main() -> int:
           f"mtf={le_params.get('mtf_enabled')})")
     print(f"macro regime: BTC EMA{fast_p}/{slow_p} slope±{slope_up} over {lookback} bars "
           f"(live regime_classifier params)")
-    print(f"cost model (H-7): {bt.ROUND_TRIP_FEE_BPS:.1f}bps RT fee + "
+    print(f"cost model (H-7): {kcost.DEFAULT_ROUND_TRIP_FEE_BPS:.1f}bps RT fee + "
           f"{args.entry_slip_bps:.1f}bps entry / {args.exit_slip_bps:.1f}bps exit slip + "
           f"{args.stop_delay_slip_bps:.1f}bps stop-out delay")
     print(f"live short gates for reference: min_short_confidence={live_min_short_conf} "
@@ -339,15 +315,14 @@ def main() -> int:
     # Macro regime series from BTC 1h closes (production classifier params).
     print("\nfetching BTC 1h for macro regime series ...")
     btc = fetch_hl_candles("BTC", interval, total_bars)
-    btc_closes = [c.c for c in btc]
     macro_ts = [c.t for c in btc]
-    macro_regime = _macro_regime_series(btc_closes, fast_p, slow_p, slope_up,
-                                        lookback)
+    macro_regime = _macro_regime_series(
+        [c.c for c in btc], fast_p, slow_p, slope_up, lookback)
     n_down = sum(1 for r in macro_regime if r == "down")
     n_up = sum(1 for r in macro_regime if r == "up")
     print(f"BTC bars: {len(btc)}   regime mix: up {n_up / len(btc) * 100:.0f}% / "
           f"down {n_down / len(btc) * 100:.0f}% / "
-          f"neutral {(len(btc) - n_up - n_down) / len(btc) * 100:.0f}%")
+          f"{(len(btc) - n_up - n_down) / len(btc) * 100:.0f}%")
 
     universe = get_universe()
     perps = [m for m in universe
@@ -355,12 +330,11 @@ def main() -> int:
              and float(m.get("dayNtlVlm", 0) or 0) >= args.min_vol]
     coins = sorted(perps, key=lambda m: float(m.get("dayNtlVlm", 0) or 0),
                    reverse=True)[: args.coins]
-    print(f"universe: {len(perps)} perps pass the volume floor; "
-          f"simulating top {len(coins)}: "
-          f"{', '.join(m['coin'] for m in coins)}\n")
+    print(f"universe: {len(perps)} perps pass the volume floor; simulating top "
+          f"{len(coins)}: {', '.join(m['coin'] for m in coins)}\n")
 
     variant_labels = ["A", "B", "C", "D"] + [f"E>={s:g}" for s in SCAN_SCORES]
-    trades_by_variant: Dict[str, List[bt.Trade]] = {v: [] for v in variant_labels}
+    trades_by_variant: Dict[str, List[Trade]] = {v: [] for v in variant_labels}
     candles_by_coin: Dict[str, List[Candle]] = {}
     total_stats = {"bearish": 0, "signal": 0, "ta_conf": 0, "late_veto": 0}
 
@@ -377,27 +351,32 @@ def main() -> int:
             print(f"  {coin}: fetch failed: {e} — skipped")
             continue
         candles_by_coin[coin] = candles
-        cands, stats = _scan_candidates(coin, candles, candles_4h, macro_ts,
-                                        macro_regime, cfg, le_params,
-                                        warmup=100, sim_ms=sim_ms)
+        cands, cstats = _scan_candidates(
+            coin, candles, candles_4h, macro_ts, macro_regime, th, weights,
+            le_params, warmup=100, sim_ms=sim_ms)
         for k in total_stats:
-            total_stats[k] += stats[k]
+            total_stats[k] += cstats[k]
+
+        lev = min(lev_ceiling, max_lev)
+        notional = args.equity * equity_fraction * lev
+        cost = kcost.CostModel(
+            round_trip_fee_bps=kcost.DEFAULT_ROUND_TRIP_FEE_BPS,
+            entry_slip_bps=args.entry_slip_bps,
+            exit_slip_bps=args.exit_slip_bps,
+            stop_delay_slip_bps=args.stop_delay_slip_bps,
+        )
         for label in variant_labels:
             if label.startswith("E"):
                 ms = float(label.split(">=")[1])
                 admit = _variant_admit("E", ms)
             else:
                 admit = _variant_admit(label)
-            trades_by_variant[label].extend(_simulate_shorts(
-                coin, candles, cands, max_lev, equity=args.equity,
-                equity_fraction=equity_fraction, lev_ceiling=lev_ceiling,
-                max_loss_pct=max_loss, protect_pct=protect, retrace_threshold=retrace,
-                admit=admit, entry_slip_bps=args.entry_slip_bps,
-                exit_slip_bps=args.exit_slip_bps,
-                stop_delay_slip_bps=args.stop_delay_slip_bps))
+            trades_by_variant[label].extend(_run_variant(
+                candles, cands, policy, admit, coin=coin, leverage=lev,
+                notional=notional, cost=cost, sim_ms=sim_ms))
         print(f"  {coin:8s} bars={len(candles)}  base short candidates={len(cands)} "
-              f"(bearish {stats['bearish']} → signal {stats['signal']} → "
-              f"ta_conf {stats['ta_conf']}, late-veto {stats['late_veto']})")
+              f"(bearish {cstats['bearish']} → signal {cstats['signal']} → "
+              f"ta_conf {cstats['ta_conf']}, late-veto {cstats['late_veto']})")
 
     print(f"\nbase-candidate funnel (all coins): bearish {total_stats['bearish']} → "
           f"signal {total_stats['signal']} → ta_conf {total_stats['ta_conf']} → "
@@ -416,22 +395,18 @@ def main() -> int:
     print("\n=== VARIANT RESULTS (net of H-7 costs) ===")
     verdict_rows = []
     for label in variant_labels:
-        merged: Dict[int, Dict[str, Any]] = {}
+        trades_by_window: Dict[int, List[Trade]] = {}
         for d in windows:
-            per_coin = []
+            sub = []
             for coin, candles in candles_by_coin.items():
                 ct = [t for t in trades_by_variant[label] if t.coin == coin]
-                per_coin.append(_window_metrics(ct, candles, d, args.equity))
-            merged[d] = _merge_metrics(per_coin, args.equity)
-        _print_variant(label, descs[label], merged, windows)
-        for d in windows:
-            m = merged[d]
-            verdict_rows.append((label, d, m.get("n", 0), m.get("win_rate", 0.0),
-                                 m.get("expectancy", 0.0), m.get("pnl", 0.0),
-                                 m.get("max_dd", 0.0)))
+                sub.extend(_window_trades(ct, candles, d))
+            trades_by_window[d] = sub
+        verdict_rows.extend(_print_variant(
+            label, descs[label], trades_by_window, windows, args.equity))
 
-    print("\n=== DECISION GRID (expectancy is per-trade USD on $"
-          f"{args.equity:.0f} equity) ===")
+    print("\n=== DECISION GRID (per-trade USD on "
+          f"${args.equity:.0f} equity) ===")
     print(f"  {'variant':<8s} {'win':>5s} {'n':>4s} {'win%':>6s} "
           f"{'exp/trade':>10s} {'PnL':>9s} {'maxDD':>8s}")
     for label, d, n, wr, exp, pnl, mdd in verdict_rows:
@@ -443,12 +418,10 @@ def main() -> int:
     print("  - AI verdict substituted with a heuristic; min_short_confidence "
           "(LLM) NOT replayed — only min_short_composite is calibrated here.")
     print("  - Volume floor uses TODAY's dayNtlVlm snapshot (survivorship bias).")
-    print("  - DSL modelled with the base 3-param ladder; live phase2_tiers / "
-          "regime_aware / breakeven refinements not replayed.")
-    print("  - One open position per coin; equity constant; no cooldown; "
+    print("  - One open position per coin; equity constant; cooldown not applied; "
           "max_concurrent cap NOT enforced across coins.")
-    print("  - 150-bar 1h / 60-bar 4h indicator windows (exponential-memory "
-          "approximation, <1% residual).")
+    print("  - Exits/costs come from the unified kernel (production DSLTracker + "
+          "H-7), matching scripts/backtest.py.")
     print("  - Past performance does NOT imply future results.")
     return 0
 
