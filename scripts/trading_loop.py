@@ -2112,20 +2112,7 @@ while True:
                             _would_admit = (
                                 _elapsed_min >= _active_min and not _jumped)
                             if _would_admit:
-                                if _rca_shadow:
-                                    log_event({"event": "risk_tuning_shadow",
-                                               "rule": "research_cooldown_adaptive",
-                                               "coin": coin,
-                                               "would": "re_research",
-                                               "detail": {
-                                                   "elapsed_min": round(_elapsed_min, 2),
-                                                   "calm_min": float(
-                                                       _cfg_cd.get("research_cooldown_min", 15)),
-                                                   "active_min": _active_min,
-                                                   "score": round(float(score), 2),
-                                                   **_hot_dbg,
-                                                   "enforced": False}})
-                                else:
+                                if not _rca_shadow:
                                     logger.info(
                                         f"{coin}: adaptive cooldown ENFORCE "
                                         f"re-research after {_elapsed_min:.1f}min "

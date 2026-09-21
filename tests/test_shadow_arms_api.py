@@ -321,11 +321,6 @@ def backfill_client(tmp_path, make_backfill_client):
          "pnl_pct": -0.2, "outcome": "loss"},
         {"would_change": False, "cf_v1_pnl_pct": 1.0, "cf_v2_pnl_pct": 1.0},
     ])
-    _write_jsonl(tmp_path / "per_coin_regime_backfill.jsonl", [
-        {"would": "pass", "outcome": "sim_winner"},
-        {"would": "demote_to_weak_aligned", "outcome": None},
-        {"would": "n/a_non_aligned", "outcome": "tier_na"},
-    ])
     _write_jsonl(tmp_path / "relax_tier_shadow.backfill.jsonl", [
         # ta_late records graded with rt_*-prefixed fields; bare outcome/pnl
         # keys stay None and must not leak into the summary.
@@ -344,9 +339,9 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     r = backfill_client.get("/api/dashboard/shadow-arms/backfill-summary")
     assert r.status_code == 200
     body = r.json()
-    assert body["files_present"] == 5
+    assert body["files_present"] == 4
     by_arm = {a["arm"]: a for a in body["arms"]}
-    assert len(by_arm) == 8
+    assert len(by_arm) == 7
 
     ta = by_arm["ta_late_entry"]
     assert ta["present"] is True and ta["records"] == 3
@@ -383,12 +378,6 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     assert atr["pnl"]["n"] == 2  # the not_material row carries no pnl_pct
     assert atr["outcomes"] == {"win": 1, "loss": 1}
 
-    pcr = by_arm["per_coin_regime"]
-    assert pcr["extras"]["would"] == {
-        "pass": 1, "demote_to_weak_aligned": 1, "n/a_non_aligned": 1}
-    # ungraded rows (outcome None) must not produce a literal "None" bucket
-    assert pcr["outcomes"] == {"sim_winner": 1, "tier_na": 1}
-
     rt = by_arm["relax_tier"]
     assert rt["present"] is True and rt["records"] == 3
     # rt_* field mapping: bare outcome/pnl_pct keys are None on this artifact
@@ -410,16 +399,16 @@ def test_backfill_summary_anonymous_read_and_ttl_cached(backfill_client, tmp_pat
     c = backfill_client
     r1 = c.get("/api/dashboard/shadow-arms/backfill-summary")  # no auth headers
     assert r1.status_code == 200
-    assert r1.json()["files_present"] == 5
+    assert r1.json()["files_present"] == 4
     # A new artifact landing inside the TTL window must NOT show up...
     _write_jsonl(tmp_path / "pullback_shadow.backfill.jsonl", [{"pnl_pct": -1.0}])
     r2 = c.get("/api/dashboard/shadow-arms/backfill-summary")
-    assert r2.json()["files_present"] == 5
+    assert r2.json()["files_present"] == 4
     # ...until the cache entry is invalidated/expires.
     from hermes_trader.dashboard import _TTL_CACHE
     _TTL_CACHE.pop("shadow_arms_backfill_summary", None)
     r3 = c.get("/api/dashboard/shadow-arms/backfill-summary")
-    assert r3.json()["files_present"] == 6
+    assert r3.json()["files_present"] == 5
     pb = {a["arm"]: a for a in r3.json()["arms"]}["pullback"]
     assert pb["present"] is True and pb["pnl"]["n"] == 1
 

@@ -98,18 +98,6 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --write
   echo "$(ts) relax_tier shadow backfill exit=$?"
 
-  # Audit 2026-09-11 (early_breakout half-size lane backfill): grades the
-  # observation-only first-leg volume-breakout counterfactuals (two-phase 1h
-  # sim, tight ATR stop + trailing floor, half vs full size). The lane defaults
-  # to shadow off so the file may be empty; an empty/no-file run is harmless.
-  # --window-hours is a freshness guard: signals newer than it are left pending.
-  # Pure paper, best-effort: never masks the fills reconcile exit code above.
-  echo "$(ts) early_breakout shadow backfill start (freshness=${HERMES_EARLY_BREAKOUT_WINDOW:-1}h)"
-  docker exec "$CONTAINER" python /app/scripts/reconcile_early_breakout_shadow.py \
-    --file "${HERMES_EARLY_BREAKOUT_SHADOW_FILE:-/data/early_breakout_shadow.jsonl}" \
-    --window-hours "${HERMES_EARLY_BREAKOUT_WINDOW:-1}" --write
-  echo "$(ts) early_breakout shadow backfill exit=$?"
-
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1

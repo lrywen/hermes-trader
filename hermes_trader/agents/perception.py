@@ -209,34 +209,10 @@ def _age_decay_metric(mode: str, outcome: str) -> None:
         pass
 
 
-# Audit 2026-09-12 (sigma_burst_gate): counter-factual surfacing records for a
-# large σ return/volume spike that falls short of the composite gate. Shares
-# the same risk-tuning JSONL + rotating writer as the executor gray-release
-# arms (HERMES_RISK_TUNING_SHADOW_FILE). Observation-only in shadow_mode: the
-# coin is still dropped; enforce additionally surfaces it for research. Never
-# raises into the scan hot path.
-_SIGMA_BURST_SHADOW_FILE = os.environ.get(
-    "HERMES_RISK_TUNING_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"),
-)
-
-
-def _record_sigma_burst_shadow(rec: dict[str, Any]) -> None:
-    try:
-        from datetime import datetime, timezone
-        from hermes_trader.shadow_log import append_jsonl
-
-        rec = {
-            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "rule": "sigma_burst_gate",
-            "would": "surface",
-            **rec,
-        }
-        append_jsonl(_SIGMA_BURST_SHADOW_FILE, rec, stream="risk_tuning")
-    except Exception as _e:
-        logger.debug(f"[sigma-burst] shadow record failed: {_e}")
-
-
+# Audit 2026-09-12 (sigma_burst_gate): counter-factual surfacing decision for a
+# large σ return/volume spike that falls short of the composite gate.
+# 2026-09-21 cleanup: the observation-only JSONL recorder was retired; the
+# enforce branch (which surfaces the coin for research) is preserved below.
 def _sigma_burst_params(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the sigma_burst_gate block; absent/disabled → feature off."""
     try:
@@ -791,11 +767,6 @@ def _scan_single_market(
                 float(score), float(min_score), hits, _sb)
             if _qualifies:
                 _sb_shadow = bool(_sb.get("shadow_mode", True))
-                _record_sigma_burst_shadow({
-                    "coin": market["coin"],
-                    "side": "",
-                    "detail": {**_sb_info, "enforced": not _sb_shadow},
-                })
                 if not _sb_shadow:
                     logger.info(
                         f"[sigma-burst] {market['coin']} ENFORCE surface "

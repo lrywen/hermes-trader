@@ -10,7 +10,6 @@ compose block exactly):
   00:30  reconcile_ta_late_entry_shadow --window-hours 8 --write
   00:40  reconcile_xs_reversal_shadow --write
   00:50  reconcile_relax_tier_shadow --write
-  00:55  reconcile_short_only_shadow --window-hours 24 --write
   HH:05  macro_regime_watch --push (every hour)
 
 Each job is eligible for a 2-minute window; the runner dedups by slot id
@@ -90,12 +89,6 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "reconcile_relax_tier_shadow", 0, 50,
         ("scripts/reconcile_relax_tier_shadow.py", "--write"),
         "relax-tier-reconcile.log",
-    ),
-    _daily(
-        "reconcile_short_only_shadow", 0, 55,
-        ("scripts/reconcile_short_only_shadow.py", "--window-hours", "24", "--write"),
-        "short-only-reconcile.log",
-        extra_env=(("HERMES_SHORT_ONLY_SHADOW_FILE", "/data/short_only_shadow.jsonl"),),
     ),
     ScheduledJob(
         name="macro_regime_watch",

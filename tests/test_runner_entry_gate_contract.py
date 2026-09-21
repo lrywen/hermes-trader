@@ -66,8 +66,7 @@ def isolated_gate(monkeypatch):
                         lambda cfg: {"posture": "neutral"})
     monkeypatch.setattr(executor, "resolve_applied_knobs",
                         lambda base, cfg, snap: dict(base))
-    for name in ("_record_short_only_shadow", "_record_risk_tuning_shadow",
-                 "_record_pullback_shadow"):
+    for name in ("_record_risk_tuning_shadow", "_record_pullback_shadow"):
         monkeypatch.setattr(executor, name, lambda *a, **k: None)
     # pullback macro regime lookup (lazy import inside the function).
     import hermes_trader.agents.market_regime as mr

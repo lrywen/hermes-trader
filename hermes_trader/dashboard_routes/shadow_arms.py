@@ -68,7 +68,6 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     ("xs_reversal", "xs_reversal_shadow.backfill.jsonl"),
     ("atr_regime_calib", "atr_regime_calib_shadow.backfill.jsonl"),
     ("pullback", "pullback_shadow.backfill.jsonl"),
-    ("per_coin_regime", "per_coin_regime_backfill.jsonl"),
     ("daily_extension_cap", "daily_extension_cap_shadow.backfill.jsonl"),
     ("relax_tier", "relax_tier_shadow.backfill.jsonl"),
     ("trend_filter", "trend_filter_shadow.backfill.jsonl"),
@@ -132,12 +131,6 @@ def _arm_extras(arm: str, rows: list[dict]) -> dict:
                 "avg_pct": round(sum(deltas) / len(deltas), 4),
                 "improved": sum(1 for d in deltas if d > 0),
             }
-    elif arm == "per_coin_regime":
-        would: dict[str, int] = {}
-        for r in rows:
-            k = str(r.get("would"))
-            would[k] = would.get(k, 0) + 1
-        extras["would"] = would
     return extras
 
 

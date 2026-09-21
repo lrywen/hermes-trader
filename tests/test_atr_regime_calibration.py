@@ -1,22 +1,20 @@
 """Tests for ATR regime calibration (roadmap §1).
 
 Covers the pure ratio→regime→factor mapping in agents.sizing
-(atr_regime_calibration / ATR_REGIME_DEFAULTS), the self-contained config +
-shadow-JSONL wiring in agents.executor (_atr_calib_*), and the suppression
-of the legacy binary ATR-spike breaker when the calibration enforces.
+(atr_regime_calibration / ATR_REGIME_DEFAULTS), the self-contained config
+in agents.executor (_atr_calib_*), and the suppression of the legacy binary
+ATR-spike breaker when the calibration enforces. The observation-only shadow
+JSONL branch was removed in the 2026-09-21 cleanup.
 Default mode is OFF: with no config, sizing behavior is byte-identical to
 before this change.
 """
 
 from __future__ import annotations
 
-import json
-
 from hermes_trader.agents import executor
 from hermes_trader.agents.sizing import ATR_REGIME_DEFAULTS, atr_regime_calibration
 
 _ENV_MODE = "HERMES_ATR_REGIME_CALIB_MODE"
-_ENV_FILE = "HERMES_ATR_REGIME_CALIB_SHADOW_FILE"
 
 
 # ── pure mapping math (agents.sizing) ───────────────────────────────────────
@@ -131,19 +129,6 @@ def test_config_invalid_mode_falls_back_off(monkeypatch):
     assert executor._atr_calib_config({})["mode"] == "off"
 
 
-def test_shadow_path_resolution(monkeypatch, tmp_path):
-    monkeypatch.delenv(_ENV_FILE, raising=False)
-    # Config block wins.
-    blk = {"shadow_log_path": str(tmp_path / "from_config.jsonl")}
-    assert executor._atr_calib_shadow_path(blk).endswith("from_config.jsonl")
-    # Env overrides an empty block.
-    monkeypatch.setenv(_ENV_FILE, str(tmp_path / "from_env.jsonl"))
-    assert executor._atr_calib_shadow_path({}).endswith("from_env.jsonl")
-    # Default fallback when neither set.
-    monkeypatch.delenv(_ENV_FILE, raising=False)
-    assert executor._atr_calib_shadow_path({}).endswith("atr_regime_calib_shadow.jsonl")
-
-
 # ── _atr_calib_apply: off / shadow / enforce semantics ──────────────────────
 def _apply(mode_cfg, tmp_path, **kw):
     cfg = {"atr_regime_calibration": dict(mode_cfg)}
@@ -159,60 +144,37 @@ def _apply(mode_cfg, tmp_path, **kw):
     return executor._atr_calib_apply(**kw)
 
 
-def _read_jsonl(path):
-    with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-
-def test_apply_off_is_passthrough_and_no_file(monkeypatch, tmp_path):
+def test_apply_off_is_passthrough(monkeypatch, tmp_path):
     monkeypatch.delenv(_ENV_MODE, raising=False)
     out = _apply({"mode": "off"}, tmp_path)
     assert out["mode"] == "off"
     assert out["factor"] == 1.0
     assert out["effective_stop_pct"] == 2.0
     assert out["would_change"] is False
-    # OFF must never touch the JSONL.
-    assert not (tmp_path / "calib.jsonl").exists()
 
 
-def test_apply_shadow_logs_but_keeps_raw(tmp_path):
+def test_apply_shadow_keeps_raw(tmp_path):
     out = _apply({"mode": "shadow"}, tmp_path)
-    # High regime (ratio 2.0) → factor 1.20, calibrated width recorded...
+    # High regime (ratio 2.0) → factor 1.20, calibrated width computed...
     assert out["regime"] == "high"
     assert out["factor"] == ATR_REGIME_DEFAULTS["high_mult"]
     assert out["calibrated_stop_pct"] == 2.0 * ATR_REGIME_DEFAULTS["high_mult"]
     assert out["would_change"] is True
     # ...but the applied effective stop stays RAW in shadow.
     assert out["effective_stop_pct"] == 2.0
-    recs = _read_jsonl(tmp_path / "calib.jsonl")
-    assert len(recs) == 1
-    rec = recs[0]
-    assert rec["mode"] == "shadow"
-    assert rec["coin"] == "TEST"
-    assert rec["vol_regime"] == "high"
-    assert rec["would_change"] is True
-    assert rec["raw_stop_pct"] == 2.0
-    assert rec["calibrated_stop_pct"] == round(2.0 * ATR_REGIME_DEFAULTS["high_mult"], 4)
 
 
-def test_apply_enforce_uses_calibrated_and_logs(tmp_path):
+def test_apply_enforce_uses_calibrated(tmp_path):
     out = _apply({"mode": "enforce"}, tmp_path)
     assert out["effective_stop_pct"] == 2.0 * ATR_REGIME_DEFAULTS["high_mult"]
-    recs = _read_jsonl(tmp_path / "calib.jsonl")
-    assert len(recs) == 1
-    assert recs[0]["mode"] == "enforce"
 
 
-def test_apply_normal_regime_records_no_change(tmp_path):
+def test_apply_normal_regime_no_change(tmp_path):
     out = _apply({"mode": "shadow"}, tmp_path, atr_pct=1.0, atr_hist_mean_pct=1.0)
     assert out["regime"] == "normal"
     assert out["factor"] == 1.0
     assert out["would_change"] is False
     assert out["effective_stop_pct"] == 2.0
-    # Normal regime is still logged (every v2 sizing records an observation).
-    recs = _read_jsonl(tmp_path / "calib.jsonl")
-    assert len(recs) == 1
-    assert recs[0]["vol_regime"] == "normal"
 
 
 def test_apply_no_baseline_stays_neutral_even_in_enforce(tmp_path):

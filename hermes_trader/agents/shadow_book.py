@@ -1,25 +1,30 @@
-"""SHADOW-mode paper-trading ledger (virtual account, live-marked).
+"""SHADOW-mode paper-trading ledger (virtual accounts, live-marked).
 
 When the engine runs in mode=SHADOW, a decision that passes EVERY risk gate
 normally just returns ``{"executed": False, "reason":
 "shadow_mode_would_execute"}`` — nothing is booked, so the dashboard cannot
-show what the strategy *would* have done. This module adds an isolated paper
-account:
+show what the strategy *would* have done. This module books that decision into
+ISOLATED paper accounts and marks them to live mids every loop:
 
-  * ``shadow_open(...)`` books a VIRTUAL fill at the decision-time mid, locking
-    notional / leverage / ATR exactly like the live sizing did.
-  * ``mark_to_market(mids)`` runs each virtual position through the SAME
-    ``DSLTracker`` exit engine the live engine uses (constructed from the live
-    ``dsl_exit`` config block), marking to live mids every loop. When a stop /
-    target / timeout fires it books a virtual close with realized PnL.
-  * Fees mirror the live bookkeeping (``execution.taker_fee_pct`` x
-    ``round_trip_fills``, modeled on close). No real orders, no real funds:
-    nothing here ever touches the exchange or ``.agent-memory.json``.
+统一成交契约（2026-09-21）—— 同一个「过闸决策」同时喂给两个并列口径账户：
 
-Persistence follows the memory.py / dsl_exit.py pattern: a single JSON state
-file guarded by ``fcntl.flock(LOCK_EX)`` + tmp + fsync + ``os.replace``, with a
-process-wide ``threading.RLock`` for in-thread serialization. Overridable via
-``HERMES_SHADOW_BOOK_FILE`` (default on the repo root, mounted volume-friendly).
+  * ``taker``：决策时按 mid 立即吃单成交（历史既有行为），费用按 taker。
+  * ``maker_shadow``：按决策时 mid 挂一张 post-only 限价单（limit 内移一个
+    可配 offset），每个 mark 周期拉一次**短缓存 1m K线**，复用
+    ``execution.maker_shadow.simulate_shadow_order`` 的保守触及规则判定是否
+    被动成交；TTL 内未被触及则撤销（不记账），成交后走与 taker **完全相同**
+    的 DSL 退出引擎，费用按 maker。两账户各自独立的 wallet / positions /
+    equity_curve，互不污染，dashboard 可直接两曲线对照。
+
+口径声明（引用 maker_shadow 结论时务必一并带上，见 maker_shadow.py）：
+SHADOW 触及规则（买单 low≤limit / 卖单 high≥limit）不知道队列位置，系统性
+**高估**真实成交率，给的是「乐观成交上界」；能判逆向选择，判不了真实排队/
+成交率——后者需小额实盘取样。
+
+No real orders, no real funds: nothing here ever touches the exchange or
+``.agent-memory.json``. Persistence follows memory.py / dsl_exit.py: a single
+JSON state file guarded by ``fcntl.flock`` + tmp + fsync + ``os.replace`` and
+a process-wide ``threading.RLock``. Overridable via ``HERMES_SHADOW_BOOK_FILE``.
 """
 
 from __future__ import annotations
@@ -44,8 +49,11 @@ SHADOW_BOOK_FILE = os.environ.get(
 )
 SHADOW_BOOK_LOCK_FILE = SHADOW_BOOK_FILE + ".lock"
 
-_STATE_VERSION = 1
-_MAX_FILLS = 2000        # open + close fills combined (audit record; capped)
+_STATE_VERSION = 2
+# Canonical account ids. ``taker`` is the default/legacy view; ``maker_shadow``
+# is the passive-fill counterfactual.
+ACCOUNTS = ("taker", "maker_shadow")
+_MAX_FILLS = 2000        # open + close fills combined per account (audit cap)
 _MAX_EQUITY_POINTS = 3000
 _EQUITY_MIN_INTERVAL_S = 60.0   # throttle between-curve points while a position is open
 _SAVE_MIN_INTERVAL_S = 5.0      # throttle mark-time persistence (open/close force-save)
@@ -66,6 +74,13 @@ def _shadow_cfg() -> dict[str, Any]:
 
 def _enabled() -> bool:
     return bool(_shadow_cfg().get("enabled", True))
+
+
+def _maker_enabled() -> bool:
+    """Whether the maker_shadow counterfactual account is fed. Default ON so
+    the two口径 are collected together; operators can disable to save the
+    (cached, opportunistic) candle fetches."""
+    return bool(_shadow_cfg().get("maker_shadow_enabled", True))
 
 
 def _starting_balance() -> float:
@@ -92,6 +107,22 @@ def _taker_fee_pct() -> float:
         return 0.025
 
 
+def _maker_fee_pct() -> float:
+    """Per-fill maker fee in PERCENT. Prefer the shadow_book override; fall back
+    to the live execution maker fee, then to HL's standard 0.01%."""
+    c = _shadow_cfg()
+    try:
+        if c.get("maker_fee_pct") is not None:
+            return float(c["maker_fee_pct"])
+    except (TypeError, ValueError):
+        pass
+    try:
+        from hermes_trader.agents.config_store import cfg_get
+        return float(cfg_get("execution.maker_fee_pct", 0.01))
+    except Exception:
+        return 0.01
+
+
 def _round_trip_fills() -> int:
     c = _shadow_cfg()
     try:
@@ -106,17 +137,39 @@ def _round_trip_fills() -> int:
         return 2
 
 
+def _maker_limit_offset_bps() -> float:
+    """How far INSIDE the spread the resting maker limit is posted (bps from
+    the decision mid). A buy posts below mid, a sell above. Default 5 bps."""
+    try:
+        v = float(_shadow_cfg().get("maker_limit_offset_bps", 5.0))
+        return v if v >= 0 else 5.0
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _maker_ttl_bars() -> int:
+    """Max 1m bars a maker order rests before it is canceled unfilled."""
+    try:
+        v = int(_shadow_cfg().get("maker_ttl_bars", 30))
+        return max(1, v)
+    except (TypeError, ValueError):
+        return 30
+
+
+def _maker_candle_lookback() -> int:
+    """1m candles fetched per mark (covers the resting TTL plus the post bar)."""
+    return _maker_ttl_bars() + 5
+
+
 def _max_positions() -> int:
-    """Concurrent-position cap for the paper book.
+    """Concurrent-position cap for EACH paper account.
 
     SHADOW/LIVE PARITY: this MUST equal the global ``max_concurrent`` so the
     paper book admits exactly as many concurrent positions as the live gate
     permits — otherwise SHADOW could book entries the live ``max_concurrent``
-    gate blocks (or vice-versa), skewing 1:1 backtest parity. The two are
-    pinned to the same value in CANONICAL_DEFAULTS (2). Here we (a) fall back
-    to the live ``max_concurrent`` when the shadow key is unset, and (b) log a
-    loud warning on any mismatch so a future config drift cannot silently
-    diverge the two modes.
+    gate blocks (or vice-versa), skewing 1:1 backtest parity. Fall back to the
+    live ``max_concurrent`` when the shadow key is unset; log a loud warning on
+    any mismatch so a future config drift cannot silently diverge the modes.
     """
     try:
         from hermes_trader.agents.config_store import cfg_get
@@ -126,8 +179,6 @@ def _max_positions() -> int:
     c = _shadow_cfg()
     raw = c.get("max_positions", None)
     if raw is None:
-        # Unset → track the live cap exactly (never hard-code a divergent
-        # fallback).
         return live_cap
     try:
         cap = max(1, int(raw))
@@ -147,18 +198,12 @@ def _build_policy(regime: str = ""):
     """Build the SAME DSL ExitPolicy a fresh live entry would get, so paper
     positions exit under identical stops. Lazy import avoids cycles.
 
-    Regime-aware parity: the live executor (executor.py register path) calls
-    ``select_exit_params(dsl_config, regime)`` and registers the resulting
-    per-regime max_loss_pct / max_loss_roe_pct / protect / retrace / tiers
-    (trend=0.8%/10%ROE trend-ride in up/down; scalp=0.4%/5%ROE in
-    neutral/chop). Previously the paper book built the regime-BLIND
-    ``_policy_from_config()`` (top-level max_loss_pct=1.0 / max_loss_roe_pct=15)
-    for every paper position, so shadow stops were systematically LOOSER than
-    live — 57/57 historical shadow closes exited beyond the live cap. We start
-    from the full config policy (every other knob) and overlay the regime-aware
-    exit params exactly as the live executor does, so paper/live stops match.
-    Fail-open: any resolution error falls back to the base config policy (never
-    a crash, never the bare ExitPolicy() default).
+    Regime-aware parity: the live executor calls ``select_exit_params`` and
+    registers the per-regime max_loss_pct / max_loss_roe_pct / protect /
+    retrace / tiers. We start from the full base config policy and overlay the
+    regime-aware exit params exactly as the live executor does, so paper/live
+    stops match. Fail-open: any resolution error falls back to the base config
+    policy (never a crash, never the bare ExitPolicy() default).
     """
     base = None
     try:
@@ -172,15 +217,14 @@ def _build_policy(regime: str = ""):
             return None
     try:
         import dataclasses
+
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.executor import select_exit_params, resolve_regime_clocks
         from hermes_trader.agents.dsl_exit import RetraceTier
+        from hermes_trader.agents.executor import resolve_regime_clocks, select_exit_params
         dsl = read_agent_config().get("dsl_exit", {}) or {}
         _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
             select_exit_params(dsl, regime or "neutral")
         _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
-        # Audit 2026-09-06 (E3, P2): regime-split clocks parity (inert → global
-        # unless regime_aware.clocks.enabled). time_scratch rides the base policy.
         _clocks = resolve_regime_clocks(dsl, regime or "neutral")
         from hermes_trader.agents.dsl_exit import ExitPolicy as _EP
         return dataclasses.replace(
@@ -201,8 +245,8 @@ def _build_policy(regime: str = ""):
 
 
 # Live exchange BACKUP stop-loss (the disaster net) defaults. Mirrors executor
-# _DEFAULT_SL_*. Parity note: in Phase 1 the exchange trigger order rests at
-# this width and never moves (sync_exchange_sl only trails once profit reaches
+# _DEFAULT_SL_*. Parity note: in Phase 1 the exchange trigger rests at this
+# width and never moves (sync_exchange_sl only trails once profit reaches
 # protect_pct), so it is the worst-case price a live max_loss can fill at on a
 # gap that trades THROUGH the DSL floor between two polls.
 _BACKUP_SL_ATR_MULT = 1.5
@@ -215,11 +259,9 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
     """Price at which the live exchange backup SL fires on a gap-through.
 
     width_pct = min(max(entry_atr_pct*mult, floor), ceiling), mirroring
-    executor._place_backup_sl / _resolve_sl_width_config (mult/floor resolve
-    from the shared dsl_exit.atr_stop block, with top-level sl_* overrides and
-    the per-coin atr_risk_sizing floor). Returns None when inputs are unusable.
-    Slip-widening is omitted (it needs live avg_exit_slip_bps the paper book
-    cannot observe); it only widens the net sub-floor and is second-order.
+    executor._place_backup_sl / _resolve_sl_width_config. Returns None when
+    inputs are unusable. Slip-widening is omitted (it needs live
+    avg_exit_slip_bps the paper book cannot observe); second-order.
     """
     try:
         if entry_px <= 0:
@@ -292,14 +334,26 @@ def _read_state(path: str) -> Optional[dict[str, Any]]:
             pass
 
 
-def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    """Bring an on-disk state payload up to ``_STATE_VERSION`` (mirrors the
-    version/migration discipline in dsl_exit.py).
+def _fresh_account() -> dict[str, Any]:
+    bal = _starting_balance()
+    return {
+        "wallet_balance": bal,     # starting + realized PnL (fees deducted on close)
+        "positions": [],
+        "pending_orders": [],      # maker_shadow-only: resting unfilled limits
+        "fills": [],
+        "equity_curve": [],
+        "closed_count": 0,
+    }
 
-    Each migration is a pure structural transform that adds fields the newer
-    schema needs with safe defaults. An unknown FUTURE version is left
-    untouched and warned about so a downgraded daemon never rewrites a newer
-    file. Idempotent: re-running on an already-current payload is a no-op.
+
+def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Bring an on-disk state payload up to ``_STATE_VERSION``.
+
+    v1 was a single FLAT taker account (wallet_balance / positions / fills /
+    equity_curve / closed_count at top level). v2 nests those under
+    ``accounts["taker"]`` and adds an empty ``accounts["maker_shadow"]``. The
+    migration preserves the entire legacy taker book verbatim. An unknown
+    FUTURE version is left untouched and warned about. Idempotent.
     """
     if not isinstance(payload, dict):
         raise ValueError("shadow_book payload is not a JSON object")
@@ -321,9 +375,23 @@ def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
         )
         return payload
 
-    # Future migrations chain here:
-    # if version < 2:
-    #     payload = _migrate_v1_to_v2(payload); version = 2
+    if version < 2:
+        # Legacy flat taker book → nest under accounts.taker, keep every field.
+        legacy = {
+            "wallet_balance": float(payload.get(
+                "wallet_balance", payload.get("starting_balance", _starting_balance()))),
+            "positions": payload.get("positions") if isinstance(payload.get("positions"), list) else [],
+            "pending_orders": [],
+            "fills": payload.get("fills") if isinstance(payload.get("fills"), list) else [],
+            "equity_curve": payload.get("equity_curve") if isinstance(payload.get("equity_curve"), list) else [],
+            "closed_count": int(payload.get("closed_count", 0) or 0),
+        }
+        payload = {
+            "created_at": payload.get("created_at", _now_ms()),
+            "starting_balance": float(payload.get(
+                "starting_balance", _starting_balance())),
+            "accounts": {"taker": legacy, "maker_shadow": _fresh_account()},
+        }
     payload["version"] = _STATE_VERSION
     return payload
 
@@ -333,12 +401,13 @@ def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 class ShadowBook:
-    """In-process singleton wrapping the virtual account state + DSL trackers."""
+    """In-process singleton wrapping the two virtual accounts + DSL trackers."""
 
     def __init__(self, path: str = SHADOW_BOOK_FILE) -> None:
         self.path = path
         self._lock = threading.RLock()
-        self._trackers: dict[str, Any] = {}   # key f"{coin}_{side}" -> DSLTracker
+        # key (account, f"{coin}_{side}") -> DSLTracker (filled positions)
+        self._trackers: dict[tuple[str, str], Any] = {}
         self._last_save_ts = 0.0
         self._last_equity_ts = 0.0
         self._last_snapshot: dict[str, Any] = {}
@@ -349,12 +418,11 @@ class ShadowBook:
     def reload_if_changed(self) -> bool:
         """Cross-process hot reload.
 
-        The dashboard runs in a SEPARATE process from the trading loop (same as
-        dsl_exit state), so the in-memory singleton goes stale the moment the
-        loop writes the file. Re-read only when the on-disk mtime advanced past
-        our last load/write; a no-op otherwise. In the loop's own process the
-        file mtime only advances after its OWN save (content == memory), so a
-        reload there is harmless and never loses unsaved mark updates.
+        The dashboard runs in a SEPARATE process from the trading loop, so the
+        in-memory singleton goes stale the moment the loop writes the file.
+        Re-read only when the on-disk mtime advanced past our last load/write;
+        a no-op otherwise. In the loop's own process the mtime only advances
+        after its OWN save (content == memory), so a reload there is harmless.
         """
         try:
             if not os.path.exists(self.path):
@@ -363,7 +431,6 @@ class ShadowBook:
             if mtime <= self._last_mtime:
                 return False
             with self._lock:
-                # Re-check under lock to avoid a double reload racing a save.
                 if mtime <= self._last_mtime:
                     return False
                 self._load()
@@ -372,19 +439,20 @@ class ShadowBook:
             return False
 
     def _fresh_state(self) -> dict[str, Any]:
-        bal = _starting_balance()
         return {
             "version": _STATE_VERSION,
             "created_at": _now_ms(),
-            "starting_balance": bal,
-            "wallet_balance": bal,     # starting + realized PnL (fees deducted on close)
-            "positions": [],
-            "fills": [],
-            "equity_curve": [],
-            "closed_count": 0,
+            "starting_balance": _starting_balance(),
+            "accounts": {acct: _fresh_account() for acct in ACCOUNTS},
         }
 
     # -- persistence --------------------------------------------------------
+
+    def _account(self, acct: str) -> dict[str, Any]:
+        accts = self.state["accounts"]
+        if acct not in accts:
+            accts[acct] = _fresh_account()
+        return accts[acct]
 
     def _load(self) -> None:
         data = _read_state(self.path)
@@ -396,66 +464,69 @@ class ShadowBook:
             return
         try:
             data = _migrate_payload(data)
-            # P0-2c: isinstance guards — a wrong-typed field (corrupt or
-            # hand-edited file) degrades that field to empty instead of
-            # aborting the whole load and losing the entire virtual book.
-            def _list_field(key):
-                val = data.get(key)
-                return val if isinstance(val, list) else []
+            start_bal = float(data.get("starting_balance", _starting_balance()))
+            accounts: dict[str, Any] = {}
+            for acct in ACCOUNTS:
+                raw = (data.get("accounts") or {}).get(acct)
+                raw = raw if isinstance(raw, dict) else {}
+                accounts[acct] = {
+                    "wallet_balance": float(raw.get("wallet_balance", start_bal)),
+                    "positions": raw.get("positions") if isinstance(raw.get("positions"), list) else [],
+                    "pending_orders": raw.get("pending_orders") if isinstance(raw.get("pending_orders"), list) else [],
+                    "fills": raw.get("fills") if isinstance(raw.get("fills"), list) else [],
+                    "equity_curve": raw.get("equity_curve") if isinstance(raw.get("equity_curve"), list) else [],
+                    "closed_count": int(raw.get("closed_count", 0) or 0),
+                }
             self.state = {
                 "version": _STATE_VERSION,
                 "created_at": data.get("created_at", _now_ms()),
-                "starting_balance": float(data.get("starting_balance", _starting_balance())),
-                "wallet_balance": float(data.get("wallet_balance", data.get("starting_balance", _starting_balance()))),
-                "positions": _list_field("positions"),
-                "fills": _list_field("fills"),
-                "equity_curve": _list_field("equity_curve"),
-                "closed_count": int(data.get("closed_count", 0) or 0),
+                "starting_balance": start_bal,
+                "accounts": accounts,
             }
         except Exception as e:
             logger.error(f"[shadow_book] corrupt state, starting fresh: {e}")
             self.state = self._fresh_state()
             return
-        # Rehydrate a DSLTracker per open position so peak/floor state resumes.
-        # P0-2c: per-row tolerance — a single malformed position row (missing
-        # coin/side/entry_px, non-numeric value) is evicted with a warning
-        # instead of aborting the loop and losing ALL trackers.
-        valid_positions: list[dict[str, Any]] = []
+        self._rehydrate_trackers()
+        counts = ", ".join(
+            f"{acct}:{len(self.state['accounts'][acct]['positions'])} open/"
+            f"{self.state['accounts'][acct]['closed_count']} closed"
+            for acct in ACCOUNTS)
+        logger.info(f"[shadow_book] loaded ({counts})")
+
+    def _rehydrate_trackers(self) -> None:
+        """Rebuild a DSLTracker per open FILLED position so peak/floor state
+        resumes. Per-row tolerance: a malformed position is evicted with a
+        warning instead of aborting and losing ALL trackers."""
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
-            for p in self.state["positions"]:
-                try:
-                    coin = p["coin"]
-                    side = p["side"]
-                    entry_px = float(p["entry_px"])
-                    entry_time = float(p.get("opened_at", _now_ms())) / 1000.0
-                    # Per-position regime-aware policy (parity with live):
-                    # each paper position exits under its own entry regime's
-                    # stops, never one shared regime-blind policy.
-                    policy = _build_policy(p.get("entry_regime", "") or "")
-                    t = DSLTracker(
-                        coin, side, entry_px, entry_time,
-                        policy=policy, leverage=int(p.get("leverage", 1) or 1),
-                        entry_atr_pct=float(p.get("entry_atr_pct", 0.0) or 0.0),
-                        entry_regime=p.get("entry_regime", "") or "",
-                    )
-                    if p.get("peak_px"):
-                        t.peak_px = float(p["peak_px"])
-                    self._trackers[self._key(coin, side)] = t
-                    valid_positions.append(p)
-                except (AttributeError, TypeError, ValueError, KeyError) as e:
-                    logger.warning(
-                        f"[shadow_book] skipping malformed position row {p!r}: {e}"
-                    )
-                    continue
-            self.state["positions"] = valid_positions
+            for acct in ACCOUNTS:
+                kept: list[dict[str, Any]] = []
+                for p in self.state["accounts"][acct]["positions"]:
+                    try:
+                        coin = p["coin"]
+                        side = p["side"]
+                        entry_px = float(p["entry_px"])
+                        entry_time = float(p.get("opened_at", _now_ms())) / 1000.0
+                        policy = _build_policy(p.get("entry_regime", "") or "")
+                        t = DSLTracker(
+                            coin, side, entry_px, entry_time,
+                            policy=policy, leverage=int(p.get("leverage", 1) or 1),
+                            entry_atr_pct=float(p.get("entry_atr_pct", 0.0) or 0.0),
+                            entry_regime=p.get("entry_regime", "") or "",
+                        )
+                        if p.get("peak_px"):
+                            t.peak_px = float(p["peak_px"])
+                        self._trackers[(acct, self._key(coin, side))] = t
+                        kept.append(p)
+                    except (AttributeError, TypeError, ValueError, KeyError) as e:
+                        logger.warning(
+                            f"[shadow_book] {acct}: skipping malformed position "
+                            f"{p!r}: {e}")
+                        continue
+                self.state["accounts"][acct]["positions"] = kept
         except Exception as e:
-            # Import/policy-build failure: keep the rows as-is; trackers are
-            # rebuilt lazily by open_position() on the trading path.
             logger.warning(f"[shadow_book] tracker rehydrate failed (non-fatal): {e}")
-        logger.info(
-            f"[shadow_book] loaded: {len(self.state['positions'])} open, "
-            f"{self.state['closed_count']} closed, wallet={self.state['wallet_balance']:.2f}")
 
     def _save(self, force: bool = False) -> None:
         now = time.monotonic()
@@ -463,10 +534,11 @@ class ShadowBook:
             return
         self._last_save_ts = now
         # Persist tracker peak into each position before serializing.
-        for p in self.state["positions"]:
-            t = self._trackers.get(self._key(p["coin"], p["side"]))
-            if t is not None:
-                p["peak_px"] = t.peak_px
+        for acct in ACCOUNTS:
+            for p in self.state["accounts"][acct]["positions"]:
+                t = self._trackers.get((acct, self._key(p["coin"], p["side"])))
+                if t is not None:
+                    p["peak_px"] = t.peak_px
         if _write_atomic(self.path, self.state):
             try:
                 self._last_mtime = os.path.getmtime(self.path)
@@ -479,26 +551,28 @@ class ShadowBook:
 
     # -- queries ------------------------------------------------------------
 
-    def _find_position(self, coin: str, side: str) -> Optional[dict[str, Any]]:
+    @staticmethod
+    def _find(rows: list[dict[str, Any]], coin: str, side: str) -> Optional[dict[str, Any]]:
         return next(
-            (p for p in self.state["positions"]
-             if p["coin"] == coin and p["side"] == side),
-            None,
-        )
+            (r for r in rows if r["coin"] == coin and r["side"] == side), None)
 
-    def _account_metrics(self, mids: Optional[dict[str, float]] = None) -> dict[str, Any]:
-        """Compute wallet / margin / equity / unrealized from live state.
+    def _account_metrics(self, acct: str,
+                         mids: Optional[dict[str, float]] = None,
+                         fee_pct: Optional[float] = None) -> dict[str, Any]:
+        """Compute wallet / margin / equity / unrealized for one account.
 
-        When ``mids`` is supplied, unrealized is marked to those live mids and
-        per-position mark fields are refreshed; otherwise the last mark stored
-        on each position is used.
+        When ``mids`` is supplied, filled positions are marked to those live
+        mids and per-position mark fields are refreshed; otherwise the last
+        stored mark is used. Resting (unfilled) maker orders hold no margin and
+        contribute nothing until filled.
         """
-        fee_pct = _taker_fee_pct()
-        fills_n = _round_trip_fills()
+        acc = self._account(acct)
+        fee_pct = fee_pct if fee_pct is not None else (
+            _maker_fee_pct() if acct == "maker_shadow" else _taker_fee_pct())
         used_margin = 0.0
         unrealized = 0.0
         open_notional = 0.0
-        for p in self.state["positions"]:
+        for p in acc["positions"]:
             notional = float(p["size_usd"])
             lev = max(1, int(p.get("leverage", 1)))
             used_margin += notional / lev
@@ -517,25 +591,25 @@ class ShadowBook:
                 p["unrealized_pnl_usd"] = notional * upct / 100.0
                 p["marked_at"] = _now_ms()
             unrealized += float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
-        wallet = float(self.state["wallet_balance"])
+        wallet = float(acc["wallet_balance"])
         equity = wallet + unrealized
         available = equity - used_margin
         return {
-            "starting_balance": float(self.state["starting_balance"]),
             "wallet_balance": round(wallet, 4),
             "equity": round(equity, 4),
             "available": round(available, 4),
             "used_margin": round(used_margin, 4),
             "unrealized_pnl_usd": round(unrealized, 4),
             "open_notional_usd": round(open_notional, 4),
-            "realized_pnl_usd": round(wallet - float(self.state["starting_balance"]), 4),
+            "realized_pnl_usd": round(wallet - self.state["starting_balance"], 4),
             "total_fees_usd": round(sum(float(f.get("fee_usd", 0.0) or 0.0)
-                                        for f in self.state["fills"]
+                                        for f in acc["fills"]
                                         if f.get("type") == "close"), 4),
-            "open_positions": len(self.state["positions"]),
-            "closed_count": self.state["closed_count"],
-            "taker_fee_pct": fee_pct,
-            "round_trip_fills": fills_n,
+            "open_positions": len(acc["positions"]),
+            "resting_orders": len(acc["pending_orders"]),
+            "closed_count": acc["closed_count"],
+            "fee_pct": fee_pct,
+            "round_trip_fills": _round_trip_fills(),
         }
 
     # -- mutations ----------------------------------------------------------
@@ -543,127 +617,261 @@ class ShadowBook:
     def shadow_open(self, *, coin: str, side: str, entry_px: float,
                     size_usd: float, leverage: int, entry_atr_pct: float = 0.0,
                     entry_regime: str = "", analysis_id: str = "") -> Optional[dict[str, Any]]:
-        """Book a virtual fill. Returns the open fill record, or None if skipped."""
+        """Feed one gated decision to BOTH paper accounts.
+
+        Returns the taker open fill record (or None if skipped) for backward
+        compatibility; the maker_shadow account additionally receives a resting
+        limit order (best-effort)."""
         if not _enabled():
             return None
         if not coin or side not in ("long", "short") or entry_px <= 0 or size_usd <= 0:
             return None
-        # Hot-reload: the dashboard/API runs in a separate process and may have
-        # reset/deposited since our last write; pick that up before mutating so
-        # we never overwrite it with stale in-memory state.
         self.reload_if_changed()
         with self._lock:
-            if self._find_position(coin, side) is not None:
-                logger.debug(f"[shadow_book] skip open {coin} {side}: already open")
-                return None
-            if len(self.state["positions"]) >= _max_positions():
-                logger.info(f"[shadow_book] skip open {coin}: max_positions reached")
-                return None
-            metrics = self._account_metrics()
-            lev = max(1, int(leverage))
-            margin_need = size_usd / lev
-            if metrics["available"] < margin_need:
-                logger.info(
-                    f"[shadow_book] skip open {coin}: need margin {margin_need:.2f} "
-                    f"> available {metrics['available']:.2f}")
-                return None
+            taker_fill = self._open_taker(
+                coin=coin, side=side, entry_px=entry_px, size_usd=size_usd,
+                leverage=leverage, entry_atr_pct=entry_atr_pct,
+                entry_regime=entry_regime, analysis_id=analysis_id)
+            if _maker_enabled():
+                try:
+                    self._post_maker_order(
+                        coin=coin, side=side, post_mid=entry_px, size_usd=size_usd,
+                        leverage=leverage, entry_atr_pct=entry_atr_pct,
+                        entry_regime=entry_regime, analysis_id=analysis_id)
+                except Exception as e:
+                    logger.warning(f"[shadow_book] maker post failed {coin}: {e}")
+            return taker_fill
 
-            size_coin = size_usd / entry_px
-            pid = uuid.uuid4().hex[:12]
-            opened_at = _now_ms()
-            pos = {
-                "id": pid,
-                "coin": coin,
-                "side": side,
-                "entry_px": float(entry_px),
-                "size_usd": float(size_usd),
-                "size_coin": float(size_coin),
-                "leverage": lev,
-                "entry_atr_pct": float(entry_atr_pct or 0.0),
-                "entry_regime": entry_regime or "",
-                "analysis_id": analysis_id or "",
-                "peak_px": float(entry_px),
-                "opened_at": opened_at,
-                "mark_px": float(entry_px),
-                "unrealized_pct": 0.0,
-                "unrealized_roe_pct": 0.0,
-                "unrealized_pnl_usd": 0.0,
-            }
-            self.state["positions"].append(pos)
-
-            # Build an isolated DSL tracker (not registered in the live global
-            # registry, so live DSL state is never touched by paper positions).
-            try:
-                from hermes_trader.agents.dsl_exit import DSLTracker
-                self._trackers[self._key(coin, side)] = DSLTracker(
-                    coin, side, float(entry_px), opened_at / 1000.0,
-                    policy=_build_policy(entry_regime), leverage=lev,
-                    entry_atr_pct=float(entry_atr_pct or 0.0),
-                    entry_regime=entry_regime or "",
-                )
-            except Exception as e:
-                logger.warning(f"[shadow_book] tracker build failed for {coin}: {e}")
-
-            fill = {
-                "type": "open",
-                "id": uuid.uuid4().hex[:12],
-                "position_id": pid,
-                "ts": opened_at,
-                "coin": coin,
-                "side": side,
-                "qty": float(size_coin),
-                "price": float(entry_px),
-                "notional_usd": float(size_usd),
-                "leverage": lev,
-                "fee_usd": 0.0,
-                "analysis_id": analysis_id or "",
-            }
-            self.state["fills"].append(fill)
-            if len(self.state["fills"]) > _MAX_FILLS:
-                del self.state["fills"][: len(self.state["fills"]) - _MAX_FILLS]
-
-            snap = self._account_metrics()
-            self._append_equity(opened_at, snap, force=True)
-            self._last_snapshot = snap
-            self._save(force=True)
+    def _open_taker(self, *, coin: str, side: str, entry_px: float, size_usd: float,
+                    leverage: int, entry_atr_pct: float, entry_regime: str,
+                    analysis_id: str) -> Optional[dict[str, Any]]:
+        """Immediate mid fill into the taker account."""
+        acc = self._account("taker")
+        if self._find(acc["positions"], coin, side) is not None:
+            logger.debug(f"[shadow_book] skip taker open {coin} {side}: already open")
+            return None
+        if len(acc["positions"]) >= _max_positions():
+            logger.info(f"[shadow_book] skip taker open {coin}: max_positions reached")
+            return None
+        metrics = self._account_metrics("taker")
+        lev = max(1, int(leverage))
+        if metrics["available"] < size_usd / lev:
             logger.info(
-                f"[shadow_book] OPEN {side} {coin} qty={size_coin:g} @ {entry_px:g} "
-                f"notional=${size_usd:.2f} lev={lev}x (paper)")
-            return fill
+                f"[shadow_book] skip taker open {coin}: need margin {size_usd/lev:.2f} "
+                f"> available {metrics['available']:.2f}")
+            return None
 
-    def _close_position(self, pos: dict[str, Any], exit_px: float,
+        size_coin = size_usd / entry_px
+        pid = uuid.uuid4().hex[:12]
+        opened_at = _now_ms()
+        acc["positions"].append({
+            "id": pid, "coin": coin, "side": side,
+            "entry_px": float(entry_px), "size_usd": float(size_usd),
+            "size_coin": float(size_coin), "leverage": lev,
+            "entry_atr_pct": float(entry_atr_pct or 0.0),
+            "entry_regime": entry_regime or "",
+            "analysis_id": analysis_id or "",
+            "peak_px": float(entry_px), "opened_at": opened_at,
+            "mark_px": float(entry_px),
+            "unrealized_pct": 0.0, "unrealized_roe_pct": 0.0,
+            "unrealized_pnl_usd": 0.0,
+        })
+        try:
+            from hermes_trader.agents.dsl_exit import DSLTracker
+            self._trackers[("taker", self._key(coin, side))] = DSLTracker(
+                coin, side, float(entry_px), opened_at / 1000.0,
+                policy=_build_policy(entry_regime), leverage=lev,
+                entry_atr_pct=float(entry_atr_pct or 0.0),
+                entry_regime=entry_regime or "")
+        except Exception as e:
+            logger.warning(f"[shadow_book] taker tracker build failed {coin}: {e}")
+
+        fill = {
+            "type": "open", "id": uuid.uuid4().hex[:12],
+            "position_id": pid, "ts": opened_at,
+            "coin": coin, "side": side, "qty": float(size_coin),
+            "price": float(entry_px), "notional_usd": float(size_usd),
+            "leverage": lev, "fee_usd": 0.0, "fill_model": "taker",
+            "analysis_id": analysis_id or "",
+        }
+        acc["fills"].append(fill)
+        if len(acc["fills"]) > _MAX_FILLS:
+            del acc["fills"][: len(acc["fills"]) - _MAX_FILLS]
+
+        snap = self._account_metrics("taker")
+        self._append_equity("taker", opened_at, snap, force=True)
+        self._save(force=True)
+        logger.info(
+            f"[shadow_book] taker OPEN {side} {coin} qty={size_coin:g} @ {entry_px:g} "
+            f"notional=${size_usd:.2f} lev={lev}x (paper)")
+        return fill
+
+    def _post_maker_order(self, *, coin: str, side: str, post_mid: float,
+                          size_usd: float, leverage: int, entry_atr_pct: float,
+                          entry_regime: str, analysis_id: str) -> None:
+        """Rest a post-only limit (offset inside the spread) in maker_shadow."""
+        acc = self._account("maker_shadow")
+        # Already filled or already resting for this coin/side → skip.
+        if self._find(acc["positions"], coin, side) is not None or \
+                self._find(acc["pending_orders"], coin, side) is not None:
+            return
+        offset_frac = _maker_limit_offset_bps() / 1e4
+        if side == "long":
+            limit_px = post_mid * (1.0 - offset_frac)
+        else:
+            limit_px = post_mid * (1.0 + offset_frac)
+        acc["pending_orders"].append({
+            "id": uuid.uuid4().hex[:12],
+            "coin": coin, "side": side,
+            "post_mid_px": float(post_mid),
+            "limit_px": float(limit_px),
+            "size_usd": float(size_usd),
+            "leverage": max(1, int(leverage)),
+            "entry_atr_pct": float(entry_atr_pct or 0.0),
+            "entry_regime": entry_regime or "",
+            "analysis_id": analysis_id or "",
+            "posted_at": _now_ms(),
+        })
+
+    def _fill_maker_order(self, order: dict[str, Any], fill_px: float,
+                          filled_at: int) -> dict[str, Any]:
+        """Convert a touched maker limit into a filled position + open fill.
+        Caller holds self._lock."""
+        acc = self._account("maker_shadow")
+        coin = order["coin"]
+        side = order["side"]
+        size_usd = float(order["size_usd"])
+        lev = max(1, int(order.get("leverage", 1)))
+        size_coin = size_usd / fill_px
+        pid = uuid.uuid4().hex[:12]
+        acc["positions"].append({
+            "id": pid, "coin": coin, "side": side,
+            "entry_px": float(fill_px), "size_usd": float(size_usd),
+            "size_coin": float(size_coin), "leverage": lev,
+            "entry_atr_pct": float(order.get("entry_atr_pct", 0.0) or 0.0),
+            "entry_regime": order.get("entry_regime", "") or "",
+            "analysis_id": order.get("analysis_id", ""),
+            "peak_px": float(fill_px), "opened_at": filled_at,
+            "mark_px": float(fill_px),
+            "unrealized_pct": 0.0, "unrealized_roe_pct": 0.0,
+            "unrealized_pnl_usd": 0.0,
+        })
+        try:
+            from hermes_trader.agents.dsl_exit import DSLTracker
+            self._trackers[("maker_shadow", self._key(coin, side))] = DSLTracker(
+                coin, side, float(fill_px), filled_at / 1000.0,
+                policy=_build_policy(order.get("entry_regime", "")),
+                leverage=lev,
+                entry_atr_pct=float(order.get("entry_atr_pct", 0.0) or 0.0),
+                entry_regime=order.get("entry_regime", "") or "")
+        except Exception as e:
+            logger.warning(f"[shadow_book] maker tracker build failed {coin}: {e}")
+
+        fill = {
+            "type": "open", "id": uuid.uuid4().hex[:12],
+            "position_id": pid, "ts": filled_at,
+            "coin": coin, "side": side, "qty": float(size_coin),
+            "price": float(fill_px), "notional_usd": float(size_usd),
+            "leverage": lev, "fee_usd": 0.0, "fill_model": "maker_shadow",
+            "analysis_id": order.get("analysis_id", ""),
+        }
+        acc["fills"].append(fill)
+        logger.info(
+            f"[shadow_book] maker FILLED {side} {coin} qty={size_coin:g} @ {fill_px:g} "
+            f"notional=${size_usd:.2f} lev={lev}x (paper)")
+        return fill
+
+    def _cancel_maker_order(self, order: dict[str, Any], at_ms: int) -> None:
+        """Drop a TTL-expired maker order and append an audit cancel fill."""
+        acc = self._account("maker_shadow")
+        acc["fills"].append({
+            "type": "cancel", "id": uuid.uuid4().hex[:12],
+            "ts": at_ms, "coin": order["coin"], "side": order["side"],
+            "limit_px": float(order["limit_px"]),
+            "fill_model": "maker_shadow",
+            "analysis_id": order.get("analysis_id", ""),
+        })
+
+    def _resolve_pending_maker_orders(self, mids: dict[str, float]) -> None:
+        """For each resting maker order, fetch cached 1m candles and reuse
+        ``maker_shadow.simulate_shadow_order`` to decide fill / cancel.
+
+        ``opportunistic=True`` keeps the candle fetch on a short budget and
+        never starves the trading path; a missed fetch simply leaves the order
+        resting for another cycle. The simulated order is posted at bar idx 0 of
+        the fetched window; the window is sized to cover the resting TTL.
+        """
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        from hermes_trader.execution.maker_shadow import ShadowMakerOrder, simulate_shadow_order
+
+        acc = self._account("maker_shadow")
+        if not acc["pending_orders"]:
+            return
+        lookback = _maker_candle_lookback()
+        ttl = _maker_ttl_bars()
+        for order in list(acc["pending_orders"]):
+            coin = order["coin"]
+            side = order["side"]
+            try:
+                bars = fetch_hl_candles(coin, "1m", lookback, opportunistic=True)
+            except Exception as e:
+                logger.debug(f"[shadow_book] maker candles miss {coin}: {e}")
+                continue
+            # Need at least the post bar + one forward bar to judge a touch.
+            if len(bars) < 2:
+                continue
+            sim = ShadowMakerOrder(
+                coin=coin,
+                is_buy=(side == "long"),
+                size=float(order["size_usd"]),
+                posted_bar_idx=0,
+                limit_px=float(order["limit_px"]),
+                post_mid_px=float(order["post_mid_px"]),
+                ttl_bars=min(ttl, len(bars) - 1),
+            )
+            verdict = simulate_shadow_order(sim, bars)
+            if verdict.filled:
+                filled_at = int(verdict.fill_ms or _now_ms())
+                acc["pending_orders"] = [
+                    o for o in acc["pending_orders"] if o["id"] != order["id"]]
+                self._fill_maker_order(order, float(verdict.fill_px), filled_at)
+            elif verdict.canceled:
+                # TTL of resting time elapsed without a touch.
+                age_min = (_now_ms() - int(order["posted_at"])) / 60000.0
+                if age_min >= ttl:
+                    acc["pending_orders"] = [
+                        o for o in acc["pending_orders"] if o["id"] != order["id"]]
+                    self._cancel_maker_order(order, _now_ms())
+
+    def _close_position(self, acct: str, pos: dict[str, Any], exit_px: float,
                         reason: str, hold_min: float = 0.0,
                         mfe_pct: float = 0.0) -> dict[str, Any]:
-        """Book a virtual close + realized PnL. Caller holds self._lock."""
+        """Book a virtual close + realized PnL. Fee uses the account's口径."""
+        acc = self._account(acct)
         coin = pos["coin"]
         side = pos["side"]
         entry_px = float(pos["entry_px"])
         notional = float(pos["size_usd"])
         lev = max(1, int(pos.get("leverage", 1)))
 
+        fee_pct = _maker_fee_pct() if acct == "maker_shadow" else _taker_fee_pct()
         if side == "long":
             spot_pct = (exit_px - entry_px) / entry_px * 100.0
         else:
             spot_pct = (entry_px - exit_px) / entry_px * 100.0
         gross_pnl = notional * spot_pct / 100.0
-        fee_usd = notional * _taker_fee_pct() / 100.0 * _round_trip_fills()
+        fee_usd = notional * fee_pct / 100.0 * _round_trip_fills()
         net_pnl = gross_pnl - fee_usd
-        roe_pct = spot_pct * lev - _taker_fee_pct() * _round_trip_fills() * lev
+        roe_pct = spot_pct * lev - fee_pct * _round_trip_fills() * lev
 
         closed_at = _now_ms()
         close_fill = {
-            "type": "close",
-            "id": uuid.uuid4().hex[:12],
-            "position_id": pos["id"],
-            "ts": closed_at,
-            "coin": coin,
-            "side": side,
-            "qty": float(pos["size_coin"]),
-            "entry_px": entry_px,
-            "price": float(exit_px),
-            "notional_usd": notional,
-            "leverage": lev,
-            "fee_usd": round(fee_usd, 6),
+            "type": "close", "id": uuid.uuid4().hex[:12],
+            "position_id": pos["id"], "ts": closed_at,
+            "coin": coin, "side": side,
+            "qty": float(pos["size_coin"]), "entry_px": entry_px,
+            "price": float(exit_px), "notional_usd": notional,
+            "leverage": lev, "fee_usd": round(fee_usd, 6),
             "spot_pct": round(spot_pct, 4),
             "realized_pnl_pct": round(roe_pct, 4),   # leveraged ROE %
             "gross_pnl_usd": round(gross_pnl, 6),
@@ -671,122 +879,111 @@ class ShadowBook:
             "reason": reason or "",
             "hold_minutes": round(hold_min, 2),
             "mfe_pct": round(mfe_pct, 4),
+            "fill_model": acct,
             "entry_regime": pos.get("entry_regime", ""),
             "analysis_id": pos.get("analysis_id", ""),
             "opened_at": pos.get("opened_at"),
         }
-        self.state["fills"].append(close_fill)
-        if len(self.state["fills"]) > _MAX_FILLS:
-            del self.state["fills"][: len(self.state["fills"]) - _MAX_FILLS]
+        acc["fills"].append(close_fill)
+        if len(acc["fills"]) > _MAX_FILLS:
+            del acc["fills"][: len(acc["fills"]) - _MAX_FILLS]
 
-        self.state["wallet_balance"] = float(self.state["wallet_balance"]) + net_pnl
-        self.state["closed_count"] = int(self.state["closed_count"]) + 1
-        self.state["positions"] = [
-            p for p in self.state["positions"] if p["id"] != pos["id"]
-        ]
-        self._trackers.pop(self._key(coin, side), None)
+        acc["wallet_balance"] = float(acc["wallet_balance"]) + net_pnl
+        acc["closed_count"] = int(acc["closed_count"]) + 1
+        acc["positions"] = [p for p in acc["positions"] if p["id"] != pos["id"]]
+        self._trackers.pop((acct, self._key(coin, side)), None)
 
-        snap = self._account_metrics()
-        self._append_equity(closed_at, snap, force=True)
-        self._last_snapshot = snap
+        snap = self._account_metrics(acct, fee_pct=fee_pct)
+        self._append_equity(acct, closed_at, snap, force=True)
         logger.info(
-            f"[shadow_book] CLOSE {side} {coin} @ {exit_px:g} reason={reason} "
+            f"[shadow_book] {acct} CLOSE {side} {coin} @ {exit_px:g} reason={reason} "
             f"spot={spot_pct:+.2f}% roe={roe_pct:+.2f}% pnl=${net_pnl:+.2f} "
             f"fee=${fee_usd:.3f} hold={hold_min:.1f}m")
         return close_fill
 
     def mark_to_market(self, mids: dict[str, float],
                        index_prices: Optional[dict[str, float]] = None) -> list[dict[str, Any]]:
-        """Mark every open paper position to live mids; run DSL exits.
+        """Mark all FILLED positions to live mids and run DSL exits; resolve
+        resting maker orders against cached 1m candles.
 
-        Returns the list of virtual close fills fired this call (may be empty).
-        Positions whose coin is absent from ``mids`` are skipped this pass.
+        Returns the list of virtual close fills fired this call across BOTH
+        accounts (may be empty). Coins absent from ``mids`` are skipped.
         """
         if not mids:
             return []
-        # Hot-reload cross-process writes (web deposit/reset/close) before we
-        # mark and save, so the trading loop never clobbers them with its own
-        # possibly-stale in-memory state.
         self.reload_if_changed()
         closed: list[dict[str, Any]] = []
         with self._lock:
-            if not self.state["positions"]:
-                # Still refresh equity snapshot cheaply (no-op when flat).
-                return []
+            if _maker_enabled():
+                try:
+                    self._resolve_pending_maker_orders(mids)
+                except Exception as e:
+                    logger.warning(f"[shadow_book] maker resolve failed: {e}")
             index_prices = index_prices or {}
-            # Iterate over a snapshot of positions (list mutates on close).
-            for pos in list(self.state["positions"]):
-                coin = pos["coin"]
-                side = pos["side"]
-                mark = mids.get(coin)
-                if mark is None or mark <= 0:
+            for acct in ACCOUNTS:
+                acc = self._account(acct)
+                if not acc["positions"]:
                     continue
-                idx = index_prices.get(coin)
-                tracker = self._trackers.get(self._key(coin, side))
-                exit_now = False
-                reason = ""
-                hold_min = (time.time() - float(pos["opened_at"]) / 1000.0) / 60.0
-                mfe = 0.0
-                if tracker is not None:
-                    try:
-                        v = tracker.check(float(mark), float(idx) if idx else None)
-                        exit_now = bool(getattr(v, "exit", False))
-                        reason = str(getattr(v, "reason", "") or "")
-                        hold_min = float(getattr(v, "hold_min", hold_min) or hold_min)
-                        mfe = float(getattr(v, "mfe_pct", 0.0) or 0.0)
-                    except Exception as e:
-                        logger.warning(f"[shadow_book] dsl check failed {coin}: {e}")
-                if exit_now:
-                    # F6 (shadow/live fill parity): a normal live exit — hard
-                    # max_loss OR trailing floor_breach — is a software IOC
-                    # market fill at the price present when the DSL signal is
-                    # confirmed. That is exactly THIS mark, so the paper book
-                    # fills at mark. The ONLY divergence is a gap-through: when
-                    # the confirming mark has traded PAST the live exchange
-                    # backup-SL trigger (the wider disaster net resting server-
-                    # side), live fills at that trigger instead of the post-gap
-                    # mark. Cap the paper fill there too — otherwise the paper
-                    # book invents a tail loss the live net actually caps (e.g.
-                    # HEMI -7.8% where live would have been stopped at ~-3%).
-                    # (F2's blanket "fill max_loss at its DSL floor" was wrong:
-                    # it filled EVERY stop at the tighter DSL floor, giving the
-                    # paper book a better price than live gets on normal exits.)
-                    fill_px = float(mark)
-                    if reason.startswith("max_loss"):
-                        trig = _backup_sl_trigger_px(
-                            coin=coin, side=side,
-                            entry_px=float(pos["entry_px"]),
-                            entry_atr_pct=float(pos.get("entry_atr_pct", 0.0) or 0.0))
-                        if trig is not None:
-                            gapped = (mark < trig) if side == "long" else (mark > trig)
-                            if gapped:
-                                fill_px = float(trig)
-                    closed.append(self._close_position(
-                        pos, fill_px, reason or "dsl_exit",
-                        hold_min=hold_min, mfe_pct=mfe))
-                else:
-                    # Refresh stored mark/unrealized for dashboard reads.
-                    if side == "long":
-                        upct = (mark - float(pos["entry_px"])) / float(pos["entry_px"]) * 100.0
+                for pos in list(acc["positions"]):
+                    coin = pos["coin"]
+                    side = pos["side"]
+                    mark = mids.get(coin)
+                    if mark is None or mark <= 0:
+                        continue
+                    idx = index_prices.get(coin)
+                    tracker = self._trackers.get((acct, self._key(coin, side)))
+                    exit_now = False
+                    reason = ""
+                    hold_min = (time.time() - float(pos["opened_at"]) / 1000.0) / 60.0
+                    mfe = 0.0
+                    if tracker is not None:
+                        try:
+                            v = tracker.check(float(mark), float(idx) if idx else None)
+                            exit_now = bool(getattr(v, "exit", False))
+                            reason = str(getattr(v, "reason", "") or "")
+                            hold_min = float(getattr(v, "hold_min", hold_min) or hold_min)
+                            mfe = float(getattr(v, "mfe_pct", 0.0) or 0.0)
+                        except Exception as e:
+                            logger.warning(f"[shadow_book] dsl check failed {coin}: {e}")
+                    if exit_now:
+                        # F6 fill parity: a normal live exit is a software IOC
+                        # market fill at the confirming mark. The ONLY divergence
+                        # is a gap-through past the exchange backup-SL trigger;
+                        # cap the paper fill there too.
+                        fill_px = float(mark)
+                        if reason.startswith("max_loss"):
+                            trig = _backup_sl_trigger_px(
+                                coin=coin, side=side, entry_px=float(pos["entry_px"]),
+                                entry_atr_pct=float(pos.get("entry_atr_pct", 0.0) or 0.0))
+                            if trig is not None:
+                                gapped = (mark < trig) if side == "long" else (mark > trig)
+                                if gapped:
+                                    fill_px = float(trig)
+                        closed.append(self._close_position(
+                            acct, pos, fill_px, reason or "dsl_exit",
+                            hold_min=hold_min, mfe_pct=mfe))
                     else:
-                        upct = (float(pos["entry_px"]) - mark) / float(pos["entry_px"]) * 100.0
-                    pos["mark_px"] = float(mark)
-                    pos["unrealized_pct"] = upct
-                    pos["unrealized_roe_pct"] = upct * max(1, int(pos.get("leverage", 1)))
-                    pos["unrealized_pnl_usd"] = float(pos["size_usd"]) * upct / 100.0
-                    pos["marked_at"] = _now_ms()
+                        if side == "long":
+                            upct = (mark - float(pos["entry_px"])) / float(pos["entry_px"]) * 100.0
+                        else:
+                            upct = (float(pos["entry_px"]) - mark) / float(pos["entry_px"]) * 100.0
+                        pos["mark_px"] = float(mark)
+                        pos["unrealized_pct"] = upct
+                        pos["unrealized_roe_pct"] = upct * max(1, int(pos.get("leverage", 1)))
+                        pos["unrealized_pnl_usd"] = float(pos["size_usd"]) * upct / 100.0
+                        pos["marked_at"] = _now_ms()
 
-            snap = self._account_metrics()
-            self._last_snapshot = snap
-            now_mono = time.monotonic()
-            if (now_mono - self._last_equity_ts) >= _EQUITY_MIN_INTERVAL_S:
-                self._append_equity(_now_ms(), snap, force=False)
-                self._last_equity_ts = now_mono
+                snap = self._account_metrics(acct)
+                now_mono = time.monotonic()
+                if (now_mono - self._last_equity_ts) >= _EQUITY_MIN_INTERVAL_S:
+                    self._append_equity(acct, _now_ms(), snap, force=False)
+            self._last_equity_ts = time.monotonic()
             self._save(force=False)
         return closed
 
-    def _append_equity(self, ts_ms: int, snap: dict[str, Any], force: bool) -> None:
-        curve = self.state["equity_curve"]
+    def _append_equity(self, acct: str, ts_ms: int, snap: dict[str, Any],
+                       force: bool) -> None:
+        curve = self._account(acct)["equity_curve"]
         if not force and curve and ts_ms - curve[-1].get("ts", 0) < _EQUITY_MIN_INTERVAL_S * 1000:
             return
         curve.append({
@@ -801,37 +998,38 @@ class ShadowBook:
         self._last_equity_ts = time.monotonic()
 
     def close_now(self, coin: str, side: Optional[str] = None,
-                  exit_px: Optional[float] = None, reason: str = "manual_close") -> Optional[dict[str, Any]]:
-        """Force-close a paper position (operator / manual). Used by the API."""
+                  exit_px: Optional[float] = None,
+                  reason: str = "manual_close") -> Optional[dict[str, Any]]:
+        """Force-close a TAKER paper position (operator / API). The maker_shadow
+        account exits on its own simulated DSL signals, not via manual close."""
         self.reload_if_changed()
         with self._lock:
-            for p in list(self.state["positions"]):
+            acc = self._account("taker")
+            for p in list(acc["positions"]):
                 if p["coin"] != coin:
                     continue
                 if side and p["side"] != side:
                     continue
                 px = float(exit_px) if exit_px else float(p.get("mark_px") or p["entry_px"])
                 hold = (time.time() - float(p["opened_at"]) / 1000.0) / 60.0
-                fill = self._close_position(p, px, reason, hold_min=hold)
+                fill = self._close_position("taker", p, px, reason, hold_min=hold)
                 self._save(force=True)
                 return fill
         return None
 
     def reset(self, starting_balance: Optional[float] = None) -> dict[str, Any]:
-        """Wipe the paper account back to a fresh bankroll (operator action)."""
+        """Wipe BOTH paper accounts back to a fresh bankroll (operator)."""
         with self._lock:
-            old_closed = self.state.get("closed_count", 0)
-            if starting_balance is not None and starting_balance > 0:
-                # Persist the new default into the live config block so restarts
-                # honor it; callers (API) handle the config write themselves.
-                pass
+            old_closed = sum(
+                self.state["accounts"][a]["closed_count"] for a in ACCOUNTS)
             self._trackers.clear()
             self.state = self._fresh_state()
             if starting_balance is not None and starting_balance > 0:
                 self.state["starting_balance"] = float(starting_balance)
-                self.state["wallet_balance"] = float(starting_balance)
-            self._last_snapshot = self._account_metrics()
-            self._append_equity(_now_ms(), self._last_snapshot, force=True)
+                for acct in ACCOUNTS:
+                    acc = self.state["accounts"][acct]
+                    acc["wallet_balance"] = float(starting_balance)
+            self._last_snapshot = {}
             self._save(force=True)
             logger.warning(f"[shadow_book] RESET — wiped {old_closed} closes; "
                            f"fresh bankroll={self.state['starting_balance']:.2f}")
@@ -839,14 +1037,12 @@ class ShadowBook:
                     "starting_balance": self.state["starting_balance"]}
 
     def deposit(self, amount: float) -> Optional[dict[str, Any]]:
-        """Add virtual funds to the paper account WITHOUT touching positions
-        or fills (operator action). Unlike reset(), open positions, trade
-        history and the equity curve are all preserved.
+        """Add virtual funds to BOTH accounts WITHOUT touching positions/fills.
 
-        The bankroll baseline (``starting_balance``) and the wallet are both
-        raised by ``amount`` so the injected cash is never counted as trading
-        profit: ``realized_pnl = wallet - starting_balance`` is unchanged, and
-        ``available`` (equity - used_margin) grows by the deposited amount.
+        The bankroll baseline and each wallet are raised by ``amount`` so the
+        cash is never counted as trading profit; ``available`` grows by the
+        deposited amount. Both口径 receive identical notional contributions
+        so the comparison stays apples-to-apples.
         """
         try:
             amt = float(amount)
@@ -857,93 +1053,118 @@ class ShadowBook:
         self.reload_if_changed()
         with self._lock:
             self.state["starting_balance"] = float(self.state["starting_balance"]) + amt
-            self.state["wallet_balance"] = float(self.state["wallet_balance"]) + amt
-            snap = self._account_metrics()
-            self._last_snapshot = snap
-            self._append_equity(_now_ms(), snap, force=True)
+            taker_snap = None
+            for acct in ACCOUNTS:
+                acc = self.state["accounts"][acct]
+                acc["wallet_balance"] = float(acc["wallet_balance"]) + amt
+                snap = self._account_metrics(acct)
+                self._append_equity(acct, _now_ms(), snap, force=True)
+                if acct == "taker":
+                    taker_snap = snap
             self._save(force=True)
             logger.warning(
-                f"[shadow_book] DEPOSIT +{amt:.2f} (paper) — wallet="
-                f"{self.state['wallet_balance']:.2f}, available={snap['available']:.2f}, "
-                f"positions held={snap['open_positions']}")
+                f"[shadow_book] DEPOSIT +{amt:.2f} (paper) both accounts; "
+                f"taker available={taker_snap['available']:.2f}")
             return {
-                "ok": True,
-                "deposited": round(amt, 4),
-                "wallet_balance": snap["wallet_balance"],
-                "equity": snap["equity"],
-                "available": snap["available"],
-                "open_positions": snap["open_positions"],
+                "ok": True, "deposited": round(amt, 4),
+                "wallet_balance": taker_snap["wallet_balance"],
+                "equity": taker_snap["equity"],
+                "available": taker_snap["available"],
+                "open_positions": taker_snap["open_positions"],
             }
 
     # -- read views ---------------------------------------------------------
 
     def get_account(self) -> dict[str, Any]:
+        """All accounts' metrics + taker positions (the default account view)."""
         self.reload_if_changed()
         with self._lock:
-            snap = self._account_metrics()
+            accounts = {}
+            for acct in ACCOUNTS:
+                accounts[acct] = self._account_metrics(acct)
+            taker = self.state["accounts"]["taker"]
+            maker = self.state["accounts"]["maker_shadow"]
             return {
-                **snap,
                 "enabled": _enabled(),
-                "positions": [dict(p) for p in self.state["positions"]],
+                "maker_shadow_enabled": _maker_enabled(),
+                "starting_balance": self.state["starting_balance"],
+                # Flattened taker fields keep the existing payload shape.
+                **accounts["taker"],
+                "positions": [dict(p) for p in taker["positions"]],
+                "accounts": accounts,
+                "maker_positions": [dict(p) for p in maker["positions"]],
+                "maker_resting_orders": [dict(o) for o in maker["pending_orders"]],
                 "last_mark_ts": max(
-                    (int(p.get("marked_at", 0) or 0) for p in self.state["positions"]),
-                    default=0,
-                ),
+                    (int(p.get("marked_at", 0) or 0) for p in taker["positions"]),
+                    default=0),
                 "updated_at": _now_ms(),
             }
 
     def get_trades(self, limit: int = 200) -> dict[str, Any]:
         self.reload_if_changed()
         with self._lock:
-            fills = list(self.state["fills"])[-limit:]
+            fills = list(self.state["accounts"]["taker"]["fills"])[-limit:]
             fills.reverse()
-            return {"trades": fills, "total": len(self.state["fills"])}
+            return {"trades": fills, "total": len(self.state["accounts"]["taker"]["fills"])}
 
     def get_equity_curve(self) -> dict[str, Any]:
+        """Taker curve plus a parallel maker_shadow curve for对照."""
         self.reload_if_changed()
         with self._lock:
-            return {"points": list(self.state["equity_curve"]),
-                    "starting_balance": float(self.state["starting_balance"])}
+            taker = self.state["accounts"]["taker"]
+            maker = self.state["accounts"]["maker_shadow"]
+            return {
+                "starting_balance": float(self.state["starting_balance"]),
+                "points": list(taker["equity_curve"]),
+                "maker_points": list(maker["equity_curve"]),
+            }
 
     def get_stats(self) -> dict[str, Any]:
-        self.reload_if_changed()
         with self._lock:
-            closes = [f for f in self.state["fills"] if f.get("type") == "close"]
-            n = len(closes)
-            wins = [c for c in closes if float(c.get("realized_pnl_usd", 0.0)) > 0]
-            losses = [c for c in closes if float(c.get("realized_pnl_usd", 0.0)) <= 0]
-            gross_win = sum(float(c.get("realized_pnl_usd", 0.0)) for c in wins)
-            gross_loss = sum(float(c.get("realized_pnl_usd", 0.0)) for c in losses)
-            total_fee = sum(float(c.get("fee_usd", 0.0) or 0.0) for c in closes)
-            total_pnl = sum(float(c.get("realized_pnl_usd", 0.0)) for c in closes)
-            holds = [float(c.get("hold_minutes", 0.0) or 0.0) for c in closes]
-            best = max((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
-            worst = min((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
-            start = float(self.state["starting_balance"])
-            equity = float(self.state["wallet_balance"]) + sum(
-                float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
-                for p in self.state["positions"])
-            return {
-                "closed_trades": n,
-                "open_positions": len(self.state["positions"]),
-                "wins": len(wins),
-                "losses": len(losses),
-                "win_rate_pct": round(100.0 * len(wins) / n, 2) if n else 0.0,
-                "total_realized_pnl_usd": round(total_pnl, 4),
-                "total_fees_usd": round(total_fee, 4),
-                "gross_profit_usd": round(gross_win, 4),
-                "gross_loss_usd": round(gross_loss, 4),
-                "profit_factor": round(gross_win / abs(gross_loss), 2) if gross_loss < 0 else None,
-                "avg_win_usd": round(gross_win / len(wins), 4) if wins else 0.0,
-                "avg_loss_usd": round(gross_loss / len(losses), 4) if losses else 0.0,
-                "best_trade_usd": round(best, 4),
-                "worst_trade_usd": round(worst, 4),
-                "avg_hold_minutes": round(sum(holds) / n, 2) if n else 0.0,
-                "starting_balance": start,
-                "wallet_balance": round(float(self.state["wallet_balance"]), 4),
-                "equity_usd": round(equity, 4),
-                "total_return_pct": round(100.0 * (equity - start) / start, 4) if start else 0.0,
-            }
+            out = self._account_stats("taker")
+            maker_stats = self._account_stats("maker_shadow")
+            out["maker_shadow"] = maker_stats
+            return out
+
+    def _account_stats(self, acct: str) -> dict[str, Any]:
+        """Win rate / PnL / hold analytics for one account from its close
+        fills. Open/cancel fills are excluded from trade counts."""
+        acc = self._account(acct)
+        closes = [f for f in acc["fills"] if f.get("type") == "close"]
+        n = len(closes)
+        wins = [c for c in closes if float(c.get("realized_pnl_usd", 0.0)) > 0]
+        losses = [c for c in closes if float(c.get("realized_pnl_usd", 0.0)) <= 0]
+        gross_win = sum(float(c.get("realized_pnl_usd", 0.0)) for c in wins)
+        gross_loss = sum(float(c.get("realized_pnl_usd", 0.0)) for c in losses)
+        total_fee = sum(float(c.get("fee_usd", 0.0) or 0.0) for c in closes)
+        total_pnl = sum(float(c.get("realized_pnl_usd", 0.0)) for c in closes)
+        holds = [float(c.get("hold_minutes", 0.0) or 0.0) for c in closes]
+        best = max((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
+        worst = min((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
+        start = float(self.state["starting_balance"])
+        equity = float(acc["wallet_balance"]) + sum(
+            float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
+            for p in acc["positions"])
+        return {
+            "closed_trades": n,
+            "open_positions": len(acc["positions"]),
+            "resting_orders": len(acc["pending_orders"]),
+            "wins": len(wins),
+            "losses": len(losses),
+            "win_rate_pct": round(100.0 * len(wins) / n, 2) if n else 0.0,
+            "total_realized_pnl_usd": round(total_pnl, 4),
+            "total_fees_usd": round(total_fee, 4),
+            "gross_profit_usd": round(gross_win, 4),
+            "gross_loss_usd": round(gross_loss, 4),
+            "profit_factor": round(gross_win / abs(gross_loss), 2) if gross_loss < 0 else None,
+            "avg_win_usd": round(gross_win / len(wins), 4) if wins else 0.0,
+            "avg_loss_usd": round(gross_loss / len(losses), 4) if losses else 0.0,
+            "best_trade_usd": round(best, 4),
+            "worst_trade": round(worst, 4),
+            "avg_hold_minutes": round(sum(holds) / n, 2) if n else 0.0,
+            "equity_usd": round(equity, 4),
+            "total_return_pct": round(100.0 * (equity - start) / start, 4) if start else 0.0,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -972,7 +1193,7 @@ def shadow_open(**kwargs: Any) -> Optional[dict[str, Any]]:
 
 
 def mark_to_market(mids: dict[str, float],
-                   index_prices: Optional[dict[str, float]] = None) -> list[dict[str, Any]]:
+                   index_prices: Optional[dict[str,float]] = None) -> list[dict[str, Any]]:
     try:
         return get_book().mark_to_market(mids, index_prices)
     except Exception as e:
@@ -1001,7 +1222,6 @@ def reset(starting_balance: Optional[float] = None) -> dict[str, Any]:
 
 
 def deposit(amount: float) -> Optional[dict[str, Any]]:
-    """Add virtual funds without wiping positions/fills (operator action)."""
     return get_book().deposit(amount)
 
 

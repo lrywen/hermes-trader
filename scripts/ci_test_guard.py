@@ -79,10 +79,13 @@ import xml.etree.ElementTree as ET
 # (execution/maker.py)，test_maker_notional_guard +7；成交质量采集
 # (execution/maker_probe.py：resting/maker edge/成交后mid漂移逆向选择)，
 # test_maker_order_probe +5。本轮仅离线代码，未入金、未启动取样。
-# SHADOW maker 成交模拟器（零资金，execution/maker_shadow.py）：保守触及规则
-# (买单low<=limit/卖单high>=limit)、PIT不回溯挂单当根、TTL撤销、BAR_START/END
-# 口径、成交后mid漂移(逆向选择代理)；test_maker_shadow_sim +8。
-MIN_OFFLINE_TESTS = 4681
+# 2026-09-21 统一技术改造（物理删除，零资金、不动生产交易语义）：删 3 条孤儿流
+# (short_only/early_breakout/per_coin_regime) 与 risk-tuning 只读面板的写入端/
+# 测试，A/B 组仅摘除 observation-only 的影子 JSONL 落盘（保留 enforce 决策）；
+# shadow-book 重写为 taker + maker_shadow 双账户统一成交契约，新增
+# test_shadow_book_maker_contract +8 并同步存量 characterization。净离线计数
+# 4681 → 4597（删除多于新增），下调基线。
+MIN_OFFLINE_TESTS = 4597
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

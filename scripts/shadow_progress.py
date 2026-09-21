@@ -55,9 +55,6 @@ from datetime import datetime, timezone
 ARMS = [
     ("pullback",            "pullback",            "HERMES_PULLBACK_SHADOW_FILE",            "pullback_shadow.jsonl",            "mode",      "shadow_log_path"),
     ("ta_late_entry",       "ta_late_entry",       "HERMES_TA_LATE_ENTRY_SHADOW_FILE",       "ta_late_entry_shadow.jsonl",       "mode",      "shadow_log_path"),
-    ("atr_regime_calib",    "atr_regime_calibration", "HERMES_ATR_REGIME_CALIB_SHADOW_FILE", "atr_regime_calib_shadow.jsonl",  "mode",      "shadow_log_path"),
-    ("sizing_v2",           "atr_risk_sizing",     "HERMES_SIZING_V2_SHADOW_FILE",           "sizing_v2_shadow.jsonl",           "sizing_v2_mode", "sizing_v2_shadow_log_path"),
-    ("confidence_decay",    "confidence_decay",    "HERMES_CONFIDENCE_DECAY_SHADOW_FILE",    "confidence_decay_shadow.jsonl",    "mode",      "shadow_log_path"),
     ("market_circuit",      "market_circuit",      "HERMES_MARKET_CIRCUIT_SHADOW_FILE",      "market_circuit_shadow.jsonl",      "mode",      "shadow_log_path"),
     ("signal_age_decay",    "signal_age_decay",    "HERMES_SIGNAL_AGE_DECAY_SHADOW_FILE",    "signal_age_decay_shadow.jsonl",    "mode",      "shadow_log_path"),
     ("daily_extension_cap", "daily_extension_cap", "HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE", "daily_extension_cap_shadow.jsonl", "mode",      "shadow_log_path"),

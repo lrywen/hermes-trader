@@ -475,23 +475,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             # mirror that conservative floor as the canonical default.
             "min_composite": 21.0,
         },
-        "early_breakout_shadow": {
-            "shadow_mode": True,
-            "shadow_log_path": "",
-            "max_extension_atr": 1.5,
-            "early_stop_atr_mult": 1.2,
-            "early_size_fraction": 0.5,
-        },
         "per_coin_cooldown": {
             "shadow_mode": True,
             "window_hours": 24,
             "repeat_min_composite": 45.0,
             "max_consecutive_losses": 2,
             "loss_cooldown_hours": 24,
-        },
-        "short_only_shadow": {
-            "shadow_mode": True,
-            "shadow_log_path": "",
         },
     },
     "plan_b": {
@@ -1668,20 +1657,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "atr_pct_max": 3.5,
         "min_composite": 40,
         "low_leverage": 5,
-    },
-    # 坑1 (2026-09-15): per-coin macro x own-4h-divergence shadow probe
-    # (per_coin_regime_shadow.py). shadow_mode=false = inert (the probe
-    # records nothing until explicitly enabled). record_all_quadrants /
-    # require_own_adx / strong_own_score / mid_own_score mirror the
-    # fallbacks the recorder applies with .get; shadow_log_path empty →
-    # env / container default path.
-    "per_coin_regime_shadow": {
-        "shadow_mode": False,
-        "record_all_quadrants": True,
-        "require_own_adx": 20.0,
-        "strong_own_score": 0.65,
-        "mid_own_score": 0.55,
-        "shadow_log_path": "",
     },
     # 坑1 (2026-09-15): own-4h gap demote threshold (%) read via cfg_get
     # in risk_gates.market_regime_gate. 0.0 = overlay disabled (the

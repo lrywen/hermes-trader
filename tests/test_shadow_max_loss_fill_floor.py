@@ -75,7 +75,7 @@ def test_max_loss_normal_fills_at_mark_long(tmp_path):
     book, coin, side = _open_book(tmp_path, entry=100.0, atr_pct=100.0)
     mark = 98.0
     floor = 99.0  # DSL stop floor — must NOT be used (F2 behaviour) on a normal exit
-    book._trackers[book._key(coin, side)] = _FakeTracker(ExitVerdict(
+    book._trackers[("taker", book._key(coin, side))] = _FakeTracker(ExitVerdict(
         exit=True, reason="max_loss", floor_price=floor))
 
     closed = book.mark_to_market({coin: mark}, index_prices={coin: mark})
@@ -91,8 +91,9 @@ def test_max_loss_gap_through_caps_at_backup_trigger_long(tmp_path):
     # the exchange trigger (97.0), not the post-gap mark nor the DSL floor.
     book, coin, side = _open_book(tmp_path, entry=100.0, atr_pct=100.0)
     mark = 94.0
-    book._trackers[book._key(coin, side)] = _FakeTracker(ExitVerdict(
-        exit=True, reason="max_loss", floor_price=99.0))
+    floor = 99.0
+    book._trackers[("taker", book._key(coin, side))] = _FakeTracker(ExitVerdict(
+        exit=True, reason="max_loss", floor_price=floor))
 
     closed = book.mark_to_market({coin: mark}, index_prices={coin: mark})
 
@@ -107,7 +108,7 @@ def test_max_loss_gap_through_caps_at_backup_trigger_short(tmp_path):
     book, coin, side = _open_book(tmp_path, coin="ETH", side="short",
                                   entry=200.0, atr_pct=100.0)
     mark = 210.0
-    book._trackers[book._key(coin, side)] = _FakeTracker(ExitVerdict(
+    book._trackers[("taker", book._key(coin, side))] = _FakeTracker(ExitVerdict(
         exit=True, reason="max_loss", floor_price=202.0))
 
     closed = book.mark_to_market({coin: mark}, index_prices={coin: mark})
@@ -123,7 +124,7 @@ def test_non_max_loss_exit_always_fills_at_mark(tmp_path):
     # even if the mark is far past where a net would sit.
     book, coin, side = _open_book(tmp_path, entry=100.0, atr_pct=100.0)
     mark = 103.0
-    book._trackers[book._key(coin, side)] = _FakeTracker(ExitVerdict(
+    book._trackers[("taker", book._key(coin, side))] = _FakeTracker(ExitVerdict(
         exit=True, reason="trailing_stop", floor_price=101.5))
 
     closed = book.mark_to_market({coin: mark}, index_prices={coin: mark})

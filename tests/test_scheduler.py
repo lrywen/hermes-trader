@@ -41,9 +41,9 @@ def _job(name: str) -> ScheduledJob:
 # Job table pins the compose schedule (regression guard against drift)
 # ---------------------------------------------------------------------------
 
-def test_job_table_has_seven_jobs_and_existing_scripts() -> None:
+def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 7
+    assert len(SCHEDULED_JOBS) == 6
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
@@ -74,12 +74,6 @@ def test_daily_job_table_matches_compose_windows() -> None:
             ("scripts/reconcile_relax_tier_shadow.py", "--write"),
             "relax-tier-reconcile.log",
             {},
-        ),
-        "reconcile_short_only_shadow": (
-            55,
-            ("scripts/reconcile_short_only_shadow.py", "--window-hours", "24", "--write"),
-            "short-only-reconcile.log",
-            {"HERMES_SHORT_ONLY_SHADOW_FILE": "/data/short_only_shadow.jsonl"},
         ),
     }
     for name, (minute, argv, log_name, env) in table.items():
@@ -174,11 +168,11 @@ def test_runner_invokes_executor_with_job_and_env_and_returns_state() -> None:
         executed.append(job)
         return 0
 
-    state = run_due(_utc(h=0, m=55), {}, executor=executor, data_dir="/tmp/fake-data")
+    state = run_due(_utc(h=0, m=50), {}, executor=executor, data_dir="/tmp/fake-data")
 
     job = executed[0]
-    assert job.name == "reconcile_short_only_shadow"
-    assert state == {"reconcile_short_only_shadow": "2026-09-17"}
+    assert job.name == "reconcile_relax_tier_shadow"
+    assert state == {"reconcile_relax_tier_shadow": "2026-09-17"}
 
 
 def test_runner_survives_failing_job_and_still_marks_slot() -> None:

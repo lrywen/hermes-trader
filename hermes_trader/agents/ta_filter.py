@@ -832,33 +832,6 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                     _be_shadow = bool(_be.get("shadow_mode", True))
                     _hq, _hq_info = _high_quality_breakout(perception, _be)
                     if _be_on and _hq:
-                        from datetime import datetime, timezone
-                        from hermes_trader.agents.risk_gates import (
-                            _record_late_entry_shadow,
-                            late_entry_shadow_path,
-                        )
-                        _be_rec = {
-                            "timestamp": datetime.now(timezone.utc).strftime(
-                                "%Y-%m-%dT%H:%M:%SZ"),
-                            "coin": coin,
-                            "side": le_side,
-                            "mode": "shadow" if _be_shadow else "enforce",
-                            "layer": "prefilter_breakout_exemption",
-                            "blocked": True,
-                            "reason": le.get("reason", ""),
-                            "rsi4h": le.get("rsi4h"),
-                            "adx4h": le.get("adx4h"),
-                            "extension": le.get("extension"),
-                            "rsi15m": None,
-                            "relaxed_by_trend": le.get("relaxed_by_trend"),
-                            "mtf_passed": None,
-                            "trend_direction": le.get("trend_direction"),
-                            "enforced": not _be_shadow,
-                            "breakout_rvol": _hq_info.get("rvol"),
-                            "would": "downgrade_reject",
-                        }
-                        _record_late_entry_shadow(
-                            _be_rec, late_entry_shadow_path(le_params))
                         if not _be_shadow:
                             logger.info(
                                 f"[ta_filter] {coin} breakout_exemption ENFORCE: "

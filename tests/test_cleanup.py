@@ -3760,16 +3760,18 @@ def test_shadow_book_load_tolerates_malformed_rows(tmp_path):
     path.write_text(_json.dumps(state))
 
     book = sb.ShadowBook(path=str(path))
-    # Both good positions survived; the three bad rows were evicted.
-    coins_sides = {(p["coin"], p["side"]) for p in book.state["positions"]}
+    # v1 flat state migrates under the taker account. Both good positions
+    # survived; the three bad rows were evicted.
+    taker = book.state["accounts"]["taker"]
+    coins_sides = {(p["coin"], p["side"]) for p in taker["positions"]}
     assert coins_sides == {("BTC", "long"), ("ETH", "short")}
     # Both trackers rehydrated (previously one bad row killed ALL trackers).
-    assert book._key("BTC", "long") in book._trackers
-    assert book._key("ETH", "short") in book._trackers
+    assert ("taker", book._key("BTC", "long")) in book._trackers
+    assert ("taker", book._key("ETH", "short")) in book._trackers
     # Wrong-typed list field degraded, equity curve preserved.
-    assert book.state["fills"] == []
-    assert len(book.state["equity_curve"]) == 1
-    assert book.state["closed_count"] == 3
+    assert taker["fills"] == []
+    assert len(taker["equity_curve"]) == 1
+    assert taker["closed_count"] == 3
 
 
 def test_dashboard_positions_prefers_snapshot_no_hl_call(monkeypatch):

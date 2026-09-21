@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import logging
 import os
-import time
 from typing import Any
 
 from hermes_trader.agents.config_store import report_legacy_mode_drift
@@ -44,24 +43,6 @@ def _atr_calib_config(config: dict[str, Any]) -> dict[str, Any]:
         valid_modes=_ATR_CALIB_MODES,
     )
     return {"mode": mode, "block": blk}
-
-
-def _atr_calib_shadow_path(blk: dict[str, Any]) -> str:
-    """Resolve the ATR calibration shadow JSONL path (config → env → default)."""
-    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
-        "HERMES_ATR_REGIME_CALIB_SHADOW_FILE",
-        os.path.expanduser("~/.hermes-trading/atr_regime_calib_shadow.jsonl"),
-    )
-
-
-def _atr_calib_record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append an ATR calibration record to the JSONL."""
-    # Audit 2026-09-06 (F2): routed through the shared shadow_log writer
-    # (daily + size-based rotation, write-failure metric). The helper never
-    # raises, so the trade hot path is unaffected.
-    from hermes_trader.shadow_log import append_jsonl
-
-    append_jsonl(path, rec, stream="atr_calib")
 
 
 def _atr_calib_metric(mode: str, outcome: str) -> None:
@@ -116,24 +97,6 @@ def _atr_calib_apply(
     factor = float(cal["factor"])
     calibrated = raw * factor
     would_change = abs(factor - 1.0) > 1e-9
-    try:
-        _atr_calib_record_shadow({
-            "ts": int(time.time() * 1000),
-            "mode": mode,
-            "coin": coin,
-            "atr_pct": round(float(atr_pct), 4),
-            "atr_hist_mean_pct": round(float(atr_hist_mean_pct), 4),
-            "ratio": round(float(cal["ratio"]), 4),
-            "vol_regime": cal["regime"],
-            "factor": round(factor, 4),
-            "core_stop_pct": round(float(core_stop), 4),
-            "trend_regime": str(regime_label),
-            "raw_stop_pct": round(raw, 4),
-            "calibrated_stop_pct": round(calibrated, 4),
-            "would_change": bool(would_change),
-        }, _atr_calib_shadow_path(cfg["block"]))
-    except Exception as e:
-        logger.debug(f"[atr-calib] shadow record failed for {coin}: {e}")
     _atr_calib_metric(mode, "applied" if would_change else "no_change")
 
     return {

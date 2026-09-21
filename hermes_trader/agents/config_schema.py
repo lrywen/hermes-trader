@@ -345,14 +345,11 @@ class _ConfigPatch(BaseModel):
         default_factory=lambda: _dict_default("research_cooldown_adaptive"))
 
     # P1-4 Phase 3 (2026-09-15 risk-tuning shadows): the volatility/score
-    # de-leverage arm (executor.py) and the macro x own-4h divergence probe
-    # (per_coin_regime_shadow.py), plus the own-4h gap demote threshold
+    # de-leverage arm (executor.py), plus the own-4h gap demote threshold
     # (risk_gates via cfg_get; 0.0 disables). Previously EXTRA keys flagged
     # unknown by every strict whole-view validation.
     leverage_tier_shadow: dict[str, Any] = Field(
         default_factory=lambda: _dict_default("leverage_tier_shadow"))
-    per_coin_regime_shadow: dict[str, Any] = Field(
-        default_factory=lambda: _dict_default("per_coin_regime_shadow"))
     own_gap_demote_pct: float = Field(
         default=CANONICAL_DEFAULTS["own_gap_demote_pct"], ge=0.0, le=100.0)
 
@@ -578,19 +575,12 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "shadow_mode": ("bool",),
             "require_macro_uptrend": ("bool",),
         },
-        # Audit 2026-09-10 (risk-tuning shadow): the four runner-gate
-        # counter-factual arms. breakout/early/short_only are record-only;
-        # per_coin_cooldown.shadow_mode=false ENFORCES a real block.
+        # Audit 2026-09-10 (risk-tuning shadow): the runner-gate
+        # counter-factual arms. per_coin_cooldown.shadow_mode=false ENFORCES
+        # a real block.
         "breakout_score_floor": {
             "shadow_mode": ("bool",),
             "min_composite": _num_leaf(0.0, 100.0),
-        },
-        "early_breakout_shadow": {
-            "shadow_mode": ("bool",),
-            "shadow_log_path": ("str",),
-            "max_extension_atr": _num_leaf(0.0, 100.0),
-            "early_stop_atr_mult": _num_leaf(0.0, 50.0),
-            "early_size_fraction": _num_leaf(0.0, 1.0),
         },
         "per_coin_cooldown": {
             "shadow_mode": ("bool",),
@@ -598,10 +588,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "repeat_min_composite": _num_leaf(0.0, 100.0),
             "max_consecutive_losses": ("int", 0, 1000),
             "loss_cooldown_hours": _num_leaf(0.0, 100_000.0),
-        },
-        "short_only_shadow": {
-            "shadow_mode": ("bool",),
-            "shadow_log_path": ("str",),
         },
     },
     "ta_late_entry": {
@@ -784,19 +770,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "atr_pct_max": _num_leaf(0.0, 100.0),
         "min_composite": _num_leaf(0.0, 100.0),
         "low_leverage": ("int", 1, 50),
-    },
-    # P1-4 Phase 3: macro x own-4h-divergence shadow probe
-    # (per_coin_regime_shadow.py). shadow_mode arms recording;
-    # record_all_quadrants keeps sampling across non-aligned stretches;
-    # require_own_adx gates trend conviction; strong/mid_own_score bucket the
-    # macro x own quadrant tier.
-    "per_coin_regime_shadow": {
-        "shadow_mode": ("bool",),
-        "record_all_quadrants": ("bool",),
-        "require_own_adx": _num_leaf(0.0, 1000.0),
-        "strong_own_score": _num_leaf(0.0, 1.0),
-        "mid_own_score": _num_leaf(0.0, 1.0),
-        "shadow_log_path": ("str",),
     },
 }
 

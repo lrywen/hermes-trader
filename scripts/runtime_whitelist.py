@@ -14,7 +14,7 @@ Call sites that justify each entry (verified 2026-09-18):
   * scheduler.SCHEDULED_JOBS (in-container subprocess):
       daily_report.py, pullback_shadow_daily.py,
       reconcile_ta_late_entry_shadow.py, reconcile_xs_reversal_shadow.py,
-      reconcile_relax_tier_shadow.py, reconcile_short_only_shadow.py,
+      reconcile_relax_tier_shadow.py,
       macro_regime_watch.py
   * Web UI spawn / lazy import (dashboard_routes/shadow_arms.py):
       regen_param_sweep.py, shadow_grade.py
@@ -23,8 +23,7 @@ Call sites that justify each entry (verified 2026-09-18):
       both `import shadow_progress`; it has no further scripts/-local deps)
   * Host cron wrappers that `docker exec` INTO the container:
       cron_reconcile.sh -> reconcile_fills.py, reconcile_change_arms_shadow.py,
-        reconcile_pullback_shadow.py, reconcile_daily_extension_cap_shadow.py,
-        reconcile_early_breakout_shadow.py
+        reconcile_pullback_shadow.py, reconcile_daily_extension_cap_shadow.py
         (xs_reversal / relax_tier already listed via scheduler)
       cron_shadow_grade.sh -> shadow_grade.py (already listed)
   * Deploy smoke (scripts/deploy_prod.sh `docker exec ... postdeploy_smoke.py`):
@@ -47,7 +46,6 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_ta_late_entry_shadow.py",
     "reconcile_xs_reversal_shadow.py",
     "reconcile_relax_tier_shadow.py",
-    "reconcile_short_only_shadow.py",
     "macro_regime_watch.py",
     # Web UI spawn / lazy import.
     "regen_param_sweep.py",
@@ -60,7 +58,6 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_change_arms_shadow.py",
     "reconcile_pullback_shadow.py",
     "reconcile_daily_extension_cap_shadow.py",
-    "reconcile_early_breakout_shadow.py",
     # Deploy smoke path.
     "postdeploy_smoke.py",
 )

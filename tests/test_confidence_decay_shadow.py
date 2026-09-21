@@ -1,5 +1,4 @@
-"""Tests for the AI-confidence freshness decay (roadmap §2, off / shadow /
-enforce).
+"""Tests for the AI-confidence freshness decay (roadmap §2, off / enforce).
 
 The debate verdict cache (TTL ~300s) can hand back a stale high confidence
 without a fresh LLM call, and the re-research throttle lets the same verdict
@@ -7,17 +6,15 @@ be re-routed cycles later — a "stale high-score entry". The decay wrapper in
 agents.executor exponentially ages the AI confidence by the age of the
 verdict CONTENT (verdict|side|confidence signature), factor = 2 ** (-age/hl).
 
-These tests cover:
+The observation-only shadow JSONL branch was removed in the 2026-09-21
+cleanup; these tests now cover:
   * _confidence_decay_config: env HERMES_CONFIDENCE_DECAY_MODE > block
     confidence_decay.mode > invalid/missing → off; halflife parsing.
   * _verdict_signature: verdict/side/rounded-confidence key.
   * _confidence_decay_age_s: first sighting age 0, same signature ages,
     changed signature resets, _reset_confidence_decay clears.
-  * _confidence_decay_shadow_path resolution: block > env > default.
-  * _confidence_decay_record_shadow appends a JSON line.
-  * Full maybe_execute wiring: off is byte-identical and writes nothing;
-    shadow logs but never mutates confidence; enforce multiplies a stale
-    verdict's confidence so the confidence gate blocks it, and leaves
+  * Full maybe_execute wiring: off is byte-identical; enforce multiplies a
+    stale verdict's confidence so the confidence gate blocks it, and leaves
     ai_confidence_pre_decay / confidence_decay audit fields; a fresh verdict
     (age 0) is untouched; PASS verdicts are skipped.
 
@@ -26,7 +23,6 @@ Default mode is OFF: with no config/env, behaviour is unchanged.
 
 from __future__ import annotations
 
-import json
 import time
 
 import pytest
@@ -34,7 +30,6 @@ import pytest
 from hermes_trader.agents import executor
 
 _ENV_MODE = "HERMES_CONFIDENCE_DECAY_MODE"
-_ENV_FILE = "HERMES_CONFIDENCE_DECAY_SHADOW_FILE"
 
 
 @pytest.fixture(autouse=True)
@@ -138,27 +133,6 @@ def test_reset_clears_onset():
     assert executor._confidence_decay_age_s("TEST", "LONG|long|0.90", 4900.0) == 0.0
 
 
-# ── shadow path / record ────────────────────────────────────────────────────
-def test_shadow_path_resolution(monkeypatch, tmp_path):
-    monkeypatch.delenv(_ENV_FILE, raising=False)
-    blk = {"shadow_log_path": str(tmp_path / "from_config.jsonl")}
-    assert executor._confidence_decay_shadow_path(blk).endswith("from_config.jsonl")
-    monkeypatch.setenv(_ENV_FILE, str(tmp_path / "from_env.jsonl"))
-    assert executor._confidence_decay_shadow_path({}).endswith("from_env.jsonl")
-    monkeypatch.delenv(_ENV_FILE, raising=False)
-    assert executor._confidence_decay_shadow_path({}).endswith(
-        "confidence_decay_shadow.jsonl")
-
-
-def test_record_shadow_appends_jsonl(tmp_path):
-    path = tmp_path / "cd.jsonl"
-    executor._confidence_decay_record_shadow({"coin": "AAA", "age_s": 0.0}, str(path))
-    executor._confidence_decay_record_shadow({"coin": "BBB", "age_s": 30.0}, str(path))
-    recs = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
-    assert [r["coin"] for r in recs] == ["AAA", "BBB"]
-    assert recs[1]["age_s"] == 30.0
-
-
 # ── full maybe_execute wiring (bot SHADOW mode = paper, no real order) ──────
 class _StubMemory:
     """Neutral memory stub: no disk, no state, zero slip/cooldowns/pnl."""
@@ -193,11 +167,11 @@ class _StubMemory:
         return None
 
 
-def _wire_executor(monkeypatch, tmp_path, cfg_extra, shadow_file):
+def _wire_executor(monkeypatch, cfg_extra):
     """Mock every I/O boundary around maybe_execute.
 
-    Returns a dict capturing the GateContext the gates see (confidence is the
-    value the confidence gate compares against) and the shadow order.
+    Returns a dict capturing the GateContext (confidence is the value the
+    confidence gate compares against) and the shadow order.
     """
     from hermes_trader.agents import market_regime, shadow_book
 
@@ -284,66 +258,24 @@ def _analysis(verdict="LONG", confidence=0.9):
     }
 
 
-def _read_jsonl(path):
-    with open(path, encoding="utf-8") as f:
-        return [json.loads(line) for line in f if line.strip()]
-
-
-def test_off_is_byte_identical_and_writes_nothing(monkeypatch, tmp_path):
-    """OFF: confidence is never touched and no JSONL appears."""
+def test_off_is_byte_identical(monkeypatch):
+    """OFF: confidence is never touched."""
     monkeypatch.delenv(_ENV_MODE, raising=False)
-    shadow_file = tmp_path / "confidence_decay_shadow.jsonl"
-    monkeypatch.setenv(_ENV_FILE, str(shadow_file))
-    captured = _wire_executor(monkeypatch, tmp_path, {}, str(shadow_file))
+    captured = _wire_executor(monkeypatch, {})
 
     res = executor.maybe_execute(_analysis())
     assert res.get("reason") == "shadow_mode_would_execute"
     # Raw 0.9 confidence flows straight to the gates.
     assert abs(captured["ctx"].confidence - 0.9) < 1e-9
-    assert not shadow_file.exists()
 
 
-def test_shadow_logs_but_never_mutates_confidence(monkeypatch, tmp_path):
-    """SHADOW: a stale verdict is aged and logged but the gates still see the
-    raw confidence — no trading behaviour changes."""
-    monkeypatch.setenv(_ENV_MODE, "shadow")
-    shadow_file = tmp_path / "confidence_decay_shadow.jsonl"
-    monkeypatch.setenv(_ENV_FILE, str(shadow_file))
-    captured = _wire_executor(monkeypatch, tmp_path,
-                              {"confidence_decay": {"halflife_s": 900.0}},
-                              str(shadow_file))
-    # Pre-seed a 1800s-old identical verdict → factor 2^(-2) = 0.25.
-    executor._confidence_decay_onset["TEST"] = {
-        "sig": "LONG|long|0.90", "first_ts": time.time() - 1800.0}
-
-    res = executor.maybe_execute(_analysis())
-    assert res.get("reason") == "shadow_mode_would_execute"
-    # Gates still see the raw 0.9 (shadow must not mutate).
-    assert abs(captured["ctx"].confidence - 0.9) < 1e-9
-
-    recs = _read_jsonl(shadow_file)
-    assert len(recs) == 1
-    rec = recs[0]
-    assert rec["mode"] == "shadow"
-    assert rec["coin"] == "TEST"
-    assert rec["verdict"] == "LONG"
-    assert abs(rec["confidence_raw"] - 0.9) < 1e-9
-    assert abs(rec["decay_factor"] - 0.25) < 0.01
-    assert abs(rec["confidence_decayed"] - 0.225) < 0.01
-    # Counterfactual tag: raw 0.9 passes the 0.70 gate, decayed 0.225 fails.
-    assert rec["would_block_gate"] is True
-
-
-def test_enforce_blocks_stale_high_confidence(monkeypatch, tmp_path):
+def test_enforce_blocks_stale_high_confidence(monkeypatch):
     """ENFORCE: a 1800s-old verdict (factor 0.25) drives 0.9 → 0.225, below
     the 0.70 confidence gate, so the stale entry is blocked; the raw value is
     preserved in ai_confidence_pre_decay for audit."""
     monkeypatch.setenv(_ENV_MODE, "enforce")
-    shadow_file = tmp_path / "confidence_decay_shadow.jsonl"
-    monkeypatch.setenv(_ENV_FILE, str(shadow_file))
-    captured = _wire_executor(monkeypatch, tmp_path,
-                              {"confidence_decay": {"halflife_s": 900.0}},
-                              str(shadow_file))
+    captured = _wire_executor(monkeypatch,
+                              {"confidence_decay": {"halflife_s": 900.0}})
     executor._confidence_decay_onset["TEST"] = {
         "sig": "LONG|long|0.90", "first_ts": time.time() - 1800.0}
 
@@ -354,43 +286,26 @@ def test_enforce_blocks_stale_high_confidence(monkeypatch, tmp_path):
     # The value the gate compared against is the decayed one.
     assert captured["ctx"].confidence < 0.70
     assert abs(captured["ctx"].confidence - 0.225) < 0.01
-    # Enforce also writes the shadow JSONL for calibration.
-    recs = _read_jsonl(shadow_file)
-    assert len(recs) == 1
-    assert recs[0]["mode"] == "enforce"
-    assert recs[0]["would_block_gate"] is True
 
 
-def test_enforce_fresh_verdict_passes(monkeypatch, tmp_path):
+def test_enforce_fresh_verdict_passes(monkeypatch):
     """ENFORCE with a fresh verdict (age 0 → factor 1.0): confidence is
     untouched and the entry proceeds."""
     monkeypatch.setenv(_ENV_MODE, "enforce")
-    shadow_file = tmp_path / "confidence_decay_shadow.jsonl"
-    monkeypatch.setenv(_ENV_FILE, str(shadow_file))
-    captured = _wire_executor(monkeypatch, tmp_path,
-                              {"confidence_decay": {"halflife_s": 900.0}},
-                              str(shadow_file))
+    captured = _wire_executor(monkeypatch,
+                              {"confidence_decay": {"halflife_s": 900.0}})
     # No pre-seeded onset → first sighting, age 0.
 
     res = executor.maybe_execute(_analysis())
     assert res.get("reason") == "shadow_mode_would_execute"
     assert abs(captured["ctx"].confidence - 0.9) < 1e-9
-    recs = _read_jsonl(shadow_file)
-    assert len(recs) == 1
-    assert recs[0]["decay_factor"] == 1.0
-    assert recs[0]["would_block_gate"] is False
 
 
-def test_pass_verdict_is_never_decayed(monkeypatch, tmp_path):
+def test_pass_verdict_is_never_decayed(monkeypatch):
     """PASS verdicts are skipped entirely (structural-override entries are
-    driven by live structure, not AI conviction): no shadow record."""
+    driven by live structure, not AI conviction)."""
     monkeypatch.setenv(_ENV_MODE, "enforce")
-    shadow_file = tmp_path / "confidence_decay_shadow.jsonl"
-    monkeypatch.setenv(_ENV_FILE, str(shadow_file))
-    _wire_executor(monkeypatch, tmp_path,
-                   {"confidence_decay": {"halflife_s": 900.0}},
-                   str(shadow_file))
-
-    executor._apply_confidence_decay(_analysis(verdict="PASS", confidence=0.95),
-                                     {"confidence_decay": {"mode": "enforce"}})
-    assert not shadow_file.exists()
+    an = _analysis(verdict="PASS", confidence=0.95)
+    executor._apply_confidence_decay(an, {"confidence_decay": {"mode": "enforce"}})
+    assert abs(an["confidence"] - 0.95) < 1e-9
+    assert "ai_confidence_pre_decay" not in an

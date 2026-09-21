@@ -115,25 +115,6 @@ def _confidence_decay_age_s(coin: str, sig: str, now: float) -> float:
         return max(0.0, now - float(entry["first_ts"]))
 
 
-def _confidence_decay_shadow_path(blk: dict[str, Any]) -> str:
-    """Resolve the confidence-decay shadow JSONL path (config → env → default)."""
-    return str(blk.get("shadow_log_path") or "").strip() or os.environ.get(
-        "HERMES_CONFIDENCE_DECAY_SHADOW_FILE",
-        os.path.expanduser("~/.hermes-trading/confidence_decay_shadow.jsonl"),
-    )
-
-
-def _confidence_decay_record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append a confidence-decay shadow record to the JSONL.
-
-    Audit 2026-09-06 (F2): routed through the shared shadow_log writer
-    (size-based rotation + write-failure metric).
-    """
-    from hermes_trader.shadow_log import append_jsonl
-
-    append_jsonl(path, rec, stream="confidence_decay")
-
-
 def _confidence_decay_metric(mode: str, outcome: str) -> None:
     """Best-effort Prometheus counter (roadmap R7 registration)."""
     try:
@@ -186,23 +167,5 @@ def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) ->
             "factor": round(factor, 4),
         }
         analysis["confidence"] = decayed
-    try:
-        _confidence_decay_record_shadow({
-            "ts": int(time.time() * 1000),
-            "mode": mode,
-            "coin": coin,
-            "verdict": verdict,
-            "side": str(analysis.get("side") or "").lower(),
-            "confidence_raw": round(raw, 4),
-            "confidence_decayed": round(decayed, 4),
-            "age_s": round(age_s, 1),
-            "halflife_s": round(cfg["halflife_s"], 1),
-            "decay_factor": round(factor, 4),
-            "min_confidence": round(min_conf, 4),
-            "would_block_gate": bool(raw >= min_conf and decayed < min_conf),
-            "debate_used": bool(analysis.get("debate_used", False)),
-        }, _confidence_decay_shadow_path(cfg["block"]))
-    except Exception as e:
-        logger.debug(f"[confidence-decay] shadow record failed for {coin}: {e}")
     _confidence_decay_metric(
         mode, "would_block" if bool(raw >= min_conf and decayed < min_conf) else _outcome)

@@ -10,9 +10,8 @@ import json
 
 import pytest
 
-from hermes_trader.agents import executor, config_store, research
 from hermes_trader import metrics
-
+from hermes_trader.agents import config_store, executor, research
 
 # ── Q9: swallowed-error counter exists and the three business call sites use it
 
@@ -22,15 +21,13 @@ def test_swallowed_metric_defined():
 
 @pytest.mark.parametrize("label", [
     "sl_coin_floor_override",
-    "regime_detection",
 ])
 def test_executor_silent_branches_are_instrumented(label):
     import inspect
 
     from hermes_trader.agents.shadow import entry_probes
-    # The regime_detection branch lives in the short-only shadow recorder,
-    # extracted to agents/shadow/entry_probes.py in the P1-1 decomposition;
-    # sl_coin_floor_override stays in executor. Scan both owning modules.
+    # sl_coin_floor_override stays in executor; entry_probes is scanned too
+    # for the generic risk-tuning recorder.
     src = inspect.getsource(executor) + inspect.getsource(entry_probes)
     assert f'labels(func="{label}")' in src
 

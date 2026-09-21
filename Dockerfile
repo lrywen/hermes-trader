@@ -57,7 +57,6 @@ COPY scripts/pullback_shadow_daily.py scripts/pullback_shadow_daily.py
 COPY scripts/reconcile_ta_late_entry_shadow.py scripts/reconcile_ta_late_entry_shadow.py
 COPY scripts/reconcile_xs_reversal_shadow.py scripts/reconcile_xs_reversal_shadow.py
 COPY scripts/reconcile_relax_tier_shadow.py scripts/reconcile_relax_tier_shadow.py
-COPY scripts/reconcile_short_only_shadow.py scripts/reconcile_short_only_shadow.py
 COPY scripts/macro_regime_watch.py scripts/macro_regime_watch.py
 COPY scripts/regen_param_sweep.py scripts/regen_param_sweep.py
 COPY scripts/shadow_grade.py scripts/shadow_grade.py
@@ -68,7 +67,6 @@ COPY scripts/reconcile_fills.py scripts/reconcile_fills.py
 COPY scripts/reconcile_change_arms_shadow.py scripts/reconcile_change_arms_shadow.py
 COPY scripts/reconcile_pullback_shadow.py scripts/reconcile_pullback_shadow.py
 COPY scripts/reconcile_daily_extension_cap_shadow.py scripts/reconcile_daily_extension_cap_shadow.py
-COPY scripts/reconcile_early_breakout_shadow.py scripts/reconcile_early_breakout_shadow.py
 COPY scripts/postdeploy_smoke.py scripts/postdeploy_smoke.py
 # Privilege-drop entrypoint (consumed by the `cp` in the RUN step below).
 COPY scripts/docker-entrypoint.sh scripts/docker-entrypoint.sh

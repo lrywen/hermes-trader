@@ -39,21 +39,3 @@ def _sizing_v2_config(config: dict[str, Any]) -> dict[str, Any]:
         valid_modes=_SIZING_V2_MODES,
     )
     return {"mode": mode, "block": blk}
-
-
-def _sizing_v2_shadow_path(blk: dict[str, Any]) -> str:
-    """Resolve the sizing v2 shadow JSONL path (config → env → default)."""
-    return str(blk.get("sizing_v2_shadow_log_path") or "").strip() or os.environ.get(
-        "HERMES_SIZING_V2_SHADOW_FILE",
-        os.path.expanduser("~/.hermes-trading/sizing_v2_shadow.jsonl"),
-    )
-
-
-def _sizing_v2_record_shadow(rec: dict[str, Any], path: str) -> None:
-    """Best-effort append a sizing v2 shadow record to the JSONL."""
-    # Audit 2026-09-06 (F2): routed through the shared shadow_log writer
-    # (daily + size-based rotation, write-failure metric). The helper never
-    # raises, so the trade hot path is unaffected.
-    from hermes_trader.shadow_log import append_jsonl
-
-    append_jsonl(path, rec, stream="sizing_v2")

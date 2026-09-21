@@ -17,9 +17,8 @@ from __future__ import annotations
 
 import pytest
 
+from hermes_trader.agents import dsl_exit, executor
 from hermes_trader.agents import shadow_book as sb
-from hermes_trader.agents import dsl_exit
-from hermes_trader.agents import executor
 
 # Mirrors the production .agent-config.json dsl_exit block: loose top-level
 # caps (1.0% / 15 ROE) that regime_aware must override per entry regime.
@@ -70,7 +69,7 @@ def _open(book, coin, side, regime, *, entry=100.0):
         analysis_id="regime-policy-test",
     )
     assert fill is not None
-    return book._trackers[book._key(coin, side)]
+    return book._trackers[("taker", book._key(coin, side))]
 
 
 def test_build_policy_trend_regimes_get_10_roe():
@@ -120,8 +119,8 @@ def test_rehydrate_rebuilds_per_regime_policies(tmp_path):
 
     # Restart: trackers are rebuilt from the persisted book.
     book2 = sb.ShadowBook(path=path)
-    t_trend = book2._trackers[book2._key("BTC", "long")]
-    t_scalp = book2._trackers[book2._key("ETH", "short")]
+    t_trend = book2._trackers[("taker", book2._key("BTC", "long"))]
+    t_scalp = book2._trackers[("taker", book2._key("ETH", "short"))]
     assert t_trend.policy.max_loss_roe_pct == pytest.approx(10.0)
     assert t_scalp.policy.max_loss_roe_pct == pytest.approx(5.0)
     # The two positions must NOT share one regime-blind policy.

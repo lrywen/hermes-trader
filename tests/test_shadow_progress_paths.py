@@ -1,19 +1,14 @@
 """Audit 2026-09-07 (shadow-progress path/mode resolution fix).
 
 The read-only SHADOW collection-health inspector (scripts/shadow_progress.py)
-mis-resolved two arms so its health verdicts silently lied:
+mis-resolved the trend_filter_200ma arm so its health verdict silently lied:
+the write side (risk_gates.py) reads env HERMES_TREND_FILTER_SHADOW_FILE /
+HERMES_TREND_FILTER_MODE, but the inspector table carried
+HERMES_TREND_FILTER_200MA_*, so an env-overridden path/mode was never
+inspected at the real file.
 
-  * trend_filter_200ma — the write side (risk_gates.py) reads env
-    HERMES_TREND_FILTER_SHADOW_FILE / HERMES_TREND_FILTER_MODE, but the
-    inspector table carried HERMES_TREND_FILTER_200MA_*, so an env-overridden
-    path/mode was never inspected at the real file.
-  * sizing_v2 — not a standalone config block: its mode lives under
-    atr_risk_sizing.sizing_v2_mode (the legacy sizing_v2_enabled boolean was
-    retired in P1-4 Phase 1 step 5) and its path under
-    atr_risk_sizing.sizing_v2_shadow_log_path
-    (executor.py). The inspector read cfg["sizing_v2"], which is always absent,
-    so the arm was perpetually reported "off" and its path defaulted to the
-    read-only home mount.
+(The sizing_v2 row and its tests were removed in the 2026-09-21 cleanup when
+the sizing_v2 shadow JSONL branch was deleted.)
 
 These tests lock the corrected resolution without touching the disk or any
 trade path (pure functions over an in-memory cfg dict + monkeypatched env).
@@ -71,41 +66,10 @@ def test_trend_filter_uses_write_side_env_names(sp, monkeypatch):
     assert sp._arm_mode(cfg, blk, env_file, mode_key) == "shadow"
 
 
-def test_sizing_v2_parasitic_block_resolution(sp, monkeypatch):
-    """sizing_v2 mode/path resolve from the atr_risk_sizing block using the
-    sizing_v2_* keys, mirroring executor._sizing_v2_config/_sizing_v2_shadow_path."""
-    label, blk, env_file, default_name, mode_key, path_key = _row(sp, "sizing_v2")
-    assert blk == "atr_risk_sizing"
-    assert mode_key == "sizing_v2_mode"
-    assert path_key == "sizing_v2_shadow_log_path"
-
-    # Config block wins.
-    cfg = {"atr_risk_sizing": {"sizing_v2_mode": "shadow",
-                               "sizing_v2_shadow_log_path": "/data/sv.jsonl"}}
-    assert sp._arm_mode(cfg, blk, env_file, mode_key) == "shadow"
-    assert sp._arm_path(cfg, blk, env_file, default_name, path_key) == "/data/sv.jsonl"
-
-
-def test_sizing_v2_legacy_boolean_is_retired(sp):
-    """P1-4 Phase 1 step 5: sizing_v2_enabled=true no longer maps to
-    enforce; without an explicit sizing_v2_mode the inspector reports off."""
-    label, blk, env_file, default_name, mode_key, path_key = _row(sp, "sizing_v2")
-    cfg = {"atr_risk_sizing": {"sizing_v2_enabled": True}}
-    assert sp._arm_mode(cfg, blk, env_file, mode_key) == "off"
-
-
-def test_sizing_v2_env_mode_override(sp, monkeypatch):
-    """Gray-release env HERMES_SIZING_V2_MODE takes precedence over config."""
-    label, blk, env_file, default_name, mode_key, path_key = _row(sp, "sizing_v2")
-    monkeypatch.setenv("HERMES_SIZING_V2_MODE", "enforce")
-    cfg = {"atr_risk_sizing": {"sizing_v2_mode": "off"}}
-    assert sp._arm_mode(cfg, blk, env_file, mode_key) == "enforce"
-
-
 def test_every_arm_row_has_six_fields_and_valid_defaults(sp):
     """Structural guard: all rows carry (label, blk, env, default, mode_key,
     path_key) and env names follow the *_SHADOW_FILE / *_MODE convention."""
-    assert len(sp.ARMS) >= 12
+    assert len(sp.ARMS) >= 9
     for row in sp.ARMS:
         assert len(row) == 6, row
         label, blk, env_file, default_name, mode_key, path_key = row

@@ -213,25 +213,21 @@ def _wire_scan(monkeypatch, candles):
     monkeypatch.setattr(perception, "fetch_hl_candles", _fake_fetch)
 
 
-def test_sigma_burst_shadow_records_but_does_not_surface(monkeypatch):
+def test_sigma_burst_shadow_does_not_surface(monkeypatch):
     from hermes_trader.agents import perception
 
     _wire_scan(monkeypatch, _quiet_candles())
-    # Force the gate-band qualification without depending on the composite
-    # calibration; the scan wiring (drop vs surface, record) is what we assert.
+    # Force the gate-band qualification; in shadow the coin must still be
+    # dropped (2026-09-21 cleanup: the observation-only recorder is gone).
     monkeypatch.setattr(perception, "_sigma_burst_decision",
                         lambda score, gate, hits, blk: (True, {"score": 49.0,
                             "gate": 54.0, "eff_gate": 45.0, "pct_z": 11.2,
                             "vol_z": 0.0, "fired_triggers": ["pctMoveSpike"]}))
-    recorded: list[dict] = []
-    monkeypatch.setattr(perception, "_record_sigma_burst_shadow",
-                        lambda rec: recorded.append(rec))
 
     cfg = _base_config()  # shadow_mode True
     ok, out = perception._scan_single_market(
         {"coin": "ETH", "sz_decimals": 2, "type": "perp"}, 100.0, cfg, min_score=54.0)
     assert ok is True and out is None  # shadow → still dropped
-    assert len(recorded) == 1 and recorded[0]["detail"]["enforced"] is False
 
 
 def test_sigma_burst_enforce_surfaces(monkeypatch):
@@ -242,7 +238,6 @@ def test_sigma_burst_enforce_surfaces(monkeypatch):
                         lambda score, gate, hits, blk: (True, {"score": 49.0,
                             "gate": 54.0, "eff_gate": 45.0, "pct_z": 11.2,
                             "vol_z": 0.0, "fired_triggers": ["pctMoveSpike"]}))
-    monkeypatch.setattr(perception, "_record_sigma_burst_shadow", lambda rec: None)
 
     cfg = _base_config()
     cfg["sigma_burst_gate"]["shadow_mode"] = False
@@ -256,7 +251,6 @@ def test_sigma_burst_disabled_leaves_original_gate(monkeypatch):
     from hermes_trader.agents import perception
 
     _wire_scan(monkeypatch, _quiet_candles())
-    monkeypatch.setattr(perception, "_record_sigma_burst_shadow", lambda rec: None)
     cfg = _base_config()
     cfg["sigma_burst_gate"]["enabled"] = False
     ok, out = perception._scan_single_market(
