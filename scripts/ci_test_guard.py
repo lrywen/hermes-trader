@@ -71,7 +71,11 @@ import xml.etree.ElementTree as ET
 # DSR 多重检验校正 + PBO），与 block-bootstrap 并列；test_validation_cpcv_dsr +17。
 # 统一验证 CLI scripts/validate_outcome.py（三方法一次跑全+二值判定）+
 # test_validate_outcome_cli +3。
-MIN_OFFLINE_TESTS = 4649
+# block-bootstrap 去重为共享 block_bootstrap_ci（bps_block_bootstrap 与
+# validate_outcome 复用，防漂移），test_block_bootstrap_shared +5；新增独立
+# dead-man 看门狗 hermes_trader/watchdog.py（风控第4层，供外部调度），
+# test_watchdog_deadman +7。
+MIN_OFFLINE_TESTS = 4661
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

@@ -65,6 +65,7 @@
 | `pdv2_no_same_venue_spot_no_edge_2026-09-21.md` | P-D-v2 | 高阈值 carry(≥4%)+波动率闸门 81币回放：**HL 81 perp 币无同场现货对、跨所basis噪声主导(−4.3bps年化放大)、99.9%提前出场**；30d独立块 CI 显著负[−5.23,−4.05]、剔6月仍负 → **Deprecated**。HL perp 1h 数据资产81币208d |
 | `t02_cpcv_dsr_confirm_outcome_b_2026-09-21.md` | T-02 | 新增 validation 包（CPCV+DSR+PBO，纯标准库）：b3 四臂 **15条OOS路径SR>0占比全0、中位OOS负**，最优夏普本为负、DSR P=0.0000 → 三方法一致确认 OUTCOME_B；+17 测试，floor 4646 |
 | `outcome_b_signoff_2026-09-21.md` | sign-off | 结局B+四范式(C-7/P-A/P-C/P-D/P-D-v2)证伪的**人工接受记录**；并新增统一验证 CLI `scripts/validate_outcome.py`（一次跑全三方法、二值判定），在 b3 复现与单脚本一致 CI |
+| `watchdog_deadman_and_dedup_2026-09-21.md` | 风控加固 | block-bootstrap 收敛为共享 `block_bootstrap_ci`（两脚本复用、CI字节不变）；补齐风控第4层**独立 dead-man 看门狗** `hermes_trader/watchdog.py`（供外部调度，STALE告警+紧急平仓钩子，默认不平仓）；+12测试 floor 4661，全量4661 passed |
 
 ## 找回原件的可选途径（备查，非必须）
 

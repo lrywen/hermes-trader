@@ -19,6 +19,7 @@ from __future__ import annotations
 
 from .significance import (
     CPCVResult,
+    block_bootstrap_ci,
     cpcv_paths,
     day_bps_series,
     deflated_sharpe_prob,
@@ -28,6 +29,7 @@ from .significance import (
 
 __all__ = [
     "CPCVResult",
+    "block_bootstrap_ci",
     "day_bps_series",
     "cpcv_paths",
     "deflated_sharpe_prob",

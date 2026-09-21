@@ -15,8 +15,9 @@ from __future__ import annotations
 import argparse
 import collections
 import json
-import random
 import statistics
+
+from hermes_trader.validation import block_bootstrap_ci
 
 
 def run(path: str, arms: tuple[str, ...], boot: int, seed: int) -> None:
@@ -28,7 +29,6 @@ def run(path: str, arms: tuple[str, ...], boot: int, seed: int) -> None:
                 continue
             byday[d["arm"]][d["entry_t"] // 86_400_000].append(d["pnl_net"] / d["notional"] * 1e4)
 
-    rng = random.Random(seed)
     print(f"{'arm':11s} {'笔':>6s} {'天':>4s} {'per-trade bps':>14s} "
           f"{'按天块自助95%CI':>24s}  含0?")
     for arm in arms:
@@ -38,14 +38,10 @@ def run(path: str, arms: tuple[str, ...], boot: int, seed: int) -> None:
             continue
         day_means = [statistics.mean(v) for v in days.values()]
         allv = [x for v in days.values() for x in v]
-        D = len(day_means)
-        boots = [statistics.mean([day_means[rng.randrange(D)] for _ in range(D)])
-                 for _ in range(boot)]
-        boots.sort()
-        lo, hi = boots[int(boot * .025)], boots[int(boot * .975)]
+        lo, hi = block_bootstrap_ci(day_means, boot, seed)
         verdict = ("含0(不显著)" if lo <= 0 <= hi
                    else "显著为负" if hi < 0 else "显著为正")
-        print(f"{arm:11s} {len(allv):6d} {D:4d} {statistics.mean(allv):14.2f} "
+        print(f"{arm:11s} {len(allv):6d} {len(day_means):4d} {statistics.mean(allv):14.2f} "
               f"[{lo:10.2f},{hi:10.2f}]  {verdict}")
 
 

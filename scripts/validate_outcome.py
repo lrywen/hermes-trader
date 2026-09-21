@@ -21,10 +21,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import random
-import statistics
 
 from hermes_trader.validation import (
+    block_bootstrap_ci,
     cpcv_paths,
     day_bps_series,
     deflated_sharpe_prob,
@@ -35,16 +34,6 @@ from hermes_trader.validation import (
 DSR_ACCEPT_P = 0.95
 
 
-def _block_bootstrap(series: list[float], boot: int, seed: int) -> tuple[float, float]:
-    D = len(series)
-    rng = random.Random(seed)
-    boots = sorted(
-        statistics.mean([series[rng.randrange(D)] for _ in range(D)])
-        for _ in range(boot)
-    )
-    return boots[int(boot * 0.025)], boots[int(boot * 0.975)]
-
-
 def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
              n_trials: int) -> dict:
     rows: list[dict] = []
@@ -53,7 +42,7 @@ def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
         if len(s) < 12:
             rows.append({"arm": arm, "skip": "样本不足(<12 天)"})
             continue
-        lo, hi = _block_bootstrap(s, boot, seed)
+        lo, hi = block_bootstrap_ci(s, boot, seed)
         cpcv = cpcv_paths(s, n_groups=6, n_test_groups=2, embargo=1)
         sr = sharpe(s)
         dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(s))

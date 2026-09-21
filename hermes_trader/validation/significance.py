@@ -5,12 +5,33 @@ import collections
 import itertools
 import json
 import math
+import random
 import statistics
 from dataclasses import dataclass
 
 DAY_MS = 86_400_000
 # 日收益序列的年化因子（此处仅用于夏普口径，bps 不影响符号判定）。
 PERIODS_PER_YEAR = 365
+
+
+def block_bootstrap_ci(
+    series: list[float], boot: int = 5000, seed: int = 20260920
+) -> tuple[float, float]:
+    """按天块自助 95% CI（单一事实实现）。
+
+    对有序"每日 bps"序列有放回重采样，重复 ``boot`` 次，取 2.5%/97.5%
+    分位。scripts/bps_block_bootstrap.py 与 scripts/validate_outcome.py
+    均调用本函数，避免两份实现漂移。
+    """
+    n = len(series)
+    if n < 2:
+        raise ValueError("block_bootstrap_ci 需至少 2 个样本")
+    rng = random.Random(seed)
+    boots = sorted(
+        statistics.mean([series[rng.randrange(n)] for _ in range(n)])
+        for _ in range(boot)
+    )
+    return boots[int(boot * 0.025)], boots[int(boot * 0.975)]
 
 
 def day_bps_series(path: str, arm: str) -> list[float]:
