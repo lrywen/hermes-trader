@@ -1,6 +1,6 @@
 # 0005：P-D-v2 预注册 —— 高阈值 carry 价差 + 已实现波动率闸门（市场中性基差）
 
-- 状态：**Proposed（预注册，先于看结果冻结规则）**
+- 状态：**Deprecated（2026-09-21 否证，见 SCOREBOARD）**
 - 日期：2026-09-21（Asia/Shanghai）
 - 关联：[0003](0003-evaluate-strategy-paradigm-shift.md)（P-D 初版）、
   [pd_basis_preregistered_no_go_2026-09-21.md](../research/2026-09/pd_basis_preregistered_no_go_2026-09-21.md)（60d 预注册证伪）、

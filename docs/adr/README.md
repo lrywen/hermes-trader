@@ -24,4 +24,4 @@
 | [0002](0002-evaluate-higher-timeframe-or-strategy.md) | 启动「换周期(1h/4h)/换策略」独立评估（C-7，结局 B 触发） | 高周期 Deprecated（NO-GO）；换策略待新开 |
 | [0003](0003-evaluate-strategy-paradigm-shift.md) | 启动「换策略范式」独立评估（carry/maker/结构化反转/基差 + funnel 筛查） | P-A/P-C/P-D Deprecated（否证）；P-B 不可行；注资或暂停待决策 |
 | [0004](0004-defer-engineering-decomposition-items.md) | 登记 executor 解构/scripts 瘦身/插件化/server 瘦身/物理隔离/exec 旁路为 Deferred（含再评估触发条件） | Accepted |
-| [0005](0005-pd-v2-preregister-carry-threshold-vol-gate.md) | P-D-v2 预注册：高阈值 carry 价差(年化≥4%/8h≥12bps) + 已实现波动率闸门(30d75分位) + 深度≥$500k，持有30d | Proposed（规则冻结，待执行） |
+| [0005](0005-pd-v2-preregister-carry-threshold-vol-gate.md) | P-D-v2 预注册：高阈值 carry 价差(年化≥4%) + 已实现波动率闸门(30d75分位) + 深度，持有30d | Deprecated（无同场现货、独立块 CI 显著负） |
