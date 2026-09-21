@@ -85,7 +85,10 @@ import xml.etree.ElementTree as ET
 # shadow-book 重写为 taker + maker_shadow 双账户统一成交契约，新增
 # test_shadow_book_maker_contract +8 并同步存量 characterization。净离线计数
 # 4681 → 4597（删除多于新增），下调基线。
-MIN_OFFLINE_TESTS = 4597
+# 2026-09-21 maker 取样观测闭环：逆向选择指标（maker_edge / post_fill_drift /
+# resting_bars）落盘到 maker open fill，get_trades 增 maker_trades、maker stats
+# 增 adverse_selection 聚合，+2 测试，4597 → 4599。
+MIN_OFFLINE_TESTS = 4599
 
 # Whole offline-suite wall-time warning ceiling, in seconds.
 # Local reference: ~360s on the dev host (2026-09-18). GitHub hosted runners

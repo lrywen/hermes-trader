@@ -734,9 +734,16 @@ class ShadowBook:
         })
 
     def _fill_maker_order(self, order: dict[str, Any], fill_px: float,
-                          filled_at: int) -> dict[str, Any]:
+                          filled_at: int,
+                          selection: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Convert a touched maker limit into a filled position + open fill.
+
+        ``selection`` carries the fill-quality metrics computed by the
+        simulator (resting bars, maker edge, post-fill mid drift = adverse
+        selection). They are pinned on the open fill so the distribution can
+        be analysed later; drift may be None when there is no forward bar.
         Caller holds self._lock."""
+        selection = selection or {}
         acc = self._account("maker_shadow")
         coin = order["coin"]
         side = order["side"]
@@ -774,6 +781,10 @@ class ShadowBook:
             "price": float(fill_px), "notional_usd": float(size_usd),
             "leverage": lev, "fee_usd": 0.0, "fill_model": "maker_shadow",
             "analysis_id": order.get("analysis_id", ""),
+            # maker fill-quality / adverse-selection metrics (may be None)
+            "resting_bars": selection.get("resting_bars"),
+            "maker_edge_bps": selection.get("maker_edge_bps"),
+            "post_fill_mid_drift_bps": selection.get("post_fill_mid_drift_bps"),
         }
         acc["fills"].append(fill)
         logger.info(
@@ -834,7 +845,13 @@ class ShadowBook:
                 filled_at = int(verdict.fill_ms or _now_ms())
                 acc["pending_orders"] = [
                     o for o in acc["pending_orders"] if o["id"] != order["id"]]
-                self._fill_maker_order(order, float(verdict.fill_px), filled_at)
+                self._fill_maker_order(
+                    order, float(verdict.fill_px), filled_at,
+                    selection={
+                        "resting_bars": verdict.resting_bars,
+                        "maker_edge_bps": verdict.maker_edge_bps,
+                        "post_fill_mid_drift_bps": verdict.post_fill_mid_drift_bps,
+                    })
             elif verdict.canceled:
                 # TTL of resting time elapsed without a touch.
                 age_min = (_now_ms() - int(order["posted_at"])) / 60000.0
@@ -1101,11 +1118,22 @@ class ShadowBook:
             }
 
     def get_trades(self, limit: int = 200) -> dict[str, Any]:
+        """Return taker fills plus a parallel maker_shadow fill list.
+
+        Maker open fills carry the adverse-selection metrics; the two lists
+        let the dashboard render a side-by-side feed."""
         self.reload_if_changed()
         with self._lock:
-            fills = list(self.state["accounts"]["taker"]["fills"])[-limit:]
-            fills.reverse()
-            return {"trades": fills, "total": len(self.state["accounts"]["taker"]["fills"])}
+            taker_fills = self.state["accounts"]["taker"]["fills"]
+            maker_fills = self.state["accounts"]["maker_shadow"]["fills"]
+            t = list(taker_fills)[-limit:]
+            m = list(maker_fills)[-limit:]
+            t.reverse()
+            m.reverse()
+            return {
+                "trades": t, "total": len(taker_fills),
+                "maker_trades": m, "maker_total": len(maker_fills),
+            }
 
     def get_equity_curve(self) -> dict[str, Any]:
         """Taker curve plus a parallel maker_shadow curve for对照."""
@@ -1145,7 +1173,7 @@ class ShadowBook:
         equity = float(acc["wallet_balance"]) + sum(
             float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
             for p in acc["positions"])
-        return {
+        out = {
             "closed_trades": n,
             "open_positions": len(acc["positions"]),
             "resting_orders": len(acc["pending_orders"]),
@@ -1164,6 +1192,36 @@ class ShadowBook:
             "avg_hold_minutes": round(sum(holds) / n, 2) if n else 0.0,
             "equity_usd": round(equity, 4),
             "total_return_pct": round(100.0 * (equity - start) / start, 4) if start else 0.0,
+        }
+        if acct == "maker_shadow":
+            out["adverse_selection"] = self._adverse_selection_stats(acc)
+        return out
+
+    @staticmethod
+    def _adverse_selection_stats(acc: dict[str, Any]) -> dict[str, Any]:
+        """Aggregate maker fill-quality metrics from open fills + cancel count.
+
+        Pins the maker go/no-go evidence: fill rate (fills vs fills+cuts),
+        resting time, captured maker edge, and post-fill adverse drift.
+        Edge/drift values of None (no forward bar) are excluded from means."""
+        opens = [f for f in acc["fills"] if f.get("type") == "open"]
+        cancels = [f for f in acc["fills"] if f.get("type") == "cancel"]
+        n_fill = len(opens)
+        n_cancel = len(cancels)
+        edges = [float(f["maker_edge_bps"]) for f in opens
+                 if f.get("maker_edge_bps") is not None]
+        drifts = [float(f["post_fill_mid_drift_bps"]) for f in opens
+                  if f.get("post_fill_mid_drift_bps") is not None]
+        rests = [float(f["resting_bars"]) for f in opens
+                 if f.get("resting_bars") is not None]
+        decided = n_fill + n_cancel
+        return {
+            "fills": n_fill,
+            "cancels": n_cancel,
+            "fill_rate_pct": round(100.0 * n_fill / decided, 2) if decided else 0.0,
+            "avg_maker_edge_bps": round(sum(edges) / len(edges), 3) if edges else None,
+            "avg_post_fill_drift_bps": round(sum(drifts) / len(drifts), 3) if drifts else None,
+            "avg_resting_bars": round(sum(rests) / len(rests), 2) if rests else None,
         }
 
 

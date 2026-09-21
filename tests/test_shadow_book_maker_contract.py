@@ -121,7 +121,13 @@ def test_maker_touch_fills_position(tmp_path, monkeypatch):
     assert closed == []
     open_fills = [f for f in maker["fills"] if f["type"] == "open"]
     assert len(open_fills) == 1
-    assert open_fills[0]["fill_model"] == "maker_shadow"
+    of = open_fills[0]
+    assert of["fill_model"] == "maker_shadow"
+    # fill-quality / adverse-selection metrics pinned on the open fill
+    assert of["resting_bars"] == 1
+    assert of["maker_edge_bps"] is not None and of["maker_edge_bps"] > 0
+    # bar after fill mid = (100.0+99.94)/2 = 99.97; filled at 99.95
+    assert of["post_fill_mid_drift_bps"] is not None
 
 
 def test_maker_no_touch_keeps_resting_within_ttl(tmp_path, monkeypatch):
@@ -226,3 +232,43 @@ def test_v1_flat_state_migrates_to_nested_accounts(tmp_path):
     # fresh maker account (counterfactual starts at the canonical bankroll)
     assert maker["wallet_balance"] == 10000.0
     assert maker["positions"] == [] and maker["fills"] == []
+
+
+# ---------------------------------------------------------------------------
+# read views: maker trades feed + adverse-selection stats
+# ---------------------------------------------------------------------------
+
+def test_get_trades_returns_both_account_feeds(tmp_path, monkeypatch):
+    _patch_cfg(monkeypatch)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    view = book.get_trades()
+    assert "trades" in view and "maker_trades" in view
+    assert view["total"] >= 1          # taker open fill
+    assert view["maker_total"] == 0    # resting order is not a fill yet
+    assert view["maker_trades"] == []
+
+
+def test_maker_stats_aggregate_adverse_selection(tmp_path, monkeypatch):
+    _patch_cfg(monkeypatch, maker_ttl_bars=30)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    bars = [
+        _candle(0, 100.0, 100.1, 99.98, 100.0),
+        _candle(1, 100.0, 100.0, 99.90, 99.96),
+        _candle(2, 99.96, 100.0, 99.94, 100.0),
+    ]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    book.mark_to_market({"BTC": 100.0})
+
+    stats = book.get_stats()["maker_shadow"]
+    sel = stats["adverse_selection"]
+    assert sel["fills"] == 1
+    assert sel["cancels"] == 0
+    assert sel["fill_rate_pct"] == 100.0
+    assert sel["avg_maker_edge_bps"] is not None
+    assert sel["avg_resting_bars"] == 1.0
