@@ -1397,3 +1397,63 @@ def scan_once(
             f"candles ({data_gaps/len(markets)*100:.0f}%) — possible degraded candle feed; "
             f"signals may be silently missed this scan")
     return sorted(results, key=lambda r: r["composite_score"], reverse=True)
+
+
+def current_composite_score(
+    coin: str,
+    config: Optional[dict[str, Any]] = None,
+    *,
+    timeout_s: float = 12.0,
+) -> Optional[float]:
+    """Re-scan ONE coin right now and return its current composite score.
+
+    Used by the score-invariant gate: after the risk gates pass on a snapshot
+    score, the trade must not be booked if a fresh evaluation no longer supports
+    that score (the "admitted on a high score, persisted analysis later shows a
+    sub-threshold score" failure mode seen on AVAX). The rescan reuses the same
+    trigger evaluation as the normal scan path — it does not trust any cached
+    analysis value.
+
+    Returns None when the score can't be determined (unknown coin / fetch /
+    eval failure / timeout); callers treat None as "inconclusive → pass open".
+    """
+    target = str(coin or "").strip().upper()
+    if not target:
+        return None
+    try:
+        base_cfg = config or get_config()
+        from hermes_trader.agents.config_store import read_agent_config
+        _cfg = read_agent_config()
+        scan_cfg = {**base_cfg, **_cfg}
+        min_score = float(scan_cfg.get("scan", {}).get("minCompositeScore", 30) or 30)
+
+        mids = fetch_all_mids()
+        if not mids:
+            return None
+        # Resolve the coin against the live universe (accept "INJ" and namespaced).
+        uni = get_universe()
+        market = None
+        for m in uni:
+            name = str(m.get("coin", ""))
+            base = name.split(":", 1)[1] if ":" in name else name
+            if base.upper() == target or name.upper() == target:
+                market = dict(m)
+                break
+        if market is None:
+            return None
+        name = market["coin"]
+        mid = float(mids.get(name) or mids.get(target) or 0.0)
+        if mid <= 0:
+            return None
+
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="hermes-rescore") as pool:
+            fut = pool.submit(
+                _scan_single_market, market, mid, scan_cfg, min_score,
+                {}, False, bool(_cfg.get("trend_surface_enabled", False)))
+            success, result = fut.result(timeout=timeout_s)
+        if success and isinstance(result, dict):
+            return float(result.get("composite_score") or 0.0)
+        return None
+    except Exception as e:
+        logger.debug(f"[rescore] {coin} failed: {e}")
+        return None

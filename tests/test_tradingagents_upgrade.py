@@ -93,7 +93,8 @@ def test_attach_reflection_tags_close_and_event(monkeypatch):
     events = []
     monkeypatch.setattr("hermes_trader.event_log.append",
                         lambda e, payload=None, trace_id="": events.append(payload))
-    monkeypatch.setattr("hermes_trader.agents.memory", m, raising=False)
+    import hermes_trader.agents.memory as memory_mod
+    monkeypatch.setattr(memory_mod, "memory", m)
 
     RF._attach(row, "一条复盘教训")
 
@@ -205,3 +206,67 @@ def test_reflections_endpoint(monkeypatch):
     d = r.json()
     assert d["count"] == 2
     assert [x["text"] for x in d["reflections"]] == ["教训一", "教训二"]
+
+
+# ── mechanism 1 wired into SHADOW paper closes ─────────────────────────────
+
+def test_reflection_row_maps_paper_fill():
+    from hermes_trader.agents.shadow_book import _reflection_row
+    fill = {
+        "coin": "AAA", "side": "long", "leverage": 3,
+        "entry_px": 100.0, "price": 98.0, "hold_minutes": 6.4,
+        "realized_pnl_pct": -5.84, "realized_pnl_usd": -0.29,
+        "entry_regime": "up", "ts": 1_700_000_000_000,
+        "opened_at": 1_699_999_616_000, "analysis_id": "an-1",
+    }
+    row = _reflection_row("taker", fill)
+    assert row["coin"] == "AAA" and row["exit_px"] == 98.0
+    assert row["closed_at"] == 1_700_000_000_000
+    assert row["fill_model"] == "taker"
+    # opened_at (ms) -> entry_time (epoch seconds); satisfies reviewer gate
+    assert row["entry_time"] == pytest.approx(1_699_999_616.0)
+
+
+def test_paper_close_schedules_reflection(monkeypatch):
+    from hermes_trader.agents import shadow_book as SB
+
+    scheduled = []
+    monkeypatch.setattr(RF, "maybe_reflect_async",
+                        lambda row: scheduled.append(row))
+    # isolation: redirect save + force an in-memory book
+    monkeypatch.setattr(SB, "_write_atomic", lambda *a, **k: True)
+    book = SB.ShadowBook()
+    pos = {
+        "id": "p1", "coin": "AAA", "side": "long",
+        "entry_px": 100.0, "size_usd": 1000.0, "size_coin": 10.0,
+        "leverage": 3, "opened_at": SB._now_ms() - 600_000,
+        "entry_regime": "up", "analysis_id": "an-1",
+    }
+    book.state["accounts"]["taker"]["positions"] = [pos]
+    fill = book._close_position("taker", pos, 98.0, "max_loss", hold_min=10.0)
+
+    assert fill["coin"] == "AAA"
+    assert scheduled and scheduled[0]["coin"] == "AAA"
+    assert scheduled[0]["fill_model"] == "taker"
+    assert scheduled[0]["entry_time"] is not None
+
+
+def test_paper_close_reflection_failure_contained(monkeypatch):
+    from hermes_trader.agents import shadow_book as SB
+
+    def boom(*a, **k):
+        raise RuntimeError("schedule down")
+
+    monkeypatch.setattr(RF, "maybe_reflect_async", boom)
+    monkeypatch.setattr(SB, "_write_atomic", lambda *a, **k: True)
+    book = SB.ShadowBook()
+    pos = {
+        "id": "p1", "coin": "AAA", "side": "long",
+        "entry_px": 100.0, "size_usd": 1000.0, "size_coin": 10.0,
+        "leverage": 3, "opened_at": SB._now_ms(),
+        "entry_regime": "up", "analysis_id": "an-1",
+    }
+    book.state["accounts"]["taker"]["positions"] = [pos]
+    # must not raise even if scheduling throws
+    fill = book._close_position("taker", pos, 98.0, "max_loss")
+    assert fill["coin"] == "AAA"

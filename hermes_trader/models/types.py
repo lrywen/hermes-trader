@@ -103,6 +103,10 @@ class GateContext:
     # own_gap_demote_pct to the counter-trend bar. 0.0 = no data / no demote
     # (fail open; manual path and stale analysis land here).
     own_gap_pct: float = 0.0
+    # Signal-price deviation gate: the AI research verdict's planned entry
+    # price (derived from the candles the model saw), compared against the
+    # fresh live mid in entry_px. 0.0 = not supplied → gate passes open.
+    signal_entry_px: float = 0.0
 
     def __post_init__(self) -> None:
         def _num(v: Any) -> float:
@@ -144,6 +148,7 @@ class GateContext:
         self.debate_used = bool(self.debate_used)
         # 坑1: 0.0 = no reading / not applicable → own-gap demote stays inert.
         self.own_gap_pct = _num(self.own_gap_pct)
+        self.signal_entry_px = _num(self.signal_entry_px)
         # The headline + matched term that tripped the binary-news gate, for
         # log visibility ("which article blocked this?").
         self.binary_news_match = str(self.binary_news_match or "")

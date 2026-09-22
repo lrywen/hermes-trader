@@ -124,6 +124,12 @@ _NEWS_CATALYST_DEFAULTS: dict[str, Any] = {
     "max_records": 30,
     "rss_limit": 25,
     "fetch_max_workers": 2,
+    # Circuit breaker: after `cb_fail_threshold` consecutive failures to a host,
+    # stop issuing requests for `cb_open_cooldown_s` (one probe is allowed at the
+    # end). Stops an unreachable source (e.g. GDELT from a blocked egress) from
+    # being retried every few seconds forever.
+    "cb_fail_threshold": 5,
+    "cb_open_cooldown_s": 300.0,
 }
 
 
@@ -149,6 +155,16 @@ def news_catalyst_params(*, config: Optional[dict[str, Any]] = None) -> dict[str
             if v is not None:
                 iv = int(v)
                 p[key] = iv if iv > 0 else p[key]
+        for key in ("cb_fail_threshold",):
+            v = cfg_get(f"news_catalyst.{key}", config=config)
+            if v is not None:
+                iv = int(v)
+                p[key] = iv if iv > 0 else p[key]
+        for key in ("cb_open_cooldown_s",):
+            v = cfg_get(f"news_catalyst.{key}", config=config)
+            if v is not None:
+                fv = float(v)
+                p[key] = fv if fv > 0 else p[key]
     except Exception as e:  # never let config break the signal path
         logger.debug(f"[news] news_catalyst params config read failed: {e}")
         return dict(_NEWS_CATALYST_DEFAULTS)
@@ -246,6 +262,57 @@ _FAIL_LOG_WINDOW_S = 300.0
 _fail_state: dict[str, list] = {}   # host -> [consecutive_failures, total_suppressed, last_log_ts]
 _fail_state_lock = threading.Lock()
 
+# Per-host circuit-breaker state: host -> [opened_at (0.0 when closed),
+# probes_allowed]. When the consecutive-failure count crosses the threshold the
+# breaker OPENS: requests short-circuit locally (no network) until the cooldown
+# elapses, after which exactly ONE probe request is allowed (half-open).
+_cb_lock = threading.Lock()
+_cb_open: dict[str, float] = {}   # host -> monotonic time the breaker opened
+
+
+def _circuit_allows(url: str) -> bool:
+    """Return True if a request to the URL's host may hit the network.
+
+    Closed → allow. Open and cooldown not elapsed → block. Open and cooldown
+    elapsed → allow a single half-open probe (re-arm the cooldown so concurrent
+    callers don't all probe; the next success closes it)."""
+    host = _fetch_host(url)
+    p = news_catalyst_params()
+    threshold = int(p["cb_fail_threshold"])
+    cooldown = float(p["cb_open_cooldown_s"])
+    now = time.monotonic()
+    with _cb_lock, _fail_state_lock:
+        st = _fail_state.get(host)
+        failures = st[0] if st else 0
+        opened = _cb_open.get(host)
+        if opened is None:
+            # Not open yet: open once the failure threshold is reached.
+            if failures >= threshold:
+                _cb_open[host] = now
+                logger.warning(
+                    f"[news] circuit OPEN for {host} after {failures} consecutive "
+                    f"failures; pausing requests for {cooldown:.0f}s"
+                )
+                return False
+            return True
+        if now - opened < cooldown:
+            return False
+        # Cooldown elapsed: allow a single probe, re-arm to throttle peers.
+        _cb_open[host] = now
+        return True
+
+
+def _circuit_note_block(url: str) -> None:
+    host = _fetch_host(url)
+    logger.debug(f"[news] circuit open for {host}; skipping request")
+
+
+def _circuit_on_success(url: str) -> None:
+    host = _fetch_host(url)
+    with _cb_lock:
+        if _cb_open.pop(host, None) is not None:
+            logger.info(f"[news] circuit CLOSED for {host} (probe succeeded)")
+
 
 def _fetch_host(url: str) -> str:
     try:
@@ -299,12 +366,16 @@ def _get_json(url: str, timeout: Optional[float] = None) -> Optional[dict]:
     if not _is_safe_web_url(url):  # M-9: reject file:// and other non-web schemes
         logger.warning(f"[news] refusing non-http(s) URL: {url[:80]!r}")
         return None
+    if not _circuit_allows(url):
+        _circuit_note_block(url)
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:  # nosec B310 (supplemental audit 2026-08-30): scheme allowlisted by _is_safe_web_url above
             data = json.loads(r.read().decode("utf-8", "replace"))
             _elapsed = time.monotonic() - _t0
+            _circuit_on_success(url)
             _log_fetch_recovery(url)
             if _elapsed > 2.0:
                 logger.info(f"[news] GET json {url[:80]}... in {_elapsed:.2f}s")
@@ -321,12 +392,16 @@ def _get_text(url: str, timeout: Optional[float] = None) -> Optional[str]:
     if not _is_safe_web_url(url):  # M-9: reject file:// and other non-web schemes
         logger.warning(f"[news] refusing non-http(s) URL: {url[:80]!r}")
         return None
+    if not _circuit_allows(url):
+        _circuit_note_block(url)
+        return None
     req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     _t0 = time.monotonic()
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_SSL) as r:  # nosec B310 (supplemental audit 2026-08-30): scheme allowlisted by _is_safe_web_url above
             data = r.read().decode("utf-8", "replace")
             _elapsed = time.monotonic() - _t0
+            _circuit_on_success(url)
             _log_fetch_recovery(url)
             if _elapsed > 2.0:
                 logger.info(f"[news] GET text {url[:80]}... in {_elapsed:.2f}s")

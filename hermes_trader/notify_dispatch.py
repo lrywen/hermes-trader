@@ -105,7 +105,7 @@ def _mirror_secondary(title: str, fields: dict[str, Any], level: str) -> None:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as _resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=5) as _resp:
             _ = _resp.status
     except Exception as exc:  # never bubble up into the trading loop
         logger.debug("secondary notify failed: %r", exc)

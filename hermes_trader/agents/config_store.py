@@ -84,6 +84,8 @@ def _invalidate_raw_cache() -> None:
 ERA_TRACKED_PATHS: tuple[str, ...] = (
     # 入场选择类
     "min_ai_confidence",
+    "max_signal_price_deviation_pct",
+    "score_invariant_enabled",
     "scan.minCompositeScore",
     "runner_entry_gate.*",
     "ta_late_entry.*",
@@ -236,6 +238,14 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "research_cooldown_min": 3,
     "held_research_interval_min": 10,
     "min_ai_confidence": 0.62,
+    # Signal-price deviation gate: max allowed % gap between the verdict's
+    # planned entry and the fresh live mid. A larger gap means the model
+    # decided on prices that no longer exist (stale candle setup). 2.0%.
+    "max_signal_price_deviation_pct": 2.0,
+    # Score-invariant gate: after the snapshot gates pass, re-scan the coin and
+    # block if the live composite score has fallen below the runner floor
+    # (prevents booking on a score the market no longer supports).
+    "score_invariant_enabled": True,
     "counter_regime_min_conf": 0.8,
     "max_crypto_long_correlated": 3,
     "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
@@ -250,10 +260,14 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "max_loss_roe_pct": 5.0,
         "protect_pct": 1.25,
         "retrace_threshold": 0.2,
-        "hard_timeout_minutes": 1800.0,
+        # Intraday-short tightening (2026-09-22): strategy enters on 5m and
+        # realised holds are minute-scale, so the legacy 30h hard / 8h stale
+        # ceilings let drifters occupy scarce slots far too long. Hard cap now
+        # 4h; a never-protected drifter is cut at 90m.
+        "hard_timeout_minutes": 240.0,
         "breakeven_trigger_pct": 0.0,
         "breakeven_lock_pct": 0.0,
-        "stale_flat_timeout_minutes": 480.0,
+        "stale_flat_timeout_minutes": 90.0,
         # B-11：atr_stop 已 DEPRECATED（死代码）。§2.7 P4 结论：8 个固定宽度
         # 全扫均负，ATR 自适应止损被否证；`min(regime_cap, atr_cap)` 中 regime
         # cap 恒胜出（W3 A-3 逐笔验证），启用也不会放宽实际止损。保留块仅为
@@ -333,15 +347,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             },
             # Audit 2026-09-06 (E3, P2): regime-split position-lifetime clocks
             # (minutes). Trend regimes get LONGER hard/stale timeouts (let
-            # rippers ride); non-trend get SHORTER (prune chop faster). Separate
-            # `enabled` gate (orthogonal to regime_aware.enabled) so the default
-            # keeps the single global hard_timeout/stale_flat (inert).
+            # rippers ride); non-trend get SHORTER (prune chop faster).
+            # Intraday-short tightening (2026-09-22): now ENABLED with minute/
+            # hour-scale ceilings — trend hard 4h / stale 2h, non-trend hard
+            # 2h / stale 1h — matching the 5m-entry short style.
             "clocks": {
-                "enabled": False,
-                "trend": {"hard_timeout_minutes": 2880.0,
-                          "stale_flat_timeout_minutes": 720.0},
-                "non_trend": {"hard_timeout_minutes": 960.0,
-                              "stale_flat_timeout_minutes": 240.0},
+                "enabled": True,
+                "trend": {"hard_timeout_minutes": 240.0,
+                          "stale_flat_timeout_minutes": 120.0},
+                "non_trend": {"hard_timeout_minutes": 120.0,
+                              "stale_flat_timeout_minutes": 60.0},
             },
         },
     },
@@ -767,6 +782,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "max_records": 30,           # ArtList maxrecords / headline cap
         "rss_limit": 25,             # rss_headlines headline cap
         "fetch_max_workers": 2,      # parallel GDELT ArtList+TimelineVol pool
+        "cb_fail_threshold": 5,      # consecutive failures before opening breaker
+        "cb_open_cooldown_s": 300.0,  # pause requests for this long, then one probe
     },
     "whale_index": {
         "min_volume_usd": 1000000,       # smart_money_concentration 24h-vol floor

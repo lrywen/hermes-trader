@@ -42,6 +42,17 @@ HEURISTIC_MIN_ATR_PCT = 0.4
 #: Minimum closed bars before the directional EMA/ATR/ADX read is trusted.
 _MIN_TREND_BARS = 30
 
+#: Bounded lookback fed to the trigger library per bar. Every production trigger
+#: only reads a fixed tail — the longest dependency is range_compression, which
+#: seeds a bbLength(20) SMA and ranks the current bandwidth against the last 100
+#: bandwidths (needing bbLength warmup), plus breakout's lookback(48)+confirm and
+#: the ATR/ADX Wilder seed. The Wilder-smoothed ATR/ADX converge from the warm-up
+#: seed; a 500-bar tail is long enough that the last value is bit-identical to a
+#: from-origin recompute (measured: residual 0 at >=500 bars). Capping the window
+#: here keeps each per-bar evaluation O(1) instead of re-scanning a growing
+#: prefix (the scan is O(n) rather than O(n²)).
+_WINDOW_LOOKBACK = 500
+
 
 @dataclass(frozen=True)
 class HeuristicConfig:
@@ -184,7 +195,10 @@ def heuristic_signals(
     signals: list[Signal] = []
     n = len(bars)
     for i in range(cfg.warmup, n - 1):
-        window = bars[: i + 1]
+        # Cap the prefix to a fixed tail: the triggers only inspect this tail,
+        # so scores are unchanged but each evaluation is bounded (O(n) overall).
+        lo = max(0, i + 1 - _WINDOW_LOOKBACK)
+        window = bars[lo: i + 1]
         score, hits = evaluate_window(window, cfg.thresholds, cfg.weights)
         bullish, atr_pct, adx14 = trend_and_atr_pct(window)
         side = heuristic_verdict(

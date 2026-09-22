@@ -298,3 +298,21 @@ def test_bar_ms_drives_context_close_timestamp() -> None:
     first_bar = next(s.bar_index for s in heuristic_signals(
         uptrend, default_heuristic_config(warmup=30)))
     assert seen[0] == uptrend[first_bar].t + BAR_MS
+
+
+def test_capped_window_matches_full_prefix() -> None:
+    """O(n) tail-capping must produce identical triggers to a growing prefix."""
+    from hermes_trader.backtest import signals as S
+
+    bars = _trend_bars(800)
+    th = default_heuristic_config().thresholds
+    weights = default_heuristic_config().weights
+    for i in (300, 550, 799):
+        full = bars[: i + 1]
+        lo = max(0, i + 1 - S._WINDOW_LOOKBACK)
+        tail = bars[lo: i + 1]
+        _sf, hits_full = S.evaluate_window(full, th, weights)
+        _st, hits_tail = S.evaluate_window(tail, th, weights)
+        for a, b in zip(hits_full, hits_tail):
+            assert a["fired"] == b["fired"]
+            assert a["score"] == b["score"]

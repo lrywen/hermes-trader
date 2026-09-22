@@ -3135,6 +3135,8 @@ def _build_gate_context(*, analysis: dict[str, Any], config: dict[str, Any],
         debate_used=bool(analysis.get("debate_used", False)),
         # 坑1: side-adjusted own-4h gap for the market_regime own-gap demote.
         own_gap_pct=_own_gap_pct,
+        # Signal-price deviation gate: the verdict's planned entry vs live mid.
+        signal_entry_px=float(analysis.get("entry_px") or 0.0),
     )
 
 
@@ -5003,12 +5005,20 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     volume = bool(analysis.get("volume_spike_fired"))
     breakout = bool(analysis.get("breakout_fired"))
     burst = bool(analysis.get("momentum_burst_fired"))
+    burst_dir = str(analysis.get("momentum_burst_dir") or "")
     daily_mover = bool(analysis.get("daily_mover_fired"))
     uptrend = bool(analysis.get("uptrend_momentum_fired"))
     downtrend = bool(analysis.get("downtrend_momentum_fired"))
     slow_count = int(analysis.get("slow_burn_count", 0) or 0)
     whale = bool(analysis.get("whale_signal"))
     forced = "[structural override]" in (analysis.get("reasoning") or "")
+
+    # Direction-aware burst: a crash burst (down) must not count as a fresh
+    # impulse for a LONG, nor a launch burst (up) for a SHORT. When the
+    # direction is unknown (older records without momentum_burst_dir) the
+    # burst stays eligible as before.
+    burst_aligned_long = burst and burst_dir != "down"
+    burst_aligned_short = burst and burst_dir != "up"
 
     # fresh_impulse: a genuine new-impulse entry signal.
     #   - breakout ALONE qualifies because breakout_fired already requires
@@ -5020,12 +5030,19 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     #     liquidity wick; a burst on volume is institutional participation).
     #   - burst+score>=min_score qualifies (a strong-scoring burst may not
     #     print a 2σ volume spike but still carries enough confluence).
-    fresh_impulse = breakout or (volume and burst) or (burst and score >= min_score)
+    # Direction-aware: uses the side-aligned burst (resolved below per side).
+    burst_for_side = burst_aligned_long if side == "long" else burst_aligned_short
+    fresh_impulse = (
+        breakout
+        or (volume and burst_for_side)
+        or (burst_for_side and score >= min_score)
+    )
 
     logger.info(
         f"[runner_gate] {coin} side={side} conf={gate_conf:.2f}/{min_conf:.2f} "
         f"score={score:.1f}/{min_score:.0f} slow={slow_count} | "
-        f"vol={int(volume)} brk={int(breakout)} burst={int(burst)} "
+        f"vol={int(volume)} brk={int(breakout)} burst={int(burst)}"
+        f"{('/'+burst_dir) if burst_dir else ''} "
         f"dMover={int(daily_mover)} up={int(uptrend)} down={int(downtrend)} "
         f"whale={int(whale)} forced={int(forced)} → fresh_impulse={int(fresh_impulse)}"
     )
@@ -5114,7 +5131,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         daily_mover
         and gate_conf >= float(gate.get("mover_min_confidence", 0.80))
         and score >= float(gate.get("mover_min_composite", 45.0))
-        and (slow_count >= 1 or volume or breakout or burst)
+        and (slow_count >= 1 or volume or breakout or burst_aligned_long)
     )
     structured_runner = fresh_impulse and (slow_count >= 1 or score >= min_score)
 
@@ -5129,7 +5146,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         and side == "long"
         and structured_runner
         and breakout
-        and not (volume and burst)
+        and not (volume and burst_aligned_long)
     ):
         try:
             _brk_min = float(_brk_floor.get("min_composite", min_score * 0.7))
@@ -5142,7 +5159,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     "composite_score": round(score, 4),
                     "floor": round(_brk_min, 4),
                     "min_composite": min_score,
-                    "breakout": breakout, "volume": volume, "burst": burst,
+                    "breakout": breakout, "volume": volume, "burst": burst_aligned_long,
                     "slow_burn_count": slow_count,
                     "confidence": round(gate_conf, 4),
                     "entry_px": float(

@@ -185,13 +185,26 @@ def test_e3_resolve_clocks_splits_trend_vs_scalp_when_enabled():
         assert c["stale_flat_timeout_minutes"] == pytest.approx(240.0)
 
 
-def test_e3_canonical_registers_time_scratch_and_clocks_inert():
+def test_e3_canonical_registers_time_scratch_inert_and_intraday_clocks():
     from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
     dsl = CANONICAL_DEFAULTS["dsl_exit"]
     ts = dsl.get("time_scratch")
     assert isinstance(ts, dict) and ts.get("enabled") is False
+    # Intraday-short tightening (2026-09-22): clocks now ENABLED with
+    # minute/hour-scale ceilings matching the 5m-entry short style.
     clocks = dsl["regime_aware"].get("clocks")
-    assert isinstance(clocks, dict) and clocks.get("enabled") is False
+    assert isinstance(clocks, dict) and clocks.get("enabled") is True
+    assert clocks["trend"]["hard_timeout_minutes"] == pytest.approx(240.0)
+    assert clocks["trend"]["stale_flat_timeout_minutes"] == pytest.approx(120.0)
+    assert clocks["non_trend"]["hard_timeout_minutes"] == pytest.approx(120.0)
+    assert clocks["non_trend"]["stale_flat_timeout_minutes"] == pytest.approx(60.0)
+
+
+def test_e3_canonical_global_timeouts_are_intraday():
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
+    dsl = CANONICAL_DEFAULTS["dsl_exit"]
+    assert dsl["hard_timeout_minutes"] == pytest.approx(240.0)
+    assert dsl["stale_flat_timeout_minutes"] == pytest.approx(90.0)
 
 
 def test_e3_schema_accepts_new_blocks():

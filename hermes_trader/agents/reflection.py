@@ -122,9 +122,9 @@ def _attach(close: dict[str, Any], text: str) -> None:
     side = close.get("side")
     closed_at = close.get("closed_at")
     try:
-        from hermes_trader.agents import memory
+        from hermes_trader.agents import memory as memory_mod
 
-        memory.attach_reflection(coin, side, closed_at, text)
+        memory_mod.memory.attach_reflection(coin, side, closed_at, text)
     except Exception as e:
         logger.warning("[reflection] memory attach failed coin=%s: %s", coin, e)
     try:

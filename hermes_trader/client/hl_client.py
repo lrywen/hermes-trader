@@ -444,6 +444,37 @@ def _candle_quality_metric(
         pass
 
 
+def _cached_tail_bar_stale(hit: Any, interval: str) -> bool:
+    """True if a cache hit's final bar was a forming-bar snapshot that has
+    crossed its close time since the fetch.
+
+    CandleSnapshot with ``endTime=now`` always includes the in-progress bar,
+    whose ``c`` is a mid-bar snapshot. When such a list is cached and the TTL
+    window straddles the bar's close, wall-clock-only forming-bar checks treat
+    the stale snapshot as the real close. Cache hits carry the fetch time
+    (``_FetchedCandles`` wrapper); when the tail was forming at fetch time and
+    has since closed, the hit is stale and must be refetched.
+    """
+    candles = getattr(hit, "candles", None)
+    fetched_ms = getattr(hit, "fetched_ms", None)
+    if candles is None or fetched_ms is None or not candles:
+        return False
+    bar_dur_ms = _MS_PER_CANDLE.get(interval, 300_000)
+    last_close_ms = float(candles[-1].t) + bar_dur_ms
+    # Forming at fetch time AND now past close → stale tail snapshot.
+    return fetched_ms < last_close_ms <= time.time() * 1000.0
+
+
+class _FetchedCandles:
+    """Cache wrapper recording the wall-clock fetch time of a candle list."""
+
+    __slots__ = ("candles", "fetched_ms")
+
+    def __init__(self, candles: list[Candle], fetched_ms: float) -> None:
+        self.candles = candles
+        self.fetched_ms = fetched_ms
+
+
 def fetch_hl_candles(
     coin: str,
     interval: str = "5m",
@@ -461,9 +492,18 @@ def fetch_hl_candles(
     if _CANDLE_CACHE is not None:
         hit = _CANDLE_CACHE.get(cache_key)
         if hit is not None:
-            logger.debug(f"[candles] {coin} {interval}: cache HIT ({len(hit)} bars)")
-            _candle_cache_metric(interval, "hit")
-            return hit
+            # Tolerate a raw list (external/test writes, pre-wrapper cache).
+            if not isinstance(hit, _FetchedCandles):
+                hit = _FetchedCandles(hit, time.time() * 1000.0)
+            if _cached_tail_bar_stale(hit, interval):
+                logger.info(
+                    f"[candles] {coin} {interval}: cache tail bar crossed close "
+                    f"since fetch — refetching")
+                _candle_cache_metric(interval, "stale_tail")
+            else:
+                logger.debug(f"[candles] {coin} {interval}: cache HIT ({len(hit.candles)} bars)")
+                _candle_cache_metric(interval, "hit")
+                return hit.candles
 
     # Coalesce concurrent requests for the same key: if another thread is
     # already fetching this exact candle range, wait for its result instead
@@ -654,7 +694,8 @@ def _fetch_hl_candles_raw(
     _candle_quality_metric(interval, quality, _dropped)
 
     if _CANDLE_CACHE is not None and candles and _quality_ok:
-        _CANDLE_CACHE.set(cache_key, candles)
+        _CANDLE_CACHE.set(
+            cache_key, _FetchedCandles(candles, time.time() * 1000.0))
     return candles
 
 

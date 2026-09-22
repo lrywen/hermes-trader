@@ -37,9 +37,8 @@ import os
 
 import pytest
 
-from hermes_trader.agents import dsl_exit
-from hermes_trader.agents import market_regime
 from hermes_trader import metrics
+from hermes_trader.agents import dsl_exit, market_regime
 
 # Minimal dsl_exit config used by the rehydrate synth tests.
 DSL_CFG = {
@@ -256,8 +255,9 @@ def test_tracker_from_dict_stale_flat_defaults_to_480():
         "policy": {"max_loss_pct": 2.0},
     }
     t = dsl_exit._tracker_from_dict(d)
-    assert t.policy.stale_flat_timeout_minutes == pytest.approx(480.0), \
-        "missing stale_flat_timeout_minutes must hydrate to canonical 480, not 0"
+    assert t.policy.stale_flat_timeout_minutes == pytest.approx(
+        dsl_exit.ExitPolicy.stale_flat_timeout_minutes), \
+        "missing stale_flat_timeout_minutes must hydrate to the canonical default, not 0"
 
 
 def test_tracker_from_dict_dirty_zero_floor_dropped():
@@ -286,7 +286,6 @@ def test_tracker_from_dict_valid_floor_preserved():
 
 def test_executor_register_propagates_hard_stop_confirm_sec(monkeypatch, tmp_path):
     from hermes_trader.agents import executor
-    from hermes_trader.agents import memory as memory_mod
 
     captured = {}
 

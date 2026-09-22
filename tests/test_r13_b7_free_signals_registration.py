@@ -155,6 +155,7 @@ def test_r13_b7_news_catalyst_block_keys_and_values():
     assert set(block.keys()) == {
         "ttl_sec", "http_timeout_s", "surge_breaking_x", "surge_elevated_x",
         "timespan", "max_records", "rss_limit", "fetch_max_workers",
+        "cb_fail_threshold", "cb_open_cooldown_s",
     }
     assert block["ttl_sec"] == 300
     assert block["http_timeout_s"] == 3.0

@@ -78,7 +78,7 @@ def test_canonical_dsl_exit_subkeys():
     assert dsl["retrace_threshold"] == 0.2
     assert dsl["max_loss_pct"] == 0.4
     assert dsl["max_loss_roe_pct"] == 5.0
-    assert dsl["hard_timeout_minutes"] == 1800.0
+    assert dsl["hard_timeout_minutes"] == 240.0
 
 
 # ── _deep_merge ─────────────────────────────────────────────────────────────
@@ -211,7 +211,7 @@ def test_cfg_get_production_values_no_drift():
     assert cfg_get("force_execute_composite", config=cfg) == 30
     assert cfg_get("dsl_exit.max_loss_pct", config=cfg) == 0.4
     assert cfg_get("dsl_exit.max_loss_roe_pct", config=cfg) == 5.0
-    assert cfg_get("dsl_exit.hard_timeout_minutes", config=cfg) == 1800.0
+    assert cfg_get("dsl_exit.hard_timeout_minutes", config=cfg) == 240.0
 
 
 # ── read_agent_config ───────────────────────────────────────────────────────

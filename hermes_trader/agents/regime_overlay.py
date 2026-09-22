@@ -33,7 +33,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Optional
 
 from hermes_trader.agents.market_regime import detect_regime_with_score
 

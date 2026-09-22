@@ -238,15 +238,6 @@ def check_trades_pit(
     return errors
 
 
-def assert_trades_pit(
-    trades: Sequence[Trade], *, bars: Sequence[Candle] | None = None
-) -> None:
-    """Raise ``AssertionError`` listing every trade-side PIT violation."""
-    errors = check_trades_pit(trades, bars=bars)
-    if errors:
-        raise AssertionError("PIT trade violations:\n  - " + "\n  - ".join(errors))
-
-
 def check_run_pit(
     bars: Sequence[Candle], signals: Sequence[Signal], trades: Sequence[Trade]
 ) -> list[str]:

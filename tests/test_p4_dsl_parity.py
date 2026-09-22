@@ -408,10 +408,10 @@ def test_fallback_defaults_diverge(scripts: _Scripts) -> None:
         1.0, 1.5, 0.15, 600.0)
     assert (prod_p.max_loss_pct, prod_p.protect_pct,
             prod_p.retrace_threshold, prod_p.hard_timeout_minutes) == (
-        0.4, 1.25, 0.20, 1800.0)
+        0.4, 1.25, 0.20, 240.0)
     assert surge_p.breakeven_trigger_pct == 2.5 and prod_p.breakeven_trigger_pct == 0.0
     assert surge_p.stale_flat_timeout_minutes == 240
-    assert prod_p.stale_flat_timeout_minutes == 480
+    assert prod_p.stale_flat_timeout_minutes == 90
     assert surge_p.phase2_tiers == [(2.0, 0.35), (6.0, 0.30),
                                    (12.0, 0.20), (20.0, 0.15)]
     assert [(t.pct_above_entry, t.retrace_threshold) for t in prod_p.phase2_tiers] == [
@@ -424,4 +424,4 @@ def test_fallback_defaults_diverge(scripts: _Scripts) -> None:
     assert cfg_get("dsl_exit.max_loss_pct", config={}) == 0.4
     assert cfg_get("dsl_exit.protect_pct", config={}) == 1.25
     assert cfg_get("dsl_exit.retrace_threshold", config={}) == 0.20
-    assert cfg_get("dsl_exit.hard_timeout_minutes", config={}) == 1800.0
+    assert cfg_get("dsl_exit.hard_timeout_minutes", config={}) == 240.0

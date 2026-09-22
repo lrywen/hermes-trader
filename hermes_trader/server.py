@@ -1619,9 +1619,9 @@ async def place_order(request: Request) -> JSONResponse:
         raise HTTPException(
             409,
             {"error": "entry_lock_busy",
-             "detail": f"another process is placing an entry order "
-                       f"(autonomous executor or another manual request); "
-                       f"retry after it settles"},
+             "detail": "another process is placing an entry order "
+                       "(autonomous executor or another manual request); "
+                       "retry after it settles"},
         )
 
     try:

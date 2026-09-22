@@ -186,6 +186,7 @@ def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
 
         import os
         from datetime import datetime, timezone
+
         from hermes_trader.shadow_log import append_jsonl
         path = os.environ.get(
             "HERMES_RISK_TUNING_SHADOW_FILE",
@@ -758,7 +759,7 @@ class ExitPolicy:
     max_loss_roe_pct: float = 5.0
     protect_pct: float = 1.25  # Price must rise this % above entry before Phase 2
     retrace_threshold: float = 0.20  # Give back 20% of peak profit (Phase 2 default)
-    hard_timeout_minutes: float = 1800.0  # Emergency exit after this long
+    hard_timeout_minutes: float = 240.0  # Emergency exit after this long
     # ── Breakeven ratchet (guaranteed-profit lock) ──────────────────────
     # Once a position's PEAK profit clears `breakeven_trigger_pct` (spot %),
     # the trailing floor may never fall below `breakeven_lock_pct` (spot %)
@@ -789,7 +790,7 @@ class ExitPolicy:
     # max_concurrent. Positions that ever reached protect are EXEMPT (the
     # hard_timeout bucket's +3.41% avg is driven by agers that peaked).
     # 0 = off.
-    stale_flat_timeout_minutes: float = 480.0
+    stale_flat_timeout_minutes: float = 90.0
     phase2_tiers: list[RetraceTier] = field(default_factory=lambda: [
         RetraceTier(8.0, 0.35),   # 8% profit → give back 35%
         RetraceTier(15.0, 0.40),  # 15% profit → give back 40% (let winners run)
@@ -2249,7 +2250,9 @@ def _build_policy_from_config() -> ExitPolicy:
             atr_stop_mult=float(atr_cfg.get("atr_mult", ExitPolicy.atr_stop_mult)),
             atr_stop_floor_pct=float(atr_cfg.get("floor_pct", ExitPolicy.atr_stop_floor_pct)),
             atr_stop_ceiling_pct=float(atr_cfg.get("ceiling_pct", ExitPolicy.atr_stop_ceiling_pct)),
-            stale_flat_timeout_minutes=float(dsl.get("stale_flat_timeout_minutes", 0.0) or 0.0),
+            stale_flat_timeout_minutes=float(
+                dsl.get("stale_flat_timeout_minutes",
+                        ExitPolicy.stale_flat_timeout_minutes) or 0.0),
             consecutive_breaches_required=int(dsl.get("consecutive_breaches_required", 1) or 1),
             # A-F5: default 4.0s breach confirmation (was 0.0 = single-tick exit).
             breach_confirm_sec=float(dsl.get("breach_confirm_sec", 4.0) or 0.0),
@@ -2299,8 +2302,9 @@ def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
     base = _policy_from_config()
     try:
         import dataclasses
+
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.executor import select_exit_params, resolve_regime_clocks
+        from hermes_trader.agents.executor import resolve_regime_clocks, select_exit_params
         dsl = read_agent_config().get("dsl_exit", {}) or {}
         _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
             select_exit_params(dsl, regime or "neutral")

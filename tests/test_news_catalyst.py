@@ -69,3 +69,47 @@ def test_parse_rss_malformed_safe():
 def test_filter_no_keywords_passthrough():
     arts = parse_rss(_RSS)
     assert filter_keywords(arts, []) == arts
+
+
+# ── circuit breaker ──────────────────────────────────────────────────────────
+
+_URL = "https://api.gdeltproject.org/api/v2/doc/doc?x=1"
+
+
+def _reset_breaker():
+    from hermes_trader.agents import news_catalyst as nc
+    nc._cb_open.clear()
+    nc._fail_state.clear()
+
+
+def test_circuit_closed_allows_when_healthy():
+    _reset_breaker()
+    from hermes_trader.agents import news_catalyst as nc
+    assert nc._circuit_allows(_URL) is True
+
+
+def test_circuit_opens_after_threshold():
+    _reset_breaker()
+    from hermes_trader.agents import news_catalyst as nc
+    for _ in range(5):
+        nc._log_fetch_failure(_URL, 1.0, TimeoutError("slow"))
+    assert nc._circuit_allows(_URL) is False
+    assert nc._circuit_allows(_URL) is False  # stays open within cooldown
+
+
+def test_circuit_half_open_single_probe_then_close():
+    _reset_breaker()
+    from hermes_trader.agents import news_catalyst as nc
+    for _ in range(5):
+        nc._log_fetch_failure(_URL, 1.0, TimeoutError("slow"))
+    nc._circuit_allows(_URL)  # trip open
+    # cooldown elapsed -> one probe allowed, peers throttled
+    host = nc._fetch_host(_URL)
+    nc._cb_open[host] = nc.time.monotonic() - 301
+    assert nc._circuit_allows(_URL) is True
+    assert nc._circuit_allows(_URL) is False
+    # successful probe closes the breaker
+    nc._cb_open[host] = nc.time.monotonic() - 301
+    nc._circuit_allows(_URL)
+    nc._circuit_on_success(_URL)
+    assert host not in nc._cb_open

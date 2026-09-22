@@ -95,6 +95,10 @@ class _ConfigPatch(BaseModel):
     # ── scalars: floats (ints accepted too, bools excluded) ───────────────
     equity_fraction_per_trade: float = Field(default=CANONICAL_DEFAULTS["equity_fraction_per_trade"], gt=0, le=1)
     min_ai_confidence: float = Field(default=CANONICAL_DEFAULTS["min_ai_confidence"], ge=0, le=1)
+    max_signal_price_deviation_pct: float = Field(
+        default=CANONICAL_DEFAULTS["max_signal_price_deviation_pct"], ge=0.0, le=100.0)
+    score_invariant_enabled: bool = Field(
+        default=CANONICAL_DEFAULTS["score_invariant_enabled"])
     max_trade_notional_usd: float = Field(default=CANONICAL_DEFAULTS["max_trade_notional_usd"], ge=0.0)
     # Audit 2026-09-04 P0-3: `max_total_notional_pct` is an EQUITY MULTIPLE
     # (4 → 400% of aggregated equity), NOT a percentage fraction. The `_pct`

@@ -29,6 +29,73 @@ def confidence_gate(ctx: GateContext, min_confidence: float) -> GateResult:
     return {"pass": False, "reason": f"confidence {ctx.confidence:.2f} < {min_confidence}"}
 
 
+def signal_price_deviation_gate(ctx: GateContext, max_deviation_pct: float) -> GateResult:
+    """Reject trades whose AI signal price is far from the live mid.
+
+    A research verdict carries ``entry_px`` derived from the candles the model
+    saw; when those candles are stale (a forming-bar snapshot later treated as
+    closed) the signal price can be several percent from the real-time mid —
+    the model believes it is buying a pullback while price has already crashed.
+    This gate is independent of the candle path: ``ctx.signal_entry_px``
+    carries the verdict's planned entry (set by the executor) and
+    ``ctx.entry_px`` carries the fresh live mid. ``max_deviation_pct <= 0``
+    disables the gate; missing data passes open.
+    """
+    max_dev = float(max_deviation_pct or 0.0)
+    if max_dev <= 0:
+        return {"pass": True}
+    signal_px = float(ctx.signal_entry_px or 0.0)
+    live_mid = float(ctx.entry_px or 0.0)
+    if signal_px <= 0 or live_mid <= 0:
+        return {"pass": True}
+    deviation_pct = abs(signal_px - live_mid) / live_mid * 100.0
+    if deviation_pct > max_dev:
+        return {"pass": False, "reason": (
+            f"signal entry {signal_px:.6g} deviates {deviation_pct:.1f}% from "
+            f"live mid {live_mid:.6g} (> {max_dev:.1f}%)")}
+    return {"pass": True}
+
+
+def score_invariant_gate(
+    ctx: GateContext,
+    enabled: bool,
+    floor_score: float,
+    *,
+    rescorer: Any = None,
+) -> GateResult:
+    """Re-verify the composite score after the snapshot-based gates pass.
+
+    The runner gate admits on ``ctx.composite_score`` carried in the analysis
+    snapshot. If — between that decision and booking/order — a fresh trigger
+    evaluation no longer reaches the admissible floor, the trade is acting on a
+    score that doesn't currently exist (AVAX was admitted while its persisted
+    analysis later showed score=22 < the 30 floor). This gate recomputes the
+    live score via ``rescorer`` (perception.current_composite_score by default)
+    and blocks when the snapshot was at/above the floor but the fresh value is
+    below it.
+
+    Disabled when ``enabled`` is false; an inconclusive rescore (None) passes
+    open so a transient feed hiccup can't hard-stop trading; a snapshot already
+    below the floor is not this gate's concern (other gates own that).
+    """
+    if not bool(enabled):
+        return {"pass": True}
+    floor = float(floor_score or 0.0)
+    snapshot = float(ctx.composite_score or 0.0)
+    if snapshot < floor:
+        return {"pass": True}
+    if rescorer is None:
+        from hermes_trader.agents.perception import current_composite_score as rescorer
+    fresh = rescorer(ctx.coin)
+    if fresh is None:
+        return {"pass": True}
+    if fresh < floor:
+        return {"pass": False, "reason": (
+            f"composite score invariant violated: snapshot {snapshot:.1f} passed "
+            f"the {floor:.0f} floor but a fresh rescan scores {fresh:.1f}")}
+    return {"pass": True, "fresh_score": round(float(fresh), 2)}
+
+
 def max_concurrent_positions_gate(ctx: GateContext, max_concurrent: int) -> GateResult:
     if len(ctx.current_positions) < max_concurrent:
         return {"pass": True}
@@ -2062,6 +2129,18 @@ def eval_all_gates(
         ctx.coin, ctx.trade_side, min_conf, aligned_min_conf,
     )
     results["confidence"] = confidence_gate(ctx, min_conf)
+    # signal_price_deviation: independent of the candle path — rejects a verdict
+    # whose planned entry is far from the fresh live mid (stale candle setup).
+    results["signal_price_deviation"] = signal_price_deviation_gate(
+        ctx, float(cfg_get("max_signal_price_deviation_pct", config=config) or 0.0))
+    # score_invariant: re-verify the composite score on a fresh rescan so the
+    # trade isn't booked on a snapshot score the market no longer supports.
+    _runner_gate_cfg = config.get("runner_entry_gate") or {}
+    results["score_invariant"] = score_invariant_gate(
+        ctx,
+        bool(cfg_get("score_invariant_enabled", config=config)),
+        float(_runner_gate_cfg.get("min_composite", 30.0)),
+    )
     # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. The book
     # posture is evaluated from the TTL-cached MACRO regime (BTC / equity
     # proxy); when in the de-risked posture AND enforce (shadow logs the
@@ -2173,7 +2252,8 @@ def eval_all_gates(
     # P3-1: count gate blocks (keys are the fixed gate names below; anything
     # unexpected is normalised to "other" to keep the label bounded).
     _GATE_KEYS = {
-        "confidence", "max_concurrent", "notional_cap", "daily_loss",
+        "confidence", "signal_price_deviation", "score_invariant",
+        "max_concurrent", "notional_cap", "daily_loss",
         "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
         "cooldown", "coin_circuit", "global_halt", "consecutive_loss",
         "coin_daily_loss", "drawdown", "liquidation_buffer",

@@ -301,6 +301,37 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _reflection_row(acct: str, fill: dict[str, Any]) -> dict[str, Any]:
+    """Map a paper close-fill onto the close-row shape reflection expects.
+
+    Paper fills use ``price``/``opened_at`` and carry no entry-time signal
+    snapshot; ``entry_time`` (opened_at, epoch seconds) satisfies the reviewer
+    gate. ``fill_model`` tags which口径 produced it so reviews stay attributable.
+    """
+    opened_at = fill.get("opened_at")
+    entry_time = None
+    if opened_at:
+        try:
+            entry_time = float(opened_at) / 1000.0
+        except (TypeError, ValueError):
+            entry_time = None
+    return {
+        "coin": fill.get("coin"),
+        "side": fill.get("side"),
+        "leverage": fill.get("leverage"),
+        "entry_px": fill.get("entry_px"),
+        "exit_px": fill.get("price"),
+        "hold_minutes": fill.get("hold_minutes"),
+        "realized_pnl_pct": fill.get("realized_pnl_pct"),
+        "realized_pnl_usd": fill.get("realized_pnl_usd"),
+        "regime_at_entry": fill.get("entry_regime"),
+        "closed_at": fill.get("ts"),
+        "entry_time": entry_time,
+        "trace_id": fill.get("analysis_id"),
+        "fill_model": acct,
+    }
+
+
 def _write_atomic(path: str, data: dict[str, Any]) -> bool:
     # Durability contract (tmp-in-dir + fsync file + replace + fsync dir,
     # serialised by an flock on <path>.lock) lives in agents.atomic_io.
@@ -916,6 +947,17 @@ class ShadowBook:
             f"[shadow_book] {acct} CLOSE {side} {coin} @ {exit_px:g} reason={reason} "
             f"spot={spot_pct:+.2f}% roe={roe_pct:+.2f}% pnl=${net_pnl:+.2f} "
             f"fee=${fee_usd:.3f} hold={hold_min:.1f}m")
+        # Absorbed from TradingAgents: in SHADOW mode closes settle here rather
+        # than executor.py, so schedule the background decision review from this
+        # path too — otherwise the learn-from-outcomes loop never runs while in
+        # shadow. Off the critical path; INERT and best-effort.
+        try:
+            from hermes_trader.agents.reflection import maybe_reflect_async
+
+            maybe_reflect_async(_reflection_row(acct, close_fill))
+        except Exception as _rf_e:
+            logger.warning("[reflection] schedule failed for %s: %s",
+                           coin, _rf_e)
         return close_fill
 
     def mark_to_market(self, mids: dict[str, float],

@@ -182,22 +182,6 @@ _load_shared_config = load_shared_config
 logger = logging.getLogger(__name__)
 
 
-class ResearchStageError(RuntimeError):
-    """A research-pipeline failure tagged with the stage that raised it.
-
-    Audit 2026-09-06 (C13): the operator console's research endpoint used to
-    surface research failures as an unstructured 500 string with no hint of
-    WHICH part failed — the parallel pre-LLM data gather (candles / funding /
-    news / positioning signals incl. FINRA short-vol) vs. the LLM debate /
-    fallback completion. The HTTP layer reads ``stage`` and returns it in the
-    error payload (e.g. "prefetch.funding", "signals.finra", "llm").
-    """
-
-    def __init__(self, stage: str, message: str):
-        self.stage = stage
-        super().__init__(message)
-
-
 # ── R13-B10: canonical research LLM / fetch knobs ───────────────────────
 # The LLM-call parameters (gateway model/base URL, temperature, token
 # budgets, read/connect timeouts, 429 retry budget with exponential backoff,
@@ -421,6 +405,22 @@ def _llm_record_failure() -> None:
             metrics.LLM_CIRCUIT_STATE.set(1.0)
         except Exception:
             pass
+
+
+def _fired_trigger_direction(perception: dict[str, Any], name: str) -> str:
+    """Direction ("up"/"down") of a fired trigger from its scored reason.
+
+    Triggers such as momentumBurst carry direction in their reason text
+    ("+4.6% over 2 bars up"). Returns "" when the trigger didn't fire or the
+    direction can't be read.
+    """
+    for t in perception.get("triggers") or []:
+        if isinstance(t, dict) and t.get("name") == name and t.get("fired"):
+            reason = str(t.get("reason") or "")
+            m = re.search(r"\s(up|down)\s*$", reason)
+            if m:
+                return m.group(1)
+    return ""
 
 
 def _compute_indicators(candles: list[Candle]) -> dict[str, Any]:
@@ -2333,6 +2333,10 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "composite_score": float(perception.get("composite_score", 0) or 0),
         # P2-6: all fired-trigger flags derive from the single extracted set.
         "momentum_burst_fired": "momentumBurst" in fired_names,
+        # Direction of a fired momentumBurst ("up"/"down") — the trigger itself
+        # is directionless as a boolean, so without this a crash burst is
+        # indistinguishable from a launch burst downstream.
+        "momentum_burst_dir": _fired_trigger_direction(perception, "momentumBurst"),
         "slow_burn_fired": bool(fired_names & {"volumeBuildup1h", "trendFlip1h", "higherLows1h"}),
         "slow_burn_count": len(fired_names & {"volumeBuildup1h", "trendFlip1h", "higherLows1h"}),
         # O'Neil breakout pair — feeds the breakout force-execute (a hedged AI
@@ -2497,8 +2501,8 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     # gate (gappy / stale / truncated after a 429 storm) yields distorted
     # EMA/RSI/ATR/ADX and confident-looking but baseless LLM entries. Mirror
     # the thin-history decline for the primary 4h decision timeframe.
-    from hermes_trader.client.hl_client import assess_candle_quality
     from hermes_trader.agents.perception import _drop_forming_bar as _drop_bar_q
+    from hermes_trader.client.hl_client import assess_candle_quality
     _c4h_for_q, _ = _drop_bar_q(c4h, "4h")
     if _c4h_for_q:
         _q = assess_candle_quality(_c4h_for_q, "4h", 100)
@@ -2545,7 +2549,7 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     user_message = _build_user_message(
         coin, perception, tf1h, tf4h, tf1d,
         funding_raw, news, equity, open_positions, mode,
-        dex_equity=dex_equity, recent_candles=c1h,
+        dex_equity=dex_equity, recent_candles=c1h_closed,
         signals_block=signals_block,
     )
 
@@ -2640,7 +2644,7 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         debate_used=debate_used, trace_id=trace_id,
         as_of_date=as_of_date,
         fired_names=fired_names,
-        tf1h=tf1h, tf4h=tf4h, c1h=c1h,
+        tf1h=tf1h, tf4h=tf4h, c1h=c1h_closed,
     )
 
     memory.record_analysis(analysis)
