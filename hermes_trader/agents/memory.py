@@ -149,6 +149,9 @@ MAX_PERCEPTIONS = 500
 MAX_ANALYSES = 200
 MAX_TRADES = 100
 MAX_CLOSES = 500  # realized trade outcomes — backs win-rate / payoff / risk-of-ruin / Phase-3 stats
+# Post-close qualitative reviews kept in working context (only the most recent
+# few are injected into the research prompt).
+MAX_REFLECTIONS = 50
 # P1-6: each coin's incremental exit-slip deque is capped (at the configured
 # closes limit) so it cannot grow unboundedly; the read-time close-time window
 # filters older entries anyway.
@@ -325,6 +328,10 @@ class AgentMemory:
         self._analyses: list[dict[str, Any]] = []
         self._trades: list[dict[str, Any]] = []
         self._closes: list[dict[str, Any]] = []  # realized exits (the trade-outcome store)
+        # Post-close qualitative reviews (absorbed from TradingAgents). Bounded
+        # list of {coin, side, closed_at, text}; injected into the next research
+        # system prompt. Rebuilt from events.jsonl "reflection" records.
+        self._reflections: list[dict[str, Any]] = []
         # Entry context keyed by "COIN_side" — entry time + the signal snapshot at
         # entry, so the matching close can carry it for the forward signal backtest.
         self._entry_ctx: dict[str, dict[str, Any]] = {}
@@ -464,6 +471,7 @@ class AgentMemory:
         try:
             trades: list[dict[str, Any]] = []
             closes: list[dict[str, Any]] = []
+            reflections: list[dict[str, Any]] = []
             with open(_EVENTS_FILE, "r", encoding="utf-8") as f:
                 for line in f:
                     line = line.strip()
@@ -486,18 +494,23 @@ class AgentMemory:
                         trades.append(payload)
                     elif ev == "close":
                         closes.append(payload)
+                    elif ev == "reflection" and payload.get("text"):
+                        reflections.append(payload)
             _limits = _memory_limits()
             if trades:
                 self._trades = trades[-_limits["trades"]:]
             if closes:
                 self._closes = closes[-_limits["closes"]:]
+            if reflections:
+                self._reflections = reflections[-MAX_REFLECTIONS:]
             if trades or closes:
                 # P1-6: _closes was replaced wholesale — force the
                 # incremental stats to lazily rebuild on first use / flush.
                 self._close_stats_built = False
                 logger.info(
                     f"[memory] rebuilt from events.jsonl: "
-                    f"{len(trades)} orders, {len(closes)} closes"
+                    f"{len(trades)} orders, {len(closes)} closes, "
+                    f"{len(reflections)} reflections"
                 )
                 return True
         except Exception as e:
@@ -541,6 +554,10 @@ class AgentMemory:
                 self._analyses = _list_field("analyses")[:limits["analyses"]]
                 self._trades = _list_field("trades")[:limits["trades"]]
                 self._closes = _list_field("closes")[:limits["closes"]]
+                self._reflections = [
+                    r for r in _list_field("reflections")
+                    if isinstance(r, dict) and r.get("text")
+                ][-MAX_REFLECTIONS:]
                 _entry_ctx = data.get("entryCtx")
                 self._entry_ctx = _entry_ctx if isinstance(_entry_ctx, dict) else {}
 
@@ -853,6 +870,7 @@ class AgentMemory:
                 "analyses": list(self._analyses),
                 "trades": list(self._trades),
                 "closes": list(self._closes),
+                "reflections": list(self._reflections),
                 "entryCtx": dict(self._entry_ctx),
                 "cooldowns": [{"coin": coin, "expires": exp} for coin, exp in self._cooldowns.items()],
                 "equity": self._equity,
@@ -1022,6 +1040,35 @@ class AgentMemory:
         # Realized close = critical: bypass the dirty/throttle gates and
         # persist immediately (P1-6).
         self.flush(force=True)
+
+    def attach_reflection(self, coin: Any, side: Any, closed_at: Any,
+                          text: str) -> None:
+        """Tag the matching close with its qualitative review and keep the
+        reflection in working context for prompt injection."""
+        text = (text or "").strip()
+        if not text:
+            return
+        with self._lock:
+            for c in reversed(self._closes):
+                if (c.get("coin") == coin and c.get("side") == side
+                        and c.get("closed_at") == closed_at):
+                    c["reflection"] = text
+                    break
+            self._reflections.append({
+                "coin": coin, "side": side, "closed_at": closed_at,
+                "text": text,
+            })
+            if len(self._reflections) > MAX_REFLECTIONS:
+                self._reflections = self._reflections[-MAX_REFLECTIONS:]
+            self._dirty = True
+        self.flush()
+
+    def get_recent_reflections(self, limit: int = 3) -> list[dict[str, Any]]:
+        """Return the most recent qualitative reviews (oldest→newest)."""
+        with self._lock:
+            if limit <= 0:
+                return []
+            return list(self._reflections[-limit:])
 
     def update_equity(self, eq: float) -> None:
         with self._lock:

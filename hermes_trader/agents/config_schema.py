@@ -332,6 +332,10 @@ class _ConfigPatch(BaseModel):
     # Audit 2026-09-21 (#3): live post-only maker execution scaffold.
     maker_execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("maker_execution"))
     reentry_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("reentry_cap"))
+    # Post-close decision reflection (absorbed from TradingAgents). INERT:
+    # one background LLM review after a close, injected into the next research
+    # prompt; never sizes/vetoes/changes gates.
+    reflection: dict[str, Any] = Field(default_factory=lambda: _dict_default("reflection"))
     # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay.
     regime_risk_overlay: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_risk_overlay"))
     # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm

@@ -423,6 +423,56 @@ def _parse_windows(raw: str | None) -> list[int]:
     return out or list(_DEFAULT_WINDOWS)
 
 
+def _debate_ab_payload(days: int) -> dict:
+    """Aggregate background debate shadow-A/B records (single vs debate).
+
+    Read-only counts/stats from events.jsonl ``debate_shadow_ab`` records.
+    """
+    from hermes_trader.event_log import query_events
+
+    since_iso = time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                              time.gmtime(time.time() - days * 86400))
+    recs = query_events(event_type="debate_shadow_ab", start=since_iso)
+    rows: list[dict] = []
+    n = agree = 0
+    single_verdicts: dict[str, int] = {}
+    debate_verdicts: dict[str, int] = {}
+    for r in recs:
+        p = r.get("payload") or {}
+        s = p.get("single") or {}
+        d = p.get("debate") or {}
+        n += 1
+        if bool(p.get("agree")):
+            agree += 1
+        sv, dv = s.get("verdict"), d.get("verdict")
+        if sv:
+            single_verdicts[sv] = single_verdicts.get(sv, 0) + 1
+        if dv:
+            debate_verdicts[dv] = debate_verdicts.get(dv, 0) + 1
+        rows.append({
+            "ts": r.get("timestamp"),
+            "coin": p.get("coin"),
+            "composite_score": p.get("composite_score"),
+            "single": s, "debate": d, "agree": bool(p.get("agree")),
+        })
+    return {
+        "days": days,
+        "sample": n,
+        "agreement_rate": round(agree / n, 4) if n else None,
+        "single_verdicts": single_verdicts,
+        "debate_verdicts": debate_verdicts,
+        "rows": rows[-200:],
+    }
+
+
+def _reflections_payload(limit: int) -> dict:
+    """Return the most recent post-close reviews (read-only text, no secrets)."""
+    import hermes_trader.agents.memory as memory_mod
+
+    refls = memory_mod.memory.get_recent_reflections(limit)
+    return {"count": len(refls), "reflections": refls}
+
+
 def register_shadow_arms_routes(app: FastAPI) -> None:
     """Mount the shadow-arm grading-center read + operator-refresh routes."""
 
@@ -437,6 +487,24 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
             )
         except Exception as e:
             raise HTTPException(503, f"shadow-arm grader unavailable: {e}")
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/shadow-arms/debate-ab")
+    async def shadow_arms_debate_ab(
+        days: int = Query(30, ge=1, le=400),
+    ) -> JSONResponse:
+        """Background debate shadow-A/B aggregate (single vs debate verdicts).
+
+        Read-only counts/stats; anonymous-safe, matching the grades posture."""
+        payload = await asyncio.to_thread(_debate_ab_payload, days)
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/shadow-arms/reflections")
+    async def shadow_arms_reflections(
+        limit: int = Query(20, ge=1, le=100),
+    ) -> JSONResponse:
+        """Most recent post-close decision reviews (read-only text)."""
+        payload = await asyncio.to_thread(_reflections_payload, limit)
         return JSONResponse(payload)
 
     @app.post("/api/dashboard/shadow-arms/refresh")

@@ -623,6 +623,27 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "cache_max_entries": 128,
         "parallel": True,
         "use_structured_output": True,
+        # Shadow A/B (absorbed from TradingAgents). When enabled, run the
+        # bull/bear/arbiter debate in the BACKGROUND for eligible candidates
+        # purely as a comparison signal — it NEVER replaces the single-LLM
+        # verdict that routes/executes. The debate verdict is logged so the
+        # shadow-grading pipeline can measure whether debate improves on the
+        # single LLM before it is ever promoted.
+        "shadow_ab": {
+            "enabled": True,
+            "min_composite": 60.0,   # only high-value candidates get the probe
+            "sample_rate": 0.25,     # fraction of eligible candidates (0–1)
+        },
+    },
+    # Post-close decision reflection (absorbed from TradingAgents). After a
+    # close, one lightweight background LLM call writes a short qualitative
+    # review that is injected into the next research prompt. Off the trading
+    # critical path; INERT (never sizes/vetoes/changes gates).
+    "reflection": {
+        "enabled": True,
+        "max_chars": 400,        # cap on one review's length
+        "inject_limit": 3,       # most-recent reviews injected into the prompt
+        "timeout_s": 20.0,       # per-reflection LLM read timeout
     },
     "signal_enforcement": {
         "enabled": True,

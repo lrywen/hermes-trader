@@ -2500,6 +2500,7 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
                 _funding_hr = None
             memory.record_entry_context(coin, trade_side, {
                 "entry_time": _entry_ts,
+                "trace_id": analysis.get("trace_id") or "",
                 "arrival_mid": _arr_mid,
                 "entry_fill": _fill,
                 "entry_slip_bps": _slip_bps,
@@ -5720,7 +5721,7 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
             _net_pnl_usd = _gross_pnl_usd - _fee_usd
             if _funding_cost_usd is not None:
                 _net_pnl_usd -= _funding_cost_usd
-            memory.record_close({
+            _close_row = {
                 "coin": coin, "side": side,
                 "entry_px": entry_px, "exit_px": fill_px,
                 "size_coin": abs(szi), "notional_usd": round(_notional_entry, 4),
@@ -5750,7 +5751,19 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                 # funding carry: rate_hr × hold_hrs × notional × side (long pays
                 # when rate>0). Estimate (entry-rate held constant over the hold).
                 "funding_cost_usd": _funding_cost_usd,
-            })
+                "trace_id": _ec.get("trace_id"),
+            }
+            memory.record_close(_close_row)
+            # Absorbed from TradingAgents: schedule a background qualitative
+            # review of this decision. Off the critical path; INERT and
+            # best-effort — never blocks or affects the exit.
+            try:
+                from hermes_trader.agents.reflection import maybe_reflect_async
+
+                maybe_reflect_async(dict(_close_row))
+            except Exception as _rf_e:
+                logger.warning("[reflection] schedule failed for %s: %s",
+                               coin, _rf_e)
         except Exception as _rc_e:
             logger.error(f"[outcome-store] record_close failed for {coin}: {_rc_e}",
                          exc_info=True)

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 
-def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
+def build_system_prompt(mode: str, win_rate: float, recent_trades: int,
+                        reflections: list[dict] | None = None) -> str:
     """Build the system prompt for the AI model.
 
     The prompt is deliberately conviction-biased: PASS is treated as the
@@ -23,6 +24,23 @@ def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
         "No trade history yet."
         if recent_trades == 0
         else f"Recent track record: {recent_trades} trades, win rate {int(win_rate * 100)}%."
+    )
+
+    # Lessons carried from post-close reviews (absorbed from TradingAgents).
+    reflection_lines = []
+    for r in (reflections or []):
+        text = str(r.get("text") or "").strip()
+        if not text:
+            continue
+        coin = str(r.get("coin") or "").strip()
+        tag = f"[{coin}] " if coin else ""
+        reflection_lines.append(f"- {tag}{text}")
+    reflection_block = (
+        ["",
+         "LESSONS FROM RECENT POST-CLOSE REVIEWS (apply, don't repeat mistakes; "
+         "these are decision lessons, not sizing advice):"]
+        + reflection_lines
+        if reflection_lines else []
     )
 
     parts = [
@@ -135,6 +153,9 @@ def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
         "- Don't size confidence based on win rate fear — calibrate to setup quality, not psychology",
         "",
         track_record,
+    ]
+    parts.extend(reflection_block)
+    parts.extend([
         "",
         "OUTPUT: 2–3 sentences of reasoning, then JSON on the last line. Nothing after.",
         "",
@@ -142,6 +163,6 @@ def build_system_prompt(mode: str, win_rate: float, recent_trades: int) -> str:
         "All JSON keys (verdict/confidence/side/entryPx/stopPx/tpPx/newsRisk/reasoning) and enum "
         "values (LONG/SHORT/PASS/CLOSE, long/short, none/positive/negative) MUST remain in English. "
         "Keep it concise, professional, and free of emoji.",
-    ]
+    ])
 
     return "\n".join(parts)

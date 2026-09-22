@@ -1656,6 +1656,100 @@ def _debate_cfg() -> dict[str, Any]:
     }
 
 
+def _debate_shadow_ab_cfg() -> dict[str, Any]:
+    """Resolve debate shadow-A/B settings (comparison probe, never traded)."""
+    cfg = read_agent_config()
+    d = (cfg.get("debate_research") or {}).get("shadow_ab") or {}
+    return {
+        "enabled": bool(d.get("enabled", True)),
+        "min_composite": float(d.get("min_composite", 60.0)),
+        "sample_rate": min(1.0, max(0.0, float(d.get("sample_rate", 0.25)))),
+    }
+
+
+def _shadow_ab_selected(perception: dict[str, Any]) -> bool:
+    """Decide whether this candidate gets a background debate probe.
+
+    High composite + deterministic sampling (hash of perception id) so the same
+    candidate does not flip-flop between cycles.
+    """
+    sc = _debate_shadow_ab_cfg()
+    if not sc["enabled"] or sc["sample_rate"] <= 0:
+        return False
+    try:
+        comp = float(perception.get("composite_score", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if comp < sc["min_composite"]:
+        return False
+    pid = str(perception.get("id") or perception.get("trace_id") or "")
+    bucket = (hash(f"shadow_ab:{pid}") % 1000) / 1000.0
+    return bucket < sc["sample_rate"]
+
+
+def _run_shadow_ab(coin: str, user_message: str, perception: dict[str, Any],
+                   *, atr_abs: Optional[float], config: Optional[dict[str, Any]],
+                   single: dict[str, Any]) -> None:
+    """Run a background debate purely for comparison; never affects trading.
+
+    Compares the debate verdict to the single-LLM verdict that actually routes,
+    and emits a ``debate_shadow_ab`` event for the grading pipeline.
+    """
+    try:
+        debate_fields = _debate_research(
+            coin, user_message, perception, atr_abs=atr_abs, config=config
+        )
+    except Exception as e:
+        logger.warning("[debate-ab] probe failed coin=%s: %s: %s",
+                       coin, type(e).__name__, e)
+        return
+    if not debate_fields:
+        return
+    from hermes_trader import event_log
+
+    event_log.append(
+        "debate_shadow_ab",
+        payload={
+            "coin": coin,
+            "composite_score": float(perception.get("composite_score", 0) or 0),
+            "single": {
+                "verdict": single.get("verdict"),
+                "side": single.get("side"),
+                "confidence": single.get("confidence"),
+            },
+            "debate": {
+                "verdict": debate_fields.get("verdict"),
+                "side": debate_fields.get("side"),
+                "confidence": debate_fields.get("confidence"),
+            },
+            "agree": (
+                debate_fields.get("verdict") == single.get("verdict")
+                and debate_fields.get("side") == single.get("side")
+            ),
+        },
+        trace_id=str(perception.get("trace_id") or ""),
+    )
+
+
+def _maybe_schedule_shadow_ab(coin: str, user_message: str,
+                              perception: dict[str, Any], *,
+                              atr_abs: Optional[float],
+                              config: Optional[dict[str, Any]],
+                              single: dict[str, Any]) -> None:
+    """Schedule a background debate A/B probe for an eligible candidate."""
+    if not _shadow_ab_selected(perception):
+        return
+    try:
+        _get_pool().submit(
+            lambda: _run_shadow_ab(coin, user_message, perception,
+                                   atr_abs=atr_abs, config=config,
+                                   single=single)
+        )
+    except Exception as e:
+        logger.warning("[debate-ab] could not schedule probe: %s: %s",
+                       type(e).__name__, e)
+
+
 def _debate_role(system_prompt: str) -> str:
     """Fingerprint a debate system prompt into a short role tag for logs."""
     low = system_prompt.lower()
@@ -2440,7 +2534,14 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     equity, dex_equity, open_positions = _account_context(account_snapshot)
 
     wr = memory.get_win_rate()
-    system_prompt = build_system_prompt(mode, wr.get("rate", 0), int(wr.get("total", 0)))
+    try:
+        from hermes_trader.agents.reflection import reflection_cfg as _rcfg
+
+        _refls = memory.get_recent_reflections(int(_rcfg()["inject_limit"]))
+    except Exception:
+        _refls = []
+    system_prompt = build_system_prompt(mode, wr.get("rate", 0),
+                                        int(wr.get("total", 0)), _refls)
     user_message = _build_user_message(
         coin, perception, tf1h, tf4h, tf1d,
         funding_raw, news, equity, open_positions, mode,
@@ -2521,6 +2622,16 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     else:
         # Debate path does not touch _call_ai; synthesize a marker for telemetry.
         ai_text = ""
+
+    # Shadow A/B probe (absorbed from TradingAgents). Only when the production
+    # path is the single LLM (an enabled debate already replaces the verdict,
+    # so there is nothing to compare). Runs in the background, never alters
+    # `parsed`/routing.
+    if not debate_used and parsed is not None:
+        _maybe_schedule_shadow_ab(
+            coin, user_message, perception, atr_abs=_atr_4h,
+            config=config, single=parsed,
+        )
 
     # Analysis-record assembly extracted to _build_analysis (P2-1).
     analysis = _build_analysis(

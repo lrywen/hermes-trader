@@ -1463,3 +1463,32 @@ def test_hit_set_below_min_falls_back_with_warning(sg):
     assert out["harmful_rate_basis"] == "all_records"
     assert any("命中集成熟样本仅 5" in w
                for w in out.get("warnings", []))
+
+
+def test_baseline_uses_dashboard_cross_source_closes(sg, monkeypatch):
+    # Audit 2026-09-22：real_closes 必须与 dashboard 平仓时间线同口径——合并
+    # events 主/轮转 + userfills 回填并去重，而不是只数 memory 单例的 _closes。
+    import hermes_trader.dashboard as dash
+    merged = [
+        {"pnl_pct": 1.5}, {"pnl_pct": -2.0}, {"pnl_pct": 3.0},
+        {"pnl_pct": None},  # 未评分行（如 ai_close）计入笔数但不进胜率
+    ]
+    monkeypatch.setattr(dash, "_closed_trades_payload", lambda limit=500: merged)
+
+    # 让 collect_grades 的臂遍历为空（sp 是 shadow_grade 内 import 的
+    # shadow_progress 模块别名），只验证 baseline 这一独立 try 块。
+    monkeypatch.setattr(sg.sp, "ARMS", [])
+    out = sg.collect_grades([168])
+    base = out["real_baseline"]
+    assert base["real_closes"] == 4
+    assert abs(base["real_win_rate"] - (2 / 3)) < 1e-4
+    assert base["note"] == ""
+
+
+def test_baseline_empty_ledger_note(sg, monkeypatch):
+    import hermes_trader.dashboard as dash
+    monkeypatch.setattr(dash, "_closed_trades_payload", lambda limit=500: [])
+    monkeypatch.setattr(sg.sp, "ARMS", [])
+    base = sg.collect_grades([168])["real_baseline"]
+    assert base["real_closes"] == 0 and base["real_win_rate"] is None
+    assert "forward ledger 为空" in base["note"]
