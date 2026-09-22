@@ -46,6 +46,7 @@ import bisect
 import math
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -208,6 +209,69 @@ def _run_variant(candles: List[Candle], cands: List[Dict[str, Any]],
     )
 
 
+def _scale_trade(t: Trade, notional_usd: float) -> Trade:
+    """重放一笔交易到新的名义金额：收益率口径不变，按名义比例缩放金额项。"""
+    base = t.notional_usd or notional_usd
+    k = (notional_usd / base) if base else 0.0
+    return replace(
+        t, notional_usd=notional_usd,
+        fee_usd=round(t.fee_usd * k, 6),
+        pnl_gross_usd=round(t.pnl_gross_usd * k, 6),
+        pnl_net_usd=round(t.pnl_net_usd * k, 6),
+    )
+
+
+def _apply_portfolio_constraint(trades: List[Trade], init_equity: float,
+                                fraction: float, max_concurrent: int
+                                ) -> List[Trade]:
+    """组合级资金/仓位约束（修正 ret% 口径）。
+
+    此前每个币独立按固定 $100 本金、每个信号都新开仓，导致同一权益被反复
+    使用、累计 PnL 远超本金（ret 出现 -4614%）。这里按入场时间做事件驱动
+    回放，模拟真实账户：
+      * 初始权益 init_equity，每笔名义 = 当前权益 × fraction × 该笔隐含杠杆
+        （杠杆由 原notional / 原占用保证金 推断，用 notional/equity 比例还原）；
+      * 同一时刻最多 max_concurrent 个持仓，且同一币种不重复开仓；
+      * 信号到达时仓位已满或该币已持仓 → 跳过（不是无脑全做）；
+      * 持仓平仓后盈亏并入权益、资金回笼，后续按新权益下单（复利）。
+
+    注：每笔交易的进/出场价与退出原因不变（kernel 已确定），仅按当时权益
+    缩放名义与金额，因此胜率/退出原因分布不变，PnL/ret 变为真实本金口径。
+    """
+    # 原回放里每笔名义=固定权益×fraction×leverage；反推每笔 leverage 倍数。
+    base_margin = init_equity * fraction
+    ordered = sorted(trades, key=lambda t: (t.entry_time_ms, t.exit_time_ms))
+    equity = init_equity
+    open_positions: List[Trade] = []  # 当前活跃（已缩放）持仓
+    accepted: List[Trade] = []
+    for t in ordered:
+        # 释放本笔入场之前已平仓的持仓，盈亏并入权益。
+        still: List[Trade] = []
+        for p in open_positions:
+            if p.exit_time_ms <= t.entry_time_ms:
+                equity += p.pnl_net_usd
+            else:
+                still.append(p)
+        open_positions = still
+        # 仓位上限 / 同币不重复。
+        if len(open_positions) >= max_concurrent:
+            continue
+        if any(p.coin == t.coin for p in open_positions):
+            continue
+        if equity <= 0:
+            break
+        leverage = (t.notional_usd / base_margin) if base_margin else 0.0
+        notional = max(0.0, equity * fraction * leverage)
+        if notional <= 0:
+            continue
+        st = _scale_trade(t, round(notional, 6))
+        open_positions.append(st)
+        accepted.append(st)
+    # 末尾仍活跃的持仓其实已在 kernel 平仓（有 exit），其盈亏也计入最终权益，
+    # 但 accepted 已含这些 Trade；统计层直接用全部 accepted 即可。
+    return sorted(accepted, key=lambda t: t.entry_time_ms)
+
+
 def _window_trades(trades: List[Trade], candles: List[Candle],
                    days: int) -> List[Trade]:
     """Trades ENTERED within the trailing `days` window."""
@@ -252,6 +316,8 @@ def main() -> int:
                     default=kcost.DEFAULT_EXIT_SLIP_BPS)
     ap.add_argument("--stop-delay-slip-bps", type=float,
                     default=kcost.DEFAULT_STOP_DELAY_SLIP_BPS)
+    ap.add_argument("--max-concurrent", type=int, default=5,
+                    help="组合级最大同时持仓数（同币不重复，平仓资金回笼）")
     args = ap.parse_args()
 
     live = read_agent_config()
@@ -286,8 +352,6 @@ def main() -> int:
     weights = dict(cfg["weights"])
 
     # Production exit policy: base 3-param ladder (see module docstring caveat).
-    from dataclasses import replace
-
     from hermes_trader.agents.dsl_exit import _build_policy_from_config
     policy = replace(
         _build_policy_from_config(),
@@ -395,11 +459,16 @@ def main() -> int:
     print("\n=== VARIANT RESULTS (net of H-7 costs) ===")
     verdict_rows = []
     for label in variant_labels:
+        # 组合级资金/仓位约束：在真实本金与并发上限下回放，PnL/ret 才可信。
+        constrained = _apply_portfolio_constraint(
+            trades_by_variant[label], args.equity, equity_fraction,
+            args.max_concurrent,
+        )
         trades_by_window: Dict[int, List[Trade]] = {}
         for d in windows:
             sub = []
             for coin, candles in candles_by_coin.items():
-                ct = [t for t in trades_by_variant[label] if t.coin == coin]
+                ct = [t for t in constrained if t.coin == coin]
                 sub.extend(_window_trades(ct, candles, d))
             trades_by_window[d] = sub
         verdict_rows.extend(_print_variant(
@@ -418,8 +487,10 @@ def main() -> int:
     print("  - AI verdict substituted with a heuristic; min_short_confidence "
           "(LLM) NOT replayed — only min_short_composite is calibrated here.")
     print("  - Volume floor uses TODAY's dayNtlVlm snapshot (survivorship bias).")
-    print("  - One open position per coin; equity constant; cooldown not applied; "
-          "max_concurrent cap NOT enforced across coins.")
+    print(f"  - Portfolio accounting: max {args.max_concurrent} concurrent positions, "
+          "one per coin, equity rebalances after each close (compounding).")
+    print("  - Cooldown between entries is NOT applied; entries still follow the "
+          "kernel's next-bar-open fill.")
     print("  - Exits/costs come from the unified kernel (production DSLTracker + "
           "H-7), matching scripts/backtest.py.")
     print("  - Past performance does NOT imply future results.")

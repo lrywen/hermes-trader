@@ -8,10 +8,25 @@ import pytest
 
 from hermes_trader.backtest import cost as kcost
 from hermes_trader.backtest import signals as ksig
+from hermes_trader.backtest.types import ExitReason, Trade
 from hermes_trader.models.types import Candle
 from scripts import backtest_short_regime as bsr
 
 HOUR = 3_600_000
+
+
+def _trade(coin: str, entry_h: int, exit_h: int, notional: float,
+           pnl_net: float) -> Trade:
+    """构造一笔最小 Trade（进出场价不影响组合约束，只看时间/名义/盈亏）。"""
+    return Trade(
+        coin=coin, side="short", entry_bar=entry_h, exit_bar=exit_h,
+        entry_time_ms=entry_h * HOUR, exit_time_ms=exit_h * HOUR,
+        entry_ref_px=100.0, entry_fill_px=100.0,
+        exit_ref_px=100.0, exit_fill_px=100.0,
+        reason=ExitReason.MAX_LOSS,
+        notional_usd=notional, fee_usd=0.0,
+        pnl_gross_usd=pnl_net, pnl_net_usd=pnl_net,
+    )
 
 
 def _falling_candles(n: int = 160, start: float = 100.0) -> list[Candle]:
@@ -83,3 +98,48 @@ def test_scan_candidates_records_inputs_and_kernel_runs(monkeypatch):
     )
     assert trades
     assert all(t.side == "short" for t in trades)
+
+
+def test_portfolio_constraint_caps_concurrency_and_same_coin():
+    # 原回放：equity=100, fraction=0.2 → base_margin=20；notional=20 → leverage=1。
+    # 三笔时间重叠（h0-10 / h1-11 / h2-12），max_concurrent=2 → 第三笔被拒。
+    trades = [
+        _trade("AAA", 0, 10, 20.0, -1.0),
+        _trade("BBB", 1, 11, 20.0, -1.0),
+        _trade("CCC", 2, 12, 20.0, -1.0),
+    ]
+    out = bsr._apply_portfolio_constraint(trades, 100.0, 0.2, 2)
+    assert [t.coin for t in out] == ["AAA", "BBB"]
+
+    # 同币重叠：第二笔 AAA 在第一笔未平时到达 → 被拒。
+    same_coin = [_trade("AAA", 0, 10, 20.0, -1.0),
+                 _trade("AAA", 5, 15, 20.0, -1.0)]
+    out2 = bsr._apply_portfolio_constraint(same_coin, 100.0, 0.2, 5)
+    assert [t.entry_time_ms for t in out2] == [0]
+
+
+def test_portfolio_constraint_rebases_equity_after_close():
+    # AAA h0-10 亏 -10 → 权益 100→90；BBB h10 入场（AAA 刚平）按新权益下单。
+    trades = [
+        _trade("AAA", 0, 10, 20.0, -10.0),
+        _trade("BBB", 10, 20, 20.0, 0.0),
+    ]
+    out = bsr._apply_portfolio_constraint(trades, 100.0, 0.2, 5)
+    assert len(out) == 2
+    # AAA 名义保持 20（首笔按初始权益）；BBB 在 90 权益下名义=90*0.2*1=18。
+    assert out[0].notional_usd == 20.0
+    assert out[1].notional_usd == 18.0
+    # 缩放口径：BBB 原 notional=20，新 18 → 缩放比 0.9。
+    assert out[1].pnl_net_usd == 0.0
+
+
+def test_portfolio_constraint_totals_bounded_by_equity():
+    # 顺序成交（互不重叠），全部亏损，账户单调下降；名义应随权益递减而非恒定。
+    trades = [_trade("AAA", h, h + 5, 20.0, -5.0) for h in range(0, 60, 10)]
+    out = bsr._apply_portfolio_constraint(trades, 100.0, 0.2, 5)
+    notionals = [t.notional_usd for t in out]
+    # 每亏 -5 后下一笔名义 = 上一权益*0.2，应严格递减。
+    assert all(a > b for a, b in zip(notionals, notionals[1:]))
+    # 全部名义合计远小于"无脑固定20×6=120"，受真实本金约束。
+    assert sum(notionals) < 120.0
+
