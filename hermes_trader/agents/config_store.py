@@ -20,6 +20,7 @@ import importlib
 import json
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -2795,8 +2796,25 @@ def update_agent_config(
         if str(cfg.get("mode", "OFF")).upper() == "LIVE":
             # Test-only escape: the offline suite has many audit/cleanup tests
             # that write mode=LIVE to prove later machinery and carry no B-13
-            # record. Gate-write tests leave this unset to exercise the guard.
-            if os.environ.get("HERMES_TEST_ALLOW_LIVE_WRITE") != "1":
+            # record. N-1 hardening: the env flag alone is a silent footgun if
+            # it leaks into production. Require BOTH the env flag AND a live
+            # pytest process ("pytest" loaded in sys.modules), and emit a
+            # WARNING when the hatch actually engages so a bypass is never
+            # invisible. Gate-write tests leave the flag unset.
+            _hatch_armed = (
+                os.environ.get("HERMES_TEST_ALLOW_LIVE_WRITE") == "1"
+                and "pytest" in sys.modules
+            )
+            if (
+                os.environ.get("HERMES_TEST_ALLOW_LIVE_WRITE") == "1"
+                and "pytest" not in sys.modules
+            ):
+                logger.warning(
+                    "[startup gate] HERMES_TEST_ALLOW_LIVE_WRITE=1 set but no "
+                    "pytest process detected — IGNORING the live-write escape "
+                    "(B-13 guard stays armed); this flag is for the offline "
+                    "test suite only")
+            if not _hatch_armed:
                 from hermes_trader.agents.live_gate import live_entry_runtime_error
                 _live_err = live_entry_runtime_error(cfg)
                 if _live_err is not None:
@@ -2807,6 +2825,10 @@ def update_agent_config(
                         "config). Keep mode=SHADOW until the gate record is "
                         f"present at the gate path. (reason={_live_err})"
                     )
+            else:
+                logger.warning(
+                    "[config] B-13 write guard BYPASSED via "
+                    "HERMES_TEST_ALLOW_LIVE_WRITE under pytest (test only)")
         # R11-E1: the body mutated cfg; validate the *post-merge* state
         # before persisting.  This catches aggregated violations the
         # patch-level gate cannot — most importantly FORBIDDEN_OVERRIDE
