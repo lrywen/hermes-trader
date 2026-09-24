@@ -201,3 +201,31 @@ def startup_live_gate_errors(
                     "B-13: mode=LIVE but the acceptance record is invalid; "
                     "refusing to start: " + "; ".join(errs))
     return fatal, warnings
+
+
+def live_entry_runtime_error(
+    cfg: dict[str, Any], *, gate_path: Optional[str] = None,
+) -> Optional[str]:
+    """Runtime B-13 guard leaf (T-01/T-02).
+
+    Pure decision: return ``None`` when a LIVE entry is permitted, or a
+    human-readable reason when it must be blocked. Mirrors the boot gate's
+    ``mode == "LIVE"`` branch but is safe to call on the hot path:
+
+    * non-LIVE modes return ``None`` (this guard concerns only real entries;
+      SHADOW/OFF are blocked earlier by the mode branch itself)
+    * a missing/invalid acceptance record (bound to *cfg* by sha256) returns
+      ``"live_gate_record_invalid"``
+
+    Callers MUST perform no order placement when a reason is returned.
+    """
+    if str(cfg.get("mode", "OFF")).upper() != "LIVE":
+        return None
+    record, _load_err = load_acceptance_record(gate_path)
+    if record is None:
+        return "live_gate_record_invalid"
+    errs = validate_acceptance_record(
+        record, expected_config_sha256=config_sha256(cfg))
+    if errs:
+        return "live_gate_record_invalid"
+    return None

@@ -2785,6 +2785,28 @@ def update_agent_config(
             )
         cfg = _deep_merge(CANONICAL_DEFAULTS, raw)
         yield cfg
+        # T-01 (DEF-01): a runtime flip to mode=LIVE MUST pass the same B-13
+        # acceptance gate enforced at boot. This is the single choke point for
+        # every config write (web PATCH, terminal resume/live, legacy merge),
+        # so no write path can arm LIVE without a valid §5.2 record. Raising
+        # here aborts before _write_raw_locked → the on-disk mode key is
+        # byte-level unchanged (INV-01). Non-LIVE modes are unaffected; a
+        # LIVE cfg that already carries a valid record passes through.
+        if str(cfg.get("mode", "OFF")).upper() == "LIVE":
+            # Test-only escape: the offline suite has many audit/cleanup tests
+            # that write mode=LIVE to prove later machinery and carry no B-13
+            # record. Gate-write tests leave this unset to exercise the guard.
+            if os.environ.get("HERMES_TEST_ALLOW_LIVE_WRITE") != "1":
+                from hermes_trader.agents.live_gate import live_entry_runtime_error
+                _live_err = live_entry_runtime_error(cfg)
+                if _live_err is not None:
+                    raise RuntimeError(
+                        "[config] refusing to write mode=LIVE: no valid B-13 "
+                        "acceptance record (§5.2 outcome A: 判据1–5 pass + block "
+                        "bootstrap 95% CI strictly > 0, bound to the current "
+                        "config). Keep mode=SHADOW until the gate record is "
+                        f"present at the gate path. (reason={_live_err})"
+                    )
         # R11-E1: the body mutated cfg; validate the *post-merge* state
         # before persisting.  This catches aggregated violations the
         # patch-level gate cannot — most importantly FORBIDDEN_OVERRIDE

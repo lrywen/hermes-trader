@@ -379,7 +379,7 @@ def test_config_write_audit_emitted_on_write(tmp_path, monkeypatch):
     monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
     monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(log_file))
 
-    write_agent_config({"mode": "LIVE", "leverage": 10}, backup=False, via="test")
+    write_agent_config({"mode": "SHADOW", "leverage": 10}, backup=False, via="test")
     # RMW path: change exactly one key through the full-merge context manager.
     with update_agent_config(via="mcp") as cfg:
         cfg["leverage"] = 8
@@ -418,7 +418,7 @@ def test_rmw_noop_write_reports_empty_diff(tmp_path, monkeypatch):
     monkeypatch.setattr(config_store, "_BACKUP_PATH", str(cfg_file) + ".bak")
     monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(log_file))
 
-    write_agent_config({"mode": "LIVE", "leverage": 10}, backup=False, via="test")
+    write_agent_config({"mode": "SHADOW", "leverage": 10}, backup=False, via="test")
     # Two no-op RMW passes back to back: the stubs oscillate null/missing on
     # each full-view write, so a naive diff fires on alternating writes.
     with update_agent_config(via="mcp"):

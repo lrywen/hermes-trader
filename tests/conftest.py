@@ -10,6 +10,8 @@ import os
 import shutil
 import tempfile
 
+import pytest
+
 _tmp = tempfile.mkdtemp(prefix="hermes-test-state-")
 # Clean up the throwaway dir at interpreter exit so each pytest session removes
 # its own state instead of leaking a hermes-test-state-* dir in /tmp (253 dirs /
@@ -80,3 +82,32 @@ for _arm_env, _arm_file in (
     ("HERMES_REGIME_OVERLAY_SHADOW_FILE", "regime_overlay_shadow.jsonl"),
 ):
     os.environ[_arm_env] = os.path.join(_tmp, _arm_file)
+
+
+# T-02 test isolation: the runtime B-13 recheck (executor._live_gate_runtime_
+# block) now fires on every LIVE entry. Hundreds of pre-existing tests drive
+# LIVE mode only to prove some LATER gate/sizer branch, and they carry no
+# acceptance record. Default to a permissive block for the whole suite so
+# those tests keep their original intent; the modules that actually verify
+# B-13 behavior opt out by name below and exercise the real function.
+_GATE_TEST_FILES = (
+    "test_live_gate_runtime_recheck.py",
+    "test_live_gate_write_guard.py",
+    "test_live_gate_b12_b13.py",
+)
+
+
+@pytest.fixture(autouse=True)
+def _relax_runtime_live_gate(request, monkeypatch):
+    test_file = os.path.basename(str(request.fspath))
+    if test_file in _GATE_TEST_FILES:
+        # Gate tests use the real blocks; nothing to patch/allow.
+        yield
+        return
+    # Permit mode=LIVE config writes for non-gate tests (audit/cleanup suite).
+    monkeypatch.setenv("HERMES_TEST_ALLOW_LIVE_WRITE", "1")
+    from hermes_trader.agents import executor
+    monkeypatch.setattr(
+        executor, "_live_gate_runtime_block", lambda _cfg: None)
+    yield
+
