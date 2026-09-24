@@ -124,14 +124,14 @@ def test_post_config_with_token_updates_value(client):
 def test_post_config_multiple_keys(client):
     r = client.post(
         "/api/dashboard/config",
-        json={"updates": {"leverage": 8, "max_concurrent": 4, "mode": "LIVE"}},
+        json={"updates": {"leverage": 8, "max_concurrent": 4, "mode": "SHADOW"}},
         headers=_auth(),
     )
     assert r.status_code == 200
     cfg = read_agent_config()
     assert cfg["leverage"] == 8
     assert cfg["max_concurrent"] == 4
-    assert cfg["mode"] == "LIVE"
+    assert cfg["mode"] == "SHADOW"
 
 
 def test_post_config_empty_updates_400(client):

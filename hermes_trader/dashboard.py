@@ -2733,7 +2733,9 @@ async def _h_help(parts: list[str], cmd: str) -> JSONResponse:
         "  config                — dump current .agent-config.json\n"
         "  dump                  — full state (config + positions + last events)\n"
         "  regime                — cached regime per proxy\n"
-        "  pause / resume / shadow — flip mode OFF / LIVE / SHADOW\n"
+        "  pause                 — record mode then flip OFF\n"
+        "  resume                — restore the pre-pause mode (resume live = arm LIVE)\n"
+        "  shadow                — flip mode SHADOW\n"
         "  close <coin>          — market-close a single position\n"
         "  close all             — market-close every open position\n"
         "  close losing          — market-close every position with uPnL < 0\n"
@@ -2760,10 +2762,75 @@ async def _h_status(parts: list[str], cmd: str) -> JSONResponse:
         return JSONResponse({"response": f"status read failed: {e}", "kind": "error"})
 
 
+_PRE_PAUSE_STATE_PATH = os.path.join(
+    os.environ.get("HERMES_DATA_DIR", "/data"), ".pre-pause-mode"
+)
+_VALID_MODES = ("OFF", "SHADOW", "LIVE")
+
+
+def _read_pre_pause_mode() -> Optional[str]:
+    """Return the mode stored at pause, or None (T-08)."""
+    try:
+        with open(_PRE_PAUSE_STATE_PATH, encoding="utf-8") as fh:
+            m = fh.read().strip().upper()
+        return m if m in _VALID_MODES else None
+    except OSError:
+        return None
+
+
+def _write_pre_pause_mode(mode: str) -> None:
+    """Persist the pre-pause mode so resume restores it across restarts."""
+    try:
+        with open(_PRE_PAUSE_STATE_PATH, "w", encoding="utf-8") as fh:
+            fh.write(mode.upper())
+    except OSError:
+        pass
+
+
+def _clear_pre_pause_mode() -> None:
+    try:
+        os.remove(_PRE_PAUSE_STATE_PATH)
+    except OSError:
+        pass
+
+
 async def _h_pause_resume(parts: list[str], cmd: str) -> JSONResponse:
-    new_mode = "OFF" if parts[0].lower() == "pause" else "LIVE"
-    result = await asyncio.to_thread(_config_apply, {"mode": new_mode})
+    # T-08 (DEF-07): pause records the current mode and goes OFF; resume
+    # restores that mode instead of silently jumping to LIVE. An explicit
+    # `resume live` is required to arm LIVE, and that path is still B-13
+    # gated (raises via _config_apply when no acceptance record exists).
+    verb = parts[0].lower()
+    explicit_live = len(parts) > 1 and parts[1].lower() == "live"
+
+    if verb == "pause":
+        current = read_agent_config().get("mode", "OFF")
+        _write_pre_pause_mode(str(current))
+        new_mode = "OFF"
+    elif explicit_live:
+        new_mode = "LIVE"
+    else:
+        restored = _read_pre_pause_mode()
+        if restored is None:
+            # No prior mode recorded: never silently choose LIVE. Refuse and
+            # tell the operator how to arm explicitly.
+            return JSONResponse({
+                "response": ("resume: no pre-pause mode recorded — use "
+                             "`resume live` to arm LIVE (B-13 gated), or "
+                             "`shadow`/`pause`; refusing to default to LIVE"),
+                "kind": "error",
+            })
+        new_mode = restored
+
+    try:
+        result = await asyncio.to_thread(_config_apply, {"mode": new_mode})
+    except RuntimeError as e:
+        # B-13 rejected the LIVE arm (T-01); surface it and keep prior mode.
+        return JSONResponse(
+            {"response": f"resume to {new_mode} refused: {e}", "kind": "error"})
     old = result["old"].get("mode", "?")
+    if verb != "pause" and new_mode != "LIVE":
+        # A normal resume consumed the stored mode.
+        _clear_pre_pause_mode()
     # F22: a terminal pause/resume is the same high-value mode switch as the
     # web path — persist it so it survives restarts (forked to events.jsonl).
     try:
