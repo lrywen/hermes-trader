@@ -1243,6 +1243,68 @@ def regime_strength_label(analysis: dict[str, Any]) -> str:
     return "CHOP"
 
 
+def coin_breakout_regime(analysis: dict[str, Any]) -> str:
+    """Coin-local trend override for regime-aware exit/sizing.
+
+    ``select_exit_params`` only loosens to trend-ride / wide stop when the
+    MACRO market regime is up/down. A coin can stage a strong, high-RVOL
+    breakout while the market (BTC) regime is neutral — the AERO / ARB cases —
+    and then wrongly gets scalp params + a 0.8% stop (~0.2 ATR), even though
+    its own tape is launching. This derives the directional regime from the
+    coin itself:
+
+      * requires ``breakout_fired`` (that flag already includes RVOL>=1.5x and
+        the closed-bar / flow-confirmed geometry),
+      * re-verifies force: within the last ``lookback`` closed 5m bars at least
+        one printed RVOL >= ``launch_capture.breakout_trend_rvol_min`` (default
+        2.0), using the shared candle cache (hot right after the scan). A window
+        (not just the latest bar) is required because the decision can land a
+        bar or two after the actual launch bar (XPL: the 6x bar was two bars
+        before admission, so a last-bar-only check saw the post-launch
+        low-volume bar and wrongly stayed on scalp),
+      * direction from the trade ``side`` / EMA8-vs-EMA21.
+
+    Returns "up"/"down" when a strong coin breakout qualifies, else "" (caller
+    keeps the macro regime). Best-effort, never raises.
+    """
+    try:
+        if not bool(analysis.get("breakout_fired")):
+            return ""
+        coin = analysis.get("coin")
+        if not coin:
+            return ""
+        rvol_min = float(cfg_get("launch_capture.breakout_trend_rvol_min", 2.0))
+        lookback = int(cfg_get("launch_capture.breakout_trend_rvol_lookback", 3))
+        lookback = max(1, min(lookback, 6))
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        m5 = fetch_hl_candles(coin, "5m", 30)
+        if len(m5) < 21:
+            return ""
+        vols = [float(getattr(b, "v", 0.0) or 0.0) for b in m5]
+        # Any one of the last ``lookback`` bars (the current forming bar is
+        # vols[-1]) must have printed RVOL >= threshold vs its own trailing
+        # 20-bar baseline.
+        strong = False
+        for idx in range(len(vols) - 1, len(vols) - 1 - lookback, -1):
+            if idx - 20 < 0:
+                continue
+            base = sum(vols[idx - 20:idx]) / 20.0
+            if base > 0 and vols[idx] / base >= rvol_min:
+                strong = True
+                break
+        if not strong:
+            return ""
+        side = analysis.get("side")
+        if side not in ("long", "short"):
+            e8 = analysis.get("ema8_1h"); e21 = analysis.get("ema21_1h")
+            if e8 is None or e21 is None:
+                return ""
+            side = "long" if float(e8) > float(e21) else "short"
+        return "up" if side == "long" else "down"
+    except Exception:
+        return ""
+
+
 def plan_b_size_multiplier(analysis: dict[str, Any],
                            plan_b_cfg: dict[str, Any]) -> tuple[float, str]:
     """Plan B: in a mid-strength TREND (not STRONG_TREND), RSI 40-60 has no
@@ -3779,6 +3841,16 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                     _regime = detect_regime(coin)
                 except Exception as _re_e:
                     logger.warning(f"[sizing-v2] regime detect failed for {coin}: {_re_e}")
+                # Coin-local override: a strong high-RVOL breakout qualifies as
+                # trend even when the macro (BTC) regime is neutral, so the
+                # position gets trend-ride / wide-stop params instead of a
+                # ~0.2-ATR scalp stop (AERO / ARB fix).
+                _coin_regime = coin_breakout_regime(analysis)
+                if _coin_regime:
+                    logger.info(
+                        f"[sizing-v2] {coin} coin-breakout override: "
+                        f"macro={_regime} → trend({_coin_regime})")
+                    _regime = _coin_regime
                 _atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
                 _slip_bps = memory.avg_exit_slip_bps(coin, days=30.0)
                 _slip_pct = _slip_bps / 100.0
@@ -5037,6 +5109,44 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         or (volume and burst_for_side)
         or (burst_for_side and score >= min_score)
     )
+
+    # P1 velocity/position decoupling: a burst measures VELOCITY, so the fastest
+    # print is often the terminal tick of an already-run move. When a *burst*
+    # (not a volume-self-confirming breakout) is what qualifies the entry, check
+    # the real-time (forming-bar) short interval — an already-stretched burst is
+    # exhaustion, not a fresh impulse, so don't let it satisfy "fresh" structure.
+    # Hard safety still lives in late_chase Leg3 at the gate (which runs after);
+    # this just keeps an exhausted burst from being treated as fresh structure.
+    terminal_burst = False
+    if burst_for_side and not breakout:
+        try:
+            from hermes_trader.agents.risk_gates import _realtime_terminal
+            _lc_cfg = (config.get("late_chase") or {}) if isinstance(config, dict) else {}
+            _rt_cfg = _lc_cfg.get("realtime") if isinstance(_lc_cfg, dict) else None
+            if isinstance(_rt_cfg, dict) and _rt_cfg.get("enabled", False):
+                _mid_now = float(analysis.get("mid_price") or analysis.get("price") or 0.0)
+                _got = _realtime_terminal(
+                    coin, str(_rt_cfg.get("interval", "5m")), _mid_now)
+                if _got is not None:
+                    _live_rsi, _live_ext = _got
+                    _rsi_hi = float(_rt_cfg.get("rsi_overbought", 80.0) or 0.0)
+                    _rsi_lo = float(_rt_cfg.get("rsi_oversold", 20.0) or 0.0)
+                    _ext = float(_rt_cfg.get("max_extension_atr", 3.0) or 0.0)
+                    terminal_burst = (
+                        (side == "long" and (
+                            (_rsi_hi > 0 and _live_rsi > _rsi_hi) or
+                            (_ext > 0 and _live_ext > _ext))) or
+                        (side == "short" and (
+                            (_rsi_lo > 0 and _live_rsi < _rsi_lo) or
+                            (_ext > 0 and _live_ext < -_ext))))
+                    if terminal_burst:
+                        fresh_impulse = False
+                        logger.info(
+                            f"[runner_gate] {coin} {side} burst at terminal "
+                            f"({_live_rsi:.0f} RSI / {_live_ext:.1f} ATR) "
+                            f"→ not a fresh impulse")
+        except Exception:
+            pass
 
     logger.info(
         f"[runner_gate] {coin} side={side} conf={gate_conf:.2f}/{min_conf:.2f} "

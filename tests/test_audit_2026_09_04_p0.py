@@ -17,7 +17,6 @@ from hermes_trader.agents import research as R
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
 from hermes_trader.agents.executor import _tiered_notional_cap
 
-
 # ── P0-1: debate per-leg timeouts ──────────────────────────────────────────
 
 def _patch_debate_cfg(monkeypatch, **overrides):
@@ -109,10 +108,12 @@ def test_llm_circuit_breaker_tightened():
     assert cb["cooldown_s"] == 300
 
 
-def test_debate_and_llm_timeouts_unified_at_25s():
-    # P0-7: debate max_latency and research_llm timeout agree at 25s.
-    assert CANONICAL_DEFAULTS["debate_research"]["max_latency_s"] == 25.0
-    assert CANONICAL_DEFAULTS["research_llm"]["timeout_sec"] == 25.0
+def test_debate_and_llm_timeouts_unified_at_55s():
+    # P0-7 originally unified debate max_latency and research_llm timeout at
+    # 25s. Audit 2026-09-23 raised both to 55s to cover the observed slow-
+    # reasoning p85; they must still agree with each other.
+    assert CANONICAL_DEFAULTS["debate_research"]["max_latency_s"] == 55.0
+    assert CANONICAL_DEFAULTS["research_llm"]["timeout_sec"] == 55.0
 
 
 def test_research_llm_continuations_capped():

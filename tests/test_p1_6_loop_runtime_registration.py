@@ -60,6 +60,7 @@ LEAVES = (
     "research_parallel",
     "research_parallel_workers",
     "research_max_jobs_per_scan",
+    "research_batch_timeout_s",
 )
 LEGACY_ENVS = tuple(spec[0] for spec in _LEGACY_ENV_SPEC.values())
 
@@ -73,13 +74,13 @@ def _clear_legacy_envs(monkeypatch):
         monkeypatch.delenv(var, raising=False)
 
 
-# ── canonical 登记：块存在、19 叶、与 resolver 字面量表逐字一致 ────────────
+# ── canonical 登记：块存在、20 叶、与 resolver 字面量表逐字一致 ────────────
 
 def test_p1_6_block_registered():
-    """loop_runtime 嵌套块必须在 CANONICAL_DEFAULTS 中且恰为 19 叶。"""
+    """loop_runtime 嵌套块必须在 CANONICAL_DEFAULTS 中且恰为 20 叶。"""
     assert BLOCK in CANONICAL_DEFAULTS
     assert isinstance(CANONICAL_DEFAULTS[BLOCK], dict)
-    assert len(CANONICAL_DEFAULTS[BLOCK]) == 19
+    assert len(CANONICAL_DEFAULTS[BLOCK]) == 20
     assert set(CANONICAL_DEFAULTS[BLOCK]) == set(LEAVES)
 
 
@@ -111,6 +112,7 @@ def test_p1_6_individual_leaf_values_sentinel():
     assert b["research_parallel"] is True          # 默认开（P1-4 审计结论）
     assert b["research_parallel_workers"] == 4
     assert b["research_max_jobs_per_scan"] == 8
+    assert b["research_batch_timeout_s"] == 180.0
 
 
 def test_p1_6_leaf_types_match_literals():
@@ -122,7 +124,8 @@ def test_p1_6_leaf_types_match_literals():
         assert isinstance(b[leaf], int) and not isinstance(b[leaf], bool), leaf
     for leaf in ("surge_min_score", "exit_checkpoint_min_interval_s",
                  "meta_prewarm_timeout_s", "startup_grace_s", "scan_fresh_s",
-                 "ws_status_hold_s", "ws_status_fresh_s"):
+                 "ws_status_hold_s", "ws_status_fresh_s",
+                 "research_batch_timeout_s"):
         assert isinstance(b[leaf], float), leaf
     for leaf in ("scan_dynamic", "ws_fill_wake", "ws_status_event",
                  "research_parallel"):
@@ -139,7 +142,7 @@ def test_p1_6_cfg_get_all_leaves():
 
 def test_p1_6_cfg_get_full_block():
     blk = cfg_get(BLOCK, config={})
-    assert isinstance(blk, dict) and len(blk) == 19
+    assert isinstance(blk, dict) and len(blk) == 20
     assert blk["scan_interval"] == 15
     assert blk["research_parallel"] is True
 
@@ -216,7 +219,7 @@ def test_p1_6_config_patch_knows_block():
     blk = fields[BLOCK].default_factory()
     assert blk["scan_interval"] == 15
     assert blk["research_parallel_workers"] == 4
-    assert len(blk) == 19
+    assert len(blk) == 20
 
 
 # ── helper：默认 18 叶 == 字面量、SPEC 映射正确 ───────────────────────────
@@ -229,8 +232,8 @@ def test_p1_6_helper_defaults_equal_literals(monkeypatch):
 
 
 def test_p1_6_spec_maps_nineteen_legacy_envs():
-    """19 个 leaf 全部映射到 legacy HERMES_* env（无一纯硬编码）。"""
-    assert len(_LEGACY_ENV_SPEC) == 19
+    """20 个 leaf 全部映射到 legacy HERMES_* env（无一纯硬编码）。"""
+    assert len(_LEGACY_ENV_SPEC) == 20
     assert _LEGACY_ENV_SPEC["loop_log_path"] == ("HERMES_LOOP_LOG_FILE", "str")
     assert _LEGACY_ENV_SPEC["surge_min_score"] == ("HERMES_SURGE_MIN_SCORE", "float")
     assert _LEGACY_ENV_SPEC["watchdog_timeout_s"] == ("HERMES_WATCHDOG_TIMEOUT_S", "int")
@@ -254,6 +257,8 @@ def test_p1_6_spec_maps_nineteen_legacy_envs():
         "HERMES_RESEARCH_PARALLEL_WORKERS", "int")
     assert _LEGACY_ENV_SPEC["research_max_jobs_per_scan"] == (
         "HERMES_RESEARCH_MAX_JOBS_PER_SCAN", "int")
+    assert _LEGACY_ENV_SPEC["research_batch_timeout_s"] == (
+        "HERMES_RESEARCH_BATCH_TIMEOUT_S", "float")
 
 
 # ── legacy env 兼容（硬约束）：仍生效且优先于 canonical 通道 ──────────────

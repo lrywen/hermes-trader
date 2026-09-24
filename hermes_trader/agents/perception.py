@@ -521,6 +521,18 @@ def _scan_single_market(
             candles_1h, _ = _drop_forming_bar(candles_1h, "1h")
 
         thresholds = config["thresholds"]
+        # Launch capture: read the real-time aggressive-flow (CVD) accumulator
+        # populated by the WS trades subscription. A signed read aligned with
+        # the break lets breakout() accept the launch bar instead of waiting
+        # the full confirmation. None when launch capture is off / no flow.
+        _flow_confirm = None
+        try:
+            _lc_capture = (config.get("launch_capture") or {})
+            if _lc_capture.get("enabled", False):
+                from hermes_trader.agents.microstructure import get_microstructure
+                _flow_confirm = get_microstructure().aggression(market["coin"])
+        except Exception:
+            _flow_confirm = None
         hits = [
             trigger_mod.pct_move_spike(candles, thresholds["sigmaThreshold"]),
             trigger_mod.volume_spike(candles, thresholds["sigmaThreshold"]),
@@ -531,6 +543,9 @@ def _scan_single_market(
                 rvol_window=thresholds.get("breakoutRvolWindow", 20),
                 atr_score_mult=thresholds.get("breakoutAtrScoreMult", 3.0),
                 confirm_bars=thresholds.get("breakoutConfirmBars", 2),
+                flow_confirm=_flow_confirm,
+                flow_confirm_min=float(
+                    (config.get("launch_capture") or {}).get("flow_confirm_min", 0.7)),
             ),
             trigger_mod.range_compression(candles, thresholds["bbLength"], thresholds["bbStdDev"]),
             trigger_mod.trend_strength(candles, thresholds["adxPeriod"]),

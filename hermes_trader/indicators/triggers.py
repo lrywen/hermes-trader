@@ -102,6 +102,8 @@ def breakout(
     atr_period: int = 14,
     atr_score_mult: float = 3.0,
     confirm_bars: int = 2,
+    flow_confirm: float | None = None,
+    flow_confirm_min: float = 0.7,
 ) -> TriggerHit:
     """Breakout detection against the prior range high/low over lookback bars.
 
@@ -112,6 +114,15 @@ def breakout(
     stop-runs / fakeouts that immediately reverse back into the range — a
     single wick close above the high no longer fires. (Set confirm_bars=1 to
     restore the old single-close behavior.)
+
+    Adaptive confirmation (launch capture): ``flow_confirm`` is a signed,
+    directional aggression read in [-1,1] (CVD aligned with the break: + for
+    an upside break, − for downside). When it is at least
+    ``flow_confirm_min``, one-sided aggressive taking substitutes for
+    bar-holding, so a single strong close is accepted — entering at the
+    launch bar instead of waiting the full confirmation. ``None`` (no
+    microstructure read) preserves the standard ``confirm_bars`` behavior and
+    fails safe.
 
     Score is ATR-normalized so BTC/ETH and low-price alts are on the same
     scale: ``score = min(10, |close - edge| / ATR * atr_score_mult)``. A
@@ -124,6 +135,16 @@ def breakout(
 
     current = candles[-1]
     cur_close = candle_val(current, "c")
+
+    # Adaptive confirmation: strong one-sided flow aligned with an UPSIDE
+    # break lets the latest single close act as the whole confirm window;
+    # aligned DOWNSIDE flow likewise. We evaluate the held test against the
+    # latest close and mark flow-confirmed so the reason stays auditable.
+    flow_up = (flow_confirm is not None
+               and float(flow_confirm) >= float(flow_confirm_min))
+    flow_dn = (flow_confirm is not None
+               and float(flow_confirm) <= -float(flow_confirm_min))
+
     # Prior range is the `lookback` bars BEFORE the confirmation window.
     prior_start = len(candles) - lookback - confirm_bars
     prior_end = len(candles) - confirm_bars
@@ -142,13 +163,23 @@ def breakout(
                       for i in range(len(candles) - confirm_bars, len(candles))]
     held_above = all(c > prior_high for c in confirm_closes)
     held_below = all(c < prior_low for c in confirm_closes)
+    # Flow-confirmed launch: the latest single close beyond the edge counts
+    # (aggressive taking substitutes for the N-bar hold). Still require the
+    # close beyond the same edge so direction is unambiguous.
+    flow_confirmed_above = bool(flow_up and cur_close > prior_high)
+    flow_confirmed_below = bool(flow_dn and cur_close < prior_low)
+    held_above = held_above or flow_confirmed_above
+    held_below = held_below or flow_confirmed_below
     first_break_idx = len(candles) - confirm_bars  # bar that first cleared edge
 
     # RVOL: current volume relative to prior `rvol_window`-bar average.
     # For multi-bar confirmation, measure volume on the bar that FIRST broke
     # the edge (the start of the confirm window) — that is the volume bar
-    # that actually matters for confirming institutional participation.
+    # that actually matters for confirming institutional participation. For a
+    # flow-confirmed launch the latest (launch) bar is the relevant volume.
     rvol_ref_idx = min(len(candles) - 1, first_break_idx)
+    if flow_confirmed_above or flow_confirmed_below:
+        rvol_ref_idx = len(candles) - 1
     cur_vol = candle_val(candles[rvol_ref_idx], "v")
     vol_start = max(0, rvol_ref_idx - rvol_window)
     prior_vols = [candle_val(candles[i], "v") for i in range(vol_start, rvol_ref_idx)]
@@ -176,13 +207,14 @@ def breakout(
         full_score = _break_score(distance, prior_high)
         if rvol_ok:
             held_note = f"held {confirm_bars} bars" if confirm_bars > 1 else ""
+            flow_note = ", flow-confirmed launch" if flow_confirmed_above else ""
             return {
                 "name": "breakout",
                 "score": full_score,
                 "reason": (
                     f"breakout above {lookback}-bar high "
                     f"(+{distance/ prior_high * 100:.2f}%, RVOL {rvol:.2f}x"
-                    f"{', ' + held_note if held_note else ''})"
+                    f"{', ' + held_note if held_note else ''}{flow_note})"
                 ),
                 "fired": True,
             }
@@ -204,13 +236,14 @@ def breakout(
         full_score = _break_score(distance, prior_low)
         if rvol_ok:
             held_note = f"held {confirm_bars} bars" if confirm_bars > 1 else ""
+            flow_note = ", flow-confirmed launch" if flow_confirmed_below else ""
             return {
                 "name": "breakout",
                 "score": full_score,
                 "reason": (
                     f"breakout below {lookback}-bar low "
                     f"(-{distance / prior_low * 100:.2f}%, RVOL {rvol:.2f}x"
-                    f"{', ' + held_note if held_note else ''})"
+                    f"{', ' + held_note if held_note else ''}{flow_note})"
                 ),
                 "fired": True,
             }

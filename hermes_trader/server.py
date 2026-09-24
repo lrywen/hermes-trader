@@ -43,6 +43,18 @@ def _load_env_local_early() -> None:
 
 _load_env_local_early()
 
+# 统一敏感配置（LLM/交易所/飞书）：把已保存到 .secrets.json 的密钥在任何
+# hermes_trader 模块导入前注入 os.environ。放在 .env.local 之后并用
+# setdefault，因此真实环境变量 / K8s Secret 优先级最高，secret 文件只补齐。
+try:
+    from hermes_trader.agents.secret_store import bootstrap_env as _bootstrap_secrets
+
+    _bootstrap_secrets()
+except Exception as _e:  # 绝不能因 secret 加载问题阻断启动
+    import logging as _logging
+
+    _logging.getLogger("hermes-secrets").debug("secret bootstrap skipped: %s", _e)
+
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse

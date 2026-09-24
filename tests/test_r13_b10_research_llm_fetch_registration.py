@@ -130,17 +130,18 @@ def test_r13_b10_individual_llm_leaf_values_sentinel():
     assert b["temperature"] == 0.1
     assert b["max_tokens"] == 500
     assert b["debate_max_tokens"] == 350
-    # Audit 2026-09-04 P0-7: unified with debate_research.max_latency_s=25.
-    assert b["timeout_sec"] == 25.0
+    # Audit 2026-09-23: raised 25→55 to cover observed slow-reasoning p85.
+    assert b["timeout_sec"] == 55.0
     assert b["connect_timeout_sec"] == 5.0
-    assert b["retries"] == 2
+    # Audit 2026-09-23: retries 2→1 (one p85-covered attempt).
+    assert b["retries"] == 1
     assert b["backoff_base_sec"] == 1.0
     assert b["backoff_cap_sec"] == 15.0
     # Audit 2026-09-04 P1-13: continuations capped to 1 (was 2 → 75s worst case).
     assert b["continuations"] == 1
     # Audit 2026-09-03 P0-2: fallback path per-call cap; 0 disables.
-    # Audit 2026-09-04 P0-7: aligned to 25s.
-    assert b["fallback_timeout_sec"] == 25.0
+    # Audit 2026-09-23: aligned to 55s.
+    assert b["fallback_timeout_sec"] == 55.0
 
 
 def test_r13_b10_individual_fetch_leaf_values_sentinel():
@@ -191,7 +192,7 @@ def test_r13_b10_cfg_get_full_blocks():
     lb = cfg_get(LLM_BLOCK, config={})
     assert isinstance(lb, dict) and len(lb) == 12  # Audit 2026-09-03 P0-2: +fallback_timeout_sec
     assert lb["model"] == "deepseek-v4-flash"
-    assert lb["retries"] == 2
+    assert lb["retries"] == 1
     fb = cfg_get(FETCH_BLOCK, config={})
     assert isinstance(fb, dict) and len(fb) == 9
     assert fb["pool_workers"] == 16
@@ -240,7 +241,7 @@ def test_r13_b10_config_dict_partial_overlay():
     assert cfg_get(f"{LLM_BLOCK}.max_tokens", config=cfg) == 1024
     assert cfg_get(f"{LLM_BLOCK}.temperature", config=cfg) == 0.3
     assert cfg_get(f"{LLM_BLOCK}.model", config=cfg) == "deepseek-v4-flash"
-    assert cfg_get(f"{LLM_BLOCK}.retries", config=cfg) == 2
+    assert cfg_get(f"{LLM_BLOCK}.retries", config=cfg) == 1
     assert cfg_get(f"{FETCH_BLOCK}.pool_workers", config=cfg) == 4
     assert cfg_get(f"{FETCH_BLOCK}.fetch_timeout_news_sec", config=cfg) == 9.0
     assert cfg_get(f"{FETCH_BLOCK}.max_connections", config=cfg) == 16
@@ -295,7 +296,7 @@ def test_r13_b10_config_patch_knows_both_blocks():
     assert LLM_BLOCK in fields and FETCH_BLOCK in fields
     lb = fields[LLM_BLOCK].default_factory()
     # Audit 2026-09-03 P0-2: 12 leaves (+fallback_timeout_sec).
-    assert len(lb) == 12 and lb["model"] == "deepseek-v4-flash" and lb["retries"] == 2
+    assert len(lb) == 12 and lb["model"] == "deepseek-v4-flash" and lb["retries"] == 1
     fb = fields[FETCH_BLOCK].default_factory()
     assert len(fb) == 9 and fb["pool_workers"] == 16 and fb["max_keepalive_connections"] == 8
 

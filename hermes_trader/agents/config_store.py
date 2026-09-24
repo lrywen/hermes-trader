@@ -246,6 +246,48 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # block if the live composite score has fallen below the runner floor
     # (prevents booking on a score the market no longer supports).
     "score_invariant_enabled": True,
+    # Late-chase gate: (a) move-state machine blocks joining a move that has
+    # already run more than fresh_move_band_pct beyond its anchor, and (b) a
+    # terminal 1h-RSI blowoff blocks entries regardless of trigger freshness.
+    "late_chase": {
+        "enabled": True,
+        "fresh_move_band_pct": 8.0,
+        "rsi1h_overbought": 85.0,
+        "rsi1h_oversold": 15.0,
+        # P2：锚点防重锚。
+        "min_anchor_age_sec": 300.0,
+        "min_move_extension_pct_for_reset": 3.0,
+        # P1 Leg3：短周期、对未收盘 bar 实时计算的耗尽度。
+        "realtime": {
+            "enabled": True,
+            "interval": "5m",
+            "rsi_overbought": 80.0,
+            "rsi_oversold": 20.0,
+            "max_extension_atr": 3.0,
+        },
+    },
+    # 抓住启动点（leading signals，shadow-only）：用主动成交流(CVD)、盘口失衡、
+    # 波动压缩与 HTF 关键位共振，在突破确认之前/当根给出预触发。不直接下单，
+    # 仅放宽 breakout 的确认根数与标记 launch 证据。
+    "launch_capture": {
+        "enabled": True,
+        "aggression_min": 0.55,       # burst 窗口最低单向主动占比
+        "imbalance_min": 0.2,         # 盘口失衡阈值
+        "compression_pct_max": 20.0,  # BB 带宽分位 ≤ 此值视为压缩
+        "require_key_level": True,    # 要求 HTF 关键位共振
+        "flow_confirm_min": 0.7,      # CVD 强到可替代 N 根确认
+        "breakout_trend_rvol_min": 2.0,  # 强突破据此升级为 trend（宽止损）
+        "breakout_trend_rvol_lookback": 3,  # 近N根5m内出现过强RVOL即升级（决策可能晚启动bar一两根）
+        # 订阅时序修复：在突破发生“之前”就对尚未触发、但处于压缩蓄力状态的
+        # 候选币持续订阅 trades，使 CVD 累加器在启动当根已有连续读数。
+        "presubscribe_enabled": True,
+        "presubscribe_pool": 60,       # 从流动 universe 头部取多少币做压缩筛查
+        "presubscribe_max": 12,       # 额外提前订阅的未触发币上限
+        "presubscribe_compress_pct_max": 20.0,  # 带宽分位 ≤ 此值视为蓄力候选
+        "weight_aggression": 0.5,
+        "weight_imbalance": 0.2,
+        "weight_compression": 0.3,
+    },
     "counter_regime_min_conf": 0.8,
     "max_crypto_long_correlated": 3,
     "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
@@ -268,12 +310,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "breakeven_trigger_pct": 0.0,
         "breakeven_lock_pct": 0.0,
         "stale_flat_timeout_minutes": 90.0,
-        # B-11：atr_stop 已 DEPRECATED（死代码）。§2.7 P4 结论：8 个固定宽度
-        # 全扫均负，ATR 自适应止损被否证；`min(regime_cap, atr_cap)` 中 regime
-        # cap 恒胜出（W3 A-3 逐笔验证），启用也不会放宽实际止损。保留块仅为
-        # byte-aligned parity（stop_model.py / dsl_exit.py），禁止重新启用。
+        # P0（2026-09-23，UNI/MON 末端追高复盘）：重新启用 ATR 自适应止损。
+        # 此前“启用也不放宽”的原因是 trend regime cap=0.8% 在 min(regime_cap,
+        # atr_cap) 中恒胜出；本次同时把 regime_aware.max_loss.trend 的上限放宽到
+        # 4.0%，使 ATR 宽度得以生效（见该块注释）。non_trend（chop/scalp）仍为
+        # 0.4% 紧止损，行为不变。
         "atr_stop": {
-            "enabled": False,
+            "enabled": True,
             "atr_mult": 1.5,
             "floor_pct": 1.0,
             "ceiling_pct": 4.0,
@@ -342,7 +385,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
                 ],
             },
             "max_loss": {
-                "trend": {"max_loss_pct": 0.8, "max_loss_roe_pct": 10.0},
+                # P0：trend 上限 0.8% → 4.0%（天花板，非目标宽度）。配合 atr_stop
+                # 启用，实际止损 = min(4.0%, clamp(1.5×ATR%, 1%, 4%))，给趋势单
+                # 足够噪声空间；杠杆帽同步放宽 trend ROE 10%→20%（5x 下=4% 现货），
+                # 否则 ROE 帽恒为 2% 现货，仍会架空 ATR 宽度。
+                "trend": {"max_loss_pct": 4.0, "max_loss_roe_pct": 20.0},
                 "non_trend": {"max_loss_pct": 0.4, "max_loss_roe_pct": 5.0},
             },
             # Audit 2026-09-06 (E3, P2): regime-split position-lifetime clocks
@@ -624,7 +671,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # the debate's overall latency budget and the LLM per-call timeout
         # agree — when the debate gives up, the LLM call has already timed
         # out (no residual 12s burning of quota after a debate abort).
-        "max_latency_s": 25.0,
+        # Audit 2026-09-23: raised from 25 to 55 so the debate legs (bull/bear
+        # 0.7×=38.5s, synth 0.92×=50.6s) cover the observed slow-reasoning p85.
+        "max_latency_s": 55.0,
         # Audit 2026-09-04 P0-1: optional per-leg timeouts. When set they win
         # over the max_latency_s fractions; when unset the legs scale directly
         # off max_latency_s (bull 0.7×, synth 0.92×) with no hard cap, so a
@@ -1500,9 +1549,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # Audit 2026-09-04 P0-7: unified with debate_research.max_latency_s=25
         # so a debate abort and the LLM per-call timeout line up — no residual
         # 12s of quota burn after the debate gives up.
-        "timeout_sec": 25.0,
+        # Audit 2026-09-23: real Ark verdicts (long prompt + reasoning tokens)
+        # show median ~38s / p85 ~53s; the old 25s cap killed 76% of successful
+        # reads. Raised to 55s to cover p85 in one attempt; retries=1.
+        "timeout_sec": 55.0,
         "connect_timeout_sec": 5.0,
-        "retries": 2,
+        "retries": 1,
         "backoff_base_sec": 1.0,
         "backoff_cap_sec": 15.0,
         # Audit 2026-09-04 P1-13: continuations=2 meant an incomplete LLM reply
@@ -1514,7 +1566,45 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # (legacy 60s inheritance). Mirrors research.py literal verbatim.
         # Audit 2026-09-04 P0-7: aligned to 25s in sync with research_llm
         # timeout_sec and debate max_latency_s.
-        "fallback_timeout_sec": 25.0,
+        "fallback_timeout_sec": 55.0,
+    },
+    # 2026-09-23: shadow probe for capping TOTAL output (reasoning + answer)
+    # via OpenAI's max_completion_tokens. Unlike max_tokens (which bounds only
+    # the answer on this model), max_completion_tokens bounds the chain-of-
+    # thought too — the part that actually drives latency. This block is
+    # COUNTERFACTUAL ONLY: it never alters the real request. After each call it
+    # reads the real usage and records (to a shadow jsonl) whether the proposed
+    # cap would have truncated the output, plus the observed token counts /
+    # wall time. Promote to "enforce" only after the shadow shows truncation is
+    # rare and verdicts still parse. mode: off | shadow | enforce.
+    "completion_cap_shadow": {
+        "mode": "shadow",
+        # Proposed ceiling for reasoning_tokens + answer completion_tokens.
+        # Raised 1200→5000: real calls show reasoning 1475–5434, so 1200
+        # truncated 100% of samples. 5000 keeps the rare heavy-high tail
+        # observable while measuring the residual truncation rate.
+        "max_completion_tokens": 5000,
+        # Also record the counterfactual per-call timeout a cap would imply
+        # (informational; used later to pick a tighter read timeout). 0 skips.
+        "implied_timeout_sec": 40.0,
+        "log_path": "",   # empty = <data_dir>/completion_cap_shadow.jsonl
+        "sample_rate": 1.0,  # fraction of calls to record (0–1)
+    },
+    # 2026-09-23: canary rollout for OpenAI's reasoning_effort. Controlled
+    # testing on real verdicts proved low cuts reasoning tokens ~39% and wall
+    # time ~48% vs high, without truncating the final answer. This block is the
+    # safe path to production:
+    #   off      → never send the parameter (legacy behaviour)
+    #   shadow   → don't send, just record the counterfactual (no traffic change)
+    #   enforce  → actually attach reasoning_effort=<effort>; sample_rate lets a
+    #              small % of traffic go first, the rest stays legacy
+    # Verdicts remain valid because low only shrinks the (unseen) chain of
+    # thought, not the emitted JSON.
+    "reasoning_effort_rollout": {
+        "mode": "enforce",
+        "effort": "low",          # none | low | high | max
+        "sample_rate": 1.0,       # enforce: fraction of requests to apply low
+        "log_path": "",           # empty = <data_dir>/reasoning_effort_rollout.jsonl
     },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
@@ -1705,6 +1795,14 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # 2026-09-04: per-scan jobs backpressure cap (mirrors
         # loop_runtime.LOOP_RUNTIME_DEFAULTS); 0 disables the cap.
         "research_max_jobs_per_scan": 8,
+        # 2026-09-23: hard wall-clock cap for the whole parallel research
+        # batch. The batch blocks the main loop on the slowest coin
+        # (fut.result() has no per-future timeout); this bounds the total wait
+        # so a stall can never stretch a scan toward the 600s watchdog. Any
+        # coin still unfinished when the budget expires is dropped and routed
+        # as a conservative PASS. 0 disables the cap (legacy behaviour).
+        # Tightened 240→180 for a more aggressive scan cadence.
+        "research_batch_timeout_s": 180.0,
     },
     # Audit 2026-09-10 (risk-tuning shadow): volatility/score de-leverage
     # arm read by executor.py (`_lev_tier`). shadow_mode=false keeps it an

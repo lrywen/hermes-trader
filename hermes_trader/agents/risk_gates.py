@@ -96,6 +96,164 @@ def score_invariant_gate(
     return {"pass": True, "fresh_score": round(float(fresh), 2)}
 
 
+def late_chase_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
+    """Block entries that join an already-missed / terminal move.
+
+    Two complementary checks, both evaluated at order time:
+
+    1. Move-state machine (move_state.entry_allowed): once a coin's directional
+       move has run more than ``fresh_move_band_pct`` beyond its anchor, the
+       move is "missed" and joining it in the same direction is blocked until a
+       pullback re-anchors. This catches the BCH failure (bought +19% from the
+       12:30 anchor at the terminal tick).
+    2. Terminal 1h RSI blowoff: a LONG with 1h RSI above ``rsi1h_overbought``
+       (or a SHORT with 1h RSI below ``rsi1h_oversold``) is a blowoff-top/
+       bottom entry regardless of whether the breakout trigger itself is fresh
+       — a 3x-RVOL breakout printed at RSI 87 after a 43-min vertical is a
+       distribution wick, not a continuation.
+
+    Fail-open when the data cannot be obtained (a risk gate must not stall the
+    order path); thresholds <= 0 disable each leg. Mode-independent (SHADOW and
+    LIVE parity).
+    """
+    cfg = config.get("late_chase")
+    if not isinstance(cfg, dict) or not bool(cfg.get("enabled", False)):
+        return {"pass": True, "via": "late_chase_disabled"}
+    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
+    mid = float(ctx.entry_px or 0.0)
+    if mid <= 0:
+        return {"pass": True}
+
+    # Leg 1 — move-state freshness.
+    band = float(cfg.get("fresh_move_band_pct", 8.0) or 0.0)
+    from hermes_trader.agents.move_state import entry_allowed as _move_entry_allowed
+    allowed, why = _move_entry_allowed(
+        coin=ctx.coin, side=side, mid=mid, fresh_max_extension_pct=band)
+    if not allowed:
+        logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
+        return {"pass": False, "via": "late_chase_missed_move", "reason": why}
+
+    # Leg 2 — terminal 1h RSI.
+    rsi_high = float(cfg.get("rsi1h_overbought", 85.0) or 0.0)
+    rsi_low = float(cfg.get("rsi1h_oversold", 15.0) or 0.0)
+    if (side == "long" and rsi_high > 0) or (side == "short" and rsi_low > 0):
+        rsi1h = _latest_closed_rsi(ctx.coin, "1h")
+        if rsi1h is not None:
+            if side == "long" and rsi1h > rsi_high:
+                why = f"1h RSI {rsi1h:.0f} > {rsi_high:.0f} — terminal blowoff long"
+                logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
+                return {"pass": False, "via": "late_chase_rsi_blowoff", "reason": why}
+            if side == "short" and rsi1h < rsi_low:
+                why = f"1h RSI {rsi1h:.0f} < {rsi_low:.0f} — terminal blowoff short"
+                logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
+                return {"pass": False, "via": "late_chase_rsi_blowoff", "reason": why}
+
+    # Leg 3 — real-time short-timeframe exhaustion (forming-bar aware).
+    # Closes the lag hole: UNI/MON/PUMP entered inside the forming bar while
+    # closed-bar 1h RSI was still 49–59. Evaluated on a fast interval with the
+    # live mid so a terminal vertical is visible *now*. Block when either the
+    # real-time RSI or the extension-in-ATR is at a blowoff extreme.
+    rt = cfg.get("realtime")
+    if isinstance(rt, dict) and rt.get("enabled", False):
+        interval = str(rt.get("interval", "5m"))
+        rt_rsi_high = float(rt.get("rsi_overbought", 80.0) or 0.0)
+        rt_rsi_low = float(rt.get("rsi_oversold", 20.0) or 0.0)
+        rt_ext = float(rt.get("max_extension_atr", 3.0) or 0.0)
+        got = _realtime_terminal(ctx.coin, interval, mid)
+        if got is not None:
+            live_rsi, live_ext = got
+            if side == "long" and (
+                    (rt_rsi_high > 0 and live_rsi > rt_rsi_high) or
+                    (rt_ext > 0 and live_ext > rt_ext)):
+                why = (f"{interval} live RSI {live_rsi:.0f}/ext {live_ext:.1f}ATR "
+                       f"— terminal vertical long")
+                logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
+                return {"pass": False, "via": "late_chase_realtime_blowoff",
+                        "reason": why}
+            if side == "short" and (
+                    (rt_rsi_low > 0 and live_rsi < rt_rsi_low) or
+                    (rt_ext > 0 and live_ext < -rt_ext)):
+                why = (f"{interval} live RSI {live_rsi:.0f}/ext {live_ext:.1f}ATR "
+                       f"— terminal vertical short")
+                logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
+                return {"pass": False, "via": "late_chase_realtime_blowoff",
+                        "reason": why}
+
+    return {"pass": True}
+
+
+def _latest_closed_rsi(coin: str, interval: str) -> Optional[float]:
+    """RSI of the last CLOSED bar for a coin/interval, best-effort.
+
+    Uses the shared candle cache (dropping the still-forming tail) so it does
+    not add cold network weight on a cache-hot order path. Returns None on any
+    failure / insufficient data (caller fails open).
+    """
+    try:
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        from hermes_trader.indicators.math import rsi as rsi_arr
+
+        candles = fetch_hl_candles(coin, interval, 60)
+        candles, _ = _drop_forming_bar(candles, interval)
+        if len(candles) < 20:
+            return None
+        vals = rsi_arr(candles, 14)
+        val = vals[-1] if vals else None
+        return float(val) if val is not None and val == val else None
+    except Exception:
+        return None
+
+
+def _realtime_terminal(coin: str, interval: str, mid: float) -> Optional[tuple[float, float]]:
+    """Real-time (forming-bar aware) RSI and extension for a short interval.
+
+    P1 fix for the structural lag in ``_latest_closed_rsi``: a terminal vertical
+    hides inside the still-forming bar, so closed-bar RSI reads a stale, mild
+    value until the bar closes — too late to block the chase. Here the forming
+    tail bar's close is replaced with the live ``mid`` and the indicators are
+    recomputed, giving an instantaneous read at order time.
+
+    Returns ``(rsi, extension_atr)`` where extension_atr is the live close's
+    distance from EMA21 in ATR(14) units (positive = stretched up). Best-effort;
+    None on insufficient data / failure so the caller fails open.
+    """
+    try:
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        from hermes_trader.indicators.math import atr as atr_arr
+        from hermes_trader.indicators.math import ema as ema_arr
+        from hermes_trader.indicators.math import rsi as rsi_arr
+
+        candles = list(fetch_hl_candles(coin, interval, 60))
+        if len(candles) < 30 or mid <= 0:
+            return None
+        # Synthesize the forming tail bar at the live mid (only its close feeds
+        # the indicators; O/H/L are irrelevant to RSI/EMA/extension here).
+        tail = candles[-1]
+        if isinstance(tail, dict):
+            tail = dict(tail)
+            tail["c"] = mid
+            candles[-1] = tail
+        else:
+            try:
+                tail.c = mid  # pydantic / mutable object
+            except Exception:
+                tail = tail.model_copy(update={"c": mid})
+            candles[-1] = tail
+
+        closes = [c.get("c") if isinstance(c, dict) else getattr(c, "c")
+                  for c in candles]
+        rsi_val = rsi_arr(candles, 14)[-1]
+        e21 = ema_arr(closes, 21)[-1]
+        a = atr_arr(candles, 14)[-1]
+        import math as _math
+        if not all(_math.isfinite(x) for x in (rsi_val, e21, a)) or a <= 0:
+            return None
+        return float(rsi_val), float((mid - e21) / a)
+    except Exception:
+        return None
+
+
 def max_concurrent_positions_gate(ctx: GateContext, max_concurrent: int) -> GateResult:
     if len(ctx.current_positions) < max_concurrent:
         return {"pass": True}
@@ -2141,6 +2299,9 @@ def eval_all_gates(
         bool(cfg_get("score_invariant_enabled", config=config)),
         float(_runner_gate_cfg.get("min_composite", 30.0)),
     )
+    # late_chase: refuse to join an already-missed (over-extended) move or a
+    # terminal 1h-RSI blowoff, even when the breakout trigger itself is fresh.
+    results["late_chase"] = late_chase_gate(ctx, config)
     # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay. The book
     # posture is evaluated from the TTL-cached MACRO regime (BTC / equity
     # proxy); when in the de-risked posture AND enforce (shadow logs the
@@ -2253,6 +2414,7 @@ def eval_all_gates(
     # unexpected is normalised to "other" to keep the label bounded).
     _GATE_KEYS = {
         "confidence", "signal_price_deviation", "score_invariant",
+        "late_chase",
         "max_concurrent", "notional_cap", "daily_loss",
         "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
         "cooldown", "coin_circuit", "global_halt", "consecutive_loss",

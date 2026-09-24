@@ -8,6 +8,7 @@ import json
 import logging
 import math
 import os
+import random
 import re
 import stat
 import sys
@@ -92,6 +93,118 @@ def _http() -> httpx.Client:
                     ),
                 )
     return _HTTP
+
+
+_completion_cap_lock = threading.Lock()
+
+
+def _record_reasoning_effort(
+    data: dict[str, Any],
+    *,
+    elapsed_ms: int,
+    finish_reason: str,
+    path: str,
+    applied: bool,
+    mode: str,
+    effort: str,
+) -> None:
+    """Rollout record for reasoning_effort.
+
+    Shadow mode records the counterfactual baseline (applied=false) so it can
+    be compared against enforce-mode calls (applied=true) on the same metrics.
+    Observation-only; never raises.
+    """
+    try:
+        if mode == "off":
+            return
+        usage = data.get("usage") or {}
+        rt = int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        cfg = read_agent_config().get("reasoning_effort_rollout") or {}
+        log_path = str(cfg.get("log_path") or "").strip()
+        if not log_path:
+            data_dir = os.environ.get("HERMES_DATA_DIR", "/data")
+            log_path = os.path.join(data_dir, "reasoning_effort_rollout.jsonl")
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": path,
+            "mode": mode,
+            "applied_low": applied,
+            "effort": effort if applied else None,
+            "elapsed_ms": elapsed_ms,
+            "finish_reason": finish_reason,
+            "reasoning_tokens": rt,
+            "answer_tokens": max(0, completion - rt),
+            "model": str(data.get("model") or ""),
+        }
+        with _completion_cap_lock:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _record_completion_cap(
+    data: dict[str, Any],
+    *,
+    elapsed_ms: int,
+    finish_reason: str,
+    path: str,
+    model_used: str,
+) -> None:
+    """Counterfactual shadow record for a max_completion_tokens cap.
+
+    Reads the REAL usage of the just-completed call and writes one JSONL line
+    describing whether the proposed cap (reasoning + answer) would have
+    truncated the output. NEVER modifies the request and never raises — a
+    failure here must not affect the trading path.
+    """
+    try:
+        cfg = read_agent_config().get("completion_cap_shadow") or {}
+        mode = str(cfg.get("mode", "off"))
+        if mode not in ("shadow", "enforce"):
+            return
+        sample_rate = float(cfg.get("sample_rate", 1.0))
+        if sample_rate < 1.0 and random.random() > sample_rate:
+            return
+        usage = data.get("usage") or {}
+        rt = int((usage.get("completion_tokens_details") or {}).get("reasoning_tokens") or 0)
+        completion = int(usage.get("completion_tokens") or 0)
+        answer = max(0, completion - rt)
+        cap = int(cfg.get("max_completion_tokens") or 0)
+        would_truncate = bool(cap > 0 and (rt + answer) > cap)
+        log_path = str(cfg.get("log_path") or "").strip()
+        if not log_path:
+            data_dir = os.environ.get("HERMES_DATA_DIR", "/data")
+            log_path = os.path.join(data_dir, "completion_cap_shadow.jsonl")
+        rec = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "path": path,
+            "model": model_used,
+            "mode": mode,
+            "elapsed_ms": elapsed_ms,
+            "finish_reason": finish_reason,
+            "reasoning_tokens": rt,
+            "answer_tokens": answer,
+            "total_completion_tokens": rt + answer,
+            "proposed_cap": cap,
+            "would_truncate": would_truncate,
+            "implied_timeout_sec": float(cfg.get("implied_timeout_sec") or 0),
+        }
+        line = json.dumps(rec, ensure_ascii=False)
+        with _completion_cap_lock:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        # In enforce mode a real cap would still need payload wiring; the
+        # shadow line is emitted first so promotion is evidence-based.
+        if would_truncate:
+            logger.debug(
+                f"[completion_cap] cap={cap} would truncate "
+                f"rt={rt} answer={answer}"
+            )
+    except Exception:
+        # Observation-only: swallow so it can never perturb research().
+        pass
 
 
 # ── Shared infrastructure (cross-component single source of truth) ──────
@@ -208,9 +321,12 @@ _RESEARCH_LLM_DEFAULTS: dict[str, Any] = {
     # research_llm.timeout_sec=25 and debate_research.max_latency_s=25 so a
     # debate abort and the LLM per-call timeout line up (no residual quota
     # burn after the debate gives up).
-    "timeout_sec": 25.0,
+    # Audit 2026-09-23: real Ark verdicts (long prompt + reasoning tokens)
+    # show median ~38s / p85 ~53s, so the old 25s per-call cap killed 76% of
+    # otherwise-successful reads. Raised to 55s to cover p85 in ONE attempt.
+    "timeout_sec": 55.0,
     "connect_timeout_sec": 5.0,
-    "retries": 2,
+    "retries": 1,
     "backoff_base_sec": 1.0,
     "backoff_cap_sec": 15.0,
     # Audit 2026-09-04 P1-13: continuations=2 → worst case 25s×3=75s per call,
@@ -222,7 +338,7 @@ _RESEARCH_LLM_DEFAULTS: dict[str, Any] = {
     # (retries+1) ≈ 180s worst case, which produced the 30-46s slow-scan
     # cluster. 0 disables the cap (legacy behaviour).
     # Audit 2026-09-04 P0-7: kept at 25s in sync with research_llm.timeout_sec.
-    "fallback_timeout_sec": 25.0,
+    "fallback_timeout_sec": 55.0,
 }
 # leaf -> (legacy env var or None, kind "i"/"f"/"s", minimum guard).
 _RESEARCH_LLM_SPEC: dict[str, tuple[Optional[str], str, float]] = {
@@ -1042,6 +1158,16 @@ def _call_openrouter(
     url = base_url.rstrip("/") + "/chat/completions"
     headers = {"Authorization": f"Bearer {openrouter_key}"}
 
+    # reasoning_effort canary: decide ONCE per top-level call (stable across
+    # 429/timeout retries) whether this request actually carries the parameter.
+    _ro = read_agent_config().get("reasoning_effort_rollout") or {}
+    _ro_mode = str(_ro.get("mode", "off"))
+    _ro_effort = str(_ro.get("effort", "low"))
+    _apply_low = (
+        _ro_mode == "enforce"
+        and random.random() <= float(_ro.get("sample_rate", 1.0))
+    )
+
     payload: dict[str, Any] = {
         "model": model,
         "messages": [
@@ -1068,6 +1194,10 @@ def _call_openrouter(
         body = dict(payload)
         body["messages"] = msgs
         body["max_tokens"] = max_toks
+        if _apply_low:
+            # Canary: shrink the (unseen) chain-of-thought budget. Proven −39%
+            # reasoning tokens / −48% wall time in controlled testing.
+            body["reasoning_effort"] = _ro_effort
         # Give the read (response body) phase the full timeout; connect/pool
         # phases are fast but LLM inference can take several seconds, so a
         # blanket timeout kills otherwise-successful slow reads.
@@ -1206,6 +1336,24 @@ def _call_openrouter(
                     break
         _llm_record_success()  # P3-2: usable content closes any failure streak
         _llm_metric_outcome(path, "ok", _t_started)
+        # Shadow probe: counterfactual max_completion_tokens cap. Based on the
+        # primary response usage (continuations are rare); never alters output.
+        _record_completion_cap(
+            data,
+            elapsed_ms=int((time.time() - _t_started) * 1000),
+            finish_reason=finish_reason,
+            path=path,
+            model_used=str(data.get("model") or model),
+        )
+        _record_reasoning_effort(
+            data,
+            elapsed_ms=int((time.time() - _t_started) * 1000),
+            finish_reason=finish_reason,
+            path=path,
+            applied=_apply_low,
+            mode=_ro_mode,
+            effort=_ro_effort,
+        )
         return content
     except Exception as e:
         logger.error(f"[research] LLM call EXCEPTION: {e}")
@@ -1642,7 +1790,7 @@ def _debate_cfg() -> dict[str, Any]:
     d = cfg.get("debate_research") or {}
     return {
         "enabled": bool(d.get("enabled", False)),
-        "max_latency_s": float(d.get("max_latency_s", 15)),
+        "max_latency_s": float(d.get("max_latency_s", 55)),
         "cache_ttl_s": float(d.get("cache_ttl_s", 300)),
         "parallel": bool(d.get("parallel", True)),
         "use_structured_output": bool(d.get("use_structured_output", True)),

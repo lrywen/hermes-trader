@@ -292,6 +292,12 @@ class HyperliquidWebSocket:
         self._user_fills_seen_dirty: bool = False
         self._user_fills_last_persist: float = 0.0
         self._user_fills_hist_dropped: int = 0
+        # Market ``trades`` subscriptions for launch-point detection. Coins we
+        # want public trade flow for; the callback feeds the microstructure
+        # singleton (CVD). Reconnects re-subscribe from this set via
+        # ``_connect_and_subscribe``. Bounded by the trading layer (only the
+        # watched/candidate coins are subscribed).
+        self._trades_coins: set[str] = set()
         # Warm the in-memory dedup set from the on-disk snapshot so a fill
         # already reported by a previous process is never re-emitted.
         self._load_seen_tids()
@@ -864,6 +870,67 @@ class HyperliquidWebSocket:
         self._user_fills_user = None
         self._user_fills_sub_id = None
 
+    # ── Market trades (launch-point CVD) ───────────────────────────────────
+    def _on_trades(self, data: Any) -> None:
+        """Callback for the public ``trades`` channel → microstructure CVD.
+
+        Payload (SDK wrapper):
+            {"channel": "trades", "data": [ {coin, side, px, sz, time, ...} ]}
+        ``side`` is the taker side: "B" = taker bought (buyer-aggressor),
+        "A" = taker sold. Feeds the microstructure singleton only — never
+        touches trading state, so a bad feed cannot affect the loop. Runs in
+        the WS callback thread; the accumulator is thread-safe.
+        """
+        try:
+            inner = data.get("data", []) if isinstance(data, dict) else data
+            trades = inner if isinstance(inner, list) else []
+            if not trades:
+                return
+            from hermes_trader.agents.microstructure import get_microstructure
+            ms = get_microstructure()
+            for t in trades:
+                if not isinstance(t, dict):
+                    continue
+                coin = t.get("coin")
+                if not coin or coin not in self._trades_coins:
+                    continue
+                ms.add_trade(
+                    coin=coin,
+                    ts=float(t.get("time", 0.0)) / 1000.0,
+                    size=float(t.get("sz", 0.0) or 0.0),
+                    buyer_aggressor=(t.get("side") == "B"),
+                )
+        except Exception:
+            logger.debug("[ws:trades] callback failed", exc_info=True)
+
+    def subscribe_trades(self, coin: str) -> bool:
+        """Subscribe to public ``trades`` for ``coin`` (idempotent).
+
+        Adds to ``_trades_coins`` so reconnects re-subscribe. Returns True if
+        the subscription is active (already or newly), False on failure
+        (non-fatal — launch capture just lacks a CVD read and fails open).
+        """
+        if not coin:
+            return False
+        if coin in self._trades_coins:
+            return True
+        if not self._info:
+            logger.warning("[ws:trades] subscribe skipped — no Info")
+            return False
+        try:
+            self._info.subscribe({"type": "trades", "coin": coin}, self._on_trades)
+            self._trades_coins.add(coin)
+            logger.info("[ws:trades] subscribed coin=%s", coin)
+            return True
+        except Exception as e:
+            logger.warning("[ws:trades] subscribe FAILED coin=%s err=%s", coin, e)
+            return False
+
+    def unsubscribe_trades(self, coin: str) -> None:
+        """Stop tracking trade flow for ``coin``. SDK registry is torn down on
+        disconnect; this clears our persistent set."""
+        self._trades_coins.discard(coin)
+
     def start(self) -> None:
         """Start the WebSocket connection and subscribe to allMids."""
         if self._running:
@@ -978,6 +1045,16 @@ class HyperliquidWebSocket:
             except Exception as e:
                 # Non-fatal: allMids is already up; user-fills is best-effort.
                 logger.warning(f"[ws:user-fills] re-subscribe on reconnect failed (non-fatal): {e}")
+
+        # Re-subscribe public trade flow for tracked coins on reconnect so the
+        # CVD accumulator keeps a continuous read. Best-effort; failure just
+        # leaves launch capture without CVD for that coin (fail open).
+        for coin in list(self._trades_coins):
+            try:
+                self._info.subscribe({"type": "trades", "coin": coin}, self._on_trades)
+            except Exception as e:
+                logger.warning("[ws:trades] re-subscribe on reconnect failed "
+                               "coin=%s (non-fatal): %s", coin, e)
 
     def _heartbeat_loop(self) -> None:
         """R11-D1: application-level heartbeat loop.

@@ -66,6 +66,10 @@ _LEGACY_ENV_SPEC: dict[str, tuple[Optional[str], str]] = {
     # is dropped (cycle_outcomes reason "jobs_backpressure_cap") to keep the
     # parallel pool saturated and avoid e2e back-up. 0 disables the cap.
     "research_max_jobs_per_scan": ("HERMES_RESEARCH_MAX_JOBS_PER_SCAN", "int"),
+    # 2026-09-23: hard wall-clock cap for the whole parallel research batch.
+    # The batch blocks the main loop on the slowest coin; this bounds the total
+    # wait so a stall can never stretch a scan toward the watchdog. 0 disables.
+    "research_batch_timeout_s": ("HERMES_RESEARCH_BATCH_TIMEOUT_S", "float"),
 }
 
 # Inline-literal defaults — the exact values trading_loop.py used in its
@@ -92,6 +96,7 @@ LOOP_RUNTIME_DEFAULTS: dict[str, Any] = {
     "research_parallel": True,
     "research_parallel_workers": 4,
     "research_max_jobs_per_scan": 8,
+    "research_batch_timeout_s": 180.0,
 }
 
 

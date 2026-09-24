@@ -91,9 +91,9 @@ from hermes_trader.agents.executor import (
 )
 from hermes_trader.agents.market_circuit import evaluate as market_circuit_evaluate
 from hermes_trader.agents.market_circuit import record_stop as market_circuit_record_stop
-from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
+from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.client.exchange import (
@@ -1964,6 +1964,133 @@ while True:
                 perception=_p,
             )
 
+        # Move-state machine (2026-09-22 anti-late-chase): anchor each coin's
+        # directional move on a fresh breakout/burst so later orders can tell a
+        # fresh entry from a missed, over-extended one. Best-effort, never
+        # blocks the loop.
+        try:
+            from hermes_trader.agents.config_store import read_agent_config as _load_mv_cfg
+            from hermes_trader.agents.move_state import observe as _move_observe
+            _lc_cfg = (_load_mv_cfg().get("late_chase") or {})
+        except Exception:
+            _lc_cfg = {}
+        for _p in results:
+            try:
+                _trig = _p.get("triggers", []) or []
+                _brk_hit = next((t for t in _trig
+                                 if t.get("name") == "breakout" and t.get("fired")), None)
+                _bst_hit = next((t for t in _trig
+                                 if t.get("name") == "momentumBurst" and t.get("fired")), None)
+                _dir = ""
+                if _brk_hit is not None:
+                    _br = str(_brk_hit.get("reason") or "")
+                    _dir = "up" if "above" in _br else ("down" if "below" in _br else "")
+                if not _dir and _bst_hit is not None:
+                    _br = str(_bst_hit.get("reason") or "")
+                    if _br.rstrip().endswith("up"):
+                        _dir = "up"
+                    elif _br.rstrip().endswith("down"):
+                        _dir = "down"
+                _band = float((_lc_cfg or {}).get("fresh_move_band_pct", 8.0))
+                _min_age = float((_lc_cfg or {}).get("min_anchor_age_sec", 300.0))
+                _min_ext_reset = float(
+                    (_lc_cfg or {}).get("min_move_extension_pct_for_reset", 3.0))
+                _move_observe(
+                    coin=_p.get("coin", "?"), mid=float(_p.get("mid") or 0.0),
+                    impulse=bool(_brk_hit or _bst_hit), impulse_dir=_dir,
+                    fresh_max_extension_pct=_band,
+                    min_anchor_age_sec=_min_age,
+                    min_move_extension_pct_for_reset=_min_ext_reset)
+            except Exception:
+                pass
+
+        # Launch capture maintenance (shadow): keep a WS trades subscription
+        # for a bounded set of candidate coins so the CVD accumulator has a
+        # continuous read, and refresh top-of-book imbalance from an L2
+        # snapshot. Best-effort: any failure is non-fatal, launch read just
+        # fails open and the normal confirmation path is used.
+        try:
+            _lc = read_agent_config().get("launch_capture") or {}
+            if _lc.get("enabled", False):
+                from hermes_trader.agents.microstructure import get_microstructure, imbalance_from_sides
+                from hermes_trader.client.exchange import _l2_snapshot_bounded
+                from hermes_trader.client.hl_client import _get_ws_mids_instance
+                _ws = _get_ws_mids_instance()
+                _cand = []
+                for _p in results[:20]:
+                    _c = _p.get("coin")
+                    if _c:
+                        _cand.append(_c)
+
+                # Pre-launch subscriptions (subscription-timing fix): the
+                # triggered list above is, by definition, read *after* a coin
+                # has already broken out — too late to warm the CVD accumulator
+                # for the launch bar. Screen the head of the liquid universe
+                # for coins that have NOT triggered yet but are coiled at a
+                # low range-bandwidth percentile, and subscribe their trades
+                # ahead of the breakout so CVD has a continuous read on the
+                # bar that actually launches. Best-effort, bounded, cached
+                # candles — zero new fetches when the scan cache is hot.
+                _pre = []
+                try:
+                    if _lc.get("presubscribe_enabled", True):
+                        from hermes_trader.agents.microstructure import compression_extreme
+                        from hermes_trader.client.hl_client import fetch_hl_candles
+                        _pool_n = int(_lc.get("presubscribe_pool", 60))
+                        _pre_max = int(_lc.get("presubscribe_max", 12))
+                        _cmp_max = float(_lc.get("presubscribe_compress_pct_max", 20.0))
+                        _triggered = set(_cand)
+                        # Liquid non-spot coins the running loop already holds,
+                        # head of list = primary crypto universe (most liquid).
+                        _pool = [
+                            m.get("coin") for m in (universe or [])
+                            if m.get("coin")
+                            and not str(m.get("coin")).startswith("@")
+                            and m.get("type") != "spot"
+                            and m.get("coin") not in _triggered
+                        ][:_pool_n]
+                        for _cc in _pool:
+                            try:
+                                _bars = fetch_hl_candles(_cc, "5m", 80)
+                                _pct = compression_extreme(_bars, 48)
+                                if _pct is not None and _pct <= _cmp_max:
+                                    _pre.append(_cc)
+                                if len(_pre) >= _pre_max:
+                                    break
+                            except Exception:
+                                continue
+                except Exception:
+                    _pre = []
+
+                # cap subscriptions, drop ones no longer candidates. Pre-launch
+                # slots are added AFTER triggered coins (triggered always win).
+                _want = set(_cand[:15])
+                for _cc in _pre:
+                    if len(_want) >= 27:
+                        break
+                    _want.add(_cc)
+                if _ws is not None:
+                    for _c in list(_ws._trades_coins - _want):
+                        _ws.unsubscribe_trades(_c)
+                    for _c in _want:
+                        _ws.subscribe_trades(_c)
+                # feed book imbalance for candidates (cheap, throttled by SDK cache)
+                _all_imb = _cand + [_c for _c in _pre if _c not in _cand]
+                if _all_imb:
+                    import time as _tmod
+                    for _c in _all_imb:
+                        try:
+                            _book = _l2_snapshot_bounded(_c)
+                            _bids = _book.get("levels", [{}, {}])[0]
+                            _asks = _book.get("levels", [{}, {}])[1]
+                            get_microstructure().set_book_imbalance(
+                                coin=_c, ts=_tmod.time(),
+                                imbalance=imbalance_from_sides(_bids, _asks))
+                        except Exception:
+                            pass
+        except Exception as _lc_err:
+            logger.debug(f"[launch] maintenance non-fatal: {_lc_err}")
+
         # Pre-research dedupe cache: coin → last research timestamp this run.
         # Prevents burning AI tokens on a setup that's still in cooldown from a
         # prior cycle. The execute-time `cooldown_gate` is still in place as the
@@ -2263,15 +2390,68 @@ while True:
                 # DSL exit checkpoint before we block on the slowest coin, so a
                 # stop/floor breach during the parallel batch is still actioned.
                 _exit_checkpoint(mids, tag="research:batch-pre")
-                with ThreadPoolExecutor(max_workers=_workers,
-                                        thread_name_prefix="research-coin") as _pool:
-                    _futures = [_pool.submit(_run_research, *_job) for _job in _research_jobs]
+                # Managed manually (no `with`): on a cap-induced timeout we must
+                # shutdown(wait=False) so the main loop isn't blocked by the
+                # orphaned (cancelled-but-still-running) research threads.
+                _pool = ThreadPoolExecutor(max_workers=_workers,
+                                           thread_name_prefix="research-coin")
+                _futures = [_pool.submit(_run_research, *_job) for _job in _research_jobs]
+                # Batch wall-clock cap (loop_runtime.research_batch_timeout_s):
+                # the pool would otherwise block this main loop until the slowest
+                # coin returns, so poll for completion under a hard deadline
+                # instead of an unbounded fut.result(). Any coin still running
+                # when the budget expires is cancelled (best effort) and routed
+                # as a guaranteed conservative PASS — no order is placed on a
+                # stale/stalled read. 0 disables the cap (legacy blocking).
+                _batch_budget = float(_rt["research_batch_timeout_s"] or 0)
+                _orphans = False
+                if _batch_budget > 0:
+                    _deadline = time.monotonic() + _batch_budget
+                    while True:
+                        _pending = [_f for _f in _futures if not _f.done()]
+                        if not _pending:
+                            break
+                        _left = _deadline - time.monotonic()
+                        if _left <= 0:
+                            break
+                        # A stop/floor breach during the wait is still actioned.
+                        _exit_checkpoint(mids, tag="research:batch-wait")
+                        time.sleep(min(0.5, _left))
+                    _timed_out = []
+                    for _f, _job in zip(_futures, _research_jobs):
+                        if _f.done():
+                            _research_results.append(_f.result())
+                        else:
+                            _f.cancel()
+                            _orphans = True
+                            _tc = _job[0]
+                            _ts = _job[2]
+                            _tg = _job[3]
+                            logger.warning(
+                                f"[p0-4] research batch cap reached — "
+                                f"{_tc} dropped → conservative PASS")
+                            _timed_out.append(_tc)
+                            _research_results.append(
+                                (_tc, _ts, _tg,
+                                 {"coin": _tc, "verdict": "PASS",
+                                  "confidence": 0.0, "side": None,
+                                  "reasoning": "research batch wall-clock "
+                                               "cap reached; conservative PASS"},
+                                 None))
+                    if _timed_out:
+                        log_event({"event": "research_batch_timeout",
+                                   "coins": _timed_out,
+                                   "budget_s": _batch_budget})
+                else:
                     # Futures mirror _research_jobs order (score-desc when the
                     # backpressure cap trimmed a batch, otherwise scan/trigger
                     # order); iterating them re-serializes results
                     # deterministically for phase 3.
                     for _fut in _futures:
                         _research_results.append(_fut.result())
+                # wait=: orphans finish read-only in the background; never block
+                # the scan tick waiting on them.
+                _pool.shutdown(wait=not _orphans)
                 _beat("research_batch_done")
             else:
                 # Serial path — same behaviour as the original loop; ordering

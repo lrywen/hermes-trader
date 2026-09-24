@@ -336,6 +336,14 @@ class _ConfigPatch(BaseModel):
     # Audit 2026-09-21 (#3): live post-only maker execution scaffold.
     maker_execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("maker_execution"))
     reentry_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("reentry_cap"))
+    # Late-chase gate (2026-09-22): move-state freshness + terminal 1h-RSI
+    # blowoff. Enabled by default (hard block, SHADOW/LIVE parity).
+    late_chase: dict[str, Any] = Field(default_factory=lambda: _dict_default("late_chase"))
+    launch_capture: dict[str, Any] = Field(default_factory=lambda: _dict_default("launch_capture"))
+    completion_cap_shadow: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("completion_cap_shadow"))
+    reasoning_effort_rollout: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("reasoning_effort_rollout"))
     # Post-close decision reflection (absorbed from TradingAgents). INERT:
     # one background LLM review after a close, injected into the next research
     # prompt; never sizes/vetoes/changes gates.
@@ -561,6 +569,51 @@ _SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
 
 _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "dsl_exit": _DSL_EXIT_SPEC,
+    "completion_cap_shadow": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "max_completion_tokens": _num_leaf(1, 1_000_000),
+        "implied_timeout_sec": _num_leaf(0.0, 100000.0),
+        "log_path": ("str",),
+        "sample_rate": _num_leaf(0.0, 1.0),
+    },
+    "reasoning_effort_rollout": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "effort": ("enum", ("none", "low", "high", "max")),
+        "sample_rate": _num_leaf(0.0, 1.0),
+        "log_path": ("str",),
+    },
+    "late_chase": {
+        "enabled": ("bool",),
+        "fresh_move_band_pct": _num_leaf(0.0, 100.0),
+        "rsi1h_overbought": _num_leaf(0.0, 100.0),
+        "rsi1h_oversold": _num_leaf(0.0, 100.0),
+        "min_anchor_age_sec": _num_leaf(0.0, 86400.0),
+        "min_move_extension_pct_for_reset": _num_leaf(0.0, 100.0),
+        "realtime": {
+            "enabled": ("bool",),
+            "interval": ("enum", ("1m", "3m", "5m", "15m")),
+            "rsi_overbought": _num_leaf(0.0, 100.0),
+            "rsi_oversold": _num_leaf(0.0, 100.0),
+            "max_extension_atr": _num_leaf(0.0, 20.0),
+        },
+    },
+    "launch_capture": {
+        "enabled": ("bool",),
+        "aggression_min": _num_leaf(0.0, 1.0),
+        "imbalance_min": _num_leaf(0.0, 1.0),
+        "compression_pct_max": _num_leaf(0.0, 100.0),
+        "require_key_level": ("bool",),
+        "flow_confirm_min": _num_leaf(0.0, 1.0),
+        "breakout_trend_rvol_min": _num_leaf(0.0, 100.0),
+        "breakout_trend_rvol_lookback": _num_leaf(1, 6),
+        "presubscribe_enabled": ("bool",),
+        "presubscribe_pool": _num_leaf(0, 500),
+        "presubscribe_max": _num_leaf(0, 100),
+        "presubscribe_compress_pct_max": _num_leaf(0.0, 100.0),
+        "weight_aggression": _num_leaf(0.0, 1.0),
+        "weight_imbalance": _num_leaf(0.0, 1.0),
+        "weight_compression": _num_leaf(0.0, 1.0),
+    },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
     "runner_entry_gate": {

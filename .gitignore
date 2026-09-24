@@ -92,6 +92,7 @@ DISTRIBUTE.md
 # Agent config
 .agent-config.json
 .agent-memory.json
+.secrets.json
 .dsl-state.json
 .positions-snapshot.json
 .monitor-journal.md
