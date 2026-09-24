@@ -3478,6 +3478,32 @@ def _price_divergence_veto(*, coin: str, mid_price: float, aid: str) -> tuple[bo
     return False, "", _px_check
 
 
+_LIVE_GATE_RECHECK_TTL_S = max(
+    0.0, float(os.environ.get("HERMES_LIVE_GATE_RECHECK_TTL_S", "60"))
+)
+_live_gate_cache: dict[str, Any] = {"checked_at": -1e18, "error": None}
+_live_gate_cache_lock = threading.Lock()
+
+
+def _live_gate_runtime_block(config: dict[str, Any]) -> Optional[str]:
+    """T-02: runtime B-13 recheck on the LIVE entry path.
+
+    The acceptance record is evaluated at boot, but mode can change at runtime.
+    Re-validate here before any order is placed. The record lookup is cached for
+    ``HERMES_LIVE_GATE_RECHECK_TTL_S`` (60s) to keep the hot path cheap.
+    Returns the block reason or None; non-LIVE modes are not evaluated.
+    """
+    if str(config.get("mode", "OFF")).upper() != "LIVE":
+        return None
+    now = time.monotonic()
+    with _live_gate_cache_lock:
+        if now - _live_gate_cache["checked_at"] >= _LIVE_GATE_RECHECK_TTL_S:
+            from hermes_trader.agents.live_gate import live_entry_runtime_error
+            _live_gate_cache["error"] = live_entry_runtime_error(config)
+            _live_gate_cache["checked_at"] = now
+        return _live_gate_cache["error"]
+
+
 def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> dict[str, Any]:
     """Execute an analysis through risk gates and into the market.
 
@@ -3520,6 +3546,21 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         return {
             "executed": False, "mode": mode,
             "analysis_id": analysis["id"], "reason": "live_not_authorized",
+        }
+    # T-02 (DEF-01): runtime B-13 recheck. L2 env is granted but the §5.2
+    # acceptance record may be missing/stale (mode was flipped after boot).
+    # Block before any order function can run; reduce-only exits never reach
+    # this function (C-03 / INV-03).
+    _live_gate_reason = _live_gate_runtime_block(config)
+    if _live_gate_reason is not None:
+        logger.error(
+            "[executor] LIVE entry DENIED for %s (analysis %s): %s — no valid "
+            "B-13 acceptance record bound to the current config.",
+            analysis.get("coin"), analysis.get("id"), _live_gate_reason)
+        _record_decision(_live_gate_reason)
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"], "reason": _live_gate_reason,
         }
     # Per-coin enabled flag (set by the portal 币种配置 module). False here
     # disables trading for THIS coin only without changing the global mode.

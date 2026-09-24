@@ -66,6 +66,29 @@ def _minimal_live_wire(monkeypatch):
     """
     monkeypatch.setattr(executor, "read_agent_config",
                         lambda: {"mode": "LIVE"})
+    # T-02: the LIVE path now also requires a valid B-13 acceptance record.
+    # Provide one bound to the LIVE config stub and reset the executor's TTL
+    # cache so this wire is evaluated afresh (other tests in the session may
+    # have cached a block).
+    import tempfile
+    from hermes_trader.agents import live_gate
+    _live_cfg = {"mode": "LIVE"}
+    _gate = tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False)
+    json.dump({
+        "version": 1,
+        "decision": "outcome_a_go_live",
+        "arms": ["filt"],
+        "block_bootstrap_ci": [1.2, 8.4],
+        "config_src": "/data/.agent-config.json",
+        "config_sha256": live_gate.config_sha256(_live_cfg),
+        "operator": "p0test",
+        "utc_iso": "2026-09-24T00:00:00Z",
+    }, _gate)
+    _gate.close()
+    monkeypatch.setenv("HERMES_LIVE_GATE_FILE", _gate.name)
+    executor._live_gate_cache["checked_at"] = -1e18
+    executor._live_gate_cache["error"] = None
     # apply_coin_override on a plain dict without coin_overrides is a no-op
     # merge; leave the real function in place.
     monkeypatch.setattr(executor, "get_max_leverage",
