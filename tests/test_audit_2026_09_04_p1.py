@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_trader.agents import risk_gates as RG
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     startup_config_integrity_errors,
@@ -28,7 +27,6 @@ from hermes_trader.agents.risk_gates import (
     daily_loss_kill_switch,
     effective_daily_loss_cutoff,
 )
-
 
 # ── P1-9: analyst5 whale-or confidence aligned to entry gate ───────────────
 

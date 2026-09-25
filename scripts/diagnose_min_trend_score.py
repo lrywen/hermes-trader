@@ -32,13 +32,13 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.client.hl_client import fetch_hl_candles  # noqa: E402
+from hermes_trader.client.hl_client import fetch_hl_candles
 
 DEFAULT_EVENTS = os.environ.get("HERMES_EVENTS_FILE", "/data/events.jsonl")
 DEDUP_TTL_MS = 5 * 60_000          # == market_regime REGIME_TTL_S

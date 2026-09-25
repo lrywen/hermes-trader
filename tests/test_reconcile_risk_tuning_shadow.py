@@ -12,8 +12,6 @@ import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-import pytest
-
 _REPO = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location(
     "reconcile_risk_tuning",

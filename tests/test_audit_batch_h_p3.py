@@ -25,8 +25,6 @@ import logging
 import sys
 from pathlib import Path
 
-import pytest
-
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"
 MCP_PY = SCRIPTS / "hermes-mcp-server.py"
@@ -222,8 +220,8 @@ def test_session_log_fork_failure_is_logged_not_swallowed(monkeypatch, tmp_path,
 # ── H-P3 follow-up: HTTP audit helper + cross-ingress error_code ──────────────
 
 def test_http_audit_logs_when_append_raises(monkeypatch, caplog):
-    from hermes_trader import server
     import hermes_trader.event_log as event_log
+    from hermes_trader import server
 
     def _boom(*a, **k):
         raise OSError("disk full")
@@ -236,8 +234,8 @@ def test_http_audit_logs_when_append_raises(monkeypatch, caplog):
 
 
 def test_http_audit_logs_when_append_returns_false(monkeypatch, caplog):
-    from hermes_trader import server
     import hermes_trader.event_log as event_log
+    from hermes_trader import server
     captured = {}
 
     def _append(event, payload=None):
@@ -257,8 +255,8 @@ def test_http_audit_logs_when_append_returns_false(monkeypatch, caplog):
 
 
 def test_http_audit_silent_on_success(monkeypatch, caplog):
-    from hermes_trader import server
     import hermes_trader.event_log as event_log
+    from hermes_trader import server
     monkeypatch.setattr(event_log, "append", lambda *a, **k: True)
     with caplog.at_level(logging.ERROR, logger="hermes-server"):
         server._http_operator_audit("cancel_order", oid=3)

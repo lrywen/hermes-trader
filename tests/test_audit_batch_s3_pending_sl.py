@@ -14,9 +14,9 @@ import json
 import uuid
 
 import pytest
+from hyperliquid.utils.types import Cloid
 
 from hermes_trader.agents import executor
-from hyperliquid.utils.types import Cloid
 
 
 @pytest.fixture()
@@ -103,6 +103,7 @@ def test_retry_pending_sl_invokes_load(monkeypatch):
 
 def test_metrics_names_exposed():
     from fastapi.testclient import TestClient
+
     from hermes_trader.server import app
     client = TestClient(app)
     body = client.get("/metrics").text

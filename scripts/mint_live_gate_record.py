@@ -37,8 +37,6 @@ from datetime import datetime, timezone
 
 from hermes_trader.agents import config_store, live_gate
 from hermes_trader.agents.config_store import (
-    CANONICAL_DEFAULTS,
-    _deep_merge,
     read_agent_config,
 )
 

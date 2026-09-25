@@ -16,7 +16,6 @@ import pytest
 
 from hermes_trader import shadow_log
 
-
 # ── append happy path ───────────────────────────────────────────────────────
 
 @pytest.mark.parametrize(

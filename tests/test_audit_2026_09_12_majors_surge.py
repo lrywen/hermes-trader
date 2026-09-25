@@ -18,8 +18,6 @@ not change score/fired/reason, which existing composite scoring relies on).
 
 from __future__ import annotations
 
-import pytest
-
 from hermes_trader.agents.cooldown_adaptive import coin_is_hot
 from hermes_trader.indicators.triggers import pct_move_spike, volume_spike
 from hermes_trader.models.types import Candle
@@ -185,8 +183,7 @@ def test_sigma_decision_disabled_and_garbled_fail_open():
 
 
 def _base_config() -> dict:
-    from hermes_trader.agents.config import (
-        trigger_thresholds_params, trigger_weights_params)
+    from hermes_trader.agents.config import trigger_thresholds_params, trigger_weights_params
     return {
         "scan": {"candleInterval": "5m", "candleCount": 100,
                  "cacheTtlMs": 50_000, "cacheTtlMs1h": 600_000,

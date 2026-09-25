@@ -25,8 +25,7 @@ CONFIG_FILE = _REPO / ".agent-config.json"
 # derived from config_store.STARTUP_ONLY_KEYS so it can never claim a key needs
 # a restart when the loop actually hot-reloads it.
 sys.path.insert(0, str(_REPO))
-from hermes_trader.agents.config_store import STARTUP_ONLY_KEYS  # noqa: E402
-
+from hermes_trader.agents.config_store import STARTUP_ONLY_KEYS
 
 PRESETS: dict[str, dict] = {
     # ── Small accounts ($100-500) ──────────────────────────────────────────

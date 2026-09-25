@@ -32,13 +32,9 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_trader.agents import executor
-from hermes_trader.agents import news_catalyst
-from hermes_trader.agents import research
+from hermes_trader.agents import executor, news_catalyst, research, shadow_book
 from hermes_trader.agents import risk_gates as RG
-from hermes_trader.agents import shadow_book
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
-
 
 # ── P2-17: equity_fraction_per_trade is a live legacy fallback ────────────
 

@@ -12,8 +12,7 @@ import json
 
 import pytest
 
-from hermes_trader.agents import live_gate
-from hermes_trader.agents import executor
+from hermes_trader.agents import executor, live_gate
 
 
 @pytest.fixture

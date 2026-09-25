@@ -81,15 +81,16 @@ if _env.is_file():
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(_REPO / "scripts"))
 
-import backtest as bt  # noqa: E402  (Trade/DSL/cost constants/_split_metrics/...)
-from hermes_trader.agents.config_store import cfg_get, read_agent_config  # noqa: E402
-from hermes_trader.agents.market_regime import classify_candles  # noqa: E402
-from hermes_trader.agents.ta_filter import late_entry_check  # noqa: E402
-from hermes_trader.client.universe import get_universe  # noqa: E402
-from hermes_trader.data import historical_candles as hc  # noqa: E402
-from hermes_trader.indicators import math as ind  # noqa: E402
-from hermes_trader.indicators import triggers as trig  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
+import backtest as bt
+
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.market_regime import classify_candles
+from hermes_trader.agents.ta_filter import late_entry_check
+from hermes_trader.client.universe import get_universe
+from hermes_trader.data import historical_candles as hc
+from hermes_trader.indicators import math as ind
+from hermes_trader.indicators import triggers as trig
+from hermes_trader.models.types import Candle
 
 SCAN_SCORES = (20.0, 25.0, 30.0, 40.0)  # variant-E min_short_composite sweep
 W4_WINDOW = 60     # trailing 4h suffix fed to late_entry_check
@@ -574,8 +575,7 @@ def main() -> int:
     scan = live.get("scan") or {}
     min_score = float(scan.get("minCompositeScore", 54))
     candle_count = int(scan.get("candleCount", 100))
-    from hermes_trader.agents.config import (
-        trigger_thresholds_params, trigger_weights_params)
+    from hermes_trader.agents.config import trigger_thresholds_params, trigger_weights_params
     weights = trigger_weights_params(config=live)
     thresholds = trigger_thresholds_params(config=live)
     cp = live.get("candlestick_patterns") or {}

@@ -25,9 +25,8 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_trader.client import exchange
 from hermes_trader.agents import dsl_exit, executor
-
+from hermes_trader.client import exchange
 
 # ── fixtures / helpers ────────────────────────────────────────────────────
 

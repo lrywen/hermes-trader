@@ -27,9 +27,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_trader.agents import executor
+from hermes_trader.agents import config_store, executor
 from hermes_trader.agents import memory as memory_mod
-from hermes_trader.agents import config_store
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = ROOT / "scripts"

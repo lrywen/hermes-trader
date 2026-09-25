@@ -26,7 +26,6 @@ from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
 from hermes_trader.agents.executor import _runner_entry_block_reason
 from hermes_trader.agents.shadow import entry_probes
 
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 def _pb_analysis(**over):

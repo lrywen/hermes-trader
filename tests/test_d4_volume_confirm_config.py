@@ -14,14 +14,12 @@ Covers:
 """
 from __future__ import annotations
 
-from hermes_trader.agents import config_store
+from hermes_trader.agents import config_store, ta_filter
 from hermes_trader.agents.config_store import (
     CANONICAL_DEFAULTS,
     cfg_get,
     read_agent_config,
 )
-from hermes_trader.agents import ta_filter
-
 
 # ── canonical registration: defaults mirror the old hardcoded literals ──────
 

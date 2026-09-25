@@ -29,7 +29,6 @@ import pytest
 from hermes_trader.agents import regime_overlay as ro
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
 
-
 # ── helpers ────────────────────────────────────────────────────────────────
 
 

@@ -263,9 +263,9 @@ def manual_harness(tmp_path, monkeypatch):
     """Patch the full place_order I/O surface; returns (client, srv, env)."""
     from fastapi.testclient import TestClient
 
+    from hermes_trader import server as srv
     from hermes_trader.client import exchange
     from hermes_trader.client.lock import EntryOrderLock
-    from hermes_trader import server as srv
 
     monkeypatch.setenv("HERMES_OPERATOR_TOKEN", _OP_TOKEN)
 

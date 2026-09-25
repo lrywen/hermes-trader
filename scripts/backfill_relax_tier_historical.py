@@ -49,7 +49,7 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.data import historical_candles as hc  # noqa: E402
+from hermes_trader.data import historical_candles as hc
 
 DEFAULT_FILE = "/data/ta_late_entry_shadow.jsonl"
 DEFAULT_OUT = "/data/relax_tier_shadow.backfill.jsonl"

@@ -300,7 +300,8 @@ def test_r12_a1_bypass_alert_actually_sends_with_real_signature(monkeypatch):
     A spy on the REAL module slot proves the helper now calls send_text
     with exactly the live signature (text, category="risk")."""
     import inspect
-    from hermes_trader import server, notify
+
+    from hermes_trader import notify, server
 
     sig = inspect.signature(notify.send_text)
     assert "priority" not in sig.parameters, (
@@ -324,6 +325,7 @@ def test_r12_a1_bypass_alert_wired_into_place_order():
     bypass branch routes through the never-raises helper and no longer
     passes priority= anywhere."""
     import pathlib
+
     from hermes_trader import server
 
     src = pathlib.Path(server.__file__).read_text(encoding="utf-8")

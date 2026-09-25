@@ -28,7 +28,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,7 +36,7 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.client.hl_client import _http_post  # noqa: E402
+from hermes_trader.client.hl_client import _http_post
 
 DEFAULT_FILE = "/data/xs_reversal_shadow.jsonl"
 FILE = os.environ.get("HERMES_XS_REVERSAL_SHADOW_FILE", DEFAULT_FILE)
@@ -207,7 +207,7 @@ def main() -> int:
         print(f"  {path}: total={len(recs)} newly_graded={changed}"
               f"{' [WRITTEN]' if args.write and changed else ''}")
 
-    print(f"\n=== xs_reversal shadow reconciliation ===")
+    print("\n=== xs_reversal shadow reconciliation ===")
     print(f"records scanned: {total}   mature+graded: {graded}")
     if graded:
         print(f"overall 72h win-rate: {100*winners/graded:.1f}% ({winners}W/{graded-winners}L)")

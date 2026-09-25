@@ -241,8 +241,9 @@ def test_force_load_precedes_registration_no_clobber(bracket_env):
         return orig_reg(coin, side, entry_px, **kw)
 
     # re-patch on the live module (helper imports the module, not the names)
-    import hermes_trader.client.exchange as _ex  # noqa: F401
     from unittest import mock
+
+    import hermes_trader.client.exchange as _ex  # noqa: F401
     with mock.patch.object(dsl_exit, "load_state", _load), \
          mock.patch.object(dsl_exit, "register_position", _reg):
         out = _run()

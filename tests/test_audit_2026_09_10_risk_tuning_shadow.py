@@ -15,8 +15,6 @@ effect of enabling is an append to the risk-tuning JSONL. These tests pin:
 """
 from __future__ import annotations
 
-import types
-
 import pytest
 
 from hermes_trader.agents import dsl_exit, executor

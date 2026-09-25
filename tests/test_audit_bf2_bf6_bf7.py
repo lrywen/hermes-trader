@@ -617,9 +617,9 @@ def test_c1_blind_gates_alert_but_still_pass(monkeypatch, tmp_path):
 def test_c1_alert_path_never_blocks_gate(monkeypatch, tmp_path):
     """If the Feishu call itself raises (or notify import breaks), the gate
     must still fail open silently — alerting is best-effort, never a blocker."""
+    from hermes_trader import notify
     from hermes_trader.agents import memory as memory_mod
     from hermes_trader.agents import risk_gates
-    from hermes_trader import notify
     _isolated_memory(monkeypatch, tmp_path)
 
     def _exploding_send_card(*_a, **_k):

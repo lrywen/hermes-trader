@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import pytest
 
-
 # ── _scan_stage tagging primitive ───────────────────────────────────────────
 
 
@@ -151,8 +150,8 @@ def test_research_tags_llm_stage_failure(monkeypatch):
     def _explode_debate(*_a, **_kw):
         raise _LLMBoom("debate gateway 500")
 
-    import hermes_trader.client.hl_client as hl_client
     import hermes_trader.agents.perception as perception_mod
+    import hermes_trader.client.hl_client as hl_client
 
     monkeypatch.setattr(research, "_parallel_prefetch", _fake_prefetch)
     monkeypatch.setattr(research, "_debate_research", _explode_debate)

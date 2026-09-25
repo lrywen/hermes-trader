@@ -45,7 +45,7 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.data import historical_candles as hc  # noqa: E402
+from hermes_trader.data import historical_candles as hc
 
 DEFAULT_FILE = "/data/daily_extension_cap_shadow.jsonl"
 DEFAULT_OUT = "/data/daily_extension_cap_shadow.backfill.jsonl"

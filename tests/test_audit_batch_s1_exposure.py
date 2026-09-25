@@ -27,7 +27,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from hermes_trader import server, dashboard
+from hermes_trader import dashboard, server
 
 _OP_TOKEN = "test-op-secret-s1"
 

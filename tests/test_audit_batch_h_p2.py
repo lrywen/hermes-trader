@@ -35,6 +35,7 @@ def client(monkeypatch):
     dashboard._write_hits.clear()
     dashboard._auth_failures.clear()
     from fastapi.testclient import TestClient
+
     from hermes_trader.server import app
     return TestClient(app, raise_server_exceptions=False)
 

@@ -29,7 +29,6 @@ import pytest
 
 from hermes_trader.agents import dsl_exit
 
-
 # ── 1. canonical registration + schema ─────────────────────────────────────
 
 def test_e4_canonical_dsl_exit_has_smooth_transition_block():
@@ -106,7 +105,7 @@ def test_e4_rehydrate_preserves_smooth_fields(monkeypatch):
     """_tracker_to_dict → _tracker_from_dict must round-trip the smooth knob
     (previously rehydrate rebuilt ExitPolicy without the fields, silently
     dropping an enabled ramp after a restart)."""
-    from hermes_trader.agents.dsl_exit import ExitPolicy, DSLTracker
+    from hermes_trader.agents.dsl_exit import DSLTracker, ExitPolicy
     monkeypatch.setattr(dsl_exit, "_request_save", lambda **_k: None)
     pol = ExitPolicy(smooth_transition_enabled=True, smooth_band_pct=2.0)
     t = DSLTracker("E4R", "long", 100.0, time.time(), policy=pol, leverage=10)

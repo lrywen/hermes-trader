@@ -29,7 +29,6 @@ from hermes_trader.agents.config_store import (
     validate_config_dict,
 )
 
-
 # ── canonical registration: block + scalar ───────────────────────────
 
 def test_phase3_leverage_tier_block_registered():

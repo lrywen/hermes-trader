@@ -25,9 +25,8 @@ import logging
 
 import pytest
 
-from hermes_trader.agents import config_store, executor, perception
 from hermes_trader import loop_runtime, session_log
-
+from hermes_trader.agents import config_store, executor, perception
 
 # ── P0-1: 4th gray-release mode registered ─────────────────────────────────
 

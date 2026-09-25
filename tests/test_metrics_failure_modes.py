@@ -21,7 +21,6 @@ import shutil
 import time
 
 import pytest
-
 from prometheus_client.parser import text_string_to_metric_families
 
 from hermes_trader import metrics, positions_snapshot, session_log

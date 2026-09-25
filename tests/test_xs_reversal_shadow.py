@@ -27,7 +27,6 @@ from hermes_trader.agents.config_schema import validate_config_updates
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
 from hermes_trader.models.types import Candle
 
-
 # ── synthetic candle construction ──────────────────────────────────────────
 
 _HOUR_MS = 3600 * 1000

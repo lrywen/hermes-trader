@@ -13,8 +13,8 @@
 另锁 CANONICAL_DEFAULTS sentinel 与 schema 越界拒绝。
 """
 
-from hermes_trader.agents import risk_gates as rg
 from hermes_trader.agents import executor as ex
+from hermes_trader.agents import risk_gates as rg
 from hermes_trader.agents.config_schema import validate_config_updates
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
 from hermes_trader.client import exchange as exchange_mod

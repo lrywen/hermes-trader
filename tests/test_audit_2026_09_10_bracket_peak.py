@@ -32,13 +32,11 @@ Three distinct defects were reconstructed from the live evidence:
 from __future__ import annotations
 
 import json
-import types
 
 import pytest
 
-from hermes_trader.agents import dsl_exit, executor
 from hermes_trader import event_log
-
+from hermes_trader.agents import dsl_exit, executor
 
 # ── 1. bracket exceptions are contained and surfaced ────────────────────
 

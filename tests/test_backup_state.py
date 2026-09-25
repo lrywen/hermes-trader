@@ -27,7 +27,6 @@ import pytest
 
 from scripts import backup_state as bs
 
-
 # ---------------------------------------------------------------------------
 # Manifest: exact set of critical state files (regression guard vs drift)
 # ---------------------------------------------------------------------------

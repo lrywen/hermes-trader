@@ -45,7 +45,7 @@ import json
 import os
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
@@ -53,7 +53,7 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.data import historical_candles as hc  # noqa: E402
+from hermes_trader.data import historical_candles as hc
 
 DEFAULT_FILE = "/data/atr_regime_calib_shadow.jsonl"
 DEFAULT_OUT = "/data/atr_regime_calib_shadow.backfill.jsonl"

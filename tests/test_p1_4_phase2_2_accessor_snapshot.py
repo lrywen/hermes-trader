@@ -24,10 +24,9 @@ import json
 
 import pytest
 
-from hermes_trader.agents import config_store, dsl_exit, executor, memory, research
 from hermes_trader import dashboard
+from hermes_trader.agents import config_store, dsl_exit, executor, memory, research
 from hermes_trader.client import rate_limit
-
 
 # ── fixtures ───────────────────────────────────────────────────────────────
 

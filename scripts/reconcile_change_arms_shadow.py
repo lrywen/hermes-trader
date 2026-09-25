@@ -85,9 +85,10 @@ _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from hermes_trader.client.hl_client import _http_post  # noqa: E402
-from hermes_trader.models.types import Candle  # noqa: E402
-import shadow_progress as sp  # noqa: E402
+import shadow_progress as sp
+
+from hermes_trader.client.hl_client import _http_post
+from hermes_trader.models.types import Candle
 
 # Round-trip taker fees, bps (matches reconcile_ta_late_entry / reconcile_pullback).
 ROUND_TRIP_FEE_BPS = 5.0

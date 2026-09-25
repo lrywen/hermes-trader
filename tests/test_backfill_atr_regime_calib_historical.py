@@ -28,7 +28,7 @@ mod = importlib.util.module_from_spec(_spec)
 sys.modules["backfill_atr_hist"] = mod
 _spec.loader.exec_module(mod)
 
-from hermes_trader.data import historical_candles as hc  # noqa: E402
+from hermes_trader.data import historical_candles as hc
 
 STEP = hc.INTERVAL_MS["1h"]
 

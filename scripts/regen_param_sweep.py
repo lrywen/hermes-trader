@@ -53,7 +53,6 @@ import argparse
 import bisect
 import glob
 import json
-import math
 import os
 import sys
 import time
@@ -65,9 +64,9 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.ta_filter import late_entry_check  # noqa: E402
-from hermes_trader.data import historical_candles as hc  # noqa: E402
-from hermes_trader.indicators.math import sma  # noqa: E402
+from hermes_trader.agents.ta_filter import late_entry_check
+from hermes_trader.data import historical_candles as hc
+from hermes_trader.indicators.math import sma
 
 BAR_4H = hc.INTERVAL_MS["4h"]
 BAR_1H = hc.INTERVAL_MS["1h"]

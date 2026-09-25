@@ -31,7 +31,6 @@ from hermes_trader.agents.config_store import (
     cfg_get,
 )
 
-
 # ── sizing_v2_cap_pct canonical default mirrors the executor fallback ─
 
 def test_batch2_sizing_v2_cap_pct_canonical_default_is_one():

@@ -1,13 +1,9 @@
 """Offline tests for the historical candle data layer (no network)."""
 from __future__ import annotations
 
-import importlib
-import math
-
 import pytest
 
 from hermes_trader.data import historical_candles as hc
-from hermes_trader.models.types import Candle
 
 STEP = hc.INTERVAL_MS["1h"]
 

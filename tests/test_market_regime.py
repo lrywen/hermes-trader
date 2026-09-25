@@ -34,7 +34,6 @@ from hermes_trader.agents import market_regime as mr
 from hermes_trader.indicators.math import ema
 from hermes_trader.models.types import Candle
 
-
 # ── helpers ─────────────────────────────────────────────────────────────
 
 def _mk(t, o, h, l, c, v=1000.0):

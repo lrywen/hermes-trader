@@ -27,7 +27,6 @@ import pytest
 
 from hermes_trader.agents import config_store, executor
 
-
 # ── P0-1: live_trading_authorized truth table ──────────────────────────────
 
 @pytest.mark.parametrize("value", ["1", "true", "TRUE", "True", "yes", "on",
@@ -71,6 +70,7 @@ def _minimal_live_wire(monkeypatch):
     # cache so this wire is evaluated afresh (other tests in the session may
     # have cached a block).
     import tempfile
+
     from hermes_trader.agents import live_gate
     _live_cfg = {"mode": "LIVE"}
     _gate = tempfile.NamedTemporaryFile(

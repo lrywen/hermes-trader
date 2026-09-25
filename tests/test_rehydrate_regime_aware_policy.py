@@ -19,9 +19,7 @@ from __future__ import annotations
 
 import pytest
 
-from hermes_trader.agents import dsl_exit
-from hermes_trader.agents import executor
-from hermes_trader.agents import market_regime
+from hermes_trader.agents import dsl_exit, executor, market_regime
 
 # Mirrors production dsl_exit: loose top-level caps that regime_aware overrides.
 DSL_CFG = {

@@ -47,8 +47,8 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.agents.config_store import cfg_get, read_agent_config  # noqa: E402
-from hermes_trader.data import historical_candles as hc  # noqa: E402
+from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.data import historical_candles as hc
 
 DEFAULT_FILE = "/data/pullback_shadow.jsonl"
 DEFAULT_OUT = "/data/pullback_shadow.backfill.jsonl"

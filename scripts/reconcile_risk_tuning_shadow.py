@@ -39,7 +39,7 @@ import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 os.environ["HERMES_BACKTEST"] = "1"
 _REPO = Path(__file__).resolve().parents[1]

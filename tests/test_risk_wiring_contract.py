@@ -681,9 +681,8 @@ def test_entry_context_capture_failure_is_recorded(monkeypatch):
     config-era / enforcement snapshot). A failure was logged at DEBUG only;
     it must reach events.jsonl as an ``error`` scoped ``entry_context`` while
     the fill itself still settles (executor.py ~:2856-2873)."""
-    from hermes_trader.agents import executor
-    from hermes_trader.agents import market_regime
     from hermes_trader import event_log
+    from hermes_trader.agents import executor, market_regime
 
     monkeypatch.setattr(executor, "register_position",
                         lambda *a, **k: None)
@@ -720,10 +719,9 @@ def test_h6_rehydrate_failure_is_recorded(monkeypatch):
     shrinks the orphan window can itself fail. That failure was only logged;
     it must land in events.jsonl as an ``error`` scoped ``h6_rehydrate`` while
     the streak/halt control flow is untouched (executor.py ~:2526-2537)."""
-    from hermes_trader.agents import executor
-    from hermes_trader.client import exchange
-    from hermes_trader.agents import dsl_exit
     from hermes_trader import event_log
+    from hermes_trader.agents import dsl_exit, executor
+    from hermes_trader.client import exchange
 
     monkeypatch.setattr(exchange, "reconcile_order_fill",
                         lambda **k: {"status": "unknown",
@@ -773,8 +771,8 @@ def test_tiered_breaker_arm_failure_is_recorded(monkeypatch):
     can keep entering into a server-side stop cascade; a warning-only handler
     would hide that. It must emit an ``error`` scoped ``tiered_breaker_arm``
     while still never raising (executor.py ~:6358-6361)."""
-    from hermes_trader.agents import executor
     from hermes_trader import event_log
+    from hermes_trader.agents import executor
 
     def _boom(_coin, _roe):
         raise RuntimeError("loss outcome store down")
@@ -805,8 +803,7 @@ def test_roe_blowup_halt_check_failure_is_recorded(monkeypatch):
     quieter than success. It must emit an ``error`` scoped
     ``roe_blowup_halt_check`` and still return False (executor.py ~:6268-6270).
     """
-    from hermes_trader.agents import executor
-    from hermes_trader.agents import config_store
+    from hermes_trader.agents import config_store, executor
 
     monkeypatch.setattr(executor, "read_agent_config",
                         lambda: {"mode": "LIVE", "roe_halt_enabled": True,
@@ -846,8 +843,8 @@ def test_pending_sl_persist_failure_is_recorded(monkeypatch):
     naked positions from the retry queue. It must emit an ``error`` scoped
     ``pending_sl_persist`` (stage=persist) while never raising
     (executor.py ~:353-354)."""
-    from hermes_trader.agents import executor
     from hermes_trader import event_log
+    from hermes_trader.agents import executor
 
     # Force json.dumps to fail inside the lock, before any filesystem I/O.
     monkeypatch.setattr(executor, "_pending_sl_retries",
@@ -871,8 +868,8 @@ def test_pending_sl_load_failure_is_recorded(monkeypatch, tmp_path):
     as "no naked positions across the restart"). The load failure must land in
     events.jsonl as an ``error`` scoped ``pending_sl_persist`` (stage=load)
     while still returning 0 and never raising (executor.py ~:389-391)."""
-    from hermes_trader.agents import executor
     from hermes_trader import event_log
+    from hermes_trader.agents import executor
 
     bad = tmp_path / "pending-sl.json"
     bad.write_text("{not valid json", encoding="utf-8")
@@ -899,9 +896,8 @@ def test_dsl_policy_build_failopen_is_recorded(monkeypatch):
     disabling ATR/noise/scratch sub-protections) for all positions. It must
     still fail open to ExitPolicy() but emit an ``error`` scoped
     ``dsl_policy_build_failopen`` (dsl_exit.py ~:2177-2178)."""
-    from hermes_trader.agents import dsl_exit
-    from hermes_trader.agents import config_store
     from hermes_trader import event_log
+    from hermes_trader.agents import config_store, dsl_exit
 
     def _boom():
         raise RuntimeError("config store exploded")
@@ -929,8 +925,8 @@ def test_dsl_bracket_backfill_failure_is_recorded(monkeypatch):
     is invisible/immovable. rehydrate must still return normally but emit an
     ``error`` scoped ``dsl_bracket_backfill_fail`` (dsl_exit.py ~:2417-2421).
     """
-    from hermes_trader.agents import dsl_exit
     from hermes_trader import event_log
+    from hermes_trader.agents import dsl_exit
 
     def _boom(*a, **k):
         raise RuntimeError("openOrders fetch exploded")
@@ -1060,12 +1056,9 @@ def test_reentry_cap_read_failure_is_loud_but_fails_open(monkeypatch, tmp_path):
     metric, nor the risk_gate_blind SSE event. The fail-open return must NOT
     change (pass=True/via=reentry_cap_data_missing); only the loudness triplet
     is added (risk_gates.py ~:2021-2031)."""
-    from hermes_trader.agents import risk_gates
-    from hermes_trader import metrics
-    from hermes_trader import notify
-    from hermes_trader import session_log
-
     import hermes_trader.agents.memory as memory_mod
+    from hermes_trader import metrics, notify, session_log
+    from hermes_trader.agents import risk_gates
 
     class _BoomMem:
         def count_openings_since(self, coin, since_ms):
@@ -1125,9 +1118,8 @@ def test_gex_veto_check_failure_is_recorded(monkeypatch):
     options-wall veto is silently OFF for that signal. Admission must remain
     fail-open, but an ``error`` scoped ``gex_veto_check_fail`` must be durably
     recorded (executor.py ~:5539-5540)."""
-    from hermes_trader.agents import executor
-    from hermes_trader.agents import options_gex
     from hermes_trader import event_log
+    from hermes_trader.agents import executor, options_gex
 
     monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
                         lambda **kw: None)
@@ -1179,6 +1171,7 @@ def test_market_circuit_evaluate_outer_failure_is_recorded(monkeypatch, tmp_path
     ``error`` event scoped ``market_circuit_evaluate_failopen`` must be emitted
     best-effort (market_circuit.py ~:460-465)."""
     from types import SimpleNamespace
+
     from hermes_trader.agents import market_circuit as mc
 
     def _calm_fetcher(*_a, **_k):
@@ -1222,6 +1215,7 @@ def test_market_circuit_enforce_trip_arm_failure_is_truthful(caplog, tmp_path):
     armed=False; the critical log must say the arm FAILED instead
     (market_circuit.py ~:425-434)."""
     from types import SimpleNamespace
+
     from hermes_trader.agents import market_circuit as mc
 
     def _crash_fetcher(*_a, **_k):
@@ -1307,7 +1301,6 @@ def _run_backfill(*, dropped, fill=None, resolve_raises=None,
 
     Returns the flat event list. Each protection arm is injected so a test
     can force it to raise; default arms are no-ops (a healthy run)."""
-    from hermes_trader.agents.dsl_exit import DSLTracker
 
     events = []
 
@@ -1634,7 +1627,7 @@ def _wire_entry_case(monkeypatch, *, tier_cfg=None, h4_raises=False):
     paper order kwargs. ``tier_cfg`` enables the leverage-tier arm;
     ``h4_raises`` makes the H4 width resolver explode (the liq-buffer
     worst-case stop estimate then fails blind)."""
-    from hermes_trader.agents import market_regime, shadow_book, executor
+    from hermes_trader.agents import executor, market_regime, shadow_book
 
     cfg = {
         "mode": "SHADOW", "enable_crypto": True,
@@ -1810,8 +1803,8 @@ def test_index_price_lookup_import_failure_is_loud(monkeypatch):
     no trace. The empty-dict posture must NOT change; a scoped ``error``
     ``index_price_lookup_blind`` must now be recorded."""
     import hermes_trader.client.hl_client as hl_client
-    from hermes_trader.agents import dsl_exit
     from hermes_trader import event_log
+    from hermes_trader.agents import dsl_exit
 
     written = _event_sink(monkeypatch, event_log)
     monkeypatch.delattr(hl_client, "_http_post", raising=True)
@@ -1835,10 +1828,9 @@ def test_rehydrate_record_trade_failure_is_loud(monkeypatch, tmp_path):
     (broken trades↔closes join, win-rate stats) with no durable trace. The
     synth tracker must still be created (non-fatal); a scoped ``error``
     ``rehydrate_record_trade`` must now be recorded."""
-    from hermes_trader.agents import dsl_exit
-    from hermes_trader.agents import market_regime
-    from hermes_trader.agents.memory import memory as _mem
     from hermes_trader import event_log
+    from hermes_trader.agents import dsl_exit, market_regime
+    from hermes_trader.agents.memory import memory as _mem
 
     # Reuse the rehydrate test's hermetic setup inline (tests/ is not a
     # package, so its fixture cannot be imported).

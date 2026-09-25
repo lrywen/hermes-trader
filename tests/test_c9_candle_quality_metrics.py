@@ -23,7 +23,6 @@ import time
 
 from prometheus_client import REGISTRY
 
-
 _MS_4H = 14_400_000
 
 
@@ -100,8 +99,8 @@ def test_cold_fetch_emits_quality_and_parse_metrics(monkeypatch):
 
 def test_quality_metric_helper_never_raises(monkeypatch):
     """A metrics backend failure must never propagate to the fetch path."""
-    from hermes_trader.client import hl_client
     from hermes_trader import metrics
+    from hermes_trader.client import hl_client
 
     def _boom(*_a, **_kw):
         raise RuntimeError("metrics backend down")

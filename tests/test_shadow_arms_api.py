@@ -581,8 +581,8 @@ def test_regen_refresh_validates_body(regen_client):
 
 def test_regen_refresh_runs_and_drops_report_cache(regen_client, monkeypatch):
     c, report_path = regen_client
-    from hermes_trader.dashboard_routes import shadow_arms
     from hermes_trader import session_log
+    from hermes_trader.dashboard_routes import shadow_arms
     captured = []
     monkeypatch.setattr(session_log, "append", lambda ev: captured.append(ev))
 
@@ -658,8 +658,8 @@ def test_regen_refresh_failed_run_keeps_state(regen_client, monkeypatch):
 # ── blind-gate SSE mirror (agents/risk_gates.py) ─────────────────────────────
 
 def test_alert_memory_gate_blind_emits_sse_event(monkeypatch):
-    from hermes_trader.agents import risk_gates
     from hermes_trader import session_log
+    from hermes_trader.agents import risk_gates
     captured = []
     monkeypatch.setattr(session_log, "append", lambda ev: captured.append(ev))
     # notify.send_card must be invoked but must not matter if it raises.
@@ -676,8 +676,8 @@ def test_alert_memory_gate_blind_emits_sse_event(monkeypatch):
 
 
 def test_alert_memory_gate_blind_never_raises(monkeypatch):
-    from hermes_trader.agents import risk_gates
     from hermes_trader import session_log
+    from hermes_trader.agents import risk_gates
     # Even if the session-log append itself explodes, the hot path is safe.
     monkeypatch.setattr(session_log, "append",
                         lambda ev: (_ for _ in ()).throw(RuntimeError("log disk dead")))
