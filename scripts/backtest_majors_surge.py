@@ -603,7 +603,8 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
 def _simulate_baseline_kernel(cand: Candidate, bars: List[Candle], i: int,
                               dsl_blk: Dict[str, Any], notional: float,
                               entry_slip: float, exit_slip: float,
-                              coin: str) -> Optional[Trade]:
+                              coin: str,
+                              confirm_mode: str = "tick") -> Optional[Trade]:
     """baseline 臂出场委托【统一内核】（ARP-02 B4 收口）。
 
     不再走脚本自建的 ``_simulate_trade`` 阶梯：policy 由生产单源
@@ -630,7 +631,8 @@ def _simulate_baseline_kernel(cand: Candidate, bars: List[Candle], i: int,
     policy = _policy_from_dsl_dict(dsl_blk)
     engine = DslBarExit(
         side=cand.side, entry_px=entry_px, entry_time_ms=entry_t,
-        policy=policy, leverage=1, coin=coin, bar_ms=MS_5M)
+        policy=policy, leverage=1, coin=coin, bar_ms=MS_5M,
+        confirm_mode=confirm_mode)
 
     tr = Trade(coin=coin, side=cand.side, arm=cand.arm, entry_t=entry_t,
                entry_px=entry_px, notional=notional, score=cand.score,

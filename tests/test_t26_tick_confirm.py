@@ -108,13 +108,14 @@ def test_tick_interval_is_configurable() -> None:
     assert bar_idx == 1
 
 
-def test_default_mode_is_bar_parity() -> None:
-    # 不传 confirm_mode：默认 bar，req=2 仍是旧的延迟到 bar4 行为（逐位一致）。
+def test_default_mode_is_tick() -> None:
+    # 不传 confirm_mode：生产默认 tick，req=2 在首个破 floor 的 bar1 内由
+    # 两个 5s tick 确认（PRM-07 收口后的默认口径）。
     ex = DslBarExit(side="long", entry_px=100.0, entry_time_ms=0,
                     policy=_policy(2), leverage=1, coin="T",
                     entry_atr_pct=1.0, bar_ms=BAR_MS)
     for i, b in enumerate(_series()):
         if ex.on_bar(b, i) is not None:
-            assert i == 3
+            assert i == 1
             return
     raise AssertionError("never exited")

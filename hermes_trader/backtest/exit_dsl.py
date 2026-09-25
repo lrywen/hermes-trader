@@ -102,11 +102,11 @@ class DslBarExit:
     entry_regime: str = ""
     bar_ms: int = BAR_MS_5M
     # T-26：破位确认口径。
-    #   "bar"  —— 旧口径：一根 bar 只驱动一次 check，consecutive_breaches 被
-    #             解释为"连续 N 根 K 线"（默认，逐位不变，供粗粒度回测）。
-    #   "tick" —— 实盘口径：bar 内以 tick_confirm_s 为步长子采样，多次驱动
-    #             check，consecutive_breaches 表示"连续 N 次秒级轮询"。
-    confirm_mode: str = "bar"
+    #   "tick" —— 【生产默认】实盘口径：bar 内以 tick_confirm_s 为步长子采样，
+    #             多次驱动 check，consecutive_breaches 表示"连续 N 次秒级轮询"。
+    #   "bar"  —— 显式可选粗粒度口径：一根 bar 只驱动一次 check，
+    #             consecutive_breaches 被解释为"连续 N 根 K 线"。
+    confirm_mode: str = "tick"
     #: 实盘出场检查点最小间隔（exit_checkpoint_min_interval_s 默认 5s）。
     tick_confirm_s: float = 5.0
 

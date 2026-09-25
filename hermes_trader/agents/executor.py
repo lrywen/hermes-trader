@@ -383,6 +383,35 @@ def _resolve_sl_width_config(config: dict[str, Any], coin: str) -> dict[str, flo
             "sl_ceiling_pct": sl_ceiling_pct,
             "sl_limit_band_pct": sl_limit_band_pct}
 
+
+def compute_backup_sl_width_pct(
+    *,
+    atr: float,
+    entry_px: float,
+    sl_atr_mult: float,
+    sl_floor_pct: float,
+    sl_ceiling_pct: float,
+    slip_widen_pct: float = 0.0,
+) -> float:
+    """备份 SL 宽度【单一事实来源】（NEW-01/PRM-01）。
+
+    备份 SL 是与 DSL 出场【不同层】的交易所侧兜底网（故意覆盖比 DSL 硬止损
+    更宽的爆炸半径，并按近期 adverse exit slip 动态加宽），故它不调
+    ``resolve_effective_stop_width_pct``（那个返回紧的 regime/ROE 宽度）。
+    本函数是备份网宽度的唯一计算处，自动下单（_place_backup_sl 与回执 stop_px）
+    与手动下单（server.py）MUST 都调用它，消除同一公式三处手写漂移：
+
+        base   = clamp((atr/entry_px)*sl_atr_mult*100, sl_floor, sl_ceiling)
+        return min(base + max(0, slip_widen), sl_ceiling)
+
+    slip 只加宽、且最终不超过 ceiling。纯函数。返回正数 %。
+    """
+    if not (atr > 0 and entry_px > 0):
+        return 0.0
+    atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100.0
+    base = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
+    return min(base + max(0.0, float(slip_widen_pct)), sl_ceiling_pct)
+
 # Hyperliquid perp taker fee, in PERCENT (HL = 2.5 bps = 0.025%). Used to model
 # round-trip entry+exit cost in realized-PnL bookkeeping. Env-overridable so a
 # future fee change doesn't require a code edit; 2 round-trip fills modeled.
@@ -1660,11 +1689,6 @@ def _place_backup_sl(
     """
     sl_missing = False
     if atr > 0 and size_in_coin > 0:
-        atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100
-        # Three-way clamp: floor (no too-tight BOME stop) ≤ width ≤ ceiling
-        # (no 43% HYPE gap). This mirrors the DSL atr_stop clamp so the backup
-        # net always overlaps the DSL's own stop blast radius.
-        sl_width_pct = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
         # Dynamic slippage compensation (PURR #6 root cause): widen the backup
         # stop by the coin's recent mean adverse exit slip so a gap-through at
         # trigger time still lands within the intended cap. Capped so a noisy
@@ -1675,7 +1699,11 @@ def _place_backup_sl(
             _slip_widen_pct = min(_slip_widen_pct, sl_ceiling_pct * 0.5)
         except Exception:
             _slip_widen_pct = 0.0
-        sl_width_pct = min(sl_width_pct + _slip_widen_pct, sl_ceiling_pct)
+        # NEW-01：宽度统一走备份 SL SSOT（不再本地手写三层 clamp）。
+        sl_width_pct = compute_backup_sl_width_pct(
+            atr=atr, entry_px=entry_px, sl_atr_mult=sl_atr_mult,
+            sl_floor_pct=sl_floor_pct, sl_ceiling_pct=sl_ceiling_pct,
+            slip_widen_pct=_slip_widen_pct)
         sl_px = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
         # C4-3: sl_limit_band_pct > 0 arms a trigger LIMIT (worst-case fill
         # capped `band` past the trigger); 0 keeps the market-on-trigger default.
@@ -2757,10 +2785,12 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
         logger.error(f"[executor] TP scale-out placement raised for {coin}: {_tp_err}")
 
     if atr > 0 and size_in_coin > 0:
-        atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100
-        # Mirror the placed backup SL width (floor/ceiling clamp) so the
-        # returned stop_px matches the order actually on the exchange.
-        sl_width_pct = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
+        # NEW-01：回执 stop_px 与实际挂单同一宽度 SSOT（无 slip 加宽——挂单
+        # 已在 _place_backup_sl 内含 slip；这里 mirror 不含 slip 的基础宽度会
+        # 漂移，故直接复算基础宽度并对齐，保持与交易所挂单一致）。
+        sl_width_pct = compute_backup_sl_width_pct(
+            atr=atr, entry_px=entry_px, sl_atr_mult=sl_atr_mult,
+            sl_floor_pct=sl_floor_pct, sl_ceiling_pct=sl_ceiling_pct)
         final_sl = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
     else:
         final_sl = stop_px

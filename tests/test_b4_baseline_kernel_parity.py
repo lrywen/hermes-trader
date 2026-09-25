@@ -76,7 +76,8 @@ def _run_kernel(surge: Any, allbars: List[Candle]) -> Tuple[str, int, float]:
     cand = surge.Candidate(bar_idx=0, side="long", arm="baseline", score=60.0,
                            fired=[], meta={})
     tr = surge._simulate_baseline_kernel(cand, allbars, 0, DSL_BLOCK, 10_000.0,
-                                         0.0, 0.0, "TEST")
+                                         0.0, 0.0, "TEST",
+                                         confirm_mode="bar")
     assert tr is not None
     return tr.exit_reason, tr.hold_bars, round(tr.exit_px, 8)
 

@@ -91,7 +91,8 @@ def test_phase1_accessor_file_shadow_without_env(monkeypatch):
     assert executor._sizing_v2_config(cfg)["mode"] == "shadow"
 
 
-def test_phase1_accessor_default_off_when_nothing_set(monkeypatch):
+def test_phase1_accessor_default_enforce_when_nothing_set(monkeypatch):
     from hermes_trader.agents import executor
     monkeypatch.delenv("HERMES_SIZING_V2_MODE", raising=False)
-    assert executor._sizing_v2_config({})["mode"] == "off"
+    # PRM-06：canonical 叶仍注册为 "off"，但访问器缺省默认已切 enforce。
+    assert executor._sizing_v2_config({})["mode"] == "enforce"

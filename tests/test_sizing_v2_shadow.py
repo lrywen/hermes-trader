@@ -7,12 +7,14 @@ observation-only shadow JSONL branch was removed in the 2026-09-21 cleanup;
 these tests now cover only:
 
   * _sizing_v2_config mode resolution: env HERMES_SIZING_V2_MODE > block
-    sizing_v2_mode > invalid/missing → off. The legacy boolean
+    sizing_v2_mode > invalid/missing → enforce（生产默认）. The legacy boolean
     sizing_v2_enabled was retired (P1-4 Phase 1 step 5) and is ignored.
   * Full maybe_execute wiring: ENFORCE applies the v2 width and the gray cap;
-    OFF is byte-identical to the legacy v1 path.
+    explicit OFF is byte-identical to the legacy v1 path.
 
-Default mode is OFF: with no config/env, behavior is unchanged.
+Default mode is ENFORCE (PRM-06 收口）: with no config/env the position sizes on
+the stop-width SSOT rather than the legacy 1.0% v1 width; write ``"off"`` to
+explicitly fall back.
 """
 
 from __future__ import annotations
@@ -23,25 +25,25 @@ _ENV_MODE = "HERMES_SIZING_V2_MODE"
 
 
 # ── config resolution ───────────────────────────────────────────────────────
-def test_config_defaults_off(monkeypatch):
+def test_config_defaults_enforce(monkeypatch):
     monkeypatch.delenv(_ENV_MODE, raising=False)
-    assert executor._sizing_v2_config({})["mode"] == "off"
-    assert executor._sizing_v2_config({"atr_risk_sizing": {}})["mode"] == "off"
-    # Retired legacy boolean is ignored (false or true).
+    assert executor._sizing_v2_config({})["mode"] == "enforce"
+    assert executor._sizing_v2_config({"atr_risk_sizing": {}})["mode"] == "enforce"
+    # Retired legacy boolean is ignored (does not switch the arm off/on).
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_enabled": False}})["mode"] == "off"
+        {"atr_risk_sizing": {"sizing_v2_enabled": False}})["mode"] == "enforce"
 
 
 def test_config_legacy_boolean_is_retired_and_ignored(monkeypatch):
     monkeypatch.delenv(_ENV_MODE, raising=False)
     # P1-4 Phase 1 step 5: sizing_v2_mode is the only switch; the old
-    # boolean no longer flips the arm to enforce (dead knob resolves off).
+    # boolean no longer flips the arm (dead knob keeps the enforce default).
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "off"
+        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "enforce"
     # An explicit mode still wins alongside the dead boolean.
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_mode": "enforce",
-                             "sizing_v2_enabled": False}})["mode"] == "enforce"
+        {"atr_risk_sizing": {"sizing_v2_mode": "off",
+                             "sizing_v2_enabled": False}})["mode"] == "off"
 
 
 def test_config_block_mode(monkeypatch):
@@ -67,13 +69,13 @@ def test_config_env_overrides_everything(monkeypatch):
         {"atr_risk_sizing": {"sizing_v2_mode": "shadow"}})["mode"] == "enforce"
 
 
-def test_config_invalid_mode_falls_back_off(monkeypatch):
+def test_config_invalid_mode_falls_back_enforce(monkeypatch):
     monkeypatch.setenv(_ENV_MODE, "bogus")
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "off"
+        {"atr_risk_sizing": {"sizing_v2_enabled": True}})["mode"] == "enforce"
     monkeypatch.delenv(_ENV_MODE, raising=False)
     assert executor._sizing_v2_config(
-        {"atr_risk_sizing": {"sizing_v2_mode": "nope"}})["mode"] == "off"
+        {"atr_risk_sizing": {"sizing_v2_mode": "nope"}})["mode"] == "enforce"
 
 
 # ── full maybe_execute wiring (bot SHADOW mode = paper, no real order) ──────
@@ -220,8 +222,8 @@ def _analysis():
 
 
 def test_off_matches_legacy_v1(monkeypatch):
-    """OFF: v2 math never runs; sizing is the legacy v1 width."""
-    monkeypatch.delenv(_ENV_MODE, raising=False)
+    """Explicit OFF: v2 math never runs; sizing is the legacy v1 width."""
+    monkeypatch.setenv(_ENV_MODE, "off")
     captured = _wire_executor(monkeypatch, {})
 
     res = executor.maybe_execute(_analysis())
@@ -244,10 +246,10 @@ def test_enforce_applies_v2_width_and_gray_cap(monkeypatch):
     assert abs(captured["shadow_open"]["size_usd"] - 100.0) < 1e-6
 
 
-def test_legacy_boolean_alone_keeps_arm_off(monkeypatch):
+def test_legacy_boolean_alone_does_not_keep_arm_off(monkeypatch):
     """With sizing_v2_mode absent, the retired sizing_v2_enabled=true must
-    NOT engage v2: the order sizes on the legacy v1 width (off behavior,
-    $800)."""
+    NOT switch the arm off: the default enforce path applies the v2 width
+    (gray-capped $100 here)."""
     monkeypatch.delenv(_ENV_MODE, raising=False)
     captured = _wire_executor(
         monkeypatch,
@@ -258,7 +260,7 @@ def test_legacy_boolean_alone_keeps_arm_off(monkeypatch):
 
     res = executor.maybe_execute(_analysis())
     assert res.get("reason") == "shadow_mode_would_execute"
-    assert abs(captured["ctx"].trade_notional_usd - 800.0) < 1e-6
+    assert abs(captured["ctx"].trade_notional_usd - 100.0) < 1e-6
 
 
 def test_enforce_gray_cap_bumps_sub_min_to_floor(monkeypatch):

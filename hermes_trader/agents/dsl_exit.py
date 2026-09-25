@@ -1360,6 +1360,13 @@ class DSLTracker:
         # the ATR noise band, treat it as NOT breached (hold) so we don't concede
         # inside the noise. Requires an ATR captured at entry; degrades to
         # current behavior when absent.
+        #
+        # PRM-04 可达域（2026-09-25 收口标注）：抑制只在
+        #   peak_profit ∈ [0, first_tier) 且 pullback ≤ band 时成立。
+        #   * scalp 档：first_tier=2（phase2 首档 pct_above_entry），
+        #     non_trend cap=1.5，存在约 0.5pp 的可达窗口 —— 非死代码。
+        #   * trend_ride 档：protect=first_tier=2.5，窗口 [0,2.5) 内 floor
+        #     本身尚未上抬，交集实际为空 —— 该档 noise_band 不生效（已知、接受）。
         if breached and pol.noise_band_enabled and self.entry_atr_pct > 0:
             first_tier_pct = min((t.pct_above_entry for t in pol.phase2_tiers), default=3.0)
             peak_profit_pct = self._peak_profit_pct()

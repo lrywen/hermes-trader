@@ -40,7 +40,7 @@ def run(
     bar_ms: int = BAR_MS_5M,
     regime_replay: bool = False,
     dsl_config: Optional[dict] = None,
-    confirm_mode: str = "bar",
+    confirm_mode: str = "tick",
     tick_confirm_s: float = 5.0,
 ) -> list[Trade]:
     """Run one-coin backtest; return completed trades in chronological order.

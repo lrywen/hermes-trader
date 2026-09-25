@@ -257,8 +257,9 @@ def main() -> int:
                      help="RFT-01：每仓在 PIT 窗口现判 regime，并按生产同源 "
                           "select_exit_params/regime clocks 选出场档（默认关闭=平铺 policy）")
     ap.add_argument("--tick-confirm", action="store_true",
-                     help="T-26：破位确认按实盘秒级 tick 子采样回放（consecutive_breaches "
-                          "= 连续 N 次轮询）；默认关闭=旧 bar 口径（连续 N 根 K 线）")
+                     help="T-26（已为生产默认）：破位确认按实盘秒级 tick 子采样回放")
+    ap.add_argument("--bar-confirm", action="store_true",
+                     help="T-26：改用旧 bar 粗粒度口径（consecutive_breaches=连续 N 根 K 线）")
     ap.add_argument("--tick-confirm-interval-s", type=float, default=5.0,
                      help="T-26 子采样 tick 间隔秒（默认 5=exit_checkpoint_min_interval_s）")
     ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
@@ -489,7 +490,7 @@ def main() -> int:
                 notional_usd=notional, cost=cost, bar_ms=sim_ms,
                 regime_replay=args.regime_replay,
                 dsl_config=live.get("dsl_exit", {}),
-                confirm_mode="tick" if args.tick_confirm else "bar",
+                confirm_mode="bar" if args.bar_confirm else "tick",
                 tick_confirm_s=args.tick_confirm_interval_s,
             )
             # Structural no-look-ahead invariant check on every coin.

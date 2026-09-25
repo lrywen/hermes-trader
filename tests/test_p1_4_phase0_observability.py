@@ -70,7 +70,8 @@ _DRIFT_CASES = (
          "confidence_decay.mode",
          lambda c: executor._confidence_decay_config(c)["mode"]),
         ("HERMES_SIZING_V2_MODE",
-         {"atr_risk_sizing": {"sizing_v2_enabled": False}},
+         {"atr_risk_sizing": {"sizing_v2_mode": "off",
+                              "sizing_v2_enabled": False}},
          "atr_risk_sizing.sizing_v2_mode",
          lambda c: executor._sizing_v2_config(c)["mode"]),
         ("HERMES_SIGNAL_AGE_DECAY_MODE",
@@ -141,15 +142,16 @@ def test_p02_drift_alarm_silent_on_invalid_env(
 def test_p02_sizing_v2_legacy_bool_no_longer_counts_as_file_enforce(
         monkeypatch, caplog, drift_events):
     """P1-4 Phase 1 step 5: the retired sizing_v2_enabled boolean must not
-    count as a file-side mode; env=shadow vs bool=true reports the file
-    value as off and still alarms on the env override."""
+    count as a file-side mode; env=shadow vs bool=true still alarms on the
+    env override. With no mode leaf the accessor file baseline is now the
+    enforce default (the dead boolean does not change it)."""
     monkeypatch.setenv("HERMES_SIZING_V2_MODE", "shadow")
     cfg = {"atr_risk_sizing": {"sizing_v2_enabled": True}}
     effective = executor._sizing_v2_config(cfg)
     assert effective["mode"] == "shadow"
     drift = [e for e in drift_events if e.get("event") == "config_env_drift"]
     assert len(drift) == 1
-    assert drift[0]["config_value"] == "off"
+    assert drift[0]["config_value"] == "enforce"
 
 
 # ── P0-3: accessor-effective snapshot view ─────────────────────────────────

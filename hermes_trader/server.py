@@ -80,6 +80,7 @@ from hermes_trader.agents.executor import (
     _resolve_sl_width_config,
     _signed_price,
     close_position_market,
+    compute_backup_sl_width_pct,
     maybe_execute,
 )
 from hermes_trader.agents.memory import memory
@@ -622,10 +623,8 @@ def _place_manual_post_fill_brackets(
                        band, ceiling)
         band = ceiling
 
-    atr_stop_pct = (atr / entry_px) * sl_mult * 100
-    sl_width_pct = min(max(atr_stop_pct, floor), ceiling)
     # Widen for recent mean adverse exit slip (cap ceiling*0.5), mirroring
-    # executor._place_backup_sl:1553-1563.
+    # executor._place_backup_sl.
     slip_widen_pct = 0.0
     try:
         slip_widen_pct = max(0.0, float(memory.avg_exit_slip_bps(coin, days=30.0)) / 100.0)
@@ -633,7 +632,11 @@ def _place_manual_post_fill_brackets(
     except Exception as e:
         logger.debug("[manual-order] avg_exit_slip_bps failed for %s: %s",
                      coin, e)
-    sl_width_pct = min(sl_width_pct + slip_widen_pct, ceiling)
+    # NEW-01：宽度统一走备份 SL SSOT（不再本地手写 clamp+加宽）。
+    sl_width_pct = compute_backup_sl_width_pct(
+        atr=atr, entry_px=entry_px, sl_atr_mult=sl_mult,
+        sl_floor_pct=floor, sl_ceiling_pct=ceiling,
+        slip_widen_pct=slip_widen_pct)
     sl_px = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
 
     tp_mult = _resolve_live_float("tp_atr_mult", 1.0, config=cfg)
