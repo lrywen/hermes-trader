@@ -405,10 +405,13 @@ def compute_backup_sl_width_pct(
         return min(base + max(0, slip_widen), sl_ceiling)
 
     slip 只加宽、且最终不超过 ceiling。纯函数。返回正数 %。
+
+    atr=0 合法：此时 ATR 贡献为 0，base 退化为 floor（新仓/无 ATR 时备份网
+    落在地板宽度，而非完全不挂网）；仅要求 entry_px 与 floor/ceiling 有效。
     """
-    if not (atr > 0 and entry_px > 0):
+    if not (entry_px > 0 and sl_floor_pct > 0 and sl_ceiling_pct > 0):
         return 0.0
-    atr_stop_pct = (atr / entry_px) * sl_atr_mult * 100.0
+    atr_stop_pct = (max(0.0, atr) / entry_px) * sl_atr_mult * 100.0
     base = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
     return min(base + max(0.0, float(slip_widen_pct)), sl_ceiling_pct)
 
@@ -961,7 +964,7 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
     vs trend-ride -$757/47%). When regime is directional ('up'/'down') and
     regime_aware is enabled, LOOSEN to trend-ride protect/retrace so we RIDE the
     rippers, AND widen the hard stop (live: 4.0% spot / ROE 20% in
-    up/down vs 0.8% / ROE 10 in chop/neutral) so trending positions aren't
+    up/down vs 1.5% / ROE 15 in chop/neutral) so trending positions aren't
     shaken out by 1h noise before the trailing protect kicks in.
     'neutral'/'chop' keep scalp params and the tight stop.
     Returns (protect_pct, retrace_threshold, phase2_tiers_raw,
@@ -969,7 +972,7 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
     base_protect = float(dsl_config.get("protect_pct", cfg_get("dsl_exit.protect_pct")))
     base_retrace = float(dsl_config.get("retrace_threshold", cfg_get("dsl_exit.retrace_threshold")))
     base_tiers = dsl_config.get("phase2_tiers")
-    # 生产 regime_aware.enabled=true 时 trend 块显式给 4.0、non_trend 块给 0.8，
+    # 生产 regime_aware.enabled=true 时 trend 块显式给 4.0、non_trend 块给 1.5，
     # 故顶层 dsl_exit.max_loss_pct（=1.0）在本出场路径不可达，仅在 non_trend
     # 块缺省时作为回落默认。它仍被 v1 sizing 读取（见 _v1_stop_width）。
     base_max_loss = float(dsl_config.get("max_loss_pct", cfg_get("dsl_exit.max_loss_pct")))
@@ -981,8 +984,8 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
         ml = ra.get("max_loss") or {}
         trend_ml = ml.get("trend") or {}
         _p, _rt = float(tr.get("protect_pct", 3.0)), float(tr.get("retrace_threshold", 0.55))
-        _ml_pct = float(trend_ml.get("max_loss_pct", 0.8))
-        _ml_roe = float(trend_ml.get("max_loss_roe_pct", 10.0))
+        _ml_pct = float(trend_ml.get("max_loss_pct", 4.0))
+        _ml_roe = float(trend_ml.get("max_loss_roe_pct", 20.0))
         # B-8：显式记录 regime_aware 的参数生效路径，便于回测/实盘核对"是否
         # 真按 trend_ride 档放宽"，而非静默选档。
         logger.debug(
@@ -1279,7 +1282,7 @@ def coin_breakout_regime(analysis: dict[str, Any]) -> str:
     ``select_exit_params`` only loosens to trend-ride / wide stop when the
     MACRO market regime is up/down. A coin can stage a strong, high-RVOL
     breakout while the market (BTC) regime is neutral — the AERO / ARB cases —
-    and then wrongly gets scalp params + a 0.8% stop (~0.2 ATR), even though
+    and then wrongly gets scalp params + a 1.5% stop (~0.4 ATR), even though
     its own tape is launching. This derives the directional regime from the
     coin itself:
 
@@ -3894,7 +3897,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             # ── Sizing v2: regime-aware + full DSL stop width ───────────
             # The legacy path sizes off the top-level 1.0% stop while the DSL
             # actually applies the regime/ROE-clamped width via the SSOT
-            # resolve_effective_stop_width_pct (non_trend 0.8% / trend up to
+            # resolve_effective_stop_width_pct (non_trend 1.5% / trend up to
             # 4%). v2 mirrors that exact width, plus ATR-spike/slippage
             # adjustments and the §1 ATR-regime calibration. Gray-released via
             # three states (see _sizing_v2_config): off (default, v1 sizing),

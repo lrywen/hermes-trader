@@ -26,16 +26,16 @@ _SIZING_V2_MODES = ("off", "shadow", "enforce")
 def test_phase1_sizing_v2_mode_registered_in_canonical_block():
     block = CANONICAL_DEFAULTS["atr_risk_sizing"]
     assert "sizing_v2_mode" in block
-    assert block["sizing_v2_mode"] == "off"
+    assert block["sizing_v2_mode"] == "enforce"
 
 
 def test_phase1_sizing_v2_mode_cfg_get_default():
-    assert cfg_get("atr_risk_sizing.sizing_v2_mode", config={}) == "off"
+    assert cfg_get("atr_risk_sizing.sizing_v2_mode", config={}) == "enforce"
 
 
 def test_phase1_sizing_v2_mode_visible_in_read_agent_config():
     cfg = read_agent_config()
-    assert cfg["atr_risk_sizing"]["sizing_v2_mode"] == "off"
+    assert cfg["atr_risk_sizing"]["sizing_v2_mode"] == "enforce"
 
 
 def test_phase1_sizing_v2_mode_file_overlay_wins():

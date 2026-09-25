@@ -62,8 +62,8 @@ def test_r12_c1_atr_risk_sizing_coin_overrides_registered():
 
 def test_r12_c1_dsl_exit_fields_registered():
     dsl = CANONICAL_DEFAULTS["dsl_exit"]
-    assert dsl["noise_band"] == {"enabled": False, "atr_mult": 1.0}
-    assert dsl["consecutive_breaches_required"] == 1
+    assert dsl["noise_band"] == {"enabled": True, "atr_mult": 0.8}
+    assert dsl["consecutive_breaches_required"] == 2
     # A-F5 (deep audit 2026-08-28): DSL floor breach needs a 3-5s time gate;
     # default is 4.0s (0.0 previously meant the gate was disabled).
     assert dsl["breach_confirm_sec"] == 4.0
@@ -104,9 +104,9 @@ def test_r12_c1_aligned_min_conf_registered_enabled():
     ("sl_floor_pct", 1.2),
     ("tp_atr_mult", 1.0),
     ("atr_risk_sizing.coin_overrides", {}),
-    ("dsl_exit.noise_band.enabled", False),
-    ("dsl_exit.noise_band.atr_mult", 1.0),
-    ("dsl_exit.consecutive_breaches_required", 1),
+    ("dsl_exit.noise_band.enabled", True),
+    ("dsl_exit.noise_band.atr_mult", 0.8),
+    ("dsl_exit.consecutive_breaches_required", 2),
     ("dsl_exit.breach_confirm_sec", 4.0),
     ("runner_entry_gate.pullback_long.enabled", False),
     ("runner_entry_gate.pullback_long.min_composite", 20.0),
@@ -194,8 +194,8 @@ def test_r12_c1_read_agent_config_exposes_all_new_fields():
     assert cfg["tp_atr_mult"] == 1.0
     assert cfg["conviction_tiers"] == [[0.80, 1.5], [0.65, 1.0], [0.0, 0.7]]
     assert cfg["atr_risk_sizing"]["coin_overrides"] == {}
-    assert cfg["dsl_exit"]["noise_band"]["enabled"] is False
-    assert cfg["dsl_exit"]["consecutive_breaches_required"] == 1
+    assert cfg["dsl_exit"]["noise_band"]["enabled"] is True
+    assert cfg["dsl_exit"]["consecutive_breaches_required"] == 2
     assert cfg["dsl_exit"]["breach_confirm_sec"] == 4.0
     assert cfg["runner_entry_gate"]["pullback_long"]["shadow_mode"] is False
     assert cfg["debate_gate"]["analyst3_default"] is False

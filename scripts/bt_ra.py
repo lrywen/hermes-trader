@@ -938,7 +938,7 @@ def main() -> None:
         (float(t["pct_above_entry"]), float(t["retrace_threshold"]))
         for t in (_tr.get("phase2_tiers") or [])) or None
     dsls["ra_trend"] = DslParams(
-        max_loss_pct=float(_tr_ml.get("max_loss_pct", 0.8)),
+        max_loss_pct=float(_tr_ml.get("max_loss_pct", 4.0)),
         protect_pct=float(_tr.get("protect_pct", 2.5)),
         retrace_threshold=float(_tr.get("retrace_threshold", 0.4)),
         hard_timeout_minutes=float(_dx.get("hard_timeout_minutes", 600)),

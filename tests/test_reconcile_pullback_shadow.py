@@ -27,8 +27,8 @@ _spec.loader.exec_module(mod)
 
 BAR = 3600_000
 # Canonical defaults resolved by cfg_get when the live config has no
-# dsl_exit block (config_store L247-251; max_loss 0.4% matches live outcomes).
-CANON = {"max_loss_pct": 0.4, "protect_pct": 1.25, "retrace_threshold": 0.2}
+# dsl_exit block (flat max_loss 1.0% / protect 1.5 / retrace 0.15).
+CANON = {"max_loss_pct": 1.0, "protect_pct": 1.5, "retrace_threshold": 0.15}
 
 
 def _t0_iso(age_h=100):
@@ -83,15 +83,15 @@ def _flat_tape(monkeypatch):
 
 
 def test_max_loss_stop_losses(monkeypatch, tmp_path):
-    tape = [(100, 100, 100, 100)] * 3 + [(100, 100, 99.5, 99.6)] \
+    tape = [(100, 100, 100, 100)] * 3 + [(100, 100, 98.9, 99.1)] \
         + [(100, 100, 100, 100)] * 4
     monkeypatch.setattr(mod, "_http_post", _serve(tape))
     rows = _run(monkeypatch, tmp_path, [_rec()], write=True)
     r = rows[0]
     assert r["outcome"] == "loss"
     assert r["exit_reason"] == f"max_loss {CANON['max_loss_pct']}%"
-    assert r["exit_px"] == pytest.approx(99.6)
-    assert r["pnl_pct"] == pytest.approx(-0.45, abs=0.001)
+    assert r["exit_px"] == pytest.approx(99.0)
+    assert r["pnl_pct"] == pytest.approx(-1.05, abs=0.001)
 
 
 def test_trailing_stop_wins(monkeypatch, tmp_path):

@@ -250,16 +250,16 @@ def test_p2_9_primary_stop_uses_canonical_gates(monkeypatch):
                             "sizing_basis": "primary_stop"},
     }
     # Empty dsl_cfg: keys missing → cfg_get falls through to CANONICAL_DEFAULTS
-    # (max_loss_pct 0.4 / max_loss_roe_pct 5.0), not the old stale 2.0 / 40.0.
+    # (flat max_loss_pct 1.0 / max_loss_roe_pct 15.0), not the old stale 2.0 / 40.0.
     notional, tag = bt.live_sized_notional(
         coin="BTC", entry_px=60000.0, entry_ms=0, equity=1000.0,
         equity_fraction=0.1, leverage=5, cfg=cfg, dsl_cfg={},
     )
     assert tag.startswith("primary_stop")
-    # stop_frac = min(0.4, 5.0/5)/100 = 0.004 → notional = 0.01*1000/0.004 = 2500,
+    # stop_frac = min(1.0, 15/5)/100 = 0.01 → notional = 0.01*1000/0.01 = 1000,
     # capped at equity*lev = 5000. Stale fallbacks would have given
     # min(2.0, 40/5)/100 = 0.02 → 500. Assert the canonical number.
-    assert abs(notional - 2500.0) < 1e-6
+    assert abs(notional - 1000.0) < 1e-6
 
 
 def test_p2_9_no_stale_inline_fallbacks_in_source():

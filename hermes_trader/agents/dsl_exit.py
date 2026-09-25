@@ -2332,7 +2332,7 @@ def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
     The live entry path (executor.register) calls ``select_exit_params(dsl,
     regime)`` and builds the policy from those params: trend regimes (up/down)
     get the trend-ride 4.0% / 20%-ROE cap, non-trend (neutral/chop) the scalp
-    0.8% / 10%-ROE cap. We start from the full config policy (every other knob)
+    1.5% / 15%-ROE cap. We start from the full config policy (every other knob)
     and overlay exactly those regime params. Fail-open: any resolution error
     (missing regime_aware block, import error, select failure) returns the base
     config policy — never a crash, never the bare ExitPolicy() default.
@@ -2442,7 +2442,7 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
             # Regime parity: when the caller didn't pass an explicit policy,
             # build the SAME regime-aware policy a fresh live entry would get
             # (trend up/down → 4.0%/20%ROE trend-ride; neutral/chop →
-            # 0.8%/10%ROE scalp). The position's true entry regime is gone after
+            # 1.5%/15%ROE scalp). The position's true entry regime is gone after
             # a state wipe, so we use the CURRENT regime (TTL-cached) as the best
             # available proxy — and it is already what the live entry path used
             # for this coin's most recent gate evaluation. detect_regime fails

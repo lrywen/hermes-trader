@@ -423,7 +423,7 @@ def test_fallback_defaults_diverge(scripts: _Scripts) -> None:
     # i.e. production semantics — not the surge/backtest.py hardcodes.
     from hermes_trader.agents.config_store import cfg_get
 
-    assert cfg_get("dsl_exit.max_loss_pct", config={}) == 0.4
-    assert cfg_get("dsl_exit.protect_pct", config={}) == 1.25
-    assert cfg_get("dsl_exit.retrace_threshold", config={}) == 0.20
+    assert cfg_get("dsl_exit.max_loss_pct", config={}) == 1.0
+    assert cfg_get("dsl_exit.protect_pct", config={}) == 1.5
+    assert cfg_get("dsl_exit.retrace_threshold", config={}) == 0.15
     assert cfg_get("dsl_exit.hard_timeout_minutes", config={}) == 240.0

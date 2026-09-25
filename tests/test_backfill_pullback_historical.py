@@ -88,13 +88,13 @@ def test_canonical_defaults_when_dsl_cfg_empty():
     _seed([
         (100.0, 100.0, 100.0, 100.0),
         (100.0, 100.0, 100.0, 100.0),
-        (99.7, 99.8, 99.5, 99.6),  # canonical stop at 99.6 (max_loss 0.4%)
-        (99.6, 99.6, 99.6, 99.6),
+        (99.1, 99.2, 98.9, 99.0),  # canonical stop at 99.0 (flat max_loss 1.0%)
+        (99.0, 99.0, 99.0, 99.0),
     ])
     rec = _rec()
     assert mod.grade_record(rec, dsl_cfg={}, as_of_ms=AS_OF) == "loss"
-    assert rec["exit_reason"] == "max_loss 0.4%"
-    assert rec["pnl_pct"] == pytest.approx(-0.45)
+    assert rec["exit_reason"] == "max_loss 1.0%"
+    assert rec["pnl_pct"] == pytest.approx(-1.05)
 
 
 def test_window_end_when_no_stop_hit():

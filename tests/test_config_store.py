@@ -56,7 +56,7 @@ def test_canonical_defaults_contain_all_production_keys():
         "loss_cooldown_min": 180,
         "min_ai_close_hold_min": 25,
         "force_execute_composite": 30,
-        "sl_atr_mult": 1.5,
+        "sl_atr_mult": 1.2,
         "min_trend_score": 0.55,
         "chop_min_conf": 0.75,
         "chop_min_score": 55.0,
@@ -74,10 +74,10 @@ def test_canonical_defaults_contain_all_production_keys():
 
 def test_canonical_dsl_exit_subkeys():
     dsl = CANONICAL_DEFAULTS["dsl_exit"]
-    assert dsl["protect_pct"] == 1.25
-    assert dsl["retrace_threshold"] == 0.2
-    assert dsl["max_loss_pct"] == 0.4
-    assert dsl["max_loss_roe_pct"] == 5.0
+    assert dsl["protect_pct"] == 1.5
+    assert dsl["retrace_threshold"] == 0.15
+    assert dsl["max_loss_pct"] == 1.0
+    assert dsl["max_loss_roe_pct"] == 15.0
     assert dsl["hard_timeout_minutes"] == 240.0
 
 
@@ -109,7 +109,7 @@ def test_deep_merge_does_not_mutate_inputs():
 # ── _lookup helpers ─────────────────────────────────────────────────────────
 
 def test_lookup_default_nested():
-    assert _lookup_default("dsl_exit.protect_pct") == 1.25
+    assert _lookup_default("dsl_exit.protect_pct") == 1.5
     assert _lookup_default("dsl_exit.atr_stop.atr_mult") == 1.5
 
 
@@ -157,7 +157,7 @@ def test_coerce_list():
 def test_cfg_get_returns_canonical_default_when_key_absent():
     cfg = {}
     assert cfg_get("leverage", config=cfg) == 10
-    assert cfg_get("dsl_exit.protect_pct", config=cfg) == 1.25
+    assert cfg_get("dsl_exit.protect_pct", config=cfg) == 1.5
 
 
 def test_cfg_get_prefers_config_dict_value():
@@ -209,8 +209,8 @@ def test_cfg_get_production_values_no_drift():
     assert cfg_get("loss_cooldown_min", config=cfg) == 180
     assert cfg_get("min_ai_close_hold_min", config=cfg) == 25
     assert cfg_get("force_execute_composite", config=cfg) == 30
-    assert cfg_get("dsl_exit.max_loss_pct", config=cfg) == 0.4
-    assert cfg_get("dsl_exit.max_loss_roe_pct", config=cfg) == 5.0
+    assert cfg_get("dsl_exit.max_loss_pct", config=cfg) == 1.0
+    assert cfg_get("dsl_exit.max_loss_roe_pct", config=cfg) == 15.0
     assert cfg_get("dsl_exit.hard_timeout_minutes", config=cfg) == 240.0
 
 
@@ -220,7 +220,7 @@ def test_read_agent_config_returns_canonical_when_file_missing():
     # conftest points HERMES_AGENT_CONFIG_FILE at a temp path that doesn't exist
     result = read_agent_config()
     assert result["leverage"] == 10
-    assert result["dsl_exit"]["protect_pct"] == 1.25
+    assert result["dsl_exit"]["protect_pct"] == 1.5
 
 
 def test_read_agent_config_deep_merges_disk_values(tmp_path, monkeypatch):
@@ -237,7 +237,7 @@ def test_read_agent_config_deep_merges_disk_values(tmp_path, monkeypatch):
     assert result["leverage"] == 20
     assert result["dsl_exit"]["protect_pct"] == 4.0
     # Canonical values still present (not clobbered by shallow merge)
-    assert result["dsl_exit"]["retrace_threshold"] == 0.2
+    assert result["dsl_exit"]["retrace_threshold"] == 0.15
     assert result["max_concurrent"] == 2
 
 

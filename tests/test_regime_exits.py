@@ -60,5 +60,5 @@ def test_missing_regime_aware_safe():
         {"protect_pct": 1.5, "retrace_threshold": 0.30}, "up")
     assert pp == 1.5 and label == "scalp"
     # No top-level max_loss either → falls back to CANONICAL_DEFAULTS
-    # (dsl_exit.max_loss_pct=0.4, dsl_exit.max_loss_roe_pct=5.0).
-    assert ml == 0.4 and mlr == 5.0
+    # (dsl_exit.max_loss_pct=1.0, dsl_exit.max_loss_roe_pct=15.0).
+    assert ml == 1.0 and mlr == 15.0

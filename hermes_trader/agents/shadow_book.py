@@ -258,8 +258,8 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
                           entry_atr_pct: float) -> Optional[float]:
     """Price at which the live exchange backup SL fires on a gap-through.
 
-    width_pct = min(max(entry_atr_pct*mult, floor), ceiling), mirroring
-    executor._place_backup_sl / _resolve_sl_width_config. Returns None when
+    宽度统一走备份 SL SSOT ``executor.compute_backup_sl_width_pct``（PRM-01/S4
+    收口），不再本地手写 clamp，避免与生产挂单公式漂移。Returns None when
     inputs are unusable. Slip-widening is omitted (it needs live
     avg_exit_slip_bps the paper book cannot observe); second-order.
     """
@@ -267,6 +267,7 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
         if entry_px <= 0:
             return None
         from hermes_trader.agents.config_store import cfg_get
+        from hermes_trader.agents.executor import compute_backup_sl_width_pct
         mult = float(cfg_get("sl_atr_mult",
                              cfg_get("dsl_exit.atr_stop.atr_mult",
                                      _BACKUP_SL_ATR_MULT)))
@@ -283,7 +284,11 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
         if floor > ceiling:
             floor = ceiling
         atr_pct = float(entry_atr_pct or 0.0)
-        width = min(max(atr_pct * mult, floor), ceiling)
+        # SSOT 以 atr 价格计；由 entry_atr_pct 反推 atr = atr_pct% × entry_px。
+        atr_price = atr_pct / 100.0 * float(entry_px)
+        width = compute_backup_sl_width_pct(
+            atr=atr_price, entry_px=float(entry_px), sl_atr_mult=mult,
+            sl_floor_pct=floor, sl_ceiling_pct=ceiling)
         if side == "long":
             return float(entry_px) * (1.0 - width / 100.0)
         if side == "short":

@@ -306,35 +306,34 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "hip3_dex_allowlist": ["xyz"],
     "hip3_dex_blocklist": [],
     "dsl_exit": {
-        "max_loss_pct": 0.4,
-        "max_loss_roe_pct": 5.0,
-        "protect_pct": 1.25,
-        "retrace_threshold": 0.2,
+        "max_loss_pct": 1.0,
+        "max_loss_roe_pct": 15.0,
+        "protect_pct": 1.5,
+        "retrace_threshold": 0.15,
         # Intraday-short tightening (2026-09-22): strategy enters on 5m and
         # realised holds are minute-scale, so the legacy 30h hard / 8h stale
         # ceilings let drifters occupy scarce slots far too long. Hard cap now
         # 4h; a never-protected drifter is cut at 90m.
         "hard_timeout_minutes": 240.0,
-        "breakeven_trigger_pct": 0.0,
-        "breakeven_lock_pct": 0.0,
+        "breakeven_trigger_pct": 2.5,
+        "breakeven_lock_pct": 0.5,
         "stale_flat_timeout_minutes": 90.0,
-        # P0（2026-09-23，UNI/MON 末端追高复盘）：重新启用 ATR 自适应止损。
-        # 此前“启用也不放宽”的原因是 trend regime cap=0.8% 在 min(regime_cap,
-        # atr_cap) 中恒胜出；本次同时把 regime_aware.max_loss.trend 的上限放宽到
-        # 4.0%，使 ATR 宽度得以生效（见该块注释）。non_trend（chop/scalp）仍为
-        # 0.4% 紧止损，行为不变。
+        # ATR 自适应止损：经 409 笔全分布回测裁决「ATR 开/关无 edge」，生产
+        # 明确关闭（enabled=false，2026-09-25）。代码/parity 路径保留；canonical
+        # 默认同步为 false，避免配置丢失时静默回落到 true（与运维意图相反）。
         "atr_stop": {
-            "enabled": True,
+            "enabled": False,
             "atr_mult": 1.5,
             "floor_pct": 1.0,
             "ceiling_pct": 4.0,
         },
         # R12-C1: noise band tolerates a pull-back of atr_mult × entry ATR%
         # below the floor before an exit fires (sub-first-tier only); was
-        # implicit via .get("noise_band", {}) in executor/dsl_exit.
+        # implicit via .get("noise_band", {}) in executor/dsl_exit. B-10 符号
+        # 一致性检验判其为正贡献，生产启用 atr_mult=0.8。
         "noise_band": {
-            "enabled": False,
-            "atr_mult": 1.0,
+            "enabled": True,
+            "atr_mult": 0.8,
         },
         # Audit 2026-09-10 (risk-tuning shadow 3): record whether a wider
         # max-loss cap / lower breakeven trigger would have mattered; live
@@ -375,11 +374,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # (audit: 3–5s). A single instantaneous mid tick through the floor no
         # longer closes; the breach must persist 4s AND the oracle index price
         # must confirm it (dsl_exit.get_index_prices).
-        "consecutive_breaches_required": 1,
+        "consecutive_breaches_required": 2,
         "breach_confirm_sec": 4.0,
         "phase2_tiers": [
-            {"pct_above_entry": 8.0, "retrace_threshold": 0.35},
-            {"pct_above_entry": 15.0, "retrace_threshold": 0.4},
+            {"pct_above_entry": 2.0, "retrace_threshold": 0.35},
+            {"pct_above_entry": 6.0, "retrace_threshold": 0.3},
+            {"pct_above_entry": 12.0, "retrace_threshold": 0.2},
+            {"pct_above_entry": 20.0, "retrace_threshold": 0.15},
         ],
         "regime_aware": {
             "enabled": True,
@@ -398,7 +399,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
                 # 足够噪声空间；杠杆帽同步放宽 trend ROE 10%→20%（5x 下=4% 现货），
                 # 否则 ROE 帽恒为 2% 现货，仍会架空 ATR 宽度。
                 "trend": {"max_loss_pct": 4.0, "max_loss_roe_pct": 20.0},
-                "non_trend": {"max_loss_pct": 0.4, "max_loss_roe_pct": 5.0},
+                # non_trend（scalp）止损 0.4/5 → 1.5/15（PRM-02，2026-09-25）：
+                # 旧 0.8%≈0.23×4h ATR 深陷噪声带，固定 cap 抬到 1.5、ROE 15。
+                "non_trend": {"max_loss_pct": 1.5, "max_loss_roe_pct": 15.0},
             },
             # Audit 2026-09-06 (E3, P2): regime-split position-lifetime clocks
             # (minutes). Trend regimes get LONGER hard/stale timeouts (let
@@ -477,7 +480,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "loss_cooldown_min": 180,
     "min_ai_close_hold_min": 25,
     "breakout_force_execute": False,
-    "sl_atr_mult": 1.5,
+    "sl_atr_mult": 1.2,
     # R12-C1: backup stop clamp width (%) and manual/TP bracket ATR mult.
     # Was implicit via executor module constants (_DEFAULT_SL_CEILING_PCT=3.0,
     # _DEFAULT_SL_FLOOR_PCT=1.2) and server.py tp default 1.0. sl_floor_pct
@@ -581,9 +584,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "sizing_basis": "primary_stop",
         # P1-4 Phase 1: sizing v2 gray-release mode as a canonical file
         # leaf so the truth source can move out of HERMES_SIZING_V2_MODE.
-        # Safe default "off", identical to the accessor's fallback; the
-        # legacy boolean sizing_v2_enabled was retired in Phase 1 step 5.
-        "sizing_v2_mode": "off",
+        # PRM-06 收口（2026-09-25）：canonical 默认 enforce，按止损宽度 SSOT
+        # sizing；legacy boolean sizing_v2_enabled was retired in Phase 1 step 5.
+        "sizing_v2_mode": "enforce",
         # P1-4 Phase 3 batch 2: gray-release cap (0-1) scaling the v2
         # notional. 1.0 mirrors executor.py's .get(..., 1.0) fallback so a
         # key-absent config behaves identically (no scale-down).
