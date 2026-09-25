@@ -3,15 +3,23 @@
 PURE FUNCTIONS ONLY. No network, no config reads, no side effects — so they are
 trivially testable and carry zero live impact until a caller wires them in.
 
-The production sizing today (executor.py) is:
-    notional = equity * equity_fraction * leverage * conviction_mult
-which is volatility-BLIND: a high-ATR 10x memecoin and a low-ATR 3x major sized
-by the same formula carry wildly different dollar-risk-to-stop by accident
-(Phase-1/Phase-2 audit finding). These helpers replace that with EQUAL DOLLAR
-RISK PER TRADE: size so that, if the stop is hit, every trade loses the same
-fixed fraction of equity regardless of the instrument's volatility or leverage.
+The production sizing today (executor.py) has TWO branches:
+  * atr_risk_sizing.enabled=true (live): notional = risk_pct * equity / stop_width,
+    where stop_width is the position's effective stop (SSOT
+    dsl_exit.resolve_effective_stop_width_pct) — equal dollar risk per trade.
+  * legacy (atr sizing off): notional = equity * equity_fraction * leverage
+    * conviction_mult, which is volatility-BLIND: a high-ATR 10x memecoin and a
+    low-ATR 3x major sized by the same formula carry wildly different
+    dollar-risk-to-stop by accident (Phase-1/Phase-2 audit finding).
 
-Nothing here is enforced until the executor calls it (gated, default-off).
+NOTE: on micro accounts (equity below the notional-cap tier, live <$50) the
+absolute max_trade_notional_usd ($30) clamps every trade, so even the ATR branch
+degenerates to a fixed $30 notional and risk-per-trade stops binding there (see
+executor._tiered_notional_cap; parameter review PRM-05).
+
+These helpers provide the EQUAL DOLLAR RISK math: size so that, if the stop is
+hit, every trade loses the same fixed fraction of equity regardless of the
+instrument's volatility or leverage.
 """
 
 from __future__ import annotations

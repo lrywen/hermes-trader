@@ -871,6 +871,45 @@ class ExitPolicy:
     time_scratch_giveback_pct: float = 0.3
 
 
+def resolve_effective_stop_width_pct(
+    *,
+    regime_max_loss_pct: float,
+    max_loss_roe_pct: float,
+    leverage: float,
+    atr_stop_enabled: bool,
+    atr_mult: float,
+    atr_floor_pct: float,
+    atr_ceiling_pct: float,
+    entry_atr_pct: float,
+) -> float:
+    """T-25 止损宽度【单一事实来源】：返回本笔最终生效的 SPOT-% 硬止损宽度。
+
+    生产出场引擎（``DSLTracker._effective_max_loss``）与 sizing 层
+    （``executor.compute_effective_stop_pct`` 的 core_stop）MUST 都调用本函数，
+    不再各自重算"这笔最多亏多少"。语义（与原生产逻辑逐位一致）：
+
+      regime_cap = regime_max_loss_pct                 # 每 regime 硬上界
+      atr_cap    = clamp(entry_atr_pct*atr_mult, atr_floor, atr_ceiling)
+      spot_cap   = min(regime_cap, atr_cap)  仅当 ATR 启用，否则 = regime_cap
+      roe_cap    = max_loss_roe_pct / leverage
+      return min(spot_cap, roe_cap)
+
+    ATR 只能在 regime 上界内收紧，永不覆盖更紧的 regime 止损（单向性）。
+    纯函数、无状态、无 I/O。返回正数 %（如 0.8 表示 0.8%）；无任何有效
+    上界时返回 inf（调用方据此视为不设该类闸门）。
+    """
+    lev = max(1.0, float(leverage))
+    regime_cap = float(regime_max_loss_pct) if float(regime_max_loss_pct) > 0 else float("inf")
+    if atr_stop_enabled and entry_atr_pct > 0:
+        atr_cap = min(max(entry_atr_pct * atr_mult, atr_floor_pct), atr_ceiling_pct)
+        spot_cap = min(regime_cap, atr_cap)
+    else:
+        spot_cap = regime_cap
+    roe_cap = (float(max_loss_roe_pct) / lev) if float(max_loss_roe_pct) > 0 else float("inf")
+    spot_cap = spot_cap if spot_cap > 0 else float("inf")
+    return min(spot_cap, roe_cap)
+
+
 class DSLTracker:
     """Tracks DSL state for a single open position.
 
@@ -958,36 +997,21 @@ class DSLTracker:
         return active
 
     def _effective_max_loss(self) -> float:
-        """Effective SPOT-% stop: min(regime/fixed cap, ATR cap, ROE/lev cap).
-
-        Pure computation — no state mutation. Shared by check() and status().
-
-        The ATR stop may only WIDEN the stop up to the configured
-        ``atr_stop_ceiling_pct``; it must never OVERRIDE a tighter regime
-        ``max_loss_pct`` (live sets trend=4.0% / non-trend=0.8% via
-        ``select_exit_params``). Previously the ATR branch replaced
-        ``spot_cap`` wholesale, so an ATR value above the regime cap clamped at
-        the 3% ceiling meant the tight regime stop never bound. Taking the min
-        with ``pol.max_loss_pct`` keeps the regime stop as the hard upper
-        bound while still letting a calm regime benefit from the ATR floor.
+        """Effective SPOT-% stop — T-25 委托单一事实来源
+        ``resolve_effective_stop_width_pct``（不再本地重算，保证 sizing 与
+        出场读到同一个值）。Pure computation — no state mutation.
         """
         pol = self.policy
-        lev = max(1, self.leverage)
-        # Regime/fixed spot cap (live passes a per-regime value; default is the
-        # config max_loss_pct). This is the hard upper bound on loss width.
-        regime_cap = pol.max_loss_pct if pol.max_loss_pct > 0 else float("inf")
-        if pol.atr_stop_enabled and self.entry_atr_pct > 0:
-            atr_cap = min(max(self.entry_atr_pct * pol.atr_stop_mult,
-                              pol.atr_stop_floor_pct),
-                          pol.atr_stop_ceiling_pct)
-            # ATR can only widen up to the regime cap, never override a tighter
-            # regime stop: the binding spot cap is the smaller of the two.
-            spot_cap = min(regime_cap, atr_cap)
-        else:
-            spot_cap = regime_cap
-        roe_cap = (pol.max_loss_roe_pct / lev) if pol.max_loss_roe_pct > 0 else float("inf")
-        spot_cap = spot_cap if spot_cap > 0 else float("inf")
-        return min(spot_cap, roe_cap)
+        return resolve_effective_stop_width_pct(
+            regime_max_loss_pct=pol.max_loss_pct,
+            max_loss_roe_pct=pol.max_loss_roe_pct,
+            leverage=self.leverage,
+            atr_stop_enabled=pol.atr_stop_enabled,
+            atr_mult=pol.atr_stop_mult,
+            atr_floor_pct=pol.atr_stop_floor_pct,
+            atr_ceiling_pct=pol.atr_stop_ceiling_pct,
+            entry_atr_pct=self.entry_atr_pct,
+        )
 
     def _phase_label(self) -> str:
         """Phase 1/2 label based on PEAK favorable excursion vs protect_pct.

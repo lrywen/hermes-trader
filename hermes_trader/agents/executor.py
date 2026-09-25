@@ -931,19 +931,18 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
     (bank fast — +EV in chop/down per the controlled backtest: scalp +$1536/63%
     vs trend-ride -$757/47%). When regime is directional ('up'/'down') and
     regime_aware is enabled, LOOSEN to trend-ride protect/retrace so we RIDE the
-    rippers, AND widen the hard stop (Plan C: 0.8% spot / ROE 10% vs the tight
-    0.4% / 5% in chop/neutral) so trending positions aren't shaken out by 1h
-    noise before the trailing protect kicks in. 'neutral'/'chop' keep scalp
-    params and tight stop.
+    rippers, AND widen the hard stop (live: 4.0% spot / ROE 20% in
+    up/down vs 0.8% / ROE 10 in chop/neutral) so trending positions aren't
+    shaken out by 1h noise before the trailing protect kicks in.
+    'neutral'/'chop' keep scalp params and the tight stop.
     Returns (protect_pct, retrace_threshold, phase2_tiers_raw,
              max_loss_pct, max_loss_roe_pct, label)."""
     base_protect = float(dsl_config.get("protect_pct", cfg_get("dsl_exit.protect_pct")))
     base_retrace = float(dsl_config.get("retrace_threshold", cfg_get("dsl_exit.retrace_threshold")))
     base_tiers = dsl_config.get("phase2_tiers")
-    # A-1（2026-09-20）：生产 regime_aware.enabled=true 时 trend 用 0.8、
-    # non_trend 块显式给 0.4，故顶层 dsl_exit.max_loss_pct（=1.0）在本出场
-    # 路径不可达，仅在 non_trend 块缺省时作为回落默认。它仍被 v1 sizing 读取
-    # （见 _v1_stop_width 的 A-1 注释），两处语义勿混。
+    # 生产 regime_aware.enabled=true 时 trend 块显式给 4.0、non_trend 块给 0.8，
+    # 故顶层 dsl_exit.max_loss_pct（=1.0）在本出场路径不可达，仅在 non_trend
+    # 块缺省时作为回落默认。它仍被 v1 sizing 读取（见 _v1_stop_width）。
     base_max_loss = float(dsl_config.get("max_loss_pct", cfg_get("dsl_exit.max_loss_pct")))
     base_max_loss_roe = float(dsl_config.get("max_loss_roe_pct", cfg_get("dsl_exit.max_loss_roe_pct")))
 
@@ -1051,20 +1050,22 @@ def compute_effective_stop_pct(
     atr_floor = float(atr_cfg.get("floor_pct", 1.0))
     atr_ceiling = float(atr_cfg.get("ceiling_pct", 4.0))
 
-    lev = max(1.0, float(leverage))
-    # Layer 1+2: spot cap = min(regime max_loss, ATR cap). The ATR stop may
-    # only widen up to the regime cap — it must never OVERRIDE a tighter regime
-    # stop (F1 sync, byte-aligned with dsl_exit._effective_max_loss L632-641).
-    regime_cap = float(ml_pct) if float(ml_pct) > 0 else float("inf")
-    if atr_enabled and atr_pct > 0:
-        atr_cap = min(max(atr_pct * atr_mult, atr_floor), atr_ceiling)
-        spot_cap = min(regime_cap, atr_cap)
-    else:
-        spot_cap = regime_cap
-    # Layer 3: ROE/margin cap.
-    roe_cap = (float(ml_roe) / lev) if float(ml_roe) > 0 else float("inf")
-    spot_cap = spot_cap if spot_cap > 0 else float("inf")
-    core_stop = min(spot_cap, roe_cap)
+    # Layer 1+2+3：T-25 委托止损宽度单一事实来源（与生产 DSLTracker
+    # _effective_max_loss 同一函数），sizing 假设宽度 == 出场实际宽度，不再
+    # 本地镜像三层 clamp（消除漂移）。
+    from hermes_trader.agents.dsl_exit import resolve_effective_stop_width_pct
+    spot_cap_for_log = float(ml_pct) if float(ml_pct) > 0 else float("inf")
+    roe_cap_for_log = float(ml_roe) / max(1.0, float(leverage))
+    core_stop = resolve_effective_stop_width_pct(
+        regime_max_loss_pct=float(ml_pct),
+        max_loss_roe_pct=float(ml_roe),
+        leverage=leverage,
+        atr_stop_enabled=atr_enabled,
+        atr_mult=atr_mult,
+        atr_floor_pct=atr_floor,
+        atr_ceiling_pct=atr_ceiling,
+        entry_atr_pct=float(atr_pct),
+    )
     effective = core_stop
 
     # Sizing-only ATR-spike breaker: tighten by 30% when current ATR is more
@@ -1097,8 +1098,8 @@ def compute_effective_stop_pct(
         "regime_label": label,
         "ml_pct": float(ml_pct),
         "ml_roe": float(ml_roe),
-        "spot_cap": float(spot_cap if spot_cap != float("inf") else -1.0),
-        "roe_cap": float(roe_cap if roe_cap != float("inf") else -1.0),
+        "spot_cap": float(spot_cap_for_log if spot_cap_for_log != float("inf") else -1.0),
+        "roe_cap": float(roe_cap_for_log if roe_cap_for_log != float("inf") else -1.0),
         "atr_spike": bool(atr_spike),
         "slip_adj_pct": slip_adj_pct,
     }
@@ -3232,13 +3233,13 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
 
     A-1 澄清（2026-09-20，容器生产配置只读取证）：顶层 ``max_loss_pct`` 在
     **出场引擎**里不可达——``select_exit_params`` 在 regime_aware.enabled=true
-    下恒返回 per-regime 值（trend 0.8 / non_trend 0.4），DSLTracker 从不读顶层
+    下恒返回 per-regime 值（trend 4.0 / non_trend 0.8），DSLTracker 从不读顶层
     值。但它在**本 v1 sizing 路径**仍然可达并被读取（实盘下单日志
     "@ 1.00% stop"）。当前因权益极小、notional 恒被 30 美元 notional_cap 钳制，
-    该宽度不改变实际下单量；sizing_v2（shadow）转正后此值被真实 DSL 三层宽度
-    取代。因此顶层 1.0 是历史手动调参遗留（2026-09-08/09 自 2.5 改为 1.0，
-    无 git/审计记录），**不是**纯死值：改它会在放大资金/notional_cap 放开后
-    影响 v1 sizing。勿据「永远不可达」将其删除。
+    该宽度不改变实际下单量；sizing v2 转正后此值被真实止损宽度 SSOT
+    （resolve_effective_stop_width_pct，T-25）取代。因此顶层 1.0 是历史手动
+    调参遗留（2026-09-08/09 自 2.5 改为 1.0，无 git/审计记录），**不是**纯死值：
+    改它会在放大资金/notional_cap 放开后影响 v1 sizing。勿据「永远不可达」将其删除。
     """
     max_loss = float(dsl.get("max_loss_pct", 0.4) or 0.4)
     max_roe = float(dsl.get("max_loss_roe_pct", 5.0) or 5.0)
@@ -3856,19 +3857,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         if _sizing_basis in ("primary_stop", "dsl_stop"):
             _dsl = config.get("dsl_exit", {}) or {}
             # Legacy v1 stop width: top-level max_loss_pct/max_loss_roe
-            # (2.5%/25 at 10x → 2.5% stop). Computed up front so v2 shadow can
-            # log the v1-vs-v2 comparison while still sizing on v1. Extracted to
-            # _v1_stop_width in the P1-1 step ③ phase split.
+            # (1.0%/15 at 10x → 1.0% stop). Computed up front so v2 shadow can
+            # log the v1-vs-v2 comparison while still sizing on v1.
             _v1_stop_frac = _v1_stop_width(_dsl, leverage)
             _stop_frac = _v1_stop_frac
-            # ── Sizing v2: regime-aware + full DSL three-layer stop ───────
-            # The legacy path under-risks every trade 2.5-5x (it assumes the
-            # 2.5% top-level stop while the DSL actually applies a
-            # regime+atr_stop+ROE clamp: 0.5% scalp / 1.0% trend). v2 mirrors
-            # the DSL math exactly, plus ATR-spike/slippage adjustments and
-            # the §1 ATR-regime calibration. Gray-released via three states
-            # (see _sizing_v2_config): off (default, v1 sizing), shadow
-            # (compute + log v1-vs-v2, keep sizing on v1), enforce (apply).
+            # ── Sizing v2: regime-aware + full DSL stop width ───────────
+            # The legacy path sizes off the top-level 1.0% stop while the DSL
+            # actually applies the regime/ROE-clamped width via the SSOT
+            # resolve_effective_stop_width_pct (non_trend 0.8% / trend up to
+            # 4%). v2 mirrors that exact width, plus ATR-spike/slippage
+            # adjustments and the §1 ATR-regime calibration. Gray-released via
+            # three states (see _sizing_v2_config): off (default, v1 sizing),
+            # shadow (compute + log v1-vs-v2, keep sizing on v1), enforce (apply).
             _sv2 = _sizing_v2_config(config)
             _sizing_v2_mode = _sv2["mode"]
             _sizing_v2 = _sizing_v2_mode in ("shadow", "enforce")

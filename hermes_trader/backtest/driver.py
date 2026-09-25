@@ -40,6 +40,8 @@ def run(
     bar_ms: int = BAR_MS_5M,
     regime_replay: bool = False,
     dsl_config: Optional[dict] = None,
+    confirm_mode: str = "bar",
+    tick_confirm_s: float = 5.0,
 ) -> list[Trade]:
     """Run one-coin backtest; return completed trades in chronological order.
 
@@ -101,6 +103,8 @@ def run(
                 coin=coin, entry_atr_pct=sig_atr,
                 entry_regime=entry_effective_regime,
                 bar_ms=bar_ms,
+                confirm_mode=confirm_mode,
+                tick_confirm_s=tick_confirm_s,
             )
             pending = None
 
