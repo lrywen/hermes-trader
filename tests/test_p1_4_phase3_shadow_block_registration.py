@@ -42,10 +42,10 @@ def test_phase3_leverage_tier_block_registered():
 
 
 def test_phase3_own_gap_demote_scalar_registered():
-    # 0.0 preserves current behaviour for a key-absent config (the risk
-    # gate treats 0/missing as "overlay disabled").
-    assert CANONICAL_DEFAULTS["own_gap_demote_pct"] == 0.0
-    assert cfg_get("own_gap_demote_pct", config={}) == 0.0
+    # Canonical default aligned to production (15.0); 0.0 remains the explicit
+    # "overlay disabled" signal only when an operator sets it.
+    assert CANONICAL_DEFAULTS["own_gap_demote_pct"] == 15.0
+    assert cfg_get("own_gap_demote_pct", config={}) == 15.0
 
 
 # ── cfg_get resolution of nested leaves ───────────────────────────────

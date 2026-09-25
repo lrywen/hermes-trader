@@ -110,11 +110,11 @@ def test_margin_zero_threshold_disables_gate():
         equity=100.0, available=0.0, target_dex="") is None
 
 
-def test_margin_missing_config_defaults_to_10pct():
+def test_margin_missing_config_defaults_to_20pct():
     res = _free_margin_floor_block(aid="a1", mode="live", config={},
                                    equity=100.0, available=9.0, target_dex=None)
     assert res is not None
-    assert "floor 10%" in res["reason"]
+    assert "floor 20%" in res["reason"]
 
 
 def test_margin_non_positive_equity_inert():

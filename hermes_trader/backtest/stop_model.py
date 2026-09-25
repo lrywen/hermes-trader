@@ -55,16 +55,18 @@ def effective_stop_pct(
 ) -> EffectiveStop:
     """Effective SPOT-% hard stop, byte-aligned with the live DSL computation.
 
-    ``max_loss_pct`` is the per-regime spot cap (trend 0.8 / non-trend 0.4 in
+    ``max_loss_pct`` is the per-regime spot cap (trend 4.0 / non-trend 1.5 in
     production). ``leverage`` is the per-trade leverage (``lev = max(1, …)``);
     the ROE/margin cap in spot terms is ``max_loss_roe_pct / lev``. When
     ``atr_stop_enabled`` and a positive ``entry_atr_pct`` are supplied, an ATR
     width ``clamp(atr*mult, floor, ceiling)`` may WIDEN the stop, but only up to
     the regime cap — never override a tighter regime stop.
 
-    B-11：``atr_stop_enabled`` 分支已 **DEPRECATED**（死代码）。生产数据下
-    regime cap 恒胜出、atr_cap 从不 bind（§2.7 P4，W3 A-3）；入参仅为与
-    DSLTracker 的 byte-aligned parity 而保留，禁止据此重新启用 ATR 止损。
+    ATR 止损状态（经 409 笔全分布回测裁决，2026-09-25）：``atr_cap`` 在 trend
+    4% cap 下**确实会 bind**（典型 trend 单 ATR cap 落 1.2-1.8%，比 4% 更紧），
+    因此该分支不是死代码、parity 必须保留；但 ATR 开/关的期望 PnL 无 edge
+    （开 -$0.449 vs 关 -$0.440），故生产 ``atr_stop.enabled=false``。重新启用
+    须先拿出新的 edge 证据，不得仅凭“它会 bind”启用。
     """
     lev = max(1.0, float(leverage))
     regime_cap = float(max_loss_pct) if float(max_loss_pct) > 0 else float("inf")

@@ -73,10 +73,10 @@ def test_r12_c1_pullback_long_block_registered():
     pb = CANONICAL_DEFAULTS["runner_entry_gate"]["pullback_long"]
     assert pb == {
         "enabled": False,
-        "min_composite": 20.0,
-        "max_rsi": 70.0,
+        "min_composite": 30.0,
+        "max_rsi": 65.0,
         "max_extension_atr": 2.0,
-        "min_slow_burn": 1,
+        "min_slow_burn": 2,
         "shadow_mode": False,
         "require_macro_uptrend": True,
     }
@@ -109,10 +109,10 @@ def test_r12_c1_aligned_min_conf_registered_enabled():
     ("dsl_exit.consecutive_breaches_required", 2),
     ("dsl_exit.breach_confirm_sec", 4.0),
     ("runner_entry_gate.pullback_long.enabled", False),
-    ("runner_entry_gate.pullback_long.min_composite", 20.0),
-    ("runner_entry_gate.pullback_long.max_rsi", 70.0),
+    ("runner_entry_gate.pullback_long.min_composite", 30.0),
+    ("runner_entry_gate.pullback_long.max_rsi", 65.0),
     ("runner_entry_gate.pullback_long.max_extension_atr", 2.0),
-    ("runner_entry_gate.pullback_long.min_slow_burn", 1),
+    ("runner_entry_gate.pullback_long.min_slow_burn", 2),
     ("runner_entry_gate.pullback_long.shadow_mode", False),
     ("runner_entry_gate.pullback_long.require_macro_uptrend", True),
     ("debate_gate.analyst3_default", False),
@@ -217,7 +217,7 @@ def test_r12_c1_read_agent_config_deep_merges_partial_overlay(tmp_path, monkeypa
     assert cfg["circuit_breaker"]["daily_loss_pct"] == 7.5
     assert cfg["circuit_breaker"]["single_coin_loss_pct"] == 3.0  # canonical 保留
     assert cfg["runner_entry_gate"]["pullback_long"]["enabled"] is True
-    assert cfg["runner_entry_gate"]["pullback_long"]["max_rsi"] == 70.0
+    assert cfg["runner_entry_gate"]["pullback_long"]["max_rsi"] == 65.0
     # 既有键不受影响
     assert cfg["runner_entry_gate"]["allow_shorts"] is False
 

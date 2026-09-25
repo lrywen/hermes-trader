@@ -450,7 +450,7 @@ def _num_leaf(lo: float, hi: float) -> tuple:
 
 
 # Percent leaves: percentages are expressed in the same units as the
-# canonical defaults (max_loss_pct=0.4 means 0.4%, etc.). Bounds are
+# canonical defaults (max_loss_pct=1.5 means 1.5%, etc.). Bounds are
 # deliberately generous sanity rails, not the runtime operating range.
 _DSL_EXIT_SPEC: dict[str, Any] = {
     "max_loss_pct": _num_leaf(0.0, 25.0),
@@ -461,9 +461,9 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
     "breakeven_trigger_pct": _num_leaf(0.0, 50.0),
     "breakeven_lock_pct": _num_leaf(0.0, 50.0),
     "stale_flat_timeout_minutes": _num_leaf(0.0, 100_000.0),
-    # B-11：DEPRECATED（死代码，禁止重新启用）。ATR 自适应止损被 P4 否证，
-    # 实际止损恒为更紧的 regime cap（atr_cap 永不 bind）。保留 schema 仅供
-    # 历史配置 round-trip 与 stop_model/dsl_exit parity 校验。
+    # ATR 自适应止损：经 409 笔回测，atr_cap 在 trend 4% cap 下确实会 bind
+    # （典型 1.2-1.8%），并非死代码；但开/关无 edge（开 -$0.449 vs 关 -$0.440），
+    # 故生产 enabled=false。schema/parity 保留；重新启用须先有新 edge 证据。
     "atr_stop": {
         "enabled": ("bool",),
         "atr_mult": _num_leaf(0.0, 20.0),

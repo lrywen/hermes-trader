@@ -121,7 +121,7 @@ def test_d_config_defaults_registered():
     assert r["max_per_coin"] == 2
     assert r["window_hours"] == 24.0
     # D1/D2 root scalars
-    assert cfg_get("min_history_bars", config={}) == 0
+    assert cfg_get("min_history_bars", config={}) == 200
     assert cfg_get("override_max_daily_extension_pct", config={}) == 30.0
 
 
@@ -222,8 +222,9 @@ def test_d1_new_coin_fail_closed_only_with_floor(monkeypatch, tmp_path):
     cfg2["min_history_bars"] = 5
     r2 = rg.trend_filter_200ma_gate(_ctx(), cfg2)
     assert r2["pass"] and r2["via"] == "trend_filter_shadow_new_coin"
-    # floor inactive (min_history_bars=0, Pathia default) → fail-open
-    cfg3 = _d_cfg(tmp_path, mode="enforce")  # no min_history_bars → 0
+    # floor explicitly disabled (min_history_bars=0, top-level) → fail-open
+    cfg3 = _d_cfg(tmp_path, mode="enforce")
+    cfg3["min_history_bars"] = 0
     r3 = rg.trend_filter_200ma_gate(_ctx(), cfg3)
     assert r3["pass"] and r3["via"] in (
         "trend_filter_insufficient_history", "trend_filter_data_missing")

@@ -1512,7 +1512,7 @@ def _free_margin_floor_block(*, aid: str, mode: str, config: dict[str, Any],
     Pure decision leaf on already-read account state: no I/O, no locks, no
     mutation. Extracted verbatim in the P1-1 step ③ phase split.
     """
-    min_avail_pct = float(config.get("min_available_margin_pct", 0.10))
+    min_avail_pct = float(config.get("min_available_margin_pct", 0.20))
     if equity > 0 and (available / equity) < min_avail_pct:
         return {
             "executed": False, "mode": mode,

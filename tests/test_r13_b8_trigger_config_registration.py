@@ -119,10 +119,10 @@ def test_r13_b8_trigger_thresholds_individual_values():
     assert t["trend_momentum_lookback"] == 72
     assert t["trend_momentum_pct"] == 5.0  # D6 canonical：不是 3.0
     assert t["breakout_lookback"] == 48
-    assert t["breakout_min_rvol"] == 1.5
+    assert t["breakout_min_rvol"] == 1.8
     assert t["breakout_rvol_window"] == 20
     assert t["breakout_atr_score_mult"] == 3.0
-    assert t["breakout_confirm_bars"] == 2
+    assert t["breakout_confirm_bars"] == 3
     assert t["bb_length"] == 20
     assert t["bb_std_dev"] == 2
     assert t["adx_period"] == 14

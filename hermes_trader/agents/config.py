@@ -40,10 +40,10 @@ TRIGGER_CONFIG: dict[str, Any] = {
         "trendMomentumLookback": 72,  # 5m bars (~6h) for sustained up/down trend surfacing
         "trendMomentumPct": 5.0,      # min |%| move over ~6h to surface (5%: 3.0 over-surfaced — 22 triggers/scan, ~4.5x AI cost, flooded longs)
         "breakoutLookback": 48,
-        "breakoutMinRvol": 1.5,       # RVOL threshold: close break only fires when current vol >= this × prior avg
+        "breakoutMinRvol": 1.8,       # RVOL threshold: close break only fires when current vol >= this × prior avg
         "breakoutRvolWindow": 20,     # prior-bar window for the RVOL average
         "breakoutAtrScoreMult": 3.0,  # ATR-normalized score multiplier: min(10, distance/ATR * mult)
-        "breakoutConfirmBars": 2,     # consecutive closes beyond the edge required to fire (rejects 1-bar fakeouts)
+        "breakoutConfirmBars": 3,     # consecutive closes beyond the edge required to fire (rejects 1-bar fakeouts)
         "bbLength": 20,
         "bbStdDev": 2,
         "adxPeriod": 14,

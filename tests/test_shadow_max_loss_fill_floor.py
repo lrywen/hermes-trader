@@ -47,26 +47,25 @@ def test_backup_trigger_long_clamps_to_ceiling():
     assert abs(trig - 97.0) < 1e-9
 
 
-def test_backup_trigger_long_uses_floor():
-    # Zero ATR -> the net sits at the resolved floor below entry. The canonical
-    # default floor is the shared dsl_exit.atr_stop.floor_pct = 1.2%; assert the
-    # floor binds (atr*mult=0 contributes nothing) and it is inside the ceiling.
+def test_backup_trigger_no_net_when_atr_missing_long():
+    # atr=0 -> aligned with production executor (L1694 ``if atr > 0``): NO
+    # backup net is rested, so the shadow book must not invent floor protection
+    # (NEW_C). A tiny positive ATR still resolves a width (floor binds there).
     trig = sb._backup_sl_trigger_px(
         coin="BTC", side="long", entry_px=100.0, entry_atr_pct=0.0)
-    assert trig is not None
-    assert 96.99 < trig < 99.01        # between 3% ceiling and 1% hard default
-    # A small ATR that does not clear the floor leaves the trigger unchanged.
+    assert trig is None
+    # A small ATR that does not clear the floor rests the net at the floor.
     trig2 = sb._backup_sl_trigger_px(
         coin="BTC", side="long", entry_px=100.0, entry_atr_pct=0.1)
-    assert abs(trig2 - trig) < 1e-9
+    assert trig2 is not None
+    assert 96.99 < trig2 < 99.01
 
 
-def test_backup_trigger_short_is_above_entry():
+def test_backup_trigger_no_net_when_atr_missing_short():
+    # Same atr=0 parity for shorts: no net above entry.
     trig = sb._backup_sl_trigger_px(
         coin="ETH", side="short", entry_px=200.0, entry_atr_pct=0.0)
-    assert trig is not None
-    assert trig > 200.0                # short's net rests above entry
-    assert 201.0 < trig < 206.01       # between 1% and 3% adverse
+    assert trig is None
 
 
 def test_max_loss_normal_fills_at_mark_long(tmp_path):

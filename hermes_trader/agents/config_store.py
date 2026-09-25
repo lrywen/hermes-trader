@@ -166,7 +166,7 @@ def compute_config_era(
 CANONICAL_DEFAULTS: dict[str, Any] = {
     "mode": "OFF",
     "enable_crypto": True,
-    "enable_hip3": True,
+    "enable_hip3": False,
     "equity_fraction_per_trade": 0.2,
     "leverage": 10,
     # F4 (supplemental audit 2026-08-31): keys that config_schema declares as
@@ -178,7 +178,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "max_trade_notional_usd": 30.0,
     "tp_scale_fraction": 0.5,
     "max_concurrent": 2,
-    "max_total_notional_pct": 4.0,
+    "max_total_notional_pct": 2.0,
     # Audit 2026-09-04 P0-3 (dimensional clarity): `max_total_notional_pct` is
     # read as a MULTIPLE of aggregated equity (e.g. 4 → 400% of equity), NOT a
     # percentage fraction. The `_pct` suffix is historical and misleading; the
@@ -232,9 +232,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "roe_halt_enabled": True,
     "roe_halt_threshold_pct": -50.0,
     "daily_giveback_halt_pct": 0.35,
-    "daily_giveback_min_peak_usd": 25.0,
+    "daily_giveback_min_peak_usd": 2.0,
     "crowded_with_min_conf": 0.8,
-    "min_available_margin_pct": 0.1,
+    "min_available_margin_pct": 0.2,
     "cooldown_min": 30,
     "research_cooldown_min": 3,
     "held_research_interval_min": 10,
@@ -296,8 +296,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "aggression_min": 0.7,      # 真实主动买盘 flow 须≥此值
         },
     },
-    "counter_regime_min_conf": 0.8,
-    "max_crypto_long_correlated": 3,
+    "counter_regime_min_conf": 0.82,
+    "max_crypto_long_correlated": 2,
     "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
     "min_hip3_volume_usd": 5_000_000.0,    # F4: float per schema (supplemental audit 2026-08-31)
     "min_short_volume_usd": 50_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
@@ -385,12 +385,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "regime_aware": {
             "enabled": True,
             "trend_ride": {
-                "protect_pct": 3.0,
-                "retrace_threshold": 0.55,
+                "protect_pct": 2.5,
+                "retrace_threshold": 0.4,
                 "phase2_tiers": [
-                    {"pct_above_entry": 3.0, "retrace_threshold": 0.55},
-                    {"pct_above_entry": 8.0, "retrace_threshold": 0.45},
-                    {"pct_above_entry": 15.0, "retrace_threshold": 0.4},
+                    {"pct_above_entry": 2.5, "retrace_threshold": 0.4},
+                    {"pct_above_entry": 8, "retrace_threshold": 0.38},
+                    {"pct_above_entry": 15, "retrace_threshold": 0.35},
+                    {"pct_above_entry": 25, "retrace_threshold": 0.3},
                 ],
             },
             "max_loss": {
@@ -438,11 +439,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "block_counter_trend_bypass": True,
     "trend_surface_enabled": True,
     # Audit 2026-09-06 (D1): minimum number of DAILY candles a coin must have
-    # for the 200MA trend filter to be considered "established". Pathia ships
-    # min_history_bars=0 (a fetch that returns <period daily bars is treated as
-    # a genuinely new listing and the gate's new-coin branch decides); hermes
-    # keeps 0 as the default so the gate is a no-op until an operator arms it.
-    "min_history_bars": 0,
+    # for the 200MA trend filter to be considered "established". Production
+    # pins min_history_bars=200 so coins without an established daily history
+    # are not traded on an ungrounded trend; aligned to live (2026-09-25).
+    "min_history_bars": 200,
     # Audit 2026-09-06 (D2): hard 24h price-extension ceiling for LONGS. A coin
     # up more than this percent over the last 24h is a blow-off chase and is
     # refused regardless of mover/score. 0 disables. Ported from Pathia
@@ -490,8 +490,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "tp_atr_mult": 1.0,
     "min_trend_score": 0.55,
     # Regime classifier thresholds (chop / against-funding conviction bars)
-    "chop_min_conf": 0.75,
-    "chop_min_score": 55.0,
+    "chop_min_conf": 0.85,
+    "chop_min_score": 60.0,
     # P1-4: momentum-burst bypass in chop requires at least this composite score
     "chop_burst_min_score": 20.0,
     "against_funding_min_conf": 0.85,
@@ -520,23 +520,23 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "runner_entry_gate": {
         "enabled": True,
         "allow_shorts": False,
-        "bypass_sidestep_overrides": True,
+        "bypass_sidestep_overrides": False,
         "min_confidence": 0.7,
-        "min_composite": 30.0,
+        "min_composite": 45.0,
         "min_hip3_composite": 50.0,
         "min_short_confidence": 0.72,
-        "min_short_composite": 25.0,
+        "min_short_composite": 40.0,
         "mover_min_confidence": 0.72,
-        "mover_min_composite": 20.0,
+        "mover_min_composite": 30.0,
         # R12-C1: pullback-long bypass admits uptrend longs that have pulled
         # back to a lower-risk zone. Off by default; was implicit via
         # gate.get("pullback_long") hardcoded defaults in executor.
         "pullback_long": {
             "enabled": False,
-            "min_composite": 20.0,
-            "max_rsi": 70.0,
+            "min_composite": 30.0,
+            "max_rsi": 65.0,
             "max_extension_atr": 2.0,
-            "min_slow_burn": 1,
+            "min_slow_burn": 2,
             "shadow_mode": False,
             # Audit 2026-09-06 (E2, Q3): require the MACRO regime (BTC / SP500
             # proxy EMA20/30 + ADX via detect_regime_with_score) to be "up"
@@ -557,9 +557,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # the deep merge preserves it.
         "breakout_score_floor": {
             "shadow_mode": True,
-            # min_composite falls back to min_score*0.7 at the read site;
-            # mirror that conservative floor as the canonical default.
-            "min_composite": 21.0,
+            # Aligned to live breakout floor (production pins 31.5).
+            "min_composite": 31.5,
         },
         "per_coin_cooldown": {
             "shadow_mode": True,
@@ -735,7 +734,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "enabled": False,
         "log_near_miss": True,
         "min_trend_pct": 8.0,
-        "max_pullback_pct": 6.0,
+        "max_pullback_pct": 4.0,
         "weight": 0.4,
     },
     # K线形态识别
@@ -1493,10 +1492,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "trend_momentum_lookback": 72,
         "trend_momentum_pct": 5.0,
         "breakout_lookback": 48,
-        "breakout_min_rvol": 1.5,
+        "breakout_min_rvol": 1.8,
         "breakout_rvol_window": 20,
         "breakout_atr_score_mult": 3.0,
-        "breakout_confirm_bars": 2,
+        "breakout_confirm_bars": 3,
         "bb_length": 20,
         "bb_std_dev": 2,
         "adx_period": 14,
@@ -1829,8 +1828,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     },
     # 坑1 (2026-09-15): own-4h gap demote threshold (%) read via cfg_get
     # in risk_gates.market_regime_gate. 0.0 = overlay disabled (the
-    # revert switch; production runs 15).
-    "own_gap_demote_pct": 0.0,
+    # revert switch); production runs 15, aligned as canonical default.
+    "own_gap_demote_pct": 15.0,
     # 配置文件注释字段（不参与交易逻辑）
     "_comment": "",
 }
@@ -2153,8 +2152,8 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
     # 直接触发退出、回测与实盘出场口径分叉。
     #
     # 该守卫仅在生产权威源（/data/.agent-config.json）上强制：canonical
-    # 代码默认 noise_band.enabled=false（由 /data 显式打开），本地/CI/测试
-    # 用 canonical 默认时不应报错；只防止**生产**配置把它从开启状态误关。
+    # 代码默认 noise_band.enabled=true（已与生产对齐，atr_mult=0.8）；守卫仍
+    # 只读取 /data 原始文件，防止**生产**配置把它从开启状态误关，本地/CI 不报错。
     errors.extend(_production_noise_band_errors())
 
     # B-7：配置来源强制断言。生产权威配置＝容器挂载卷 /data/.agent-config.json
@@ -2170,8 +2169,8 @@ def _running_from_data_config() -> bool:
 
 
 def _production_noise_band_errors() -> list[str]:
-    """B-10：仅在生产权威 /data 源上要求 noise_band 保持开启。其它部署口径
-    （canonical 默认 enabled=false）不检查。"""
+    """B-10：仅在生产权威 /data 源上要求 noise_band 保持开启。canonical
+    默认已 enabled=true；非 /data 部署（本地/CI）不检查。"""
     if not _running_from_data_config():
         return []
     try:

@@ -122,5 +122,5 @@ def test_research_llm_continuations_capped():
 
 
 def test_max_total_notional_pct_is_equity_multiple():
-    # P0-3: value pinned to production 4 (= 400% of equity, a multiple not pct).
-    assert CANONICAL_DEFAULTS["max_total_notional_pct"] == 4.0
+    # P0-3: equity multiple (not pct); pinned to production 2 (= 200% of equity).
+    assert CANONICAL_DEFAULTS["max_total_notional_pct"] == 2.0

@@ -262,9 +262,17 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
     收口），不再本地手写 clamp，避免与生产挂单公式漂移。Returns None when
     inputs are unusable. Slip-widening is omitted (it needs live
     avg_exit_slip_bps the paper book cannot observe); second-order.
+
+    atr 不可用（entry_atr_pct<=0）时与生产 executor 挂单守卫一致——**不挂备份
+    网**、直接返回 None（生产 L1694 ``if atr > 0 and size_in_coin > 0``）；不得
+    退回 SSOT 的 floor 宽度，否则纸簿会高估实盘的 gap-through 保护（NEW_C）。
     """
     try:
         if entry_px <= 0:
+            return None
+        atr_pct = float(entry_atr_pct or 0.0)
+        if atr_pct <= 0.0:
+            # 对齐生产：atr 缺失时不挂备份止损单。
             return None
         from hermes_trader.agents.config_store import cfg_get
         from hermes_trader.agents.executor import compute_backup_sl_width_pct
@@ -283,7 +291,6 @@ def _backup_sl_trigger_px(*, coin: str, side: str, entry_px: float,
             return None
         if floor > ceiling:
             floor = ceiling
-        atr_pct = float(entry_atr_pct or 0.0)
         # SSOT 以 atr 价格计；由 entry_atr_pct 反推 atr = atr_pct% × entry_px。
         atr_price = atr_pct / 100.0 * float(entry_px)
         width = compute_backup_sl_width_pct(

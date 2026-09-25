@@ -1012,7 +1012,7 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
             _dsl = arm_dsl
             if arm in ("filt_ra", "filt_ra_exch"):
                 # P6-RA：复现 select_exit_params —— trend(up/down) 走 trend_ride
-                # （宽追踪 + 0.8% 止损），neutral/chop 走 scalp（+0.4% 止损）。
+                # （宽追踪 + 4.0% 止损天花板），neutral/chop 走 scalp（+1.5% 止损）。
                 _dsl = (dsls["ra_trend"]
                         if _regime_at(bars[i].t + MS_5M) in ("up", "down")
                         else dsls["ra_nontrend"])
@@ -1251,9 +1251,9 @@ def main() -> None:
 
     # ── P6-RA：复现实盘 select_exit_params（regime_aware.enabled=True）──
     # 实盘出场是 regime 相关的：trend(up/down) → trend_ride（protect 2.5 /
-    # retrace 0.4 / 止损 0.8%）；non_trend(neutral/chop) → scalp（顶层
-    # protect/retrace + 止损 0.4%）。顶层 max_loss_pct=1 在 regime_aware
-    # 开启时【永远用不到】——A 组（全程 1%）与 B 组（全程 0.4%）都是极端假设。
+    # retrace 0.4 / 止损 4.0% 天花板）；non_trend(neutral/chop) → scalp（顶层
+    # protect/retrace + 止损 1.5%）。顶层 max_loss_pct=1 在 regime_aware
+    # 开启时【永远用不到】——A 组（全程 1%）与 B 组（全程 1.5%）都是极端假设。
     # clocks.enabled=False → hard/stale 用顶层全局值。
     _dx = cfg.get("dsl_exit", {}) or {}
     _ra = _dx.get("regime_aware", {}) or {}
@@ -1270,8 +1270,8 @@ def main() -> None:
         retrace_threshold=float(_tr.get("retrace_threshold", 0.4)),
         hard_timeout_minutes=float(_dx.get("hard_timeout_minutes", 600)),
         breakeven_trigger_pct=float(_dx.get("breakeven_trigger_pct", 2.5)),
-        breakeven_lock_pct=float(_dx.get("breakeven_lock_pct", 0.3)),
-        stale_flat_timeout_minutes=float(_dx.get("stale_flat_timeout_minutes", 240)),
+        breakeven_lock_pct=float(_dx.get("breakeven_lock_pct", 0.5)),
+        stale_flat_timeout_minutes=float(_dx.get("stale_flat_timeout_minutes", 90)),
         phase2_tiers=_tr_tiers or live_dsl.phase2_tiers,
         # B-1a-改③④：杠杆/ROE/ATR 与 live 同源（只 regime cap 不同）
         leverage=live_dsl.leverage,
@@ -1284,7 +1284,7 @@ def main() -> None:
     )
     # non_trend = 顶层 protect/retrace/tiers，仅覆盖 max_loss
     dsls["ra_nontrend"] = replace(
-        live_dsl, max_loss_pct=float(_nt_ml.get("max_loss_pct", 0.4)))
+        live_dsl, max_loss_pct=float(_nt_ml.get("max_loss_pct", 1.5)))
     dsls["filt_ra"] = dsls["ra_nontrend"]  # 兜底；实际在调用点按 regime 选
 
     now_ms = int(time.time() * 1000)

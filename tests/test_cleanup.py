@@ -5670,8 +5670,8 @@ def test_chop_regime_gate_raises_conviction_bar(monkeypatch):
     assert r["via"] == "chop_blocked"
     assert r.get("chop") is True
 
-    # high confidence -> passes
-    strong = _ctx(confidence=0.8, composite_score=30, trade_side="long")
+    # high confidence -> passes (threshold now max(0.82 counter, 0.85 chop))
+    strong = _ctx(confidence=0.9, composite_score=30, trade_side="long")
     r = market_regime_gate(strong)
     assert r["pass"] is True and r["via"] == "chop_conviction"
 
