@@ -288,6 +288,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "weight_aggression": 0.5,
         "weight_imbalance": 0.2,
         "weight_compression": 0.3,
+        # 低位启动放行（默认关闭，开启后也只在 shadow 记录/放行；先影子验证）。
+        "low_position_relax": {
+            "enabled": False,
+            "confidence_min": 0.58,     # raw conf 低于门槛但≥此值才考虑
+            "pre1h_max_pct": 1.5,       # 入场前1h涨幅须≤此值（低位、非追高）
+            "aggression_min": 0.7,      # 真实主动买盘 flow 须≥此值
+        },
     },
     "counter_regime_min_conf": 0.8,
     "max_crypto_long_correlated": 3,

@@ -613,6 +613,15 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "weight_aggression": _num_leaf(0.0, 1.0),
         "weight_imbalance": _num_leaf(0.0, 1.0),
         "weight_compression": _num_leaf(0.0, 1.0),
+        # 低位启动放行：对“位置低（启动前未涨）+ 真实 flow 转强”但 confidence
+        # 差门槛一点的 LONG 开口子。仅放宽 runner_gate 的 confidence 拦截，其余
+        # 闸门（late_chase / 流动性 / counter-regime 等）仍照常执行。
+        "low_position_relax": {
+            "enabled": ("bool",),
+            "confidence_min": _num_leaf(0.0, 1.0),
+            "pre1h_max_pct": _num_leaf(-100.0, 100.0),
+            "aggression_min": _num_leaf(0.0, 1.0),
+        },
     },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,

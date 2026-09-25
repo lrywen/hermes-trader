@@ -5065,6 +5065,71 @@ def route_verdict(
     return {"action": "unknown", "verdict": verdict, "result": None}
 
 
+def _low_position_relax_allows(
+    analysis: dict[str, Any], config: dict[str, Any]
+) -> tuple[bool, str]:
+    """Whether a sub-threshold LONG may be admitted via the low-position path.
+
+    Backtest (2026-09-24, the LIT review) showed simply dropping the confidence
+    bar has ~0 edge, but admitting a LONG that is still LOW (prior-1h move not
+    extended) AND backed by real buyer flow wins ~85% over 171 blocked cases.
+    This relaxes ONLY the runner-gate confidence block; every other gate still
+    runs unchanged. Fail-closed: missing/insufficient data returns False.
+
+    Returns (allowed, audit_detail).
+    """
+    coin = analysis.get("coin") or ""
+    if (analysis.get("side") or "").lower() != "long":
+        return False, "not long"
+    lc = config.get("launch_capture") or {}
+    r = lc.get("low_position_relax") or {}
+    if not (isinstance(r, dict) and bool(r.get("enabled", False))):
+        return False, "disabled"
+
+    conf_min = float(r.get("confidence_min", 0.58) or 0.0)
+    pre_max = float(r.get("pre1h_max_pct", 1.5))
+    agg_min = float(r.get("aggression_min", 0.7) or 0.0)
+
+    gate_conf = float(analysis.get("ai_confidence_raw",
+                                   analysis.get("confidence", 0)) or 0.0)
+    if gate_conf < conf_min:
+        return False, f"conf {gate_conf:.2f} < {conf_min:.2f}"
+
+    # Pre-1h position: % move of the last CLOSED 5m bar vs 12 bars earlier.
+    pre_pct: Optional[float] = None
+    try:
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        candles = fetch_hl_candles(coin, "5m", 30)
+        candles, _ = _drop_forming_bar(candles, "5m")
+        if len(candles) >= 13:
+            now_c = float(candles[-1]["c"])
+            past_c = float(candles[-13]["c"])
+            if past_c > 0:
+                pre_pct = (now_c - past_c) / past_c * 100.0
+    except Exception:
+        pre_pct = None
+    if pre_pct is None:
+        return False, "pre1h unavailable"
+    if pre_pct > pre_max:
+        return False, f"pre1h {pre_pct:+.1f}% > {pre_max:.1f}"
+
+    # Real buyer flow (WS-trades microstructure aggression over the burst).
+    aggression: Optional[float] = None
+    try:
+        from hermes_trader.agents.microstructure import get_microstructure
+        aggression = get_microstructure().aggression(coin)
+    except Exception:
+        aggression = None
+    if aggression is None:
+        return False, "flow unavailable"
+    if aggression < agg_min:
+        return False, f"flow {aggression:.2f} < {agg_min:.2f}"
+
+    return True, (f"low-position relax: conf {gate_conf:.2f}, "
+                  f"pre1h {pre_pct:+.1f}%, flow {aggression:.2f}")
+
+
 def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any]) -> str:
     """Block entries that are not fresh runner setups.
 
@@ -5199,9 +5264,14 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     )
 
     if gate_conf < min_conf:
-        logger.info(f"[runner_gate] {coin} BLOCKED: confidence {gate_conf:.2f} < {min_conf:.2f}")
-        _block = f"confidence {gate_conf:.2f} < {min_conf:.2f}"
-        return f"runner_gate_blocked ({_block})"
+        _relax_ok, _relax_detail = _low_position_relax_allows(analysis, config)
+        if _relax_ok:
+            logger.info(f"[runner_gate] {coin} ADMITTED via {_relax_detail}")
+        else:
+            logger.info(f"[runner_gate] {coin} BLOCKED: confidence "
+                        f"{gate_conf:.2f} < {min_conf:.2f} ({_relax_detail})")
+            _block = f"confidence {gate_conf:.2f} < {min_conf:.2f}"
+            return f"runner_gate_blocked ({_block})"
 
     # --- Late-entry veto: RSI extremes + over-extension from EMA21 (4h) ---
     # These catch the "buying the top tick / selling the bottom tick" failure
