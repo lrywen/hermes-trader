@@ -964,7 +964,7 @@ class DSLTracker:
 
         The ATR stop may only WIDEN the stop up to the configured
         ``atr_stop_ceiling_pct``; it must never OVERRIDE a tighter regime
-        ``max_loss_pct`` (live sets trend=0.8% / non-trend=0.4% via
+        ``max_loss_pct`` (live sets trend=4.0% / non-trend=0.8% via
         ``select_exit_params``). Previously the ATR branch replaced
         ``spot_cap`` wholesale, so an ATR value above the regime cap clamped at
         the 3% ceiling meant the tight regime stop never bound. Taking the min
@@ -2229,16 +2229,36 @@ def _build_policy_from_config() -> ExitPolicy:
     try:
         from hermes_trader.agents.config_store import read_agent_config
         dsl = read_agent_config().get("dsl_exit", {}) or {}
-        tiers_raw = dsl.get("phase2_tiers")
-        tiers = [RetraceTier(**t) for t in tiers_raw] if tiers_raw else None
-        atr_cfg = dsl.get("atr_stop", {}) or {}
-        noise_cfg = dsl.get("noise_band", {}) or {}
-        # Audit 2026-09-06 (E4, P2): wire the smooth-transition knob (was a
-        # dead field — no construction path fed it). Default OFF (inert).
-        smooth_cfg = dsl.get("smooth_transition", {}) or {}
-        # Audit 2026-09-06 (E3, P2): time-based scratch exit. Default OFF.
-        scratch_cfg = dsl.get("time_scratch", {}) or {}
-        return ExitPolicy(
+        return _policy_from_dsl_dict(dsl)
+    except Exception as _dp_e:
+        logger.error("[dsl] exit-policy build failed, failing open to "
+                     "ExitPolicy defaults: %r", _dp_e)
+        try:
+            from hermes_trader import event_log
+            event_log.append("error", payload={
+                "scope": "dsl_policy_build_failopen",
+                "error": repr(_dp_e)})
+        except Exception as _ev_e:
+            logger.error("[dsl] dsl_policy_build_failopen event log failed: %r", _ev_e)
+        return ExitPolicy()
+
+
+def _policy_from_dsl_dict(dsl: dict) -> ExitPolicy:
+    """Pure ``dsl_exit`` config dict → ExitPolicy（唯一的 dict 接缝）。
+
+    生产 config 构造路径（``_build_policy_from_config``）与回测 baseline 委托
+    内核时共用此函数，避免第二套 dict→policy 映射漂移。
+    """
+    tiers_raw = dsl.get("phase2_tiers")
+    tiers = [RetraceTier(**t) for t in tiers_raw] if tiers_raw else None
+    atr_cfg = dsl.get("atr_stop", {}) or {}
+    noise_cfg = dsl.get("noise_band", {}) or {}
+    # Audit 2026-09-06 (E4, P2): wire the smooth-transition knob (was a
+    # dead field — no construction path fed it). Default OFF (inert).
+    smooth_cfg = dsl.get("smooth_transition", {}) or {}
+    # Audit 2026-09-06 (E3, P2): time-based scratch exit. Default OFF.
+    scratch_cfg = dsl.get("time_scratch", {}) or {}
+    return ExitPolicy(
             max_loss_pct=dsl.get("max_loss_pct", ExitPolicy.max_loss_pct),
             max_loss_roe_pct=dsl.get("max_loss_roe_pct", ExitPolicy.max_loss_roe_pct),
             protect_pct=dsl.get("protect_pct", ExitPolicy.protect_pct),
@@ -2270,19 +2290,6 @@ def _build_policy_from_config() -> ExitPolicy:
             time_scratch_giveback_pct=float(scratch_cfg.get("giveback_pct", ExitPolicy.time_scratch_giveback_pct)),
             phase2_tiers=tiers if tiers else ExitPolicy().phase2_tiers,
         )
-    except Exception as _dp_e:
-        logger.error("[dsl] exit-policy build failed, failing open to "
-                     "ExitPolicy defaults: %r", _dp_e)
-        # Fail-open silently swaps every live stop for the ExitPolicy defaults;
-        # mirror loudly so the authoritative feed records the parameter swap.
-        try:
-            from hermes_trader import event_log
-            event_log.append("error", payload={
-                "scope": "dsl_policy_build_failopen",
-                "error": repr(_dp_e)})
-        except Exception as _ev_e:
-            logger.error("[dsl] dsl_policy_build_failopen event log failed: %r", _ev_e)
-        return ExitPolicy()
 
 
 def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
@@ -2293,8 +2300,8 @@ def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
 
     The live entry path (executor.register) calls ``select_exit_params(dsl,
     regime)`` and builds the policy from those params: trend regimes (up/down)
-    get the trend-ride 0.8% / 10%-ROE cap, non-trend (neutral/chop) the scalp
-    0.4% / 5%-ROE cap. We start from the full config policy (every other knob)
+    get the trend-ride 4.0% / 20%-ROE cap, non-trend (neutral/chop) the scalp
+    0.8% / 10%-ROE cap. We start from the full config policy (every other knob)
     and overlay exactly those regime params. Fail-open: any resolution error
     (missing regime_aware block, import error, select failure) returns the base
     config policy — never a crash, never the bare ExitPolicy() default.
@@ -2403,8 +2410,8 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
             #
             # Regime parity: when the caller didn't pass an explicit policy,
             # build the SAME regime-aware policy a fresh live entry would get
-            # (trend up/down → 0.8%/10%ROE trend-ride; neutral/chop →
-            # 0.4%/5%ROE scalp). The position's true entry regime is gone after
+            # (trend up/down → 4.0%/20%ROE trend-ride; neutral/chop →
+            # 0.8%/10%ROE scalp). The position's true entry regime is gone after
             # a state wipe, so we use the CURRENT regime (TTL-cached) as the best
             # available proxy — and it is already what the live entry path used
             # for this coin's most recent gate evaluation. detect_regime fails

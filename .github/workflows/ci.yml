@@ -77,3 +77,9 @@ jobs:
 
       - name: Ruff check
         run: uv run ruff check hermes_trader/ scripts/ tests/
+
+      # T-22 闸门有效性自检：在历史提交上重放 lint 闸门，断言已知红灯快照
+      # (a38df9e=164) 仍红、绿灯点 (cf5245e/HEAD) 仍绿。若有人削弱/收紧规则
+      # 导致历史行为变化，此步失败 —— 让 lint 闸门无法被悄无声息地改动。
+      - name: "Lint gate historical replay (T-22)"
+        run: uv run python scripts/lint_gate_replay.py

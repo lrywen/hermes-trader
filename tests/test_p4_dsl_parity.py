@@ -10,7 +10,9 @@ re-implementations of that engine:
 
   1. scripts/backtest.py                 DSL.check_bar
   2. scripts/backtest_logged.py          simulate_dsl_exit
-  3. scripts/backtest_majors_surge.py    _simulate_trade   (still standalone)
+  3. scripts/backtest_majors_surge.py    _simulate_trade   (baseline 臂 ARP-02 B4
+                              已改委托内核，见 test_b4_baseline_kernel_parity；
+                              其余实验臂仍 standalone)
 
 P4-5 converted (1) and (2) into thin wrappers over the SAME ``DslBarExit``
 kernel (backtest_logged via ``replay_exit_bars``). The contract here therefore
@@ -26,9 +28,9 @@ changed:
   same-bar peak lookahead (D1), gap-through fills (D3), hard-timeout bar
   counting (D4) and single-vs-multi-tier floors (D6).
 
-  * ``surge``   - scripts/backtest_majors_surge.py is deliberately still a
-                  standalone one-off research engine and keeps its own replica;
-                  it retains residual, CONSCIOUSLY PINNED drift:
+  * ``surge``   - scripts/backtest_majors_surge.py 的【非 baseline 实验臂】仍走
+                  自建复刻（baseline 已委托内核，另见 test_b4_baseline_kernel_parity），
+                  保留残余、CONSCIOUSLY PINNED drift：
                     D2: strict ``b.l < floor`` (a mark exactly on the floor does
                         NOT breach), scenario s3_floor_boundary;
                     D5: its own fallback defaults (test_fallback_defaults_diverge).

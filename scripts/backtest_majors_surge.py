@@ -19,10 +19,13 @@
     4h 取已收盘切片末 100 根（方向推断 extension 与 late_entry 共用，同 live）。
   * PIT 反前视：决策在 bar i 收盘，成交在 bar i+1 开盘价（加逆方向滑点）；
     高 TF 一律 _closed_slice 取已收盘前缀；出场峰值收盘后推进。
-  * 出场 = live dsl_exit 核心阶梯：stale_flat(240min, peak<protect) →
+  * 出场 = live dsl_exit 核心阶梯：baseline 臂委托【统一内核】（DslBarExit
+    驱动生产 DSLTracker，policy 经 _policy_from_dsl_dict 同源构造，
+    ARP-02 B4）：stale_flat(240min, peak<protect) →
     hard_timeout(600min) → max_loss(min(max_loss_pct, roe/lev)=1%) →
     phase2 tier 移动止损（{2,.35},{6,.3},{12,.2},{20,.15}，arm/选层基于 PEAK）
-    + breakeven(2.5→0.3) clamp + monotonic floor。成本模型（P5-1 实测校正）：
+    + breakeven(2.5→0.3) clamp + monotonic floor。其余实验臂仍走脚本内
+    _simulate_trade（实验口径，非生产）。成本模型（P5-1 实测校正）：
     来回费 8.64bps、entry/exit 滑 = 半价差（per-coin 逐币，majors 均值 0.31）、
     max_loss 止损无额外延迟滑点。旧口径 5/5/15/10 是假设，已弃用；用
     --slip-mode flat --fee-bps 5.0 --entry-slip-bps 5.0 --exit-slip-bps 15.0
@@ -597,6 +600,62 @@ def _simulate_trade(cand: Candidate, bars: List[Candle], i: int,
     return _close(bars[k].t + MS_5M, bars[k].c, "end_of_data", k, False)
 
 
+def _simulate_baseline_kernel(cand: Candidate, bars: List[Candle], i: int,
+                              dsl_blk: Dict[str, Any], notional: float,
+                              entry_slip: float, exit_slip: float,
+                              coin: str) -> Optional[Trade]:
+    """baseline 臂出场委托【统一内核】（ARP-02 B4 收口）。
+
+    不再走脚本自建的 ``_simulate_trade`` 阶梯：policy 由生产单源
+    ``dsl_exit._policy_from_dsl_dict`` 构造，出场判定由内核 ``DslBarExit``
+    驱动生产 ``DSLTracker``（与 live 完全同源），消除"旧脚本绕开内核导致
+    出场语义漂移"。baseline 是平铺 regime（非 regime_aware 分层），故直接用
+    dsl_exit 配置块。
+
+    成本仍按脚本实测口径施加（与旧 baseline 逐位一致）：入场加 entry_slip，
+    出场统一加 exit_slip（实测 config 下 stop_delay=0），往返一次扣
+    ROUND_TRIP_FEE_BPS。信号 bar i 收盘 → bar i+1 开盘成交。
+    """
+    from hermes_trader.agents.dsl_exit import _policy_from_dsl_dict
+    from hermes_trader.backtest.exit_dsl import DslBarExit
+    from hermes_trader.backtest.types import normalize_reason
+
+    j = i + 1
+    if j >= len(bars):
+        return None
+    sgn = 1 if cand.side == "long" else -1
+    entry_px = bars[j].o * (1 + sgn * entry_slip / 1e4)
+    entry_t = bars[j].t
+
+    policy = _policy_from_dsl_dict(dsl_blk)
+    engine = DslBarExit(
+        side=cand.side, entry_px=entry_px, entry_time_ms=entry_t,
+        policy=policy, leverage=1, coin=coin, bar_ms=MS_5M)
+
+    tr = Trade(coin=coin, side=cand.side, arm=cand.arm, entry_t=entry_t,
+               entry_px=entry_px, notional=notional, score=cand.score,
+               fired=cand.fired, meta=cand.meta)
+    sub = bars[j:]
+    for bi, b in enumerate(sub):
+        ev = engine.on_bar(b, bi)
+        if ev is None and j + bi == len(bars) - 1:
+            from hermes_trader.backtest.types import ExitEvent, ExitReason
+            ev = ExitEvent(bi, ExitReason.END_OF_DATA, b.c)
+        if ev is None:
+            continue
+        reason = normalize_reason(ev.reason)
+        exit_px = ev.ref_px * (1 - sgn * exit_slip / 1e4)
+        tr.exit_t = b.t + MS_5M
+        tr.exit_px = exit_px
+        tr.exit_reason = reason.value  # 与旧 _simulate_trade 的 snake 字符串一致
+        tr.hold_bars = bi + 1
+        tr.peak_pct = sgn * (ev.ref_px - entry_px) / entry_px * 100.0
+        tr.pnl_gross = sgn * (exit_px - entry_px) / entry_px * notional
+        tr.pnl_net = tr.pnl_gross - notional * ROUND_TRIP_FEE_BPS / 1e4
+        return tr
+    return None
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # 单币回放
 # ─────────────────────────────────────────────────────────────────────────────
@@ -702,8 +761,13 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
             if i <= open_until:
                 funnel["skip_open_pos"] += 1
                 continue
-            tr = _simulate_trade(cand, bars, i, arm_dsl, notional,
-                                 e_slip, x_slip, stop_delay, coin, **pb_kw)
+            if arm == "baseline":
+                # ARP-02 B4：baseline 出场委托统一内核（生产同源），不再自建阶梯。
+                tr = _simulate_baseline_kernel(
+                    cand, bars, i, P["dsl"], notional, e_slip, x_slip, coin)
+            else:
+                tr = _simulate_trade(cand, bars, i, arm_dsl, notional,
+                                     e_slip, x_slip, stop_delay, coin, **pb_kw)
             if tr is None:
                 continue
             trades.append(tr)

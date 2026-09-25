@@ -32,6 +32,10 @@ LOOP_EVENTS = ("loop_heartbeat", "scan", "research", "execute", "ta_skip",
                "near_miss")
 DEFAULT_MAX_AGE_S = 300
 
+# 对账日跑（cron 15 0 * * *）。默认 36h 而非 24h：覆盖"日跑 + 一次失败重试"
+# 窗口，一次 cron 延迟或主机维护不会误报，同时仍能在两天内发现停摆。
+DEFAULT_RECONCILE_MAX_AGE_S = 129_600
+
 
 @dataclass(frozen=True)
 class WatchdogResult:
@@ -95,6 +99,74 @@ def check(path: str, max_age_s: int, *, now_ms: int | None = None,
                           f"心跳新鲜 age={age:.0f}s source={source}")
 
 
+def _parse_iso_z_ms(value: str) -> int:
+    from datetime import datetime, timezone
+
+    v = value.strip()
+    if v.endswith("Z"):
+        v = v[:-1] + "+00:00"
+    dt = datetime.fromisoformat(v)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def check_reconcile_freshness(status_path: str, max_age_s: int, *,
+                              now_ms: int | None = None) -> WatchdogResult:
+    """读 reconcile_status.json 的 generated_at（ISO Z），判对账是否新鲜。
+
+    文件缺失 ⇒ STALE("status file missing")；解析失败 ⇒ STALE("status
+    unparsable")。这是独立于主循环心跳的检查，两者失效模式不同，故不合并。
+    """
+    p = Path(status_path)
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    if not p.exists():
+        return WatchdogResult(False, 0, 0.0,
+                              f"对账停摆: status file missing: {status_path}")
+    try:
+        data = json.loads(p.read_text(errors="ignore"))
+        generated_ms = _parse_iso_z_ms(str(data["generated_at"]))
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+        return WatchdogResult(False, 0, 0.0,
+                              f"对账停摆: status unparsable: {status_path}")
+
+    age = (now - generated_ms) / 1000
+    if age < 0:
+        return WatchdogResult(False, generated_ms, age,
+                              "对账时间在未来（时钟漂移?）")
+    if age > max_age_s:
+        return WatchdogResult(False, generated_ms, age,
+                              f"对账停摆: 对账过期 {age:.0f}s > {max_age_s}s")
+    return WatchdogResult(True, generated_ms, age,
+                          f"对账新鲜 age={age:.0f}s")
+
+
+def check_reconcile_vacuous(status_path: str) -> WatchdogResult | None:
+    """空绿检测（FND-07）：0 成交窗口却报 clean 且本地有交易。
+
+    "空绿"产生虚假安全感——对账器从未在真实负载下被行使过。返回非 None 的
+    STALE 结果表示应报 vacuous；status 文件本身不可读时返回 None（新鲜度
+    检查会另行报错，避免重复告警）。
+    """
+    p = Path(status_path)
+    if not p.exists():
+        return None
+    try:
+        data = json.loads(p.read_text(errors="ignore"))
+    except (json.JSONDecodeError, TypeError):
+        return None
+    in_window = int(data.get("exchange_fills_in_window", 0) or 0)
+    local_trades = int(data.get("local_trades", 0) or 0)
+    status = str(data.get("status", ""))
+    if in_window == 0 and local_trades > 0 and status == "clean":
+        return WatchdogResult(
+            False, 0, 0.0,
+            "对账空绿(vacuous): exchange_fills_in_window=0 但本地有 "
+            f"{local_trades} 笔交易且 status=clean；该结果未在真实负载下验证")
+    return None
+
+
+
 def _send_alert(text: str) -> bool:
     try:
         from hermes_trader.notify import send_text
@@ -114,27 +186,41 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--max-age", type=int, default=DEFAULT_MAX_AGE_S,
                     help="心跳最大允许年龄（秒），默认 300")
     ap.add_argument("--alert", action="store_true", help="STALE 时发送告警")
+    ap.add_argument("--reconcile-status", default="/data/reconcile_status.json",
+                    help="对账状态文件路径（默认 /data/reconcile_status.json）")
+    ap.add_argument("--reconcile-max-age", type=int,
+                    default=DEFAULT_RECONCILE_MAX_AGE_S,
+                    help="对账最大允许年龄（秒），默认 129600=36h")
+    ap.add_argument("--no-reconcile", action="store_true",
+                    help="跳过对账新鲜度/空绿检查（仅检查主循环心跳）")
     ap.add_argument("--emergency-close-cmd", default=None,
                     help="STALE 时执行的外部平仓命令（默认不执行任何平仓）")
     args = ap.parse_args()
 
+    results: list[WatchdogResult] = []
     try:
-        r = check(args.heartbeat, args.max_age)
+        results.append(check(args.heartbeat, args.max_age))
     except FileNotFoundError as e:
-        msg = f"[dead-man] {e}"
-        print(msg, file=sys.stderr)
-        if args.alert:
-            _send_alert(msg)
-        if args.emergency_close_cmd:
-            _run_cmd(args.emergency_close_cmd)
-        return 2
+        results.append(WatchdogResult(False, 0, 0.0, f"[dead-man] {e}"))
 
-    print(f"[dead-man] {'OK' if r.ok else 'STALE'}: {r.reason}")
-    if r.ok:
+    vacuous: WatchdogResult | None = None
+    if not args.no_reconcile:
+        results.append(check_reconcile_freshness(
+            args.reconcile_status, args.reconcile_max_age))
+        vacuous = check_reconcile_vacuous(args.reconcile_status)
+        if vacuous is not None:
+            results.append(vacuous)
+
+    stale = [r for r in results if not r.ok]
+    for r in results:
+        tag = "OK" if r.ok else "STALE"
+        print(f"[dead-man] {tag}: {r.reason}")
+    if not stale:
         return 0
 
     if args.alert:
-        _send_alert(f"[dead-man] STALE: {r.reason}")
+        for r in stale:
+            _send_alert(f"[dead-man] STALE: {r.reason}")
     if args.emergency_close_cmd:
         _run_cmd(args.emergency_close_cmd)
     return 1

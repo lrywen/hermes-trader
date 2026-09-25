@@ -44,7 +44,7 @@ This architecture reduced daily AI costs from $8-$52 to $3-$10 while improving s
 |          hermes-trader — autonomous trading pipeline          |
 |                                                               |
 |  Scan ➜ TA Filter ➜ AI Research ➜ Risk Gates ➜ Execute ➜ DSL Monitor ──▶ Auto-Close
-|        (cheap)          (expensive)     (11 gates)            (per-tick, 2-phase)
+|        (cheap)          (expensive)     (22 gates)            (per-tick, 2-phase)
 │                       |
 │                  Only CONFIRMED
 │                  signals proceed
@@ -60,7 +60,7 @@ This architecture reduced daily AI costs from $8-$52 to $3-$10 while improving s
 ┌─────────────┐    ┌──────────────┐    ┌─────────────────┐    ┌──────────┐    ┌──────────┐
 │  Perception │───>│  TA Filter   │───>│   AI Research   │───>│  Risk    │───>│  Executor│
 │   Scanner   │    │  (TA Filter) │    │ (OpenRouter API)│    │  Gates   │    │ (HL + DSL)│
-│ 5m/1h/4h    │    │  EMA/RSI/ATR│    │ Verdict + Price │    │  11 gates│    │ SL/TP    │
+│ 5m/1h/4h    │    │  EMA/RSI/ATR│    │ Verdict + Price │    │  22 gates│    │ SL/TP    │
 │ Volume-N    │    └──────────────┘    └─────────────────┘    └──────────┘    └──────────┘
 └─────────────┘
      │
@@ -117,7 +117,7 @@ Replicates the Hyperfeed MCP plugin's data directly from HL API:
 | `hermes_trader/indicators/triggers.py` | Trigger engine — composite scoring across signal types |
 | `hermes_trader/agents/ta_filter.py` | Pre-AI technical analysis — multi-TF (1h/4h/1d) EMA, RSI, ATR, ADX, volume confirmation |
 | `hermes_trader/agents/research.py` | AI research pipeline — fetches candles, builds context, calls OpenRouter for verdict |
-| `hermes_trader/agents/risk_gates.py` | 11 independent risk gates: confidence, notional caps, daily loss, cooldown, correlation, news blackout, etc. |
+| `hermes_trader/agents/risk_gates.py` | 22 risk gates: confidence, notional caps, late-chase, drawdown, daily giveback, cooldown, market regime, news blackout, TA late-entry, etc. |
 | `hermes_trader/agents/executor.py` | ATR/fallback sizing + Hyperliquid precision normalization + EIP-712 order signing + DSL exit registration |
 | `hermes_trader/agents/dsl_exit.py` | Two-phase trailing stop engine — disk-persisted (`.dsl-state.json`), reconciled with exchange positions each tick |
 | `hermes_trader/agents/hyperfeed.py` | Hyperfeed Discovery API — leaderboard, whale index, smart money signals |
@@ -390,7 +390,7 @@ process. Use `scripts/restart.sh` for normal operation.
 - Each tick, reconciles DSL trackers with live exchange positions and runs an exit pass — market-closes anything whose dynamic floor, hard stop, or timeout has tripped
 - Runs the TA filter on each trigger — only CONFIRMED signals (or fired momentum bursts) reach AI research
 - Researches qualifying signals with the OpenRouter model configured in `.env.local`
-- Executes trades that clear all 11 risk gates
+- Executes trades that clear all 22 risk gates
 - Runs continuously until stopped
 
 ---
@@ -589,7 +589,7 @@ hermes-trader/
 │   │   ├── memory.py              # File-backed state
 │   │   ├── perception.py          # Volume-filtered parallel scanner
 │   │   ├── research.py            # AI research pipeline
-│   │   ├── risk_gates.py          # 11 risk gates
+│   │   ├── risk_gates.py          # 22 risk gates
 │   │   ├── system_prompt.py       # Agent system prompt
 │   │   ├── ta_filter.py           # Pre-AI TA filter
 │   │   ├── dsl_exit.py            # Two-phase trailing stop engine

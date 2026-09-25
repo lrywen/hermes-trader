@@ -179,9 +179,10 @@ One scan cycle (default 15s, env-tunable via `HERMES_SCAN_INTERVAL`, shortened f
      f. Log `execute` event with side, executed flag, order_id, blocked_by.
 ```
 
-### The 16 risk gates
+### The risk gates
 
-All evaluated; results recorded for telemetry. Trade blocks if any returns
+`risk_gates.py` defines **22** `*_gate` functions. All are evaluated; results
+recorded for telemetry. Trade blocks if any returns
 `{pass: False}`. **All config keys are `snake_case`** — legacy camelCase
 keys (e.g. `maxConcurrent`) are silently ignored by the gates and only
 used by the old MCP-server status display.
@@ -189,21 +190,34 @@ used by the old MCP-server status display.
 | Gate | What it checks |
 |---|---|
 | `confidence` | AI confidence ≥ `min_ai_confidence` (in-code default 0.8; live config typically 0.25–0.3) |
+| `signal_price_deviation` | Signal reference price vs decision price deviation ≤ `max_signal_price_deviation_pct` |
+| `score_invariant` | Re-scored composite stays within an invariant band of the scan-time score (prevents post-hoc score drift) |
+| `late_chase` | Rejects buying after an extended, RSI-heated run unless a fresh breakout/follow-through qualifies |
 | `max_concurrent` | Open positions < `max_concurrent` |
 | `notional_cap` | Per-trade notional ≤ `max_trade_notional_usd` |
-| `daily_loss` | Daily PnL > `max_daily_loss_usd` (kill switch) |
 | `daily_giveback` | Halts new entries once realized+unrealized PnL gives back more than `daily_giveback_halt_pct` from the session peak (peak must exceed `daily_giveback_min_peak_usd`) |
-| `liquidity` | Asset-class-aware floor. Crypto: ≥ `min_market_volume_usd` (default 5M). HIP-3 (colon-namespaced): ≥ `min_hip3_volume_usd` (default 500k). Same floor would have wrongly blocked legitimately-liquid tokenized markets like `xyz:CRCL` ($4.7M) and `km:USTECH` ($1.06M). |
-| `short_liquidity` | Per-side floor for shorts: 24h volume on the coin must clear `min_short_volume_usd` (0 disables) so illiquid borrow/sell-side conditions don't trap a short |
 | `coin_filter` | Coin not in blocklist; if allowlist set, must be in it |
 | `cooldown` | Same-coin cooldown elapsed (`cooldown_min`). Keys off the most-recent REAL trade in memory (blocked attempts no longer pollute this — see fix in pipeline section). |
-| `opposite_guard` | No simultaneous opposite-direction position on the same coin |
-| `correlation` | Crypto long correlation cap — `max_crypto_long_correlated` (default 2, often 5–8 in live). HIP-3 equity/commodity longs don't count against the crypto cap because the regime classifier strips the dex prefix and routes them to the equity/commodity class. |
-| `equity_risk` | Total open notional ≤ `max_total_notional_pct × equity` |
+| `coin_circuit_breaker` | Per-coin circuit breaker after a loss streak / adverse cluster |
+| `global_halt` | Global kill switch (operator / hard risk event) |
+| `consecutive_loss` | Consecutive-loss count below the halt limit |
+| `per_coin_daily_loss` | Per-coin realized daily loss below its cap |
+| `drawdown` | Account drawdown from peak below `max_drawdown_pct` |
+| `liquidation_buffer` | Margin/liquidation-distance buffer keeps the position outside the liquidation zone |
 | `market_regime` | Counter-trend trades blocked unless confidence ≥ `counter_regime_min_conf`. Per-asset-class proxy: BTC for crypto, `xyz:SP500` for equity, own ticker for commodities. |
-| `news` | No binary news risk in research's news_context (Fed/CPI/earnings/etc.) |
+| `news_blackout` | No binary news risk in research's news_context (Fed/CPI/earnings/etc.) |
 | `debate` | Multi-agent conviction debate (bull vs. bear vs. critic) must not produce a blocking dissent against the AI verdict |
-| `hta_risk` | HTA three-party risk review gate; fails **open** on timeout/unavailability so a missing AI advisor never blocks trading |
+| `ta_late_entry` | Order-time hard gate: rejects a late/overheated entry (RSI + ATR extension), failing closed on missing data |
+| `trend_filter_200ma` | Long-side 200-MA trend filter when enabled |
+| `daily_extension_cap` | Blocks a new entry after a >30% 24h extension (`enforce` mode) |
+| `reentry_cap` | Limits re-entry into a coin that already stopped out within the window |
+
+> Note: the 22 functions are the current point-in-time code count. Earlier
+> revisions of this table listed 16 conceptual gates (some merged concepts such
+> as liquidity / opposite-direction guard / correlation / total-notional / HTA
+> risk are enforced in sizing and the DSL/order layer rather than as standalone
+> `*_gate` functions). Count the code, not this table, when auditing.
+
 
 ### Why the two-stage AI gating
 
