@@ -22,6 +22,7 @@ from hermes_trader.models.types import Candle
 
 from .cost import CostModel
 from .exit_dsl import BAR_MS_5M, DslBarExit
+from .regime import regime_aware_policy, resolve_regime
 from .types import ExitEvent, ExitReason, Side, Signal, Trade
 
 
@@ -37,12 +38,20 @@ def run(
     entry_atr_pct: float = 0.0,
     entry_regime: str = "",
     bar_ms: int = BAR_MS_5M,
+    regime_replay: bool = False,
+    dsl_config: Optional[dict] = None,
 ) -> list[Trade]:
     """Run one-coin backtest; return completed trades in chronological order.
 
     ``bar_ms`` is the bars' real interval; it only calibrates the production
     exit engine's wall-clock timeouts (hard timeout / stale-flat), which are
     measured in minutes rather than bars. It defaults to the 5m live cadence.
+
+    RFT-01：``regime_replay=True`` 时，每次开仓都在 PIT 窗口上调用生产同源
+    ``classify_candles`` 判 regime，并通过同源 ``select_exit_params`` /
+    ``resolve_regime_clocks`` 选出场档与时钟（见 :mod:`.regime`）。默认关闭，
+    保持旧的"单一平铺 policy + 常量 regime"口径；``dsl_config`` 为该币生产
+    dsl_exit 配置，regime_replay 时用于选档。
     """
     cost = cost or CostModel()
     if not bars:
@@ -57,6 +66,8 @@ def run(
     entry_side: Side = "long"
     entry_bar = 0
     entry_ref = entry_fill = 0.0
+    entry_effective_regime = ""
+    entry_exit_label = ""
 
     n = len(bars)
     for i in range(n):
@@ -72,11 +83,23 @@ def run(
             # constant-context runs (heuristic) fall back to the run-level values.
             sig_atr = pending.entry_atr_pct or entry_atr_pct
             sig_regime = pending.entry_regime or entry_regime
+            # RFT-01：在 PIT 窗口上判 regime 并选出场档（同源）。信号自带真实
+            # regime 时 resolve_regime 直接采用；否则按决策 bar 现判。
+            entry_effective_regime = resolve_regime(
+                bars, pending.bar_index,
+                enabled=regime_replay, dsl_config=dsl_config,
+                fallback=sig_regime,
+            )
+            eff_policy = policy
+            if regime_replay:
+                eff_policy, entry_exit_label = regime_aware_policy(
+                    policy, dsl_config or {}, entry_effective_regime)
             exit_engine = DslBarExit(
                 side=entry_side, entry_px=entry_fill,
                 # Candle t is the bar-OPEN ms — also the entry instant.
-                entry_time_ms=bar.t, policy=policy, leverage=leverage,
-                coin=coin, entry_atr_pct=sig_atr, entry_regime=sig_regime,
+                entry_time_ms=bar.t, policy=eff_policy, leverage=leverage,
+                coin=coin, entry_atr_pct=sig_atr,
+                entry_regime=entry_effective_regime,
                 bar_ms=bar_ms,
             )
             pending = None
@@ -105,6 +128,8 @@ def run(
                     reason=exit_event.reason, notional_usd=notional_usd,
                     fee_usd=cost.fee_usd(notional_usd),
                     pnl_gross_usd=gross, pnl_net_usd=net,
+                    entry_regime=entry_effective_regime,
+                    exit_label=entry_exit_label,
                 ))
                 exit_engine = None
                 # A new signal decided on this bar's close may still fill at

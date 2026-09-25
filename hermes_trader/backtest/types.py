@@ -109,6 +109,9 @@ class Trade:
     fee_usd: float
     pnl_gross_usd: float
     pnl_net_usd: float
+    #: RFT-01：入场时判定的 regime 与出场选档标签（trend_ride/scalp）。
+    entry_regime: str = ""
+    exit_label: str = ""
 
     @property
     def hold_bars(self) -> int:

@@ -178,6 +178,18 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int,
     print(f"total PnL     : ${pnl_total:+.2f}  ({pnl_total / equity * 100:+.1f}% on ${equity:.0f}, over {days} days)")
     print(f"exit reasons  : {s.by_reason}")
 
+    # RFT-01：regime 选档分布（仅当回测带了 regime/选档标签时）。
+    labeled = [t for t in all_trades if t.exit_label]
+    if labeled:
+        print("regime 选档   :")
+        buckets: dict[str, List[Trade]] = {}
+        for t in labeled:
+            buckets.setdefault(t.exit_label, []).append(t)
+        for label, ts_ in sorted(buckets.items(), key=lambda kv: -len(kv[1])):
+            tot = sum(t.pnl_net_usd for t in ts_)
+            print(f"  {label:28} {len(ts_):4d} 笔  PnL ${tot:+.2f}  "
+                  f"(${tot/len(ts_):+.3f}/笔)")
+
     # Sample worst and best
     sorted_t = sorted(all_trades, key=lambda t: t.pnl_net_usd)
     print("\nworst 3       :")
@@ -241,6 +253,9 @@ def main() -> int:
     ap.add_argument("--no-late-entry", action="store_true",
                     help="disable the live ta_late_entry hard gate (default: enforced, "
                          "100%% parity with the live order-time gate)")
+    ap.add_argument("--regime-replay", action="store_true",
+                    help="RFT-01：每仓在 PIT 窗口现判 regime，并按生产同源 "
+                         "select_exit_params/regime clocks 选出场档（默认关闭=平铺 policy）")
     ap.add_argument("--entry-slip-bps", type=float, default=DEFAULT_ENTRY_SLIP_BPS,
                     help=f"adverse entry slippage in bps (default {DEFAULT_ENTRY_SLIP_BPS})")
     ap.add_argument("--exit-slip-bps", type=float, default=DEFAULT_EXIT_SLIP_BPS,
@@ -467,6 +482,8 @@ def main() -> int:
             trades = kdriver.run(
                 candles, kept, base_policy, coin=coin, leverage=lev,
                 notional_usd=notional, cost=cost, bar_ms=sim_ms,
+                regime_replay=args.regime_replay,
+                dsl_config=live.get("dsl_exit", {}),
             )
             # Structural no-look-ahead invariant check on every coin.
             kguard.assert_run_pit(candles, kept, trades)
