@@ -864,6 +864,13 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
            "verdict": verdict, "verdict_cn": _VERDICT_CN[verdict],
            "reason": reason, "windows": stats,
            "backfill_rate": round(backfill, 4)}
+    # 最新记录时间/数据年龄（所有臂无条件带出）：让前端能一眼区分「样本不足
+    # 但仍在采数」与「写路径已断」，不必展开 warnings 推断。
+    _ts_all = [t for t in (_record_ts_ms(r) for r in records) if t]
+    if _ts_all:
+        _newest = max(_ts_all)
+        out["last_record_ms"] = _newest
+        out["last_record_age_h"] = round((now_ms - _newest) / 3_600_000, 1)
     # 命中集有害率（分母修正）：面板与 API 可直接展示，不依赖 reason 文案。
     if longest["mature_outcomes"] >= MIN_MATURE_OUTCOMES:
         _w: list[str] = []
