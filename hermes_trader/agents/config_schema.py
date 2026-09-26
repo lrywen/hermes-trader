@@ -622,6 +622,18 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "pre1h_max_pct": _num_leaf(-100.0, 100.0),
             "aggression_min": _num_leaf(0.0, 1.0),
         },
+        "cvd_divergence": {
+            "left": _num_leaf(1, 100),
+            "right": _num_leaf(1, 100),
+            "min_strength_pct": _num_leaf(0.0, 1000.0),
+        },
+        "volume_profile": {
+            "bins": _num_leaf(1, 500),
+            "atr_bins": ("bool",),
+            "atr_period": _num_leaf(1, 200),
+            "atr_multiple": _num_leaf(0.01, 10.0),
+        },
+        "trades_capture": ("bool",),
     },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,

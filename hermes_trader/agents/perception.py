@@ -21,9 +21,10 @@ from typing import Any, Callable, Iterator, Optional
 from hermes_trader.agents.config import get_config, trigger_thresholds_params, trigger_weights_params
 from hermes_trader.agents.config_store import cfg_get, report_legacy_mode_drift
 from hermes_trader.client.cache import _Cache
-from hermes_trader.client.hl_client import fetch_all_mids, fetch_hl_candles
+from hermes_trader.client.hl_client import _get_ws_mids_instance, fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
 from hermes_trader.indicators import triggers as trigger_mod
+from hermes_trader.indicators.volume_profile import volume_profile
 from hermes_trader.models.types import Candle
 
 logger = logging.getLogger(__name__)
@@ -521,18 +522,69 @@ def _scan_single_market(
             candles_1h, _ = _drop_forming_bar(candles_1h, "1h")
 
         thresholds = config["thresholds"]
-        # Launch capture: read the real-time aggressive-flow (CVD) accumulator
-        # populated by the WS trades subscription. A signed read aligned with
-        # the break lets breakout() accept the launch bar instead of waiting
-        # the full confirmation. None when launch capture is off / no flow.
+        _lc_capture = (config.get("launch_capture") or {})
         _flow_confirm = None
+        _cvd_divergence_info = None
         try:
-            _lc_capture = (config.get("launch_capture") or {})
             if _lc_capture.get("enabled", False):
-                from hermes_trader.agents.microstructure import get_microstructure
-                _flow_confirm = get_microstructure().aggression(market["coin"])
+                from hermes_trader.agents.microstructure import detect_cvd_divergence, get_microstructure
+
+                ws = _get_ws_mids_instance()
+                if ws is not None:
+                    ws.subscribe_trades(market["coin"])
+                    ws.enable_trades_capture(bool(_lc_capture.get("trades_capture", False)))
+                micro = get_microstructure()
+                _flow_confirm = micro.aggression(market["coin"])
+                cvd_points = [(ts * 1000.0, value)
+                              for ts, value in micro.cvd_series(market["coin"])]
+                price_points = [(float(c.t), float(c.c)) for c in candles]
+                cvd_cfg = _lc_capture.get("cvd_divergence") or {}
+                divergence = detect_cvd_divergence(
+                    price_points,
+                    cvd_points,
+                    left=int(cvd_cfg.get("left", 8)),
+                    right=int(cvd_cfg.get("right", 5)),
+                    min_strength_pct=float(cvd_cfg.get("min_strength_pct", 10.0)),
+                )
+                _cvd_divergence_info = {
+                    "bullish": divergence.bullish,
+                    "bearish": divergence.bearish,
+                    "reason": divergence.reason,
+                    "strength_pct": divergence.strength_pct,
+                    "source": "live_taker_trades" if cvd_points else "insufficient_data",
+                }
         except Exception:
             _flow_confirm = None
+            _cvd_divergence_info = None
+
+        _vp_cfg = _lc_capture.get("volume_profile") or {}
+        _vp = volume_profile(
+            candles,
+            bins=int(_vp_cfg.get("bins", 50)),
+            atr_bins=bool(_vp_cfg.get("atr_bins", True)),
+            atr_period=int(_vp_cfg.get("atr_period", 14)),
+            atr_multiple=float(_vp_cfg.get("atr_multiple", 0.25)),
+        )
+        _volume_profile_info = None
+        if _vp is not None:
+            _atr_last = None
+            try:
+                from hermes_trader.indicators.math import atr as atr_series
+                _atr_values = atr_series(candles, 14)
+                _atr_last = next((v for v in reversed(_atr_values)
+                                  if v == v and v > 0), None)
+            except Exception:
+                _atr_last = None
+            _volume_profile_info = {
+                "poc": _vp.poc,
+                "vah": _vp.vah,
+                "val": _vp.val,
+                "bin_size": _vp.bin_size,
+                "position_pct": _vp.position_pct(mid),
+                "distance_from_poc_pct": _vp.distance_from_poc_pct(mid),
+                "distance_from_poc_atr": _vp.distance_from_poc_atr(mid, _atr_last),
+                "chase_risk": _vp.chase_risk(mid, _atr_last),
+            }
         hits = [
             trigger_mod.pct_move_spike(candles, thresholds["sigmaThreshold"]),
             trigger_mod.volume_spike(candles, thresholds["sigmaThreshold"]),
@@ -854,6 +906,8 @@ def _scan_single_market(
             "mid": mid,
             "triggers": hits,
             "composite_score": score,
+            "volume_profile": _volume_profile_info,
+            "cvd_divergence": _cvd_divergence_info,
             "whale_signal": whale,  # None unless coin is in oi_funding_anomaly hits
         })
     except Exception as e:

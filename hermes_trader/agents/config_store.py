@@ -295,6 +295,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "pre1h_max_pct": 1.5,       # 入场前1h涨幅须≤此值（低位、非追高）
             "aggression_min": 0.7,      # 真实主动买盘 flow 须≥此值
         },
+        "cvd_divergence": {
+            "left": 8,
+            "right": 5,
+            "min_strength_pct": 10.0,
+        },
+        "volume_profile": {
+            "bins": 50,
+            "atr_bins": True,
+            "atr_period": 14,
+            "atr_multiple": 0.25,
+        },
+        "trades_capture": False,
     },
     "counter_regime_min_conf": 0.82,
     "max_crypto_long_correlated": 2,

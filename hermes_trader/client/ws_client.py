@@ -22,6 +22,7 @@ import random
 import ssl
 import threading
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -119,6 +120,7 @@ _USER_FILLS_SEEN_FILE = os.environ.get(
 )
 _USER_FILLS_PERSIST_MIN_INTERVAL_S = 5.0
 _USER_FILLS_HIST_GRACE_MS = 30_000  # clock-skew / subscribe-latency slack
+_TRADES_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "trades-raw")
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
@@ -298,6 +300,7 @@ class HyperliquidWebSocket:
         # ``_connect_and_subscribe``. Bounded by the trading layer (only the
         # watched/candidate coins are subscribed).
         self._trades_coins: set[str] = set()
+        self._trades_capture_enabled = False
         # Warm the in-memory dedup set from the on-disk snapshot so a fill
         # already reported by a previous process is never re-emitted.
         self._load_seen_tids()
@@ -870,6 +873,21 @@ class HyperliquidWebSocket:
         self._user_fills_user = None
         self._user_fills_sub_id = None
 
+    def enable_trades_capture(self, enabled: bool = True) -> None:
+        """开启/关闭公共trades原始落盘。"""
+        self._trades_capture_enabled = bool(enabled)
+        if enabled:
+            os.makedirs(_TRADES_RAW_DIR, exist_ok=True)
+
+    def _append_trade_record(self, trade: dict[str, Any]) -> None:
+        ts_ms = int(float(trade.get("time", time.time() * 1000.0)))
+        day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        day_dir = os.path.join(_TRADES_RAW_DIR, f"date={day}")
+        os.makedirs(day_dir, exist_ok=True)
+        path = os.path.join(day_dir, f"{str(trade.get('coin')).upper()}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(trade, ensure_ascii=False, separators=(",", ":")) + "\n")
+
     # ── Market trades (launch-point CVD) ───────────────────────────────────
     def _on_trades(self, data: Any) -> None:
         """Callback for the public ``trades`` channel → microstructure CVD.
@@ -894,6 +912,8 @@ class HyperliquidWebSocket:
                 coin = t.get("coin")
                 if not coin or coin not in self._trades_coins:
                     continue
+                if self._trades_capture_enabled:
+                    self._append_trade_record(t)
                 ms.add_trade(
                     coin=coin,
                     ts=float(t.get("time", 0.0)) / 1000.0,

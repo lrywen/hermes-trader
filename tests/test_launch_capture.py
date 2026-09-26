@@ -142,3 +142,80 @@ def test_breakout_no_flow_default_unchanged():
     candles = _flat_candles(53, price=100.0, spread=0.2, vol=100.0)
     r = triggers.breakout(candles, lookback=48, min_rvol=1.5, confirm_bars=2)
     assert r["fired"] is False
+
+
+# ── time-aligned CVD divergence ─────────────────────────────────────────────
+
+def _wave_prices() -> list[tuple[float, float]]:
+    out = []
+    for i in range(20):
+        if i < 5:
+            price = 100.0 + i
+        elif i < 10:
+            price = 104.0 - (i - 4)
+        elif i < 15:
+            price = 99.0 + (i - 9) * 1.2
+        else:
+            price = 105.0 - (i - 14)
+        out.append((float(i * 300_000), price))
+    return out
+
+
+def test_cvd_bearish_divergence_requires_matching_time():
+    prices = _wave_prices()
+    strong_cvd = [(ts, price - 100.0) for ts, price in prices]
+    weak_diverging_cvd = [
+        (ts, 10.0 if i < 5 else 5.0 if i < 10 else 8.0 if i < 15 else 3.0)
+        for i, (ts, _) in enumerate(prices)
+    ]
+
+    strong = ms_mod.detect_cvd_divergence(
+        prices, strong_cvd, left=3, right=2, min_strength_pct=1.0,
+    )
+    weak = ms_mod.detect_cvd_divergence(
+        prices, weak_diverging_cvd, left=3, right=2, min_strength_pct=10.0,
+    )
+
+    assert strong.bearish is False
+    assert weak.bearish is True
+    assert weak.strength_pct >= 10.0
+
+
+def test_cvd_divergence_filters_micro_strength():
+    prices = _wave_prices()
+    cvd = [
+        (ts, 10.0 if i < 5 else 9.95 if i < 10 else 10.0 if i < 15 else 9.9)
+        for i, (ts, _) in enumerate(prices)
+    ]
+    got = ms_mod.detect_cvd_divergence(
+        prices, cvd, left=3, right=2, min_strength_pct=10.0,
+    )
+    assert got.bearish is False
+
+
+def test_trades_capture_appends_jsonl(tmp_path, monkeypatch):
+    from hermes_trader.client import ws_client
+
+    captured = []
+
+    class FakeInfo:
+        def subscribe(self, sub, cb):
+            captured.append((sub, cb))
+            return 1
+
+    ws = object.__new__(ws_client.HyperliquidWebSocket)
+    ws._info = FakeInfo()
+    ws._trades_coins = {"BTC"}
+    ws._trades_capture_enabled = False
+    monkeypatch.setattr(ws_client, "_TRADES_RAW_DIR", str(tmp_path))
+
+    ws.enable_trades_capture(True)
+    assert ws.subscribe_trades("BTC") is True
+
+    trade = {"coin": "BTC", "side": "B", "px": "100", "sz": "1.5",
+             "time": 0}
+    ws._on_trades({"data": [trade]})
+
+    path = tmp_path / "date=1970-01-01" / "BTC.jsonl"
+    assert path.exists()
+    assert '"coin":"BTC"' in path.read_text(encoding="utf-8")

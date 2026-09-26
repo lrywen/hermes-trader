@@ -28,6 +28,7 @@ import logging
 import threading
 import time
 from collections import deque
+from dataclasses import dataclass
 from typing import Any, Deque, Optional
 
 logger = logging.getLogger(__name__)
@@ -41,7 +42,7 @@ _BURST_SEC = 60.0
 
 
 class _CoinFlow:
-    __slots__ = ("prints", "cvds", "last_imbalance", "last_imbalance_ts")
+    __slots__ = ("prints", "cvds", "last_imbalance", "last_imbalance_ts", "cvd_points")
 
     def __init__(self) -> None:
         # (ts, signed_size)
@@ -50,6 +51,7 @@ class _CoinFlow:
         self.cvds: Deque[float] = deque()
         self.last_imbalance: Optional[float] = None
         self.last_imbalance_ts: float = 0.0
+        self.cvd_points: Deque[tuple[float, float]] = deque()
 
 
 class Microstructure:
@@ -82,6 +84,7 @@ class Microstructure:
                 prev = f.cvds[-1] if f.cvds else 0.0
                 f.prints.append((float(ts), signed))
                 f.cvds.append(prev + signed)
+                f.cvd_points.append((float(ts), prev + signed))
                 self._prune_locked(f, float(ts))
         except Exception:  # pragma: no cover - defensive
             logger.debug("[micro] add_trade failed", exc_info=True)
@@ -103,6 +106,9 @@ class Microstructure:
                             or len(f.prints) > self._max_prints):
             f.prints.popleft()
             f.cvds.popleft()
+        while f.cvd_points and (f.cvd_points[0][0] < cutoff
+                                 or len(f.cvd_points) > self._max_prints):
+            f.cvd_points.popleft()
 
     # ── reads (main thread) ───────────────────────────────────────────────
     def aggression(self, coin: str, *, now: Optional[float] = None
@@ -149,6 +155,12 @@ class Microstructure:
                 return None
             return f.last_imbalance
 
+    def cvd_series(self, coin: str) -> list[tuple[float, float]]:
+        """Timestamped cumulative delta points for divergence detection."""
+        with self._lock:
+            f = self._coins.get(coin)
+            return list(f.cvd_points) if f else []
+
     def reset(self, coin: Optional[str] = None) -> None:
         with self._lock:
             if coin is None:
@@ -194,6 +206,116 @@ def imbalance_from_sides(bids: list[Any], asks: list[Any],
     if tot <= 0:
         return 0.0
     return max(-1.0, min(1.0, (bid_sz - ask_sz) / tot))
+
+
+@dataclass(frozen=True)
+class CVDDivergence:
+    bullish: bool
+    bearish: bool
+    reason: str
+    strength_pct: float
+
+
+def _swing_pivots(points: list[tuple[float, float]], left: int = 8,
+                  right: int = 5) -> list[tuple[float, float, str]]:
+    """确认时间序列中的局部高点/低点。"""
+    out: list[tuple[float, float, str]] = []
+    for i in range(left, len(points) - right):
+        ts, value = points[i]
+        window = points[i - left:i + right + 1]
+        values = [v for _, v in window]
+        if value == max(values) and value > min(values):
+            out.append((ts, value, "high"))
+        elif value == min(values) and value < max(values):
+            out.append((ts, value, "low"))
+    return out
+
+
+def _matched_value(
+    pivot: tuple[float, float, str],
+    points: list[tuple[float, float]],
+    *,
+    kind: str,
+    window: float,
+) -> Optional[tuple[float, float]]:
+    """取价格 pivot 时间窗口内对应的 CVD 极值，避免错配。"""
+    pivot_ts = pivot[0]
+    nearby = [(ts, v) for ts, v in points
+              if abs(ts - pivot_ts) <= window]
+    if not nearby:
+        return None
+    if kind == "high":
+        return max(nearby, key=lambda x: x[1])
+    return min(nearby, key=lambda x: x[1])
+
+
+def detect_cvd_divergence(
+    price_points: list[tuple[float, float]],
+    cvd_points: list[tuple[float, float]],
+    *,
+    left: int = 8,
+    right: int = 5,
+    match_window: Optional[float] = None,
+    min_strength_pct: float = 10.0,
+) -> CVDDivergence:
+    """检测时间对齐后的常规价格/CVD背离。
+
+    Bearish：价格 higher high，同时对应时间窗口内 CVD lower high。
+    Bullish：价格 lower low，同时对应时间窗口内 CVD higher low。
+    """
+    if len(price_points) < 2:
+        return CVDDivergence(False, False, "no confirmed CVD divergence", 0.0)
+
+    if match_window is None:
+        price_gaps = [
+            abs(price_points[i][0] - price_points[i - 1][0])
+            for i in range(1, len(price_points))
+        ]
+        match_window = max(1.0, sum(price_gaps) / len(price_gaps) * float(right))
+
+    price_pivots = _swing_pivots(price_points, left, right)
+    price_highs = [p for p in price_pivots if p[2] == "high"][-2:]
+    price_lows = [p for p in price_pivots if p[2] == "low"][-2:]
+
+    bullish = False
+    bearish = False
+    strength_pct = 0.0
+
+    if len(price_highs) == 2:
+        first = _matched_value(price_highs[-2], cvd_points, kind="high",
+                               window=match_window)
+        second = _matched_value(price_highs[-1], cvd_points, kind="high",
+                                window=match_window)
+        if (first is not None and second is not None
+                and price_highs[-1][1] > price_highs[-2][1]
+                and second[1] < first[1] and first[1] != 0.0):
+            strength_pct = abs((first[1] - second[1]) / first[1]) * 100.0
+            bearish = strength_pct >= min_strength_pct
+
+    if len(price_lows) == 2:
+        first = _matched_value(price_lows[-2], cvd_points, kind="low",
+                               window=match_window)
+        second = _matched_value(price_lows[-1], cvd_points, kind="low",
+                                window=match_window)
+        if (first is not None and second is not None
+                and price_lows[-1][1] < price_lows[-2][1]
+                and second[1] > first[1] and first[1] != 0.0):
+            bull_strength = abs((second[1] - first[1]) / first[1]) * 100.0
+            if bull_strength >= min_strength_pct:
+                bullish = True
+                strength_pct = max(strength_pct, bull_strength)
+
+    reason = (
+        "bearish price/CVD divergence" if bearish else
+        "bullish price/CVD divergence" if bullish else
+        "no confirmed CVD divergence"
+    )
+    return CVDDivergence(
+        bullish=bullish,
+        bearish=bearish,
+        reason=reason,
+        strength_pct=round(strength_pct, 4),
+    )
 
 
 # ── launch scoring: combine leading flow with volatility compression ────────
