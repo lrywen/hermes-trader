@@ -3266,7 +3266,7 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
 
     A-1 澄清（2026-09-20，容器生产配置只读取证）：顶层 ``max_loss_pct`` 在
     **出场引擎**里不可达——``select_exit_params`` 在 regime_aware.enabled=true
-    下恒返回 per-regime 值（trend 4.0 / non_trend 0.8），DSLTracker 从不读顶层
+    下恒返回 per-regime 值（trend 4.0 / non_trend 1.5），DSLTracker 从不读顶层
     值。但它在**本 v1 sizing 路径**仍然可达并被读取（实盘下单日志
     "@ 1.00% stop"）。当前因权益极小、notional 恒被 30 美元 notional_cap 钳制，
     该宽度不改变实际下单量；sizing v2 转正后此值被真实止损宽度 SSOT
@@ -3274,8 +3274,8 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     调参遗留（2026-09-08/09 自 2.5 改为 1.0，无 git/审计记录），**不是**纯死值：
     改它会在放大资金/notional_cap 放开后影响 v1 sizing。勿据「永远不可达」将其删除。
     """
-    max_loss = float(dsl.get("max_loss_pct", 0.4) or 0.4)
-    max_roe = float(dsl.get("max_loss_roe_pct", 5.0) or 5.0)
+    max_loss = float(dsl.get("max_loss_pct", 1.5) or 1.5)
+    max_roe = float(dsl.get("max_loss_roe_pct", 15.0) or 15.0)
     lev = max(1, leverage)
     return min(max_loss, max_roe / lev) / 100.0
 

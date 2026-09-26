@@ -231,7 +231,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # default; set false explicitly to opt out.
     "roe_halt_enabled": True,
     "roe_halt_threshold_pct": -50.0,
-    "daily_giveback_halt_pct": 0.35,
+    "daily_giveback_halt_pct": 0.3,
     "daily_giveback_min_peak_usd": 2.0,
     "crowded_with_min_conf": 0.8,
     "min_available_margin_pct": 0.2,
@@ -590,10 +590,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # notional. 1.0 mirrors executor.py's .get(..., 1.0) fallback so a
         # key-absent config behaves identically (no scale-down).
         "sizing_v2_cap_pct": 1.0,
-        # R12-C1: per-coin overrides for the ATR sizing / SL floor params
-        # (e.g. {"HYPE": {"sl_floor_pct": 1.5}}). Empty by default; was
-        # implicit via .get("coin_overrides", {}) in executor.
-        "coin_overrides": {},
+        # R12-C1: per-coin overrides for the ATR sizing / SL floor params.
+        # Canonical 对齐生产：HYPE 现货深度/波动特征使用更宽止损地板 1.5%；
+        # PURR/BOME 钉 1.2%。配置丢键深合并时不得回落到空 dict，否则 HYPE 地板
+        # 会静默收紧到默认 1.2%，与实盘口径分叉。
+        "coin_overrides": {
+            "HYPE": {"sl_floor_pct": 1.5},
+            "PURR": {"sl_floor_pct": 1.2},
+            "BOME": {"sl_floor_pct": 1.2},
+        },
     },
     "regime_classifier": {
         "fast_ema": 20,
@@ -722,12 +727,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "signal_enforcement": {
         "enabled": True,
         "veto": True,
-        "boost": True,
+        # boost canonical 对齐生产 false：boost 会把 force_execute 门槛自动下调
+        # boost_bar_delta(4) 点（shadow_signals.enforce_signals + executor
+        # L2027-2030 真实消费）。配置丢键深合并时不得默认重新武装，否则会静默
+        # 放宽强制开仓门槛。与其它 gray-release 一致取 inert 方向。
+        "boost": False,
         "gex_veto": True,
         "boost_bar_delta": 4,
         "whale_window_min": 15,
-        "whale_veto_min_usd": 250000,
-        "whale_boost_min_usd": 250000,
+        "whale_veto_min_usd": 500000,
+        "whale_boost_min_usd": 500000,
     },
     # 动量延续因子（趋势中继回调入场）
     "momentum_continuation": {

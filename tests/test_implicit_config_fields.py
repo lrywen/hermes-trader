@@ -57,7 +57,11 @@ def test_r12_c1_conviction_tiers_registered():
 
 
 def test_r12_c1_atr_risk_sizing_coin_overrides_registered():
-    assert CANONICAL_DEFAULTS["atr_risk_sizing"]["coin_overrides"] == {}
+    assert CANONICAL_DEFAULTS["atr_risk_sizing"]["coin_overrides"] == {
+        "HYPE": {"sl_floor_pct": 1.5},
+        "PURR": {"sl_floor_pct": 1.2},
+        "BOME": {"sl_floor_pct": 1.2},
+    }
 
 
 def test_r12_c1_dsl_exit_fields_registered():
@@ -103,7 +107,11 @@ def test_r12_c1_aligned_min_conf_registered_enabled():
     ("sl_ceiling_pct", 3.0),
     ("sl_floor_pct", 1.2),
     ("tp_atr_mult", 1.0),
-    ("atr_risk_sizing.coin_overrides", {}),
+    ("atr_risk_sizing.coin_overrides", {
+        "HYPE": {"sl_floor_pct": 1.5},
+        "PURR": {"sl_floor_pct": 1.2},
+        "BOME": {"sl_floor_pct": 1.2},
+    }),
     ("dsl_exit.noise_band.enabled", True),
     ("dsl_exit.noise_band.atr_mult", 0.8),
     ("dsl_exit.consecutive_breaches_required", 2),
@@ -193,7 +201,11 @@ def test_r12_c1_read_agent_config_exposes_all_new_fields():
     assert cfg["sl_floor_pct"] == 1.2
     assert cfg["tp_atr_mult"] == 1.0
     assert cfg["conviction_tiers"] == [[0.80, 1.5], [0.65, 1.0], [0.0, 0.7]]
-    assert cfg["atr_risk_sizing"]["coin_overrides"] == {}
+    assert cfg["atr_risk_sizing"]["coin_overrides"] == {
+        "HYPE": {"sl_floor_pct": 1.5},
+        "PURR": {"sl_floor_pct": 1.2},
+        "BOME": {"sl_floor_pct": 1.2},
+    }
     assert cfg["dsl_exit"]["noise_band"]["enabled"] is True
     assert cfg["dsl_exit"]["consecutive_breaches_required"] == 2
     assert cfg["dsl_exit"]["breach_confirm_sec"] == 4.0

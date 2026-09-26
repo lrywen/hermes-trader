@@ -8,8 +8,8 @@ Validates:
   * read_agent_config deep-merge (new keys present even when absent on disk)
   * write_agent_config backup / restore_backup round-trip
   * The production values that were once at risk of fallback drift
-    (leverage=10, max_daily_loss=-30, daily_giveback_halt_pct=0.35,
-    min_short_volume=50M, counter_regime=0.8, dsl_exit.protect_pct=1.25,
+    (leverage=10, max_daily_loss=-30, daily_giveback_halt_pct=0.3,
+    min_short_volume=50M, counter_regime=0.82, dsl_exit.protect_pct=1.25,
     etc.) are returned correctly.
 """
 
@@ -46,7 +46,7 @@ def test_canonical_defaults_contain_all_production_keys():
         "max_concurrent": 2,
         "max_total_notional_pct": 2.0,
         "max_daily_loss_usd": -2,
-        "daily_giveback_halt_pct": 0.35,
+        "daily_giveback_halt_pct": 0.3,
         "daily_giveback_min_peak_usd": 2.0,
         "min_short_volume_usd": 50_000_000,
         "min_market_volume_usd": 5_000_000,
@@ -202,7 +202,7 @@ def test_cfg_get_production_values_no_drift():
     all resolve to their canonical production values when config is empty."""
     cfg = {}
     assert cfg_get("max_daily_loss_usd", config=cfg) == -2
-    assert cfg_get("daily_giveback_halt_pct", config=cfg) == 0.35
+    assert cfg_get("daily_giveback_halt_pct", config=cfg) == 0.3
     assert cfg_get("daily_giveback_min_peak_usd", config=cfg) == 2.0
     assert cfg_get("min_short_volume_usd", config=cfg) == 50_000_000
     assert cfg_get("counter_regime_min_conf", config=cfg) == 0.82
