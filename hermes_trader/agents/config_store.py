@@ -1258,10 +1258,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # but not parabolic breakout may legitimately start above the 200MA before
     # price has reverted to it; a move past daily_mover_max_ext_pct is too
     # extended to bypass (the D2 extension ceiling independently refuses it).
-    # mode off|shadow|enforce, default off (gray-release; shadow via
-    # HERMES_TREND_FILTER_MODE).
+    # mode off|shadow|enforce. 生产已 enforce（shadow 数据证明只拦历史不足新币，
+    # 成熟币均放行）；canonical 对齐 enforce，使配置丢键深合并时不会静默关闭这个
+    # 已生效的过滤器（第五轮复核新危险方向收口）。新部署因此默认启用——该保护
+    # 已验证，且只对无 200d 趋势依据的新币 fail-closed，风险低。
     "trend_filter_200ma": {
-        "mode": "off",
+        "mode": "enforce",
         "period": 200,
         # Fetch slightly more than `period` daily bars so the forming bar / a
         # short shortfall does not starve the SMA.

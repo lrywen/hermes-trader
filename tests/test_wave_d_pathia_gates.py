@@ -105,7 +105,7 @@ def test_d_config_defaults_registered():
     assert "trend_filter_200ma" in CANONICAL_DEFAULTS
     assert "reentry_cap" in CANONICAL_DEFAULTS
     t = CANONICAL_DEFAULTS["trend_filter_200ma"]
-    assert t["mode"] == "off"                # 默认不武装（零网络直到翻转）
+    assert t["mode"] == "enforce"          # 生产已生效；canonical 对齐，丢键不再关闭保护
     assert t["period"] == 200
     assert t["block_unknown"] is False
     assert t["allow_daily_mover_long_bypass"] is True
