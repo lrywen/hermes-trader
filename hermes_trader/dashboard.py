@@ -798,21 +798,27 @@ def _risk_status_payload() -> dict[str, Any]:
     arms: dict[str, Any] = {}
     try:
         cfg = read_agent_config()
+        # sizing_v2 carries a separate enabled switch alongside sizing_v2_mode.
         sv2 = cfg.get("atr_risk_sizing") if isinstance(cfg.get("atr_risk_sizing"), dict) else {}
         arms["sizing_v2"] = {
             "enabled": bool(sv2.get("enabled", False)),
             "mode": str(sv2.get("sizing_v2_mode", "off")),
             "cap_pct": float(sv2.get("sizing_v2_cap_pct", 1.0)),
         }
+        # trend_filter / daily_extension_cap have NO enabled leaf — mode is the
+        # sole gray-release switch (off|shadow|enforce), so derive enabled from
+        # mode != "off".
         tf = cfg.get("trend_filter_200ma") if isinstance(cfg.get("trend_filter_200ma"), dict) else {}
+        tf_mode = str(tf.get("mode", "off"))
         arms["trend_filter"] = {
-            "enabled": bool(tf.get("enabled", False)),
-            "mode": str(tf.get("mode", "off")),
+            "enabled": tf_mode != "off",
+            "mode": tf_mode,
         }
         dec = cfg.get("daily_extension_cap") if isinstance(cfg.get("daily_extension_cap"), dict) else {}
+        dec_mode = str(dec.get("mode", "off"))
         arms["daily_extension_cap"] = {
-            "enabled": bool(dec.get("enabled", False)),
-            "mode": str(dec.get("mode", "off")),
+            "enabled": dec_mode != "off",
+            "mode": dec_mode,
         }
     except Exception as e:  # never 500 the card over a config read
         logger.debug("[dashboard] protection-arms projection failed: %s", e)
