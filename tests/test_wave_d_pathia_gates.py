@@ -365,7 +365,15 @@ def test_d3_under_cap_passes(monkeypatch, tmp_path):
 
 
 def test_d3_over_cap_shadow_passes_enforce_blocks(monkeypatch, tmp_path):
-    _patch_memory(monkeypatch, _FakeMemory(count=2))  # >= 2
+    # Shadow mode counts the SHADOW BOOK (shadow_open does not write the live
+    # memory log); enforce counts memory. Patch each source accordingly.
+    class _FakeBook:
+        def count_openings_since(self, coin, since_ms):
+            return 2  # >= cap
+
+    import hermes_trader.agents.shadow_book as sb_mod
+    monkeypatch.setattr(sb_mod, "get_book", lambda: _FakeBook())
+    _patch_memory(monkeypatch, _FakeMemory(count=2))  # for the enforce leg
     cfg = _r_cfg(tmp_path, mode="shadow")
     rs = rg.reentry_cap_gate(_ctx(), cfg)
     assert rs["pass"] and rs["via"] == "reentry_cap_shadow_block"

@@ -2055,6 +2055,8 @@ def test_executor_whale_signal_overrides_pass_to_long(monkeypatch):
     })
     monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
     monkeypatch.setattr(executor, "fetch_account_state", lambda u, **kw: {"equity": 0})
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda analysis, config: "neutral")
 
     analysis = {
         "id": "whale-override", "coin": "ALT", "verdict": "PASS",
@@ -2144,6 +2146,8 @@ def test_maybe_execute_refuses_when_no_atr(monkeypatch):
     # gates pass
     monkeypatch.setattr(executor, "eval_all_gates",
                         lambda ctx, cfg, lt, **kwargs: {"blocked": False, "results": {}})
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda analysis, config: "neutral")
     # the coin under test: no candle history → ATR 0
     monkeypatch.setattr(executor, "get_hl_atr", lambda *a, **k: 0.0)
     placed = {"n": 0}
@@ -2416,6 +2420,8 @@ def test_maybe_execute_ta_sidestep_can_bypass_runner_gate(monkeypatch):
                         lambda analysis, config: "runner_gate_blocked")
     monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
     monkeypatch.setattr(executor, "fetch_account_state", lambda u, **kw: {"equity": 0})
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda analysis, config: "neutral")
 
     res = executor.maybe_execute({
         "id": "sidestep-pass",

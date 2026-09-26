@@ -2207,8 +2207,20 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
     path = _gate_shadow_path(blk, "HERMES_REENTRY_CAP_SHADOW_FILE",
                              "reentry_cap_shadow.jsonl")
     try:
-        from hermes_trader.agents.memory import memory
-        openings = int(memory.count_openings_since(ctx.coin, since_ms))
+        # Data source depends on mode: in SHADOW the actual openings live in
+        # the shadow book (shadow_open never writes the live memory trade log),
+        # so counting memory would always return 0 and the gate could never
+        # fire. Count the shadow population in shadow mode; the live memory
+        # log in enforce mode.
+        if mode == "shadow":
+            from hermes_trader.agents import shadow_book
+            openings = int(
+                shadow_book.get_book().count_openings_since(ctx.coin, since_ms))
+            source = "shadow_book"
+        else:
+            from hermes_trader.agents.memory import memory
+            openings = int(memory.count_openings_since(ctx.coin, since_ms))
+            source = "memory"
     except Exception as e:
         rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
                "max_per_coin": max_per_coin, "window_hours": window_hours,
@@ -2234,7 +2246,7 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
     over = openings >= max_per_coin
     rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
            "max_per_coin": max_per_coin, "window_hours": window_hours,
-           "state": "ok", "openings": openings,
+           "state": "ok", "openings": openings, "source": source,
            "reentry_would_block": bool(over)}
     _record_gate_shadow(rec, path, "reentry_cap")
     if not over:

@@ -481,6 +481,32 @@ class ShadowBook:
         except OSError:
             return False
 
+    def count_openings_since(self, coin: str, since_ms: int) -> int:
+        """Count this coin's TAKER open fills at/after ``since_ms``.
+
+        reentry_cap must count the openings that actually happened in the mode
+        the system runs in. In SHADOW mode entries land here (shadow_open), not
+        in the live memory trade log, so a memory-backed count would always read
+        0 and the gate could never trigger. This is the shadow-population
+        counterpart to ``memory.count_openings_since``.
+        """
+        self.reload_if_changed()
+        with self._lock:
+            try:
+                fills = list(self._account("taker")["fills"])
+            except Exception:
+                fills = []
+        n = 0
+        for f in fills:
+            if f.get("type") != "open" or f.get("coin") != coin:
+                continue
+            try:
+                if int(f.get("ts") or 0) >= since_ms:
+                    n += 1
+            except (TypeError, ValueError):
+                continue
+        return n
+
     def _fresh_state(self) -> dict[str, Any]:
         return {
             "version": _STATE_VERSION,

@@ -1306,16 +1306,25 @@ def _fmt_report(d: dict) -> str:
         # for all arms as "win = counterfactual pnl>0 => the arm foregoes profit
         # (arm hurts)". For change arms a "win" therefore means arm-HARMFUL;
         # relabel so the night report doesn't read as the arm's own win-rate.
-        if a.get("kind") == "change":
-            oc_good, oc_bad = "臂有益", "臂有害"
-        else:
-            oc_good, oc_bad = "胜", "负"
+        # B-4d (2026-09-26): label pairing differs by arm kind and is computed
+        # inside the window loop (it depends on each window's counts):
+        #   change arm: a foregone win means arm-HARMFUL → 臂有益=losses /
+        #               臂有害=wins (the historical counterfactual semantics);
+        #   signal/block: the raw count is the arm's OWN result → 胜=wins /
+        #                 负=losses. Applying the change pairing here previously
+        #                 inverted signal-arm labels.
         for s in a["windows"]:
             pend = "  [短窗 outcome 回填滞后，结论只采信最长窗]" if s.get("outcomes_pending") else ""
+            if a.get("kind") == "change":
+                _label_good, _cnt_good = "臂有益", s["outcome_losses"]
+                _label_bad, _cnt_bad = "臂有害", s["outcome_wins"]
+            else:
+                _label_good, _cnt_good = "胜", s["outcome_wins"]
+                _label_bad, _cnt_bad = "负", s["outcome_losses"]
             lines.append(f"{'':36s}{s['window_h']:>4d}h: {s['total']:>5d} 条  "
                          f"命中 {s['hits']:>4d}/{s['decisions']:<4d} "
                          f"({s['hit_rate']:.1%})  回填 outcome {s['mature_outcomes']} "
-                         f"({oc_good}{s['outcome_losses']}/{oc_bad}{s['outcome_wins']}){pend}")
+                         f"({_label_good}{_cnt_good}/{_label_bad}{_cnt_bad}){pend}")
         cost = a.get("sv2_cost")
         if cost:
             _COST_CN = {
