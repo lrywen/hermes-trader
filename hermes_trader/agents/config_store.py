@@ -238,7 +238,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "cooldown_min": 30,
     "research_cooldown_min": 3,
     "held_research_interval_min": 10,
-    "min_ai_confidence": 0.62,
+    "min_ai_confidence": 0.60,
     # Signal-price deviation gate: max allowed % gap between the verdict's
     # planned entry and the fresh live mid. A larger gap means the model
     # decided on prices that no longer exist (stale candle setup). 2.0%.
@@ -252,9 +252,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # terminal 1h-RSI blowoff blocks entries regardless of trigger freshness.
     "late_chase": {
         "enabled": True,
-        "fresh_move_band_pct": 8.0,
-        "rsi1h_overbought": 85.0,
-        "rsi1h_oversold": 15.0,
+        "fresh_move_band_pct": 12.0,
+        "rsi1h_overbought": 88.0,
+        "rsi1h_oversold": 12.0,
         # P2：锚点防重锚。
         "min_anchor_age_sec": 300.0,
         "min_move_extension_pct_for_reset": 3.0,
@@ -503,8 +503,8 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "tp_atr_mult": 1.0,
     "min_trend_score": 0.55,
     # Regime classifier thresholds (chop / against-funding conviction bars)
-    "chop_min_conf": 0.85,
-    "chop_min_score": 60.0,
+    "chop_min_conf": 0.75,
+    "chop_min_score": 45.0,
     # P1-4: momentum-burst bypass in chop requires at least this composite score
     "chop_burst_min_score": 20.0,
     "against_funding_min_conf": 0.85,
@@ -544,6 +544,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
         # _reason used before these were schema-configurable).
         "rsi_overbought": 75.0,
+        "trend_rsi_overbought": 80.0,
         "rsi_oversold": 25.0,
         "max_extension_atr": 2.5,
         # Counter-regime direction probe (observation only): path the

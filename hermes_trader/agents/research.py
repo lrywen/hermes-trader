@@ -2493,6 +2493,9 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         # while both of these were fired hours before the move).
         "breakout_fired": "breakout" in fired_names,
         "volume_spike_fired": "volumeSpike" in fired_names,
+        # 触发信号所在K线的收盘时间（ms），供 runner gate 判断突破年龄、
+        # 在有效期窗口内仍视为 fresh，避免研究链路延迟导致的误杀。
+        "signal_bar_close_ms": perception.get("bar_close_ms"),
         "uptrend_momentum_fired": "uptrendMomentum" in fired_names,
         "downtrend_momentum_fired": "downtrendMomentum" in fired_names,
         "daily_mover_fired": "dailyMover" in fired_names,
