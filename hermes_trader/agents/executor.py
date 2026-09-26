@@ -1338,6 +1338,132 @@ def coin_breakout_regime(analysis: dict[str, Any]) -> str:
         return ""
 
 
+def resolve_decision_regime(analysis: dict[str, Any],
+                            config: dict[str, Any]) -> str:
+    """Single authoritative regime for ONE entry decision.
+
+    Resolves the macro (BTC-proxy) regime once, then applies the coin-local
+    high-RVOL breakout override (``coin_breakout_regime``). Every consumer in
+    the decision — runner gate, sizing, shadow/live write-in — MUST reuse this
+    value instead of calling ``detect_regime`` again (a second detection at a
+    classification boundary could return a different regime, which was the
+    LIT defect: sized as trend 4% but locked as scalp 0.8%).
+
+    Cached on the analysis dict as ``_decision_regime`` so repeated reads in
+    the same decision are identical. Returns one of up/down/neutral/chop;
+    detection failure falls back to "neutral" (never raises).
+    """
+    cached = analysis.get("_decision_regime")
+    if cached:
+        return str(cached)
+    regime = "neutral"
+    try:
+        from hermes_trader.agents.market_regime import detect_regime
+        regime = detect_regime(analysis.get("coin")) or "neutral"
+    except Exception as _e:
+        logger.warning(f"[regime] detect failed for "
+                       f"{analysis.get('coin')}: {_e}")
+    try:
+        _coin_regime = coin_breakout_regime(analysis)
+        if _coin_regime:
+            logger.info(
+                f"[regime] {analysis.get('coin')} coin-breakout override: "
+                f"macro={regime} → trend({_coin_regime})")
+            regime = _coin_regime
+    except Exception:
+        pass
+    analysis["_decision_regime"] = regime
+    return str(regime)
+
+
+def regime_direction_observe(analysis: dict[str, Any],
+                             config: dict[str, Any]) -> dict[str, Any]:
+    """Counter-regime direction probe — OBSERVATION ONLY, never blocks.
+
+    PENGU (2026-09-25) was admitted long with ``entry_regime=down`` because the
+    regime was recorded but never acted on. The earlier hard gate
+    (``regime_direction_block``) was reverted: a 106-trade shadow replay showed
+    it blocked a net-POSITIVE half (long&down, 7 trades +$1.19) while missing
+    the actually losing short&neutral trades — and the large 60-day backtest
+    conflicts with the tiny sample. So this is now a counterfactual probe in the
+    same family as risk_gates' ``counter_regime_would_block``: it records what a
+    hard gate WOULD do and accumulates evidence; it never feeds the decision.
+
+    Returns a record ``{would_block, side, regime, coin}``; neutral/chop and
+    aligned sides give ``would_block=False``.
+    """
+    side = str(analysis.get("side") or "").lower()
+    regime = str(analysis.get("_decision_regime")
+                 or resolve_decision_regime(analysis, config))
+    reversal = bool(analysis.get("counter_reversal_confirmed", False))
+    would_block = False
+    if side in ("long", "short") and regime not in ("neutral", "chop", ""):
+        counter = (side == "long" and regime == "down") or \
+                  (side == "short" and regime == "up")
+        # A confirmed reversal is the documented escape, so a real gate would
+        # not fire; would_block only when counter-regime and no escape.
+        would_block = counter and not reversal
+        if would_block:
+            logger.info(f"[regime] {analysis.get('coin')} counter-regime "
+                        f"{side}&{regime} — would_block recorded (observation only)")
+
+    record = {
+        "ts": int(time.time() * 1000),
+        "coin": analysis.get("coin"),
+        "side": side or None,
+        "regime": regime,
+        "would_block": bool(would_block),
+        "reversal_confirmed": reversal,
+        "analysis_id": analysis.get("id"),
+    }
+    try:
+        from hermes_trader.shadow_log import append_jsonl
+        _path = str((config.get("runner_entry_gate") or {}).get(
+            "regime_direction_shadow_path") or
+            "/data/regime_direction_shadow.jsonl")
+        append_jsonl(_path, record, stream="regime_direction")
+    except Exception as _e:
+        logger.debug(f"[regime] direction shadow write failed (non-fatal): {_e}")
+    return record
+
+
+def regime_direction_block(analysis: dict[str, Any],
+                           config: dict[str, Any]) -> str:
+    """Hard direction gate: never open LONG in a DOWN regime / SHORT in UP.
+
+    PENGU (2026-09-25) was admitted long with ``entry_regime=down`` because the
+    regime was recorded but never enforced. Unlike the soft market_regime_gate
+    (which only raises the confidence/score bar and offers bypasses), this is a
+    hard block. The ONLY counter-regime path is an explicit reversal
+    confirmation (``counter_reversal_confirmed``); neutral/chop are not blocked.
+    Fail-open on unknown side.
+
+    Returns "" when allowed, otherwise a runner_gate_blocked reason.
+    """
+    side = str(analysis.get("side") or "").lower()
+    if side not in ("long", "short"):
+        return ""
+    regime = str(analysis.get("_decision_regime")
+                 or resolve_decision_regime(analysis, config))
+    if regime in ("neutral", "chop", ""):
+        return ""
+
+    counter = (side == "long" and regime == "down") or \
+              (side == "short" and regime == "up")
+    if not counter:
+        return ""
+
+    if bool(analysis.get("counter_reversal_confirmed", False)):
+        logger.info(f"[regime] {analysis.get('coin')} {side} counter-{regime} "
+                    f"allowed via explicit reversal confirmation")
+        return ""
+
+    logger.info(f"[regime] {analysis.get('coin')} BLOCKED: {side} in {regime} "
+                f"regime (counter-regime, no reversal confirmation)")
+    return f"runner_gate_blocked ({side} against {regime} regime, " \
+           f"no reversal confirmation)"
+
+
 def plan_b_size_multiplier(analysis: dict[str, Any],
                            plan_b_cfg: dict[str, Any]) -> tuple[float, str]:
     """Plan B: in a mid-strength TREND (not STRONG_TREND), RSI 40-60 has no
@@ -2360,12 +2486,17 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
         # params when regime=='up' to ride rippers. detect_regime is cached
         # (TTL) and already computed by the market_regime gate in this same
         # execute flow — no extra fetch.
-        _regime = "neutral"
-        try:
-            from hermes_trader.agents.market_regime import detect_regime
-            _regime = detect_regime(analysis["coin"])
-        except Exception as _re_e:
-            logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
+        # Reuse the authoritative regime resolved once for this decision (it is
+        # cached on the analysis). Never re-detect here: a boundary flip between
+        # sizing and registration made the locked stop disagree with the sized
+        # stop — the LIT defect.
+        _regime = str(analysis.get("_decision_regime") or "neutral")
+        if not analysis.get("_decision_regime"):
+            try:
+                from hermes_trader.agents.market_regime import detect_regime
+                _regime = detect_regime(analysis["coin"])
+            except Exception as _re_e:
+                logger.debug(f"[executor] regime lookup failed (non-fatal): {_re_e}")
         _ex_protect, _ex_retrace, _tiers_raw, _ex_ml_pct, _ex_ml_roe, _ex_label = \
             select_exit_params(dsl_config, _regime)
         # phase2_tiers is optional in config; when present it OVERRIDES the class
@@ -2921,7 +3052,8 @@ def _ai_zero_confidence_block(analysis: dict[str, Any],
 def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
                         trade_side: str, mid_price: float, atr: float,
                         trade_notional: float, leverage: float,
-                        gate_results: dict[str, Any]) -> dict[str, Any]:
+                        gate_results: dict[str, Any],
+                        entry_regime: str = "") -> dict[str, Any]:
     """S11 stage of maybe_execute: the SHADOW-mode terminal branch.
 
     Records the "shadow" decision and paper-books the would-be fill into the
@@ -2939,12 +3071,13 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
             _sh_atr_pct = (atr / _sh_entry * 100.0) if (_sh_entry > 0 and atr > 0) else 0.0
         except Exception:
             _sh_atr_pct = 0.0
-        _sh_regime = ""
-        try:
-            from hermes_trader.agents.market_regime import detect_regime
-            _sh_regime = detect_regime(coin) or ""
-        except Exception:
-            _sh_regime = ""
+        _sh_regime = str(entry_regime or "")
+        if not _sh_regime:
+            try:
+                from hermes_trader.agents.market_regime import detect_regime
+                _sh_regime = detect_regime(coin) or ""
+            except Exception:
+                _sh_regime = ""
         if _sh_entry > 0:
             shadow_book.shadow_open(
                 coin=coin, side=trade_side, entry_px=_sh_entry,
@@ -3676,6 +3809,19 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "analysis_id": analysis["id"], "reason": "pass_no_override",
         }
 
+    # Resolve the authoritative regime ONCE for this decision and cache it on
+    # the analysis. The hard direction gate and every downstream consumer
+    # (runner gate, sizing, shadow/live write-in) reuse it instead of calling
+    # detect_regime again.
+    resolve_decision_regime(analysis, config)
+    _regime_dir_block = regime_direction_block(analysis, config)
+    if _regime_dir_block:
+        _record_decision("blocked")
+        return {
+            "executed": False, "mode": mode,
+            "analysis_id": analysis["id"], "reason": _regime_dir_block,
+        }
+
     _runner_cfg = config.get("runner_entry_gate") or {}
     _sidestep_bypasses_runner = (
         bool(analysis.get("sidestep_override"))
@@ -3906,25 +4052,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             _sizing_v2_mode = _sv2["mode"]
             _sizing_v2 = _sizing_v2_mode in ("shadow", "enforce")
             if _sizing_v2:
-                # Regime is cached by detect_regime (market_regime_gate also
-                # populates it later, but sizing runs first; the call is a safe
-                # cache hit / self-populating read).
-                _regime = "neutral"
-                try:
-                    from hermes_trader.agents.market_regime import detect_regime
-                    _regime = detect_regime(coin)
-                except Exception as _re_e:
-                    logger.warning(f"[sizing-v2] regime detect failed for {coin}: {_re_e}")
-                # Coin-local override: a strong high-RVOL breakout qualifies as
-                # trend even when the macro (BTC) regime is neutral, so the
-                # position gets trend-ride / wide-stop params instead of a
-                # ~0.2-ATR scalp stop (AERO / ARB fix).
-                _coin_regime = coin_breakout_regime(analysis)
-                if _coin_regime:
-                    logger.info(
-                        f"[sizing-v2] {coin} coin-breakout override: "
-                        f"macro={_regime} → trend({_coin_regime})")
-                    _regime = _coin_regime
+                # Reuse the authoritative regime resolved once earlier in this
+                # decision; never re-detect here (a boundary flip made sizing
+                # and the write-in lock different regimes — the LIT defect).
+                _regime = str(analysis.get("_decision_regime") or "neutral")
+                # Coin-local high-RVOL breakout override was already applied by
+                # resolve_decision_regime, so the cached value is final.
                 _atr_pct = (atr / mid_price * 100.0) if mid_price > 0 else 0.0
                 _slip_bps = memory.avg_exit_slip_bps(coin, days=30.0)
                 _slip_pct = _slip_bps / 100.0
@@ -4324,6 +4457,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             trade_side=trade_side, mid_price=mid_price, atr=atr,
             trade_notional=trade_notional, leverage=leverage,
             gate_results=gate_output["results"],
+            entry_regime=str(analysis.get("_decision_regime") or ""),
         )
 
     # ── INACTIVE: external HTA (:8766) size-veto channel retired ─────────

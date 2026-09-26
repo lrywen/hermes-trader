@@ -47,9 +47,13 @@ def test_batch2_runner_shadow_subblocks_registered():
     gate = CANONICAL_DEFAULTS["runner_entry_gate"]
     for name in ("breakout_score_floor", "per_coin_cooldown"):
         assert name in gate, name
-        # Default to observation only: a synthesised default block must
-        # never arm an ENFORCE path for a key-absent config.
-        assert gate[name]["shadow_mode"] is True, name
+    # per_coin_cooldown must default to observation only: a synthesised default
+    # block must never arm an ENFORCE path for a key-absent config.
+    assert gate["per_coin_cooldown"]["shadow_mode"] is True
+    # breakout_score_floor is an observation arm whose record never converted to
+    # a decision, so it defaults OFF (P1-2 cleanup, 2026-09-25) to stop writing
+    # unactioned data; the block remains registered for explicit re-enable.
+    assert gate["breakout_score_floor"]["shadow_mode"] is False
 
 
 def test_batch2_stop_tuning_shadow_registered():

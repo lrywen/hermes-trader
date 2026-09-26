@@ -638,6 +638,13 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "min_short_composite": _num_leaf(0.0, 100.0),
         "mover_min_confidence": _num_leaf(0.0, 1.0),
         "mover_min_composite": _num_leaf(0.0, 100.0),
+        # 4h late-entry veto thresholds (consumed in _runner_entry_block_reason).
+        # Previously read via .get() with hard-coded defaults but absent from the
+        # schema, so they could not be tuned; added here with the code defaults.
+        "rsi_overbought": _num_leaf(0.0, 100.0),
+        "rsi_oversold": _num_leaf(0.0, 100.0),
+        "max_extension_atr": _num_leaf(0.0, 50.0),
+        "regime_direction_shadow_path": ("str",),
         "pullback_long": {
             "enabled": ("bool",),
             "min_composite": _num_leaf(0.0, 100.0),

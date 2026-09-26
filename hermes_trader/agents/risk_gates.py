@@ -19,6 +19,11 @@ logger = logging.getLogger(__name__)
 
 GateResult = dict[str, Any]  # {pass: bool, reason?: str}
 
+# Per-forming-bar memo for ``_realtime_terminal`` (dedupes runner-gate
+# terminal_burst vs late_chase Leg3 within one decision). Key -> (monotonic_ts,
+# result).
+_RT_TERMINAL_CACHE: dict[Any, tuple[float, Optional[tuple[float, float]]]] = {}
+
 
 # P1-3: GateContext moved to hermes_trader.models.types (central boundary
 # type layer). It is re-imported here so existing `from ...risk_gates import
@@ -217,7 +222,34 @@ def _realtime_terminal(coin: str, interval: str, mid: float) -> Optional[tuple[f
     Returns ``(rsi, extension_atr)`` where extension_atr is the live close's
     distance from EMA21 in ATR(14) units (positive = stretched up). Best-effort;
     None on insufficient data / failure so the caller fails open.
+
+    A short per-forming-bar cache deduplicates the two consumers in the same
+    decision (runner-gate terminal_burst and late_chase Leg3), which otherwise
+    fetched candles and recomputed the identical values twice. Keyed on the
+    forming-bar start so it refreshes exactly when a new bar begins.
     """
+    import time as _time
+    try:
+        bar_ms = {"5m": 300_000, "15m": 900_000, "1h": 3_600_000}.get(
+            interval, 300_000)
+        bar_start = int(_time.time() * 1000) // bar_ms * bar_ms
+        cache_key = (coin, interval, bar_start, round(float(mid), 8))
+        now = _time.monotonic()
+        cached = _RT_TERMINAL_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < 30.0:
+            return cached[1]
+    except Exception:
+        cache_key = None
+
+    result = _realtime_terminal_compute(coin, interval, mid)
+    if cache_key is not None:
+        _RT_TERMINAL_CACHE[cache_key] = (_time.monotonic(), result)
+        if len(_RT_TERMINAL_CACHE) > 128:
+            _RT_TERMINAL_CACHE.clear()
+    return result
+
+
+def _realtime_terminal_compute(coin: str, interval: str, mid: float) -> Optional[tuple[float, float]]:
     try:
         from hermes_trader.client.hl_client import fetch_hl_candles
         from hermes_trader.indicators.math import atr as atr_arr

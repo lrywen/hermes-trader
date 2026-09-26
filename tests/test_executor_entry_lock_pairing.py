@@ -62,6 +62,11 @@ def live_to_lock(monkeypatch, tmp_path):
                         lambda c, n, mid: n / mid)
     monkeypatch.setattr(executor, "eval_all_gates",
                         lambda ctx, cfg, lt, **kw: {"blocked": False, "results": {}})
+    # These tests target post-lock branches, so pin the decision regime neutral
+    # (otherwise the real detect_regime cache, populated by earlier tests in the
+    # full-suite ordering, could hard-block before reaching the lock).
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda analysis, config: "neutral")
     monkeypatch.setattr(executor, "get_orderbook_spread", lambda c: {
         "ok": True, "spread_pct": 0.01,
         "bid_depth_1pct_usd": 1e9, "ask_depth_1pct_usd": 1e9,

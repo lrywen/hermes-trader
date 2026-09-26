@@ -60,7 +60,14 @@ def regime_aware_policy(base: ExitPolicy, dsl_config: dict,
 
     protect, retrace, tiers_raw, ml_pct, ml_roe, label = \
         select_exit_params(dsl_config, regime)
-    tiers = list(tiers_raw) if tiers_raw else list(base.phase2_tiers)
+    # 与生产 executor（:2373）同源：select_exit_params 返回 raw dict tiers，
+    # 必须转成 RetraceTier，不能把 dict 直接塞进 phase2_tiers（否则
+    # dsl_exit 读 tier.pct_above_entry 时报 'dict' has no attribute）。
+    if tiers_raw:
+        from hermes_trader.agents.dsl_exit import RetraceTier
+        tiers = [RetraceTier(**t) for t in tiers_raw]
+    else:
+        tiers = list(base.phase2_tiers)
     clocks = resolve_regime_clocks(dsl_config, regime)
     policy = replace(
         base,

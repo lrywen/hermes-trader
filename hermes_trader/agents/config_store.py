@@ -529,6 +529,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_short_composite": 40.0,
         "mover_min_confidence": 0.72,
         "mover_min_composite": 30.0,
+        # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
+        # _reason used before these were schema-configurable).
+        "rsi_overbought": 75.0,
+        "rsi_oversold": 25.0,
+        "max_extension_atr": 2.5,
+        # Counter-regime direction probe (observation only): path the
+        # would_block verdicts append to. Empty falls back to
+        # /data/regime_direction_shadow.jsonl.
+        "regime_direction_shadow_path": "",
         # R12-C1: pullback-long bypass admits uptrend longs that have pulled
         # back to a lower-risk zone. Off by default; was implicit via
         # gate.get("pullback_long") hardcoded defaults in executor.
@@ -556,8 +565,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # is true (record-only) to keep a synthesised default block inert.
         # The production file sets per_coin_cooldown.shadow_mode=false and
         # the deep merge preserves it.
+        # breakout_score_floor: long-running observation-only arm whose record
+        # never converted to a decision (P1-2 cleanup, 2026-09-25). Defaulted
+        # OFF now so it stops writing risk_tuning_shadow data; the block is kept
+        # for a future explicit re-enable. Set shadow_mode=true to observe.
         "breakout_score_floor": {
-            "shadow_mode": True,
+            "shadow_mode": False,
             # Aligned to live breakout floor (production pins 31.5).
             "min_composite": 31.5,
         },
