@@ -9,7 +9,7 @@ net-positive half. These tests cover:
   * the block shim regime_direction_block always returns "" (allows entry).
 
 Macro detection and the coin breakout override are stubbed at their source
-modules; shadow writes go to a tmp path so no /data side effects.
+modules; shadow writes are neutralized so there are no /data side effects.
 """
 
 import pytest
@@ -60,12 +60,12 @@ def _observe(analysis, patched):
     return executor.regime_direction_observe(analysis, {})
 
 
-def test_long_in_down_would_block_but_not_blocked(patched):
+def test_long_in_down_would_block_but_entry_allowed(patched):
     patched["macro"] = "down"
     analysis = {"coin": "T", "side": "long"}
     rec = _observe(analysis, patched)
     assert rec["would_block"] is True
-    # observation only: the entry is still allowed
+    # observation only: the block shim still admits the entry
     assert executor.regime_direction_block(analysis, {}) == ""
 
 
@@ -87,13 +87,11 @@ def test_neutral_regime_never_would_block(patched):
     assert rec["would_block"] is False
 
 
-def test_counter_regime_with_reversal_recorded_not_logged(patched):
+def test_counter_regime_with_reversal_not_would_block(patched):
     patched["macro"] = "down"
     analysis = {"coin": "T", "side": "long",
                 "counter_reversal_confirmed": True}
     rec = _observe(analysis, patched)
-    # it is counter-regime, but the explicit reversal escape means a real gate
-    # would not fire — flagged on the record for later analysis.
     assert rec["would_block"] is False
     assert rec["reversal_confirmed"] is True
 

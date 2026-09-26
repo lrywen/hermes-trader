@@ -1429,39 +1429,16 @@ def regime_direction_observe(analysis: dict[str, Any],
 
 def regime_direction_block(analysis: dict[str, Any],
                            config: dict[str, Any]) -> str:
-    """Hard direction gate: never open LONG in a DOWN regime / SHORT in UP.
+    """Deprecated hard gate — thin OBSERVATION shim (always allows).
 
-    PENGU (2026-09-25) was admitted long with ``entry_regime=down`` because the
-    regime was recorded but never enforced. Unlike the soft market_regime_gate
-    (which only raises the confidence/score bar and offers bypasses), this is a
-    hard block. The ONLY counter-regime path is an explicit reversal
-    confirmation (``counter_reversal_confirmed``); neutral/chop are not blocked.
-    Fail-open on unknown side.
-
-    Returns "" when allowed, otherwise a runner_gate_blocked reason.
+    Kept so the call site in maybe_execute stays one line while the gate is
+    downgraded to a counterfactual probe. Runs regime_direction_observe and
+    returns "" so no entry is blocked. Promoting back to a hard gate requires
+    fresh out-of-sample edge evidence (the prior form blocked a net-positive
+    half: long&down 7 trades +$1.19, while short&neutral losses were missed).
     """
-    side = str(analysis.get("side") or "").lower()
-    if side not in ("long", "short"):
-        return ""
-    regime = str(analysis.get("_decision_regime")
-                 or resolve_decision_regime(analysis, config))
-    if regime in ("neutral", "chop", ""):
-        return ""
-
-    counter = (side == "long" and regime == "down") or \
-              (side == "short" and regime == "up")
-    if not counter:
-        return ""
-
-    if bool(analysis.get("counter_reversal_confirmed", False)):
-        logger.info(f"[regime] {analysis.get('coin')} {side} counter-{regime} "
-                    f"allowed via explicit reversal confirmation")
-        return ""
-
-    logger.info(f"[regime] {analysis.get('coin')} BLOCKED: {side} in {regime} "
-                f"regime (counter-regime, no reversal confirmation)")
-    return f"runner_gate_blocked ({side} against {regime} regime, " \
-           f"no reversal confirmation)"
+    regime_direction_observe(analysis, config)
+    return ""
 
 
 def plan_b_size_multiplier(analysis: dict[str, Any],
