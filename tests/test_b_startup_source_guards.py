@@ -20,6 +20,9 @@ def _full_prod_raw():
         "max_trade_notional_usd": 30.0, "max_daily_loss_usd": -50.0,
         "runner_entry_gate": {},
         "dsl_exit": {"noise_band": {"enabled": True, "atr_mult": 0.8}},
+        # 灰度 enforce 臂：生产基线已 enforce，守卫要求保持。
+        "market_circuit": {"mode": "enforce"},
+        "daily_extension_cap": {"mode": "enforce"},
     }
 
 
@@ -69,3 +72,28 @@ def test_b10_noise_band_enabled_on_production_passes(monkeypatch):
     monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
     errors = cs.startup_config_integrity_errors({})
     assert not any("noise_band" in e for e in errors), errors
+
+
+def test_enforce_arm_downgrade_is_startup_error(monkeypatch):
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/data/.agent-config.json")
+    raw = _full_prod_raw()
+    raw["market_circuit"] = {"mode": "shadow"}
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: raw)
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
+    errors = cs.startup_config_integrity_errors({})
+    assert any("market_circuit" in e for e in errors), errors
+
+
+def test_enforce_arm_missing_block_is_startup_error(monkeypatch):
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/data/.agent-config.json")
+    raw = _full_prod_raw()
+    del raw["daily_extension_cap"]
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: raw)
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
+    errors = cs.startup_config_integrity_errors({})
+    assert any("daily_extension_cap" in e for e in errors), errors
+
+
+def test_enforce_arm_non_data_source_enforces_nothing(monkeypatch):
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/home/dev/.agent-config.json")
+    assert cs._production_enforce_arm_errors() == []

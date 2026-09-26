@@ -110,7 +110,7 @@ def test_deep_merge_does_not_mutate_inputs():
 
 def test_lookup_default_nested():
     assert _lookup_default("dsl_exit.protect_pct") == 1.5
-    assert _lookup_default("dsl_exit.atr_stop.atr_mult") == 1.5
+    assert _lookup_default("dsl_exit.atr_stop.atr_mult") == 1.2
 
 
 def test_lookup_default_missing_raises_keyerror():

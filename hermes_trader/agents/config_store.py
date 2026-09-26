@@ -323,9 +323,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # 默认同步为 false，避免配置丢失时静默回落到 true（与运维意图相反）。
         "atr_stop": {
             "enabled": False,
-            "atr_mult": 1.5,
-            "floor_pct": 1.0,
-            "ceiling_pct": 4.0,
+            # 关态参数对齐生产（S3-A 收口）：不沿用 09-23 实验宽口径 1.5/1.0/4.0。
+            "atr_mult": 1.2,
+            "floor_pct": 1.2,
+            "ceiling_pct": 3.0,
         },
         # R12-C1: noise band tolerates a pull-back of atr_mult × entry ATR%
         # below the floor before an exit fires (sub-first-tier only); was
@@ -2167,6 +2168,12 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
     # 只读取 /data 原始文件，防止**生产**配置把它从开启状态误关，本地/CI 不报错。
     errors.extend(_production_noise_band_errors())
 
+    # 灰度 enforce fail-closed 守卫（market_circuit / daily_extension_cap）：
+    # 这两项 canonical 保持 shadow（新部署惰性），但生产 /data 已切 enforce。
+    # 与改 canonical 不同，这里用守卫保证：生产基线既为 enforce，配置被截断/
+    # 改弱时拒绝启动，而不是静默回落到 canonical 的 shadow（保护被关）。
+    errors.extend(_production_enforce_arm_errors())
+
     # B-7：配置来源强制断言。生产权威配置＝容器挂载卷 /data/.agent-config.json
     # （2026-09 为 142 顶键）。当实际加载路径就是 /data 权威文件时，校验其
     # 关键键齐全度，防止读到被截断/写错的配置而静默运行。非 /data 部署
@@ -2196,6 +2203,41 @@ def _production_noise_band_errors() -> list[str]:
     except Exception as e:
         logger.error("B-10 noise_band check failed (non-fatal): %s", e)
     return []
+
+
+# 灰度臂：canonical 口径（新部署惰性）与生产 /data 基线（已 enforce）。
+_GRAY_ENFORCE_ARMS: tuple[tuple[str, str], ...] = (
+    ("market_circuit", "market_circuit"),
+    ("daily_extension_cap", "daily_extension_cap"),
+)
+
+
+def _production_enforce_arm_errors() -> list[str]:
+    """生产 /data 基线已切 enforce 的灰度臂，必须保持 enforce。
+
+    canonical 仍 shadow 是有意的（新部署默认惰性）；但生产一旦确立 enforce，
+    配置丢键/被截断而深合并回落到 shadow 会静默关闭保护。本守卫在权威 /data
+    源上检测这些块的 mode 弱于 enforce 即拒绝启动（fail-closed）。非 /data
+    部署（本地/CI）不检查。
+    """
+    if not _running_from_data_config():
+        return []
+    errors: list[str] = []
+    try:
+        raw = _read_raw_config()
+        for block, human in _GRAY_ENFORCE_ARMS:
+            blk = (raw or {}).get(block)
+            mode = blk.get("mode") if isinstance(blk, dict) else None
+            if mode != "enforce":
+                errors.append(
+                    f"startup safety: {human}.mode={mode!r} on the production /data "
+                    f"config — production baseline is enforce; a weaker mode would "
+                    f"silently disable the gate on a key-loss fallback to canonical "
+                    f"shadow. Restore enforce (or set HERMES_SKIP_STARTUP_SAFETY=1 to "
+                    f"deliberately downgrade)")
+    except Exception as e:
+        logger.error("gray enforce-arm check failed (non-fatal): %s", e)
+    return errors
 
 
 def _authoritative_config_errors() -> list[str]:
