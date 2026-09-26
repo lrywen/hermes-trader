@@ -3274,7 +3274,7 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     调参遗留（2026-09-08/09 自 2.5 改为 1.0，无 git/审计记录），**不是**纯死值：
     改它会在放大资金/notional_cap 放开后影响 v1 sizing。勿据「永远不可达」将其删除。
     """
-    max_loss = float(dsl.get("max_loss_pct", 1.5) or 1.5)
+    max_loss = float(dsl.get("max_loss_pct", 1.0) or 1.0)
     max_roe = float(dsl.get("max_loss_roe_pct", 15.0) or 15.0)
     lev = max(1, leverage)
     return min(max_loss, max_roe / lev) / 100.0

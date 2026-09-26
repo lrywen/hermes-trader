@@ -176,7 +176,7 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
                     window_minutes=float(cfg_get("signal_enforcement.whale_window_min", 15.0,
                                                 config=cfg)),
                     allow_fetch=False)
-                min_net = float(cfg_get("signal_enforcement.whale_veto_min_usd", 250_000.0,
+                min_net = float(cfg_get("signal_enforcement.whale_veto_min_usd", 500_000.0,
                                         config=cfg))
                 if w and w.bias == "whale_selling" and abs(w.net_usd) >= min_net:
                     veto = True
@@ -217,7 +217,7 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
                     window_minutes=float(cfg_get("signal_enforcement.whale_window_min", 15.0,
                                                 config=cfg)),
                     allow_fetch=False)
-                min_net = float(cfg_get("signal_enforcement.whale_boost_min_usd", 250_000.0,
+                min_net = float(cfg_get("signal_enforcement.whale_boost_min_usd", 500_000.0,
                                         config=cfg))
                 if w and w.bias == "whale_buying" and w.net_usd >= min_net:
                     boost = True
