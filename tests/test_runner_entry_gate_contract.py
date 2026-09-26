@@ -120,7 +120,10 @@ def test_confidence_at_boundary_passes_floor(isolated_gate):
 # ── 3. RSI late-entry veto ──────────────────────────────────────────────────
 
 def test_long_overbought_rsi_blocked(isolated_gate):
-    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=80.0)
+    # isolated_gate pins macro regime=up, so the LONG overbought veto uses the
+    # relaxed trend threshold trend_rsi_overbought=80 (strict >). RSI 81 trips
+    # it; the 80-vs-80 inclusive boundary is pinned separately below.
+    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=81.0)
     reason = _block(a, _gate())
     assert "overbought" in reason
 

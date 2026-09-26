@@ -40,8 +40,8 @@ def test_canonical_defaults_contain_all_production_keys():
     correct production value."""
     expected = {
         "leverage": 10,
-        # Audit 2026-09-04: canonical re-aligned to production values
-        # (30/2/4/-2/0.62 per config audit cross-check).
+        # Audit 2026-09-04: canonical re-aligned to production values;
+        # a501b00 (gate loosening) lowered min_ai_confidence 0.62→0.60.
         "max_trade_notional_usd": 30,
         "max_concurrent": 2,
         "max_total_notional_pct": 2.0,
@@ -51,15 +51,15 @@ def test_canonical_defaults_contain_all_production_keys():
         "min_short_volume_usd": 50_000_000,
         "min_market_volume_usd": 5_000_000,
         "counter_regime_min_conf": 0.82,
-        "min_ai_confidence": 0.62,
+        "min_ai_confidence": 0.60,
         "cooldown_min": 30,
         "loss_cooldown_min": 180,
         "min_ai_close_hold_min": 25,
         "force_execute_composite": 30,
         "sl_atr_mult": 1.2,
         "min_trend_score": 0.55,
-        "chop_min_conf": 0.85,
-        "chop_min_score": 60.0,
+        "chop_min_conf": 0.75,
+        "chop_min_score": 45.0,
         "against_funding_min_conf": 0.85,
         "against_funding_min_score": 60.0,
         "max_atr_pct": 15.0,

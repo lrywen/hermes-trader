@@ -1732,8 +1732,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # gate (0.62). A trade in [0.62, 0.75) cleared the entry gate but
         # systematically lost this 5th vote, slashing debate-gate pass rate —
         # inconsistent with the "0.62 is enough to enter" intent. Aligned to
-        # 0.62 so a confidence that can enter can also earn this vote.
-        "analyst5_whale_or_conf": 0.62,
+        # the entry gate; a501b00 lowered that gate 0.62→0.60, so this floor
+        # follows to 0.60 (any confidence that can enter can earn the vote).
+        "analyst5_whale_or_conf": 0.60,
     },
     # R13-B4: executor execution-path constants (executor.py). Three gaps:
     #   * tp_atr_mult DRIFT FIX — the key was already registered (above) and

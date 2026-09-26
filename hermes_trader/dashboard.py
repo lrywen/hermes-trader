@@ -790,6 +790,34 @@ def _risk_status_payload() -> dict[str, Any]:
         logger.debug("[dashboard] market_circuit heartbeat read failed: %s", e)
     out["market_circuit"] = mc_block
 
+    # Effective protection-arm switches (2026-09-25): sizing_v2 / trend_filter /
+    # daily_extension_cap previously only appeared in the operator-only raw
+    # config, so the risk card could not show whether they were live. Read the
+    # resolved config and project the *effective* state (anonymous-safe: modes
+    # and a cap multiplier only, no thresholds / secrets).
+    arms: dict[str, Any] = {}
+    try:
+        cfg = read_agent_config()
+        sv2 = cfg.get("atr_risk_sizing") if isinstance(cfg.get("atr_risk_sizing"), dict) else {}
+        arms["sizing_v2"] = {
+            "enabled": bool(sv2.get("enabled", False)),
+            "mode": str(sv2.get("sizing_v2_mode", "off")),
+            "cap_pct": float(sv2.get("sizing_v2_cap_pct", 1.0)),
+        }
+        tf = cfg.get("trend_filter_200ma") if isinstance(cfg.get("trend_filter_200ma"), dict) else {}
+        arms["trend_filter"] = {
+            "enabled": bool(tf.get("enabled", False)),
+            "mode": str(tf.get("mode", "off")),
+        }
+        dec = cfg.get("daily_extension_cap") if isinstance(cfg.get("daily_extension_cap"), dict) else {}
+        arms["daily_extension_cap"] = {
+            "enabled": bool(dec.get("enabled", False)),
+            "mode": str(dec.get("mode", "off")),
+        }
+    except Exception as e:  # never 500 the card over a config read
+        logger.debug("[dashboard] protection-arms projection failed: %s", e)
+    out["protection_arms"] = arms
+
     return out
 
 

@@ -654,6 +654,7 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         # Previously read via .get() with hard-coded defaults but absent from the
         # schema, so they could not be tuned; added here with the code defaults.
         "rsi_overbought": _num_leaf(0.0, 100.0),
+        "trend_rsi_overbought": _num_leaf(0.0, 100.0),
         "rsi_oversold": _num_leaf(0.0, 100.0),
         "max_extension_atr": _num_leaf(0.0, 50.0),
         "regime_direction_shadow_path": ("str",),

@@ -94,11 +94,14 @@ def test_tiered_cap_never_below_base_floor():
 # ── P0-5 / P0-6 / P0-7: canonical config values ────────────────────────────
 
 def test_aligned_min_conf_enabled_below_entry_gate():
-    # P0-5: was None (feature silently off); now 0.60 < min_ai_confidence 0.62.
+    # P0-5: was None (feature silently off); enabled at 0.60. a501b00 later
+    # lowered the global min_ai_confidence 0.62→0.60, so the aligned floor now
+    # sits AT the entry gate rather than strictly below it — it stays enabled and
+    # never above the gate (no relaxation of the structural override bar).
     val = cfg_get("aligned_min_conf", config={})
     assert val is not None
     assert 0.58 <= val <= 0.60
-    assert val < cfg_get("min_ai_confidence", config={})
+    assert val <= cfg_get("min_ai_confidence", config={})
 
 
 def test_llm_circuit_breaker_tightened():

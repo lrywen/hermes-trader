@@ -31,7 +31,8 @@ from hermes_trader.agents.risk_gates import (
 # ── P1-9: analyst5 whale-or confidence aligned to entry gate ───────────────
 
 def test_p1_9_analyst5_whale_or_conf_aligned_to_entry_gate():
-    assert CANONICAL_DEFAULTS["analyst_scoring"]["analyst5_whale_or_conf"] == 0.62
+    # a501b00 lowered the entry gate 0.62→0.60; the analyst5 floor follows it.
+    assert CANONICAL_DEFAULTS["analyst_scoring"]["analyst5_whale_or_conf"] == 0.60
     assert (
         CANONICAL_DEFAULTS["analyst_scoring"]["analyst5_whale_or_conf"]
         == CANONICAL_DEFAULTS["min_ai_confidence"]

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
@@ -199,6 +200,33 @@ def register_public_routes(app: FastAPI) -> None:
                 _risk_status_payload,
             )
         )
+        return JSONResponse(payload)
+
+    @app.get("/api/dashboard/config-parity")
+    async def dashboard_config_parity() -> JSONResponse:
+        """Read-only fail-open drift report (anonymous-safe).
+
+        Runs the same canonical-vs-live check the CI guard uses and returns
+        ``{dangerous_count, items}``. ``dangerous_count`` must be 0: a non-zero
+        value means some protection would silently loosen if a config key were
+        dropped (deep-merge fallback to canonical). Only leaf paths and the
+        canonical/live scalars are returned — no secrets. Cached briefly like
+        the other dashboard reads.
+        """
+        def _serve():
+            from hermes_trader.agents.config_parity_guard import find_dangerous_divergences
+            from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
+
+            def _compute():
+                live = read_agent_config()
+                items = find_dangerous_divergences(CANONICAL_DEFAULTS, live)
+                return {"dangerous_count": len(items), "items": items,
+                        "ts": int(time.time() * 1000)}
+
+            return _ttl_cached("config-parity",
+                               _http_cache_params()["summary_ttl_s"], _compute)
+
+        payload = await asyncio.to_thread(_serve)
         return JSONResponse(payload)
 
     @app.get("/api/dashboard/equity-curve")
