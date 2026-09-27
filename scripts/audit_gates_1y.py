@@ -33,26 +33,55 @@ os.environ.setdefault("HERMES_BACKTEST", "1")
 _REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(_REPO))
 
-from hermes_trader.indicators.math import rsi as _rsi_fn, atr as _atr_fn, ema
+from hermes_trader.indicators.math import atr as _atr_fn
+from hermes_trader.indicators.math import ema
+from hermes_trader.indicators.math import rsi as _rsi_fn
 
 _BINANCE = "https://data-api.binance.vision/api/v3/klines"
 _CACHE_DIR = _REPO / "logs" / "binance_klines_cache"
 
-# 生产实盘基准（2026-09-26 审计自容器 /data/.agent-config.json）。
-BASE = {
-    "ta_late_entry": {
-        "rsi_ob": 75, "rsi_os": 25, "ext_ob": 2.5, "ext_os": -2.5,
-        "trend_relax_enabled": True, "adx_trend_threshold": 35,
-        "rsi_ob_relaxed": 82, "rsi_os_relaxed": 18,
-        "ext_ob_relaxed": 3.5, "ext_os_relaxed": -3.5,
-    },
-    "late_chase": {
-        "rsi1h_ob": 85, "rsi1h_os": 15,
-        "rt_rsi_ob": 80, "rt_rsi_os": 20, "rt_ext_atr": 3.0,
-        "fresh_band_pct": 8.0,
-    },
-    "daily_ext_cap": 30.0,
-}
+# 生产实盘基准 —— 直接从 CANONICAL_DEFAULTS 派生，避免硬编码随调参过期
+# （此前写死 85/15/8.0，生产已为 88/12/12.0；daily cap 也已结构化为
+# {mode, fail_closed}）。canonical 即生产 read_agent_config 的 deep-merge 基底。
+def _build_base() -> dict[str, Any]:
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS as _CD
+
+    _tle = _CD.get("ta_late_entry") or {}
+    _lc = _CD.get("late_chase") or {}
+    _lc_rt = _lc.get("realtime") or {}
+    _dec = _CD.get("daily_extension_cap") or {}
+    return {
+        "ta_late_entry": {
+            "rsi_ob": _tle.get("rsi_ob", 75),
+            "rsi_os": _tle.get("rsi_os", 25),
+            "ext_ob": _tle.get("ext_ob", 2.5),
+            "ext_os": _tle.get("ext_os", -2.5),
+            "trend_relax_enabled": _tle.get("trend_relax_enabled", True),
+            "adx_trend_threshold": _tle.get("adx_trend_threshold", 35),
+            "rsi_ob_relaxed": _tle.get("rsi_ob_relaxed", 82),
+            "rsi_os_relaxed": _tle.get("rsi_os_relaxed", 18),
+            "ext_ob_relaxed": _tle.get("ext_ob_relaxed", 3.5),
+            "ext_os_relaxed": _tle.get("ext_os_relaxed", -3.5),
+        },
+        "late_chase": {
+            "rsi1h_ob": _lc.get("rsi1h_overbought", 88.0),
+            "rsi1h_os": _lc.get("rsi1h_oversold", 12.0),
+            "rt_rsi_ob": _lc_rt.get("rsi_overbought", 80.0),
+            "rt_rsi_os": _lc_rt.get("rsi_oversold", 20.0),
+            "rt_ext_atr": _lc_rt.get("max_extension_atr", 3.0),
+            "fresh_band_pct": _lc.get("fresh_move_band_pct", 12.0),
+        },
+        # daily_extension_cap 是灰度臂而非裸数值：mode=off/shadow/enforce。
+        # 仅 enforce 时该闸门才真正强制；数值顶来自 override_max_daily_extension_pct。
+        "daily_ext_cap": {
+            "mode": str(_dec.get("mode", "off")),
+            "fail_closed": bool(_dec.get("fail_closed", True)),
+            "cap_pct": float(_CD.get("override_max_daily_extension_pct", 30.0)),
+        },
+    }
+
+
+BASE = _build_base()
 
 ROUND_TRIP_FEE_BPS = 5.0
 HORIZON_BARS = 12          # 5m基准：持有12根=1h（与早前VP/CVD验证同口径）
@@ -217,9 +246,13 @@ def evaluate_gates(window5m: list[_B], window1h: list[_B],
         return bool((rsi5m is not None and rsi5m > p_lc["rt_rsi_ob"])
                     or (ext5m is not None and ext5m > p_lc["rt_ext_atr"]))
 
-    # daily_extension_cap
+    # daily_extension_cap：仅 enforce 时强制（off/shadow 不拦）。
+    _dec_cfg = BASE["daily_ext_cap"]
+
     def _daily_cap_long() -> bool:
-        return bool(chg24 is not None and chg24 > BASE["daily_ext_cap"])
+        if _dec_cfg["mode"] != "enforce":
+            return False
+        return bool(chg24 is not None and chg24 > _dec_cfg["cap_pct"])
 
     return {
         "rsi5m": rsi5m, "rsi1h": rsi1h, "ext5m": ext5m,

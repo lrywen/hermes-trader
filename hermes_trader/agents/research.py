@@ -2493,9 +2493,10 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         # while both of these were fired hours before the move).
         "breakout_fired": "breakout" in fired_names,
         "volume_spike_fired": "volumeSpike" in fired_names,
-        # 触发信号所在K线的收盘时间（ms），供 runner gate 判断突破年龄、
-        # 在有效期窗口内仍视为 fresh，避免研究链路延迟导致的误杀。
-        "signal_bar_close_ms": perception.get("bar_close_ms"),
+        # 突破首次触发那根K线的收盘时间（ms），由 perception 无条件追踪。
+        # runner gate 据此判断"本bar未突破"的候选是否仍在 fresh 有效期内，
+        # 避免研究链路延迟误杀，也无需在闸门内重新同步抓 K线。
+        "breakout_onset_ms": perception.get("breakout_onset_ms"),
         "uptrend_momentum_fired": "uptrendMomentum" in fired_names,
         "downtrend_momentum_fired": "downtrendMomentum" in fired_names,
         "daily_mover_fired": "dailyMover" in fired_names,
@@ -2527,6 +2528,18 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "close1h": tf1h.get("last_close"),
         "obv_slope_1h": _obv_slope_sign(c1h),
     }
+    # Regime snapshot taken HERE, during research, so the executor's RSI gate
+    # uses the SAME timebase as rsi4h (both snapshotted in this research pass)
+    # instead of re-resolving regime at gate-execution minutes later. Cached
+    # for REGIME_TTL_S; a read failure leaves the key absent and the gate keeps
+    # its strict base threshold (fail-safe, never relaxes on unknown).
+    try:
+        from hermes_trader.agents.market_regime import detect_regime_with_score
+        _reg, _reg_score = detect_regime_with_score(coin)
+        analysis["regime"] = str(_reg)
+        analysis["regime_score"] = float(_reg_score)
+    except Exception:
+        logger.debug("[research] regime snapshot failed coin=%s", coin, exc_info=True)
     return analysis
 
 

@@ -5274,35 +5274,6 @@ def _low_position_relax_allows(
                   f"pre1h {pre_pct:+.1f}%, flow {aggression:.2f}")
 
 
-def _recent_breakout(coin: str, within_bars: int) -> bool:
-    """最近 ``within_bars`` 根已收盘5m K线内是否发生过突破。
-
-    用生产 trigger.breakout 判定，对窗口末尾逐根切片；任一 fired 即 True。
-    失败 fail-open 返回 False（调用方仅据此放宽，不影响其他判定）。
-    """
-    try:
-        from hermes_trader.client.hl_client import fetch_hl_candles
-        from hermes_trader.indicators import triggers as trigger_mod
-        lookback = 48
-        need = lookback + int(within_bars) + 4
-        candles = fetch_hl_candles(coin, "5m", need)
-        closed, _ = _drop_client_forming(candles, "5m")
-        if len(closed) < lookback + 2:
-            return False
-        # 检查末尾 within_bars 根作为"突破发生bar"
-        start_check = max(lookback + 1, len(closed) - int(within_bars))
-        for end in range(start_check, len(closed)):
-            window = closed[:end + 1]
-            hit = trigger_mod.breakout(window, lookback=lookback)
-            if hit.get("fired"):
-                return True
-        return False
-    except Exception:
-        logger.debug("[runner_gate] recent-breakout check failed coin=%s",
-                     coin, exc_info=True)
-        return False
-
-
 def _drop_client_forming(candles, interval):
     from hermes_trader.client.hl_client import closed_candles_only
     return closed_candles_only(candles, interval)
@@ -5388,13 +5359,22 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     #     print a 2σ volume spike but still carries enough confluence).
     # Direction-aware: uses the side-aligned burst (resolved below per side).
     burst_for_side = burst_aligned_long if side == "long" else burst_aligned_short
-    # 突破有效期：研究/裁决链路存在数分钟延迟，且很多趋势中段候选本bar未
-    # 突破但近期刚突破。检测该币最近 N 根已收盘5m K线内是否发生过突破，
-    # 若是则仍视为 fresh，避免链路延迟/中段信号被一刀切误杀。
+    # 突破有效期：研究/裁决链路存在数分钟延迟，部分趋势中段候选本bar未
+    # 突破但近期刚突破。perception 已无条件记录 breakout 首次触发时间，
+    # 直接读 analysis 快照判断是否仍在 N 根5m K线窗口内（纯内存、零网络，
+    # 与研究链路同一时间基），避免链路延迟/中段信号被一刀切误杀。
     breakout_validity_bars = int(gate.get("breakout_validity_bars", 6) or 0)
     recent_breakout = False
     if not breakout and breakout_validity_bars > 0:
-        recent_breakout = _recent_breakout(coin, breakout_validity_bars)
+        try:
+            _onset_ms = analysis.get("breakout_onset_ms")
+            if _onset_ms is not None:
+                _window_ms = breakout_validity_bars * 5 * 60_000
+                recent_breakout = (
+                    int(time.time() * 1000) - int(_onset_ms) <= _window_ms
+                )
+        except (TypeError, ValueError):
+            recent_breakout = False
     fresh_impulse = (
         breakout
         or recent_breakout
@@ -5468,16 +5448,11 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     rsi_overbought = float(gate.get("rsi_overbought", 75.0))
     rsi_oversold = float(gate.get("rsi_oversold", 25.0))
     # 仅趋势市放宽：regime=up 时用更高的超买阈值，避免在强趋势中把
-    # 75-80 的健康延续误杀；震荡/其他市场保持严格阈值。
+    # 75-80 的健康延续误杀；震荡/其他市场保持严格阈值。regime 取自研究
+    # 链路快照（与 rsi4h 同一时间基）；快照缺失时不放宽（fail-safe）。
     if side == "long":
-        try:
-            from hermes_trader.agents.market_regime import detect_regime_with_score
-            _reg, _ = detect_regime_with_score(coin)
-            if _reg == "up":
-                rsi_overbought = float(
-                    gate.get("trend_rsi_overbought", 80.0))
-        except Exception:
-            pass
+        if str(analysis.get("regime") or "") == "up":
+            rsi_overbought = float(gate.get("trend_rsi_overbought", 80.0))
     if rsi4h is not None:
         try:
             rsi_val = float(rsi4h)

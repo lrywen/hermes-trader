@@ -170,6 +170,7 @@ def _resolve_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "breakout_exemption": dict(ta_le.get("breakout_exemption") or {}),
         "trend_surface_enabled": bool(cfg.get("trend_surface_enabled", True)),
         "regime": regime,
+        "runner_entry_gate": dict(cfg.get("runner_entry_gate") or {}),
         "dsl": dsl,
     }
 
@@ -273,10 +274,13 @@ class Candidate:
 
 def _eval_bar(coin: str, window5m: List[Candle], c1h: List[Candle],
               c4h: List[Candle], P: Dict[str, Any],
-              funnel: Dict[str, int]) -> List[Candidate]:
+              funnel: Dict[str, int], macro_regime: str = "neutral") -> List[Candidate]:
     """单 bar 信号评估。返回各臂候选（0 或多个）。复刻 perception
     :539-568 触发器列表/:573 squeeze 耦合/:723-805 旁路丢弃链 +
-    analyze_perception :782-793 方向推断 + late_entry/#7 流程。"""
+    analyze_perception :782-793 方向推断 + late_entry/#7 流程。
+
+    ``macro_regime`` 是该决策时刻 BTC 1h 代理 regime（与实盘 runner gate
+    同一时间基/同一代理），用于复现 trend_rsi_overbought 的趋势市放宽。"""
     th = P["thresholds"]
     hits = [
         trig.pct_move_spike(window5m, th["sigmaThreshold"]),
@@ -398,11 +402,25 @@ def _eval_bar(coin: str, window5m: List[Candle], c1h: List[Candle],
         return cands
     le = late_entry_check(c4h, None, side, P["ta_late_entry"])
     if not le.get("block"):
-        cands.append(Candidate(
-            -1, side, "baseline", score, fired_names,
-            {"rsi4h": le.get("rsi4h"), "adx4h": le.get("adx4h"),
-             "extension": ext,
-             "relaxed_by_trend": le.get("relaxed_by_trend")}))
+        # 复现实盘 runner gate 的 RSI 趋势市放宽（NEW-03 回测对齐）：
+        # LONG 在 BTC 代理 regime=up 时阈值 trend_rsi_overbought=80，
+        # 其余市场用 rsi_overbought=75；严格 >。与研究链路同一时间基。
+        _rg_gate = P.get("runner_entry_gate", {}) or {}
+        _rsi_ob = float(
+            _rg_gate.get("trend_rsi_overbought", 80)
+            if macro_regime == "up"
+            else _rg_gate.get("rsi_overbought", 75)
+        )
+        _rsi4h_now = le.get("rsi4h")
+        if side == "long" and _rsi4h_now is not None and float(_rsi4h_now) > _rsi_ob:
+            funnel["runner_rsi_block"] += 1
+        else:
+            cands.append(Candidate(
+                -1, side, "baseline", score, fired_names,
+                {"rsi4h": le.get("rsi4h"), "adx4h": le.get("adx4h"),
+                 "extension": ext,
+                 "macro_regime": macro_regime,
+                 "relaxed_by_trend": le.get("relaxed_by_trend")}))
     else:
         funnel["le_block"] += 1
         hq, hq_info = _high_quality_breakout(perception, P["breakout_exemption"])
@@ -698,7 +716,8 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
         decision_ms = bars[i].t + MS_5M
         c1h = _closed_prefix(c1h_all, ts_1h, decision_ms, MS_1H, 48)
         c4h = _closed_prefix(c4h_all, ts_4h, decision_ms, MS_4H, 100)
-        for cand in _eval_bar(coin, window, c1h, c4h, P, funnel):
+        for cand in _eval_bar(coin, window, c1h, c4h, P, funnel,
+                              _regime_at(bars[i].t + MS_5M)):
             cand.bar_idx = i
             per_arm[cand.arm].append((i, cand))
             if cand.arm == "baseline":

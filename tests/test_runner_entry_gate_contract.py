@@ -25,6 +25,8 @@ DECISION branches deterministically:
 Tests LOCK EXISTING BEHAVIOR and change no trading logic.
 """
 
+import time
+
 import pytest
 
 from hermes_trader.agents import executor
@@ -120,12 +122,23 @@ def test_confidence_at_boundary_passes_floor(isolated_gate):
 # ── 3. RSI late-entry veto ──────────────────────────────────────────────────
 
 def test_long_overbought_rsi_blocked(isolated_gate):
-    # isolated_gate pins macro regime=up, so the LONG overbought veto uses the
-    # relaxed trend threshold trend_rsi_overbought=80 (strict >). RSI 81 trips
-    # it; the 80-vs-80 inclusive boundary is pinned separately below.
-    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=81.0)
+    # regime 现在取自研究快照 analysis['regime']（与 rsi4h 同一时间基）。
+    # 显式给 regime='up'，使 LONG 超买否决用放宽阈值 trend_rsi_overbought=80
+    # （严格 >）；RSI 81 触发，80-vs-80 边界另在下面钉死。
+    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=81.0, regime="up")
     reason = _block(a, _gate())
     assert "overbought" in reason
+
+
+def test_long_overbought_relaxed_only_in_up_regime(isolated_gate):
+    """非 up regime（如 neutral）仍用严格阈值 75：regime 快照决定放宽与否，
+    RSI 78 在 neutral 下被拦、在 up 下通过。"""
+    a_neutral = _analysis(confidence=0.9, breakout_fired=True,
+                          rsi4h=78.0, regime="neutral")
+    assert "overbought" in _block(a_neutral, _gate())
+    a_up = _analysis(confidence=0.9, breakout_fired=True,
+                     rsi4h=78.0, regime="up")
+    assert "overbought" not in _block(a_up, _gate())
 
 
 def test_short_oversold_rsi_blocked(isolated_gate):
@@ -136,13 +149,40 @@ def test_short_oversold_rsi_blocked(isolated_gate):
 
 
 def test_rsi_boundary_is_inclusive(isolated_gate):
-    # rsi == overbought threshold must NOT block (strict >); give no structure
+    # rsi == overbought_threshold must NOT block (strict >); give no structure
     # so it would otherwise block on late-chase, proving it got PAST the RSI
     # veto (reason mentions chase, not overbought).
     a = _analysis(confidence=0.9, uptrend_momentum_fired=True, rsi4h=75.0)
     reason = _block(a, _gate())
     assert "overbought" not in reason
     assert "late trend-only chase" in reason
+
+
+# ── 3b. recent-breakout fresh window (memory snapshot, no network) ─────────
+
+def test_recent_breakout_inside_window_admits(isolated_gate):
+    # 本bar未突破，但 breakout_onset_ms 在 validity 窗口内 → fresh 放宽。
+    # 给足 confidence 且不触发任何 late/RSI/extension 否决，应当放行。
+    now_ms = int(time.time() * 1000)
+    a = _analysis(confidence=0.9, breakout_fired=False,
+                  breakout_onset_ms=now_ms - 10 * 60_000)  # 10min前突破
+    assert _block(a, _gate()) == ""
+
+
+def test_recent_breakout_outside_window_blocks(isolated_gate):
+    # onset 早于 validity 窗口 → 不算 fresh；无其他结构 → 被闸门拦截
+    # （fresh-impulse 检查先于 late-chase，故只断言被 block）。
+    now_ms = int(time.time() * 1000)
+    a = _analysis(confidence=0.9, breakout_fired=False,
+                  breakout_onset_ms=now_ms - 40 * 60_000)  # 40min前突破
+    assert _block(a, _gate()) != ""
+
+
+def test_no_breakout_onset_does_not_admit(isolated_gate):
+    # 从无突破（onset=None）不得因 recent_breakout 放宽 → 闸门拦截。
+    a = _analysis(confidence=0.9, breakout_fired=False,
+                  breakout_onset_ms=None)
+    assert _block(a, _gate()) != ""
 
 
 # ── 4. EMA21 extension veto ─────────────────────────────────────────────────

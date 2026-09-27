@@ -104,6 +104,53 @@ def _reset_age_decay() -> None:
         _age_decay_onset.clear()
 
 
+# ── Independent breakout-onset tracking ────────────────────────────────────
+# The runner entry gate needs the bar the breakout FIRST fired on, to decide if
+# a currently-not-breaking candidate is still inside its fresh-window. The
+# age-decay onset map above is only maintained while signal_age_decay != off,
+# so it cannot be relied on (production runs age-decay off). This tracker runs
+# UNCONDITIONALLY on every scored bar and tracks the breakout trigger alone.
+_BREAKOUT_ONSET_TTL_MS = 21_600_000  # 6h: a quiet setup past this re-clocks
+_breakout_onset_lock = threading.Lock()
+# coin -> (first-fire bar_close_ms, last-fire bar_close_ms)
+_breakout_onset: dict[str, tuple[int, int]] = {}
+
+
+def _reset_breakout_onset() -> None:
+    """Clear breakout-onset state (tests / explicit reset)."""
+    with _breakout_onset_lock:
+        _breakout_onset.clear()
+
+
+def _observe_breakout_onset(
+    coin: str, breakout_fired: bool, bar_close_ms: int,
+) -> int | None:
+    """Record the breakout lifecycle for one scored bar; return the first-fire
+    bar_close_ms of the active breakout (None if no recent breakout).
+
+    Stamps the first bar the breakout fires; while it keeps firing (or stays
+    within the TTL since its last fire) the original onset is preserved so the
+    gate can read the breakout's true age. Once it stops firing past the TTL the
+    entry is pruned and a later fire starts a fresh clock.
+    """
+    with _breakout_onset_lock:
+        rec = _breakout_onset.get(coin)
+        if rec is not None and (bar_close_ms - rec[1]) > _BREAKOUT_ONSET_TTL_MS:
+            rec = None  # expired quiet window
+        if breakout_fired:
+            if rec is None:
+                rec = (int(bar_close_ms), int(bar_close_ms))
+            else:
+                rec = (rec[0], int(bar_close_ms))
+            _breakout_onset[coin] = rec
+            return rec[0]
+        # Not firing this bar: retain a still-fresh onset, drop a stale one.
+        if rec is not None:
+            _breakout_onset[coin] = rec
+            return rec[0]
+        return None
+
+
 def _age_decay_config(config: dict[str, Any]) -> dict[str, Any]:
     """Resolve the signal_age_decay block: merged agent-config, then an env
     override for the mode (gray-release flip without a file write). Invalid
@@ -890,6 +937,15 @@ def _scan_single_market(
             return (True, None)
 
         whale = (whale_signals or {}).get(market["coin"])
+        # Track the breakout's first-fire bar UNCONDITIONALLY (independent of
+        # signal_age_decay, which is off in production). The runner gate reads
+        # this via research to judge a non-breaking candidate's true age.
+        _breakout_fired = any(
+            h.get("fired") and h.get("name") == "breakout" for h in hits
+        )
+        breakout_onset_ms = _observe_breakout_onset(
+            market["coin"], bool(_breakout_fired), scored_bar_close_ms,
+        )
         # O-2: expose the CLOSE TIME (ms) of the bar the triggers were scored
         # on (= its open time + bar duration). `candles` here is the closed
         # set the trigger eval used (the forming bar was dropped above), so
@@ -903,6 +959,7 @@ def _scan_single_market(
             "type": market["type"],
             "fired_at": int(time.time() * 1000),
             "bar_close_ms": scored_bar_close_ms,
+            "breakout_onset_ms": breakout_onset_ms,
             "mid": mid,
             "triggers": hits,
             "composite_score": score,
