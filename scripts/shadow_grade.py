@@ -162,9 +162,7 @@ _VERDICT_CN = {
 ARM_KIND = {
     "pullback": "signal",
     "ta_late_entry": "block",
-    "atr_regime_calib": "change",
     "sizing_v2": "change",
-    "confidence_decay": "change",
     "market_circuit": "signal",
     "signal_age_decay": "change",
     "daily_extension_cap": "block",
@@ -173,10 +171,12 @@ ARM_KIND = {
     "xs_reversal": "signal",
     "regime_overlay": "signal",
     # LLM 调用层 rollout 探针（非逐币闸门；每个 LLM 请求一行，无 coin/outcome）。
-    # block 语义：命中=该探针会对请求采取动作（reasoning 应用 low effort /
-    # completion 触发 token cap）。用 would-block 命中率考核其动作宽度。
-    "reasoning_effort_rollout": "block",
-    "completion_cap_shadow": "block",
+    # rollout 语义：记录 LLM 调用层参数（reasoning effort / completion cap）的
+    # 应用情况与成本/时延，不是逐币拦/改闸门。其动作率天然接近 100%（设计目的
+    # 就是让绝大多数调用跑 low effort / 观测 cap），故不适用「命中率>50%=拦太宽」
+    # 的 block 启发式（2026-09-27 修正误报）。
+    "reasoning_effort_rollout": "rollout",
+    "completion_cap_shadow": "rollout",
 }
 
 # Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如
@@ -488,7 +488,7 @@ def _hit_field(rec: dict, kind: str, arm: str = ""):
         v = rec.get("would_truncate")
         return bool(v) if v is not None else None
     fields = {"block": _BLOCK_FIELDS, "change": _CHANGE_FIELDS,
-              "signal": _SIGNAL_FIELDS}[kind]
+              "signal": _SIGNAL_FIELDS, "rollout": ()}[kind]
     for f in fields:
         if f in rec and rec[f] is not None:
             return bool(rec[f])
@@ -812,7 +812,8 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
                     + "，疑似事件驱动型闸门停采或写路径异常")
 
     # M12：样本够但 outcome 回填恒为 0 → 永远无法进入有效性判定。
-    if mode in ("shadow", "enforce") and longest["total"] >= ZERO_BACKFILL_MIN_SAMPLES \
+    if mode in ("shadow", "enforce") and kind != "rollout" \
+            and longest["total"] >= ZERO_BACKFILL_MIN_SAMPLES \
             and longest["mature_outcomes"] == 0:
         eligible = longest.get("eligible_total", longest["total"])
         nm = longest.get("not_material_outcomes", 0)
@@ -868,6 +869,9 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     elif mode == "enforce":
         verdict, reason = _enforce_verdict(
             arm, kind, longest, w_long, records, now_ms, backfill, warnings)
+    elif kind == "rollout":
+        verdict, reason = _rollout_verdict(
+            arm, mode, longest, w_long, records, now_ms, warnings)
     else:
         verdict, reason = _shadow_verdict(
             arm, kind, longest, w_long, records, now_ms, backfill, warnings)
@@ -1091,6 +1095,50 @@ def _harm_health_fragment(eh: dict) -> str:
             return f"无实质性笔（{eh['denom_note']}）{sum_txt}"
         return f"实质性臂有害率 {wr:.0%}（{eh['denom_note']}）{sum_txt}"
     return f"臂有害率 {eh['eff_wr']:.0%}（{eh['denom_note']}）"
+
+
+def _rollout_window_records(records: list[dict], w_long: int,
+                            now_ms: float) -> list[dict]:
+    cut = now_ms - w_long * 3_600_000
+    out = []
+    for r in records:
+        ts = _record_ts_ms(r)
+        if ts is not None and ts < cut:
+            continue
+        out.append(r)
+    return out
+
+
+def _rollout_verdict(arm: str, mode: str, s: dict, w_long: int,
+                     records: list[dict], now_ms: float,
+                     warnings: list[str]) -> tuple[str, str]:
+    """LLM 调用层 rollout 探针评级（2026-09-27）。
+
+    与逐币 block/change 臂不同：它不改/不拦任何交易，只观测 LLM 调用参数的
+    应用情况与成本/时延，记录无 coin/outcome。因此：
+      * 不用「命中率>50%=拦太宽」考核——应用 low effort 的比例天然接近 100%；
+      * 不计算反事实有害率（没有可回填的逐币结果）。
+    输出动作率 + 平均时延/ token 摘要，供人工判断 LLM 成本/时延收益；enforce
+    建议 MAINTAIN，shadow 建议 COLLECTING。
+    """
+    win_recs = _rollout_window_records(records, w_long, now_ms)
+    applied = [r for r in win_recs if _hit_field(r, "rollout", arm) is True]
+    lat = [r.get("elapsed_ms") for r in win_recs
+           if isinstance(r.get("elapsed_ms"), (int, float))]
+    avg_ms = round(sum(lat) / len(lat)) if lat else None
+    rate_note = (f"动作 {len(applied)}/{len(win_recs)}"
+                 if win_recs else "窗口内无记录")
+    lat_note = f"，平均调用时延 {avg_ms}ms" if avg_ms is not None else ""
+    warnings.append(
+        "LLM 调用层 rollout 探针（非逐币闸门，无 coin/outcome）：不适用命中率"
+        f"/有害率考核；{rate_note}{lat_note}，用于评估 LLM 成本/时延收益")
+    if mode == "enforce":
+        return MAINTAIN, (
+            f"已在 enforce：{w_long}h {s['total']} 条调用观测、{rate_note}"
+            f"{lat_note}；rollout 探针运行正常建议维持")
+    return COLLECTING, (
+        f"{w_long}h {s['total']} 条调用观测、{rate_note}{lat_note}；"
+        "rollout 探针持续采数")
 
 
 def _enforce_verdict(arm: str, kind: str, s: dict, w_long: int,

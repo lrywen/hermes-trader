@@ -66,13 +66,7 @@ ARMS = [
     # 与逐币臂不同，默认落盘目录是可写 /data（research.py 用 HERMES_DATA_DIR），
     # 不走只读 HOME；collect_grades / _arm_path 据此把默认文件解析到 /data。
     ("reasoning_effort_rollout", "reasoning_effort_rollout", "HERMES_REASONING_EFFORT_ROLLOUT_SHADOW_FILE", "reasoning_effort_rollout.jsonl", "mode", "log_path"),
-    ("completion_cap_shadow",    "completion_cap_shadow",    "HERMES_COMPLETION_CAP_SHADOW_SHADOW_FILE",    "completion_cap_shadow.jsonl",    "mode", "log_path"),
-    # Audit 2026-09-27 (P0): confidence_decay 是可 enforce 的 change 臂，此前
-    # 漏出 ARMS（评级器看不见）。默认落盘 /data，与 reconcile_change_arms 一致。
-    ("confidence_decay", "confidence_decay", "HERMES_CONFIDENCE_DECAY_SHADOW_FILE", "confidence_decay_shadow.jsonl", "mode", "shadow_log_path"),
-    # Audit 2026-09-27 (P0): atr_regime_calibration 可 enforce，此前完全不在
-    # ARMS。label 用 canonical 长名；落盘文件沿用历史短名 atr_regime_calib。
-    ("atr_regime_calibration", "atr_regime_calibration", "HERMES_ATR_REGIME_CALIB_SHADOW_FILE", "atr_regime_calib_shadow.jsonl", "mode", "shadow_log_path"),
+    ("completion_cap_shadow",    "completion_cap_shadow",    "HERMES_COMPLETION_CAP_SHADOW_SHADOW_FILE",    "completion_cap_shadow.jsonl", "mode", "log_path"),
 ]
 
 # 只读挂载：落在这里的 shadow 文件写不进去（容器内 ro）。
@@ -82,15 +76,13 @@ WRITABLE_DATA = "/data"
 # Audit 2026-09-27 (P0): LLM rollout 探针由 research.py 写到可写 /data，
 # 默认文件不落在只读 HOME。key 为 ARMS label。
 ARM_DEFAULT_DATA_DIR = frozenset((
-    "reasoning_effort_rollout", "completion_cap_shadow", "confidence_decay",
-    "atr_regime_calibration",
+    "reasoning_effort_rollout", "completion_cap_shadow",
 ))
 
 # Audit 2026-09-27 (P0): 唯一权威的臂名别名表。ARMS label 一律使用 canonical
 # 配置块名（长名）；落盘文件 / 证据面历史遗留短名在此映射，禁止在各表里 ad hoc
 # 混用。key=canonical 长名 -> value=落盘/证据面短名。
 ARM_ALIASES: dict[str, str] = {
-    "atr_regime_calibration": "atr_regime_calib",
     "trend_filter_200ma": "trend_filter",
 }
 

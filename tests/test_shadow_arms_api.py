@@ -314,12 +314,10 @@ def backfill_client(tmp_path, make_backfill_client):
         {"is_candidate": True, "forward": {"fwd24h_pct": -8.0, "fwd72h_pct": -7.0}},
         {"is_candidate": False, "forward": {"fwd24h_pct": -4.0, "fwd72h_pct": None}},
     ])
-    _write_jsonl(tmp_path / "atr_regime_calib_shadow.backfill.jsonl", [
-        {"would_change": True, "cf_v1_pnl_pct": -3.0, "cf_v2_pnl_pct": -3.6,
-         "pnl_pct": 0.6, "outcome": "win"},
-        {"would_change": True, "cf_v1_pnl_pct": -2.0, "cf_v2_pnl_pct": -1.8,
-         "pnl_pct": -0.2, "outcome": "loss"},
-        {"would_change": False, "cf_v1_pnl_pct": 1.0, "cf_v2_pnl_pct": 1.0},
+    _write_jsonl(tmp_path / "daily_extension_cap_shadow.backfill.jsonl", [
+        {"ext_would_block": True, "pnl_pct": 0.6, "outcome": "win"},
+        {"ext_would_block": True, "pnl_pct": -0.2, "outcome": "loss"},
+        {"ext_would_block": False, "pnl_pct": 1.0, "outcome": "win"},
     ])
     _write_jsonl(tmp_path / "relax_tier_shadow.backfill.jsonl", [
         # ta_late records graded with rt_*-prefixed fields; bare outcome/pnl
@@ -341,7 +339,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     body = r.json()
     assert body["files_present"] == 4
     by_arm = {a["arm"]: a for a in body["arms"]}
-    assert len(by_arm) == 14
+    assert len(by_arm) == 12
 
     ta = by_arm["ta_late_entry"]
     assert ta["present"] is True and ta["records"] == 3
@@ -364,19 +362,15 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     assert xs["extras"]["forward"]["72h"]["n"] == 1
     assert xs["extras"]["forward"]["168h"] is None
 
-    atr = by_arm["atr_regime_calibration"]
-    assert atr["extras"]["would_change"] == 2
-    d = atr["extras"]["calibration_delta"]
-    assert d["n"] == 2
-    assert d["avg_pct"] == pytest.approx((-0.6 + 0.2) / 2, abs=1e-4)
-    assert d["improved"] == 1
-    # change-arm: win = arm-HARMFUL, so the positive share must surface as
+    dec = by_arm["daily_extension_cap"]
+    # block-arm: outcome win = arm-HARMFUL, so the positive share surfaces as
     # arm_harmful_rate (never a literal win_rate) with an explicit semantics tag
-    assert atr["semantics"] == shadow_arms._COUNTERFACTUAL_SEMANTICS
-    assert "win_rate" not in atr["pnl"]
-    assert atr["pnl"]["arm_harmful_rate"] == pytest.approx(0.5, abs=1e-4)
-    assert atr["pnl"]["n"] == 2  # the not_material row carries no pnl_pct
-    assert atr["outcomes"] == {"win": 1, "loss": 1}
+    assert dec["semantics"] == shadow_arms._COUNTERFACTUAL_SEMANTICS
+    assert "win_rate" not in dec["pnl"]
+    assert dec["records"] == 3
+    assert dec["pnl"]["n"] == 3
+    assert dec["pnl"]["arm_harmful_rate"] == pytest.approx(2 / 3, abs=1e-4)
+    assert dec["outcomes"] == {"win": 2, "loss": 1}
 
     rt = by_arm["relax_tier"]
     assert rt["present"] is True and rt["records"] == 3
@@ -389,7 +383,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     assert rt["by_side"]["long"]["n"] == 1
     assert rt["by_side"]["short"]["arm_harmful_rate"] == 0.0
 
-    for missing in ("pullback", "daily_extension_cap", "trend_filter_200ma"):
+    for missing in ("pullback", "trend_filter_200ma"):
         assert by_arm[missing]["present"] is False
         assert by_arm[missing]["records"] == 0
         assert "note" in by_arm[missing]

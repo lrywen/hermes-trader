@@ -31,6 +31,15 @@ import pytest
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
 
+# Audit 2026-09-27 (arm retirement): these change arms are RETIRED. Their
+# observation-only shadow writers were physically removed in the 2026-09-21
+# cleanup (no code appends new rows), so the rater can no longer grade fresh
+# evidence and they are deliberately absent from ARMS / the evidence surface.
+# Their canonical blocks stay in config (the inert modules are still wired in
+# executor/sizing) but MUST default to mode="off" — never a live money path —
+# which ``test_retired_arms_are_off`` pins. Historical files remain under /data.
+RETIRED_ARMS = frozenset(("confidence_decay", "atr_regime_calibration"))
+
 
 def _load_script(fname: str):
     spec = importlib.util.spec_from_file_location(
@@ -72,11 +81,23 @@ def backfill_surface():
 
 
 def test_every_canonical_mode_arm_is_gradeable(canonical_arm_blocks, rater_labels):
-    """Every block that can be mode=enforce must be visible to the INERT rater."""
-    missing = sorted(b for b in canonical_arm_blocks if b not in rater_labels)
+    """Every block that can be a live mode=enforce path must be visible to the
+    INERT rater. Retired blocks are excluded (they default off, no money path)."""
+    missing = sorted(b for b in canonical_arm_blocks
+                     if b not in rater_labels and b not in RETIRED_ARMS)
     assert not missing, (
         f"以下可 enforce 的臂评级器看不见（资金路径无证据开关）：{missing}；"
         "请加入 shadow_progress.ARMS")
+
+
+def test_retired_arms_are_off(canonical_arm_blocks):
+    """Retired blocks must exist in config but default to mode=off so they can
+    never silently become a live money path the rater does not cover."""
+    for arm in RETIRED_ARMS:
+        blk = canonical_arm_blocks.get(arm)
+        assert blk is not None, f"退役臂配置块缺失：{arm}"
+        assert str(blk.get("mode")) == "off", (
+            f"退役臂 {arm} 必须默认 mode=off，实际 {blk.get('mode')!r}")
 
 
 def test_every_rater_arm_is_on_evidence_surface(rater_labels, backfill_surface):

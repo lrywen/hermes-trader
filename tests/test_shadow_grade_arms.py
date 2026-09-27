@@ -398,9 +398,10 @@ def test_change_arm_promote_shows_beneficial_rate_when_backfilled(sg):
 def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
     # CS-C gate fix: a change arm whose backfilled counterfactual outcomes are
     # mostly "win" (arm-HARMFUL: the change foregoes profit) must be REVIEW,
-    # even when it never writes pnl_usd (confidence_decay / atr_regime_calib).
-    # Before the fix the `kind == "block"` guard skipped the high-harm-rate
-    # branch for change arms and such an arm was mislabelled PROMOTE_CANDIDATE.
+    # even when it never writes pnl_usd. Before the fix the `kind == "block"`
+    # guard skipped the high-harm-rate branch for change arms and such an arm
+    # was mislabelled PROMOTE_CANDIDATE. (Vehicle: the surviving change arm
+    # signal_age_decay; confidence_decay/atr_regime_calib were retired 2026-09.)
     now = 1_700_000_000_000.0
     recs = []
     # 20 harmful (outcome=win, no pnl_usd at all) + 5 beneficial (outcome=loss),
@@ -412,7 +413,7 @@ def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
         recs.append(_rec(now, would_change=True, outcome="loss"))
     for i in range(40):
         recs.append(_rec(now, would_change=(i < 4)))
-    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["kind"] == "change"
     assert out["verdict"] == sg.REVIEW
@@ -959,7 +960,7 @@ def test_shadow_wide_but_healthy_outcomes_still_review(sg):
     recs = [_rec(now, would_change=True, outcome="win") for _ in range(5)]
     recs += [_rec(now, would_change=True, outcome="loss") for _ in range(45)]
     recs += [_rec(now, would_change=False, outcome="loss") for _ in range(10)]
-    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.REVIEW
     assert out["windows"][-1]["decisions"] == 60
@@ -968,19 +969,20 @@ def test_shadow_wide_but_healthy_outcomes_still_review(sg):
 # ── M3: PROMOTE requires ≤40% harm rate safety margin ────────────────────────
 
 def test_promote_grey_zone_45pct_harm_is_collecting(sg):
-    # confidence_decay production profile: 45.1% harm rate, healthy backfill.
+    # 45.1% harm rate change-arm profile, healthy backfill. (Vehicle: the
+    # surviving change arm signal_age_decay.)
     now = 1_700_000_000_000.0
     recs = []
     # 45% harm rate (45 wins / 100 mature) on hit records. All 400 records are
     # mature (100% backfill clears M4); only the first 100 are hits so the
     # overall hit rate is 25% (under the too-wide line).
     for _ in range(45):
-        recs.append(_rec(now, would_block_gate=True, outcome="win"))
+        recs.append(_rec(now, would_change=True, outcome="win"))
     for _ in range(55):
-        recs.append(_rec(now, would_block_gate=True, outcome="loss"))
+        recs.append(_rec(now, would_change=True, outcome="loss"))
     for _ in range(300):
-        recs.append(_rec(now, would_block_gate=False, outcome="loss"))
-    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+        recs.append(_rec(now, would_change=False, outcome="loss"))
+    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.COLLECTING
     assert "安全余量" in out["reason"]
@@ -1425,24 +1427,24 @@ def test_manual_history_not_deduped_against_cron(sg, tmp_path, monkeypatch):
 # ── 分母修正（2026-09-10）：harm rate denominator = hit-and-mature set ───────
 
 def test_harm_rate_uses_hit_set_denominator(sg):
-    # confidence_decay production profile: 754 mature overall but only the
-    # would_block_gate=True rows are the arm's decisions. 340/754 = 45% on all
-    # records; on the hit set it is much higher. Non-hit outcomes must not
-    # dilute the rate.
+    # A change arm with many mature records overall but only the
+    # would_change=True rows are the arm's decisions. 90/754 = 12% on all
+    # records; on the hit set it is 45%. Non-hit outcomes must not dilute the
+    # rate. (Vehicle: the surviving change arm signal_age_decay.)
     now = 1_700_000_000_000.0
     recs = []
     # Hit set: 200 mature, 45% harmful (90 win / 110 loss).
     for _ in range(90):
-        recs.append(_rec(now, would_block_gate=True, outcome="win"))
+        recs.append(_rec(now, would_change=True, outcome="win"))
     for _ in range(110):
-        recs.append(_rec(now, would_block_gate=True, outcome="loss"))
+        recs.append(_rec(now, would_change=True, outcome="loss"))
     # Non-hit mature tail (the gate didn't act, outcomes irrelevant) +
     # non-mature records to mirror the real long tail.
     for _ in range(554):
-        recs.append(_rec(now, would_block_gate=False, outcome="loss"))
+        recs.append(_rec(now, would_change=False, outcome="loss"))
     for _ in range(3109):
-        recs.append(_rec(now, would_block_gate=False))
-    out = sg.grade_arm("confidence_decay", "shadow", "p.jsonl", [168],
+        recs.append(_rec(now, would_change=False))
+    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     # All-records win rate would be 90/754 = 12%; hit-set rate is 45%.
     assert out["hit_set_harmful_rate"] == sg.pytest.approx(0.45, abs=0.001) \
