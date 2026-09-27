@@ -1079,23 +1079,6 @@ def side_adjusted_own_gap(side: str, close4h: Any,
     return raw if str(side or "").lower() == "long" else -raw
 
 
-def classify_regime_alignment(mr: dict[str, Any]) -> tuple[bool, bool]:
-    """Translate a market_regime gate output into (counter_regime, weak_aligned).
-
-    ``counter_regime`` is True only for a GENUINE counter-trend (direction
-    opposite the detected regime) or a trade against the funding crowd. A
-    weak-aligned trade (EMA-aligned but below the continuous trend-score
-    floor; the gate marks it ``weak_trend_score`` and folds it into
-    ``counter_trend`` so it faces the elevated conviction bar) is NOT
-    counter-trend in direction and is reported separately as
-    ``weak_aligned`` instead of being mislabelled as counter-regime.
-    """
-    weak = bool(mr.get("weak_trend_score"))
-    counter = ((bool(mr.get("counter_trend")) and not weak)
-               or bool(mr.get("against_funding")))
-    return counter, weak
-
-
 def market_regime_gate(ctx: GateContext, counter_regime_min_conf: float = 0.7,
                        block_counter_trend_bypass: bool = False,
                        crowded_with_min_conf: float = 0.0,
