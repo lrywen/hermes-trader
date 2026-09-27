@@ -156,11 +156,6 @@ def _maker_ttl_bars() -> int:
         return 30
 
 
-def _maker_candle_lookback() -> int:
-    """1m candles fetched per mark (covers the resting TTL plus the post bar)."""
-    return _maker_ttl_bars() + 5
-
-
 def _max_positions() -> int:
     """Concurrent-position cap for EACH paper account.
 
@@ -882,32 +877,40 @@ class ShadowBook:
         the fetched window; the window is sized to cover the resting TTL.
         """
         from hermes_trader.client.hl_client import fetch_hl_candles
-        from hermes_trader.execution.maker_shadow import ShadowMakerOrder, simulate_shadow_order
+        from hermes_trader.execution.maker_shadow import (
+            ShadowMakerOrder, simulate_shadow_order, locate_posted_bar_idx)
 
         acc = self._account("maker_shadow")
         if not acc["pending_orders"]:
             return
-        lookback = _maker_candle_lookback()
         ttl = _maker_ttl_bars()
+        # Window must span the real post bar through post+TTL. The order has
+        # rested <= TTL bars, so the most recent (TTL + post bar + one slack)
+        # candles always cover it.
+        fetch_n = ttl + 2
         for order in list(acc["pending_orders"]):
             coin = order["coin"]
             side = order["side"]
+            posted_at = int(order["posted_at"])
             try:
-                bars = fetch_hl_candles(coin, "1m", lookback, opportunistic=True)
+                bars = fetch_hl_candles(coin, "1m", fetch_n, opportunistic=True)
             except Exception as e:
                 logger.debug(f"[shadow_book] maker candles miss {coin}: {e}")
                 continue
-            # Need at least the post bar + one forward bar to judge a touch.
-            if len(bars) < 2:
+            # Locate the real post bar from the order's timestamp instead of
+            # hard-coding idx 0. Until at least one bar has closed after
+            # posting, the order simply rests (skip this cycle).
+            posted_idx = locate_posted_bar_idx(bars, posted_at)
+            if posted_idx is None or posted_idx >= len(bars) - 1:
                 continue
             sim = ShadowMakerOrder(
                 coin=coin,
                 is_buy=(side == "long"),
                 size=float(order["size_usd"]),
-                posted_bar_idx=0,
+                posted_bar_idx=posted_idx,
                 limit_px=float(order["limit_px"]),
                 post_mid_px=float(order["post_mid_px"]),
-                ttl_bars=min(ttl, len(bars) - 1),
+                ttl_bars=min(ttl, len(bars) - 1 - posted_idx),
             )
             verdict = simulate_shadow_order(sim, bars)
             if verdict.filled:
@@ -923,7 +926,7 @@ class ShadowBook:
                     })
             elif verdict.canceled:
                 # TTL of resting time elapsed without a touch.
-                age_min = (_now_ms() - int(order["posted_at"])) / 60000.0
+                age_min = (_now_ms() - posted_at) / 60000.0
                 if age_min >= ttl:
                     acc["pending_orders"] = [
                         o for o in acc["pending_orders"] if o["id"] != order["id"]]

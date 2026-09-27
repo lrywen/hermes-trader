@@ -89,6 +89,26 @@ def would_fill_on_bar(order: ShadowMakerOrder, bar: Candle) -> bool:
     return bar.h >= order.limit_px
 
 
+def locate_posted_bar_idx(bars: list[Candle], posted_at_ms: float,
+                          bar_period_ms: int = 60_000) -> Optional[int]:
+    """Index of the last bar that had CLOSED when the order was posted.
+
+    The touch test may only run on bars strictly after posting, so the
+    returned index is the most recent bar whose close-time (``t +
+    bar_period_ms``) is <= ``posted_at_ms``. A bar still forming at post
+    time is excluded (its high/low did not yet exist and using it would be
+    look-ahead). Returns None when no closed bar precedes the post time
+    (the order must rest until at least one later bar is available).
+    """
+    idx: Optional[int] = None
+    for i, bar in enumerate(bars):
+        if bar.t + bar_period_ms <= posted_at_ms:
+            idx = i
+        else:
+            break
+    return idx
+
+
 def simulate_shadow_order(
     order: ShadowMakerOrder,
     bars: list[Candle],

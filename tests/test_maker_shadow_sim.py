@@ -5,6 +5,7 @@ from __future__ import annotations
 from hermes_trader.execution.maker_shadow import (
     FillTimePolicy,
     ShadowMakerOrder,
+    locate_posted_bar_idx,
     simulate_shadow_order,
     would_fill_on_bar,
 )
@@ -98,3 +99,46 @@ def test_ttl_expiry_cancels():
     assert f.canceled is True
     assert f.resting_bars is None
     assert f.maker_edge_bps is None
+
+
+# ---------- locate_posted_bar_idx：按真实 posted_at 锚定，防前视 ----------
+
+def test_locate_picks_last_bar_closed_at_post_time():
+    bars = [bar(0), bar(60_000), bar(120_000), bar(180_000)]
+    # posted 2:30 (150k): t=60k closed at 120k; t=120k closes at 180k
+    # (still forming) → posted idx = 1
+    assert locate_posted_bar_idx(bars, 150_000) == 1
+
+
+def test_locate_excludes_bar_still_forming_at_post():
+    bars = [bar(0), bar(60_000)]
+    # posted 1:00 sharp → bar t=0 just closed; t=60k is the forming bar
+    assert locate_posted_bar_idx(bars, 60_000) == 0
+
+
+def test_locate_none_when_no_closed_bar_precedes_post():
+    bars = [bar(60_000)]
+    assert locate_posted_bar_idx(bars, 90_000) is None
+
+
+def test_fill_never_precedes_real_post_time():
+    # Regression for SUI 2026-09-27: old code hard-coded posted idx 0 and
+    # filled on an early bar before the order existed. Anchor the post bar by
+    # timestamp; the touch must only occur on a LATER bar.
+    bars = [
+        bar(0, l=90.0),        # long before post — would "fill" if idx0 used
+        bar(60_000, l=91.0),
+        bar(120_000, l=100.0), # real post bar (closed at 180k)
+        bar(180_000, l=100.0), # first bar after posting — does not touch 99
+        bar(240_000, l=98.0),  # touches 99 → real fill
+        bar(300_000, l=97.0),
+    ]
+    posted = 185_000
+    pidx = locate_posted_bar_idx(bars, posted)
+    assert pidx == 2
+    f = simulate_shadow_order(
+        _order(True, limit=99.0, posted=pidx, ttl=5), bars)
+    assert f.filled is True
+    assert f.fill_bar_idx == 4
+    assert f.fill_ms == 240_000          # strictly after the post time
+    assert f.resting_bars == 2

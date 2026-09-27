@@ -98,6 +98,9 @@ def test_maker_touch_fills_position(tmp_path, monkeypatch):
     book.shadow_open(coin="BTC", side="long", entry_px=100.0,
                      size_usd=1000.0, leverage=1)
     order = _resting_order(book)
+    # Pin the real post time to the close of bar0 so locate_posted_bar_idx
+    # anchors bar0 as the posted bar and only bar1+ are judged for a touch.
+    order["posted_at"] = _T0 + 60_000
 
     # bar0 = post bar (no look-back fill); bar1 dips to the limit (99.95).
     bars = [
@@ -135,6 +138,7 @@ def test_maker_no_touch_keeps_resting_within_ttl(tmp_path, monkeypatch):
     book = sb.ShadowBook(path=str(tmp_path / "s.json"))
     book.shadow_open(coin="BTC", side="long", entry_px=100.0,
                      size_usd=1000.0, leverage=1)
+    _resting_order(book)["posted_at"] = _T0 + 60_000
     # price never dips near the 99.95 limit
     bars = [_candle(i, 100.0, 100.2, 99.99, 100.1)
             for i in range(5)]
@@ -156,9 +160,10 @@ def test_maker_ttl_expiry_cancels_order(tmp_path, monkeypatch):
                      size_usd=1000.0, leverage=1)
     # Force the real posted age past the TTL so the cancel branch fires.
     order = _resting_order(book)
-    order["posted_at"] = sb._now_ms() - 31 * 60 * 1000
+    order["posted_at"] = _T0 - 31 * 60 * 1000
+    # Bars must span the real post bar (31 min back) through now; none touch.
     bars = [_candle(i, 100.0, 100.2, 99.99, 100.1)
-            for i in range(35)]
+            for i in range(-32, 3)]
     monkeypatch.setattr(
         "hermes_trader.client.hl_client.fetch_hl_candles",
         lambda *a, **k: bars)
@@ -255,6 +260,7 @@ def test_maker_stats_aggregate_adverse_selection(tmp_path, monkeypatch):
     book = sb.ShadowBook(path=str(tmp_path / "s.json"))
     book.shadow_open(coin="BTC", side="long", entry_px=100.0,
                      size_usd=1000.0, leverage=1)
+    _resting_order(book)["posted_at"] = _T0 + 60_000
     bars = [
         _candle(0, 100.0, 100.1, 99.98, 100.0),
         _candle(1, 100.0, 100.0, 99.90, 99.96),
