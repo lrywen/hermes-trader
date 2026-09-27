@@ -78,3 +78,34 @@ def test_every_arm_row_has_six_fields_and_valid_defaults(sp):
         assert mode_key in ("mode", "sizing_v2_mode"), row
         assert path_key in ("shadow_log_path", "sizing_v2_shadow_log_path",
                             "log_path"), row
+
+
+def test_llm_probe_arms_default_to_writable_data_dir(sp):
+    """Audit 2026-09-27: collect() must pass label into _arm_path so the LLM
+    rollout probes default to the writable /data dir (research.py uses
+    HERMES_DATA_DIR), not the read-only HOME mount. Previously the missing
+    label made the rater raise a false "read-only mount" health alert while
+    the real writes succeeded under /data."""
+    cfg = {
+        "reasoning_effort_rollout": {"mode": "enforce", "log_path": ""},
+        "completion_cap_shadow": {"mode": "shadow", "log_path": ""},
+    }
+    for label in ("reasoning_effort_rollout", "completion_cap_shadow"):
+        _, blk, env_file, default_name, _, path_key = _row(sp, label)
+        path = sp._arm_path(cfg, blk, env_file, default_name, path_key,
+                            label=label)
+        assert path == os.path.join("/data", default_name)
+
+    # End-to-end: collect() must not flag these arms on a read-only mount.
+    sp._file_stat = lambda path: {"path": path, "exists": True, "lines": 1,
+                                  "bad_lines": 0, "last_mod": None,
+                                  "age_min": 0, "rotated": 0, "size": 1}
+    report = sp.collect()
+    by_arm = {a["arm"]: a for a in report["arms"]}
+    for label in ("reasoning_effort_rollout", "completion_cap_shadow"):
+        assert by_arm[label]["on_readonly_mount"] is False
+    assert not [a for a in report["alerts"]
+                if "只读挂载" in a
+                and any(label in a for label in
+                        ("reasoning_effort_rollout", "completion_cap_shadow"))]
+

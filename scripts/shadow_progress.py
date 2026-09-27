@@ -191,7 +191,8 @@ def collect() -> dict:
     arms, alerts = [], []
     for label, blk_name, env_file, default_name, mode_key, path_key in ARMS:
         mode = _arm_mode(cfg, blk_name, env_file, mode_key)
-        path = _arm_path(cfg, blk_name, env_file, default_name, path_key)
+        path = _arm_path(cfg, blk_name, env_file, default_name, path_key,
+                         label=label)
         stat = _file_stat(path)
         on_readonly = os.path.dirname(os.path.abspath(path)) == os.path.abspath(READONLY_HOME)
         arms.append({"arm": label, "mode": mode, "path": path,
