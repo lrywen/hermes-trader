@@ -2508,6 +2508,9 @@ while True:
                         # neutral / confidence / composite / trigger:<name> / blocked.
                         _all_gates = result.get("gate_results") or {}
                         mr = _all_gates.get("market_regime") or {}
+                        from hermes_trader.agents.risk_gates import (
+                            classify_regime_alignment)
+                        _counter_regime, _weak_aligned = classify_regime_alignment(mr)
                         # Persist a compact pass/fail summary of ALL gates so the
                         # event log can reconstruct which gates blocked a trade
                         # (previously only market_regime's 4 fields were saved).
@@ -2538,7 +2541,12 @@ while True:
                                    "regime": mr.get("regime"),
                                    "funding_regime": mr.get("funding"),
                                    "regime_via": mr.get("via"),
-                                   "counter_regime": mr.get("counter_trend") or mr.get("against_funding"),
+                                   # See risk_gates.classify_regime_alignment:
+                                   # weak-aligned (e.g. SUI 2026-09-27 up/long,
+                                   # trend_score 0.334) is reported separately,
+                                   # not mislabelled as counter-regime.
+                                   "weak_aligned": _weak_aligned,
+                                   "counter_regime": _counter_regime,
                                    "gates": _gates_summary,
                                    "gate_results": _all_gates})
                         _cycle_outcomes.append((_r_coin, "execute", executed,

@@ -1618,6 +1618,7 @@ def _open_row(e: dict[str, Any]) -> dict[str, Any]:
         "regime": e.get("regime"),
         "funding_regime": e.get("funding_regime"),
         "counter_regime": e.get("counter_regime"),
+        "weak_aligned": e.get("weak_aligned"),
         "sl_missing": e.get("sl_missing"),
         "bracket_error": e.get("bracket_error"),
         "gates": e.get("gates"),
