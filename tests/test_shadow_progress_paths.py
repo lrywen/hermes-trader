@@ -76,4 +76,5 @@ def test_every_arm_row_has_six_fields_and_valid_defaults(sp):
         assert env_file.endswith("_SHADOW_FILE"), row
         assert default_name.endswith(".jsonl"), row
         assert mode_key in ("mode", "sizing_v2_mode"), row
-        assert path_key in ("shadow_log_path", "sizing_v2_shadow_log_path"), row
+        assert path_key in ("shadow_log_path", "sizing_v2_shadow_log_path",
+                            "log_path"), row

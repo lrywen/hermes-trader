@@ -82,6 +82,7 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     ("reentry_cap", "reentry_cap_shadow.jsonl"),
     ("signal_age_decay", "signal_age_decay_shadow.jsonl"),
     ("regime_overlay", "regime_overlay_shadow.jsonl"),
+    ("confidence_decay", "confidence_decay_shadow.jsonl"),
 )
 
 # Counterfactual probe arms (change/stricter-rule simulations) encode outcome

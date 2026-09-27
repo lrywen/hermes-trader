@@ -341,7 +341,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     body = r.json()
     assert body["files_present"] == 4
     by_arm = {a["arm"]: a for a in body["arms"]}
-    assert len(by_arm) == 7
+    assert len(by_arm) == 14
 
     ta = by_arm["ta_late_entry"]
     assert ta["present"] is True and ta["records"] == 3
@@ -364,7 +364,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     assert xs["extras"]["forward"]["72h"]["n"] == 1
     assert xs["extras"]["forward"]["168h"] is None
 
-    atr = by_arm["atr_regime_calib"]
+    atr = by_arm["atr_regime_calibration"]
     assert atr["extras"]["would_change"] == 2
     d = atr["extras"]["calibration_delta"]
     assert d["n"] == 2
@@ -389,7 +389,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     assert rt["by_side"]["long"]["n"] == 1
     assert rt["by_side"]["short"]["arm_harmful_rate"] == 0.0
 
-    for missing in ("pullback", "daily_extension_cap", "trend_filter"):
+    for missing in ("pullback", "daily_extension_cap", "trend_filter_200ma"):
         assert by_arm[missing]["present"] is False
         assert by_arm[missing]["records"] == 0
         assert "note" in by_arm[missing]
