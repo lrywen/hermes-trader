@@ -610,9 +610,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "presubscribe_pool": _num_leaf(0, 500),
         "presubscribe_max": _num_leaf(0, 100),
         "presubscribe_compress_pct_max": _num_leaf(0.0, 100.0),
-        "weight_aggression": _num_leaf(0.0, 1.0),
-        "weight_imbalance": _num_leaf(0.0, 1.0),
-        "weight_compression": _num_leaf(0.0, 1.0),
         # 低位启动放行：对“位置低（启动前未涨）+ 真实 flow 转强”但 confidence
         # 差门槛一点的 LONG 开口子。仅放宽 runner_gate 的 confidence 拦截，其余
         # 闸门（late_chase / 流动性 / counter-regime 等）仍照常执行。
@@ -729,6 +726,22 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "require_rvol": _num_leaf(0.0, 1000.0),
         }),
     },
+    # P0 (生成端核查 2026-09-27): circuit_breaker 是最需要保护的熔断块，
+    # 此前不在深度校验范围内，坏值（如 max_drawdown_pct=0）能静默废掉保护。
+    # 区间允许调参（含 <=0 表示禁用的语义由读取侧处理），但拒绝明显异常值。
+    "circuit_breaker": {
+        "single_coin_loss_pct": _num_leaf(0.0, 100.0),
+        "single_coin_halt_min": _num_leaf(0.0, 100_000.0),
+        "daily_loss_pct": _num_leaf(0.0, 100.0),
+        "daily_halt_min": _num_leaf(0.0, 100_000.0),
+        "consecutive_loss_limit": ("int", 0, 10_000),
+        "coin_daily_loss_pct": _num_leaf(0.0, 100.0),
+        "max_drawdown_pct": _num_leaf(0.0, 100.0),
+        "resp_unknown_halt_n": ("int", 0, 10_000),
+        "resp_unknown_halt_min": _num_leaf(0.0, 100_000.0),
+        "drawdown_peak_window_days": _num_leaf(0.0, 3650.0),
+        "drawdown_cooldown_hours": _num_leaf(0.0, 87_600.0),
+    },
     # Audit 2026-09-12 (#4 majors-missed-surge): σ-burst surfacing gate.
     "sigma_burst_gate": {
         "enabled": ("bool",),
@@ -839,7 +852,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "enabled": ("bool",),
         "resting_lifecycle_ready": ("bool",),
         "offset_bps": _num_leaf(0.0, 1000.0),
-        "ttl_seconds": ("int", 0, 100_000),
         "max_notional_usd": _num_leaf(0.0, 1_000_000.0),
     },
     # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: per-coin rolling

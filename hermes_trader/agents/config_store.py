@@ -285,9 +285,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "presubscribe_pool": 60,       # 从流动 universe 头部取多少币做压缩筛查
         "presubscribe_max": 12,       # 额外提前订阅的未触发币上限
         "presubscribe_compress_pct_max": 20.0,  # 带宽分位 ≤ 此值视为蓄力候选
-        "weight_aggression": 0.5,
-        "weight_imbalance": 0.2,
-        "weight_compression": 0.3,
         # 低位启动放行（默认关闭，开启后也只在 shadow 记录/放行；先影子验证）。
         "low_position_relax": {
             "enabled": False,
@@ -527,7 +524,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "enabled": False,
         "resting_lifecycle_ready": False,
         "offset_bps": 5.0,
-        "ttl_seconds": 300,
         "max_notional_usd": 100.0,
     },
     "runner_entry_gate": {
