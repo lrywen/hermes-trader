@@ -568,6 +568,15 @@ def _scan_single_market(
         if scan_cfg.get("evaluateClosedBarsOnly", True) and candles_1h:
             candles_1h, _ = _drop_forming_bar(candles_1h, "1h")
 
+        # 15m candles for rangeCompression (w6: upgraded from 5m so the squeeze
+        # read filters 5m noise). Failure is non-fatal — the trigger just won't fire.
+        candles_15m = _fetch_candles_sync(
+            market["coin"], "15m", 48,
+            scan_cfg.get("cacheTtlMs15m", 300_000),
+        ) or []
+        if scan_cfg.get("evaluateClosedBarsOnly", True) and candles_15m:
+            candles_15m, _ = _drop_forming_bar(candles_15m, "15m")
+
         thresholds = config["thresholds"]
         _lc_capture = (config.get("launch_capture") or {})
         _flow_confirm = None
@@ -614,14 +623,8 @@ def _scan_single_market(
         )
         _volume_profile_info = None
         if _vp is not None:
-            _atr_last = None
-            try:
-                from hermes_trader.indicators.math import atr as atr_series
-                _atr_values = atr_series(candles, 14)
-                _atr_last = next((v for v in reversed(_atr_values)
-                                  if v == v and v > 0), None)
-            except Exception:
-                _atr_last = None
+            # reuse the ATR14 already computed inside volume_profile (w7).
+            _atr_last = _vp.atr_last
             _volume_profile_info = {
                 "poc": _vp.poc,
                 "vah": _vp.vah,
@@ -646,8 +649,8 @@ def _scan_single_market(
                 flow_confirm_min=float(
                     (config.get("launch_capture") or {}).get("flow_confirm_min", 0.7)),
             ),
-            trigger_mod.range_compression(candles, thresholds["bbLength"], thresholds["bbStdDev"]),
-            trigger_mod.trend_strength(candles, thresholds["adxPeriod"]),
+            trigger_mod.range_compression(candles_15m, thresholds["bbLength"], thresholds["bbStdDev"]),
+            trigger_mod.trend_strength(candles_1h, thresholds["adxPeriod"]),
             trigger_mod.momentum_burst(candles, thresholds["momentumLookback"], thresholds["momentumPct"]),
             trigger_mod.volume_buildup_1h(candles_1h, thresholds.get("volBuildupRatio", 2.5)),
             trigger_mod.trend_flip_1h(candles_1h, thresholds.get("trendFlipBars", 3)),

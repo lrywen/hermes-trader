@@ -97,19 +97,20 @@ def test_r13_b8_trigger_thresholds_defaults_mirror_trigger_config():
 
 def test_r13_b8_trigger_weights_individual_values():
     w = CANONICAL_DEFAULTS["trigger_weights"]
-    assert w["trend_strength"] == 0.55
+    assert w["trend_strength"] == 0.30
     assert w["pct_move_spike"] == 0.40
     assert w["breakout"] == 0.30
     assert w["volume_spike"] == 0.25
     assert w["momentum_burst"] == 0.20
     assert w["volume_buildup_1h"] == 0.15
+    assert w["uptrend_momentum"] == 0.20
 
 
-def test_r13_b8_six_weights_intentionally_zero():
-    """六个权重故意为 0（净负 lift / surfacing-only），canonical 必须保持 0。"""
+def test_r13_b8_five_weights_intentionally_zero():
+    """五个权重故意为 0（净负 lift / surfacing-only），canonical 必须保持 0。"""
     w = CANONICAL_DEFAULTS["trigger_weights"]
     for leaf in ("higher_lows_1h", "trend_flip_1h", "range_compression",
-                 "uptrend_momentum", "downtrend_momentum", "daily_mover"):
+                 "downtrend_momentum", "daily_mover"):
         assert w[leaf] == 0.0, f"{leaf} 应为故意 0 权重，实际 {w[leaf]!r}"
 
 
@@ -126,8 +127,8 @@ def test_r13_b8_trigger_thresholds_individual_values():
     assert t["bb_length"] == 20
     assert t["bb_std_dev"] == 2
     assert t["adx_period"] == 14
-    assert t["momentum_lookback"] == 2
-    assert t["momentum_pct"] == 4.0
+    assert t["momentum_lookback"] == 3
+    assert t["momentum_pct"] == 3.0
     assert t["vol_buildup_ratio"] == 2.5
     assert t["trend_flip_bars"] == 3
     assert t["higher_lows_required"] == 4
@@ -136,7 +137,7 @@ def test_r13_b8_trigger_thresholds_individual_values():
 def test_r13_b8_trigger_config_itself_unchanged():
     """TRIGGER_CONFIG 字面量保持原样（回测脚本直读的外部符号）。"""
     assert TRIGGER_CONFIG["thresholds"]["trendMomentumPct"] == 5.0
-    assert TRIGGER_CONFIG["weights"]["trendStrength"] == 0.55
+    assert TRIGGER_CONFIG["weights"]["trendStrength"] == 0.30
     assert len(TRIGGER_CONFIG["weights"]) == 12
     assert len(TRIGGER_CONFIG["thresholds"]) == 16
 
@@ -203,7 +204,7 @@ def test_r13_b8_read_agent_config_exposes_blocks():
     cfg = read_agent_config()
     assert "trigger_weights" in cfg
     assert "trigger_thresholds" in cfg
-    assert cfg["trigger_weights"]["trend_strength"] == 0.55
+    assert cfg["trigger_weights"]["trend_strength"] == 0.30
     assert cfg["trigger_thresholds"]["trend_momentum_pct"] == 5.0
 
 
@@ -218,7 +219,7 @@ def test_r13_b8_read_agent_config_deep_merges_partial_overlay(tmp_path, monkeypa
 
     cfg = read_agent_config()
     assert cfg["trigger_weights"]["breakout"] == 0.65          # 覆盖
-    assert cfg["trigger_weights"]["trend_strength"] == 0.55   # canonical 保留
+    assert cfg["trigger_weights"]["trend_strength"] == 0.30   # canonical 保留
     assert cfg["trigger_thresholds"]["momentum_pct"] == 5.5   # 覆盖
     assert cfg["trigger_thresholds"]["trend_momentum_pct"] == 5.0
 
@@ -243,7 +244,7 @@ def test_r13_b8_config_patch_knows_both_fields():
     assert "trigger_thresholds" in fields
     w = fields["trigger_weights"].default_factory()
     t = fields["trigger_thresholds"].default_factory()
-    assert w["trend_strength"] == 0.55
+    assert w["trend_strength"] == 0.30
     assert t["trend_momentum_pct"] == 5.0
 
 
@@ -266,7 +267,7 @@ def test_r13_b8_weights_helper_env_override_flows_to_camel_key(monkeypatch):
     monkeypatch.setenv("HERMES_CFG_TRIGGER_WEIGHTS__BREAKOUT", "0.88")
     w = trigger_weights_params(config={})
     assert w["breakout"] == 0.88
-    assert w["trendStrength"] == 0.55  # 其余不动
+    assert w["trendStrength"] == 0.30  # 其余不动
 
 
 def test_r13_b8_thresholds_helper_env_override_flows_to_camel_key(monkeypatch):
@@ -288,11 +289,11 @@ def test_r13_b8_helper_config_dict_override():
 def test_r13_b8_weights_guard_negative_falls_back(monkeypatch):
     monkeypatch.setenv("HERMES_CFG_TRIGGER_WEIGHTS__TREND_STRENGTH", "-0.5")
     w = trigger_weights_params(config={})
-    assert w["trendStrength"] == 0.55  # 负权重非法 → 字面量
+    assert w["trendStrength"] == 0.30  # 负权重非法 → 字面量
 
 
 def test_r13_b8_weights_guard_zero_is_legal(monkeypatch):
-    """权重 0 合法（六个零权重是有意的）；把正权重覆成 0 必须生效。"""
+    """权重 0 合法（零权重是有意的）；把正权重覆成 0 必须生效。"""
     monkeypatch.setenv("HERMES_CFG_TRIGGER_WEIGHTS__TREND_STRENGTH", "0")
     w = trigger_weights_params(config={})
     assert w["trendStrength"] == 0.0
@@ -325,9 +326,9 @@ def test_r13_b8_helper_returns_independent_copy():
     t1["bbLength"] = 999
     w2 = trigger_weights_params(config={})
     t2 = trigger_thresholds_params(config={})
-    assert w2["trendStrength"] == 0.55
+    assert w2["trendStrength"] == 0.30
     assert t2["bbLength"] == 20
-    assert TRIGGER_CONFIG["weights"]["trendStrength"] == 0.55
+    assert TRIGGER_CONFIG["weights"]["trendStrength"] == 0.30
     assert TRIGGER_CONFIG["thresholds"]["bbLength"] == 20
 
 

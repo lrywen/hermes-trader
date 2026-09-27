@@ -133,10 +133,11 @@ def test_directional_momentum_triggers_are_symmetric():
     assert uptrend_momentum(down, 72, 3.0)["fired"] is False
     assert uptrend_momentum(flat, 72, 3.0)["fired"] is False
     assert downtrend_momentum(flat, 72, 3.0)["fired"] is False
-    # weight 0 in config → no composite-denominator impact (gate calibration intact)
+    # downtrend weight stays 0 (negative EV chase); uptrend was promoted to a
+    # scored weight 0.20 (only stable positive-EV trigger, 2026-09-28 reweight).
     from hermes_trader.agents.config import get_config
     w = get_config()["weights"]
-    assert w["uptrendMomentum"] == 0.0 and w["downtrendMomentum"] == 0.0
+    assert w["uptrendMomentum"] == 0.20 and w["downtrendMomentum"] == 0.0
 
 
 def test_atr_rsi_adx_produce_finite_output():

@@ -91,21 +91,6 @@ def test_compression_insufficient_data():
     assert ms_mod.compression_extreme(_flat_candles(10)) is None
 
 
-# ── key level ───────────────────────────────────────────────────────────────
-
-def test_near_key_level_long_on_support():
-    # A deep swing low early, then price recovers to near it.
-    candles = []
-    for i in range(60):
-        candles.append(_candle(i * 300_000, 100, 101, 99, 100))
-    # insert one deep low
-    candles[5] = _candle(5 * 300_000, 100, 100, 95, 96)
-    # latest close near (above) the 95 low but within 1 ATR
-    candles[-1] = _candle(59 * 300_000, 96, 97, 95.5, 96)
-    got = ms_mod.near_key_level(candles, "long", tolerance_atr=5.0)
-    assert got is True
-
-
 # ── flow-confirmed breakout ─────────────────────────────────────────────────
 
 def test_breakout_flow_confirmed_fires_on_single_close():

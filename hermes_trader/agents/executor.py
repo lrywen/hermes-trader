@@ -5439,11 +5439,22 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             _block = f"confidence {gate_conf:.2f} < {min_conf:.2f}"
             return f"runner_gate_blocked ({_block})"
 
-    # --- Late-entry veto: RSI extremes + over-extension from EMA21 (4h) ---
-    # These catch the "buying the top tick / selling the bottom tick" failure
-    # mode that fresh_impulse alone doesn't — a momentum burst at RSI 82 after
-    # a 12h run is still a "fresh" burst but a terrible entry. Both checks use
-    # the 4h snapshot carried in the analysis dict (computed by research()).
+    # --- Early late-entry pre-screen: RSI extremes + over-extension (4h) ---
+    # INTENTIONALLY DISTINCT from ta_filter.late_entry_check — this is an
+    # EARLY, WIDE, FAIL-OPEN pre-filter, not a duplicate of the downstream
+    # hard gate. Audit 2026-09-28 (高4) confirmed the two are not the same
+    # rule and must not be merged naively:
+    #   * timebase — reads the snapshot scalars carried in `analysis`
+    #     (rsi4h/atr4h/ema21_4h/close4h), computed by research() on the SAME
+    #     pass as the candidate. late_entry_check re-fetches 4h candles at
+    #     gate-execution, minutes later (timebase drift + an extra fetch).
+    #   * relax rule — here `regime=="up"` widens RSI to 80; the SSOT uses
+    #     ADX>=35 + trend-aligned and widens to 82.
+    #   * missing data — a missing snapshot field here FAILS OPEN (skips the
+    #     veto); late_entry_check defaults to fail_closed.
+    # The authoritative SSOT veto still runs before fill as ta_late_entry_gate
+    # in eval_all_gates(); this just sheds the worst top/bottom-tick chases
+    # earlier. Keep both; do not converge.
     rsi4h = analysis.get("rsi4h")
     rsi_overbought = float(gate.get("rsi_overbought", 75.0))
     rsi_oversold = float(gate.get("rsi_oversold", 25.0))
@@ -5471,21 +5482,30 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     atr4h = analysis.get("atr4h")
     ema21_4h = analysis.get("ema21_4h")
     close4h = analysis.get("close4h")
-    if ext_mult > 0 and atr4h and ema21_4h and close4h:
+    # 4h extension in ATR units, computed ONCE from the research snapshot and
+    # reused by both this late-entry veto and the pullback-long bypass below
+    # (w8: they previously recomputed the identical (c-e)/a separately).
+    extension_4h: Optional[float] = None
+    if atr4h and ema21_4h and close4h:
         try:
             atr_val = float(atr4h)
             ema_val = float(ema21_4h)
             close_val = float(close4h)
             if atr_val > 0 and ema_val > 0:
-                extension = (close_val - ema_val) / atr_val
-                if side == "long" and extension > ext_mult:
-                    logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR > {ext_mult}x (over-extended long)")
-                    return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
-                            f"above EMA21 — over-extended long)")
-                if side == "short" and extension < -ext_mult:
-                    logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR < -{ext_mult}x (over-extended short)")
-                    return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
-                            f"below EMA21 — over-extended short)")
+                extension_4h = (close_val - ema_val) / atr_val
+        except (TypeError, ValueError):
+            extension_4h = None
+    if ext_mult > 0 and extension_4h is not None:
+        extension = extension_4h
+        try:
+            if side == "long" and extension > ext_mult:
+                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR > {ext_mult}x (over-extended long)")
+                return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
+                        f"above EMA21 — over-extended long)")
+            if side == "short" and extension < -ext_mult:
+                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR < -{ext_mult}x (over-extended short)")
+                return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
+                        f"below EMA21 — over-extended short)")
         except (TypeError, ValueError):
             pass
 
@@ -5751,14 +5771,8 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         pb_max_rsi = float(pb_cfg.get("max_rsi", 70.0))
         pb_max_ext = float(pb_cfg.get("max_extension_atr", 2.0))
         pb_min_slow = int(pb_cfg.get("min_slow_burn", 1) or 1)
-        pb_extension = None
-        if ext_mult > 0 and atr4h and ema21_4h and close4h:
-            try:
-                _a = float(atr4h); _e = float(ema21_4h); _c = float(close4h)
-                if _a > 0 and _e > 0:
-                    pb_extension = (_c - _e) / _a
-            except (TypeError, ValueError):
-                pb_extension = None
+        # reuse the 4h ATR extension computed once above (w8).
+        pb_extension = extension_4h
         # Audit 2026-09-06 (E2, Q3): the bypass must also align with the MACRO
         # regime (BTC / SP500 proxy), not only the per-coin 4h uptrendMomentum
         # flag. In a choppy macro the 4h flag fires on false golden crosses and

@@ -16,6 +16,7 @@ class VolumeProfile:
     val: float
     bin_size: float
     bins: list[tuple[float, float]]
+    atr_last: float | None = None
 
     def position_pct(self, price: float) -> float | None:
         """VAL处为0，VAH处为100；范围为空时返回None。"""
@@ -63,18 +64,19 @@ def _candle_value(c: Any, key: str) -> float:
 
 def _resolve_bin_size(candles: list[Any], bins: int, lo: float, hi: float,
                       atr_bins: bool, atr_period: int,
-                      atr_multiple: float) -> tuple[float, int]:
+                      atr_multiple: float) -> tuple[float, int, float | None]:
     fixed_size = (hi - lo) / int(bins)
-    if not atr_bins:
-        return fixed_size, int(bins)
-
     atr_values = atr(candles, atr_period)
     finite_values = [v for v in atr_values if math.isfinite(v) and v > 0.0]
+    atr_last = finite_values[-1] if finite_values else None
+    if not atr_bins:
+        return fixed_size, int(bins), atr_last
+
     if not finite_values:
-        return fixed_size, int(bins)
+        return fixed_size, int(bins), atr_last
     dynamic_size = finite_values[-1] * float(atr_multiple)
     dynamic_bins = max(1, int(math.ceil((hi - lo) / dynamic_size)))
-    return max(dynamic_size, (hi - lo) / 10_000.0), dynamic_bins
+    return max(dynamic_size, (hi - lo) / 10_000.0), dynamic_bins, atr_last
 
 
 def volume_profile(
@@ -100,7 +102,7 @@ def volume_profile(
     if hi <= lo:
         return None
 
-    bin_size, resolved_bins = _resolve_bin_size(
+    bin_size, resolved_bins, atr_last = _resolve_bin_size(
         candles, int(bins), lo, hi, atr_bins, atr_period, atr_multiple,
     )
     counts = [0.0] * resolved_bins
@@ -152,4 +154,5 @@ def volume_profile(
         val=center(val_i),
         bin_size=bin_size,
         bins=[(center(i), counts[i]) for i in range(resolved_bins)],
+        atr_last=atr_last,
     )

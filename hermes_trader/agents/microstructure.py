@@ -353,38 +353,5 @@ def compression_extreme(candles: list[Any], lookback: int = 48) -> Optional[floa
         return None
 
 
-def near_key_level(candles: list[Any], side: str, *,
-                   pivot_lookback: int = 120,
-                   tolerance_atr: float = 1.0) -> Optional[bool]:
-    """Whether a launch is confluent with a higher-timeframe key level.
 
-    For a long, price should be breaking OUT from just above a major swing
-    LOW (the launch base sits on HTF support); for a short, from below a major
-    swing HIGH (HTF resistance). We use the most extreme pivot over
-    ``pivot_lookback`` bars as the key level and require the latest close to
-    be within ``tolerance_atr`` of it on the correct side. Returns None on
-    insufficient data so the caller fails open.
-    """
-    try:
-        from hermes_trader.indicators.math import atr as atr_arr
-        if len(candles) < 30:
-            return None
-        a = atr_arr(candles, 14)[-1]
-        if not (a == a) or a <= 0:
-            return None
-        window = candles[-pivot_lookback:]
-        def _lvl(c: Any, k: str) -> float:
-            return c.get(k) if isinstance(c, dict) else getattr(c, k)
-        swing_low = min(_lvl(c, "l") for c in window)
-        swing_high = max(_lvl(c, "h") for c in window)
-        last = _lvl(candles[-1], "c")
-        band = float(tolerance_atr) * a
-        if side == "long":
-            # Base on support: latest close is above the swing low but near it.
-            return last >= swing_low and (last - swing_low) <= band
-        else:
-            # Base under resistance: latest close below swing high but near it.
-            return last <= swing_high and (swing_high - last) <= band
-    except Exception:
-        return None
 

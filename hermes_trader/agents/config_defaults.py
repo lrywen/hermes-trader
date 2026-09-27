@@ -1348,7 +1348,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # intentionally 0.0 (net-negative / surfacing-only triggers), hence the
     # >= 0 guard. Defaults mirror TRIGGER_CONFIG verbatim; behaviour unchanged.
     "trigger_weights": {
-        "trend_strength": 0.55,
+        # 近1年事件研究（scripts/audit_triggers_1y.py）：trend_strength
+        # 触发率43%且负期望，原0.55权重过高 → 降到0.30。
+        "trend_strength": 0.30,
         "pct_move_spike": 0.40,
         "breakout": 0.30,
         "volume_spike": 0.25,
@@ -1357,7 +1359,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "higher_lows_1h": 0.0,
         "trend_flip_1h": 0.0,
         "range_compression": 0.0,
-        "uptrend_momentum": 0.0,
+        # 唯一 train/test 两段稳定正EV的trigger（虽小），从仅surfacing
+        # 转为评分项，给0.20小权重。
+        "uptrend_momentum": 0.20,
         "downtrend_momentum": 0.0,
         "daily_mover": 0.0,
     },
@@ -1384,8 +1388,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "bb_length": 20,
         "bb_std_dev": 2,
         "adx_period": 14,
-        "momentum_lookback": 2,
-        "momentum_pct": 4.0,
+        # 1年事件研究：2bar/4% 使 momentumBurst 近1年只触发9次，放宽到
+        # 3bar/3%（与 TRIGGER_CONFIG 同步）。
+        "momentum_lookback": 3,
+        "momentum_pct": 3.0,
         "vol_buildup_ratio": 2.5,
         "trend_flip_bars": 3,
         "higher_lows_required": 4,
