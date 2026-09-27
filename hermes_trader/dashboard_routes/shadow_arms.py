@@ -66,11 +66,22 @@ _BACKFILL_CACHE_KEY = "shadow_arms_backfill_summary"
 _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     ("ta_late_entry", "ta_late_entry_shadow.backfill.jsonl"),
     ("xs_reversal", "xs_reversal_shadow.backfill.jsonl"),
-    ("atr_regime_calib", "atr_regime_calib_shadow.backfill.jsonl"),
+    ("atr_regime_calibration", "atr_regime_calib_shadow.backfill.jsonl"),
     ("pullback", "pullback_shadow.backfill.jsonl"),
     ("daily_extension_cap", "daily_extension_cap_shadow.backfill.jsonl"),
     ("relax_tier", "relax_tier_shadow.backfill.jsonl"),
-    ("trend_filter", "trend_filter_shadow.backfill.jsonl"),
+    ("trend_filter_200ma", "trend_filter_shadow.backfill.jsonl"),
+    # Audit 2026-09-27 (P0 registry consistency): LLM 调用层 rollout 探针没有
+    # 离线历史回放脚本，其累积证据即主日志本身（每个 LLM 请求一行）。指向主
+    # 日志，使这两个臂在证据面可见，而非成为表外盲区。
+    ("reasoning_effort_rollout", "reasoning_effort_rollout.jsonl"),
+    ("completion_cap_shadow", "completion_cap_shadow.jsonl"),
+    # Audit 2026-09-27 (P0): 无离线回放脚本的臂，证据即主日志本身。补齐这4臂
+    # 以保证「评级器能看见的臂，证据面也能看见」。
+    ("market_circuit", "market_circuit_shadow.jsonl"),
+    ("reentry_cap", "reentry_cap_shadow.jsonl"),
+    ("signal_age_decay", "signal_age_decay_shadow.jsonl"),
+    ("regime_overlay", "regime_overlay_shadow.jsonl"),
 )
 
 # Counterfactual probe arms (change/stricter-rule simulations) encode outcome
@@ -80,7 +91,8 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
 # pnl win_rate is renamed arm_harmful_rate so no metric name carries opposite
 # meanings across arms.
 _COUNTERFACTUAL_ARMS = frozenset({
-    "atr_regime_calib", "daily_extension_cap", "relax_tier", "trend_filter",
+    "atr_regime_calibration", "daily_extension_cap", "relax_tier",
+    "trend_filter_200ma",
 })
 _COUNTERFACTUAL_SEMANTICS = "counterfactual: outcome win=arm-harmful loss=arm-beneficial"
 
@@ -116,7 +128,7 @@ def _arm_extras(arm: str, rows: list[dict]) -> dict:
         for label, key in (("24h", "fwd24h_pct"), ("72h", "fwd72h_pct"), ("168h", "fwd168h_pct")):
             fwd[label] = _pnl_stats((r.get("forward") or {}).get(key) for r in rows)
         extras["forward"] = fwd
-    elif arm == "atr_regime_calib":
+    elif arm == "atr_regime_calibration":
         changed = [r for r in rows if r.get("would_change")]
         extras["would_change"] = len(changed)
         deltas = [

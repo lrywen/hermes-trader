@@ -62,11 +62,37 @@ ARMS = [
     ("trend_filter_200ma",  "trend_filter_200ma",  "HERMES_TREND_FILTER_SHADOW_FILE",        "trend_filter_shadow.jsonl",        "mode",      "shadow_log_path"),
     ("xs_reversal",         "xs_reversal",         "HERMES_XS_REVERSAL_SHADOW_FILE",         "xs_reversal_shadow.jsonl",         "mode",      "shadow_log_path"),
     ("regime_overlay",      "regime_risk_overlay", "HERMES_REGIME_OVERLAY_SHADOW_FILE",      "regime_overlay_shadow.jsonl",      "mode",      "shadow_log_path"),
+    # Audit 2026-09-27 (P0 registry consistency): LLM 调用层 rollout 探针。
+    # 与逐币臂不同，默认落盘目录是可写 /data（research.py 用 HERMES_DATA_DIR），
+    # 不走只读 HOME；collect_grades / _arm_path 据此把默认文件解析到 /data。
+    ("reasoning_effort_rollout", "reasoning_effort_rollout", "HERMES_REASONING_EFFORT_ROLLOUT_SHADOW_FILE", "reasoning_effort_rollout.jsonl", "mode", "log_path"),
+    ("completion_cap_shadow",    "completion_cap_shadow",    "HERMES_COMPLETION_CAP_SHADOW_SHADOW_FILE",    "completion_cap_shadow.jsonl",    "mode", "log_path"),
+    # Audit 2026-09-27 (P0): confidence_decay 是可 enforce 的 change 臂，此前
+    # 漏出 ARMS（评级器看不见）。默认落盘 /data，与 reconcile_change_arms 一致。
+    ("confidence_decay", "confidence_decay", "HERMES_CONFIDENCE_DECAY_SHADOW_FILE", "confidence_decay_shadow.jsonl", "mode", "shadow_log_path"),
+    # Audit 2026-09-27 (P0): atr_regime_calibration 可 enforce，此前完全不在
+    # ARMS。label 用 canonical 长名；落盘文件沿用历史短名 atr_regime_calib。
+    ("atr_regime_calibration", "atr_regime_calibration", "HERMES_ATR_REGIME_CALIB_SHADOW_FILE", "atr_regime_calib_shadow.jsonl", "mode", "shadow_log_path"),
 ]
 
 # 只读挂载：落在这里的 shadow 文件写不进去（容器内 ro）。
 READONLY_HOME = os.path.expanduser("~/.hermes-trading")
 WRITABLE_DATA = "/data"
+
+# Audit 2026-09-27 (P0): LLM rollout 探针由 research.py 写到可写 /data，
+# 默认文件不落在只读 HOME。key 为 ARMS label。
+ARM_DEFAULT_DATA_DIR = frozenset((
+    "reasoning_effort_rollout", "completion_cap_shadow", "confidence_decay",
+    "atr_regime_calibration",
+))
+
+# Audit 2026-09-27 (P0): 唯一权威的臂名别名表。ARMS label 一律使用 canonical
+# 配置块名（长名）；落盘文件 / 证据面历史遗留短名在此映射，禁止在各表里 ad hoc
+# 混用。key=canonical 长名 -> value=落盘/证据面短名。
+ARM_ALIASES: dict[str, str] = {
+    "atr_regime_calibration": "atr_regime_calib",
+    "trend_filter_200ma": "trend_filter",
+}
 
 
 def _arm_mode(cfg: dict, blk_name: str, env_name: str, mode_key: str = "mode") -> str:
@@ -106,11 +132,13 @@ def _arm_mode(cfg: dict, blk_name: str, env_name: str, mode_key: str = "mode") -
 
 
 def _arm_path(cfg: dict, blk_name: str, env_file: str, default_name: str,
-              path_key: str = "shadow_log_path") -> str:
+              path_key: str = "shadow_log_path", label: str = "") -> str:
     """Resolve exactly like the runtime: config path key > env > home default.
 
     ``path_key`` lets parasitic arms override the config field (sizing_v2 uses
-    ``sizing_v2_shadow_log_path`` under the atr_risk_sizing block)."""
+    ``sizing_v2_shadow_log_path`` under the atr_risk_sizing block).
+    ``label`` selects the default directory: LLM rollout probes default to the
+    writable /data dir, coin arms to the read-only HOME mount."""
     blk = cfg.get(blk_name)
     if isinstance(blk, dict):
         p = str(blk.get(path_key) or "").strip()
@@ -119,7 +147,8 @@ def _arm_path(cfg: dict, blk_name: str, env_file: str, default_name: str,
     env_p = os.environ.get(env_file, "").strip()
     if env_p:
         return os.path.expanduser(env_p)
-    return os.path.join(READONLY_HOME, default_name)
+    base = WRITABLE_DATA if label in ARM_DEFAULT_DATA_DIR else READONLY_HOME
+    return os.path.join(base, default_name)
 
 
 def _file_stat(path: str) -> dict:

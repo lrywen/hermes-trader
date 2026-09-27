@@ -172,6 +172,11 @@ ARM_KIND = {
     "trend_filter_200ma": "block",
     "xs_reversal": "signal",
     "regime_overlay": "signal",
+    # LLM 调用层 rollout 探针（非逐币闸门；每个 LLM 请求一行，无 coin/outcome）。
+    # block 语义：命中=该探针会对请求采取动作（reasoning 应用 low effort /
+    # completion 触发 token cap）。用 would-block 命中率考核其动作宽度。
+    "reasoning_effort_rollout": "block",
+    "completion_cap_shadow": "block",
 }
 
 # Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如
@@ -475,6 +480,13 @@ def _hit_field(rec: dict, kind: str, arm: str = ""):
         h = _pullback_candidate(rec)
         if h is not None:
             return h
+    # LLM rollout 探针：动作布尔与逐币 block 臂不同（无 would_block 字段）。
+    if arm == "reasoning_effort_rollout":
+        v = rec.get("applied_low")
+        return bool(v) if v is not None else None
+    if arm == "completion_cap_shadow":
+        v = rec.get("would_truncate")
+        return bool(v) if v is not None else None
     fields = {"block": _BLOCK_FIELDS, "change": _CHANGE_FIELDS,
               "signal": _SIGNAL_FIELDS}[kind]
     for f in fields:
@@ -1262,7 +1274,8 @@ def collect_grades(windows: list[int]) -> dict:
     arms = []
     for label, blk_name, env_file, default_name, mode_key, path_key in sp.ARMS:
         mode = sp._arm_mode(cfg, blk_name, env_file, mode_key)
-        path = sp._arm_path(cfg, blk_name, env_file, default_name, path_key)
+        path = sp._arm_path(cfg, blk_name, env_file, default_name, path_key,
+                            label=label)
         # M13 修正：事件型闸门用心跳判活（心跳新鲜则 24h 无事件不判停滞）。
         hb_age = _heartbeat_age_sec(label, now_ms) if label in ARM_HEARTBEAT_FILE else None
         arm_macro = macro_regime if label in MACRO_LONG_ONLY_ARMS else None
