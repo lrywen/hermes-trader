@@ -66,6 +66,11 @@ def _daily(
 
 SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
     _daily(
+        "clean_trades_raw", 0, 0,
+        ("scripts/clean_trades_raw.py",),
+        "clean-trades-raw.log",
+    ),
+    _daily(
         "daily_report", 0, 10,
         ("scripts/daily_report.py", "--push"),
         "daily-report.log",

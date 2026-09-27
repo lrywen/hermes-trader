@@ -43,7 +43,7 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 6
+    assert len(SCHEDULED_JOBS) == 7
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
