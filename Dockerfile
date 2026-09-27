@@ -52,6 +52,8 @@ COPY hermes_trader/ hermes_trader/
 COPY scripts/trading_loop.py scripts/trading_loop.py
 COPY scripts/ip_drift_watch.py scripts/ip_drift_watch.py
 COPY scripts/scheduler.py scripts/scheduler.py
+# scheduler.SCHEDULED_JOBS 每日00:00调用：清理过期 trades-raw 落盘。
+COPY scripts/clean_trades_raw.py scripts/clean_trades_raw.py
 COPY scripts/daily_report.py scripts/daily_report.py
 COPY scripts/pullback_shadow_daily.py scripts/pullback_shadow_daily.py
 COPY scripts/reconcile_ta_late_entry_shadow.py scripts/reconcile_ta_late_entry_shadow.py

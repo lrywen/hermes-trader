@@ -12,7 +12,7 @@ Call sites that justify each entry (verified 2026-09-18):
   * Process entrypoints (docker-compose command, k8s statefulset):
       trading_loop.py, ip_drift_watch.py, scheduler.py
   * scheduler.SCHEDULED_JOBS (in-container subprocess):
-      daily_report.py, pullback_shadow_daily.py,
+      clean_trades_raw.py, daily_report.py, pullback_shadow_daily.py,
       reconcile_ta_late_entry_shadow.py, reconcile_xs_reversal_shadow.py,
       reconcile_relax_tier_shadow.py,
       macro_regime_watch.py
@@ -41,6 +41,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "ip_drift_watch.py",
     "scheduler.py",
     # scheduler.SCHEDULED_JOBS.
+    "clean_trades_raw.py",
     "daily_report.py",
     "pullback_shadow_daily.py",
     "reconcile_ta_late_entry_shadow.py",

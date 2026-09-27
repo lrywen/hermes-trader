@@ -97,3 +97,24 @@ def test_dockerfile_has_no_wholesale_scripts_copy():
         "blanket `COPY scripts/ scripts/` is forbidden by P0-1; enumerate the "
         "whitelist explicitly"
     )
+
+
+def test_scheduler_referenced_scripts_are_whitelisted():
+    """反向断言：scheduler 子进程调用的每个脚本都必须随镜像发布。
+
+    防的正是此类缺口：在 scheduler 注册了脚本却忘记 Dockerfile/白名单，
+    导致每日任务引用容器内不存在的文件而静默失败。
+    """
+    from scripts import scheduler
+
+    whitelist = set(RUNTIME_SCRIPTS)
+    referenced = {
+        argv[0].split("/")[-1]
+        for job in scheduler.SCHEDULED_JOBS
+        for argv in (job.argv,)
+        if argv and argv[0].endswith(".py")
+    }
+    missing = referenced - whitelist
+    assert not missing, (
+        f"scheduler 调用的脚本未纳入运行时白名单（容器内将缺失）: {sorted(missing)}"
+    )
