@@ -9,7 +9,6 @@ imported from ``hermes_trader.dashboard``.
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import time
 from typing import Any, get_origin
@@ -96,7 +95,7 @@ def register_config_routes(app: FastAPI) -> None:
 
         errors = _validate_config_updates(updates)
         if errors:
-            raise HTTPException(422, json.dumps({"errors": errors}))
+            raise HTTPException(422, {"errors": errors})
 
         # O-1: arming a safety-gate bypass is a two-step write.
         if updates_arm_force_override(updates):

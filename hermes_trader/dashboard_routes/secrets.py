@@ -15,6 +15,7 @@ BFF 层进一步用 ``config:read`` / ``config:write`` 做 RBAC。
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
@@ -42,8 +43,13 @@ def _audit(action: str, request: Request, details: dict[str, Any] | None = None)
     try:
         user = request.headers.get("X-Portal-User", "")
         session_log.append(
-            "secret_config_update",
-            {"action": action, "user": user, **(details or {})},
+            {
+                "event": "secret_config_update",
+                "ts": int(time.time() * 1000),
+                "action": action,
+                "user": user,
+                **(details or {}),
+            }
         )
     except Exception:  # pragma: no cover
         pass

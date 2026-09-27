@@ -1409,7 +1409,7 @@ async def update_config(request: Request) -> JSONResponse:
         {k: v for k, v in patch.items()}, strict_keys=True
     )
     if errors:
-        raise HTTPException(422, json.dumps({"errors": errors}))
+        raise HTTPException(422, {"errors": errors})
     write_body = {k: v for k, v in body.items() if k != "confirm_token"}
     try:
         with update_agent_config(via="web_api_legacy") as cfg:

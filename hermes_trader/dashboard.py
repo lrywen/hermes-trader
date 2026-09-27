@@ -2434,7 +2434,7 @@ def issue_force_confirm_token(updates: dict[str, Any], ip: str) -> dict[str, Any
     # before we hand out a token — never issue a token for an invalid arm.
     errors = _validate_config_updates(updates)
     if errors:
-        raise HTTPException(422, json.dumps({"errors": errors}))
+        raise HTTPException(422, {"errors": errors})
 
     now = time.time()
     with _force_confirm_lock:
@@ -3320,14 +3320,14 @@ def register_routes(app: FastAPI) -> None:
     """
     from hermes_trader.dashboard_routes.audit import register_audit_routes
     from hermes_trader.dashboard_routes.config import register_config_routes
+    from hermes_trader.dashboard_routes.microstructure_debug import (
+        register_microstructure_debug_routes,
+    )
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
     from hermes_trader.dashboard_routes.secrets import register_secrets_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
     from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
-    from hermes_trader.dashboard_routes.microstructure_debug import (
-        register_microstructure_debug_routes,
-    )
 
     register_config_routes(app)
     register_operator_routes(app)
