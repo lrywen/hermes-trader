@@ -3325,6 +3325,9 @@ def register_routes(app: FastAPI) -> None:
     from hermes_trader.dashboard_routes.secrets import register_secrets_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
     from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
+    from hermes_trader.dashboard_routes.microstructure_debug import (
+        register_microstructure_debug_routes,
+    )
 
     register_config_routes(app)
     register_operator_routes(app)
@@ -3343,5 +3346,8 @@ def register_routes(app: FastAPI) -> None:
     # endpoints. Read-only/anonymous-safe at the trader boundary; the portal
     # BFF tightens RBAC. Same before-public ordering as the other API groups.
     register_audit_routes(app)
+    # 只读 microstructure debug：在主进程内暴露实时成交/CVD 累积器状态。
+    # 须在 public catch-all 之前注册，避免被 /{full_path:path} 吞掉。
+    register_microstructure_debug_routes(app)
     register_public_routes(app)
 
