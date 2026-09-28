@@ -29,11 +29,13 @@ class ExitReason(str, Enum):
     FLOOR_BREACH = "floor_breach"
     HARD_TIMEOUT = "hard_timeout"
     STALE_FLAT_TIMEOUT = "stale_flat_timeout"
+    IGNITE_TIMEOUT = "ignite_timeout"
     TIME_SCRATCH = "time_scratch"
     END_OF_DATA = "end_of_data"
 
 
 _PREFIX_MAP = (
+    ("ignite_timeout", ExitReason.IGNITE_TIMEOUT),
     ("max_loss", ExitReason.MAX_LOSS),
     ("stale_flat_timeout", ExitReason.STALE_FLAT_TIMEOUT),
     ("time_scratch", ExitReason.TIME_SCRATCH),

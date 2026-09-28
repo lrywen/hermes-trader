@@ -36,6 +36,8 @@ DSL_BLOCK = {
     "retrace_threshold": 0.15,
     "hard_timeout_minutes": 600.0,
     "stale_flat_timeout_minutes": 240.0,
+    # baseline parity test: the legacy kernel has no ignition gate, so align
+    "ignite_grace_minutes": 0.0,
     "breakeven_trigger_pct": 2.5,
     "breakeven_lock_pct": 0.3,
     "phase2_tiers": [

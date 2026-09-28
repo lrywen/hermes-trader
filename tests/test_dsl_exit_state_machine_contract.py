@@ -44,6 +44,7 @@ def _policy(**kw):
         retrace_threshold=0.20,
         hard_timeout_minutes=1e9,
         stale_flat_timeout_minutes=0.0,
+        ignite_grace_minutes=0.0,
         breach_confirm_sec=0.0,
         hard_stop_confirm_sec=0.0,
         consecutive_breaches_required=1,

@@ -31,6 +31,7 @@ from hermes_trader.agents.dsl_exit import (
     active_position_coins,
     check_all_positions,
     deregister_position,
+    refresh_ignition_states,
     register_position,
     set_bracket,
 )
@@ -4834,6 +4835,12 @@ def monitor_exits(mids: dict[str, float]) -> list[dict[str, Any]]:
     (phase1/phase2/timeout). `leveraged_pct` ≈ spot move × leverage and matches
     what Hyperliquid's UI shows on the user's margin.
     """
+    # Mark positions that have printed a post-entry volume+breakout launch
+    # before the exit checks run (drives the ignite_timeout gate).
+    try:
+        refresh_ignition_states()
+    except Exception as _e:
+        logger.debug(f"[executor] ignition refresh failed: {_e}")
     exits = check_all_positions(mids)
     return [
         {

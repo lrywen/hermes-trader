@@ -116,6 +116,7 @@ def _record_exit(reason: str) -> None:
         from hermes_trader.metrics import DSL_EXITS
         known = {
             "max_loss", "floor_breach", "hard_timeout", "stale_flat_timeout",
+            "ignite_timeout",
             "time_scratch",  # Audit 2026-09-06 (E3, P2)
         }
         label = "other"
@@ -791,6 +792,18 @@ class ExitPolicy:
     # hard_timeout bucket's +3.41% avg is driven by agers that peaked).
     # 0 = off.
     stale_flat_timeout_minutes: float = 90.0
+    # ── Launch-ignition confirmation (post-entry time gate) ─────────────
+    # A position gets a fixed grace window after entry. If a "launch" has not
+    # fired within it — the current bar's volume >= `ignite_vol_mult` × the
+    # average of the prior `ignite_lookback` bars AND its close breaks the
+    # prior `ignite_lookback` high (long; low for short) — the position is
+    # closed as an un-ignited drifter. Once ignited this gate never fires.
+    # Historical replay (111 trades, 15m bars): 27 coins improved / 9 worse,
+    # exact sign test p=0.0039, total +$7.63 over baseline; the best trend
+    # trades (e.g. SUI) ignite inside the window and are retained. 0 = off.
+    ignite_grace_minutes: float = 90.0
+    ignite_vol_mult: float = 2.0
+    ignite_lookback: int = 20
     phase2_tiers: list[RetraceTier] = field(default_factory=lambda: [
         RetraceTier(8.0, 0.35),   # 8% profit → give back 35%
         RetraceTier(15.0, 0.40),  # 15% profit → give back 40% (let winners run)
@@ -936,6 +949,12 @@ class DSLTracker:
         # State
         self.peak_px = entry_px
         self.consecutive_breaches = 0
+        # Launch-ignition confirmation: flips True once a post-entry bar
+        # prints the volume+breakout launch (see ExitPolicy.ignite_*). Drives
+        # the ignite_timeout exit; once True never resets. Persisted so a
+        # restart does not re-arm an already-launched position.
+        self.ignited = False
+        self.ignite_ts: Optional[float] = None
         # monotonic() timestamp of the first tick in the current sustained
         # breach run; None while not breached or after recovery. Used by the
         # time-based breach_confirm_sec gate (P2-7). Not persisted: on
@@ -958,6 +977,18 @@ class DSLTracker:
         self.sl_size: Optional[float] = None   # size covered by the backup SL
         self.tp_oid: Optional[int] = None
         self.tp_px: Optional[float] = None     # trigger price of the TP scale-out
+
+    def mark_ignited(self, when: Optional[float] = None) -> bool:
+        """Record that the launch-ignition bar has printed.
+
+        Returns True if this call flipped the state (a fresh ignition), False
+        if it was already ignited. Monotonic: never resets.
+        """
+        if self.ignited:
+            return False
+        self.ignited = True
+        self.ignite_ts = float(when if when is not None else time.time())
+        return True
 
     def is_long(self) -> bool:
         return self.side == "long"
@@ -1156,6 +1187,23 @@ class DSLTracker:
             spot_cap_display = pol.max_loss_pct if pol.max_loss_pct > 0 else float("inf")
         # Reason string surfaces both inputs so it's obvious post-hoc
         # which cap was binding for a given exit.
+
+        # ── Launch-ignition timeout ───────────────────────────────────
+        # No volume+breakout launch within the post-entry grace → close as
+        # an un-ignited drifter. Once ignited this gate is inert.
+        if (pol.ignite_grace_minutes > 0
+                and not self.ignited
+                and elapsed_min >= pol.ignite_grace_minutes):
+            _record_exit("ignite_timeout")
+            _request_save(force=True)
+            return self._verdict(
+                exit=True,
+                reason=(f"ignite_timeout ({elapsed_min:.0f}min no launch; "
+                        f"need vol>={pol.ignite_vol_mult:g}x and "
+                        f"{pol.ignite_lookback}-bar break)"),
+                floor_price=None, peak_price=self.peak_px, phase="timeout",
+                unrealized_pct=upct,
+            )
 
         # ── Stale-flat timeout ────────────────────────────────────────
         # Only for positions that never armed phase-2: peak profit < protect.
@@ -1560,6 +1608,8 @@ def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
         "entry_regime": t.entry_regime,
         "peak_px": t.peak_px,
         "consecutive_breaches": t.consecutive_breaches,
+        "ignited": t.ignited,
+        "ignite_ts": t.ignite_ts,
         "last_floor": t._last_floor,
         "policy": asdict(t.policy),
         # v2: exchange bracket order IDs / prices (None when no resting order).
@@ -1660,6 +1710,11 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
         stale_flat_timeout_minutes=float(
             pol_raw.get("stale_flat_timeout_minutes", ExitPolicy.stale_flat_timeout_minutes)
             or 0.0),
+        ignite_grace_minutes=float(
+            pol_raw.get("ignite_grace_minutes", ExitPolicy.ignite_grace_minutes)
+            or 0.0),
+        ignite_vol_mult=pol_raw.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult),
+        ignite_lookback=pol_raw.get("ignite_lookback", ExitPolicy.ignite_lookback),
         atr_stop_mult=pol_raw.get("atr_stop_mult", ExitPolicy.atr_stop_mult),
         atr_stop_floor_pct=pol_raw.get("atr_stop_floor_pct", ExitPolicy.atr_stop_floor_pct),
         atr_stop_ceiling_pct=pol_raw.get("atr_stop_ceiling_pct", ExitPolicy.atr_stop_ceiling_pct),
@@ -1684,6 +1739,8 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
                    entry_regime=str(d.get("entry_regime") or ""))
     t.peak_px = float(d.get("peak_px", d["entry_px"]))
     t.consecutive_breaches = int(d.get("consecutive_breaches", 0))
+    t.ignited = bool(d.get("ignited", False))
+    t.ignite_ts = _opt_float(d.get("ignite_ts"))
     # Audit 2026-09-06 (E5, P2): validate a persisted last_floor before
     # trusting it as the ratchet anchor. The floor is always a positive PRICE
     # (long: a stop below entry that ratchets up; short: a stop above entry
@@ -2304,6 +2361,11 @@ def _policy_from_dsl_dict(dsl: dict) -> ExitPolicy:
             stale_flat_timeout_minutes=float(
                 dsl.get("stale_flat_timeout_minutes",
                         ExitPolicy.stale_flat_timeout_minutes) or 0.0),
+            ignite_grace_minutes=float(
+                dsl.get("ignite_grace_minutes",
+                        ExitPolicy.ignite_grace_minutes) or 0.0),
+            ignite_vol_mult=float(dsl.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult)),
+            ignite_lookback=int(dsl.get("ignite_lookback", ExitPolicy.ignite_lookback) or 1),
             consecutive_breaches_required=int(dsl.get("consecutive_breaches_required", 1) or 1),
             # A-F5: default 4.0s breach confirmation (was 0.0 = single-tick exit).
             breach_confirm_sec=float(dsl.get("breach_confirm_sec", 4.0) or 0.0),
@@ -2703,6 +2765,69 @@ def get_index_prices(coins: set[str]) -> dict[str, float]:
             if px > 0:
                 out[c] = px
     return out
+
+
+def detect_ignition(bars: list[Any], entry_time_s: float, is_long: bool,
+                    vol_mult: float = 2.0, lookback: int = 20,
+                    bar_period_ms: int = 15 * 60_000) -> Optional[int]:
+    """Whether a volume+breakout launch printed after entry.
+
+    Pure, no look-ahead: only CLOSED bars (``t + bar_period_ms <= now``) are
+    considered, and a bar's breakout is measured against the ``lookback``
+    bars strictly before it. Long: ``v >= vol_mult * prior-avg`` AND
+    ``close > prior high``; short: same volume AND ``close < prior low``.
+
+    Returns the igniting bar's timestamp (ms) or None.
+    """
+    entry_ms = entry_time_s * 1000.0
+    now_ms = time.time() * 1000.0
+    for i, b in enumerate(bars):
+        # Bar must be after entry AND already closed.
+        if b.t < entry_ms or b.t + bar_period_ms > now_ms:
+            continue
+        prior = bars[max(0, i - lookback):i]
+        if len(prior) < lookback:
+            continue
+        avg_v = sum(x.v for x in prior) / len(prior)
+        if avg_v <= 0 or b.v < vol_mult * avg_v:
+            continue
+        if is_long and b.c > max(x.h for x in prior):
+            return int(b.t)
+        if (not is_long) and b.c < min(x.l for x in prior):
+            return int(b.t)
+    return None
+
+
+def refresh_ignition_states() -> int:
+    """Mark trackers whose position has printed a launch bar.
+
+    Fetches 15m candles per held coin and runs :func:`detect_ignition`.
+    Best-effort: any fetch failure leaves the tracker un-marked (the gate
+    simply keeps waiting). Returns the number of FRESH ignitions this call.
+    """
+    from hermes_trader.client.hl_client import fetch_hl_candles
+    fresh = 0
+    pol = _policy_from_config()
+    if pol.ignite_grace_minutes <= 0:
+        return 0
+    for tracker in list(_active_positions.values()):
+        if tracker.ignited:
+            continue
+        try:
+            bars = fetch_hl_candles(tracker.coin, "15m", 5000)
+        except Exception as e:
+            logger.debug(f"[dsl] ignition candles miss {tracker.coin}: {e}")
+            continue
+        ig_ms = detect_ignition(
+            bars, tracker.entry_time, tracker.is_long(),
+            vol_mult=pol.ignite_vol_mult, lookback=pol.ignite_lookback)
+        if ig_ms is not None and tracker.mark_ignited(ig_ms / 1000.0):
+            fresh += 1
+            _request_save(force=True)
+            logger.info(
+                f"[dsl] {tracker.coin} {tracker.side} launch IGNITED "
+                f"@ {ig_ms}")
+    return fresh
 
 
 def check_all_positions(mids: dict[str, float], index_prices: Optional[dict[str, float]] = None) -> list[ExitVerdict]:

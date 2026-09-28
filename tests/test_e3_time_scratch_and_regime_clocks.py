@@ -36,6 +36,8 @@ def _scratch_policy(**kw):
         retrace_threshold=0.40, hard_timeout_minutes=99999.0,
         stale_flat_timeout_minutes=0.0, hard_stop_confirm_sec=0.0,
         breach_confirm_sec=0.0,
+        # isolate the time_scratch path from the launch-ignition gate
+        ignite_grace_minutes=0.0,
         time_scratch_enabled=True, time_scratch_minutes=60.0,
         time_scratch_min_peak_pct=0.3, time_scratch_giveback_pct=0.3,
     )
