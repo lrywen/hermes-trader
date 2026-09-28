@@ -794,16 +794,21 @@ class ExitPolicy:
     stale_flat_timeout_minutes: float = 90.0
     # ── Launch-ignition confirmation (post-entry time gate) ─────────────
     # A position gets a fixed grace window after entry. If a "launch" has not
-    # fired within it — the current bar's volume >= `ignite_vol_mult` × the
-    # average of the prior `ignite_lookback` bars AND its close breaks the
-    # prior `ignite_lookback` high (long; low for short) — the position is
-    # closed as an un-ignited drifter. Once ignited this gate never fires.
-    # Historical replay (111 trades, 15m bars): 27 coins improved / 9 worse,
-    # exact sign test p=0.0039, total +$7.63 over baseline; the best trend
-    # trades (e.g. SUI) ignite inside the window and are retained. 0 = off.
+    # fired within it — a CLOSED bar whose volume >= `ignite_vol_mult` × the
+    # average of the prior lookback bars AND whose close breaks that lookback
+    # range (high for long, low for short) — the position is closed as an
+    # un-ignited drifter. Once ignited this gate never fires.
+    #
+    # Multi-timeframe: ignition is evaluated on EVERY period in
+    # `ignite_periods` and the earliest qualifying bar wins (OR). 5m is the
+    # sensitive layer (fast/short-lived launches 15m would miss), 15m the mid
+    # confirmation, 1h the structural layer. Per-period bar duration and
+    # lookback come from IGNITE_PERIOD_DEFAULTS (~5h each). Replay (111
+    # trades, 5m/15m/1h OR): 30 ignite while held; best trend trades (e.g.
+    # SUI) ignite inside the window and are retained.
     ignite_grace_minutes: float = 90.0
     ignite_vol_mult: float = 2.0
-    ignite_lookback: int = 20
+    ignite_periods: tuple[str, ...] = ("5m", "15m", "1h")
     phase2_tiers: list[RetraceTier] = field(default_factory=lambda: [
         RetraceTier(8.0, 0.35),   # 8% profit → give back 35%
         RetraceTier(15.0, 0.40),  # 15% profit → give back 40% (let winners run)
@@ -955,6 +960,8 @@ class DSLTracker:
         # restart does not re-arm an already-launched position.
         self.ignited = False
         self.ignite_ts: Optional[float] = None
+        # Which timeframe fired the earliest igniting bar ("5m"/"15m"/"1h").
+        self.ignite_period: Optional[str] = None
         # monotonic() timestamp of the first tick in the current sustained
         # breach run; None while not breached or after recovery. Used by the
         # time-based breach_confirm_sec gate (P2-7). Not persisted: on
@@ -978,7 +985,8 @@ class DSLTracker:
         self.tp_oid: Optional[int] = None
         self.tp_px: Optional[float] = None     # trigger price of the TP scale-out
 
-    def mark_ignited(self, when: Optional[float] = None) -> bool:
+    def mark_ignited(self, when: Optional[float] = None,
+                     period: Optional[str] = None) -> bool:
         """Record that the launch-ignition bar has printed.
 
         Returns True if this call flipped the state (a fresh ignition), False
@@ -988,6 +996,7 @@ class DSLTracker:
             return False
         self.ignited = True
         self.ignite_ts = float(when if when is not None else time.time())
+        self.ignite_period = period
         return True
 
     def is_long(self) -> bool:
@@ -1198,9 +1207,9 @@ class DSLTracker:
             _request_save(force=True)
             return self._verdict(
                 exit=True,
-                reason=(f"ignite_timeout ({elapsed_min:.0f}min no launch; "
-                        f"need vol>={pol.ignite_vol_mult:g}x and "
-                        f"{pol.ignite_lookback}-bar break)"),
+                reason=(f"ignite_timeout ({elapsed_min:.0f}min no launch on "
+                        f"{'/'.join(pol.ignite_periods)}; need "
+                        f"vol>={pol.ignite_vol_mult:g}x + range break)"),
                 floor_price=None, peak_price=self.peak_px, phase="timeout",
                 unrealized_pct=upct,
             )
@@ -1610,6 +1619,7 @@ def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
         "consecutive_breaches": t.consecutive_breaches,
         "ignited": t.ignited,
         "ignite_ts": t.ignite_ts,
+        "ignite_period": t.ignite_period,
         "last_floor": t._last_floor,
         "policy": asdict(t.policy),
         # v2: exchange bracket order IDs / prices (None when no resting order).
@@ -1714,7 +1724,8 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
             pol_raw.get("ignite_grace_minutes", ExitPolicy.ignite_grace_minutes)
             or 0.0),
         ignite_vol_mult=pol_raw.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult),
-        ignite_lookback=pol_raw.get("ignite_lookback", ExitPolicy.ignite_lookback),
+        ignite_periods=_parse_ignite_periods(
+            pol_raw.get("ignite_periods", ExitPolicy.ignite_periods)),
         atr_stop_mult=pol_raw.get("atr_stop_mult", ExitPolicy.atr_stop_mult),
         atr_stop_floor_pct=pol_raw.get("atr_stop_floor_pct", ExitPolicy.atr_stop_floor_pct),
         atr_stop_ceiling_pct=pol_raw.get("atr_stop_ceiling_pct", ExitPolicy.atr_stop_ceiling_pct),
@@ -1741,6 +1752,7 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
     t.consecutive_breaches = int(d.get("consecutive_breaches", 0))
     t.ignited = bool(d.get("ignited", False))
     t.ignite_ts = _opt_float(d.get("ignite_ts"))
+    t.ignite_period = d.get("ignite_period")
     # Audit 2026-09-06 (E5, P2): validate a persisted last_floor before
     # trusting it as the ratchet anchor. The floor is always a positive PRICE
     # (long: a stop below entry that ratchets up; short: a stop above entry
@@ -2365,7 +2377,8 @@ def _policy_from_dsl_dict(dsl: dict) -> ExitPolicy:
                 dsl.get("ignite_grace_minutes",
                         ExitPolicy.ignite_grace_minutes) or 0.0),
             ignite_vol_mult=float(dsl.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult)),
-            ignite_lookback=int(dsl.get("ignite_lookback", ExitPolicy.ignite_lookback) or 1),
+            ignite_periods=_parse_ignite_periods(
+                dsl.get("ignite_periods", ExitPolicy.ignite_periods)),
             consecutive_breaches_required=int(dsl.get("consecutive_breaches_required", 1) or 1),
             # A-F5: default 4.0s breach confirmation (was 0.0 = single-tick exit).
             breach_confirm_sec=float(dsl.get("breach_confirm_sec", 4.0) or 0.0),
@@ -2767,6 +2780,31 @@ def get_index_prices(coins: set[str]) -> dict[str, float]:
     return out
 
 
+# Per-period ignition config: bar duration (ms) and volume/breakout lookback
+# sized to ~5h of history on each timeframe.
+IGNITE_PERIOD_DEFAULTS: dict[str, tuple[int, int]] = {
+    "5m": (5 * 60_000, 60),
+    "15m": (15 * 60_000, 20),
+    "1h": (60 * 60_000, 5),
+}
+
+
+def _parse_ignite_periods(raw: Any) -> tuple[str, ...]:
+    """Normalise an ignite_periods config value.
+
+    Accepts a list/tuple of period names (unknown/empty entries dropped) or a
+    single string. Falls back to the ExitPolicy default when nothing valid.
+    """
+    if isinstance(raw, str):
+        cand = [raw]
+    elif isinstance(raw, (list, tuple)):
+        cand = list(raw)
+    else:
+        cand = []
+    periods = tuple(p for p in cand if p in IGNITE_PERIOD_DEFAULTS)
+    return periods or ExitPolicy.ignite_periods
+
+
 def detect_ignition(bars: list[Any], entry_time_s: float, is_long: bool,
                     vol_mult: float = 2.0, lookback: int = 20,
                     bar_period_ms: int = 15 * 60_000) -> Optional[int]:
@@ -2801,9 +2839,11 @@ def detect_ignition(bars: list[Any], entry_time_s: float, is_long: bool,
 def refresh_ignition_states() -> int:
     """Mark trackers whose position has printed a launch bar.
 
-    Fetches 15m candles per held coin and runs :func:`detect_ignition`.
-    Best-effort: any fetch failure leaves the tracker un-marked (the gate
-    simply keeps waiting). Returns the number of FRESH ignitions this call.
+    Multi-timeframe OR: for each held coin, evaluates every period in
+    ``policy.ignite_periods`` (5m/15m/1h) and accepts the EARLIEST igniting
+    closed bar. Best-effort: per-period fetch failures are skipped; if no
+    period can confirm, the tracker stays un-marked and the gate keeps
+    waiting. Returns the number of FRESH ignitions this call.
     """
     from hermes_trader.client.hl_client import fetch_hl_candles
     fresh = 0
@@ -2813,20 +2853,32 @@ def refresh_ignition_states() -> int:
     for tracker in list(_active_positions.values()):
         if tracker.ignited:
             continue
-        try:
-            bars = fetch_hl_candles(tracker.coin, "15m", 5000)
-        except Exception as e:
-            logger.debug(f"[dsl] ignition candles miss {tracker.coin}: {e}")
-            continue
-        ig_ms = detect_ignition(
-            bars, tracker.entry_time, tracker.is_long(),
-            vol_mult=pol.ignite_vol_mult, lookback=pol.ignite_lookback)
-        if ig_ms is not None and tracker.mark_ignited(ig_ms / 1000.0):
+        best_ms: Optional[int] = None
+        best_period: Optional[str] = None
+        for period in pol.ignite_periods:
+            cfg = IGNITE_PERIOD_DEFAULTS.get(period)
+            if cfg is None:
+                continue
+            bar_ms, lookback = cfg
+            try:
+                bars = fetch_hl_candles(tracker.coin, period, 5000)
+            except Exception as e:
+                logger.debug(
+                    f"[dsl] ignition candles miss {tracker.coin} {period}: {e}")
+                continue
+            ig_ms = detect_ignition(
+                bars, tracker.entry_time, tracker.is_long(),
+                vol_mult=pol.ignite_vol_mult, lookback=lookback,
+                bar_period_ms=bar_ms)
+            if ig_ms is not None and (best_ms is None or ig_ms < best_ms):
+                best_ms, best_period = ig_ms, period
+        if best_ms is not None and tracker.mark_ignited(
+                best_ms / 1000.0, period=best_period):
             fresh += 1
             _request_save(force=True)
             logger.info(
                 f"[dsl] {tracker.coin} {tracker.side} launch IGNITED "
-                f"@ {ig_ms}")
+                f"@ {best_ms} on {best_period}")
     return fresh
 
 

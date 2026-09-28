@@ -39,7 +39,7 @@ def _policy(**kw) -> ExitPolicy:
                 retrace_threshold=0.40, hard_timeout_minutes=99999.0,
                 stale_flat_timeout_minutes=0.0, hard_stop_confirm_sec=0.0,
                 ignite_grace_minutes=90.0, ignite_vol_mult=2.0,
-                ignite_lookback=20)
+                ignite_periods=("5m", "15m", "1h"))
     base.update(kw)
     return ExitPolicy(**base)
 
@@ -126,14 +126,22 @@ def test_mark_ignited_is_monotonic():
     assert t.mark_ignited() is False
 
 
+def test_mark_ignited_records_period():
+    t = _tracker(_policy(), 10)
+    t.mark_ignited(period="5m")
+    assert t.ignite_period == "5m"
+
+
 def test_state_roundtrip_preserves_ignition():
     t = _tracker(_policy(), 30)
-    t.mark_ignited()
+    t.mark_ignited(period="1h")
     d = _tracker_to_dict(t)
     t2 = _tracker_from_dict(d)
     assert t2.ignited is True
     assert t2.ignite_ts is not None
+    assert t2.ignite_period == "1h"
     assert t2.policy.ignite_grace_minutes == 90.0
+    assert t2.policy.ignite_periods == ("5m", "15m", "1h")
 
 
 def test_old_state_without_ignite_fields_hydrates_unignited():
@@ -144,3 +152,20 @@ def test_old_state_without_ignite_fields_hydrates_unignited():
     t2 = _tracker_from_dict(d)
     assert t2.ignited is False
     assert t2.policy.ignite_grace_minutes == 90.0
+
+
+# ---------- _parse_ignite_periods ----------
+
+def test_parse_periods_drops_unknown_and_keeps_order():
+    from hermes_trader.agents.dsl_exit import _parse_ignite_periods
+    assert _parse_ignite_periods(["1h", "junk", "5m"]) == ("1h", "5m")
+
+
+def test_parse_periods_accepts_string():
+    from hermes_trader.agents.dsl_exit import _parse_ignite_periods
+    assert _parse_ignite_periods("15m") == ("15m",)
+
+
+def test_parse_periods_falls_back_when_all_invalid():
+    from hermes_trader.agents.dsl_exit import _parse_ignite_periods
+    assert _parse_ignite_periods(["x", 3]) == ExitPolicy.ignite_periods
