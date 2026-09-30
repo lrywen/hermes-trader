@@ -107,6 +107,7 @@ from hermes_trader.client.hl_client import (
     fetch_account_state,
     fetch_aggregate_contributions_since,
     resolve_user_address,
+    _get_ws_mids_instance,
     start_ws_mids,
     start_ws_user_fills,
     stop_ws_mids,
@@ -776,6 +777,29 @@ try:
     start_ws_mids()
 except Exception as _ws_err:
     logger.warning(f"[ws] start_ws_mids failed (will fall back to REST): {_ws_err}")
+
+# Independent L2 order-book research feed (decoupled from the trading path).
+# Fixed basket by 24h notional volume, 1s top-10-level snapshots to
+# /data/book-raw. Off by config; exists to build an OFI/CVD panel that public
+# candle/funding data cannot provide. Failures are non-fatal.
+try:
+    _bc = config.get("book_capture") or {}
+    if _bc.get("enabled", True):
+        _ws = _get_ws_mids_instance()
+        if _ws is not None:
+            _bc_coins = _bc.get("coins")
+            if not _bc_coins:
+                _perps = [m for m in get_universe()
+                          if m["type"] == "perp" and not m["coin"].startswith("@")]
+                _perps.sort(key=lambda m: m.get("dayNtlVlm", 0), reverse=True)
+                _bc_coins = [m["coin"] for m in _perps[:int(_bc.get("top_n", 20))]]
+            _ws.start_book_capture(
+                list(_bc_coins),
+                interval_s=float(_bc.get("interval_s", 1.0)),
+                levels=int(_bc.get("levels", 10)),
+            )
+except Exception as _bc_err:
+    logger.warning(f"[ws:book] start_book_capture failed (non-fatal): {_bc_err}")
 
 # Phase 1 (WS user-fills feasibility): subscribe to the wallet's fill
 # stream on the SAME WS connection as allMids. Callback is LOG-ONLY in

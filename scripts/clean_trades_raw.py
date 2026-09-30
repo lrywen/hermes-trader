@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""清理过期的公共 trades 原始落盘。
+"""清理过期的公共原始落盘（trades 逐笔 + L2 order book 快照）。
 
 trades_capture 会按 UTC 日期把逐笔成交写入：
     ${HERMES_DATA_DIR:-/data}/trades-raw/date=YYYY-MM-DD/COIN.jsonl
+book_capture 会按 UTC 日期把 L2 盘口快照写入：
+    ${HERMES_DATA_DIR:-/data}/book-raw/date=YYYY-MM-DD/COIN.jsonl
 长期运行会持续占用磁盘。本脚本删除保留期之外的 ``date=`` 目录（只按目录名
 中的日期判定，不依赖 mtime），由 scheduler 每日触发。
 
@@ -29,6 +31,12 @@ DEFAULT_RETENTION_DAYS = 14
 
 def raw_dir() -> Path:
     return Path(os.environ.get("HERMES_DATA_DIR", "/data")) / "trades-raw"
+
+
+def raw_dirs() -> list[Path]:
+    """本脚本负责清理的全部原始根目录（trades-raw + book-raw）。"""
+    data_root = Path(os.environ.get("HERMES_DATA_DIR", "/data"))
+    return [data_root / "trades-raw", data_root / "book-raw"]
 
 
 def expired_dirs(base: Path, *, today: date, retention_days: int
@@ -75,10 +83,15 @@ def main() -> int:
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.retention_days < 1:
         ap.error("--retention-days 必须 >= 1")
-    base = raw_dir()
-    removed = cleanup(base, today=datetime.now(timezone.utc).date(),
-                      retention_days=args.retention_days, dry_run=args.dry_run)
-    print(f"{'[dry-run] ' if args.dry_run else ''}清理 {len(removed)} 个过期目录: {removed}")
+    today = datetime.now(timezone.utc).date()
+    all_removed: list[str] = []
+    for base in raw_dirs():
+        removed = cleanup(base, today=today,
+                          retention_days=args.retention_days, dry_run=args.dry_run)
+        if removed:
+            print(f"{base}: 清理 {len(removed)} 个过期目录: {removed}")
+        all_removed.extend(f"{base.name}/{n}" for n in removed)
+    print(f"{'[dry-run] ' if args.dry_run else ''}合计清理 {len(all_removed)} 个过期目录")
     return 0
 
 

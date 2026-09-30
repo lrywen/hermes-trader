@@ -66,6 +66,9 @@
 | `t02_cpcv_dsr_confirm_outcome_b_2026-09-21.md` | T-02 | 新增 validation 包（CPCV+DSR+PBO，纯标准库）：b3 四臂 **15条OOS路径SR>0占比全0、中位OOS负**，最优夏普本为负、DSR P=0.0000 → 三方法一致确认 OUTCOME_B；+17 测试，floor 4646 |
 | `outcome_b_signoff_2026-09-21.md` | sign-off | 结局B+四范式(C-7/P-A/P-C/P-D/P-D-v2)证伪的**人工接受记录**；并新增统一验证 CLI `scripts/validate_outcome.py`（一次跑全三方法、二值判定），在 b3 复现与单脚本一致 CI |
 | `watchdog_deadman_and_dedup_2026-09-21.md` | 风控加固 | block-bootstrap 收敛为共享 `block_bootstrap_ci`（两脚本复用、CI字节不变）；补齐风控第4层**独立 dead-man 看门狗** `hermes_trader/watchdog.py`（供外部调度，STALE告警+紧急平仓钩子，默认不平仓）；+12测试 floor 4661，全量4661 passed |
+| `m1_l2_book_capture_prereg_2026-09-28.md` | M-1 | K线+funding 四轮失败后转向**扩信息集**：L2 order book 采集已部署（Top20/1s/10档/集成容器，book-raw 保留14天）；并在看数前**预注册** OFI 主假设（W=60s,h=5m）、按时间块 bootstrap、CI下界>0 且净均值≥3bps/笔，首次检验不早于 2026-10-28、60天确认不早于 2026-11-27；明确当前无 tape、CVD 仅作 exploratory |
+| `m2_binance_tape_cvd_prereg_2026-09-28.md` | M-2 | 换 venue 走历史：`/mnt/tick` 的 **Binance U本位永续逐笔成交**补齐为 BTC/ETH 各 **270 天连续（2026-01-01→09-27）零缺口**，含 is_buyer_maker 可算真 CVD；看数前**预注册**极端净流 H1（W=60s,h=5m,前/后50%天切分,固定成本11bp round-trip）、按天5天块 bootstrap、CI下界>0 且净均值≥3bps/笔，H2 CVD-价格背离作次要；明确不跑扫参、迁回 HL 需另开假设 |
+| `m2_binance_tape_cvd_result_2026-09-28.md` | M-2 结果 | test 135天 n=15,756：净 **−11.04bp/笔 ≈ 纯成本**（毛利≈−0.04bp，方向预测力≈随机），9/15bp、单币、1/10天块全部 CI 为负不含0 → **H1 CLOSED**；确定性清洗 44 天微秒时间戳；第五类公开信号（tape/CVD）结案，edge 仍待不可回溯数据（M-1 OFI / 扩 venue） |
 
 ## 找回原件的可选途径（备查，非必须）
 

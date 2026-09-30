@@ -121,6 +121,7 @@ _USER_FILLS_SEEN_FILE = os.environ.get(
 _USER_FILLS_PERSIST_MIN_INTERVAL_S = 5.0
 _USER_FILLS_HIST_GRACE_MS = 30_000  # clock-skew / subscribe-latency slack
 _TRADES_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "trades-raw")
+_BOOK_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "book-raw")
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
@@ -301,6 +302,19 @@ class HyperliquidWebSocket:
         # watched/candidate coins are subscribed).
         self._trades_coins: set[str] = set()
         self._trades_capture_enabled = False
+        # Independent L2 order-book research feed. Coins are fixed by the
+        # research capture (decoupled from the trading path). ``_on_book``
+        # caches each coin's latest top levels in ``_latest_book``; a flusher
+        # thread snapshots it to disk at a fixed cadence so every coin's
+        # sample is time-aligned and we never write every raw push.
+        self._book_coins: set[str] = set()
+        self._book_capture_enabled = False
+        self._book_levels = 10
+        self._latest_book: dict[str, Any] = {}
+        self._book_lock = threading.Lock()
+        self._book_flush_thread: Optional[threading.Thread] = None
+        self._book_flush_stop = threading.Event()
+        self._book_flush_interval_s = 1.0
         # Warm the in-memory dedup set from the on-disk snapshot so a fill
         # already reported by a previous process is never re-emitted.
         self._load_seen_tids()
@@ -951,6 +965,107 @@ class HyperliquidWebSocket:
         disconnect; this clears our persistent set."""
         self._trades_coins.discard(coin)
 
+    # ── L2 order-book research feed ───────────────────────────────────────
+    def _on_book(self, data: Any) -> None:
+        """Callback for the ``l2Book`` channel → cache latest top levels.
+
+        Wrapped payload: {"channel":"l2Book","data":{"coin","time",
+        "levels":[[bids...],[asks...]]}}. Only caches; the flusher thread
+        owns disk writes so the WS callback never blocks on file I/O.
+        """
+        try:
+            d = data.get("data") if isinstance(data, dict) else data
+            if not isinstance(d, dict):
+                return
+            coin = d.get("coin")
+            levels = d.get("levels")
+            if not coin or coin not in self._book_coins or not levels:
+                return
+            bids, asks = levels[0], levels[1]
+            k = self._book_levels
+
+            def slim(rows: list[dict]) -> list[list[str]]:
+                return [[str(r.get("px")), str(r.get("sz"))] for r in rows[:k]]
+
+            snap = {"t": int(d.get("time", time.time() * 1000)),
+                    "b": slim(bids), "a": slim(asks)}
+            with self._book_lock:
+                self._latest_book[coin] = snap
+        except Exception:
+            logger.debug("[ws:book] callback failed", exc_info=True)
+
+    def subscribe_book(self, coin: str) -> bool:
+        """Subscribe to ``l2Book`` for ``coin`` (idempotent). Adds to the
+        persistent set so reconnects re-subscribe automatically."""
+        if not coin:
+            return False
+        if coin in self._book_coins:
+            return True
+        if not self._info:
+            logger.warning("[ws:book] subscribe skipped — no Info")
+            return False
+        try:
+            self._info.subscribe({"type": "l2Book", "coin": coin}, self._on_book)
+            self._book_coins.add(coin)
+            logger.info("[ws:book] subscribed coin=%s", coin)
+            return True
+        except Exception as e:
+            logger.warning("[ws:book] subscribe FAILED coin=%s err=%s", coin, e)
+            return False
+
+    def _book_flush_loop(self) -> None:
+        """Snapshot each coin's cached book at a fixed cadence and append to
+        /data/book-raw/date=YYYY-MM-DD/COIN.jsonl. Time-aligned per tick."""
+        handles: dict[str, Any] = {}
+        try:
+            while not self._book_flush_stop.wait(self._book_flush_interval_s):
+                if not self._book_capture_enabled:
+                    continue
+                with self._book_lock:
+                    items = [(coin, snap) for coin, snap in self._latest_book.items()]
+                now_ms = int(time.time() * 1000)
+                day = datetime.fromtimestamp(now_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+                day_dir = os.path.join(_BOOK_RAW_DIR, f"date={day}")
+                os.makedirs(day_dir, exist_ok=True)
+                for coin, snap in items:
+                    if coin not in self._book_coins:
+                        continue
+                    path = os.path.join(day_dir, f"{coin.upper()}.jsonl")
+                    fh = handles.get(path)
+                    if fh is None:
+                        fh = open(path, "a", encoding="utf-8")
+                        handles[path] = fh
+                    row = {"t": now_ms, "bt": snap["t"],
+                           "b": snap["b"], "a": snap["a"]}
+                    fh.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+                    fh.flush()
+        except Exception:
+            logger.warning("[ws:book] flush loop failed", exc_info=True)
+        finally:
+            for fh in handles.values():
+                fh.close()
+
+    def start_book_capture(self, coins: list[str], interval_s: float = 1.0,
+                           levels: int = 10) -> int:
+        """Enable independent L2 capture for a fixed basket and start the
+        flusher. Returns the number of coins actively subscribed."""
+        self._book_levels = levels
+        self._book_flush_interval_s = interval_s
+        self._book_capture_enabled = True
+        os.makedirs(_BOOK_RAW_DIR, exist_ok=True)
+        n = 0
+        for coin in coins:
+            if self.subscribe_book(coin):
+                n += 1
+        if self._book_flush_thread is None:
+            self._book_flush_stop.clear()
+            self._book_flush_thread = threading.Thread(
+                target=self._book_flush_loop, daemon=True, name="ws-book-flush")
+            self._book_flush_thread.start()
+        logger.info("[ws:book] capture started coins=%d interval=%.2fs levels=%d",
+                    n, interval_s, levels)
+        return n
+
     def start(self) -> None:
         """Start the WebSocket connection and subscribe to allMids."""
         if self._running:
@@ -1074,6 +1189,16 @@ class HyperliquidWebSocket:
                 self._info.subscribe({"type": "trades", "coin": coin}, self._on_trades)
             except Exception as e:
                 logger.warning("[ws:trades] re-subscribe on reconnect failed "
+                               "coin=%s (non-fatal): %s", coin, e)
+
+        # Re-subscribe the independent L2 feed on reconnect so the research
+        # panel stays continuous. Best-effort; the flusher simply skips ticks
+        # for any coin that fails (fail open).
+        for coin in list(self._book_coins):
+            try:
+                self._info.subscribe({"type": "l2Book", "coin": coin}, self._on_book)
+            except Exception as e:
+                logger.warning("[ws:book] re-subscribe on reconnect failed "
                                "coin=%s (non-fatal): %s", coin, e)
 
     def _heartbeat_loop(self) -> None:
