@@ -42,6 +42,7 @@ def run(
     dsl_config: Optional[dict] = None,
     confirm_mode: str = "tick",
     tick_confirm_s: float = 5.0,
+    ignition_series: Optional[dict] = None,
 ) -> list[Trade]:
     """Run one-coin backtest; return completed trades in chronological order.
 
@@ -105,6 +106,7 @@ def run(
                 bar_ms=bar_ms,
                 confirm_mode=confirm_mode,
                 tick_confirm_s=tick_confirm_s,
+                ignition_series=ignition_series,
             )
             pending = None
 

@@ -69,6 +69,15 @@ class HeuristicConfig:
     min_score: float = HEURISTIC_MIN_SCORE
     min_atr_pct: float = HEURISTIC_MIN_ATR_PCT
     require_ta_confirm: bool = True
+    # ── entry-tightening knobs (all default OFF = legacy loose behavior) ──
+    # require_score: must clear the composite-score gate; trend-ATR / burst alone
+    # can no longer admit. min_adx: only enter a real trend. max_extension_pct:
+    # reject chasing — |close - EMA21|/EMA21*100 must be <= this. max_atr_pct:
+    # skip violent regimes (wide, unfavourable stops).
+    require_score: bool = False
+    min_adx: float = 0.0
+    max_extension_pct: float = 0.0
+    max_atr_pct: float = 0.0
 
 
 def default_heuristic_config(*, warmup: int = 100) -> HeuristicConfig:
@@ -176,6 +185,18 @@ def ta_confirmed(
 ContextFn = Callable[[int], tuple[float, str]]
 
 
+def _extension_pct(window: Sequence[Candle]) -> Optional[float]:
+    """|last close - EMA21| / EMA21 * 100 — how far price has stretched from
+    its near-term trend anchor. ``None`` if EMA is unavailable/non-positive."""
+    closes = [c.c for c in window]
+    if len(closes) < 21:
+        return None
+    e21 = ind.ema(closes, 21)[-1]
+    if not math.isfinite(e21) or e21 <= 0:
+        return None
+    return abs(closes[-1] - e21) / e21 * 100.0
+
+
 def heuristic_signals(
     bars: Sequence[Candle],
     config: Optional[HeuristicConfig] = None,
@@ -207,6 +228,17 @@ def heuristic_signals(
         )
         if side is None:
             continue
+        # ── entry tightening (each default-off; all PIT from this window) ──
+        if cfg.require_score and score < cfg.min_score:
+            continue
+        if cfg.min_adx > 0 and (adx14 is None or adx14 < cfg.min_adx):
+            continue
+        if cfg.max_atr_pct > 0 and (atr_pct is None or atr_pct > cfg.max_atr_pct):
+            continue
+        if cfg.max_extension_pct > 0:
+            ext = _extension_pct(window)
+            if ext is None or ext > cfg.max_extension_pct:
+                continue
         burst = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
         if cfg.require_ta_confirm and not ta_confirmed(
             bullish, atr_pct, adx14, score

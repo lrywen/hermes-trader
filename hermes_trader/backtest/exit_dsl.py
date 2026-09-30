@@ -47,6 +47,22 @@ from .types import ExitEvent, Side, normalize_reason
 #: Default bar cadence: 5-minute bars, the production DSL cadence.
 BAR_MS_5M = 300_000
 
+# Cross-position cache of each ignition series' time index, keyed by id(series).
+# During one backtest the same per-coin lists are reused by every position, so
+# this collapses the otherwise O(n) timestamp rebuild per position. Lists can't
+# be weakref'd; id is stable for a live object and the cache dies with the
+# short-lived backtest process (no cross-run retention).
+_TS_INDEX: dict[int, list[int]] = {}
+
+
+def _shared_time_index(period: str, bars: object) -> list[int]:
+    key = id(bars)
+    ts = _TS_INDEX.get(key)
+    if ts is None:
+        ts = [b.t for b in bars]
+        _TS_INDEX[key] = ts
+    return ts
+
 
 @contextlib.contextmanager
 def _frozen_clock(wall: float, mono: float):
@@ -109,6 +125,11 @@ class DslBarExit:
     confirm_mode: str = "tick"
     #: 实盘出场检查点最小间隔（exit_checkpoint_min_interval_s 默认 5s）。
     tick_confirm_s: float = 5.0
+    #: PIT 多周期点火检测用的各周期 K 线（period -> bars，全历史）。
+    #: 生产里点火由独立的 refresh_ignition_states() 拉多周期 K 线判定；回测
+    #: 内核不跑该取数，故由调用方把已预算好的各周期序列注入，on_bar 在冻结
+    #: 时钟下用纯函数 detect_ignition 判定（time.time 已钉在虚拟时刻，天然 PIT）。
+    ignition_series: Optional[dict] = None
 
     def __post_init__(self) -> None:
         # bar 口径：复制 policy 并把亚秒级确认闸门清零（一根 bar 已是聚合的、
@@ -133,6 +154,61 @@ class DslBarExit:
             entry_atr_pct=self.entry_atr_pct, entry_regime=self.entry_regime,
         )
 
+    def _update_ignition(self) -> None:
+        """PIT 多周期点火判定（必须在 _frozen_clock 内调用）。
+
+        与生产 refresh_ignition_states 同口径：对注入的每个周期序列跑纯函数
+        detect_ignition，OR 取最早点火 bar，再 mark_ignited（单调）。此时
+        time.time 已被冻结在本 bar 收盘的虚拟时刻，detect_ignition 只会看到
+        截至该刻已收盘的 bar，无前瞻。已点火则直接返回。
+        """
+        if not self.ignition_series or self._tr.ignited:
+            return
+        pol = self.policy
+        if pol.ignite_grace_minutes <= 0:
+            return
+        best_ms: Optional[int] = None
+        best_period: Optional[str] = None
+        now_ms = int(time.time() * 1000)
+        entry_ms = self.entry_time_ms
+        for period, bars in self.ignition_series.items():
+            cfg = dx.IGNITE_PERIOD_DEFAULTS.get(period)
+            if cfg is None or not bars:
+                continue
+            bar_ms_p, lookback = cfg
+            # Perf: this runs on every un-ignited position bar, so instead of
+            # the production full-scan detect_ignition (O(series) per call),
+            # locate the [entry, now] index range with a cached, cross-position
+            # time index and evaluate ONLY those bars, each against its `lookback`
+            # predecessors (which are already on the same list). O(window) once.
+            ts = _shared_time_index(period, bars)
+            import bisect
+            i0 = bisect.bisect_left(ts, entry_ms)
+            i1 = bisect.bisect_right(
+                ts, now_ms - bar_ms_p)  # last bar already CLOSED by now
+            ig_idx: Optional[int] = None
+            for i in range(i0, i1):
+                b = bars[i]
+                p_lo = max(0, i - lookback)
+                prior = bars[p_lo:i]
+                if len(prior) < lookback:
+                    continue
+                avg_v = sum(x.v for x in prior) / lookback
+                if avg_v <= 0 or b.v < pol.ignite_vol_mult * avg_v:
+                    continue
+                if self.side == "long" and b.c > max(x.h for x in prior):
+                    ig_idx = i
+                    break
+                if self.side == "short" and b.c < min(x.l for x in prior):
+                    ig_idx = i
+                    break
+            if ig_idx is not None:
+                ig_ms = int(bars[ig_idx].t)
+                if best_ms is None or ig_ms < best_ms:
+                    best_ms, best_period = ig_ms, period
+        if best_ms is not None:
+            self._tr.mark_ignited(best_ms / 1000.0, period=best_period)
+
     def on_bar(self, bar, bar_index: int) -> Optional[ExitEvent]:
         """Process one bar (0 = the entry bar itself); exit or None.
 
@@ -156,6 +232,7 @@ class DslBarExit:
         wall = self.entry_time_ms / 1000.0 + (bar_index + 1) * bar_secs
         mono = float(bar_index + 1) * bar_secs
         with _no_persistence(), _frozen_clock(wall, mono):
+            self._update_ignition()
             adverse = bar.l if is_long else bar.h
             verdict = self._tr.check(adverse, index_px=None)
             if verdict.exit:
@@ -219,6 +296,7 @@ class DslBarExit:
                 # favorable 的任何影响。
                 self._tr.peak_px = entry_peak
                 self._tr._last_floor = entry_floor
+                self._update_ignition()
                 verdict = self._tr.check(adverse, index_px=None)
                 # 首根 bar 基线为 None：check 已据 hard-stop 算出，取为基线。
                 if entry_floor is None:

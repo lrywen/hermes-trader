@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import json
 import math
 import os
 import sys
@@ -228,6 +229,30 @@ def _print_summary(all_trades: List[Trade], equity: float, days: int,
         _print_walk_forward(walk_forward[0], walk_forward[1], equity)
 
 
+def _export_trades_jsonl(path: str, all_trades: List[Trade], arm: str) -> None:
+    """Write completed trades in the validate_outcome trade-JSONL contract.
+
+    day_bps_series (hermes_trader.validation) selects rows with
+    type=="trade" plus arm / notional / entry_t / pnl_net; pnl is converted to
+    bps via ``pnl_net / notional * 1e4`` and bucketed by entry_t day. We emit
+    exactly those fields (side/coin/reason included for traceability only).
+    """
+    with open(path, "w", encoding="utf-8") as fh:
+        for t in all_trades:
+            row = {
+                "type": "trade",
+                "arm": arm,
+                "coin": t.coin,
+                "side": t.side,
+                "entry_t": int(t.entry_time_ms),
+                "exit_t": int(t.exit_time_ms),
+                "notional": float(t.notional_usd),
+                "pnl_net": float(t.pnl_net_usd),
+                "reason": t.reason.value,
+            }
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--days", type=int, default=14)
@@ -284,6 +309,11 @@ def main() -> int:
                     help="O-7: fraction of the tradeable window held out as "
                          "out-of-sample for walk-forward validation (e.g. 0.3 = "
                          "last 30%%; 0 disables the IS/OOS report)")
+    ap.add_argument("--export-trades", default="",
+                    help="export completed trades as a validate_outcome-compatible "
+                         "JSONL (type=trade; fields arm/notional/entry_t/pnl_net)")
+    ap.add_argument("--arm-name", default="filt",
+                    help="arm label written into exported trade rows (default filt)")
     args = ap.parse_args()
     if not 0.0 <= args.oos_frac < 1.0:
         ap.error("--oos-frac must be in [0, 1) (0 disables the OOS report)")
@@ -400,17 +430,34 @@ def main() -> int:
             if len(candles) < 110:
                 print(f"  {coin:8} skip ({len(candles)} bars — insufficient)")
                 continue
-            candles_4h: Optional[List[Candle]] = None
-            candles_15m: Optional[List[Candle]] = None
-            if late_entry_params:
+            # Single fetch per timeframe for this coin, shared by the late-entry
+            # gate AND the ignition detector (avoids re-requesting the same
+            # series under 429 throttling). The base interval reuses candles.
+            series: Dict[str, Optional[List[Candle]]] = {args.interval: candles}
+
+            def _need(period: str) -> int:
+                if period == "4h":
+                    return need_4h
+                if period == "15m":
+                    return need_15m
+                return 5000
+
+            for period in ("4h", "15m", "5m"):
+                if period == args.interval:
+                    continue
+                # Only fetch what a consumer can use: the gate needs 4h/15m;
+                # ignition needs the policy's ignite_periods. Skip others.
+                used_by_gate = bool(late_entry_params) and period in ("4h", "15m")
+                used_by_ign = period in base_policy.ignite_periods
+                if not (used_by_gate or used_by_ign):
+                    continue
                 try:
-                    # Reuse the base series when it IS the higher TF; fetch failures
-                    # degrade this coin to no-gate, mirroring the live fail-open.
-                    candles_4h = candles if args.interval == "4h" else fetch_hl_candles(coin, "4h", need_4h)
-                    candles_15m = candles if args.interval == "15m" else fetch_hl_candles(coin, "15m", need_15m)
+                    series[period] = fetch_hl_candles(coin, period, _need(period))
                 except Exception as e:
-                    print(f"  {coin:8} late-entry gate unavailable ({e}) — running without it")
-                    candles_4h = candles_15m = None
+                    series[period] = None
+                    print(f"  {coin:8} {period} unavailable ({e}); consumers skip that layer")
+            candles_4h = series.get("4h") if late_entry_params else None
+            candles_15m = series.get("15m") if late_entry_params else None
             # H-7: per-coin realized adverse exit slip (when enabled and the
             # coin has enough live closes), else the CLI/default value.
             coin_exit_slip = exit_slip_bps
@@ -477,6 +524,17 @@ def main() -> int:
                         continue
                 kept.append(sig)
 
+            # PIT 多周期点火序列：复用上面统一拉取的各周期 K 线（不重复请求）；
+            # 缺某周期（fetch 失败/历史不足）就只在可得周期上 OR，与生产检测器
+            # "当时能看到什么就用什么"的口径一致。
+            ignition_series: Dict[str, List[Candle]] = {}
+            for period in base_policy.ignite_periods:
+                if period not in ("5m", "15m", "1h"):
+                    continue
+                src = candles if period == args.interval else series.get(period)
+                if src:
+                    ignition_series[period] = src
+
             lev = min(leverage_ceiling, max_lev)
             notional = args.equity * equity_fraction * lev
             cost = kcost.CostModel(
@@ -492,6 +550,7 @@ def main() -> int:
                 dsl_config=live.get("dsl_exit", {}),
                 confirm_mode="bar" if args.bar_confirm else "tick",
                 tick_confirm_s=args.tick_confirm_interval_s,
+                ignition_series=ignition_series,
             )
             # Structural no-look-ahead invariant check on every coin.
             kguard.assert_run_pit(candles, kept, trades)
@@ -536,6 +595,9 @@ def main() -> int:
         all_trades, args.equity, args.days, cost_note=cost_note,
         walk_forward=((is_trades, oos_trades) if args.oos_frac > 0 else None),
     )
+    if args.export_trades and all_trades:
+        _export_trades_jsonl(args.export_trades, all_trades, args.arm_name)
+        print(f"\nexported {len(all_trades)} trades (arm={args.arm_name}) -> {args.export_trades}")
     if stop_widths:
         sw = sorted(stop_widths)
         n = len(sw)
