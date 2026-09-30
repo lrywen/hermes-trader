@@ -69,6 +69,12 @@
 | `m1_l2_book_capture_prereg_2026-09-28.md` | M-1 | K线+funding 四轮失败后转向**扩信息集**：L2 order book 采集已部署（Top20/1s/10档/集成容器，book-raw 保留14天）；并在看数前**预注册** OFI 主假设（W=60s,h=5m）、按时间块 bootstrap、CI下界>0 且净均值≥3bps/笔，首次检验不早于 2026-10-28、60天确认不早于 2026-11-27；明确当前无 tape、CVD 仅作 exploratory |
 | `m2_binance_tape_cvd_prereg_2026-09-28.md` | M-2 | 换 venue 走历史：`/mnt/tick` 的 **Binance U本位永续逐笔成交**补齐为 BTC/ETH 各 **270 天连续（2026-01-01→09-27）零缺口**，含 is_buyer_maker 可算真 CVD；看数前**预注册**极端净流 H1（W=60s,h=5m,前/后50%天切分,固定成本11bp round-trip）、按天5天块 bootstrap、CI下界>0 且净均值≥3bps/笔，H2 CVD-价格背离作次要；明确不跑扫参、迁回 HL 需另开假设 |
 | `m2_binance_tape_cvd_result_2026-09-28.md` | M-2 结果 | test 135天 n=15,756：净 **−11.04bp/笔 ≈ 纯成本**（毛利≈−0.04bp，方向预测力≈随机），9/15bp、单币、1/10天块全部 CI 为负不含0 → **H1 CLOSED**；确定性清洗 44 天微秒时间戳；第五类公开信号（tape/CVD）结案，edge 仍待不可回溯数据（M-1 OFI / 扩 venue） |
+| `m3_metalabel_filter_prereg_2026-09-30.md` | M-3 | "模拟人工盯盘"的可复制部分=入场**选择性**：不预测方向，用 ≤5 个入场时刻特征（score/触发数/ADX/RSI/extension）训练浅 go/no-go meta-label 过滤层；切分点 2026-06-17，模型由训练段时序CV选定，τ 训练段定，按天块 bootstrap；目标仅减损，不预设转正 |
+| `m3_metalabel_filter_result_2026-09-30.md` | M-3 结果 | test 7,216笔/96天：训练CV AUC 仅 **0.5225≈随机**，τ≈0.49、保留99.9%（等价不过滤），Δ=+0.00 CI[−0.05,+0.05]，GO净−7.32bp CI全负 → **H1 CLOSED**。累计第六轮：方向/出场/入场选择三层在公开信息集上均证伪；"盘口感"属微结构信息，归 M-1（2026-10-28） |
+| `m4_bookdepth_imbalance_prereg_2026-09-30.md` | M-4 | 不等 M-1 30天，走 Binance 免费历史：bookDepth **30s帧**、12档（±0.2/1/2%，非真逐档L2），检验近mid ±0.2% 名义额失衡对5m收益的预测力；BTC+ETH、179天、切分03-31、阈值仅训练段估、扣11bp往返、按天块bootstrap |
+| `m4_bookdepth_imbalance_result_2026-09-30.md` | M-4 结果 | test 89天/49,556桶：gross方向收益仅 **+0.07bp≈随机**，go 8,965笔净 **−10.93bp** CI[−11.25,−10.60]，middle带无差异 → **H1 CLOSED**。第七类公开信号（深度总量）结案；不代表真OFI(M-1)失败，但强化"公开可回溯数据edge=0" |
+
+
 
 ## 找回原件的可选途径（备查，非必须）
 
