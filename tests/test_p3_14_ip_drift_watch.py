@@ -189,6 +189,41 @@ def test_p3_14_changed_ip_warns_and_appends_chained_event(monkeypatch, tmp_path,
     assert rec["hash"] == watch._record_hash(rec)
 
 
+def test_p3_14_within_pool_rotation_is_silent(monkeypatch, tmp_path, caplog):
+    """Per-connection SNAT rotation within one /24 must not alert or append."""
+    state_file = tmp_path / "state.json"
+    events_file = tmp_path / "events.jsonl"
+    state_file.write_text(json.dumps({"ip": "143.14.106.176"}))
+    monkeypatch.setattr(watch, "fetch_ip", lambda: "143.14.106.83")
+
+    with caplog.at_level(logging.WARNING, logger="ip_drift_watch"):
+        changed = watch.check_once(state_file=state_file, events_file=events_file)
+
+    assert changed is False
+    assert caplog.records == []
+    assert not events_file.exists()
+    state = json.loads(state_file.read_text())
+    assert state["ip"] == "143.14.106.83"  # tracked IP still refreshed
+    assert state["pool"] == "143.14.106.0/24"
+
+
+def test_p3_14_pool_change_warns(monkeypatch, tmp_path):
+    state_file = tmp_path / "state.json"
+    events_file = tmp_path / "events.jsonl"
+    state_file.write_text(json.dumps({"ip": "143.14.106.176"}))
+    monkeypatch.setattr(watch, "fetch_ip", lambda: "203.0.113.9")
+    assert watch.check_once(state_file=state_file, events_file=events_file) is True
+    lines = [ln for ln in events_file.read_text().splitlines() if ln.strip()]
+    assert len(lines) == 1
+
+
+def test_p3_14_ipv4_pool_helper():
+    assert watch.ipv4_pool("143.14.106.176") == "143.14.106.0/24"
+    assert watch.ipv4_pool("143.14.106.1") == watch.ipv4_pool("143.14.106.254")
+    assert watch.ipv4_pool("2001:db8::1") is None
+    assert watch.ipv4_pool("not-an-ip") is None
+
+
 def test_p3_14_chained_event_verifies_with_event_log(tmp_path):
     """The watchdog's hash scheme must match hermes_trader.event_log so
     verify_chain() accepts its records."""

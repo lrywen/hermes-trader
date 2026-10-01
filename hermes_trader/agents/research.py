@@ -2165,6 +2165,13 @@ def _debate_research(
             bull = _bull_analysis(ctx_msg)
             bear = _bear_analysis(ctx_msg)
     except Exception as e:
+        # Release the shared-pool workers: a future that hit the per-call cap
+        # is still running and would otherwise occupy a worker until the LLM
+        # eventually replies. Pending slow calls pile up across coins and starve
+        # the same pool (the cause of the cascading timeouts), so cancel them.
+        for _f in (locals().get("f_bull"), locals().get("f_bear")):
+            if _f is not None and not _f.done():
+                _f.cancel()
         logger.warning(
             f"[debate] bull/bear FAILED → single fallback | coin={coin} "
             f"elapsed_ms={int((time.time()-bb_start)*1000)} "

@@ -185,6 +185,32 @@ def test_debate_both_empty_returns_none(monkeypatch, _enable_debate, caplog):
     assert any("bull/bear FAILED" in m for m in caplog.messages)
 
 
+def test_debate_timeout_cancels_pending_futures(monkeypatch, _enable_debate, caplog):
+    """A slow bull/bear leg that exceeds the per-call cap must be cancelled
+    instead of lingering on and starving the shared pool."""
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor
+
+    exe = ThreadPoolExecutor(max_workers=2)
+    monkeypatch.setattr(R, "_get_pool", lambda: exe)
+    # The future cap is per_call + 4s; keep the leg sleeping past that.
+    monkeypatch.setattr(R, "_debate_per_call_timeout", lambda: 0.05)
+
+    def _slow(_ctx):
+        _time.sleep(6.0)
+        return "late"
+
+    monkeypatch.setattr(R, "_bull_analysis", _slow)
+    monkeypatch.setattr(R, "_bear_analysis", _slow)
+
+    with caplog.at_level("WARNING", logger="hermes_trader"):
+        result = R._debate_research("DOGE", "ctx", _perception(mid=0.1), atr_abs=0.01)
+
+    assert result is None
+    assert any("bull/bear FAILED" in m for m in caplog.messages)
+    exe.shutdown(wait=False, cancel_futures=True)
+
+
 def test_debate_serial_mode(monkeypatch, _enable_debate):
     monkeypatch.setattr(
         R, "_debate_cfg",

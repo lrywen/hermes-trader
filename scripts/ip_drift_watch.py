@@ -131,6 +131,34 @@ def _valid_ip(raw: str) -> bool:
     return bool(raw) and len(raw) <= 45 and bool(_IP_RE.match(raw))
 
 
+def _ipv4_octets(ip: str) -> Optional[tuple[int, int, int, int]]:
+    parts = ip.split(".")
+    if len(parts) != 4:
+        return None
+    try:
+        octets = tuple(int(p) for p in parts)
+    except ValueError:
+        return None
+    return octets if all(0 <= o <= 255 for o in octets) else None  # type: ignore[return-value]
+
+
+def ipv4_pool(ip: str, prefix: int = 24) -> Optional[str]:
+    """Logical egress-pool id for an IPv4 address (zeroed host bits).
+
+    Some uplinks sit behind a per-connection SNAT/CGNAT pool: every outbound
+    connection is NATed to a different address within one /24 (observed the
+    egress IP changing on connections only 2s apart, and even between two
+    simultaneous requests). Alerting on those rotations is pure noise, so they
+    are collapsed into the owning pool. Returns None for non-IPv4 inputs.
+    """
+    octets = _ipv4_octets(ip)
+    if octets is None:
+        return None
+    if prefix == 24:
+        return f"{octets[0]}.{octets[1]}.{octets[2]}.0/24"
+    return None
+
+
 def fetch_ip() -> Optional[str]:
     """Return the current egress IP, or None if BOTH sources failed.
 
@@ -299,7 +327,15 @@ def check_once(*, state_file: Optional[Path] = None, events_file: Optional[Path]
     if ip is None:
         return None
 
-    if old_ip and old_ip != ip:
+    # Pool-aware comparison. Two routable IPv4 addresses in the same /24 are
+    # treated as one logical egress pool so per-connection SNAT rotation does
+    # not raise a false alert or append a junk chain record. Non-IPv4 or a
+    # missing pool falls back to exact-address comparison.
+    new_pool = ipv4_pool(ip)
+    old_pool = ipv4_pool(old_ip) if old_ip else None
+    same_pool = new_pool is not None and new_pool == old_pool
+
+    if old_ip and not same_pool and old_ip != ip:
         logger.warning("[ip-drift] egress IP changed: old=%s new=%s", old_ip, ip)
         append_ip_drift_event(old_ip, ip, path=ep)
 
@@ -310,8 +346,10 @@ def check_once(*, state_file: Optional[Path] = None, events_file: Optional[Path]
             "source": "scripts/ip_drift_watch.py",
         }
     )
+    if new_pool is not None:
+        state["pool"] = new_pool
     save_state(state, path=sp)
-    return bool(old_ip and old_ip != ip)
+    return bool(old_ip and not same_pool and old_ip != ip)
 
 
 def run_forever() -> None:
