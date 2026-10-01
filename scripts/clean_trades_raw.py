@@ -10,7 +10,7 @@ book_capture 会按 UTC 日期把 L2 盘口快照写入：
 
 安全边界：
   * 只处理形如 ``date=YYYY-MM-DD`` 的目录，其它文件/目录一律不碰。
-  * 默认保留近14天；``--dry-run`` 只打印不删除。
+  * 默认保留近3天（book-raw 为 90 天，保护 M-1 检验窗口）；``--dry-run`` 只打印不删除。
 """
 from __future__ import annotations
 
@@ -26,7 +26,22 @@ from pathlib import Path
 logger = logging.getLogger("clean_trades_raw")
 
 _DIR_RE = re.compile(r"^date=(\d{4})-(\d{2})-(\d{2})$")
-DEFAULT_RETENTION_DAYS = 14
+# trades-raw 是公开逐笔成交，仅用于当天/近期的 dashboard 微结构调试，不被 M-1
+# 检验或回放依赖（M-2 用 /mnt/tick Binance）。扩到 Top20 币后每天约 7G，
+# 14 天会逼近磁盘上限，故只保留 3 天。可用 HERMES_TRADES_RETENTION_DAYS 覆盖。
+DEFAULT_RETENTION_DAYS = 3
+# book-raw 是 M-1 L2 OFI 的检验样本：采集器 2026-09 上线，首次检验 2026-10-28、
+# 60 天确认 2026-11-27。14 天滚动删除会把预注册窗口截断，故 book-raw 单独保留
+# 90 天（覆盖确认日并留余量）。
+DEFAULT_BOOK_RETENTION_DAYS = 90
+
+
+def retention_for(base: Path) -> int:
+    if base.name == "book-raw":
+        env = os.environ.get("HERMES_BOOK_RETENTION_DAYS")
+        return int(env) if env and env.isdigit() else DEFAULT_BOOK_RETENTION_DAYS
+    env = os.environ.get("HERMES_TRADES_RETENTION_DAYS")
+    return int(env) if env and env.isdigit() else DEFAULT_RETENTION_DAYS
 
 
 def raw_dir() -> Path:
@@ -76,18 +91,20 @@ def cleanup(base: Path, *, today: date, retention_days: int,
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--retention-days", type=int, default=DEFAULT_RETENTION_DAYS)
+    ap.add_argument("--retention-days", type=int, default=None,
+                    help="覆盖全部原始目录的保留天数；缺省按类型默认（trades-raw 14 / book-raw 90）")
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
-    if args.retention_days < 1:
+    if args.retention_days is not None and args.retention_days < 1:
         ap.error("--retention-days 必须 >= 1")
     today = datetime.now(timezone.utc).date()
     all_removed: list[str] = []
     for base in raw_dirs():
+        retention_days = args.retention_days or retention_for(base)
         removed = cleanup(base, today=today,
-                          retention_days=args.retention_days, dry_run=args.dry_run)
+                          retention_days=retention_days, dry_run=args.dry_run)
         if removed:
             print(f"{base}: 清理 {len(removed)} 个过期目录: {removed}")
         all_removed.extend(f"{base.name}/{n}" for n in removed)

@@ -827,10 +827,20 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                 # applies, and sizing may tighten on the hot flag). Fail-safe:
                 # any error keeps the REJECT.
                 _be = _late_entry_params().get("breakout_exemption") or {}
+                _be_obs = {}
                 try:
                     _be_on = bool(_be.get("enabled"))
                     _be_shadow = bool(_be.get("shadow_mode", True))
                     _hq, _hq_info = _high_quality_breakout(perception, _be)
+                    # OBS-01: record the exemption evaluation on EVERY block so a
+                    # would-downgrade is visible even while shadow keeps REJECT.
+                    _be_obs = {
+                        "exemption_enabled": _be_on,
+                        "exemption_shadow": _be_shadow,
+                        "hq_breakout": bool(_hq),
+                        "would_downgrade": bool(_be_on and _hq),
+                        "rvol": _hq_info.get("rvol"),
+                    }
                     if _be_on and _hq:
                         if not _be_shadow:
                             logger.info(
@@ -863,6 +873,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                         "mode": str(le_params.get("mode", "shadow") or "shadow"),
                         "layer": "prefilter",
                         "blocked": True,
+                        "breakout_exemption": _be_obs,
                         "reason": le.get("reason", ""),
                         "rsi4h": le.get("rsi4h"),
                         "adx4h": le.get("adx4h"),

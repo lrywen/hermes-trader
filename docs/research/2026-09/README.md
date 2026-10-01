@@ -73,6 +73,18 @@
 | `m3_metalabel_filter_result_2026-09-30.md` | M-3 结果 | test 7,216笔/96天：训练CV AUC 仅 **0.5225≈随机**，τ≈0.49、保留99.9%（等价不过滤），Δ=+0.00 CI[−0.05,+0.05]，GO净−7.32bp CI全负 → **H1 CLOSED**。累计第六轮：方向/出场/入场选择三层在公开信息集上均证伪；"盘口感"属微结构信息，归 M-1（2026-10-28） |
 | `m4_bookdepth_imbalance_prereg_2026-09-30.md` | M-4 | 不等 M-1 30天，走 Binance 免费历史：bookDepth **30s帧**、12档（±0.2/1/2%，非真逐档L2），检验近mid ±0.2% 名义额失衡对5m收益的预测力；BTC+ETH、179天、切分03-31、阈值仅训练段估、扣11bp往返、按天块bootstrap |
 | `m4_bookdepth_imbalance_result_2026-09-30.md` | M-4 结果 | test 89天/49,556桶：gross方向收益仅 **+0.07bp≈随机**，go 8,965笔净 **−10.93bp** CI[−11.25,−10.60]，middle带无差异 → **H1 CLOSED**。第七类公开信号（深度总量）结案；不代表真OFI(M-1)失败，但强化"公开可回溯数据edge=0" |
+| `m5_limit_vs_taker_ab_prereg_2026-09-30.md` | M-5 | 信号触发后不立刻市价追、改 post-only 限价回调 r=10bps（W=15m超时不追、往返6.5bp）能否减损；用 Binance 逐笔精确判成交，同信号同持有 H=15m，切分03-31，看数前冻结四门槛（B′≥A且ΔCI≥0、成交率≥50%、踏空机会成本≤1bp、A≥300） |
+| `m5_limit_vs_taker_ab_result_2026-09-30.md` | M-5 结果 | test 171天/2153笔：成交率63.2%，B′−4.38 vs A−9.87（Δ+5.49显著）但**踏空单机会成本+7.57bp**（系统性错过不回调的最强趋势单）→ R3 FAIL，**KEEP TAKER**。表面减损是选择偏差；执行层不改，唯一待验 M-1 OFI（2026-10-28） |
+| `m6_hold_horizon_decay_prereg_2026-09-30.md` | M-6 | 零预测自由度出场诊断：同一冻结信号/成本/切分，隔离纯 time-based exit，H∈{5,15,30,60,120,240}m 看数前列死，test唯一报告净bps衰减曲线，只判形状不在样本内选最优H |
+| `m6_hold_horizon_decay_result_2026-09-30.md` | M-6 结果 | test 945笔：净bps全horizon≈−9bp平坦（相邻|Δ|≤0.85、CI全重叠），**无短H集中/长H回吐** → time-based exit 不做，缩短持有期救不了。过程中修复b1前视bug（曾造假衰减曲线），H15与M-5交叉对账一致。累计：改平仓时刻也无效，毛利≈0亏的全是成本 |
+| `m7_signal_significance_prereg_2026-10-01.md` | M-7 | 零自由度决策闸门：5m/15m/1h 各自检验动量方向在下一bar去趋势回报上的stationary bootstrap p值+毛利/净bps，分多空，决定周期该不该上移 |
+| `m7_signal_significance_result_2026-10-01.md` | M-7 结果 | 9格中**唯一净正=1h多头**（毛利+11.59bp、净+2.59、p=0.0375）；5m多空≈0、做空全周期为负（1h空−10.4/p0.98）→ **主周期上移1h、只做多、静态关空**。薄edge需波动率目标+出场结构，新数据再确认 |
+| `m8_h1_long_exit_curve_prereg_2026-10-01.md` | M-8 | 1h多头信号出场诊断：H∈{1,2,4,8,16,24,48}h 看数前列死，净bps+stationary bootstrap CI，只判形状不选最优 |
+| `m8_h1_long_exit_curve_result_2026-10-01.md` | M-8 结果 | n=182：净bps随持有累积（H1+2.6→H4+14.9→H16/24+38峰→H48回吐+28），**真趋势跟随** → 让利润奔跑+trailing在1-2天保护，不做固定短持有；峰值CI宽不选16h |
+| `m9_vol_target_sizing_prereg_2026-10-01.md` | M-9 | 零方向自由度风控：1h多头固定H=8h，对比 U/V20/V40 三档定尺（w=target/sigma，trailing30d，cap2），看数前列死不扫参 |
+| `m9_vol_target_sizing_result_2026-10-01.md` | M-9 结果 | test134笔：**V20 Pareto最优**——回撤−30%→−15%减半、ES−3→−1.24，同时收益2.4%→4.8%、Sharpe0.22→0.42；V40≈加杠杆U未降回撤。**采纳20%目标波动**，新数据再确认 |
+| `m10_integrated_candidate_prereg_2026-10-01.md` | M-10 | 整合 1h多头 + 硬止损−10/门槛+2/Chandelier回撤5%/最长120h，三臂 BASELINE(固定H8,w1)/TRAIL(trailing,w1)/FULL(trailing+V20)，前向单仓状态机严格非重叠 |
+| `m10_integrated_candidate_result_2026-10-01.md` | M-10 结果 | **否证**：TRAIL−27.5%/FULL−13.4% 远劣于 BASELINE+0.8%。M-8收盘+38bp无法用盘中trailing实现（5%盘中回撤太常见、被扫在局部低点）→ 固定trailing不切换；1h多头edge薄、仅作M-1方向载体 |
 
 
 
