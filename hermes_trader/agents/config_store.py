@@ -1036,6 +1036,9 @@ def _emit_config_write_audit(
             "prev_era_id": prev_era,
             "era_id": new_era,
         })
+        # Stamp the O(1) sidecar so the per-heartbeat integrity reconciler
+        # never has to scan the (potentially huge) session history again.
+        _write_last_config_write_ts(int(time.time() * 1000))
     except Exception:  # pragma: no cover - audit must never break the write
         logger.debug("[config] config_write audit emit failed", exc_info=True)
 
@@ -1225,30 +1228,46 @@ def update_agent_config(
                 pass
 
 
+# Cap on the one-time active-log fallback scan in
+# _last_config_write_audit_mtime_ms, so the cost stays bounded regardless
+# of active-log size (config_write is emitted on every audited save, so a
+# recent one normally appears well within this window).
+_ACTIVE_LOG_FALLBACK_LINES = 5000
+
+
 def _last_config_write_audit_mtime_ms() -> Optional[int]:
     """Return the ``ts`` (epoch ms) of the most recent ``config_write``
-    event in the session log, or None if there is none / the log is
-    unreadable.
-
-    Scans the active log plus rotated gz files (oldest→newest) and keeps
-    the last match. Best-effort: any read/parse error is treated as "no
-    audit" so a torn log cannot mask a drift.
+    event, or None if there is none / it is unreadable.
+    Hot-path safe (incident 2026-10-01): this runs on every heartbeat via
+    :func:`reconcile_config_integrity`, so it must NOT parse the full
+    history. The authoritative value is the O(1) sidecar stamped by the
+    write path. Only when that sidecar is missing (fresh checkout before
+    the first write) do we fall back to a BOUNDED reverse scan of the
+    ACTIVE log alone — rotated gz files are never opened and the scan is
+    capped at ``_ACTIVE_LOG_FALLBACK_LINES`` lines, so a giant/garbage log
+    can still never stall the loop. Best-effort throughout: any error is
+    treated as "no audit".
     """
-    try:
-        from hermes_trader import session_log
-    except Exception:
-        return None
-    last_ts: Optional[int] = None
-    try:
-        events = session_log.read_all_history()
-        for ev in events:
-            if ev.get("event") == "config_write":
-                ts = ev.get("ts")
-                if isinstance(ts, (int, float)):
-                    last_ts = int(ts)
-    except Exception:
-        return None
-    return last_ts
+    sidecar_ts = _read_last_config_write_ts()
+
+    fallback_ts: Optional[int] = None
+    if sidecar_ts is None:
+        try:
+            from hermes_trader import session_log
+            # Only inspect the most recent N active-log lines. A config_write
+            # is emitted on every audited save, so under normal operation a
+            # recent one is present; if all writes predate rotation there is
+            # none in the active log and we correctly return None.
+            for ev in session_log.tail(n=_ACTIVE_LOG_FALLBACK_LINES):
+                if ev.get("event") == "config_write":
+                    ts = ev.get("ts")
+                    if isinstance(ts, (int, float)):
+                        fallback_ts = int(ts)
+        except Exception:
+            return sidecar_ts
+
+    candidates = [t for t in (sidecar_ts, fallback_ts) if t is not None]
+    return max(candidates) if candidates else None
 
 
 def reconcile_config_integrity(*, grace_s: float = 5.0) -> Optional[dict[str, Any]]:
@@ -1361,6 +1380,33 @@ def _write_integrity_marker(mtime_ms: int) -> None:
 def _clear_integrity_marker() -> None:
     try:
         os.unlink(_INTEGRITY_MARKER_PATH)
+    except OSError:
+        pass
+
+
+# ── Last-audited config_write timestamp (O(1) hot-path cache) ───────────
+# Incident 2026-10-01: the per-heartbeat integrity reconciler used to call
+# session_log.read_all_history(), which json.loads EVERY rotated gz file plus
+# the whole active log into one giant list just to learn the most recent
+# config_write ts. As the log grew this single call blocked the main loop
+# (pure CPU, GIL held) for tens of minutes — the heartbeat stalled and the
+# dashboard became unusable. The write path now stamps this tiny sidecar in
+# O(1); the reconciler reads it instead of scanning history.
+_LAST_CONFIG_WRITE_TS_PATH = CONFIG_PATH + ".lastwrite"
+
+
+def _read_last_config_write_ts() -> Optional[int]:
+    try:
+        with open(_LAST_CONFIG_WRITE_TS_PATH, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_last_config_write_ts(ts_ms: int) -> None:
+    try:
+        with open(_LAST_CONFIG_WRITE_TS_PATH, "w") as f:
+            f.write(str(int(ts_ms)))
     except OSError:
         pass
 
