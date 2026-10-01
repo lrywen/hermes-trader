@@ -78,7 +78,12 @@ except Exception as _loop_log_err:
         "loop file handler disabled (stderr only): %s", _loop_log_err)
 
 from hermes_trader.agents.config import get_config
-from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.config_store import (
+    cfg_get,
+    read_agent_config,
+    reconcile_config_integrity,
+    regime_max_loss_tiers_flat,
+)
 from hermes_trader.agents.dsl_exit import active_position_coins, held_coins_missing_mids, rehydrate_from_exchange
 from hermes_trader.agents.executor import (
     arm_close_tiered_breakers,
@@ -1325,10 +1330,26 @@ _last_research_score_by_coin: dict = {}
 # Held coins are exempt (their AI close-check must not be suppressed). Entries
 # keyed on a new bar_close_ms naturally fall out of scope; the set stays small.
 _researched_signal_fps: set = set()
+_regime_tiers_flat_prev = False
 
 
 while True:
     try:
+        # ── Integrity: flag any config write that bypassed config_store ───
+        # Emits config_write_unattributed once per un-audited mtime; a
+        # legitimate write clears the marker. Best-effort, never raises.
+        reconcile_config_integrity()
+        # Read-only warning when the enabled regime_aware max_loss tiers are
+        # identical (split armed but a no-op). Log only on the transition so
+        # the heartbeat log isn't spammed. Values are NOT changed.
+        _tiers_flat = regime_max_loss_tiers_flat()
+        if _tiers_flat and not _regime_tiers_flat_prev:
+            logger.warning(
+                "[risk] dsl_exit.regime_aware is enabled but max_loss trend "
+                "and non_trend tiers are identical — regime split currently "
+                "has NO effect (same stop for every regime). Operator chose "
+                "to keep this value; restore differentiated tiers to re-enable.")
+        _regime_tiers_flat_prev = _tiers_flat
         # ── Heartbeat: refresh equity / positions before scanning ──────────
         equity, positions, available, spot_usdc, queried_dexes, state = _sync_account_state()
         daily_pnl = memory.get_daily_pnl()

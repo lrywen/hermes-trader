@@ -1225,6 +1225,146 @@ def update_agent_config(
                 pass
 
 
+def _last_config_write_audit_mtime_ms() -> Optional[int]:
+    """Return the ``ts`` (epoch ms) of the most recent ``config_write``
+    event in the session log, or None if there is none / the log is
+    unreadable.
+
+    Scans the active log plus rotated gz files (oldest→newest) and keeps
+    the last match. Best-effort: any read/parse error is treated as "no
+    audit" so a torn log cannot mask a drift.
+    """
+    try:
+        from hermes_trader import session_log
+    except Exception:
+        return None
+    last_ts: Optional[int] = None
+    try:
+        events = session_log.read_all_history()
+        for ev in events:
+            if ev.get("event") == "config_write":
+                ts = ev.get("ts")
+                if isinstance(ts, (int, float)):
+                    last_ts = int(ts)
+    except Exception:
+        return None
+    return last_ts
+
+
+def reconcile_config_integrity(*, grace_s: float = 5.0) -> Optional[dict[str, Any]]:
+    """Detect a config mutation that bypassed the audited write path.
+
+    Root cause this guards against (incident 2026-09-30): an ad-hoc /
+    hand-held script made its own backup copies and wrote
+    ``.agent-config.json`` directly, instead of going through
+    :func:`write_agent_config` / :func:`update_agent_config`. Those two
+    are the only code paths that emit a ``config_write`` audit event, so
+    the silent drift left the file newer than the last audited write.
+
+    We cannot force throwaway code to call an API, so instead the
+    always-on loop calls this reconciler: when the config file's mtime is
+    more than *grace_s* newer than the last ``config_write`` event, it
+    emits a single ``config_write_unattributed`` incident (with the
+    current vs last-audited mtime) and returns it. A small state file
+    dedups repeated alerts for the same on-disk mtime. A legitimate
+    audited write (which refreshes the audit timestamp) clears the state.
+
+    Returns the incident dict on a new detection, otherwise None. Never
+    raises — integrity checks must not break the trading loop.
+    """
+    try:
+        st = os.stat(CONFIG_PATH)
+    except OSError:
+        return None
+    mtime_ms = int(st.st_mtime * 1000)
+    last_audit_ms = _last_config_write_audit_mtime_ms()
+    # No audit at all and the file is older than the grace window relative
+    # to now only fires when a write genuinely lacks an event.
+    if last_audit_ms is not None and (mtime_ms - last_audit_ms) <= grace_s * 1000:
+        # File is at or behind the last audited write — clear stale marker.
+        _clear_integrity_marker()
+        return None
+    if last_audit_ms is None and (time.time() - st.st_mtime) <= grace_s:
+        return None
+    # Dedup: only alert once per distinct file mtime.
+    if _read_integrity_marker() == mtime_ms:
+        return None
+    _write_integrity_marker(mtime_ms)
+    incident = {
+        "event": "config_write_unattributed",
+        "path": CONFIG_PATH,
+        "file_mtime_ms": mtime_ms,
+        "last_audit_mtime_ms": last_audit_ms,
+        "lag_ms": (mtime_ms - last_audit_ms) if last_audit_ms is not None else None,
+        "size": st.st_size,
+    }
+    try:
+        from hermes_trader import session_log
+        session_log.append(incident)
+    except Exception:
+        logger.warning("[config] unattributed write detected, audit log failed",
+                       exc_info=True)
+    logger.error(
+        "[config] config file changed WITHOUT a config_write audit event "
+        "(mtime_ms=%s last_audit_ms=%s) — likely a direct/ad-hoc write; "
+        "investigate and route future writes through config_store.",
+        mtime_ms, last_audit_ms)
+    return incident
+
+
+def regime_max_loss_tiers_flat(cfg: Optional[dict[str, Any]] = None) -> bool:
+    """Read-only diagnostic: True when ``dsl_exit.regime_aware`` is enabled
+    but its ``max_loss.trend`` and ``max_loss.non_trend`` tiers are
+    byte-identical — i.e. the regime split is armed yet has no effect.
+
+    Production state 2026-09-30: an un-audited write flattened both tiers to
+    1.5%/15, so regime_aware looked active but applied the same stop to
+    every trade. The operator chose to KEEP 1.5/15 (no value change); this
+    just makes the no-op split visible instead of silently misleading.
+
+    Does not mutate anything and never raises.
+    """
+    try:
+        if cfg is None:
+            cfg = read_agent_config()
+        dsl = cfg.get("dsl_exit") or {}
+        ra = dsl.get("regime_aware") or {}
+        if not ra.get("enabled", False):
+            return False
+        ml = ra.get("max_loss") or {}
+        trend = ml.get("trend") or {}
+        non_trend = ml.get("non_trend") or {}
+        return bool(trend) and trend == non_trend
+    except Exception:
+        return False
+
+
+_INTEGRITY_MARKER_PATH = CONFIG_PATH + ".integrity"
+
+
+def _read_integrity_marker() -> Optional[int]:
+    try:
+        with open(_INTEGRITY_MARKER_PATH, "r") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _write_integrity_marker(mtime_ms: int) -> None:
+    try:
+        with open(_INTEGRITY_MARKER_PATH, "w") as f:
+            f.write(str(mtime_ms))
+    except OSError:
+        pass
+
+
+def _clear_integrity_marker() -> None:
+    try:
+        os.unlink(_INTEGRITY_MARKER_PATH)
+    except OSError:
+        pass
+
+
 def backup_config() -> Optional[dict[str, Any]]:
     """Read and return the last backup config, or None if unavailable."""
     lock_fd = None
