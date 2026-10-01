@@ -544,12 +544,45 @@ def _shadow_files(path: str) -> list[str]:
     return files
 
 
-def _read_jsonl(path: str) -> list[dict]:
+def _line_ts_ms_fast(ln: str) -> float | None:
+    """Best-effort millisecond timestamp from a raw JSONL line *without* a full
+    json.loads. Shadow records put a numeric ``"ts"`` epoch-millis field near the
+    start (``{"ts": 1790475592526, ...}``). Returns None when absent/non-numeric
+    so the caller falls back to a full parse. Cheap: bounded prefix + one split."""
+    i = ln.find('"ts"')
+    if i < 0 or i > 200:
+        return None
+    tail = ln[i + 4:i + 60].lstrip()
+    if not tail.startswith(":"):
+        return None
+    tail = tail[1:].lstrip()
+    num = ""
+    for ch in tail:
+        if ch.isdigit():
+            num += ch
+        elif num:
+            break
+        else:
+            return None
+    if not num:
+        return None
+    v = float(num)
+    # Heuristic mirrors _record_ts_ms: >10^12 is millis, otherwise seconds.
+    return v if v > 1e12 else v * 1000.0
+
+
+def _read_jsonl(path: str, since_ms: float | None = None) -> list[dict]:
     """Read a shadow JSONL and its rotated siblings (best-effort).
 
     Merges the active file with numeric ``.1``..``.5`` rotations and de-dups by
     raw line so a record present in two files is counted once. Read-only: the
-    grader never writes back (INERT)."""
+    grader never writes back (INERT).
+
+    ``since_ms`` bounds parsing to the trailing window: lines whose timestamp is
+    older than the cutoff are skipped *before* the expensive json.loads. Records
+    lacking a cheaply-extractable timestamp are still parsed (fail-open) so we
+    never silently drop data. The merged rotation stream is appended in
+    time-order (oldest rotation first), which makes this bound effective."""
     out = []
     if not path:
         return out
@@ -561,6 +594,11 @@ def _read_jsonl(path: str) -> list[dict]:
                     ln = ln.strip()
                     if not ln or ln in seen_lines:
                         continue
+                    if since_ms is not None:
+                        fast_ts = _line_ts_ms_fast(ln)
+                        if fast_ts is not None and fast_ts < since_ms:
+                            seen_lines.add(ln)
+                            continue
                     seen_lines.add(ln)
                     try:
                         out.append(json.loads(ln))
@@ -753,7 +791,10 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
     now_ms = now_ms if now_ms is not None else time.time() * 1000.0
     kind = ARM_KIND.get(arm, "block")
     if records is None:
-        records = _read_jsonl(path)
+        # Bound parsing to the longest trailing window plus a slack so the
+        # stale-age check and late-backfilled outcomes are never truncated.
+        since_ms = now_ms - (max(windows) + 24) * 3_600_000.0
+        records = _read_jsonl(path, since_ms=since_ms)
     stats = [_window_stats(records, kind, w, now_ms, arm) for w in windows]
     w_long = max(windows)
     longest = next((s for s in stats if s["window_h"] == w_long), stats[-1])

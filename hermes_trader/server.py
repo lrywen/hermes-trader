@@ -298,6 +298,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     import threading
     threading.Thread(target=_warm_candles, daemon=True, name="candle-prewarm").start()
 
+    # Keep the shadow-arm grades payload warm in the background so the config /
+    # risk-arms pages never block on a cold multi-second grade collection (which
+    # exceeded the portal proxy timeout and left the cache never warmed).
+    from hermes_trader.dashboard_routes.shadow_arms import _start_grades_warmer
+    _start_grades_warmer()
+
     # P2 (2026-09-15): arm loop observability + GC freeze after heavy startup
     # objects exist, right before serving traffic.
     _setup_loop_observability()

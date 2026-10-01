@@ -57,6 +57,61 @@ _DEFAULT_WINDOWS = (24, 72, 168)
 _GRADES_TTL_S = 60.0
 _GRADES_CACHE_KEY = "shadow_arms_grades"
 
+
+def _get_cached_fresh_or_stale(key: str, ttl: float):
+    """Return ``(payload, is_fresh)`` from the shared dashboard TTL cache.
+
+    A cold grade collection can take well over the portal/nginx proxy timeout
+    (tens of seconds when the shadow files are large). Computing it on the
+    request path therefore guarantees a client-visible timeout and the cache
+    never gets warmed through the portal. Instead the GET handler serves the
+    last cached payload even when expired (stale-while-revalidate); a
+    background loop keeps that value current. Returns (None, False) only when
+    nothing has ever been cached."""
+    from hermes_trader.dashboard import _TTL_CACHE, _TTL_CACHE_LOCK
+
+    with _TTL_CACHE_LOCK:
+        hit = _TTL_CACHE.get(key)
+        if not hit:
+            return None, False
+        ts, val = hit
+        return val, (time.time() - ts) < ttl
+
+
+def _refresh_grades_cache(windows) -> None:
+    """Recompute grades and replace the cached value (runs in a worker thread).
+
+    Uses the singleflight-backed _ttl_cached so a concurrent on-demand loader
+    and this background refresh never stampede the disk. Best-effort: failures
+    are logged and leave any existing stale payload intact."""
+    try:
+        _ttl_cached(
+            _GRADES_CACHE_KEY, _GRADES_TTL_S,
+            lambda: _grades_payload(list(windows)),
+        )
+    except Exception as e:  # pragma: no cover - depends on runtime IO
+        logger.warning("[shadow-arms] background grade refresh failed: %s: %s",
+                       type(e).__name__, e)
+
+
+def _start_grades_warmer() -> None:
+    """Launch a daemon thread that keeps the grades payload warm.
+
+    Pre-warms once on startup (the slow path no longer blocks any request),
+    then refreshes every TTL. Read-only; never writes config."""
+    import threading
+
+    def _run() -> None:
+        wins = list(_DEFAULT_WINDOWS)
+        _refresh_grades_cache(wins)
+        while True:
+            time.sleep(_GRADES_TTL_S)
+            _refresh_grades_cache(wins)
+
+    threading.Thread(target=_run, daemon=True,
+                     name="shadow-arms-grader").start()
+
+
 # ── historical backtest (backfill) evidence surface ──────────────────────────
 # Aggregates the offline backfill artifacts (/data/*.backfill.jsonl) produced by
 # the scripts/backfill_*.py historical replayers. Same read-only posture as the
@@ -474,15 +529,32 @@ def register_shadow_arms_routes(app: FastAPI) -> None:
 
     @app.get("/api/dashboard/shadow-arms/grades")
     async def shadow_arms_grades(windows: str | None = Query(None)) -> JSONResponse:
-        """Latest per-arm verdicts/window stats. 60s TTL cache; anonymous-safe."""
+        """Latest per-arm verdicts/window stats. Served stale-while-revalidate;
+        a background warmer keeps the payload current so this never blocks on a
+        cold multi-second collection. Anonymous-safe."""
         wins = _parse_windows(windows)
-        try:
-            payload = await asyncio.to_thread(
-                _ttl_cached, _GRADES_CACHE_KEY, _GRADES_TTL_S,
-                lambda: _grades_payload(wins),
-            )
-        except Exception as e:
-            raise HTTPException(503, f"shadow-arm grader unavailable: {e}")
+        payload, is_fresh = _get_cached_fresh_or_stale(
+            _GRADES_CACHE_KEY, _GRADES_TTL_S)
+        if payload is None:
+            # Nothing cached yet (cold start). The background warmer is already
+            # computing; wait for it via the singleflight loader, but bounded so
+            # a pathological slow collection still degrades to 503 rather than
+            # hanging the proxy indefinitely.
+            try:
+                payload = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        _ttl_cached, _GRADES_CACHE_KEY, _GRADES_TTL_S,
+                        lambda: _grades_payload(wins),
+                    ),
+                    timeout=30.0,
+                )
+            except asyncio.TimeoutError:
+                raise HTTPException(503, "shadow-arm grader warming up; retry shortly")
+            except Exception as e:
+                raise HTTPException(503, f"shadow-arm grader unavailable: {e}")
+        elif not is_fresh:
+            # Serve the stale value immediately; refresh in the background.
+            asyncio.to_thread(_refresh_grades_cache, wins)
         return JSONResponse(payload)
 
     @app.get("/api/dashboard/shadow-arms/debate-ab")
