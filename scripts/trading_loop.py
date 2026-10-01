@@ -1332,6 +1332,15 @@ _last_research_score_by_coin: dict = {}
 _researched_signal_fps: set = set()
 _regime_tiers_flat_prev = False
 
+# launch_capture trades-subscription hysteresis. The desired set (_want)
+# flaps by ~1 scan cycle (top-15 result order + pre-launch compression screen
+# both shift), so dropping a coin the instant it leaves _want caused every
+# coin to be un-/re-subscribed ~8× per 30 min (observed 383 re-subs) and broke
+# CVD continuity. A coin is only dropped after being absent for this many
+# consecutive cycles; absent-count state is coin keyed and stays small.
+_TRADES_DROP_GRACE_CYCLES = 3
+_trades_absent_cycles: dict = {}
+
 
 while True:
     try:
@@ -2115,8 +2124,19 @@ while True:
                         break
                     _want.add(_cc)
                 if _ws is not None:
+                    # Hysteresis: only drop coins that have been absent from
+                    # _want for several consecutive cycles, and reset the
+                    # counter for any coin still wanted. Stops the per-cycle
+                    # un-/re-subscribe oscillation while still bounding size.
+                    for _c in _want:
+                        _trades_absent_cycles.pop(_c, None)
                     for _c in list(_ws._trades_coins - _want):
-                        _ws.unsubscribe_trades(_c)
+                        n_missed = _trades_absent_cycles.get(_c, 0) + 1
+                        if n_missed >= _TRADES_DROP_GRACE_CYCLES:
+                            _ws.unsubscribe_trades(_c)
+                            _trades_absent_cycles.pop(_c, None)
+                        else:
+                            _trades_absent_cycles[_c] = n_missed
                     for _c in _want:
                         _ws.subscribe_trades(_c)
                 # feed book imbalance for candidates (cheap, throttled by SDK cache)
