@@ -1354,6 +1354,11 @@ class DSLTracker:
         # reads "phase2". The floor is monotonic-clamped regardless, so this
         # only makes the activation criterion consistent (and keeps a restart-
         # restored tracker whose peak>=protect but mark<protect in phase2).
+        # INVARIANT (MQL5 AutoProtect rule): the trailing floor may ONLY arm
+        # AFTER the position has cleared the protect/breakeven threshold. In
+        # phase 1 the floor stays at the hard stop — it never trails before the
+        # profit trigger. This is intentional: trailing before the trigger would
+        # ratchet a stop inside the noise band and churn. Keep the ordering.
         if self._peak_profit_pct() >= pol.protect_pct:
             # Phase 2: floor trails peak by (1-retrace) of the favorable range.
             tier = self._active_tier(self.peak_px)  # Use PEAK for tier, not current

@@ -166,6 +166,25 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "hip3_dex_allowlist": ["xyz"],
     "hip3_dex_blocklist": [],
     "dsl_exit": {
+        # ───────────────────────── PARAMETER LAYERING (Zorro ≤3 discipline) ──
+        # This block has ~15 knobs but they are NOT free fit parameters. Before
+        # tuning anything, read its layer:
+        #   * FROZEN CONSTANTS — fixed by a 1y event study / audit, do NOT
+        #     re-optimize: max_loss_pct, max_loss_roe_pct, protect_pct,
+        #     retrace_threshold, breakeven_trigger/lock, hard_timeout,
+        #     stale_flat_timeout, phase2_tiers, regime_aware (trend_ride /
+        #     max_loss / clocks).
+        #   * ACTIVE DEGREE OF FREEDOM — only these may be adjusted under the
+        #     "≤3 optimized exit params" budget; currently effectively 0 (all
+        #     of the above are data-pinned, not optimizer output).
+        #   * OBSERVATION ARMS (shadow, no fills) — stop_tuning_shadow records
+        #     counter-factual arms; keep until the audit concludes.
+        #   * DISABLED-BY-EVIDENCE sub-blocks — atr_stop ("no edge on/off",
+        #     409-trade study 2026-09-25), smooth_transition (net-negative tick
+        #     replay), time_scratch (does not lift portfolio EV, A/B 2026-09-30).
+        #     Kept OFF + documented on purpose; do not re-enable without new
+        #     evidence. Removing these keys is SAFE (consumers .get() → class
+        #     defaults) but pointless for production, which pins them explicitly.
         "max_loss_pct": 1.0,
         "max_loss_roe_pct": 15.0,
         "protect_pct": 1.5,
