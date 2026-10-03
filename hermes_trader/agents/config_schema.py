@@ -346,6 +346,8 @@ class _ConfigPatch(BaseModel):
         default_factory=lambda: _dict_default("reasoning_effort_rollout"))
     signal_ranking: dict[str, Any] = Field(
         default_factory=lambda: _dict_default("signal_ranking"))
+    unstucking: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("unstucking"))
     # Post-close decision reflection (absorbed from TradingAgents). INERT:
     # one background LLM review after a close, injected into the next research
     # prompt; never sizes/vetoes/changes gates.
@@ -601,6 +603,18 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "liquidity": _num_leaf(0.0, 100.0),
             "class_penalty": _num_leaf(0.0, 100.0),
         },
+    },
+    "unstucking": {
+        # P1-1: active realisation of small losses on stuck positions.
+        #   off      -> legacy DSL hard-stop / stale_flat only
+        #   shadow   -> compute + log the would-close, never place it
+        #   enforce  -> close accepted positions via the reduce-only channel
+        # Activates only under drawdown pressure or full stuck-slots.
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "max_peak_drawdown_pct": _num_leaf(0.0, 100.0),
+        "max_stuck_slots": _num_leaf(0, 100),
+        "min_urgency": _num_leaf(0.0, 100.0),
+        "log_path": ("str",),
     },
     "late_chase": {
         "enabled": ("bool",),

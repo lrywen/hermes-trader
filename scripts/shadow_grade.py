@@ -180,6 +180,9 @@ ARM_KIND = {
     # P0-1 cross-signal ranking: snapshot rows (no per-coin outcome); the
     # block-style hit-rate heuristic does not apply, same as other rollouts.
     "signal_ranking": "rollout",
+    # P1-1 active unstucking: would-close suggestion rows; snapshot/signal
+    # hybrid, block-style hit-rate does not apply.
+    "unstucking": "rollout",
 }
 
 # Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如

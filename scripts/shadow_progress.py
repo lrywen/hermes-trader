@@ -69,6 +69,8 @@ ARMS = [
     ("completion_cap_shadow",    "completion_cap_shadow",    "HERMES_COMPLETION_CAP_SHADOW_SHADOW_FILE",    "completion_cap_shadow.jsonl", "mode", "log_path"),
     # P0-1 cross-signal ranking (trading_loop writes to writable /data).
     ("signal_ranking",           "signal_ranking",           "HERMES_SIGNAL_RANKING_SHADOW_FILE",           "signal_ranking.jsonl",        "mode", "log_path"),
+    # P1-1 active unstucking (trading_loop writes to writable /data).
+    ("unstucking",               "unstucking",               "HERMES_UNSTUCKING_SHADOW_FILE",               "unstucking.jsonl",            "mode", "log_path"),
 ]
 
 # 只读挂载：落在这里的 shadow 文件写不进去（容器内 ro）。
@@ -78,7 +80,8 @@ WRITABLE_DATA = "/data"
 # Audit 2026-09-27 (P0): LLM rollout 探针由 research.py 写到可写 /data，
 # 默认文件不落在只读 HOME。key 为 ARMS label。
 ARM_DEFAULT_DATA_DIR = frozenset((
-    "reasoning_effort_rollout", "completion_cap_shadow", "signal_ranking",
+    "reasoning_effort_rollout", "completion_cap_shadow",
+    "signal_ranking", "unstucking",
 ))
 
 # Audit 2026-09-27 (P0): 唯一权威的臂名别名表。ARMS label 一律使用 canonical

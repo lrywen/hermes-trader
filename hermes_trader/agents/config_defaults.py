@@ -1546,6 +1546,19 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "class_penalty": 0.05,
         },
     },
+    # P1-1 (strategy-paradigm optimisation 2026-10-04): active unstucking of
+    # underwater positions. Defaults to SHADOW so the would-close is recorded
+    # without realising any loss; promote to enforce only after the unstick
+    # selection proves it reduces drawdown / frees productive margin. It only
+    # activates under drawdown pressure or full stuck-slots, so it never churns
+    # normal trades.
+    "unstucking": {
+        "mode": "shadow",
+        "max_peak_drawdown_pct": 12.0,  # equity within 12% of peak triggers
+        "max_stuck_slots": 3,           # >=3 stuck slots triggers (0=off)
+        "min_urgency": 20.0,            # ignore very weak nudges
+        "log_path": "",                 # empty = <data_dir>/unstucking.jsonl
+    },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
     # covering the shared ThreadPoolExecutor width, the reused httpx client's

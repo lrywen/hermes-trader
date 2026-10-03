@@ -127,6 +127,7 @@ from hermes_trader.session_log import append as log_event
 from hermes_trader.shadow_log import append_jsonl
 from hermes_trader.agents.signal_rank import (
     conjunction_view, rank_jobs, select_top_jobs)
+from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.surge_postmortem import SurgeConfig, SurgeDetector
 
 logger = logging.getLogger(__name__)
@@ -1426,6 +1427,73 @@ while True:
         except Exception:
             pass
         _beat("account_sync")
+
+        # ── P1-1: active unstucking of underwater positions ──────────────
+        # Adapt live positions, then decide whether an account-level trigger
+        # (drawdown pressure or full stuck-slots) warrants realising a small
+        # loss on the highest-urgency (closest-to-market) position. shadow
+        # records the would-close only; enforce also flattens via the
+        # reduce-only channel. off -> legacy DSL hard-stop / stale_flat.
+        _us_block = _cfg.get("unstucking") or {}
+        _us_mode = str(_us_block.get("mode", "off")).lower()
+        if _us_mode in ("shadow", "enforce") and positions:
+            try:
+                _us_jobs = [j for j in (from_hl_position(p) for p in positions)
+                            if j is not None]
+                _us_peak = float(memory.peak_equity() or 0.0)
+                _us_band = float(_us_block.get("max_peak_drawdown_pct", 0) or 0)
+                _us_max_slots_raw = _us_block.get("max_stuck_slots", 0)
+                _us_max_slots = int(float(_us_max_slots_raw or 0))
+                # Count currently stuck (underwater) slots for the slot trigger.
+                _us_stuck_now = sum(
+                    1 for j in _us_jobs
+                    if float(j.get("unrealized_pct", 0) or 0) < 0
+                    or (j.get("entry_px") and j.get("mark_px")
+                        and float(j["mark_px"]) < float(j["entry_px"])))
+                _us_selected, _us_remaining, _us_reason = select_unstucks(
+                    _us_jobs, time.time(),
+                    equity_usd=equity, peak_equity_usd=_us_peak,
+                    max_peak_drawdown_pct=_us_band,
+                    max_active_slots=_us_max_slots if _us_max_slots > 0 else None,
+                    currently_stuck=_us_stuck_now,
+                    min_urgency=float(_us_block.get("min_urgency", 20) or 20))
+                _us_log = str(_us_block.get("log_path") or "")
+                if not _us_log:
+                    _us_log = os.path.join(
+                        os.environ.get("HERMES_DATA_DIR", "/data"),
+                        "unstucking.jsonl")
+                append_jsonl(_us_log, {
+                    "ts": int(time.time() * 1000),
+                    "mode": _us_mode,
+                    "equity": round(equity, 2),
+                    "peak": round(_us_peak, 2),
+                    "stuck_now": _us_stuck_now,
+                    "trigger": _us_reason,
+                    "selected": [j.get("coin") for j in _us_selected],
+                    "ranked": [{"coin": j.get("coin"),
+                                "urgency": round(s, 1)}
+                               for j, s in _us_remaining],
+                }, stream="unstucking")
+                if _us_selected and _us_mode == "enforce":
+                    for _j in _us_selected:
+                        _coin = _j.get("coin")
+                        try:
+                            _res = close_position_market(_coin)
+                            logger.warning(
+                                f"[unstucking] reduce-only close {_coin}: "
+                                f"ok={_res.get('ok')} (trigger={_us_reason})")
+                            log_event({"event": "unstuck_close", "coin": _coin,
+                                       "trigger": _us_reason})
+                        except Exception as _ce:
+                            logger.error(
+                                f"[unstucking] close failed for {_coin}: {_ce}")
+                elif _us_selected:
+                    logger.info(
+                        f"[unstucking] shadow would close "
+                        f"{[j.get('coin') for j in _us_selected]} "
+                        f"(trigger={_us_reason}, no orders placed)")
+            except Exception as _us_e:
+                logger.warning(f"[unstucking] evaluation failed: {_us_e}")
 
         # ── Phase 2: drain WS userFills and emit SSE events ──────────────
         # The trading loop still drives EXIT DECISIONS via monitor_exits

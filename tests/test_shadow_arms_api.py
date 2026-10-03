@@ -339,7 +339,7 @@ def test_backfill_summary_aggregates_present_files(backfill_client):
     body = r.json()
     assert body["files_present"] == 4
     by_arm = {a["arm"]: a for a in body["arms"]}
-    assert len(by_arm) == 13
+    assert len(by_arm) == 14
 
     ta = by_arm["ta_late_entry"]
     assert ta["present"] is True and ta["records"] == 3
