@@ -183,6 +183,9 @@ ARM_KIND = {
     # P1-1 active unstucking: would-close suggestion rows; snapshot/signal
     # hybrid, block-style hit-rate does not apply.
     "unstucking": "rollout",
+    # P1-2 continuous coin selection: counterfactual ranking rows; no
+    # block-style hit-rate applies.
+    "coin_selection": "rollout",
 }
 
 # Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如

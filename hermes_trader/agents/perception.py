@@ -1426,6 +1426,61 @@ def scan_once(
             logger.info(f"[scan] universe sweep: +{len(added)} new (offset {off}/{n}, "
                         f"full coverage ~{(n + sweep_n - 1) // sweep_n} cycles)")
 
+    # ── P1-2: Forager-inspired continuous coin selection ──────────────────
+    # Rank the full eligible pool on one continuous score (turnover + momentum
+    # + funding/OI) instead of the hard volume/movers buckets. shadow logs the
+    # counterfactual top-k against the bucket selection WITHOUT changing
+    # markets; enforce replaces markets with the continuous top-k. off -> the
+    # bucket selection above stands.
+    _cs_block = _cfg.get("coin_selection") or {}
+    _cs_mode = str(_cs_block.get("mode", "off")).lower()
+    if _cs_mode in ("shadow", "enforce") and eligible:
+        try:
+            from hermes_trader.agents.coin_select import rank_pool, top_k as _cs_top
+            _cs_weights = _cs_block.get("pre_weights") or None
+            _cs_ranked = rank_pool(eligible, cur_prices=mids, weights=_cs_weights)
+            try:
+                _cs_k = int(_cs_block.get("top_k", len(markets)))
+            except (TypeError, ValueError):
+                _cs_k = len(markets)
+            _cs_pick = _cs_top(eligible, _cs_k, cur_prices=mids,
+                                weights=_cs_weights)
+            _bucket_coins = [m.get("coin") for m in markets]
+            _cs_coins = [m.get("coin") for m in _cs_pick]
+            _cs_log = str(_cs_block.get("log_path") or "")
+            if not _cs_log:
+                _cs_log = os.path.join(
+                    os.environ.get("HERMES_DATA_DIR", "/data"),
+                    "coin_selection.jsonl")
+            from hermes_trader.shadow_log import append_jsonl
+            append_jsonl(_cs_log, {
+                "ts": int(time.time() * 1000),
+                "mode": _cs_mode,
+                "eligible": len(eligible),
+                "bucket_k": len(_bucket_coins),
+                "score_k": _cs_k,
+                "bucket_pick": _bucket_coins,
+                "score_pick": _cs_coins,
+                # symmetric-difference size quantifies how different the
+                # continuous selection is from the hard buckets.
+                "selection_diff": len(
+                    set(_bucket_coins).symmetric_difference(set(_cs_coins))),
+                "top_ranked": [{"coin": m.get("coin"),
+                                "score": round(s, 1)}
+                               for m, s in _cs_ranked[:15]],
+            }, stream="coin_selection")
+            if _cs_mode == "enforce":
+                markets = _cs_pick
+                logger.info(
+                    f"[scan] coin_selection enforce: continuous top-{_cs_k} "
+                    f"replaced buckets (of {len(eligible)} eligible)")
+            else:
+                logger.info(
+                    f"[scan] coin_selection shadow: scored {len(_cs_ranked)} "
+                    f"eligible, counterfactual top-{_cs_k} (markets unchanged)")
+        except Exception as _cs_e:
+            logger.warning(f"[coin_selection] evaluation failed: {_cs_e}")
+
     if not markets:
         return []
 

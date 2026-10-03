@@ -135,6 +135,8 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     ("signal_ranking", "signal_ranking.jsonl"),
     # P1-1 active unstucking: evidence is the cumulative would-close log.
     ("unstucking", "unstucking.jsonl"),
+    # P1-2 continuous coin selection: evidence is the counterfactual ranking log.
+    ("coin_selection", "coin_selection.jsonl"),
     # Audit 2026-09-27 (P0): 无离线回放脚本的臂，证据即主日志本身。补齐这4臂
     # 以保证「评级器能看见的臂，证据面也能看见」。
     ("market_circuit", "market_circuit_shadow.jsonl"),

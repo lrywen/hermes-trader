@@ -71,6 +71,8 @@ ARMS = [
     ("signal_ranking",           "signal_ranking",           "HERMES_SIGNAL_RANKING_SHADOW_FILE",           "signal_ranking.jsonl",        "mode", "log_path"),
     # P1-1 active unstucking (trading_loop writes to writable /data).
     ("unstucking",               "unstucking",               "HERMES_UNSTUCKING_SHADOW_FILE",               "unstucking.jsonl",            "mode", "log_path"),
+    # P1-2 Forager-inspired continuous coin selection (perception writes /data).
+    ("coin_selection",           "coin_selection",           "HERMES_COIN_SELECTION_SHADOW_FILE",           "coin_selection.jsonl",        "mode", "log_path"),
 ]
 
 # 只读挂载：落在这里的 shadow 文件写不进去（容器内 ro）。
@@ -81,7 +83,7 @@ WRITABLE_DATA = "/data"
 # 默认文件不落在只读 HOME。key 为 ARMS label。
 ARM_DEFAULT_DATA_DIR = frozenset((
     "reasoning_effort_rollout", "completion_cap_shadow",
-    "signal_ranking", "unstucking",
+    "signal_ranking", "unstucking", "coin_selection",
 ))
 
 # Audit 2026-09-27 (P0): 唯一权威的臂名别名表。ARMS label 一律使用 canonical

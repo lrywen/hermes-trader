@@ -348,6 +348,8 @@ class _ConfigPatch(BaseModel):
         default_factory=lambda: _dict_default("signal_ranking"))
     unstucking: dict[str, Any] = Field(
         default_factory=lambda: _dict_default("unstucking"))
+    coin_selection: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("coin_selection"))
     # Post-close decision reflection (absorbed from TradingAgents). INERT:
     # one background LLM review after a close, injected into the next research
     # prompt; never sizes/vetoes/changes gates.
@@ -615,6 +617,20 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "max_stuck_slots": _num_leaf(0, 100),
         "min_urgency": _num_leaf(0.0, 100.0),
         "log_path": ("str",),
+    },
+    "coin_selection": {
+        # P1-2: Forager-inspired continuous ranking of the eligible pool.
+        #   off      -> hard volume/movers buckets only
+        #   shadow   -> compute + log the counterfactual top-k, never change markets
+        #   enforce  -> rank the pool continuously and use the top-k selection
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "top_k": _num_leaf(1, 1000),
+        "log_path": ("str",),
+        "pre_weights": {
+            "turnover": _num_leaf(0.0, 100.0),
+            "momentum": _num_leaf(0.0, 100.0),
+            "funding_oi": _num_leaf(0.0, 100.0),
+        },
     },
     "late_chase": {
         "enabled": ("bool",),

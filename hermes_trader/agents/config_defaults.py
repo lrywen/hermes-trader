@@ -1559,6 +1559,22 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_urgency": 20.0,            # ignore very weak nudges
         "log_path": "",                 # empty = <data_dir>/unstucking.jsonl
     },
+    # P1-2 (strategy-paradigm optimisation 2026-10-04): Forager-inspired
+    # continuous ranking of the eligible scan pool, replacing the hard
+    # volume/movers buckets. Defaults to SHADOW so the counterfactual top-k is
+    # logged against the buckets without changing any markets; promote to
+    # enforce only after the continuous selection shows a higher trigger/expectancy
+    # hit rate. pre_weights are relative and normalised internally.
+    "coin_selection": {
+        "mode": "shadow",
+        "top_k": 55,
+        "log_path": "",                 # empty = <data_dir>/coin_selection.jsonl
+        "pre_weights": {
+            "turnover": 0.5,
+            "momentum": 0.35,
+            "funding_oi": 0.15,
+        },
+    },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
     # covering the shared ThreadPoolExecutor width, the reused httpx client's
