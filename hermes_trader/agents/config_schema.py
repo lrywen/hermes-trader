@@ -344,6 +344,8 @@ class _ConfigPatch(BaseModel):
         default_factory=lambda: _dict_default("completion_cap_shadow"))
     reasoning_effort_rollout: dict[str, Any] = Field(
         default_factory=lambda: _dict_default("reasoning_effort_rollout"))
+    signal_ranking: dict[str, Any] = Field(
+        default_factory=lambda: _dict_default("signal_ranking"))
     # Post-close decision reflection (absorbed from TradingAgents). INERT:
     # one background LLM review after a close, injected into the next research
     # prompt; never sizes/vetoes/changes gates.
@@ -581,6 +583,24 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "effort": ("enum", ("none", "low", "high", "max")),
         "sample_rate": _num_leaf(0.0, 1.0),
         "log_path": ("str",),
+    },
+    "signal_ranking": {
+        # P0-1: cross-signal ranking of the pre-research job queue.
+        #   off      -> legacy behaviour (all gated coins researched/routed)
+        #   shadow   -> rank + log the what-if, never drop a coin
+        #   enforce  -> keep only top_k candidates, defer (and un-stamp) the
+        #               ranked tail before the paid LLM research
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "top_k": _num_leaf(1, 1000),
+        "log_path": ("str",),
+        "score_weights": {
+            "composite": _num_leaf(0.0, 100.0),
+            "trigger_quality": _num_leaf(0.0, 100.0),
+            "whale": _num_leaf(0.0, 100.0),
+            "cvd": _num_leaf(0.0, 100.0),
+            "liquidity": _num_leaf(0.0, 100.0),
+            "class_penalty": _num_leaf(0.0, 100.0),
+        },
     },
     "late_chase": {
         "enabled": ("bool",),

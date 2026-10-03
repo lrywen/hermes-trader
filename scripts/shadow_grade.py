@@ -177,6 +177,9 @@ ARM_KIND = {
     # 的 block 启发式（2026-09-27 修正误报）。
     "reasoning_effort_rollout": "rollout",
     "completion_cap_shadow": "rollout",
+    # P0-1 cross-signal ranking: snapshot rows (no per-coin outcome); the
+    # block-style hit-rate heuristic does not apply, same as other rollouts.
+    "signal_ranking": "rollout",
 }
 
 # Audit 2026-09-21 (#rating): 灾难保险型 block 臂。这类闸门只在极端尾部（如

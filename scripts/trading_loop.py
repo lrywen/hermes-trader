@@ -124,6 +124,9 @@ from hermes_trader.client.universe import get_universe
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.realtime_feed import FeedStatusTracker, classify_feed_status, dynamic_scan_interval
 from hermes_trader.session_log import append as log_event
+from hermes_trader.shadow_log import append_jsonl
+from hermes_trader.agents.signal_rank import (
+    conjunction_view, rank_jobs, select_top_jobs)
 from hermes_trader.surge_postmortem import SurgeConfig, SurgeDetector
 
 logger = logging.getLogger(__name__)
@@ -2374,6 +2377,88 @@ while True:
             if _sig_fp is not None:
                 _researched_signal_fps.add(_sig_fp)
             _research_jobs.append((coin, perception, float(score), gate))
+
+            # P0-2: conjunction counterfactual (observation only). Record how
+            # many bullish triggers fired and whether the signal would still
+            # pass under AND >=2 / >=3, so the OR-vs-conjunction question is
+            # settled by data without touching the production OR logic.
+            try:
+                _cj_path = os.path.join(
+                    os.environ.get("HERMES_DATA_DIR", "/data"),
+                    "conjunction_probe.jsonl")
+                _cj_view = conjunction_view(perception)
+                append_jsonl(_cj_path, {
+                    "ts": now_ms,
+                    "coin": coin,
+                    "composite": round(float(score), 1),
+                    **_cj_view,
+                }, stream="conjunction_probe")
+            except Exception as _cj_e:
+                logger.warning(f"[conjunction-probe] record failed: {_cj_e}")
+
+        # ---- P0-1: cross-signal ranking / selection ----
+        # Rank every gated coin with the pre-research quality score. In shadow
+        # we only persist the counterfactual; in enforce we keep the top_k
+        # candidates and defer the ranked tail (rolling back the stamps/fingerprint
+        # exactly like the backpressure path so deferred coins stay eligible
+        # next cycle). off -> legacy behaviour.
+        _sr_block = _cfg_cd.get("signal_ranking") or {}
+        _sr_mode = str(_sr_block.get("mode", "off")).lower()
+        if _sr_mode in ("shadow", "enforce") and _research_jobs:
+            _sr_weights = _sr_block.get("score_weights") or None
+            _sr_log = str(_sr_block.get("log_path") or "")
+            if not _sr_log:
+                _sr_log = os.path.join(
+                    os.environ.get("HERMES_DATA_DIR", "/data"),
+                    "signal_ranking.jsonl")
+            _sr_ranked = rank_jobs(_research_jobs, weights=_sr_weights)
+            try:
+                append_jsonl(_sr_log, {
+                    "ts": now_ms,
+                    "mode": _sr_mode,
+                    "n": len(_sr_ranked),
+                    "ranking": [
+                        {"coin": _j[0], "score": round(_rs, 2),
+                         "composite": round(float(_j[2]), 1)}
+                        for _j, _rs in _sr_ranked],
+                }, stream="signal_ranking")
+            except Exception as _sr_e:
+                logger.warning(f"[signal-rank] jsonl write failed: {_sr_e}")
+
+            if _sr_mode == "enforce":
+                try:
+                    _sr_top_k = int(_sr_block.get("top_k", 5))
+                except (TypeError, ValueError):
+                    _sr_top_k = 5
+                _sr_selected, _sr_deferred = select_top_jobs(
+                    _research_jobs, _sr_top_k, weights=_sr_weights)
+                if _sr_deferred:
+                    for _df_j, _df_rs in _sr_deferred:
+                        _df_coin = _df_j[0]
+                        _df_score = _df_j[2]
+                        log_event({"event": "ta_skip", "coin": _df_coin,
+                                   "signal": "RANK_DEFER",
+                                   "score": round(float(_df_score), 1),
+                                   "trigger_score": round(float(_df_score), 1),
+                                   "rank_score": round(float(_df_rs), 1),
+                                   "reason": "signal_ranking"})
+                        _cycle_outcomes.append(
+                            (_df_coin, "skip", False, "signal_ranking")
+                        )
+                        _last_research_by_coin.pop(_df_coin, None)
+                        _last_research_score_by_coin.pop(_df_coin, None)
+                        _df_fp = signal_fingerprint(_df_j[1])
+                        if _df_fp is not None:
+                            _researched_signal_fps.discard(_df_fp)
+                    _research_jobs = _sr_selected
+                    logger.info(
+                        f"[signal-rank] enforce: kept {len(_sr_selected)} "
+                        f"top-ranked, deferred {len(_sr_deferred)} (top_k="
+                        f"{_sr_top_k})")
+            else:
+                logger.info(
+                    f"[signal-rank] shadow ranked {len(_sr_ranked)} "
+                    f"coin(s) (no orders changed)")
 
         # ---- B-1 (2026-09-04 P-NEW): jobs queue backpressure cap ----
         # When 5m-candle-coincident or fast-vol spike pumps jobs beyond the

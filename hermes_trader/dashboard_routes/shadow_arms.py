@@ -130,6 +130,9 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     # 日志，使这两个臂在证据面可见，而非成为表外盲区。
     ("reasoning_effort_rollout", "reasoning_effort_rollout.jsonl"),
     ("completion_cap_shadow", "completion_cap_shadow.jsonl"),
+    # P0-1 cross-signal ranking: no offline replay; the cumulative ranking log
+    # itself is the evidence surface (snapshot rows, no pnl aggregation).
+    ("signal_ranking", "signal_ranking.jsonl"),
     # Audit 2026-09-27 (P0): 无离线回放脚本的臂，证据即主日志本身。补齐这4臂
     # 以保证「评级器能看见的臂，证据面也能看见」。
     ("market_circuit", "market_circuit_shadow.jsonl"),

@@ -1526,6 +1526,26 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "sample_rate": 1.0,       # enforce: fraction of requests to apply low
         "log_path": "",           # empty = <data_dir>/reasoning_effort_rollout.jsonl
     },
+    # P0-1 (strategy-paradigm optimisation 2026-10-04): cross-signal ranking of
+    # the pre-research job queue. Defaults to SHADOW so the ranking/counterfactual
+    # is recorded without changing any order flow; promote to enforce only after
+    # the ranked selection shows a better expectation.
+    #   off / shadow / enforce ; top_k bounds how many gated coins proceed to the
+    # paid LLM research when enforce. score_weights mirror signal_rank defaults
+    # (relative weights, normalised internally).
+    "signal_ranking": {
+        "mode": "shadow",
+        "top_k": 5,
+        "log_path": "",           # empty = <data_dir>/signal_ranking.jsonl
+        "score_weights": {
+            "composite": 0.55,
+            "trigger_quality": 0.20,
+            "whale": 0.08,
+            "cvd": 0.07,
+            "liquidity": 0.05,
+            "class_penalty": 0.05,
+        },
+    },
     # R13-B10: research-path concurrency / prefetch knobs (research.py
     # _get_pool / _http / _signals_block / _parallel_prefetch). Nine leaves
     # covering the shared ThreadPoolExecutor width, the reused httpx client's
