@@ -142,6 +142,10 @@ OFF = "OFF"
 #   DEGRADED_REVIEW — 已生产但出现宽度/有害性告警，建议复核是否应降级
 MAINTAIN = "ENFORCE_MAINTAIN"
 DEGRADED_REVIEW = "ENFORCE_DEGRADED_REVIEW"
+# D-7 (2026-10-04)：持仓事件驱动臂（unstucking）只在「当前有持仓」时才评估并
+# 写记录。账户 0 持仓时长窗 0 条是设计性空窗（没有需要解套的对象），并非
+# 「闸门盲跑/写不进」。单独立档，避免误报 DATA_GAP「请立即排查」。
+DORMANT = "DORMANT_NO_POSITIONS"
 
 _VERDICT_CN = {
     PROMOTE: "可考虑升enforce(待人工拍板)",
@@ -153,7 +157,13 @@ _VERDICT_CN = {
     OFF: "未启用(mode=off)",
     MAINTAIN: "enforce·维持",
     DEGRADED_REVIEW: "enforce·建议复核降级",
+    DORMANT: "无持仓·待触发(非盲跑)",
 }
+
+# 持仓事件驱动臂：评估/落盘的前置条件是当前存在 open positions（见
+# trading_loop 的 `... and positions` 门）。0 持仓时无记录属正常，评级须结合
+# 当前持仓数判定，而不是仅凭 0 条记录报缺口。
+POSITION_GATED_ARMS = frozenset(("unstucking",))
 
 # 臂分类：决定统计哪个"命中"字段。
 #   block  —— "会拦"类：命中字段为 *would_block*（True 表示本该拦下）
@@ -656,6 +666,19 @@ def _current_macro_regime() -> str | None:
         return None
 
 
+def _current_open_positions() -> int | None:
+    """只读探测当前 open positions 数量，供 D-7 持仓事件驱动臂判定。复用
+    dashboard 同一持仓数据源（只读、带缓存）。任何异常回退 None —— 调用方据此
+    fail-open（不抑制 DATA_GAP），绝不因探测失败而掩盖真实停采。绝不写状态。"""
+    try:
+        from hermes_trader.dashboard import _live_positions
+        return len(_live_positions() or [])
+    except Exception as e:  # pragma: no cover - 网络/环境相关
+        print(f"[warn] 持仓数只读探测失败（unstucking 缺口按原逻辑判定）：{e}",
+              file=sys.stderr)
+        return None
+
+
 def _is_gate_layer_record(rec: dict) -> bool:
     """ta_late_entry：该记录是否属于真实下单闸门（gate）层。
 
@@ -784,7 +807,8 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
               now_ms: float | None = None,
               records: list[dict] | None = None,
               heartbeat_age_sec: float | None = None,
-              macro_regime: str | None = None) -> dict:
+              macro_regime: str | None = None,
+              open_positions: int | None = None) -> dict:
     """Grade one arm purely from its records + mode. Pure function (no I/O when
     ``records`` is supplied) so it is unit-testable.
 
@@ -903,6 +927,18 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
         warnings.append(
             f"事件型闸门心跳正常（{heartbeat_age_sec:.0f}s 前仍在评估），"
             f"{w_long}h 0 事件属正常（无触发条件），非闸门盲跑/写路径异常")
+    elif (mode in ("shadow", "enforce") and longest["total"] == 0
+            and arm in POSITION_GATED_ARMS and open_positions is not None
+            and open_positions <= 0):
+        # D-7：持仓事件驱动臂 + 当前 0 持仓 → 无记录是设计性空窗，不是盲跑。
+        # open_positions=None（探测失败）时不走此分支，保留 DATA_GAP 以免漏报。
+        verdict = DORMANT
+        reason = (f"mode={mode} 但当前无 open positions，{w_long}h 0 条记录属"
+                  "正常（没有可解套的水下仓位）；一旦持仓且出现亏损即会逐次评估"
+                  "并记录，非闸门盲跑/写路径异常")
+        warnings.append(
+            "持仓事件驱动臂：trading_loop 仅在有持仓时评估本臂；当前账户 0 持仓，"
+            "无记录并非采数缺口，待开仓后触发")
     elif mode in ("shadow", "enforce") and longest["total"] == 0:
         verdict = DATA_GAP
         reason = (f"mode={mode} 但 {w_long}h 窗口内 0 条记录"
@@ -1369,6 +1405,7 @@ def collect_grades(windows: list[int]) -> dict:
     # 的臂（pullback）判定「宏观非多头期策略性不采数」。独立 CLI 进程内会触发
     # 一次带缓存的 K 线拉取；任何失败都回退 None（不抑制停滞告警，fail-open）。
     macro_regime = _current_macro_regime()
+    open_positions = _current_open_positions()
     arms = []
     for label, blk_name, env_file, default_name, mode_key, path_key in sp.ARMS:
         mode = sp._arm_mode(cfg, blk_name, env_file, mode_key)
@@ -1377,8 +1414,10 @@ def collect_grades(windows: list[int]) -> dict:
         # M13 修正：事件型闸门用心跳判活（心跳新鲜则 24h 无事件不判停滞）。
         hb_age = _heartbeat_age_sec(label, now_ms) if label in ARM_HEARTBEAT_FILE else None
         arm_macro = macro_regime if label in MACRO_LONG_ONLY_ARMS else None
+        arm_pos = open_positions if label in POSITION_GATED_ARMS else None
         arms.append(grade_arm(label, mode, path, windows, now_ms=now_ms,
-                              heartbeat_age_sec=hb_age, macro_regime=arm_macro))
+                              heartbeat_age_sec=hb_age, macro_regime=arm_macro,
+                              open_positions=arm_pos))
 
     baseline = {"real_closes": 0, "real_win_rate": None, "note": ""}
     try:
@@ -1412,7 +1451,8 @@ def _fmt_report(d: dict) -> str:
              f"{'臂':20s} {'mode':8s} {'类型':6s} {'评级':28s} 说明",
              "-" * 100]
     order = {DATA_GAP: 0, DEGRADED_REVIEW: 1, REVIEW: 2, PROMOTE: 3,
-             INSUFFICIENT: 4, COLLECTING: 5, INERT: 6, MAINTAIN: 7, OFF: 8}
+             INSUFFICIENT: 4, COLLECTING: 5, INERT: 6, DORMANT: 7,
+             MAINTAIN: 8, OFF: 9}
     for a in sorted(d["arms"], key=lambda x: order.get(x["verdict"], 9)):
         lines.append(f"{a['arm']:20s} {a['mode']:8s} {a['kind']:6s} "
                      f"{a['verdict_cn']:28s} {a['reason']}")
@@ -1471,11 +1511,13 @@ def _fmt_report(d: dict) -> str:
     n_deg = sum(1 for a in d["arms"] if a["verdict"] == DEGRADED_REVIEW)
     n_maintain = sum(1 for a in d["arms"] if a["verdict"] == MAINTAIN)
     n_inert = sum(1 for a in d["arms"] if a["verdict"] == INERT)
+    n_dormant = sum(1 for a in d["arms"] if a["verdict"] == DORMANT)
     n_stall = sum(1 for a in d["arms"] if a.get("collection_stalled"))
     lines.append("-" * 100)
     lines.append(f"汇总：采数缺口 {n_gap} / 建议复核 {n_rev + n_deg}"
                  f"（含 enforce 降级复核 {n_deg}）/ 可考虑升级 {n_prom}"
                  f" / enforce 维持 {n_maintain} / 无证据不评价 {n_inert}"
+                 f" / 无持仓待触发 {n_dormant}"
                  f" / 采数停滞 {n_stall}。"
                  "所有 PROMOTE_CANDIDATE 均需人工 reconcile + config_store 权威写后才生效。")
     return "\n".join(lines)

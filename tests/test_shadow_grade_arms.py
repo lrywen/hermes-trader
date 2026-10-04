@@ -173,6 +173,50 @@ def test_non_heartbeat_arm_zero_events_still_data_gap_even_if_age_passed(sg):
     assert out["verdict"] == sg.DATA_GAP
 
 
+# ── verdict: DORMANT_NO_POSITIONS (D-7) ───────────────────────────────────────
+
+def test_position_gated_arm_no_positions_is_dormant_not_data_gap(sg):
+    # A position-gated arm (unstucking) only evaluates/writes while an open
+    # position exists. With 0 positions, zero records is a designed idle window,
+    # not a blind gate -> DORMANT for both shadow and enforce.
+    now = 1_700_000_000_000.0
+    for mode in ("shadow", "enforce"):
+        out = sg.grade_arm("unstucking", mode, "/nonexistent.jsonl",
+                           [24, 72, 168], now_ms=now, records=[],
+                           open_positions=0)
+        assert out["verdict"] == sg.DORMANT, mode
+        assert "collection_stalled" not in out
+
+
+def test_position_gated_arm_unknown_positions_stays_data_gap(sg):
+    # If the position probe fails (open_positions=None) the arm must fail-safe
+    # to DATA_GAP — never silently suppress a possibly-real blind gate.
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("unstucking", "shadow", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       open_positions=None)
+    assert out["verdict"] == sg.DATA_GAP
+
+
+def test_position_gated_arm_with_positions_zero_records_is_data_gap(sg):
+    # An open position exists yet the arm still wrote nothing -> it really is
+    # blind (there is a stuck position that should have been evaluated).
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("unstucking", "shadow", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       open_positions=2)
+    assert out["verdict"] == sg.DATA_GAP
+
+
+def test_non_position_gated_arm_ignores_open_positions(sg):
+    # The open_positions signal must not exempt an arm outside POSITION_GATED_ARMS.
+    now = 1_700_000_000_000.0
+    out = sg.grade_arm("ta_late_entry", "shadow", "/nonexistent.jsonl",
+                       [24, 72, 168], now_ms=now, records=[],
+                       open_positions=0)
+    assert out["verdict"] == sg.DATA_GAP
+
+
 # ── verdict: INSUFFICIENT_DATA / COLLECTING (sample count) ────────────────────
 
 def test_insufficient_for_shadow_below_promote_threshold(sg):
