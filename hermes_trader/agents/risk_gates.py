@@ -164,27 +164,99 @@ def late_chase_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
         rt_rsi_high = float(rt.get("rsi_overbought", 80.0) or 0.0)
         rt_rsi_low = float(rt.get("rsi_oversold", 20.0) or 0.0)
         rt_ext = float(rt.get("max_extension_atr", 3.0) or 0.0)
+        # Hysteresis latch: once a terminal extreme prints, keep same-direction
+        # chasing blocked until live RSI returns to a neutral band or the
+        # cooldown elapses — not the instant the value dips under the trigger
+        # (the 2026-10-02 AAVE leak).
+        rt_neutral_high = float(rt.get("release_rsi_high", 60.0) or 0.0)
+        rt_neutral_low = float(rt.get("release_rsi_low", 40.0) or 0.0)
+        cooldown_ms = float(rt.get("latch_cooldown_s", 900) or 0.0) * 1000.0
+        from hermes_trader.agents import entry_position as ep
+        latch_dir = "up" if side == "long" else "down"
         got = _realtime_terminal(ctx.coin, interval, mid)
         if got is not None:
             live_rsi, live_ext = got
-            if side == "long" and (
-                    (rt_rsi_high > 0 and live_rsi > rt_rsi_high) or
-                    (rt_ext > 0 and live_ext > rt_ext)):
+            terminal_long = (
+                (rt_rsi_high > 0 and live_rsi > rt_rsi_high) or
+                (rt_ext > 0 and live_ext > rt_ext))
+            terminal_short = (
+                (rt_rsi_low > 0 and live_rsi < rt_rsi_low) or
+                (rt_ext > 0 and live_ext < -rt_ext))
+            is_terminal = terminal_long if side == "long" else terminal_short
+            if is_terminal:
+                ep.set_blowoff(coin=ctx.coin, direction=latch_dir)
+            else:
+                cooled = ep.release_if_cooled(
+                    coin=ctx.coin, direction=latch_dir,
+                    cooldown_ms=cooldown_ms)
+                neutral = (
+                    (side == "long" and rt_neutral_high > 0
+                     and live_rsi <= rt_neutral_high) or
+                    (side == "short" and rt_neutral_low > 0
+                     and live_rsi >= rt_neutral_low))
+                if neutral and not cooled:
+                    ep.clear_blowoff(coin=ctx.coin, direction=latch_dir)
+            if ep.is_blowoff_latched(
+                    coin=ctx.coin, direction=latch_dir,
+                    max_age_ms=max(cooldown_ms, 0.0)):
                 why = (f"{interval} live RSI {live_rsi:.0f}/ext {live_ext:.1f}ATR "
-                       f"— terminal vertical long")
+                       f"— blowoff latched, no {side} chase near extreme")
                 logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
-                return {"pass": False, "via": "late_chase_realtime_blowoff",
-                        "reason": why}
-            if side == "short" and (
-                    (rt_rsi_low > 0 and live_rsi < rt_rsi_low) or
-                    (rt_ext > 0 and live_ext < -rt_ext)):
-                why = (f"{interval} live RSI {live_rsi:.0f}/ext {live_ext:.1f}ATR "
-                       f"— terminal vertical short")
-                logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
-                return {"pass": False, "via": "late_chase_realtime_blowoff",
+                return {"pass": False, "via": "late_chase_realtime_latched",
                         "reason": why}
 
+    # Leg 4 — absolute range-position hard gate. Blocks a long in the top band
+    # (or a short in the bottom band) of its recent high/low window regardless
+    # of RSI, so "RSI not extreme but price still at the high" cannot pass.
+    pos_cfg = cfg.get("range_position")
+    if isinstance(pos_cfg, dict) and pos_cfg.get("enabled", False):
+        block_high = float(pos_cfg.get("block_long_above_pct", 90.0) or 0.0)
+        block_low = float(pos_cfg.get("block_short_below_pct", 10.0) or 0.0)
+        pos_interval = str(pos_cfg.get("interval", "15m"))
+        lookback = int(pos_cfg.get("lookback_bars", 96))
+        percentile = _range_percentile(
+            ctx.coin, pos_interval, lookback, mid)
+        if percentile is not None:
+            reason = ep.extreme_position_block(
+                side=side, percentile=percentile,
+                block_high_pct=block_high, block_low_pct=block_low)
+            if reason:
+                logger.info("[risk][gates] late_chase BLOCK %s: %s",
+                            ctx.coin, reason)
+                return {"pass": False, "via": "late_chase_range_extreme",
+                        "reason": reason}
+
     return {"pass": True}
+
+
+def _range_percentile(
+    coin: str, interval: str, lookback: int, mid: float
+) -> Optional[float]:
+    """Live price's percentile within the last ``lookback`` closed bars.
+
+    Uses the shared candle cache, excludes the still-forming tail so no future
+    data leaks, and compares the live ``mid`` against the high/low window.
+    Best-effort; None so the caller fails open."""
+    try:
+        from hermes_trader.agents import entry_position as ep
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+
+        candles = fetch_hl_candles(coin, interval, int(lookback) + 2)
+        candles, _ = _drop_forming_bar(candles, interval)
+        candles = candles[-int(lookback):]
+        if len(candles) < 10:
+            return None
+
+        def _attr(c: Any, name: str) -> Any:
+            return c.get(name) if isinstance(c, dict) else getattr(c, name)
+
+        highs = [float(_attr(c, "h")) for c in candles]
+        lows = [float(_attr(c, "l")) for c in candles]
+        return ep.range_percentile(highs, lows, mid)
+    except Exception:
+        return None
+
 
 
 def _latest_closed_rsi(coin: str, interval: str) -> Optional[float]:

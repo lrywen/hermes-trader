@@ -645,6 +645,16 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "rsi_overbought": _num_leaf(0.0, 100.0),
             "rsi_oversold": _num_leaf(0.0, 100.0),
             "max_extension_atr": _num_leaf(0.0, 20.0),
+            "release_rsi_high": _num_leaf(0.0, 100.0),
+            "release_rsi_low": _num_leaf(0.0, 100.0),
+            "latch_cooldown_s": _num_leaf(0.0, 86400.0),
+        },
+        "range_position": {
+            "enabled": ("bool",),
+            "interval": ("enum", ("5m", "15m", "1h", "4h")),
+            "lookback_bars": ("int", 10, 500),
+            "block_long_above_pct": _num_leaf(0.0, 100.0),
+            "block_short_below_pct": _num_leaf(0.0, 100.0),
         },
     },
     "launch_capture": {

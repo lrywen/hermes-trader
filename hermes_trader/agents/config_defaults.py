@@ -116,6 +116,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "rsi_overbought": 80.0,
             "rsi_oversold": 20.0,
             "max_extension_atr": 3.0,
+            # 锁存迟滞：触及极端后，RSI 须回到此中性带（或冷却满）才解禁。
+            "release_rsi_high": 60.0,
+            "release_rsi_low": 40.0,
+            "latch_cooldown_s": 900.0,
+        },
+        # Leg4：绝对区间分位硬闸——不管 RSI，多头顶部分位 / 空头底部分位直接拦。
+        "range_position": {
+            "enabled": True,
+            "interval": "15m",
+            "lookback_bars": 96,      # 24h
+            "block_long_above_pct": 90.0,
+            "block_short_below_pct": 10.0,
         },
     },
     # 抓住启动点（leading signals，shadow-only）：用主动成交流(CVD)、盘口失衡、

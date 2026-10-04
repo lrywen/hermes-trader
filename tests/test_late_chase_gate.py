@@ -206,11 +206,13 @@ def test_underdeveloped_move_cannot_reset(tmp_path):
 # ── P1 Leg3: real-time forming-bar blowoff ──────────────────────────────────
 
 def test_gate_blocks_realtime_blowoff_long(monkeypatch, tmp_path):
+    import hermes_trader.agents.entry_position as entry_position
     import hermes_trader.agents.move_state as move_state
     import hermes_trader.agents.risk_gates as rg
-    # Pin an isolated, empty move-state so Leg1 cannot lock (the process-wide
-    # real state file may contain a live missed-move for the same coin).
+    # Pin isolated state files so Leg1 and the blowoff latch use temp paths.
     monkeypatch.setattr(move_state, "STATE_FILE", str(tmp_path / ".move.json"))
+    monkeypatch.setattr(entry_position, "STATE_FILE",
+                        str(tmp_path / ".latch.json"))
     # No move-state lock; closed RSI mild; but real-time read is a blowoff.
     monkeypatch.setattr(rg, "_latest_closed_rsi", lambda coin, interval: 59.0)
     monkeypatch.setattr(
@@ -224,7 +226,7 @@ def test_gate_blocks_realtime_blowoff_long(monkeypatch, tmp_path):
                      "max_extension_atr": 3.0}}}
     r = late_chase_gate(_ctx(coin="UNI", entry_px=9.92), cfg)
     assert r["pass"] is False
-    assert r["via"] == "late_chase_realtime_blowoff"
+    assert r["via"] == "late_chase_realtime_latched"
 
 
 def test_gate_passes_realtime_healthy(monkeypatch, tmp_path):
@@ -246,9 +248,12 @@ def test_gate_passes_realtime_healthy(monkeypatch, tmp_path):
 
 
 def test_gate_blocks_realtime_blowoff_short(monkeypatch, tmp_path):
+    import hermes_trader.agents.entry_position as entry_position
     import hermes_trader.agents.move_state as move_state
     import hermes_trader.agents.risk_gates as rg
     monkeypatch.setattr(move_state, "STATE_FILE", str(tmp_path / ".move.json"))
+    monkeypatch.setattr(entry_position, "STATE_FILE",
+                        str(tmp_path / ".latch.json"))
     monkeypatch.setattr(rg, "_latest_closed_rsi", lambda coin, interval: 40.0)
     monkeypatch.setattr(
         rg, "_realtime_terminal",
@@ -261,4 +266,61 @@ def test_gate_blocks_realtime_blowoff_short(monkeypatch, tmp_path):
                      "max_extension_atr": 3.0}}}
     r = late_chase_gate(_ctx(coin="PUMP", trade_side="short", entry_px=10.0), cfg)
     assert r["pass"] is False
-    assert r["via"] == "late_chase_realtime_blowoff"
+    assert r["via"] == "late_chase_realtime_latched"
+
+
+# ── 2026-10-02 AAVE 泄漏回归：极端后 RSI 仅回落到 79 仍须锁死 ──────────────
+
+def _isolated_states(monkeypatch, tmp_path):
+    import hermes_trader.agents.entry_position as entry_position
+    import hermes_trader.agents.move_state as move_state
+    monkeypatch.setattr(move_state, "STATE_FILE", str(tmp_path / ".move.json"))
+    monkeypatch.setattr(entry_position, "STATE_FILE",
+                        str(tmp_path / ".latch.json"))
+    return entry_position
+
+
+def _rt_cfg():
+    return {"late_chase": {
+        "enabled": True, "fresh_move_band_pct": 8.0,
+        "rsi1h_overbought": 999.0, "rsi1h_oversold": 1.0,
+        "realtime": {"enabled": True, "interval": "5m",
+                     "rsi_overbought": 80.0, "rsi_oversold": 20.0,
+                     "max_extension_atr": 3.0,
+                     "release_rsi_high": 60.0, "release_rsi_low": 40.0,
+                     "latch_cooldown_s": 900.0}}}
+
+
+def test_blowoff_stays_latched_after_dip_under_trigger(monkeypatch, tmp_path):
+    import hermes_trader.agents.risk_gates as rg
+    _isolated_states(monkeypatch, tmp_path)
+    monkeypatch.setattr(rg, "_latest_closed_rsi", lambda coin, interval: 59.0)
+
+    # 第一周期：明确 blowoff（RSI 83）→ 锁存
+    monkeypatch.setattr(rg, "_realtime_terminal",
+                        lambda coin, interval, mid: (83.0, 4.1))
+    r1 = late_chase_gate(_ctx(coin="AAVE", entry_px=184.0), _rt_cfg())
+    assert r1["pass"] is False
+
+    # 下一周期：RSI 79 / ext 2.9，两者刚跌破触发线但仍在高位 → 必须继续拦
+    monkeypatch.setattr(rg, "_realtime_terminal",
+                        lambda coin, interval, mid: (79.0, 2.9))
+    r2 = late_chase_gate(_ctx(coin="AAVE", entry_px=184.5), _rt_cfg())
+    assert r2["pass"] is False
+    assert r2["via"] == "late_chase_realtime_latched"
+
+
+def test_blowoff_releases_on_return_to_neutral(monkeypatch, tmp_path):
+    import hermes_trader.agents.risk_gates as rg
+    _isolated_states(monkeypatch, tmp_path)
+    monkeypatch.setattr(rg, "_latest_closed_rsi", lambda coin, interval: 59.0)
+
+    monkeypatch.setattr(rg, "_realtime_terminal",
+                        lambda coin, interval, mid: (83.0, 4.1))
+    late_chase_gate(_ctx(coin="AAVE", entry_px=184.0), _rt_cfg())
+
+    # RSI 回到中性带 58（< release 60）→ 解禁
+    monkeypatch.setattr(rg, "_realtime_terminal",
+                        lambda coin, interval, mid: (58.0, 1.0))
+    r = late_chase_gate(_ctx(coin="AAVE", entry_px=178.0), _rt_cfg())
+    assert r["pass"] is True
