@@ -101,6 +101,12 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         log_name="macro-regime-watch.log",
         minute_of_hour=5,
     ),
+    ScheduledJob(
+        name="monitor_book_continuity",
+        argv=("scripts/monitor_book_continuity.py", "--push"),
+        log_name="book-continuity.log",
+        minute_of_hour=15,
+    ),
 )
 
 

@@ -124,7 +124,7 @@ from hermes_trader.client.universe import get_universe
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.realtime_feed import FeedStatusTracker, classify_feed_status, dynamic_scan_interval
 from hermes_trader.session_log import append as log_event
-from hermes_trader.shadow_log import append_jsonl
+from hermes_trader.shadow_log import append_jsonl, data_path
 from hermes_trader.agents.signal_rank import (
     conjunction_view, rank_jobs, select_top_jobs)
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
@@ -1459,9 +1459,7 @@ while True:
                     min_urgency=float(_us_block.get("min_urgency", 20) or 20))
                 _us_log = str(_us_block.get("log_path") or "")
                 if not _us_log:
-                    _us_log = os.path.join(
-                        os.environ.get("HERMES_DATA_DIR", "/data"),
-                        "unstucking.jsonl")
+                    _us_log = data_path("unstucking.jsonl")
                 append_jsonl(_us_log, {
                     "ts": int(time.time() * 1000),
                     "mode": _us_mode,
@@ -2451,9 +2449,7 @@ while True:
             # pass under AND >=2 / >=3, so the OR-vs-conjunction question is
             # settled by data without touching the production OR logic.
             try:
-                _cj_path = os.path.join(
-                    os.environ.get("HERMES_DATA_DIR", "/data"),
-                    "conjunction_probe.jsonl")
+                _cj_path = data_path("conjunction_probe.jsonl")
                 _cj_view = conjunction_view(perception)
                 append_jsonl(_cj_path, {
                     "ts": now_ms,
@@ -2476,9 +2472,7 @@ while True:
             _sr_weights = _sr_block.get("score_weights") or None
             _sr_log = str(_sr_block.get("log_path") or "")
             if not _sr_log:
-                _sr_log = os.path.join(
-                    os.environ.get("HERMES_DATA_DIR", "/data"),
-                    "signal_ranking.jsonl")
+                _sr_log = data_path("signal_ranking.jsonl")
             _sr_ranked = rank_jobs(_research_jobs, weights=_sr_weights)
             try:
                 append_jsonl(_sr_log, {

@@ -416,7 +416,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_composite": 45.0,
         "min_hip3_composite": 50.0,
         "min_short_confidence": 0.72,
-        "min_short_composite": 40.0,
+        "min_short_composite": 45.0,
         "mover_min_confidence": 0.72,
         "mover_min_composite": 30.0,
         # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
