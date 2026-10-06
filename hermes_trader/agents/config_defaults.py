@@ -439,6 +439,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "max_extension_atr": 2.0,
             "min_slow_burn": 2,
             "shadow_mode": False,
+            # P1 strict pullback-to-support params (pullback_entry.py): require
+            # an established 1h uptrend (close above rising trend_ema + higher
+            # than lookback), a >= min_pull_pct correction, price AT support
+            # (rising support_ema or prior swing high within tolerance_atr ATR),
+            # and a fresh up-bar confirming the turn.
+            "trend_ema": 50,
+            "support_ema": 21,
+            "stop_atr_mult": 1.5,
+            "min_pull_pct": 0.015,
             # Audit 2026-09-06 (E2, Q3): require the MACRO regime (BTC / SP500
             # proxy EMA20/30 + ADX via detect_regime_with_score) to be "up"
             # before the bypass fires. The 4h per-coin uptrendMomentum flag
@@ -475,6 +484,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "max_consecutive_losses": 2,
             "loss_cooldown_hours": 24,
         },
+        # P2 structural: hard switch disabling BREAKOUT-chase entries in a
+        # non-trending macro regime (chop/neutral), where range breaks fade.
+        # Bursts/pullbacks are unaffected. Default ON; forced structural
+        # overrides bypass it. Regime detection is cached; fail-open on error.
+        "regime_breakout_veto": {
+            "enabled": True,
+        },
     },
     "plan_b": {
         "enabled": True,
@@ -504,6 +520,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "PURR": {"sl_floor_pct": 1.2},
             "BOME": {"sl_floor_pct": 1.2},
         },
+    },
+    # P1 structural: PORTFOLIO volatility target. Scales new notional DOWN when
+    # trailing realised portfolio sigma (BTC 1h beta proxy) exceeds target.
+    # Multiplier capped to <=1 (tail control, never levers up). M-9 showed
+    # max-DD -30%→-15%. Off by default; enable when the structural layer ships.
+    "portfolio_vol_target": {
+        "enabled": False,
+        "lookback_bars": 720,
+        "target_sigma": 0.04,
     },
     "regime_classifier": {
         "fast_ema": 20,

@@ -74,6 +74,19 @@ def isolated_gate(monkeypatch):
     import hermes_trader.agents.market_regime as mr
     monkeypatch.setattr(mr, "detect_regime_with_score",
                         lambda coin: ("up", 1.0))
+    # P1 strict pullback detector: stub the candle fetch + support/turn-up
+    # detector so the bypass decision is isolated (real shape is tested in
+    # tests/test_pullback_entry.py).
+    import hermes_trader.client.hl_client as hlc
+    monkeypatch.setattr(hlc, "fetch_hl_candles",
+                        lambda coin, interval=None, count=80: [object()] * 60)
+    import hermes_trader.indicators.math as imath
+    monkeypatch.setattr(imath, "atr",
+                        lambda candles, p=14: [1.0] * len(candles))
+    import hermes_trader.agents.pullback_entry as pbe
+    monkeypatch.setattr(pbe, "pullback_entry",
+                        lambda candles, **k: pbe.PullbackSignal(
+                            True, 100.0, 98.0, "ema", "stub"))
     return monkeypatch
 
 

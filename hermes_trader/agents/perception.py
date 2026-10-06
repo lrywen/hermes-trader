@@ -1436,15 +1436,28 @@ def scan_once(
     _cs_mode = str(_cs_block.get("mode", "off")).lower()
     if _cs_mode in ("shadow", "enforce") and eligible:
         try:
-            from hermes_trader.agents.coin_select import rank_pool, top_k as _cs_top
-            _cs_weights = _cs_block.get("pre_weights") or None
-            _cs_ranked = rank_pool(eligible, cur_prices=mids, weights=_cs_weights)
-            try:
-                _cs_k = int(_cs_block.get("top_k", len(markets)))
-            except (TypeError, ValueError):
-                _cs_k = len(markets)
-            _cs_pick = _cs_top(eligible, _cs_k, cur_prices=mids,
-                                weights=_cs_weights)
+            _cs_method = str(_cs_block.get("method", "activity")).lower()
+            # P2 cross-sectional directional momentum: rank by SIGNED 24h
+            # return and take Top-N up-leaders instead of direction-agnostic
+            # activity. Falls back to the activity ranking for other methods.
+            if _cs_method == "xs_momentum":
+                from hermes_trader.agents.coin_select import xs_momentum_rank
+                try:
+                    _cs_k = int(_cs_block.get("top_k", len(markets)))
+                except (TypeError, ValueError):
+                    _cs_k = len(markets)
+                _cs_ranked = xs_momentum_rank(eligible, cur_prices=mids)
+                _cs_pick = [m for m, s in _cs_ranked[:_cs_k] if s > 0.0]
+            else:
+                from hermes_trader.agents.coin_select import rank_pool, top_k as _cs_top
+                _cs_weights = _cs_block.get("pre_weights") or None
+                _cs_ranked = rank_pool(eligible, cur_prices=mids, weights=_cs_weights)
+                try:
+                    _cs_k = int(_cs_block.get("top_k", len(markets)))
+                except (TypeError, ValueError):
+                    _cs_k = len(markets)
+                _cs_pick = _cs_top(eligible, _cs_k, cur_prices=mids,
+                                   weights=_cs_weights)
             _bucket_coins = [m.get("coin") for m in markets]
             _cs_coins = [m.get("coin") for m in _cs_pick]
             _cs_log = str(_cs_block.get("log_path") or "")

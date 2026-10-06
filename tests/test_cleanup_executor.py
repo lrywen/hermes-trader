@@ -142,6 +142,9 @@ def _runner_gate_config(**over):
         "rsi_overbought": 75.0,
         "rsi_oversold": 25.0,
         "max_extension_atr": 2.5,
+        # These cases isolate the confidence/RSI/extension gates; the P2
+        # regime breakout veto is tested separately, so keep it off here.
+        "regime_breakout_veto": {"enabled": False},
     }
     gate.update(over)
     return {"runner_entry_gate": gate}
@@ -229,7 +232,8 @@ def test_runner_gate_uses_confidence_when_no_raw_field():
         "slow_burn_count": 1,
     }
     cfg = {"runner_entry_gate": {"enabled": True, "min_confidence": 0.70,
-                                 "min_composite": 30, "min_hip3_composite": 50}}
+                                 "min_composite": 30, "min_hip3_composite": 50,
+                                 "regime_breakout_veto": {"enabled": False}}}
 
     assert executor._runner_entry_block_reason(analysis, cfg) == ""
 

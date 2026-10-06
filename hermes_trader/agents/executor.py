@@ -4195,6 +4195,40 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         logger.info(f"[executor] Plan B size reduction {analysis['coin']}: "
                     f"{_pb_reason}, notional -> ${trade_notional:.0f}")
 
+    # P1 structural: PORTFOLIO volatility target. ATR sizing bounds each trade's
+    # own risk but nothing bounds the book's aggregate volatility. When trailing
+    # realised portfolio sigma runs above target, scale the new notional DOWN
+    # (multiplier clamped to <=1 — tail control only, never levers up). M-9
+    # showed ~-30%→-15% drawdown reduction. Sigma uses the book's dominant beta
+    # proxy (BTC 1h log returns) — the directional crypto book is beta-driven.
+    # Fail-safe: any lookup/math error skips scaling.
+    _vt_cfg = config.get("portfolio_vol_target") or {}
+    if bool(_vt_cfg.get("enabled", False)):
+        try:
+            from hermes_trader.agents.entry_structure import (
+                realised_sigma, vol_target_multiplier)
+            from hermes_trader.client.hl_client import fetch_hl_candles
+            _lookback = int(_vt_cfg.get("lookback_bars", 720))
+            _bars = fetch_hl_candles("BTC", "1h", _lookback + 2)
+            _closes = []
+            for _c in _bars:
+                _closes.append(float(_c.c if isinstance(_c, dict) else _c.c))
+            _rets = [math.log(_closes[i] / _closes[i - 1])
+                     for i in range(1, len(_closes)) if _closes[i - 1] > 0]
+            _sigma = realised_sigma(_rets)
+            if _sigma is not None:
+                _target = float(_vt_cfg.get("target_sigma", 0.04))
+                _vt_mult = vol_target_multiplier(
+                    sigma=_sigma, target_sigma=_target, cap=1.0)
+                if _vt_mult < 1.0:
+                    trade_notional *= _vt_mult
+                    logger.info(
+                        f"[executor] portfolio vol-target: BTC sigma={_sigma:.4f} "
+                        f"> target {_target:.4f} → x{_vt_mult:.2f}, "
+                        f"notional ${trade_notional:.0f}")
+        except Exception as _vt_e:
+            logger.debug("[executor] portfolio vol-target skipped: %s", _vt_e)
+
     # Normalize to the exact HL-valid entry size BEFORE risk gates. The order
     # layer enforces a $10.50 minimum and coin-size precision; if we wait until
     # place_hl_order() to apply that, the gates, DSL tracker, memory, and SL/TP
@@ -5427,6 +5461,34 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         except Exception:
             pass
 
+    # P2 structural: regime breakout veto. A breakout is only worth chasing in
+    # a confirmed TREND; in a confirmed CHOP the same print is a range break
+    # that fades (the losing pattern). This is a hard switch (the market_regime
+    # gate already raises the bar in chop but doesn't disable breakouts).
+    # Bursts/pullbacks are not vetoed — only breakout-family triggers.
+    # Data-validity guard: the classifier returns neutral/score 0 on an empty
+    # or failed candle fetch, so veto ONLY on an explicit, ADX-confirmed "chop"
+    # read backed by real candles (score>0). "neutral" (uncertain / degraded)
+    # is NOT vetoed — never block a live trade on missing data.
+    _rbv_cfg = gate.get("regime_breakout_veto") or {}
+    if bool(_rbv_cfg.get("enabled", True)) and breakout and not forced:
+        try:
+            from hermes_trader.agents.entry_structure import breakout_regime_veto
+            from hermes_trader.agents.market_regime import detect_regime_with_score
+            _rbv_regime, _rbv_score = detect_regime_with_score(coin)
+            _rbv_regime = str(_rbv_regime or "neutral")
+            _require_data = bool(_rbv_cfg.get("require_valid_data", True))
+            if not _require_data or (float(_rbv_score) > 0.0):
+                _rbv = breakout_regime_veto(
+                    regime=_rbv_regime, trigger="breakout",
+                    block_in=("chop",) if _require_data else ("chop", "neutral"))
+                if _rbv:
+                    logger.info(f"[runner_gate] {coin} BLOCKED: {_rbv}")
+                    return f"runner_gate_blocked ({_rbv})"
+        except Exception as _rbv_e:
+            logger.debug("[runner_gate] regime breakout veto skipped for %s: %s",
+                         coin, _rbv_e)
+
     logger.info(
         f"[runner_gate] {coin} side={side} conf={gate_conf:.2f}/{min_conf:.2f} "
         f"score={score:.1f}/{min_score:.0f} slow={slow_count} | "
@@ -5803,6 +5865,34 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                     logger.info(f"[executor] pullback-long bypass withheld for "
                                 f"{coin}: 4h uptrend but macro regime="
                                 f"{pb_macro_regime or 'unknown'} != up")
+        # P1 strict entry (pullback-to-support): the legacy checks below only
+        # confirm "not at the high" — they admitted mid-range buys that then
+        # fell (MFE 0). Require the stronger detector: established 1h uptrend,
+        # price pulled back TO a support (rising EMA21 / prior swing high) and a
+        # fresh up-bar confirming the down-leg has ended. Best-effort fetch.
+        pb_strict_signal = None
+        try:
+            from hermes_trader.agents.pullback_entry import pullback_entry
+            from hermes_trader.client.hl_client import fetch_hl_candles
+            from hermes_trader.indicators.math import atr as _atr_ind
+            _pb_c = fetch_hl_candles(coin, "1h", 80)
+            if len(_pb_c) >= 55:
+                _pb_atr_arr = _atr_ind(_pb_c, 14)
+                _pb_atr = next(
+                    (v for v in reversed(_pb_atr_arr)
+                     if v == v and v > 0 and v != float("inf")),
+                    0.0)
+                if _pb_atr > 0:
+                    pb_strict_signal = pullback_entry(
+                        _pb_c, atr=_pb_atr,
+                        trend_ema_p=int(pb_cfg.get("trend_ema", 50)),
+                        support_ema_p=int(pb_cfg.get("support_ema", 21)),
+                        stop_atr_mult=float(pb_cfg.get("stop_atr_mult", 1.5)),
+                        min_pull_pct=float(pb_cfg.get("min_pull_pct", 0.015)))
+        except Exception as _pb_se:
+            logger.debug("[runner_gate] strict pullback detect failed for %s: %s",
+                         coin, _pb_se)
+        pb_strict_ok = bool(pb_strict_signal and pb_strict_signal.valid)
         pullback_long = (
             side == "long"
             and uptrend
@@ -5810,6 +5900,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             and slow_count >= pb_min_slow
             and score >= pb_min_score
             and not fresh_impulse
+            and pb_strict_ok
             and (rsi4h is None or float(rsi4h) < pb_max_rsi)
             and (pb_extension is None or pb_extension < pb_max_ext)
         )

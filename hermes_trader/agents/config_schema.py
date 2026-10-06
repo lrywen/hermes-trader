@@ -185,6 +185,7 @@ class _ConfigPatch(BaseModel):
     runner_entry_gate: dict[str, Any] = Field(default_factory=lambda: _dict_default("runner_entry_gate"))
     plan_b: dict[str, Any] = Field(default_factory=lambda: _dict_default("plan_b"))
     atr_risk_sizing: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
+    portfolio_vol_target: dict[str, Any] = Field(default_factory=lambda: _dict_default("portfolio_vol_target"))
     regime_classifier: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
     regime_score: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_score"))
     # R13-B6: funding-crowding regime classifier knobs (hyperfeed.py). Five
@@ -562,6 +563,12 @@ _ATR_RISK_SIZING_SPEC: dict[str, Any] = {
     }),
 }
 
+_PORTFOLIO_VOL_TARGET_SPEC: dict[str, Any] = {
+    "enabled": ("bool",),
+    "lookback_bars": ("int", 2, 100_000),
+    "target_sigma": _num_leaf(0.0, 10.0),
+}
+
 _SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
     "enabled": ("bool",),
     "veto": ("bool",),
@@ -693,6 +700,7 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "trades_capture": ("bool",),
     },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
+    "portfolio_vol_target": _PORTFOLIO_VOL_TARGET_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
     "runner_entry_gate": {
         # Admission thresholds (executor.py runner gate). Confidence leaves
@@ -722,7 +730,19 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "max_extension_atr": _num_leaf(0.0, 50.0),
             "min_slow_burn": ("int", 0, 1000),
             "shadow_mode": ("bool",),
+            # P1 strict pullback-to-support detector params.
+            "trend_ema": ("int", 2, 1000),
+            "support_ema": ("int", 2, 1000),
+            "stop_atr_mult": _num_leaf(0.1, 50.0),
+            "min_pull_pct": _num_leaf(0.0, 1.0),
             "require_macro_uptrend": ("bool",),
+        },
+        # P2: hard switch disabling breakout-chase entries in a confirmed
+        # chop regime. require_valid_data=true also requires the regime read
+        # to be backed by real candles (never veto on missing/degraded data).
+        "regime_breakout_veto": {
+            "enabled": ("bool",),
+            "require_valid_data": ("bool",),
         },
         # Audit 2026-09-10 (risk-tuning shadow): the runner-gate
         # counter-factual arms. per_coin_cooldown.shadow_mode=false ENFORCES
