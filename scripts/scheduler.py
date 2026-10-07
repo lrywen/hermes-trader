@@ -107,6 +107,12 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         log_name="book-continuity.log",
         minute_of_hour=15,
     ),
+    ScheduledJob(
+        name="funding_carry_forward",
+        argv=("scripts/funding_carry_forward.py",),
+        log_name="funding-carry-forward.log",
+        minute_of_hour=25,
+    ),
 )
 
 
