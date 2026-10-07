@@ -5,8 +5,8 @@ import gzip
 from datetime import date
 from pathlib import Path
 
-from scripts.clean_trades_raw import (archive_book_raw, archive_dir, cleanup,
-                                      expired_dirs)
+from scripts.clean_trades_raw import (archive_old_raws as archive_book_raw,
+                                      archive_dir, cleanup, expired_dirs)
 
 
 def _make(base: Path, day: str) -> Path:
