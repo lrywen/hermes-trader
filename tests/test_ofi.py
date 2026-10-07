@@ -6,8 +6,12 @@ import pytest
 from hermes_trader.agents.ofi import (
     aggregate_ofi,
     best_ofi_two_sided,
+    depth_imbalance,
     depth_ofi,
     mid,
+    ofi_mid_divergence,
+    queue_buildup_slope,
+    queue_withdrawal,
 )
 
 
@@ -95,3 +99,69 @@ def test_mid_missing_side_none():
 
 def test_aggregate_sum():
     assert aggregate_ofi([1.0, -2.0, 4.0]) == 3.0
+
+
+# ── 扩展因子族 ───────────────────────────────────────────────────────────────
+
+def test_depth_imbalance_basic():
+    s = _snap([(100, 8), (99, 2)], [(101, 6), (102, 4)])
+    # Qb=10, Qa=10 -> 0
+    assert depth_imbalance(s) == pytest.approx(0.0)
+
+
+def test_depth_imbalance_bid_heavy():
+    s = _snap([(100, 30)], [(101, 10)])
+    assert depth_imbalance(s) == pytest.approx(0.5)
+
+
+def test_depth_imbalance_empty_none():
+    s = _snap([], [])
+    assert depth_imbalance(s) is None
+
+
+def test_queue_withdrawal_bid_removed():
+    # 同价位 bid 挂量 10->4（买盘撤离，-6），价位不动
+    prev = _snap([(100, 10)], [(101, 10)])
+    cur = _snap([(100, 4)], [(101, 10)])
+    assert queue_withdrawal(cur=cur, prev=prev) == pytest.approx(-6.0)
+
+
+def test_queue_withdrawal_ask_removed_positive():
+    # 同价位 ask 挂量 10->4（卖盘撤离，+6，利好）
+    prev = _snap([(100, 10)], [(101, 10)])
+    cur = _snap([(100, 10)], [(101, 4)])
+    assert queue_withdrawal(cur=cur, prev=prev) == pytest.approx(6.0)
+
+
+def test_queue_withdrawal_ignores_level_change():
+    # 价格移动（非同价位）不计入 -> 0
+    prev = _snap([(100, 10)], [(101, 10)])
+    cur = _snap([(99.5, 10)], [(100.5, 10)])
+    assert queue_withdrawal(cur=cur, prev=prev) == pytest.approx(0.0)
+
+
+def test_buildup_slope_bid_heavy_far_levels():
+    # bid 远端厚：bid 各档量随档位增大；ask 均匀
+    prev_bids = [(100, 1), (99, 5), (98, 9)]
+    asks = [(101, 5), (102, 5), (103, 5)]
+    s = _snap(prev_bids, asks)
+    v = queue_buildup_slope(s)
+    assert v is not None and v > 0
+
+
+def test_buildup_slope_insufficient_levels_none():
+    s = _snap([(100, 5)], [(101, 5)])
+    assert queue_buildup_slope(s) is None
+
+
+def test_ofi_mid_divergence_aligned():
+    # bid 价升量增 -> OFI>0 且 mid 升 -> +1
+    prev = _snap([(100, 5)], [(102, 5)])
+    cur = _snap([(101, 10)], [(103, 10)])
+    assert ofi_mid_divergence(cur=cur, prev=prev) == pytest.approx(1.0)
+
+
+def test_ofi_mid_divergence_missing_none():
+    prev = _snap([(100, 5)], [])
+    cur = _snap([(101, 5)], [])
+    assert ofi_mid_divergence(cur=cur, prev=prev) is None

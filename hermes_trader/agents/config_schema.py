@@ -186,6 +186,8 @@ class _ConfigPatch(BaseModel):
     plan_b: dict[str, Any] = Field(default_factory=lambda: _dict_default("plan_b"))
     atr_risk_sizing: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_risk_sizing"))
     portfolio_vol_target: dict[str, Any] = Field(default_factory=lambda: _dict_default("portfolio_vol_target"))
+    book_capture: dict[str, Any] = Field(default_factory=lambda: _dict_default("book_capture"))
+    trades_capture: dict[str, Any] = Field(default_factory=lambda: _dict_default("trades_capture"))
     regime_classifier: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_classifier"))
     regime_score: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_score"))
     # R13-B6: funding-crowding regime classifier knobs (hyperfeed.py). Five
@@ -569,6 +571,18 @@ _PORTFOLIO_VOL_TARGET_SPEC: dict[str, Any] = {
     "target_sigma": _num_leaf(0.0, 10.0),
 }
 
+_BOOK_CAPTURE_SPEC: dict[str, Any] = {
+    "enabled": ("bool",),
+    "top_n": ("int", 1, 1000),
+    "interval_s": _num_leaf(0.01, 600.0),
+    "levels": ("int", 1, 1000),
+}
+
+_TRADES_CAPTURE_SPEC: dict[str, Any] = {
+    "enabled": ("bool",),
+    "top_n": ("int", 1, 1000),
+}
+
 _SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
     "enabled": ("bool",),
     "veto": ("bool",),
@@ -701,6 +715,8 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,
     "portfolio_vol_target": _PORTFOLIO_VOL_TARGET_SPEC,
+    "book_capture": _BOOK_CAPTURE_SPEC,
+    "trades_capture": _TRADES_CAPTURE_SPEC,
     "signal_enforcement": _SIGNAL_ENFORCEMENT_SPEC,
     "runner_entry_gate": {
         # Admission thresholds (executor.py runner gate). Confidence leaves

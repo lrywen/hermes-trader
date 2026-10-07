@@ -147,3 +147,113 @@ def mid(snap: dict) -> Optional[float]:
 def aggregate_ofi(increments: Sequence[float]) -> float:
     """窗口内逐帧 e 求和（W_OFI=60/300s）。"""
     return float(sum(increments))
+
+
+# ── 扩展因子族（看数前固定口径，2026-10-07 增补，供 10-28 分层 IC）──────────
+#
+# 这些因子只用 book 快照（无成交流），因此"撤单"只能以"价位未移动而同价位
+# 挂量减少"作为队列撤离（cancellation proxy）。全部为相邻两帧或单帧纯函数，
+# 窗口聚合沿用 aggregate_*：有符号量按求和、[0,1] 比例按末值。
+
+def _side_levels(snap: dict, side_book: str, n_levels: int) -> list[Level]:
+    key = "b" if side_book == "bid" else "a"
+    return _to_levels(snap.get(key))[:n_levels]
+
+
+def total_depth(snap: dict, *, n_levels: int = 10) -> tuple[float, float]:
+    """返回 (bid 深度总量, ask 深度总量)，各取前 n_levels 档。"""
+    bd = sum(sz for _, sz in _side_levels(snap, "bid", n_levels))
+    ad = sum(sz for _, sz in _side_levels(snap, "ask", n_levels))
+    return bd, ad
+
+
+def depth_imbalance(snap: dict, *, n_levels: int = 10) -> Optional[float]:
+    """深度失衡 DI = (Qb − Qa)/(Qb + Qa) ∈ [-1,1]；全零/缺帧返回 None。
+
+    单帧因子，窗口内取末值（不求和）。>0 买盘挂单堆积占优。
+    """
+    bd, ad = total_depth(snap, n_levels=n_levels)
+    tot = bd + ad
+    if tot <= 0:
+        return None
+    return (bd - ad) / tot
+
+
+def queue_withdrawal(prev: dict, cur: dict, *, n_levels: int = 10) -> float:
+    """队列撤离（撤单代理）有符号增量。
+
+    仅在 prev/cur **同价位**（价位未移动）上比较挂量：
+      bid 侧：同价位减少=买盘撤离（负），增加=买盘堆积（正）。
+      ask 侧：同价位减少=卖盘撤离（正，利好），增加=卖盘堆积（负）。
+    新进入/退出档位不计入（那已由 best/depth OFI 捕捉），以隔离"挂单撤离"
+    这一独立信息。缺帧返回 0.0。
+    """
+    total = 0.0
+    for side_book in ("bid", "ask"):
+        pm = _depth_map(_side_levels(prev, side_book, n_levels))
+        cm = _depth_map(_side_levels(cur, side_book, n_levels))
+        for px in set(pm) & set(cm):
+            dq = cm[px] - pm[px]          # 价不变 ΔQ
+            total += dq if side_book == "bid" else -dq
+    return total
+
+
+def queue_buildup_slope(snap: dict, *, n_levels: int = 10) -> Optional[float]:
+    """挂单堆积斜率：逐档 (bid 累计挂量 − ask 累计挂量) 对档位序号做最小二乘
+    斜率，再用总深度归一（除以 Qb+Qa），使其跨币可比。
+
+    斜率>0：买盘挂量随档位增长更快（远端买盘厚）；<0 远端卖盘厚。单帧因子，
+    窗口取末值。样本<2 或总深度<=0 返回 None。
+    """
+    bl = _side_levels(snap, "bid", n_levels)
+    al = _side_levels(snap, "ask", n_levels)
+    m = min(len(bl), len(al))
+    if m < 2:
+        return None
+    cb = ca = 0.0
+    xs = list(range(1, m + 1))
+    ys = []
+    tot = 0.0
+    for i in range(m):
+        cb += bl[i][1]
+        ca += al[i][1]
+        ys.append(cb - ca)
+        tot += bl[i][1] + al[i][1]
+    if tot <= 0:
+        return None
+    mx = sum(xs) / m
+    my = sum(ys) / m
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    den = sum((x - mx) ** 2 for x in xs)
+    if den <= 0:
+        return None
+    return num / den / tot
+
+
+def ofi_mid_divergence(prev: dict, cur: dict) -> Optional[float]:
+    """OFI 与中间价的方向背离：best-OFI 与 Δmid 同向返回 +1，反向返回 -1，
+    任一为 0/缺帧返回 0。
+
+    解释：+1 = 订单流推动价格（健康）；-1 = 挂单流失向与价格变动相反（潜在
+    诱多/诱空或流动性回补）。相邻两帧因子。
+    """
+    m0, m1 = mid(prev), mid(cur)
+    if m0 is None or m1 is None or m0 <= 0:
+        return None
+    e = best_ofi_two_sided(prev, cur)
+    dm = m1 - m0
+    if e == 0.0 or dm == 0.0:
+        return 0.0
+    return 1.0 if (e > 0) == (dm > 0) else -1.0
+
+
+# 因子注册表：name -> (kind, fn)。kind="edge"（窗口求和，吃 prev,cur）或
+# "frame"（窗口取末值，吃 snap）。供研究脚本统一遍历做分层 IC；口径在此固定。
+FACTORS: dict[str, tuple[str, object]] = {
+    "ofi_best": ("edge", best_ofi_two_sided),
+    "ofi_depth10": ("edge", lambda prev, cur: depth_ofi(prev, cur, n_levels=10)),
+    "queue_withdrawal": ("edge", lambda prev, cur: queue_withdrawal(prev, cur, n_levels=10)),
+    "depth_imbalance": ("frame", depth_imbalance),
+    "buildup_slope": ("frame", queue_buildup_slope),
+    "ofi_mid_divergence": ("edge", ofi_mid_divergence),
+}

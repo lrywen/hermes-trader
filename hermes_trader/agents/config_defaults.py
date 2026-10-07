@@ -539,6 +539,20 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "lookback_bars": 720,
         "target_sigma": 0.04,
     },
+    # L2 盘口研究采集：WS 推送 + flusher 固定节奏快照到 book-raw。
+    "book_capture": {
+        "enabled": True,
+        "top_n": 20,
+        "interval_s": 1.0,
+        "levels": 10,
+    },
+    # 公共市场成交流研究采集：逐笔主动成交（taker side）落盘到 trades-raw，
+    # 事件级真实频率（盘口推送实测中位 5.4s、81% 重复帧，故 edge 信息更应从
+    # 成交流获取）。默认开启；稳定篮子按 24h 名义成交量取 top_n。
+    "trades_capture": {
+        "enabled": True,
+        "top_n": 20,
+    },
     "regime_classifier": {
         "fast_ema": 20,
         "slow_ema": 30,

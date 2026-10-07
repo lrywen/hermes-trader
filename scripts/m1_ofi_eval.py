@@ -296,6 +296,208 @@ def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int) -> dict:
     return res
 
 
+# ── 多因子分层 IC（探索性报告，不参与 H1 主判定；2026-10-07 增补）────────────
+
+def _spearman(a: list[float], b: list[float]) -> Optional[float]:
+    """Spearman 秩相关；n<2/零方差返回 None。"""
+    n = len(a)
+    if n < 2 or n != len(b):
+        return None
+
+    def ranks(x):
+        order = sorted(range(n), key=lambda i: x[i])
+        r = [0.0] * n
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and x[order[j + 1]] == x[order[i]]:
+                j += 1
+            avg = (i + j) / 2.0 + 1.0
+            for k in range(i, j + 1):
+                r[order[k]] = avg
+            i = j + 1
+        return r
+
+    ra, rb = ranks(a), ranks(b)
+    ma = sum(ra) / n
+    mb = sum(rb) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(ra, rb))
+    va = sum((x - ma) ** 2 for x in ra)
+    vb = sum((y - mb) ** 2 for y in rb)
+    if va <= 0 or vb <= 0:
+        return None
+    return cov / math.sqrt(va * vb)
+
+
+def stream_coin_factor_samples(book_root: Path, days: list[str], coin: str, *,
+                               w_s: int, h_s: int) -> list[dict]:
+    """与 stream_coin_samples 同槽口径，但对 FACTORS 注册的全部因子打分。
+
+    每个 h 槽取末帧为信号帧：
+      edge 因子 = 窗口 [t-w_s,t] 内逐帧增量求和；
+      frame 因子 = 信号帧的单帧值。
+    返回 {t, bid, ask, f:{name:value}}，None 因子不写入该 name。
+    """
+    from collections import deque
+
+    factor_names = list(ofi_mod.FACTORS)
+    # 每个 edge 因子一个 ring：(t, val)
+    rings: dict[str, deque] = {n: deque() for n, (k, _) in ofi_mod.FACTORS.items()
+                               if k == "edge"}
+    prev_snap = None
+    cur_slot = None
+    cur_frame = None
+    samples: list[dict] = []
+
+    def flush_slot(frame):
+        if frame is None:
+            return
+        t, bid, ask, snap = frame
+        fv = {}
+        for name, (kind, _) in ofi_mod.FACTORS.items():
+            if kind == "edge":
+                v = sum(v for et, v in rings[name] if et >= t - w_s)
+                fv[name] = v
+            else:
+                fn = ofi_mod.FACTORS[name][1]
+                v = fn(snap)
+                if v is not None:
+                    fv[name] = v
+        samples.append({"t": t, "bid": bid, "ask": ask, "f": fv})
+
+    for r in _stream_raw_points(book_root, days, coin):
+        t = int(r.get("t", 0)) // MS
+        ba = _best_ba(r)
+        if ba is None:
+            continue
+        bp, bq, ap, aq = ba
+        snap = {"b": r.get("b", [[bp, bq]]), "a": r.get("a", [[ap, aq]])}
+        if prev_snap is not None:
+            for name, (kind, fn) in ofi_mod.FACTORS.items():
+                if kind != "edge":
+                    continue
+                try:
+                    v = float(fn(prev_snap, snap))
+                except Exception:
+                    v = 0.0
+                rings[name].append((t, v))
+        prev_snap = snap
+
+        slot = t // h_s
+        if cur_slot is None:
+            cur_slot = slot
+        if slot != cur_slot:
+            flush_slot(cur_frame)
+            cur_slot = slot
+        cur_frame = (t, bp, ap, snap)
+        for name in rings:
+            rg = rings[name]
+            while rg and rg[0][0] < t - w_s - h_s:
+                rg.popleft()
+
+    if cur_frame is not None:
+        flush_slot(cur_frame)
+    return samples
+
+
+def evaluate_factors(book_root: Path, days: list[str], *, w_s: int, h_s: int,
+                     n_bands: int = 5) -> dict:
+    """逐因子：test 段做 ①Spearman(因子, 下一槽 mid 收益) IC；②五档多空
+    净 bps（最高档做多 / 最低档做空），分位边界只用 train 段。
+
+    内存安全：逐币流式、只留 test 的 (因子值, forward mid 收益, 可执行净bp)
+    标量。返回 {factor: {n, ic, long, short, ls}}，ls=多档−空档净bp均值差。
+    """
+    import calendar
+    half = len(days) // 2
+    y, m, d = map(int, days[half].split("-"))
+    test_start = calendar.timegm((y, m, d, 0, 0, 0))
+    all_coins = set()
+    for dd in days:
+        all_coins |= coins_present(book_root, dd)
+
+    names = list(ofi_mod.FACTORS)
+    train_vals: dict[str, list[float]] = {n: [] for n in names}
+    # test: factor -> list[(val, mid_ret_bp, long_net_bp, short_net_bp)]
+    test_rows: dict[str, list[tuple]] = {n: [] for n in names}
+
+    for coin in sorted(all_coins):
+        s = stream_coin_factor_samples(book_root, days, coin,
+                                       w_s=w_s, h_s=h_s)
+        for i, rec in enumerate(s):
+            if i + 1 >= len(s):
+                break
+            fwd = s[i + 1]
+            m0 = (rec["bid"] + rec["ask"]) / 2.0
+            m1 = (fwd["bid"] + fwd["ask"]) / 2.0
+            mid_ret = (m1 - m0) / m0 * 1e4 if m0 > 0 else 0.0
+            # 可执行净 bps（taker，开仓 cross 半价差）
+            cross = (rec["ask"] - rec["bid"]) / 2 / m0 * 1e4
+            long_net = (fwd["bid"] - rec["ask"]) / rec["ask"] * 1e4 \
+                - cross - 2 * TAKER_FEE_BP_PER_SIDE
+            short_net = (rec["bid"] - fwd["ask"]) / rec["bid"] * 1e4 \
+                - cross - 2 * TAKER_FEE_BP_PER_SIDE
+            for n in names:
+                if n not in rec["f"]:
+                    continue
+                v = rec["f"][n]
+                if rec["t"] < test_start:
+                    train_vals[n].append(v)
+                else:
+                    test_rows[n].append((v, mid_ret, long_net, short_net))
+
+    out = {}
+    for n in names:
+        rows = test_rows[n]
+        if len(rows) < 50:
+            out[n] = {"n": len(rows)}
+            continue
+        vals = [r[0] for r in rows]
+        rets = [r[1] for r in rows]
+        ic = _spearman(vals, rets)
+        # train 分位边界（n_bands 等频）
+        tv = sorted(train_vals[n])
+        cuts = []
+        for b in range(1, n_bands):
+            cuts.append(quantile(tv, b / n_bands))
+
+        def band_of(v):
+            b = 0
+            for c in cuts:
+                if v > c:
+                    b += 1
+            return b
+
+        top_l, bot_s = [], []
+        for v, _, ln, sn in rows:
+            b = band_of(v)
+            if b == n_bands - 1:
+                top_l.append(ln)
+            if b == 0:
+                bot_s.append(sn)
+        ml = sum(top_l) / len(top_l) if top_l else float("nan")
+        ms = sum(bot_s) / len(bot_s) if bot_s else float("nan")
+        out[n] = {"n": len(rows), "ic": ic,
+                  "long": ml, "short": ms,
+                  "n_long": len(top_l), "n_short": len(bot_s),
+                  "ls": (ml - ms) if (ml == ml and ms == ms) else float("nan")}
+    return out
+
+
+def print_factor_report(res: dict) -> None:
+    print(f"\n== 多因子分层 IC（W=60s h=300s，test 段，探索性，不决定 H1）==")
+    print(f"  {'factor':18}{'n':>7}{'IC':>8}{'top档多':>10}{'底档空':>10}"
+          f"{'多-空':>9}")
+    for n, r in res.items():
+        if r.get("n", 0) < 50:
+            print(f"  {n:18}{r.get('n',0):>7}  (样本不足)")
+            continue
+        ic = r.get("ic")
+        print(f"  {n:18}{r['n']:>7}"
+              f"{(ic if ic is not None else float('nan')):>8.3f}"
+              f"{r['long']:>10.2f}{r['short']:>10.2f}{r['ls']:>9.2f}")
+
+
 def verdict(res: dict) -> tuple[bool, str]:
     if res["n"] < MIN_TRADES:
         return False, f"样本不足：{res['n']} < {MIN_TRADES}，延长采集"
@@ -315,6 +517,8 @@ def main() -> int:
     ap.add_argument("--book-root", default=str(Path(data_dir) / "book-raw"))
     ap.add_argument("--i-know-its-early", action="store_true",
                     help="仅供联调；未到 10-28 不得用于结论")
+    ap.add_argument("--factor-ic", action="store_true",
+                    help="追加多因子分层 IC 探索报告（不参与 H1 主判定）")
     args = ap.parse_args()
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
@@ -342,6 +546,12 @@ def main() -> int:
         f"{r2['block15m'][2]:.2f}]" if r2['n'] else "(无交易)"))
 
     print("\n结论：" + ("进入 §5 交付" if passed else "关闭该方向，不产出策略包装"))
+
+    if args.factor_ic:
+        fr = evaluate_factors(book_root, days,
+                              w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
+        print_factor_report(fr)
+
     return 0 if passed else 1
 
 

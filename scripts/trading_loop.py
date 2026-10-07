@@ -810,6 +810,32 @@ try:
 except Exception as _bc_err:
     logger.warning(f"[ws:book] start_book_capture failed (non-fatal): {_bc_err}")
 
+# Public market trades research feed (event-level aggressive flow). The WS
+# trades plumbing already exists (subscribe_trades/_on_trades) and the trading
+# path subscribes a dynamic candidate basket, but capture-to-disk is gated by
+# enable_trades_capture() and was never turned on. Here we enable persistence
+# and ensure a stable basket (fixed by 24h notional volume, mirroring the book
+# feed) is subscribed so /data/trades-raw builds a continuous print-level panel
+# independent of the candidate churn. Failures are non-fatal.
+try:
+    _tc = config.get("trades_capture") or {}
+    if _tc.get("enabled", True):
+        _ws_t = _get_ws_mids_instance()
+        if _ws_t is not None:
+            _ws_t.enable_trades_capture(True)
+            _tc_coins = _tc.get("coins")
+            if not _tc_coins:
+                _tperps = [m for m in get_universe()
+                           if m["type"] == "perp" and not m["coin"].startswith("@")]
+                _tperps.sort(key=lambda m: m.get("dayNtlVlm", 0), reverse=True)
+                _tc_coins = [m["coin"] for m in _tperps[:int(_tc.get("top_n", 20))]]
+            for _tcoin in _tc_coins:
+                _ws_t.subscribe_trades(_tcoin)
+            logger.info(
+                f"[ws:trades] capture enabled, stable basket {len(_tc_coins)} coins")
+except Exception as _tc_err:
+    logger.warning(f"[ws:trades] trades_capture start failed (non-fatal): {_tc_err}")
+
 # Phase 1 (WS user-fills feasibility): subscribe to the wallet's fill
 # stream on the SAME WS connection as allMids. Callback is LOG-ONLY in
 # Phase 1 — no exit decisions are driven off it yet. Failures are
