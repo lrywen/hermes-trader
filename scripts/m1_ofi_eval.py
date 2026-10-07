@@ -498,6 +498,183 @@ def print_factor_report(res: dict) -> None:
               f"{r['long']:>10.2f}{r['short']:>10.2f}{r['ls']:>9.2f}")
 
 
+# ── 成交流因子 IC（基于 trades-raw；2026-10-07 增补）──────────────────────────
+
+def load_trade_coin_day(trades_root: Path, day: str, coin: str) -> list[dict]:
+    ddir = trades_root / f"date={day}"
+    for cand in (ddir / f"{coin}.jsonl", ddir / f"{coin}.jsonl.gz"):
+        if cand.is_file():
+            opener = gzip.open if cand.name.endswith(".gz") else open
+            rows = []
+            with opener(cand, "rt") as f:
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        try:
+                            rows.append(json.loads(line))
+                        except Exception:
+                            pass
+            rows.sort(key=lambda r: int(r.get("time", 0)))
+            return rows
+    return []
+
+
+def trade_coins_present(trades_root: Path, day: str) -> set[str]:
+    ddir = trades_root / f"date={day}"
+    out = set()
+    if not ddir.is_dir():
+        return out
+    for p in list(ddir.glob("*.jsonl")) + list(ddir.glob("*.jsonl.gz")):
+        name = p.name
+        for suf in (".jsonl.gz", ".jsonl"):
+            if name.endswith(suf):
+                out.add(name[: -len(suf)])
+                break
+    return out
+
+
+def trade_slot_samples(trades_root: Path, days: list[str], coin: str, *,
+                       w_s: int, h_s: int) -> list[dict]:
+    """按 h_s 槽对逐笔成交流采样。
+
+    流式收集 print；以 print 的 time//h_s 归槽，每槽取**最后一个 print** 为
+    信号锚（t=该 print time、px=成交价）。窗口 = time 落在 [t-w_s,t] 的全部
+    print，对 TRADE_FACTORS 每个因子打分。下一槽信号锚提供 forward 价。
+    返回 {t, px, f:{name:val}}。
+    """
+    from collections import deque
+    ring: deque = deque()   # (t_s, print)
+    cur_slot = None
+    cur_anchor = None
+    samples: list[dict] = []
+
+    def flush(slot, anchor):
+        if anchor is None:
+            return
+        t, px = anchor
+        win = [p for pt, p in ring if pt >= t - w_s]
+        fv = {}
+        for name, fn in ofi_mod.TRADE_FACTORS.items():
+            try:
+                v = fn(win)
+            except Exception:
+                v = None
+            if v is not None:
+                fv[name] = float(v)
+        samples.append({"t": t, "px": px, "f": fv})
+
+    for day in days:
+        for r in load_trade_coin_day(trades_root, day, coin):
+            try:
+                t = int(r.get("time", 0)) // MS
+                px = float(r.get("px"))
+            except Exception:
+                continue
+            slot = t // h_s
+            if cur_slot is None:
+                cur_slot = slot
+            if slot != cur_slot:
+                flush(cur_slot, cur_anchor)
+                cur_slot = slot
+            cur_anchor = (t, px)
+            ring.append((t, r))
+            while ring and ring[0][0] < t - w_s - h_s:
+                ring.popleft()
+    if cur_anchor is not None:
+        flush(cur_slot, cur_anchor)
+    return samples
+
+
+def evaluate_trade_factors(trades_root: Path, days: list[str], *,
+                           w_s: int, h_s: int, n_bands: int = 5) -> dict:
+    """逐成交流因子：test 段 ①Spearman(因子, 下一槽成交收益) IC；②五档多空
+    净 bps（顶档做多/底档做空，taker 口径）。分位边界只用 train 段。
+
+    用成交价（print px）相邻槽求收益；可执行净 bp 保守按 taker 双边（不再加
+    cross，因为信号来自成交、可直接 taker 成交）。内存安全：逐币流式。
+    """
+    import calendar
+    half = len(days) // 2
+    y, m, d = map(int, days[half].split("-"))
+    test_start = calendar.timegm((y, m, d, 0, 0, 0))
+    all_coins = set()
+    for dd in days:
+        all_coins |= trade_coins_present(trades_root, dd)
+
+    names = list(ofi_mod.TRADE_FACTORS)
+    train_vals: dict[str, list[float]] = {n: [] for n in names}
+    test_rows: dict[str, list[tuple]] = {n: [] for n in names}
+
+    for coin in sorted(all_coins):
+        s = trade_slot_samples(trades_root, days, coin, w_s=w_s, h_s=h_s)
+        for i, rec in enumerate(s):
+            if i + 1 >= len(s):
+                break
+            fwd = s[i + 1]
+            p0, p1 = rec["px"], fwd["px"]
+            if p0 <= 0:
+                continue
+            ret_bp = (p1 - p0) / p0 * 1e4
+            # 可执行 taker：买按 p0 卖按 p1，扣双边 taker（不加 cross）。
+            long_net = ret_bp - 2 * TAKER_FEE_BP_PER_SIDE
+            short_net = -ret_bp - 2 * TAKER_FEE_BP_PER_SIDE
+            for n in names:
+                if n not in rec["f"]:
+                    continue
+                v = rec["f"][n]
+                if rec["t"] < test_start:
+                    train_vals[n].append(v)
+                else:
+                    test_rows[n].append((v, ret_bp, long_net, short_net))
+
+    out = {}
+    for n in names:
+        rows = test_rows[n]
+        if len(rows) < 50:
+            out[n] = {"n": len(rows)}
+            continue
+        vals = [r[0] for r in rows]
+        rets = [r[1] for r in rows]
+        ic = _spearman(vals, rets)
+        tv = sorted(train_vals[n])
+        cuts = [quantile(tv, b / n_bands) for b in range(1, n_bands)]
+
+        def band_of(v):
+            b = 0
+            for c in cuts:
+                if v > c:
+                    b += 1
+            return b
+
+        top_l, bot_s = [], []
+        for v, _, ln, sn in rows:
+            b = band_of(v)
+            if b == n_bands - 1:
+                top_l.append(ln)
+            if b == 0:
+                bot_s.append(sn)
+        ml = sum(top_l) / len(top_l) if top_l else float("nan")
+        ms = sum(bot_s) / len(bot_s) if bot_s else float("nan")
+        out[n] = {"n": len(rows), "ic": ic, "long": ml, "short": ms,
+                  "n_long": len(top_l), "n_short": len(bot_s),
+                  "ls": (ml - ms) if (ml == ml and ms == ms) else float("nan")}
+    return out
+
+
+def print_trade_factor_report(res: dict) -> None:
+    print(f"\n== 成交流因子分层 IC（trades-raw，W=60s h=300s，test，探索性）==")
+    print(f"  {'factor':24}{'n':>7}{'IC':>8}{'top档多':>10}{'底档空':>10}"
+          f"{'多-空':>9}")
+    for n, r in res.items():
+        if r.get("n", 0) < 50:
+            print(f"  {n:24}{r.get('n',0):>7}  (样本不足)")
+            continue
+        ic = r.get("ic")
+        print(f"  {n:24}{r['n']:>7}"
+              f"{(ic if ic is not None else float('nan')):>8.3f}"
+              f"{r['long']:>10.2f}{r['short']:>10.2f}{r['ls']:>9.2f}")
+
+
 def verdict(res: dict) -> tuple[bool, str]:
     if res["n"] < MIN_TRADES:
         return False, f"样本不足：{res['n']} < {MIN_TRADES}，延长采集"
@@ -519,6 +696,8 @@ def main() -> int:
                     help="仅供联调；未到 10-28 不得用于结论")
     ap.add_argument("--factor-ic", action="store_true",
                     help="追加多因子分层 IC 探索报告（不参与 H1 主判定）")
+    ap.add_argument("--trade-factor-ic", action="store_true",
+                    help="追加基于 trades-raw 的成交流因子 IC（探索性）")
     args = ap.parse_args()
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
@@ -551,6 +730,18 @@ def main() -> int:
         fr = evaluate_factors(book_root, days,
                               w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
         print_factor_report(fr)
+
+    if args.trade_factor_ic:
+        trades_root = Path(data_dir) / "trades-raw"
+        tdays = list_day_dirs(trades_root)
+        if len(tdays) < 2:
+            print(f"[m1-eval] trades-raw 可用日不足：{tdays}")
+        else:
+            print(f"[m1-eval] trades 天数={len(tdays)} "
+                  f"{tdays[0]}~{tdays[-1]}")
+            tfr = evaluate_trade_factors(trades_root, tdays,
+                                         w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
+            print_trade_factor_report(tfr)
 
     return 0 if passed else 1
 

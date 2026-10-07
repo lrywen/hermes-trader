@@ -5,13 +5,20 @@ import pytest
 
 from hermes_trader.agents.ofi import (
     aggregate_ofi,
+    aggressor_count_imbalance,
     best_ofi_two_sided,
+    cvd_momentum,
+    cvd_series,
     depth_imbalance,
     depth_ofi,
+    large_trade_flow_imbalance,
     mid,
     ofi_mid_divergence,
+    quantile_sorted,
     queue_buildup_slope,
     queue_withdrawal,
+    signed_trade,
+    trade_flow_imbalance,
 )
 
 
@@ -165,3 +172,75 @@ def test_ofi_mid_divergence_missing_none():
     prev = _snap([(100, 5)], [])
     cur = _snap([(101, 5)], [])
     assert ofi_mid_divergence(cur=cur, prev=prev) is None
+
+
+# ── 成交流因子（CVD / 主动成交失衡）──────────────────────────────────────────
+
+def _tr(side, sz):
+    return {"side": side, "sz": sz, "px": 100.0, "time": 0}
+
+
+def test_signed_trade_buy_sell_bad():
+    assert signed_trade(_tr("B", 3)) == 3.0
+    assert signed_trade(_tr("A", 3)) == -3.0
+    assert signed_trade(_tr("B", 0)) == 0.0
+    assert signed_trade(_tr("B", "x")) == 0.0
+    # 非 B 一律按卖（taker sell）处理
+    assert signed_trade({"side": "X", "sz": 2}) == -2.0
+
+
+def test_cvd_series_cumulative():
+    ws = [_tr("B", 3), _tr("A", 5), _tr("B", 2)]
+    # 0, +3, -2, 0
+    assert cvd_series(ws) == [0.0, 3.0, -2.0, 0.0]
+    assert cvd_series([]) == [0.0]
+
+
+def test_trade_flow_imbalance_basic():
+    # 净 +4，gross 8 -> 0.5
+    ws = [_tr("B", 6), _tr("A", 2)]
+    assert trade_flow_imbalance(ws) == pytest.approx(0.5)
+
+
+def test_trade_flow_imbalance_empty_none():
+    assert trade_flow_imbalance([]) is None
+    assert trade_flow_imbalance([_tr("B", 0)]) is None
+
+
+def test_aggressor_count_imbalance():
+    ws = [_tr("B", 1), _tr("B", 1), _tr("A", 1)]
+    # (2-1)/3
+    assert aggressor_count_imbalance(ws) == pytest.approx(1 / 3)
+    assert aggressor_count_imbalance([]) is None
+
+
+def test_large_trade_flow_requires_enough_prints():
+    assert large_trade_flow_imbalance([_tr("B", 1)] * 4) is None
+
+
+def test_large_trade_flow_top_quantile():
+    # 5 笔；0.9 分位阈值线性插值，最大两笔（10）落在阈值以上 -> >=3? 只有2笔
+    ws = [_tr("B", 1), _tr("A", 2), _tr("B", 3), _tr("B", 10), _tr("B", 10)]
+    # 阈值= q0.9: pos=3.6 -> sorted[3]*0.4+sorted[4]*0.6 = 3*0.4+10*0.6=7.2
+    # 仅两笔 10 >= 7.2 -> cnt=2 <3 -> None
+    assert large_trade_flow_imbalance(ws) is None
+    # 三笔 10：cnt=3，净 +30 gross 30 -> 1.0
+    ws2 = [_tr("A", 1), _tr("A", 2), _tr("B", 3),
+           _tr("B", 10), _tr("B", 10), _tr("B", 10)]
+    assert large_trade_flow_imbalance(ws2) == pytest.approx(1.0)
+
+
+def test_cvd_momentum_accelerating():
+    # 6 笔，m=3：前半全卖净-3，后半全买净+3，gross 6 -> (3-(-3))/6=1
+    ws = [_tr("A", 1), _tr("A", 1), _tr("A", 1),
+          _tr("B", 1), _tr("B", 1), _tr("B", 1)]
+    assert cvd_momentum(ws) == pytest.approx(1.0)
+
+
+def test_cvd_momentum_empty_none():
+    assert cvd_momentum([_tr("B", 1)]) is None
+
+
+def test_quantile_sorted_interpolation():
+    assert quantile_sorted([1, 2, 3, 4], 0.5) == pytest.approx(2.5)
+    assert quantile_sorted([], 0.5) == 0.0

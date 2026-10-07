@@ -257,3 +257,134 @@ FACTORS: dict[str, tuple[str, object]] = {
     "buildup_slope": ("frame", queue_buildup_slope),
     "ofi_mid_divergence": ("edge", ofi_mid_divergence),
 }
+
+
+# ── 成交流因子（基于 trades-raw 逐笔；2026-10-07 增补）────────────────────────
+#
+# trades-raw 每行：{"coin","side"("B"=taker买 / "A"=taker卖),"px","sz","time",...}
+# 与盘口 OFI 不同，这是真实发生的逐笔主动成交。窗口因子吃一个 window（该窗内
+# 的 print dict 列表，按 time 升序）返回标量；归一到 [-1,1] 以便跨币可比。
+
+def signed_trade(t: dict) -> float:
+    """单笔有符号量：taker 买为 +sz，卖为 -sz。坏行返回 0。"""
+    try:
+        sz = float(t.get("sz"))
+    except Exception:
+        return 0.0
+    if sz <= 0:
+        return 0.0
+    return sz if t.get("side") == "B" else -sz
+
+
+def cvd_series(prints: Sequence[dict]) -> list[float]:
+    """累计净成交量（CVD）序列，从 0 起逐 print 累加。"""
+    out = [0.0]
+    run = 0.0
+    for t in prints:
+        run += signed_trade(t)
+        out.append(run)
+    return out
+
+
+def trade_flow_imbalance(window: Sequence[dict]) -> Optional[float]:
+    """主动成交（量）失衡 = 净成交 / 总成交 ∈ [-1,1]。
+
+    即窗口内有符号量之和 / 绝对量之和。全空/总量 0 返回 None。这是 CVD 在该
+    窗的变化（gross 归一），>0 买方主动占优。
+    """
+    net = sum(signed_trade(t) for t in window)
+    gross = sum(abs(signed_trade(t)) for t in window)
+    if gross <= 0:
+        return None
+    return max(-1.0, min(1.0, net / gross))
+
+
+def aggressor_count_imbalance(window: Sequence[dict]) -> Optional[float]:
+    """主动成交（笔数）失衡：(买笔数−卖笔数)/(买笔数+卖数) ∈ [-1,1]。
+
+    与"量"失衡独立——刻画方向一致性而非大单权重。无有效 print 返回 None。
+    """
+    nb = na = 0
+    for t in window:
+        s = signed_trade(t)
+        if s > 0:
+            nb += 1
+        elif s < 0:
+            na += 1
+    tot = nb + na
+    if tot == 0:
+        return None
+    return (nb - na) / tot
+
+
+def large_trade_flow_imbalance(window: Sequence[dict], *,
+                               size_quantile: float = 0.9) -> Optional[float]:
+    """大单主动成交失衡：仅对窗口内挂量处于 ``size_quantile`` 分位以上的
+    print 求净/总 ∈ [-1,1]（"聪明钱/鲸鱼"方向）。
+
+    分位阈值只由该窗口 print 的挂量分布决定（窗口内过去信息）。有效大单 <3
+    笔返回 None。
+    """
+    sizes = []
+    for t in window:
+        try:
+            sz = float(t.get("sz"))
+        except Exception:
+            continue
+        if sz > 0:
+            sizes.append(sz)
+    if len(sizes) < 5:
+        return None
+    thr = quantile_sorted(sorted(sizes), size_quantile)
+    net = gross = 0.0
+    cnt = 0
+    for t in window:
+        try:
+            sz = float(t.get("sz"))
+        except Exception:
+            continue
+        if sz >= thr and sz > 0:
+            s = sz if t.get("side") == "B" else -sz
+            net += s
+            gross += abs(s)
+            cnt += 1
+    if gross <= 0 or cnt < 3:
+        return None
+    return max(-1.0, min(1.0, net / gross))
+
+
+def cvd_momentum(window: Sequence[dict]) -> Optional[float]:
+    """CVD 趋势：窗口前半→后半的 CVD 变化方向（净 signed 量）gross 归一。
+
+    用窗口两半的净主动量之差，刻画"主动买压在增强还是衰减"。空窗返回 None。
+    """
+    ws = list(window)
+    m = len(ws) // 2
+    if m < 1 or len(ws) < 2:
+        return None
+    first = sum(signed_trade(t) for t in ws[:m])
+    second = sum(signed_trade(t) for t in ws[m:])
+    gross = sum(abs(signed_trade(t)) for t in ws)
+    if gross <= 0:
+        return None
+    return max(-1.0, min(1.0, (second - first) / gross))
+
+
+def quantile_sorted(sorted_vals: Sequence[float], q: float) -> float:
+    """等距分位（线性插值）；供大单于量阈值。"""
+    if not sorted_vals:
+        return 0.0
+    pos = q * (len(sorted_vals) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1 - frac) + sorted_vals[hi] * frac
+
+
+# 成交流因子注册表：name -> fn(window_trades)->scalar。供研究脚本遍历做 IC。
+TRADE_FACTORS: dict[str, object] = {
+    "trade_flow_imbalance": trade_flow_imbalance,
+    "aggressor_count_imbalance": aggressor_count_imbalance,
+    "large_trade_flow": large_trade_flow_imbalance,
+    "cvd_momentum": cvd_momentum,
+}
