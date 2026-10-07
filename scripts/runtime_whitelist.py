@@ -49,6 +49,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_relax_tier_shadow.py",
     "macro_regime_watch.py",
     "monitor_book_continuity.py",
+    "funding_carry_forward.py",
     # Web UI spawn / lazy import.
     "regen_param_sweep.py",
     "shadow_grade.py",

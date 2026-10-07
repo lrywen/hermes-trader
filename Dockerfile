@@ -61,6 +61,7 @@ COPY scripts/reconcile_xs_reversal_shadow.py scripts/reconcile_xs_reversal_shado
 COPY scripts/reconcile_relax_tier_shadow.py scripts/reconcile_relax_tier_shadow.py
 COPY scripts/macro_regime_watch.py scripts/macro_regime_watch.py
 COPY scripts/monitor_book_continuity.py scripts/monitor_book_continuity.py
+COPY scripts/funding_carry_forward.py scripts/funding_carry_forward.py
 COPY scripts/regen_param_sweep.py scripts/regen_param_sweep.py
 COPY scripts/shadow_grade.py scripts/shadow_grade.py
 # Shared scripts/-local helper imported by shadow_grade.py and
