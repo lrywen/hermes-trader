@@ -744,6 +744,13 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "enabled": ("bool",),
             "require_valid_data": ("bool",),
         },
+        # 逆势抄底需止跌确认：仅对研究 regime=down 的多单生效，急跌后需
+        # fresh up-bar 才放行。
+        "counter_trend_confirm": {
+            "enabled": ("bool",),
+            "min_drop_pct": _num_leaf(0.0, 1.0),
+            "lookback_bars": ("int", 1, 50),
+        },
         # Audit 2026-09-10 (risk-tuning shadow): the runner-gate
         # counter-factual arms. per_coin_cooldown.shadow_mode=false ENFORCES
         # a real block.

@@ -491,6 +491,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "regime_breakout_veto": {
             "enabled": True,
         },
+        # 逆势抄底需止跌确认：研究 regime=down 且近几根 1h 出现急跌（crash）
+        # 的多单，必须先看到一根新的阳线（fresh up-bar）才放行。历史配对回测
+        # 否证（50币/185天，等阳线每个 horizon 劣 10~18bp，反弹在当根兑现），
+        # 故默认关闭，仅保留开关供极端行情手动启用。
+        "counter_trend_confirm": {
+            "enabled": False,
+            "min_drop_pct": 0.015,
+            "lookback_bars": 2,
+        },
     },
     "plan_b": {
         "enabled": True,

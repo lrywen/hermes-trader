@@ -144,6 +144,34 @@ def fresh_up_bar(candles: Sequence) -> bool:
     return bool(cl > o and cl > _v(candles[-2], "c"))
 
 
+def crash_bar(
+    candles: Sequence,
+    *,
+    atr: float = 0.0,
+    min_drop_pct: float = 0.015,
+    atr_mult: float = 1.5,
+    lookback: int = 2,
+) -> bool:
+    """One of the last ``lookback`` bars was a sharp DOWN (falling-knife) bar.
+
+    A bar qualifies when its bearish body (open-close) is either >=
+    ``min_drop_pct`` of the open OR, when ``atr>0``, >= ``atr_mult × ATR``.
+    Used to gate counter-trend longs: after such a print we wait for a fresh
+    up-bar (止跌确认) rather than buying into the decline. Defensive on data.
+    """
+    if len(candles) < 2:
+        return False
+    for c in candles[-max(1, lookback):]:
+        o, cl = _v(c, "o"), _v(c, "c")
+        if o <= 0 or cl >= o:
+            continue
+        if (o - cl) / o >= min_drop_pct:
+            return True
+        if atr > 0 and (o - cl) >= atr_mult * atr:
+            return True
+    return False
+
+
 # ── Composite signal ────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)

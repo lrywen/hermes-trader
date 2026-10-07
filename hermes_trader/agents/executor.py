@@ -5934,6 +5934,50 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                         f"rsi4h={rsi4h}, ext={pb_extension}")
             return ""
 
+    # --- Counter-trend falling-knife confirm gate ---------------------------
+    # Audit 2026-10-07 (AVAX): a LONG admitted while the research regime is
+    # DOWN (counter-trend) after a sharp crash bar is catching a falling knife
+    # without confirmation — the recurring MFE-0 / ignite_timeout pattern. In
+    # that specific context require a fresh up-bar (止跌确认) on the 1h before
+    # admitting. Trend-aligned longs (regime up) and counter-trend longs with
+    # no recent crash bar are untouched. Data-validity guard mirrors the
+    # breakout veto: fail OPEN if candles/ATR can't be read (never block a live
+    # trade on missing data); the other risk gates still apply.
+    _ct_cfg = gate.get("counter_trend_confirm") or {}
+    if (
+        bool(_ct_cfg.get("enabled", True))
+        and side == "long"
+        and str(analysis.get("regime") or "") == "down"
+        and not forced
+    ):
+        try:
+            from hermes_trader.agents.pullback_entry import crash_bar, fresh_up_bar
+            from hermes_trader.client.hl_client import fetch_hl_candles
+            from hermes_trader.indicators.math import atr as _ct_atr_ind
+            _ct_c = fetch_hl_candles(coin, "1h", 80)
+            if len(_ct_c) >= 20:
+                _ct_atr_arr = _ct_atr_ind(_ct_c, 14)
+                _ct_atr = next(
+                    (v for v in reversed(_ct_atr_arr)
+                     if v == v and v > 0 and v != float("inf")),
+                    0.0)
+                _min_drop = float(_ct_cfg.get("min_drop_pct", 0.015))
+                _lookback = int(_ct_cfg.get("lookback_bars", 2))
+                if crash_bar(
+                    _ct_c, atr=_ct_atr, min_drop_pct=_min_drop,
+                    atr_mult=1.5, lookback=_lookback,
+                ) and not fresh_up_bar(_ct_c):
+                    logger.info(
+                        f"[runner_gate] {coin} BLOCKED: counter-trend long into "
+                        f"a crash bar with no fresh up-bar (止跌确认)")
+                    return (
+                        "runner_gate_blocked (counter-trend long needs "
+                        "stop-decline confirmation: fresh up-bar after crash)")
+        except Exception as _ct_e:
+            logger.debug(
+                "[runner_gate] counter-trend confirm skipped for %s: %s",
+                coin, _ct_e)
+
     if uptrend and not (fresh_impulse or structured_daily_mover):
         logger.info(f"[runner_gate] {coin} BLOCKED: late trend-only chase (uptrend without fresh breakout/burst/daily-mover)")
         return "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)"

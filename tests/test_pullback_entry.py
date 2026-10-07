@@ -80,3 +80,30 @@ def test_fresh_up_bar_detection() -> None:
     p = down[-1].c
     down.append(_C(p, p, p - 1, p - 1))
     assert pe.fresh_up_bar(down) is False
+
+
+def test_crash_bar_detects_sharp_down() -> None:
+    c = _uptrend(5)
+    p = c[-1].c
+    # 单根 -2% 急跌
+    c.append(_C(p, p, p * 0.98, p * 0.98))
+    assert pe.crash_bar(c, min_drop_pct=0.015) is True
+
+
+def test_crash_bar_ignores_normal_pullback() -> None:
+    c = _uptrend(5)
+    p = c[-1].c
+    # 仅 -0.5% 的普通回调，不算 crash
+    c.append(_C(p, p, p * 0.995, p * 0.995))
+    assert pe.crash_bar(c, min_drop_pct=0.015) is False
+
+
+def test_crash_bar_lookback_window() -> None:
+    c = _uptrend(5)
+    p = c[-1].c
+    c.append(_C(p, p, p * 0.98, p * 0.98))  # crash
+    # crash 后再跟一根阳线；lookback=1 只看末根 → 无 crash
+    up = c[-1].c
+    c.append(_C(up, up + 1, up - 0.2, up + 1))
+    assert pe.crash_bar(c, min_drop_pct=0.015, lookback=1) is False
+    assert pe.crash_bar(c, min_drop_pct=0.015, lookback=2) is True
