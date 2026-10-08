@@ -3325,6 +3325,7 @@ def register_routes(app: FastAPI) -> None:
     )
     from hermes_trader.dashboard_routes.operator import register_operator_routes
     from hermes_trader.dashboard_routes.public import register_public_routes
+    from hermes_trader.dashboard_routes.research import register_research_routes
     from hermes_trader.dashboard_routes.secrets import register_secrets_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
     from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
@@ -3349,5 +3350,8 @@ def register_routes(app: FastAPI) -> None:
     # 只读 microstructure debug：在主进程内暴露实时成交/CVD 累积器状态。
     # 须在 public catch-all 之前注册，避免被 /{full_path:path} 吞掉。
     register_microstructure_debug_routes(app)
+    # Funding-carry shadow-forward research surface (read-only, operator-gated).
+    # Register before public so the SPA catch-all does not swallow it.
+    register_research_routes(app)
     register_public_routes(app)
 
