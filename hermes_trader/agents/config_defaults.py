@@ -607,6 +607,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "cache_max_entries": 128,
         "parallel": True,
         "use_structured_output": True,
+        # Per-tier model override (TradingAgents v0.6.0 #1440). "" = use the
+        # shared research_llm default, so adding these keys changes NOTHING.
+        # analyst_model routes bull/bear (cheap/fast tier); arbiter_model routes
+        # the synth call (strong-reasoning tier). Provider/base_url stay shared.
+        "analyst_model": "",
+        "arbiter_model": "",
         # Shadow A/B (absorbed from TradingAgents). When enabled, run the
         # bull/bear/arbiter debate in the BACKGROUND for eligible candidates
         # purely as a comparison signal — it NEVER replaces the single-LLM

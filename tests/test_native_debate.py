@@ -79,6 +79,9 @@ def _enable_debate(monkeypatch):
             # Audit 2026-09-04 P0-1: per-leg optional timeouts (None = off).
             "bull_timeout_s": None,
             "synth_timeout_s": None,
+            # Per-tier model overrides default to "" (shared research_llm).
+            "analyst_model": "",
+            "arbiter_model": "",
         },
     )
     monkeypatch.setattr(R, "cfg_get", lambda key, *a, **k: 1.5)
@@ -222,6 +225,8 @@ def test_debate_serial_mode(monkeypatch, _enable_debate):
             "use_structured_output": True,
             "bull_timeout_s": None,
             "synth_timeout_s": None,
+            "analyst_model": "",
+            "arbiter_model": "",
         },
         raising=False,
     )
@@ -260,3 +265,54 @@ def test_debate_atr_stop_when_no_stop_pct(monkeypatch, _enable_debate):
     # ATR path: stop = 100 - 2*1.5 = 97, tp = 100 + 2*1.0 = 102.
     assert fields["stop_px"] == pytest.approx(97.0)
     assert fields["tp_px"] == pytest.approx(102.0)
+
+
+# ── per-tier model override (TradingAgents v0.6.0 #1440) ──────────────────
+
+def test_debate_routes_per_tier_models(monkeypatch):
+    """bull/bear use analyst_model, synth uses arbiter_model; the override is
+    passed as model= to the transport."""
+    monkeypatch.setattr(
+        R, "_debate_cfg",
+        lambda: {
+            "enabled": True, "max_latency_s": 10.0, "cache_ttl_s": 300.0,
+            "parallel": True, "use_structured_output": True,
+            "bull_timeout_s": None, "synth_timeout_s": None,
+            "analyst_model": "analyst-tier-x",
+            "arbiter_model": "arbiter-tier-y",
+        },
+    )
+    monkeypatch.setattr(R, "cfg_get", lambda key, *a, **k: 1.5)
+    seen_models: list = []
+
+    def fake(system_prompt, user_message, **kwargs):
+        seen_models.append(kwargs.get("model"))
+        if "arbiter" in system_prompt:
+            return _synth_json(verdict="LONG", confidence=0.6, stop_pct=0.03)
+        return "bull" if "LONG specialist" in system_prompt else "bear"
+
+    monkeypatch.setattr(R, "_call_openrouter", fake)
+
+    fields = R._debate_research(
+        "ETH", "ctx", _perception(mid=100.0), atr_abs=1.0)
+    assert fields is not None
+    # three calls: bull + bear on analyst tier, synth on arbiter tier.
+    assert seen_models == ["analyst-tier-x", "analyst-tier-x", "arbiter-tier-y"]
+
+
+def test_debate_default_model_when_overrides_empty(monkeypatch, _enable_debate):
+    """Empty analyst/arbiter strings → model=None passed → shared default."""
+    seen_models: list = []
+
+    def fake(system_prompt, user_message, **kwargs):
+        seen_models.append(kwargs.get("model"))
+        if "arbiter" in system_prompt:
+            return _synth_json(verdict="LONG", confidence=0.6, stop_pct=0.03)
+        return "b"
+
+    monkeypatch.setattr(R, "_call_openrouter", fake)
+
+    fields = R._debate_research(
+        "ETH", "ctx", _perception(mid=100.0), atr_abs=1.0)
+    assert fields is not None
+    assert seen_models == [None, None, None]

@@ -1100,6 +1100,7 @@ def _call_openrouter(
     response_format: Optional[dict] = None,
     timeout: Optional[float] = None,
     max_tokens: Optional[int] = None,
+    model: Optional[str] = None,
     path: str = "call_ai",
 ) -> str:
     """Call the LLM API via OpenAI-compatible endpoint (synchronous httpx).
@@ -1122,7 +1123,10 @@ def _call_openrouter(
     _t_started = time.time()
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     lp = research_llm_params()
-    model = str(lp["model"])
+    # Per-role model override (debate tiers, v0.6.0 #1440 idea): a non-empty
+    # caller model wins; otherwise the research_llm default. Provider/base_url
+    # stay shared — only the model name is tiered.
+    model = str(model) if model else str(lp["model"])
     base_url = str(lp["base_url"])
     if timeout is None:
         timeout = float(lp["timeout_sec"])
@@ -1801,7 +1805,20 @@ def _debate_cfg() -> dict[str, Any]:
         # hard clamp at 18/24 made max_latency_s>25.7s a no-op).
         "bull_timeout_s": d.get("bull_timeout_s"),
         "synth_timeout_s": d.get("synth_timeout_s"),
+        # Per-tier model override (TradingAgents v0.6.0 #1440). Empty string
+        # means "use the research_llm default". analyst_model covers bull/bear,
+        # arbiter_model covers the synth call. All stay on the shared provider.
+        "analyst_model": str(d.get("analyst_model", "") or ""),
+        "arbiter_model": str(d.get("arbiter_model", "") or ""),
     }
+
+
+def _debate_role_model(role: str) -> str:
+    """Resolve the per-tier model for a debate role ('bull'/'bear' → analyst,
+    'synth' → arbiter). '' when no override is configured (caller then routes
+    through the research_llm default)."""
+    dcfg = _debate_cfg()
+    return dcfg["arbiter_model"] if role == "synth" else dcfg["analyst_model"]
 
 
 def _debate_shadow_ab_cfg() -> dict[str, Any]:
@@ -1978,10 +1995,12 @@ def _debate_direct(
     rf = ResearchVerdict.openrouter_response_format() if structured else None
     per_call_timeout = timeout if timeout is not None else _debate_per_call_timeout()
     role = _debate_role(system_prompt)
+    role_model = _debate_role_model(role)
     t0 = time.time()
     logger.info(
         f"[debate] call START | role={role} structured={structured} "
-        f"timeout_s={per_call_timeout:.1f} prompt_chars={len(user_message)}"
+        f"timeout_s={per_call_timeout:.1f} prompt_chars={len(user_message)} "
+        f"model={role_model or '<default>'}"
     )
     try:
         out = _call_openrouter(
@@ -1990,6 +2009,7 @@ def _debate_direct(
             response_format=rf,
             timeout=per_call_timeout,
             max_tokens=debate_tokens,
+            model=role_model or None,
             path="debate_direct",
         )
     except Exception as e:
