@@ -1481,6 +1481,38 @@ def scan_once(
                     f"eligible, counterfactual top-{_cs_k} (markets unchanged)")
         except Exception as _cs_e:
             logger.warning(f"[coin_selection] evaluation failed: {_cs_e}")
+        else:
+            # A1: register score_pick (candidate) vs the bucket_pick coins it
+            # would drop, for forward-outcome attribution. In shadow the
+            # bucket_pick is what actually trades and score_pick is the
+            # counterfactual; compare their subsequent returns to decide
+            # promotion. Never raises.
+            try:
+                from hermes_trader.agents.selection_attribution import (
+                    DEFAULT_HORIZON_HOURS,
+                    register_pending,
+                )
+                _score_set = set(_cs_coins)
+                _bucket_set = set(_bucket_coins)
+                _cs_sel = [(c, None) for c in _cs_coins]
+                _cs_def = [(c, None) for c in _bucket_set - _score_set]
+                try:
+                    _cs_horizon = int(_cs_block.get("attribution_horizon_hours",
+                                                     DEFAULT_HORIZON_HOURS))
+                except (TypeError, ValueError):
+                    _cs_horizon = DEFAULT_HORIZON_HOURS
+                register_pending(
+                    "coin_selection",
+                    _cs_sel,
+                    _cs_def,
+                    base_prices=mids,
+                    cycle_ms=int(time.time() * 1000),
+                    horizon_hours=_cs_horizon,
+                )
+            except Exception as _cs_attr_e:
+                logger.debug(
+                    f"[coin_selection] attribution register failed: "
+                    f"{_cs_attr_e}")
 
     if not markets:
         return []

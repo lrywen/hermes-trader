@@ -76,6 +76,11 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "daily-report.log",
     ),
     _daily(
+        "reconcile_selection_attribution", 0, 15,
+        ("scripts/reconcile_selection_attribution.py", "--write"),
+        "selection-attribution-verdict.log",
+    ),
+    _daily(
         "pullback_shadow_daily", 0, 20,
         ("scripts/pullback_shadow_daily.py", "--window-hours", "24", "--push"),
         "pullback-shadow-report.log",

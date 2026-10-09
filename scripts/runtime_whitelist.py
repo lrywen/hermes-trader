@@ -13,8 +13,8 @@ Call sites that justify each entry (verified 2026-09-18):
       trading_loop.py, ip_drift_watch.py, scheduler.py
   * scheduler.SCHEDULED_JOBS (in-container subprocess):
       clean_trades_raw.py, daily_report.py, pullback_shadow_daily.py,
-      reconcile_ta_late_entry_shadow.py, reconcile_xs_reversal_shadow.py,
-      reconcile_relax_tier_shadow.py,
+      reconcile_selection_attribution.py, reconcile_ta_late_entry_shadow.py,
+      reconcile_xs_reversal_shadow.py, reconcile_relax_tier_shadow.py,
       macro_regime_watch.py
   * Web UI spawn / lazy import (dashboard_routes/shadow_arms.py):
       regen_param_sweep.py, shadow_grade.py
@@ -43,6 +43,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # scheduler.SCHEDULED_JOBS.
     "clean_trades_raw.py",
     "daily_report.py",
+    "reconcile_selection_attribution.py",
     "pullback_shadow_daily.py",
     "reconcile_ta_late_entry_shadow.py",
     "reconcile_xs_reversal_shadow.py",

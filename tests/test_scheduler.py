@@ -43,7 +43,7 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 7
+    assert len(SCHEDULED_JOBS) == 8
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
@@ -51,6 +51,12 @@ def test_job_table_has_six_jobs_and_existing_scripts() -> None:
 def test_daily_job_table_matches_compose_windows() -> None:
     table = {
         "daily_report": (10, ("scripts/daily_report.py", "--push"), "daily-report.log", {}),
+        "reconcile_selection_attribution": (
+            15,
+            ("scripts/reconcile_selection_attribution.py", "--write"),
+            "selection-attribution-verdict.log",
+            {},
+        ),
         "pullback_shadow_daily": (
             20,
             ("scripts/pullback_shadow_daily.py", "--window-hours", "24", "--push"),

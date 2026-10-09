@@ -55,6 +55,7 @@ COPY scripts/scheduler.py scripts/scheduler.py
 # scheduler.SCHEDULED_JOBS 每日00:00调用：清理过期 trades-raw 落盘。
 COPY scripts/clean_trades_raw.py scripts/clean_trades_raw.py
 COPY scripts/daily_report.py scripts/daily_report.py
+COPY scripts/reconcile_selection_attribution.py scripts/reconcile_selection_attribution.py
 COPY scripts/pullback_shadow_daily.py scripts/pullback_shadow_daily.py
 COPY scripts/reconcile_ta_late_entry_shadow.py scripts/reconcile_ta_late_entry_shadow.py
 COPY scripts/reconcile_xs_reversal_shadow.py scripts/reconcile_xs_reversal_shadow.py
