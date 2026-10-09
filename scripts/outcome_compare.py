@@ -68,22 +68,19 @@ def _close_fills(account: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def load_data() -> tuple[list[dict[str, Any]], list[dict[str, Any]],
-                          list[dict[str, Any]], list[dict[str, Any]],
-                          list[dict[str, Any]]]:
+                          list[dict[str, Any]], list[dict[str, Any]]]:
     with open(BOOK_PATH) as fh:
         book = json.load(fh)
     accounts = book.get("accounts", {})
     taker = _close_fills(accounts.get("taker", {}))
     maker = _close_fills(accounts.get("maker_shadow", {}))
-    maker_cancels = [f for f in accounts.get("maker_shadow", {}).get("fills", [])
-                     if f.get("type") == "cancel"]
     ranking = _read_jsonl_with_rotations(
         os.path.join(DATA_DIR, "signal_ranking.jsonl"))
     conj = _read_jsonl_with_rotations(
         os.path.join(DATA_DIR, "conjunction_probe.jsonl"))
     # Bundle the signal sources together for the join routine; they are
     # consumed separately by name below.
-    return taker, maker, maker_cancels, ranking, conj
+    return taker, maker, ranking, conj
 
 
 # --------------------------------------------------------------------------- stats
@@ -193,35 +190,16 @@ def analyse_ranking(ranking: list[dict[str, Any]],
 
 
 def analyse_execution(taker: list[dict[str, Any]],
-                      maker: list[dict[str, Any]],
-                      cancels: list[dict[str, Any]] | None = None) -> dict[str, Any]:
-    """P2: paired taker vs maker_shadow outcomes on shared analysis_id.
-
-    除"双方都成交"的配对外，还纳入 maker 的踏空口径（M-5 否决切换的关键项）：
-    TTL 内未触及被撤销的单 = maker 踏空；miss_rate=踏空/(成交+踏空)；
-    机会成本=这些踏空单按 taker 同 analysis_id 的已实现 PnL 之和（maker 错过的
-    部分）。只看成交配对会系统性高估 maker，故此处必须同时报告。
-    """
-    cancels = cancels or []
+                      maker: list[dict[str, Any]]) -> dict[str, Any]:
+    """P2: paired taker vs maker_shadow outcomes on shared analysis_id."""
     maker_by_id = {m.get("analysis_id"): m for m in maker
                    if m.get("analysis_id")}
-    taker_by_id = {t.get("analysis_id"): t for t in taker
-                   if t.get("analysis_id")}
     paired_t, paired_m = [], []
     for t in taker:
         m = maker_by_id.get(t.get("analysis_id"))
         if m is not None:
             paired_t.append(t)
             paired_m.append(m)
-
-    # 踏空：cancel 单（同一信号 taker 成交了，maker 没成交）
-    missed_ids = {c.get("analysis_id") for c in cancels if c.get("analysis_id")}
-    missed_taker = [taker_by_id[i] for i in missed_ids if i in taker_by_id]
-    n_filled = len(paired_m)
-    n_miss = len(missed_taker)
-    n_attempt = n_filled + n_miss
-    opp_cost = sum(_f(t.get("realized_pnl_usd")) for t in missed_taker)
-
     return {
         "taker_all": group_stats(taker),
         "taker_paired": group_stats(paired_t),
@@ -231,15 +209,6 @@ def analyse_execution(taker: list[dict[str, Any]],
             round((sum(_f(m.get("realized_pnl_usd")) for m in paired_m)
                    - sum(_f(t.get("realized_pnl_usd")) for t in paired_t))
                   / max(1, len(paired_t)), 4)),
-        "maker_miss_count": n_miss,
-        "maker_miss_rate_pct": round(100.0 * n_miss / n_attempt, 1)
-                               if n_attempt else 0.0,
-        "maker_missed_opportunity_cost_usd": round(opp_cost, 4),
-        "maker_net_edge_vs_taker_usd": round(
-            # 成交配对上的累计改善 − 踏空错过的 PnL
-            (sum(_f(m.get("realized_pnl_usd")) for m in paired_m)
-             - sum(_f(t.get("realized_pnl_usd")) for t in paired_t))
-            - opp_cost, 4),
     }
 
 
@@ -346,7 +315,7 @@ def main() -> None:
     args = ap.parse_args()
     tol_ms = args.join_tol_s * 1000
 
-    taker, maker, maker_cancels, ranking, conj = load_data()
+    taker, maker, ranking, conj = load_data()
 
     if args.coverage:
         print_coverage(conj, ranking, taker, args.join_tol_s)
@@ -357,7 +326,7 @@ def main() -> None:
         "join_tol_s": args.join_tol_s,
         "conjunction": analyse_conjunction(conj, taker, tol_ms),
         "ranking": analyse_ranking(ranking, taker, tol_ms),
-        "execution": analyse_execution(taker, maker, maker_cancels),
+        "execution": analyse_execution(taker, maker),
         "risk": analyse_risk(taker),
     }
 

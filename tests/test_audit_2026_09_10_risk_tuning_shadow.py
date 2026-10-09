@@ -27,9 +27,6 @@ def _base_gate(**over):
         "min_confidence": 0.62,
         "min_composite": 45,
         "min_hip3_composite": 50,
-        # These cases isolate the breakout-floor / cooldown shadow arms; the
-        # P2 regime breakout veto is covered elsewhere, keep it off here.
-        "regime_breakout_veto": {"enabled": False},
     }
     g.update(over)
     return {"runner_entry_gate": g}

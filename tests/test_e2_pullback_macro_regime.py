@@ -83,23 +83,6 @@ def _set_macro(monkeypatch, regime, score=0.7):
     )
 
 
-def _stub_strict_detector(monkeypatch, valid=True):
-    """Stub the P1 strict pullback shape (candles/atr/support+turn detector)
-    so these cases isolate the MACRO-regime gate. Real detector shape is
-    covered in tests/test_pullback_entry.py."""
-    import hermes_trader.agents.pullback_entry as pbe
-    import hermes_trader.client.hl_client as hlc
-    import hermes_trader.indicators.math as imath
-    monkeypatch.setattr(hlc, "fetch_hl_candles",
-                        lambda coin, interval=None, count=80: [object()] * 60)
-    monkeypatch.setattr(imath, "atr",
-                        lambda candles, p=14: [1.0] * len(candles))
-    monkeypatch.setattr(pbe, "pullback_entry",
-                        lambda candles, **k: pbe.PullbackSignal(
-                            valid, 100.0, 98.0, "ema",
-                            "stub" if valid else "stub-no"))
-
-
 _LATE_CHASE = "late trend-only chase"
 
 
@@ -114,7 +97,6 @@ def test_e2_canonical_require_macro_uptrend_default_true():
 
 def test_e2_bypass_admits_when_macro_up(monkeypatch):
     _set_macro(monkeypatch, "up")
-    _stub_strict_detector(monkeypatch, valid=True)
     reason = _runner_entry_block_reason(_pb_analysis(), _pb_config())
     assert reason == ""
 
@@ -140,7 +122,6 @@ def test_e2_macro_lookup_error_fails_closed(monkeypatch):
 def test_e2_require_flag_false_restores_legacy(monkeypatch):
     # Macro is chop, but the gate is disabled -> old behaviour, bypass admits.
     _set_macro(monkeypatch, "chop")
-    _stub_strict_detector(monkeypatch, valid=True)
     cfg = _pb_config(require_macro_uptrend=False)
     reason = _runner_entry_block_reason(_pb_analysis(), cfg)
     assert reason == ""
@@ -160,7 +141,6 @@ def test_e2_macro_up_without_4h_uptrend_still_blocked(monkeypatch):
 
 def test_e2_shadow_records_when_macro_up(monkeypatch, tmp_path):
     _set_macro(monkeypatch, "up")
-    _stub_strict_detector(monkeypatch, valid=True)
     monkeypatch.setattr(entry_probes, "_PULLBACK_SHADOW_FILE",
                         str(tmp_path / "pb.jsonl"))
     cfg = _pb_config(shadow_mode=True)

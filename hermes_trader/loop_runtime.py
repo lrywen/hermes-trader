@@ -161,3 +161,15 @@ def _canonical_matches_literals() -> bool:
         if block[leaf] != default or type(block[leaf]) is not type(default):
             return False
     return True
+
+
+def data_dir() -> str:
+    """数据目录解析（HERMES_DATA_DIR 优先，回退 /data）。
+
+    与 loop_runtime_params 同样外置到可导入模块，使 trading_loop 不再内联
+    ``os.environ.get`` 读取（P1-6），且解析逻辑可单测。空串视为未设。
+    """
+    raw = os.environ.get("HERMES_DATA_DIR")
+    if raw is None or raw == "":
+        return "/data"
+    return raw

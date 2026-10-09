@@ -439,15 +439,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "max_extension_atr": 2.0,
             "min_slow_burn": 2,
             "shadow_mode": False,
-            # P1 strict pullback-to-support params (pullback_entry.py): require
-            # an established 1h uptrend (close above rising trend_ema + higher
-            # than lookback), a >= min_pull_pct correction, price AT support
-            # (rising support_ema or prior swing high within tolerance_atr ATR),
-            # and a fresh up-bar confirming the turn.
-            "trend_ema": 50,
-            "support_ema": 21,
-            "stop_atr_mult": 1.5,
-            "min_pull_pct": 0.015,
             # Audit 2026-09-06 (E2, Q3): require the MACRO regime (BTC / SP500
             # proxy EMA20/30 + ADX via detect_regime_with_score) to be "up"
             # before the bypass fires. The 4h per-coin uptrendMomentum flag
@@ -484,22 +475,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "max_consecutive_losses": 2,
             "loss_cooldown_hours": 24,
         },
-        # P2 structural: hard switch disabling BREAKOUT-chase entries in a
-        # non-trending macro regime (chop/neutral), where range breaks fade.
-        # Bursts/pullbacks are unaffected. Default ON; forced structural
-        # overrides bypass it. Regime detection is cached; fail-open on error.
-        "regime_breakout_veto": {
-            "enabled": True,
-        },
-        # 逆势抄底需止跌确认：研究 regime=down 且近几根 1h 出现急跌（crash）
-        # 的多单，必须先看到一根新的阳线（fresh up-bar）才放行。历史配对回测
-        # 否证（50币/185天，等阳线每个 horizon 劣 10~18bp，反弹在当根兑现），
-        # 故默认关闭，仅保留开关供极端行情手动启用。
-        "counter_trend_confirm": {
-            "enabled": False,
-            "min_drop_pct": 0.015,
-            "lookback_bars": 2,
-        },
     },
     "plan_b": {
         "enabled": True,
@@ -529,29 +504,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "PURR": {"sl_floor_pct": 1.2},
             "BOME": {"sl_floor_pct": 1.2},
         },
-    },
-    # P1 structural: PORTFOLIO volatility target. Scales new notional DOWN when
-    # trailing realised portfolio sigma (BTC 1h beta proxy) exceeds target.
-    # Multiplier capped to <=1 (tail control, never levers up). M-9 showed
-    # max-DD -30%→-15%. Off by default; enable when the structural layer ships.
-    "portfolio_vol_target": {
-        "enabled": False,
-        "lookback_bars": 720,
-        "target_sigma": 0.04,
-    },
-    # L2 盘口研究采集：WS 推送 + flusher 固定节奏快照到 book-raw。
-    "book_capture": {
-        "enabled": True,
-        "top_n": 20,
-        "interval_s": 1.0,
-        "levels": 10,
-    },
-    # 公共市场成交流研究采集：逐笔主动成交（taker side）落盘到 trades-raw，
-    # 事件级真实频率（盘口推送实测中位 5.4s、81% 重复帧，故 edge 信息更应从
-    # 成交流获取）。默认开启；稳定篮子按 24h 名义成交量取 top_n。
-    "trades_capture": {
-        "enabled": True,
-        "top_n": 20,
     },
     "regime_classifier": {
         "fast_ema": 20,

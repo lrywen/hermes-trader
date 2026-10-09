@@ -53,6 +53,7 @@ logging.basicConfig(
 # instead of being invisible inline os.environ.get reads. Resolved once here
 # (before the file-log handler needs loop_log_path) and re-bound to the same
 # module-level names below; defaults are byte-for-byte the old literals.
+from hermes_trader.loop_runtime import data_dir as _data_dir
 from hermes_trader.loop_runtime import loop_runtime_params as _loop_runtime_params
 
 _rt = _loop_runtime_params()
@@ -77,6 +78,9 @@ except Exception as _loop_log_err:
     logging.getLogger(__name__).warning(
         "loop file handler disabled (stderr only): %s", _loop_log_err)
 
+# P1-6: 数据目录在顶部一次性解析，其余位置统一引用，避免散落 inline 环境读取。
+_DATA_DIR = _data_dir()
+
 from hermes_trader.agents.config import get_config
 from hermes_trader.agents.config_store import (
     cfg_get,
@@ -100,7 +104,9 @@ from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
+from hermes_trader.agents.signal_rank import conjunction_view, rank_jobs, select_top_jobs
 from hermes_trader.agents.ta_filter import analyze_perception
+from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
     MID_FEED_MAX_STALE_S,
     get_all_hl_mids,
@@ -108,11 +114,11 @@ from hermes_trader.client.exchange import (
     prewarm_meta_cache,
 )
 from hermes_trader.client.hl_client import (
+    _get_ws_mids_instance,
     drain_ws_user_fills,
     fetch_account_state,
     fetch_aggregate_contributions_since,
     resolve_user_address,
-    _get_ws_mids_instance,
     start_ws_mids,
     start_ws_user_fills,
     stop_ws_mids,
@@ -124,10 +130,7 @@ from hermes_trader.client.universe import get_universe
 from hermes_trader.positions_snapshot import write_snapshot
 from hermes_trader.realtime_feed import FeedStatusTracker, classify_feed_status, dynamic_scan_interval
 from hermes_trader.session_log import append as log_event
-from hermes_trader.shadow_log import append_jsonl, data_path
-from hermes_trader.agents.signal_rank import (
-    conjunction_view, rank_jobs, select_top_jobs)
-from hermes_trader.agents.unstick import from_hl_position, select_unstucks
+from hermes_trader.shadow_log import append_jsonl
 from hermes_trader.surge_postmortem import SurgeConfig, SurgeDetector
 
 logger = logging.getLogger(__name__)
@@ -810,32 +813,6 @@ try:
 except Exception as _bc_err:
     logger.warning(f"[ws:book] start_book_capture failed (non-fatal): {_bc_err}")
 
-# Public market trades research feed (event-level aggressive flow). The WS
-# trades plumbing already exists (subscribe_trades/_on_trades) and the trading
-# path subscribes a dynamic candidate basket, but capture-to-disk is gated by
-# enable_trades_capture() and was never turned on. Here we enable persistence
-# and ensure a stable basket (fixed by 24h notional volume, mirroring the book
-# feed) is subscribed so /data/trades-raw builds a continuous print-level panel
-# independent of the candidate churn. Failures are non-fatal.
-try:
-    _tc = config.get("trades_capture") or {}
-    if _tc.get("enabled", True):
-        _ws_t = _get_ws_mids_instance()
-        if _ws_t is not None:
-            _ws_t.enable_trades_capture(True)
-            _tc_coins = _tc.get("coins")
-            if not _tc_coins:
-                _tperps = [m for m in get_universe()
-                           if m["type"] == "perp" and not m["coin"].startswith("@")]
-                _tperps.sort(key=lambda m: m.get("dayNtlVlm", 0), reverse=True)
-                _tc_coins = [m["coin"] for m in _tperps[:int(_tc.get("top_n", 20))]]
-            for _tcoin in _tc_coins:
-                _ws_t.subscribe_trades(_tcoin)
-            logger.info(
-                f"[ws:trades] capture enabled, stable basket {len(_tc_coins)} coins")
-except Exception as _tc_err:
-    logger.warning(f"[ws:trades] trades_capture start failed (non-fatal): {_tc_err}")
-
 # Phase 1 (WS user-fills feasibility): subscribe to the wallet's fill
 # stream on the SAME WS connection as allMids. Callback is LOG-ONLY in
 # Phase 1 — no exit decisions are driven off it yet. Failures are
@@ -1485,7 +1462,7 @@ while True:
                     min_urgency=float(_us_block.get("min_urgency", 20) or 20))
                 _us_log = str(_us_block.get("log_path") or "")
                 if not _us_log:
-                    _us_log = data_path("unstucking.jsonl")
+                    _us_log = os.path.join(_DATA_DIR, "unstucking.jsonl")
                 append_jsonl(_us_log, {
                     "ts": int(time.time() * 1000),
                     "mode": _us_mode,
@@ -2475,7 +2452,7 @@ while True:
             # pass under AND >=2 / >=3, so the OR-vs-conjunction question is
             # settled by data without touching the production OR logic.
             try:
-                _cj_path = data_path("conjunction_probe.jsonl")
+                _cj_path = os.path.join(_DATA_DIR, "conjunction_probe.jsonl")
                 _cj_view = conjunction_view(perception)
                 append_jsonl(_cj_path, {
                     "ts": now_ms,
@@ -2498,7 +2475,7 @@ while True:
             _sr_weights = _sr_block.get("score_weights") or None
             _sr_log = str(_sr_block.get("log_path") or "")
             if not _sr_log:
-                _sr_log = data_path("signal_ranking.jsonl")
+                _sr_log = os.path.join(_DATA_DIR, "signal_ranking.jsonl")
             _sr_ranked = rank_jobs(_research_jobs, weights=_sr_weights)
             try:
                 append_jsonl(_sr_log, {

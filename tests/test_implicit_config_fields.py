@@ -82,10 +82,6 @@ def test_r12_c1_pullback_long_block_registered():
         "max_extension_atr": 2.0,
         "min_slow_burn": 2,
         "shadow_mode": False,
-        "trend_ema": 50,
-        "support_ema": 21,
-        "stop_atr_mult": 1.5,
-        "min_pull_pct": 0.015,
         "require_macro_uptrend": True,
     }
 

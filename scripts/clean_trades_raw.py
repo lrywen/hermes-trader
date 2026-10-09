@@ -26,18 +26,16 @@ import logging
 import os
 import re
 import shutil
-import sys
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 logger = logging.getLogger("clean_trades_raw")
 
 _DIR_RE = re.compile(r"^date=(\d{4})-(\d{2})-(\d{2})$")
-# trades-raw 现为研究用逐笔成交流面板（trades_capture 2026-10 起持久化）。逐笔
-# JSONL 实测 gzip 压缩约 30×（全天 2.5G -> ~85M），故非当日目录先 gzip 归档，
-# 保留 60 天足够构建/验证 CVD/aggressive-flow 信号；超过窗口才删除。可用
-# HERMES_TRADES_RETENTION_DAYS 覆盖。
-DEFAULT_RETENTION_DAYS = 60
+# trades-raw 是公开逐笔成交，仅用于当天/近期的 dashboard 微结构调试，不被 M-1
+# 检验或回放依赖（M-2 用 /mnt/tick Binance）。扩到 Top20 币后每天约 7G，
+# 14 天会逼近磁盘上限，故只保留 3 天。可用 HERMES_TRADES_RETENTION_DAYS 覆盖。
+DEFAULT_RETENTION_DAYS = 3
 # book-raw 是 M-1 L2 OFI 的检验样本：采集器 2026-09 上线，首次检验 2026-10-28、
 # 60 天确认 2026-11-27。14 天滚动删除会把预注册窗口截断，故 book-raw 单独保留
 # 90 天（覆盖确认日并留余量）。
@@ -138,8 +136,8 @@ def archive_dir(day_dir: Path, *, dry_run: bool) -> list[str]:
     return archived
 
 
-def archive_old_raws(base: Path, *, today: date, dry_run: bool) -> list[str]:
-    """压缩 base 下所有非当日 date= 目录中的 jsonl，返回 "日期/文件" 列表。"""
+def archive_book_raw(base: Path, *, today: date, dry_run: bool) -> list[str]:
+    """压缩 book-raw 下所有非当日 date= 目录中的 jsonl，返回 "日期/文件" 列表。"""
     out: list[str] = []
     if not base.is_dir():
         return out
@@ -178,11 +176,12 @@ def main() -> int:
         if removed:
             print(f"{base}: 清理 {len(removed)} 个过期目录: {removed}")
         all_removed.extend(f"{base.name}/{n}" for n in removed)
-        # 先删过期目录，再压缩剩余旧日期；两者作用于不同日期，互不重叠。
-        archived = archive_old_raws(base, today=today, dry_run=args.dry_run)
-        if archived:
-            print(f"{base}: 压缩归档 {len(archived)} 个文件")
-        all_removed.extend(f"{base.name}::{n}" for n in archived)
+        if base.name == "book-raw":
+            # 先删过期目录，再压缩剩余旧日期；两者作用于不同日期，互不重叠。
+            archived = archive_book_raw(base, today=today, dry_run=args.dry_run)
+            if archived:
+                print(f"{base}: 压缩归档 {len(archived)} 个文件")
+            all_removed.extend(f"{base.name}::{n}" for n in archived)
     print(f"{'[dry-run] ' if args.dry_run else ''}合计处理 {len(all_removed)} 个目录/文件")
     return 0
 

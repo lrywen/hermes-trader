@@ -5,8 +5,7 @@ import gzip
 from datetime import date
 from pathlib import Path
 
-from scripts.clean_trades_raw import (archive_old_raws as archive_book_raw,
-                                      archive_dir, cleanup, expired_dirs)
+from scripts.clean_trades_raw import archive_book_raw, archive_dir, cleanup, expired_dirs
 
 
 def _make(base: Path, day: str) -> Path:
@@ -74,7 +73,6 @@ def test_cleanup_actually_removes() -> None:
 
 
 def test_archive_dir_gzips_and_removes_original(tmp_path: Path) -> None:
-    import shutil
     day = tmp_path / "date=2026-09-01"
     day.mkdir()
     rows = ['{"t":1}\n', '{"t":2}\n', '{"t":3}\n']

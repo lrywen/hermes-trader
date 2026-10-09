@@ -64,19 +64,6 @@ _rotation_enabled = True
 _active_day: dict[str, str] = {}
 
 
-def data_dir() -> str:
-    """运行时数据根目录（``${HERMES_DATA_DIR:-/data}``）。
-
-    集中到一处，避免调用模块各自内联 ``os.environ.get``。
-    """
-    return os.environ.get("HERMES_DATA_DIR", "/data")
-
-
-def data_path(name: str) -> str:
-    """数据根目录下的文件路径。"""
-    return os.path.join(data_dir(), name)
-
-
 def disable_rotation() -> None:
     """Turn rotation off (test helper)."""
     global _rotation_enabled
