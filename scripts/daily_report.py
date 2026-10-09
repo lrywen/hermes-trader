@@ -409,6 +409,17 @@ def render_markdown(day: str, agg: Dict[str, Any]) -> str:
     if agg["open_positions"] is not None:
         lines.append(f"- 收盘持仓: {agg['open_positions']}")
 
+    # P1: read-only L2 book-raw footprint + volume free % (90-day retention is
+    # a pre-registration requirement, so capacity — not cleanup — is the lever).
+    try:
+        from hermes_trader.book_raw_watermark import (
+            book_raw_watermark,
+            format_line as _wm_line,
+        )
+        lines.append(f"- {_wm_line(book_raw_watermark())}")
+    except Exception:
+        pass
+
     if agg["verdicts"]:
         lines.append(f"- 研判结论: {_top(agg['verdicts'])}")
     if agg["scan_coin_hits"]:
