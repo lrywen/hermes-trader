@@ -1473,6 +1473,31 @@ def plan_b_size_multiplier(analysis: dict[str, Any],
                   f"in [{rsi_lo:.0f},{rsi_hi:.0f}), size x{mult:.2f})")
 
 
+def tiered_loss_cooldown_min(
+    consecutive_after: int,
+    base_min: float,
+    *,
+    tier2_min: float = 120.0,
+    tier3_min: float = 24.0 * 60.0,
+) -> float:
+    """Anti-revenge cooldown length from the consecutive-loss count.
+
+    ``consecutive_after`` is the streak INCLUDING the loss just closed
+    (memory.consecutive_losses() + 1 at the arm site, since that close is only
+    recorded later). 1 loss -> the configured base; 2 -> tier2 (default 2h);
+    3+ -> tier3 (default 24h, reset next UTC day by the caller's calendar).
+    A non-positive base disables cooldown (0). The tiered values are floors:
+    a configured base larger than a tier still wins.
+    """
+    if base_min <= 0:
+        return 0.0
+    if consecutive_after <= 1:
+        return float(base_min)
+    if consecutive_after == 2:
+        return float(max(base_min, tier2_min))
+    return float(max(base_min, tier3_min))
+
+
 def momentum_reentry_allowed(last_exit_px: Optional[float], last_side: Optional[str],
                              current_mid: Optional[float], composite: Optional[float],
                              cfg: dict[str, Any]) -> tuple[bool, str]:
@@ -1521,6 +1546,14 @@ def _loss_cooldown_block(*, analysis: dict[str, Any], mode: str,
     Extracted verbatim in the P1-1 step ③ phase split.
     """
     _coin = analysis["coin"]
+    # A5: an operator emergency bypass unblocks this frequency gate only; it
+    # never touches the safety gates. Fail-safe (default: not bypassing).
+    try:
+        from hermes_trader.agents.risk_bypass import is_bypassing
+        if is_bypassing():
+            return None
+    except Exception:
+        pass
     _lc_remaining = memory.loss_cooldown_remaining_min(_coin)
     if _lc_remaining <= 0:
         return None
@@ -6226,12 +6259,17 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
         # and the AI re-bought the same falling name each time.
         if out["realized_pnl_pct"] < 0:
             try:
-                lc_min = float(cfg_get("loss_cooldown_min", config=read_agent_config()))
+                lc_base = float(cfg_get("loss_cooldown_min", config=read_agent_config()))
+                # Include the loss just closed: record_loss_outcome (which
+                # updates the streak) runs later in this close.
+                _streak_after = memory.consecutive_losses(coin) + 1
+                lc_min = tiered_loss_cooldown_min(_streak_after, lc_base)
                 if lc_min > 0:
                     until = int(time.time() * 1000 + lc_min * 60_000)
                     memory.set_loss_cooldown(coin, until)
                     logger.info(f"[executor] loss cooldown armed on {coin}: "
-                                f"{lc_min:.0f}min (closed {out['realized_pnl_pct']:.2f}%)")
+                                f"{lc_min:.0f}min (loss #{_streak_after}, "
+                                f"closed {out['realized_pnl_pct']:.2f}%)")
             except Exception as e:
                 logger.warning(f"[executor] loss-cooldown arm failed for {coin}: {e}")
                 # The anti-revenge re-entry block did not arm; mirror the

@@ -104,7 +104,7 @@ from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
-from hermes_trader.agents.signal_rank import conjunction_view, rank_jobs, select_top_jobs
+from hermes_trader.agents.signal_rank import conjunction_view, rank_jobs, rank_score, select_top_jobs
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
@@ -1439,11 +1439,33 @@ while True:
         # reduce-only channel. off -> legacy DSL hard-stop / stale_flat.
         _us_block = _cfg.get("unstucking") or {}
         _us_mode = str(_us_block.get("mode", "off")).lower()
-        if _us_mode in ("shadow", "enforce") and positions:
+        # A3: when the real account holds nothing, fall back to the shadow_book
+        # virtual positions + equity curve so the arm can produce evidence in
+        # SHADOW (real positions are empty there, so the old guard skipped the
+        # whole block -> zero records forever).
+        _us_use_shadow = bool(not positions)
+        if _us_mode in ("shadow", "enforce") and (positions or _us_use_shadow):
             try:
-                _us_jobs = [j for j in (from_hl_position(p) for p in positions)
-                            if j is not None]
-                _us_peak = float(memory.peak_equity() or 0.0)
+                if _us_use_shadow:
+                    from hermes_trader.agents import shadow_book as _sb_mod
+                    from hermes_trader.agents.unstick import from_shadow_position
+                    _sb_acct = _sb_mod.get_account()
+                    # get_account() exposes positions directly at the top level
+                    # (``accounts`` there is a dict, not iterable rows).
+                    _us_raw_jobs = list(_sb_acct.get("positions") or [])
+                    _us_jobs = [j for j in (from_shadow_position(p)
+                                            for p in _us_raw_jobs)
+                                if j is not None]
+                    _us_eq = float(_sb_acct.get("equity") or 0.0)
+                    _curve = _sb_mod.get_equity_curve().get("points") or []
+                    _us_peak = max(
+                        (float(pt.get("equity") or 0.0) for pt in _curve),
+                        default=_us_eq)
+                else:
+                    _us_jobs = [j for j in (from_hl_position(p) for p in positions)
+                                if j is not None]
+                    _us_eq = equity
+                    _us_peak = float(memory.peak_equity() or 0.0)
                 _us_band = float(_us_block.get("max_peak_drawdown_pct", 0) or 0)
                 _us_max_slots_raw = _us_block.get("max_stuck_slots", 0)
                 _us_max_slots = int(float(_us_max_slots_raw or 0))
@@ -1455,7 +1477,7 @@ while True:
                         and float(j["mark_px"]) < float(j["entry_px"])))
                 _us_selected, _us_remaining, _us_reason = select_unstucks(
                     _us_jobs, time.time(),
-                    equity_usd=equity, peak_equity_usd=_us_peak,
+                    equity_usd=_us_eq, peak_equity_usd=_us_peak,
                     max_peak_drawdown_pct=_us_band,
                     max_active_slots=_us_max_slots if _us_max_slots > 0 else None,
                     currently_stuck=_us_stuck_now,
@@ -1466,7 +1488,8 @@ while True:
                 append_jsonl(_us_log, {
                     "ts": int(time.time() * 1000),
                     "mode": _us_mode,
-                    "equity": round(equity, 2),
+                    "source": ("shadow_book" if _us_use_shadow else "live"),
+                    "equity": round(_us_eq, 2),
                     "peak": round(_us_peak, 2),
                     "stuck_now": _us_stuck_now,
                     "trigger": _us_reason,
@@ -1475,7 +1498,7 @@ while True:
                                 "urgency": round(s, 1)}
                                for j, s in _us_remaining],
                 }, stream="unstucking")
-                if _us_selected and _us_mode == "enforce":
+                if _us_selected and _us_mode == "enforce" and not _us_use_shadow:
                     for _j in _us_selected:
                         _coin = _j.get("coin")
                         try:
@@ -2259,6 +2282,16 @@ while True:
         _blocklist = set(_cfg_cd.get("coin_blocklist", []) or [])
         now_ms = int(time.time() * 1000)
 
+        # A1: settle any selection-attribution items whose horizon elapsed
+        # (forward returns vs registered base price). Read-only on the market;
+        # best-effort and never fatal.
+        try:
+            from hermes_trader.agents.selection_attribution import settle_due
+            settle_due(now_ms=now_ms)
+        except Exception as _attr_settle_e:
+            logger.debug(
+                f"[selection-attribution] settle failed: {_attr_settle_e}")
+
         # Per-cycle outcome tracker for the end-of-cycle summary log.
         _cycle_outcomes = []  # list of (coin, action, executed, detail)
         # P0-4: coins that pass every cheap gate and need the paid LLM research.
@@ -2385,6 +2418,18 @@ while True:
                     except Exception as _rca_e:
                         logger.debug(f"[cooldown-adaptive] eval failed for "
                                      f"{coin} (fail-safe, keep long window): {_rca_e}")
+                    # A5: operator emergency bypass unblocks this frequency
+                    # gate only (research re-research throttle); safety gates
+                    # are untouched. Fail-safe default: not bypassing.
+                    if not _jumped:
+                        try:
+                            from hermes_trader.agents.risk_bypass import (
+                                is_bypassing as _rb_active,
+                            )
+                            if _rb_active():
+                                _jumped = True
+                        except Exception:
+                            pass
                     if _jumped:
                         logger.info(
                             f"{coin}: re-research throttle BYPASSED — composite "
@@ -2464,11 +2509,12 @@ while True:
                 logger.warning(f"[conjunction-probe] record failed: {_cj_e}")
 
         # ---- P0-1: cross-signal ranking / selection ----
-        # Rank every gated coin with the pre-research quality score. In shadow
-        # we only persist the counterfactual; in enforce we keep the top_k
-        # candidates and defer the ranked tail (rolling back the stamps/fingerprint
-        # exactly like the backpressure path so deferred coins stay eligible
-        # next cycle). off -> legacy behaviour.
+        # Fixed enforce order across the two selection stages (A4):
+        # coin_selection (ADMISSION, perception scan: who is worth computing)
+        #   -> TA gates -> signal_ranking (ORDERING: who is researched/filled
+        # first) -> research -> execute. signal_ranking therefore only ever
+        # orders coins already admitted by coin_selection; a contract test
+        # (tests/test_selection_priority_contract.py) pins both subsets.
         _sr_block = _cfg_cd.get("signal_ranking") or {}
         _sr_mode = str(_sr_block.get("mode", "off")).lower()
         if _sr_mode in ("shadow", "enforce") and _research_jobs:
@@ -2495,8 +2541,46 @@ while True:
                     _sr_top_k = int(_sr_block.get("top_k", 5))
                 except (TypeError, ValueError):
                     _sr_top_k = 5
-                _sr_selected, _sr_deferred = select_top_jobs(
-                    _research_jobs, _sr_top_k, weights=_sr_weights)
+            else:
+                # Shadow still needs the split for forward attribution, but
+                # it must not change _research_jobs.
+                try:
+                    _sr_top_k = int(_sr_block.get("top_k", 5))
+                except (TypeError, ValueError):
+                    _sr_top_k = 5
+            _sr_selected, _sr_deferred = select_top_jobs(
+                _research_jobs, _sr_top_k, weights=_sr_weights)
+
+            # A1: register selected vs deferred (chosen rank score carried) so
+            # the ranking's predictive edge can be measured. In shadow this is
+            # counterfactual (all jobs proceed); in enforce the deferred are
+            # actually skipped below. Never raises.
+            try:
+                from hermes_trader.agents.selection_attribution import (
+                    DEFAULT_HORIZON_HOURS,
+                    register_pending,
+                )
+                try:
+                    _sr_horizon = int(
+                        _sr_block.get("attribution_horizon_hours",
+                                      DEFAULT_HORIZON_HOURS))
+                except (TypeError, ValueError):
+                    _sr_horizon = DEFAULT_HORIZON_HOURS
+                register_pending(
+                    "signal_ranking",
+                    [(_j[0], rank_score(_j[1], _j[2], weights=_sr_weights))
+                     for _j in _sr_selected],
+                    [(_j[0], _rs) for _j, _rs in _sr_deferred],
+                    base_prices=mids,
+                    cycle_ms=now_ms,
+                    horizon_hours=_sr_horizon,
+                )
+            except Exception as _sr_attr_e:
+                logger.debug(
+                    f"[signal-rank] attribution register failed: "
+                    f"{_sr_attr_e}")
+
+            if _sr_mode == "enforce":
                 if _sr_deferred:
                     for _df_j, _df_rs in _sr_deferred:
                         _df_coin = _df_j[0]

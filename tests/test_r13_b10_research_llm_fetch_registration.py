@@ -566,7 +566,9 @@ def test_r13_b10_signals_block_resolves_timeout_via_helper():
 def test_r13_b10_call_openrouter_resolves_llm_knobs_via_helper():
     src = inspect.getsource(research_mod._call_openrouter)
     assert "lp = research_llm_params()" in src
-    assert 'model = str(lp["model"])' in src
+    # Per-role override (v0.6.0 #1440): a non-empty caller model wins, else the
+    # helper default — lp["model"] must remain the fallback (no inline env).
+    assert 'model = str(model) if model else str(lp["model"])' in src
     assert 'base_url = str(lp["base_url"])' in src
     assert 'timeout = float(lp["timeout_sec"])' in src
     assert 'max_tokens = int(lp["max_tokens"])' in src

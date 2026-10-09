@@ -58,6 +58,39 @@ def from_hl_position(raw: Mapping[str, Any]) -> dict[str, Any] | None:
     }
 
 
+def from_shadow_position(raw: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Adapt one shadow_book (flat) position row to an unstick dict.
+
+    Shadow positions use the internal flat shape (``coin``, ``side``,
+    ``entry_px``, ``mark_px``, ``size_usd``, ``opened_at``) rather than the
+    nested Hyperliquid ``{"position": {...}}`` shape. Lets the unstucking arm
+    run in SHADOW against virtual positions even when the real account holds
+    nothing (otherwise the arm can never produce evidence). Returns None for a
+    closed/malformed row.
+    """
+    coin = raw.get("coin")
+    if not coin:
+        return None
+    entry = _f(raw.get("entry_px"))
+    if entry <= 0:
+        return None
+    notional = _f(raw.get("size_usd"))
+    if notional <= 0:
+        notional = entry
+    opened = raw.get("opened_at")
+    # shadow_book stores opened_at in ms (>1e12); urgency wants seconds.
+    opened_f = _f(opened)
+    entry_time = opened_f / 1000.0 if opened_f > 1e12 else opened_f
+    return {
+        "coin": coin,
+        "side": str(raw.get("side", "long")).lower(),
+        "entry_px": entry,
+        "entry_time": entry_time,
+        "mark_px": _f(raw.get("mark_px")) or None,
+        "notional_usd": notional,
+    }
+
+
 def _f(x: Any, default: float = 0.0) -> float:
     try:
         v = float(x)

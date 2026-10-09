@@ -109,3 +109,32 @@ def test_requires_keyword_arguments():
 
     with pytest.raises(TypeError):
         _loss_cooldown_block(_analysis(), "live", ON)
+
+
+# ── tiered cooldown length (3.2) ────────────────────────────────────────────
+
+from hermes_trader.agents.executor import tiered_loss_cooldown_min  # noqa: E402
+
+
+def test_tiered_cooldown_zero_base_disables():
+    assert tiered_loss_cooldown_min(1, 0) == 0.0
+    assert tiered_loss_cooldown_min(3, 0) == 0.0
+
+
+def test_tiered_cooldown_first_loss_uses_base():
+    assert tiered_loss_cooldown_min(1, 20) == 20.0
+
+
+def test_tiered_cooldown_second_loss_jumps_to_two_hours():
+    assert tiered_loss_cooldown_min(2, 20) == 120.0
+
+
+def test_tiered_cooldown_third_loss_jumps_to_one_day():
+    assert tiered_loss_cooldown_min(3, 20) == 24.0 * 60.0
+    assert tiered_loss_cooldown_min(5, 20) == 24.0 * 60.0
+
+
+def test_tiered_cooldown_large_base_is_never_shortened():
+    # A configured base larger than a tier floor still wins.
+    assert tiered_loss_cooldown_min(2, 300.0) == 300.0
+    assert tiered_loss_cooldown_min(3, 2000.0) == 2000.0

@@ -32,6 +32,7 @@ from hermes_trader.agents.research_schema import (
     structured_to_analysis_fields,
 )
 from hermes_trader.agents.system_prompt import build_system_prompt
+from hermes_trader.shadow_log import append_jsonl
 from hermes_trader.client.hl_client import (
     fetch_account_state,
     fetch_funding_history,
@@ -138,8 +139,11 @@ def _record_reasoning_effort(
             "model": str(data.get("model") or ""),
         }
         with _completion_cap_lock:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            append_jsonl(
+                log_path,
+                rec,
+                stream="reasoning_effort_rollout",
+            )
     except Exception:
         pass
 
@@ -191,10 +195,12 @@ def _record_completion_cap(
             "would_truncate": would_truncate,
             "implied_timeout_sec": float(cfg.get("implied_timeout_sec") or 0),
         }
-        line = json.dumps(rec, ensure_ascii=False)
         with _completion_cap_lock:
-            with open(log_path, "a", encoding="utf-8") as f:
-                f.write(line + "\n")
+            append_jsonl(
+                log_path,
+                rec,
+                stream="completion_cap_shadow",
+            )
         # In enforce mode a real cap would still need payload wiring; the
         # shadow line is emitted first so promotion is evidence-based.
         if would_truncate:
