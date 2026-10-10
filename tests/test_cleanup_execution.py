@@ -128,6 +128,9 @@ def test_close_position_market_computes_realized_pnl_from_fill(monkeypatch, tmp_
     # We register as SHORT here since the screenshot showed ARB SHORT 10x.
     dsl_exit.register_position("ARB", "short", 0.11684, leverage=10)
 
+    # Pin the taker fee so this test's arithmetic is independent of the
+    # canonical default (HL tier-0 default moved 2.5bps -> 4.5bps).
+    monkeypatch.setenv("HERMES_TAKER_FEE_PCT", "0.025")
     monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
     monkeypatch.setattr(executor, "fetch_account_state", lambda u, **kw: {
         "asset_positions": [{"position": {"coin": "ARB", "szi": "-1000", "entryPx": "0.11684"}}],

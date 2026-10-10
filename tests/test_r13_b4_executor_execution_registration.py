@@ -79,18 +79,19 @@ def test_r13_b4_execution_block_registered():
 
 
 def test_r13_b4_execution_block_defaults_match_historical_literals():
-    """默认值严格等于 executor.py 旧硬编码字面量；零行为变化。"""
+    """默认值等于 HL retail tier-0 perp 费率（taker 4.5bps / maker 1.5bps）。"""
     block = CANONICAL_DEFAULTS["execution"]
-    # L73 env 优先 / fallback "0.025"
-    assert block["taker_fee_pct"] == 0.025
+    # L73 env 优先 / fallback "0.045"
+    assert block["taker_fee_pct"] == 0.045
+    assert block["maker_fee_pct"] == 0.015
     # L74 纯硬编码
     assert block["round_trip_fills"] == 2
 
 
-def test_r13_b4_execution_block_has_exactly_two_keys():
+def test_r13_b4_execution_block_has_exactly_three_keys():
     """sentinel：未来若有人加字段 / 删字段都需要在测试里显式改。"""
     block = CANONICAL_DEFAULTS["execution"]
-    assert set(block.keys()) == {"taker_fee_pct", "round_trip_fills"}
+    assert set(block.keys()) == {"taker_fee_pct", "maker_fee_pct", "round_trip_fills"}
 
 
 def test_r13_b4_module_fallback_constants_match_canonical():
@@ -98,7 +99,7 @@ def test_r13_b4_module_fallback_constants_match_canonical():
     canonical 默认值字面量严格一致——任何一边漂移就是 silent regression。"""
     assert executor.TP_ATR_MULT == CANONICAL_DEFAULTS["tp_atr_mult"] == 1.0
     assert executor._LIQ_BUFFER_USD == CANONICAL_DEFAULTS["liq_buffer_usd"] == 10.0
-    assert executor._HL_TAKER_FEE_PCT == CANONICAL_DEFAULTS["execution"]["taker_fee_pct"] == 0.025
+    assert executor._HL_TAKER_FEE_PCT == CANONICAL_DEFAULTS["execution"]["taker_fee_pct"] == 0.045
     assert executor._HL_ROUND_TRIP_FILLS == CANONICAL_DEFAULTS["execution"]["round_trip_fills"] == 2
 
 
@@ -119,12 +120,13 @@ def test_r13_b4_cfg_get_sl_ceiling_hard_max_pct():
 def test_r13_b4_cfg_get_execution_block():
     block = cfg_get("execution", config={})
     assert isinstance(block, dict)
-    assert block["taker_fee_pct"] == 0.025
+    assert block["taker_fee_pct"] == 0.045
+    assert block["maker_fee_pct"] == 0.015
     assert block["round_trip_fills"] == 2
 
 
 def test_r13_b4_cfg_get_execution_dotted_paths():
-    assert cfg_get("execution.taker_fee_pct", config={}) == 0.025
+    assert cfg_get("execution.taker_fee_pct", config={}) == 0.045
     assert cfg_get("execution.round_trip_fills", config={}) == 2
 
 
@@ -151,7 +153,7 @@ def test_r13_b4_env_override_sl_ceiling_hard_max_pct(monkeypatch):
 
 def test_r13_b4_env_override_execution_dotted(monkeypatch):
     """嵌套块 env 路由：双下划线。"""
-    assert cfg_get("execution.taker_fee_pct", config={}) == 0.025
+    assert cfg_get("execution.taker_fee_pct", config={}) == 0.045
     assert cfg_get("execution.round_trip_fills", config={}) == 2
     monkeypatch.setenv("HERMES_CFG_EXECUTION__TAKER_FEE_PCT", "0.03")
     monkeypatch.setenv("HERMES_CFG_EXECUTION__ROUND_TRIP_FILLS", "3")
@@ -168,7 +170,7 @@ def test_r13_b4_config_dict_partial_overlay():
     assert cfg_get("liq_buffer_usd", config=cfg) == 50.0
     # 未覆盖的 key 仍回退 canonical
     assert cfg_get("sl_ceiling_hard_max_pct", config=cfg) == 15.0
-    assert cfg_get("execution.taker_fee_pct", config=cfg) == 0.025
+    assert cfg_get("execution.taker_fee_pct", config=cfg) == 0.045
 
 
 def test_r13_b4_config_dict_execution_block_partial_overlay():
@@ -190,7 +192,8 @@ def test_r13_b4_read_agent_config_exposes_keys(monkeypatch, tmp_path):
     assert cfg["tp_atr_mult"] == 1.0
     assert cfg["liq_buffer_usd"] == 10.0
     assert cfg["sl_ceiling_hard_max_pct"] == 15.0
-    assert cfg["execution"]["taker_fee_pct"] == 0.025
+    assert cfg["execution"]["taker_fee_pct"] == 0.045
+    assert cfg["execution"]["maker_fee_pct"] == 0.015
     assert cfg["execution"]["round_trip_fills"] == 2
 
 
@@ -289,7 +292,7 @@ def test_r13_b4_resolve_hl_taker_fee_canonical_fallback(monkeypatch):
     """legacy env 未设时，canonical 兑底。"""
     monkeypatch.delenv("HERMES_TAKER_FEE_PCT", raising=False)
     monkeypatch.delenv("HERMES_CFG_EXECUTION__TAKER_FEE_PCT", raising=False)
-    assert executor._resolve_hl_taker_fee_pct() == 0.025
+    assert executor._resolve_hl_taker_fee_pct() == 0.045
 
 
 def test_r13_b4_resolve_hl_round_trip_fills_canonical_fallback(monkeypatch):
@@ -405,7 +408,7 @@ def test_r13_b4_zero_behavior_change_module_fallbacks():
     # 但我们只读 fallback 字面量而非重解析路径，所以稳定）
     assert executor.TP_ATR_MULT == 1.0
     assert executor._LIQ_BUFFER_USD == 10.0
-    assert executor._HL_TAKER_FEE_PCT == 0.025
+    assert executor._HL_TAKER_FEE_PCT == 0.045
     assert executor._HL_ROUND_TRIP_FILLS == 2
 
 

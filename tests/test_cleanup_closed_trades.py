@@ -151,9 +151,9 @@ def test_closed_trades_external_usd_reconstruction(monkeypatch):
     assert row["pnl_source"] == "fill_usd"
     assert row["pnl_usd"] == 0.4257
     assert row["notional_usd"] is not None
-    assert abs(row["notional_usd"] - 30.0071) < 0.7   # reconstruct, not fabricate
-    # net ROE ~13.9% and a real round-trip fee ~0.5% (never 14.44% / ~0)
-    assert 13.5 < row["pnl_pct"] < 14.2
+    assert abs(row["notional_usd"] - 30.0071) < 1.6   # reconstruct, not fabricate
+    # net ROE after the tier-0 round-trip fee (~0.9% at 10x) and a real fee
+    assert 13.2 < row["pnl_pct"] < 14.2
     assert row["fees_pct"] > 0.3
     assert row["fee_usd"] > 0.01
 

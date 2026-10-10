@@ -416,10 +416,11 @@ def compute_backup_sl_width_pct(
     base = min(max(atr_stop_pct, sl_floor_pct), sl_ceiling_pct)
     return min(base + max(0.0, float(slip_widen_pct)), sl_ceiling_pct)
 
-# Hyperliquid perp taker fee, in PERCENT (HL = 2.5 bps = 0.025%). Used to model
-# round-trip entry+exit cost in realized-PnL bookkeeping. Env-overridable so a
-# future fee change doesn't require a code edit; 2 round-trip fills modeled.
-_HL_TAKER_FEE_PCT = float(os.environ.get("HERMES_TAKER_FEE_PCT", "0.025"))
+# Hyperliquid perp taker fee, in PERCENT (HL retail tier-0 = 4.5 bps =
+# 0.045%; maker = 1.5 bps = 0.015%). Used to model round-trip entry+exit cost
+# in realized-PnL bookkeeping. Env-overridable so a future fee/volume tier
+# change doesn't require a code edit; 2 round-trip fills modeled.
+_HL_TAKER_FEE_PCT = float(os.environ.get("HERMES_TAKER_FEE_PCT", "0.045"))
 _HL_ROUND_TRIP_FILLS = 2
 # CS-G (sizing-v2 short side + cost cap): conservative expected perp carry
 # horizon (hours) used to size expected funding until a same-side measured

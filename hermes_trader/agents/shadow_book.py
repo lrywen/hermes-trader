@@ -102,9 +102,9 @@ def _taker_fee_pct() -> float:
         pass
     try:
         from hermes_trader.agents.config_store import cfg_get
-        return float(cfg_get("execution.taker_fee_pct", 0.025))
+        return float(cfg_get("execution.taker_fee_pct", 0.045))
     except Exception:
-        return 0.025
+        return 0.045
 
 
 def _taker_slippage_pct() -> float:
@@ -139,7 +139,7 @@ def _apply_slippage(px: float, *, side: str, opening: bool,
 
 def _maker_fee_pct() -> float:
     """Per-fill maker fee in PERCENT. Prefer the shadow_book override; fall back
-    to the live execution maker fee, then to HL's standard 0.01%."""
+    to the live execution maker fee, then to HL's tier-0 0.015%."""
     c = _shadow_cfg()
     try:
         if c.get("maker_fee_pct") is not None:
@@ -148,9 +148,9 @@ def _maker_fee_pct() -> float:
         pass
     try:
         from hermes_trader.agents.config_store import cfg_get
-        return float(cfg_get("execution.maker_fee_pct", 0.01))
+        return float(cfg_get("execution.maker_fee_pct", 0.015))
     except Exception:
-        return 0.01
+        return 0.015
 
 
 def _round_trip_fills() -> int:

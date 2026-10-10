@@ -71,9 +71,10 @@ logger = logging.getLogger("hermes-dashboard")
 
 _LOG_PATH = Path(session_log.SESSION_LOG_FILE)
 
-# Hyperliquid taker fee — 2.5bps per fill, paid on notional. We close with IOC
-# orders so all closes are taker. Round-trip cost on margin: 2 fills × 0.025% × leverage.
-HL_TAKER_FEE_PCT = 0.025
+# Hyperliquid taker fee — retail tier-0 (14d vol $0) = 4.5bps per fill, paid
+# on notional. We close with IOC orders so all closes are taker. Round-trip
+# cost on margin: 2 fills × 0.045% × leverage.
+HL_TAKER_FEE_PCT = 0.045
 HL_ROUND_TRIP_FILLS = 2
 
 # HL per-coin max leverage table, built lazily from one info.meta() call so the

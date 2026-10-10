@@ -1696,9 +1696,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "sl_ceiling_hard_max_pct": 15.0,
     "liq_buffer_usd": 10.0,
     "execution": {
-        # Hyperliquid perp taker fee in PERCENT (HL = 2.5bps = 0.025%), used
-        # to model round-trip entry+exit cost in realized-PnL bookkeeping.
-        "taker_fee_pct": 0.025,
+        # Hyperliquid perp fees in PERCENT at the retail tier-0 schedule
+        # (14d volume $0): taker = 4.5bps = 0.045%, maker = 1.5bps = 0.015%.
+        # taker models round-trip entry+exit cost in realized-PnL bookkeeping.
+        "taker_fee_pct": 0.045,
+        "maker_fee_pct": 0.015,
         # Number of taker fills modeled per round trip (entry + exit = 2).
         "round_trip_fills": 2,
     },
@@ -1718,8 +1720,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # Virtual USDC the paper account starts with (operator-configurable).
         "starting_balance": 10000.0,
         # Per-fill taker fee in PERCENT, modeled on close across the round trip
-        # (mirrors execution.taker_fee_pct; HL = 0.025% per fill).
-        "taker_fee_pct": 0.025,
+        # (mirrors execution.taker_fee_pct; HL tier-0 perp = 0.045% per fill).
+        "taker_fee_pct": 0.045,
+        # Per-fill maker fee in PERCENT for the maker_shadow book (HL tier-0
+        # perp maker = 0.015% per fill; mirrors execution.maker_fee_pct).
+        "maker_fee_pct": 0.015,
         # Number of fills per round trip (entry + exit = 2).
         "round_trip_fills": 2,
         # Cap on concurrent virtual positions. SHADOW/LIVE PARITY: the paper

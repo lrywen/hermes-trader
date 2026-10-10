@@ -286,7 +286,7 @@ def test_call_time_families_default_labels_when_nothing_overridden(no_config):
     assert view["executor"]["liq_buffer_usd"] == {
         "value": 10.0, "source": "default"}
     assert view["executor"]["execution.taker_fee_pct"] == {
-        "value": 0.025, "source": "default"}
+        "value": 0.045, "source": "default"}
     assert view["executor"]["spread_gate_fail_open"] == {
         "value": False, "source": "default"}
 
