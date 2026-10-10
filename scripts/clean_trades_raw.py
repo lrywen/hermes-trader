@@ -40,12 +40,19 @@ DEFAULT_RETENTION_DAYS = 3
 # 60 天确认 2026-11-27。14 天滚动删除会把预注册窗口截断，故 book-raw 单独保留
 # 90 天（覆盖确认日并留余量）。
 DEFAULT_BOOK_RETENTION_DAYS = 90
+# tape-raw（R3）是 BTC/ETH 的逐笔成交 + spread，供离线真 CVD/WFA 与 canary
+# 放量前的成交/滑点画像使用。逐笔量大但仅 2 币，保留 30 天足以覆盖离线
+# 分析窗口。可用 HERMES_TAPE_RETENTION_DAYS 覆盖。
+DEFAULT_TAPE_RETENTION_DAYS = 30
 
 
 def retention_for(base: Path) -> int:
     if base.name == "book-raw":
         env = os.environ.get("HERMES_BOOK_RETENTION_DAYS")
         return int(env) if env and env.isdigit() else DEFAULT_BOOK_RETENTION_DAYS
+    if base.name == "tape-raw":
+        env = os.environ.get("HERMES_TAPE_RETENTION_DAYS")
+        return int(env) if env and env.isdigit() else DEFAULT_TAPE_RETENTION_DAYS
     env = os.environ.get("HERMES_TRADES_RETENTION_DAYS")
     return int(env) if env and env.isdigit() else DEFAULT_RETENTION_DAYS
 
@@ -55,9 +62,10 @@ def raw_dir() -> Path:
 
 
 def raw_dirs() -> list[Path]:
-    """本脚本负责清理的全部原始根目录（trades-raw + book-raw）。"""
+    """本脚本负责清理的全部原始根目录（trades-raw + book-raw + tape-raw）。"""
     data_root = Path(os.environ.get("HERMES_DATA_DIR", "/data"))
-    return [data_root / "trades-raw", data_root / "book-raw"]
+    return [data_root / "trades-raw", data_root / "book-raw",
+            data_root / "tape-raw"]
 
 
 def expired_dirs(base: Path, *, today: date, retention_days: int

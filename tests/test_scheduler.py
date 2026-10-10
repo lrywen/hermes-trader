@@ -43,13 +43,19 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 8
+    assert len(SCHEDULED_JOBS) == 10
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
 
 def test_daily_job_table_matches_compose_windows() -> None:
     table = {
+        "reconcile_gate_outcomes": (
+            25,
+            ("scripts/reconcile_gate_outcomes.py", "--write"),
+            "gate-outcomes-reconcile.log",
+            {},
+        ),
         "daily_report": (10, ("scripts/daily_report.py", "--push"), "daily-report.log", {}),
         "reconcile_selection_attribution": (
             15,
@@ -79,6 +85,12 @@ def test_daily_job_table_matches_compose_windows() -> None:
             50,
             ("scripts/reconcile_relax_tier_shadow.py", "--write"),
             "relax-tier-reconcile.log",
+            {},
+        ),
+        "prepare_canary_promotion": (
+            55,
+            ("scripts/prepare_canary_promotion.py", "--write"),
+            "prepare-canary-promotion.log",
             {},
         ),
     }

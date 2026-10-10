@@ -117,6 +117,80 @@ def cpcv_paths(
     )
 
 
+@dataclass(frozen=True)
+class WFAResult:
+    n_windows: int
+    is_sharpe: tuple[float, ...]
+    oos_sharpe: tuple[float, ...]
+    oos_mean_bps: tuple[float, ...]
+    wfe: float            # walk-forward efficiency
+    wfr: float            # walk-forward ratio (robustness)
+    oos_win_frac: float
+
+
+def walk_forward_analysis(
+    series: list[float],
+    train_size: int,
+    test_size: int,
+) -> WFAResult:
+    """经典滚动（anchored/rolling）Walk-Forward Analysis.
+
+    从左到右以 ``train_size`` 个样本为训练窗、其后 ``test_size`` 个样本为
+    样本外窗，逐窗向前滚动（步长=test_size，测试段互不重叠）。对每个窗：
+
+    * IS sharpe = sharpe(训练窗)
+    * OOS sharpe / mean = 测试窗的夏普与平均 bps
+
+    汇总两个稳健性口径（Robert Pardo / López de Prado）：
+
+    * WFE（Walk-Forward Efficiency）= 平均 OOS 年化/口径收益 ÷ 全样本收益，
+      此处以"平均 OOS 夏普 / 平均 IS 夏普"实现（量纲无关）；
+    * WFR（Walk-Forward Ratio）= OOS 正收益窗占比 × (OOS 平均 bps>0)，
+      这里直接给出"OOS 夏普>0 的窗占比"作为 WFR，要求 **> 0.5**。
+
+    返回 :class:`WFAResult`；样本不足以形成至少一个完整窗时抛 ValueError。
+    """
+    n = len(series)
+    if train_size < 2 or test_size < 1:
+        raise ValueError("train_size>=2 且 test_size>=1")
+    if n < train_size + test_size:
+        raise ValueError(
+            f"序列过短: n={n} < train+test={train_size + test_size}")
+
+    is_sh, oos_sh, oos_mu = [], [], []
+    start = 0
+    while start + train_size + test_size <= n:
+        tr = series[start:start + train_size]
+        te = series[start + train_size:start + train_size + test_size]
+        is_sh.append(sharpe(tr))
+        oos_sh.append(sharpe(te))
+        oos_mu.append(statistics.mean(te) if te else 0.0)
+        start += test_size
+
+    if not oos_sh:
+        raise ValueError("无法形成任何完整 WFA 窗")
+
+    mean_is = statistics.mean(is_sh)
+    mean_oos_sr = statistics.mean(oos_sh)
+    wfe = (mean_oos_sr / mean_is) if mean_is not in (0, 0.0) else 0.0
+    mean_oos_bps = statistics.mean(oos_mu)
+    # WFR: fraction of windows whose OOS MEAN return is positive (economically
+    # meaningful; a constant positive series has zero stdev and hence zero
+    # sharpe, but is still a profitable walk-forward window).
+    win_frac = sum(1 for m in oos_mu if m > 0) / len(oos_mu)
+    # gated by a positive overall mean so isolated windows cannot mask decay.
+    wfr = win_frac if mean_oos_bps > 0 else 0.0
+    return WFAResult(
+        n_windows=len(oos_sh),
+        is_sharpe=tuple(is_sh),
+        oos_sharpe=tuple(oos_sh),
+        oos_mean_bps=tuple(oos_mu),
+        wfe=wfe,
+        wfr=wfr,
+        oos_win_frac=win_frac,
+    )
+
+
 def deflated_sharpe_prob(
     observed_sharpe: float,
     n_trials: int,

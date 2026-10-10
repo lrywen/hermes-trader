@@ -122,6 +122,12 @@ _USER_FILLS_PERSIST_MIN_INTERVAL_S = 5.0
 _USER_FILLS_HIST_GRACE_MS = 30_000  # clock-skew / subscribe-latency slack
 _TRADES_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "trades-raw")
 _BOOK_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "book-raw")
+# R3: tick-accurate trade tape for the two primary venues. Every public trade
+# is appended with its exchange timestamp and the contemporaneous best
+# bid/ask spread, so a true (non-batched) CVD and a spread/impact profile can
+# be computed offline.
+_TAPE_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "tape-raw")
+_TAPE_DEFAULT_COINS = ("BTC", "ETH")
 
 
 class HLSSLOptWebsocketManager(WebsocketManager):
@@ -315,6 +321,12 @@ class HyperliquidWebSocket:
         self._book_flush_thread: Optional[threading.Thread] = None
         self._book_flush_stop = threading.Event()
         self._book_flush_interval_s = 1.0
+        # R3: permanent tick tape for a fixed small basket (BTC/ETH). Distinct
+        # from the launch-driven ``_trades_coins`` set: these coins stay
+        # subscribed for the process lifetime and every trade is recorded with
+        # its spread. Best bid/ask for the spread come from ``_latest_book``.
+        self._tape_coins: set[str] = set()
+        self._tape_capture_enabled = False
         # Warm the in-memory dedup set from the on-disk snapshot so a fill
         # already reported by a previous process is never re-emitted.
         self._load_seen_tids()
@@ -902,6 +914,76 @@ class HyperliquidWebSocket:
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(trade, ensure_ascii=False, separators=(",", ":")) + "\n")
 
+    # ── R3: tick tape for BTC/ETH (true CVD + spread) ─────────────────────
+    def _current_spread(self, coin: str, px: float) -> dict[str, Any]:
+        """Best bid/ask and spread at the trade instant from the cached book.
+
+        Levels are populated by the ``l2Book`` research feed. Returns the
+        absolute and relative (to the trade price) spread; when the book is
+        not warmed yet the spread fields are ``None`` rather than fabricated.
+        """
+        with self._book_lock:
+            snap = self._latest_book.get(coin)
+        if not snap:
+            return {"bid": None, "ask": None, "spread": None, "spread_bps": None}
+        try:
+            bid = float(snap["b"][0][0])
+            ask = float(snap["a"][0][0])
+        except (IndexError, ValueError, KeyError, TypeError):
+            return {"bid": None, "ask": None, "spread": None, "spread_bps": None}
+        spread = ask - bid
+        mid = (bid + ask) / 2.0
+        spread_bps = (spread / mid * 1e4) if mid > 0 else None
+        return {"bid": bid, "ask": ask, "spread": spread,
+                "spread_bps": spread_bps}
+
+    def _append_tape_record(self, trade: dict[str, Any]) -> None:
+        ts_ms = int(float(trade.get("time", time.time() * 1000.0)))
+        coin = str(trade.get("coin")).upper()
+        day = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        day_dir = os.path.join(_TAPE_RAW_DIR, f"date={day}")
+        os.makedirs(day_dir, exist_ok=True)
+        px = float(trade.get("px", 0.0) or 0.0)
+        sp = self._current_spread(coin, px)
+        row = {
+            "t": int(time.time() * 1000.0),       # ingest wall-clock ms
+            "tt": ts_ms,                            # exchange trade time ms
+            "coin": coin,
+            "side": trade.get("side"),              # taker side: B/A
+            "px": px,
+            "sz": float(trade.get("sz", 0.0) or 0.0),
+            "bid": sp["bid"],
+            "ask": sp["ask"],
+            "spread": sp["spread"],
+            "spread_bps": sp["spread_bps"],
+            "hash": trade.get("hash"),
+        }
+        path = os.path.join(day_dir, f"{coin}.jsonl")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+
+    def start_tape_capture(self, coins: Optional[list[str]] = None) -> int:
+        """Enable the permanent tick tape for a fixed basket and ensure both
+        the ``trades`` and ``l2Book`` feeds are live (the book feeds spread).
+
+        Returns the number of coins whose trade stream was subscribed. The
+        coins are added to ``_trades_coins`` so the existing ``_on_trades``
+        dispatch (which filters on that set) processes them.
+        """
+        basket = list(coins) if coins else list(_TAPE_DEFAULT_COINS)
+        os.makedirs(_TAPE_RAW_DIR, exist_ok=True)
+        self._tape_capture_enabled = True
+        n = 0
+        for coin in basket:
+            self._tape_coins.add(coin)
+            if self.subscribe_trades(coin):
+                n += 1
+            # Best effort: also make sure the book feed for the spread is up.
+            self.subscribe_book(coin)
+        logger.info("[ws:tape] capture started coins=%d dir=%s", n, _TAPE_RAW_DIR)
+        return n
+
+
     # ── Market trades (launch-point CVD) ───────────────────────────────────
     def _on_trades(self, data: Any) -> None:
         """Callback for the public ``trades`` channel → microstructure CVD.
@@ -928,6 +1010,8 @@ class HyperliquidWebSocket:
                     continue
                 if self._trades_capture_enabled:
                     self._append_trade_record(t)
+                if self._tape_capture_enabled and coin in self._tape_coins:
+                    self._append_tape_record(t)
                 ms.add_trade(
                     coin=coin,
                     ts=float(t.get("time", 0.0)) / 1000.0,

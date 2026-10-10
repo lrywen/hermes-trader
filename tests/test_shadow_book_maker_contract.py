@@ -49,8 +49,10 @@ def test_open_fills_taker_and_rests_maker(tmp_path, monkeypatch):
     fill = book.shadow_open(coin="BTC", side="long", entry_px=100.0,
                             size_usd=1000.0, leverage=1, analysis_id="a1")
 
-    # taker filled immediately at mid
-    assert fill["price"] == 100.0
+    # taker filled immediately; R2 applies conservative 0.05% buy-side
+    # slippage on the open while the maker arm rests off the untouched mid.
+    assert fill["price"] == 100.05
+    assert fill["mid_px"] == 100.0
     assert fill["fill_model"] == "taker"
     taker = book.state["accounts"]["taker"]
     maker = book.state["accounts"]["maker_shadow"]

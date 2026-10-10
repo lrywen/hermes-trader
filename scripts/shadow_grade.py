@@ -76,6 +76,16 @@ MIN_MATERIAL_PNL_USD = 0.5
 # Audit 2026-09-10 (M13)：shadow/enforce 臂最长窗口 24h 子窗零记录即视为采数
 # 停滞（典型：单事件后停采），不改变 verdict 但必须出告警。
 STALE_WINDOW_H = 24
+
+# R5：离线 WFA + DSR/PBO 接入评级。从臂的反事实 pnl_pct（百分比）按 UTC 日
+# 聚合为有序"日收益（bps）"序列，在其上跑 walk-forward 与多重检验校正。
+# 天数太少不产出（fail-closed），门槛与 canary 多维门槛一致。
+R5_MIN_DAYS = 20
+R5_WFA_TRAIN_DAYS = 12
+R5_WFA_TEST_DAYS = 4
+# DSR 的多重试验口径：臂数 × 已尝试范式，保守给一个固定默认（可被配置覆盖）。
+R5_DEFAULT_N_TRIALS = 16
+R5_DSR_ACCEPT_P = 0.95
 # Audit 2026-09-10 (M13 修正)：部分臂是「每 tick 评估、仅在极端/候选事件发生
 # 时才往事件 JSONL 落一条」。对这类臂，事件流 24h 零写入是正常的（市场无极端
 # 行情），不能据此误报采数停滞——只要它的独立心跳文件仍在新鲜更新，就说明评估
@@ -780,6 +790,73 @@ def _independent_outcomes(records: list[dict], window_ms: float,
     return len(scenes)
 
 
+def _r5_daily_bps(records: list[dict]) -> list[float]:
+    """Aggregate an arm's graded counterfactual ``pnl_pct`` (percent) into an
+    ordered per-UTC-day bps series (R5). Only records carrying a numeric
+    pnl_pct are used (ungraded/zero-backfill rows are excluded)."""
+    byday: dict[int, list[float]] = {}
+    for r in records:
+        p = r.get("pnl_pct")
+        ts = _record_ts_ms(r)
+        if p is None or not ts:
+            continue
+        try:
+            bps = float(p) * 100.0   # 1 percent point == 100 bps
+        except (TypeError, ValueError):
+            continue
+        day = int(ts) // 86_400_000
+        byday.setdefault(day, []).append(bps)
+    import statistics as _st
+    return [_st.mean(byday[k]) for k in sorted(byday)]
+
+
+def r5_robustness(records: list[dict],
+                  n_trials: int = R5_DEFAULT_N_TRIALS) -> Optional[dict]:
+    """Run WFA + block-bootstrap + DSR/PBO on the arm's daily bps series.
+
+    Returns a compact stats block for the rating card, or ``None`` when there
+    is insufficient history (fewer than :data:`R5_MIN_DAYS`) — never guessed.
+    Read-only and pure (no I/O).
+    """
+    daily = _r5_daily_bps(records)
+    if len(daily) < R5_MIN_DAYS:
+        return None
+    try:
+        from hermes_trader.validation import (
+            block_bootstrap_ci,
+            deflated_sharpe_prob,
+            probability_of_backtest_overfitting,
+            sharpe,
+            walk_forward_analysis,
+        )
+        wfa = walk_forward_analysis(
+            daily, train_size=R5_WFA_TRAIN_DAYS, test_size=R5_WFA_TEST_DAYS)
+        lo, hi = block_bootstrap_ci(daily)
+        sr = sharpe(daily)
+        dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(daily))
+        pbo = probability_of_backtest_overfitting(
+            [max(v, 0.0) for v in wfa.oos_mean_bps],
+            list(wfa.oos_mean_bps))
+        import statistics as _st
+        return {
+            "days": len(daily),
+            "wfr": round(wfa.wfr, 3),
+            "wfe": round(wfa.wfe, 3),
+            "wfa_windows": wfa.n_windows,
+            "oos_win_frac": round(wfa.oos_win_frac, 3),
+            "bb_ci_lo_bps": round(lo, 2),
+            "bb_ci_hi_bps": round(hi, 2),
+            "net_edge_bps": round(_st.mean(daily), 2),
+            "sharpe": round(sr, 3),
+            "dsr_p": round(dsr, 4),
+            "pbo": round(pbo, 3),
+            "dsr_passes": dsr >= R5_DSR_ACCEPT_P,
+        }
+    except Exception as e:  # never let an offline stat break grading
+        logger.debug("r5_robustness failed: %s", e)
+        return None
+
+
 def grade_arm(arm: str, mode: str, path: str, windows: list[int],
               now_ms: float | None = None,
               records: list[dict] | None = None,
@@ -972,11 +1049,19 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
         out["macro_blocks_collection"] = bool(macro_blocks)
     if signal_note:
         out["signal_harmful_rate_note"] = signal_note
-    # CS-G §8.1：sizing_v2 成本上限六条件（独立 168h 只读闸门，不改上面的
+    # sv2 成本上限六条件（独立 168h 只读闸门，不改上面的
     # 臂级 verdict；仅供晋升时与 §4 闸门并列人工核对）。
     if arm == "sizing_v2":
         out["sv2_cost"] = grade_sizing_v2_cost(
             records, window_h=SV2_COST_WINDOW_H, now_ms=now_ms)
+    # R5：离线 WFA + DSR/PBO 稳健性块（样本不足时为 None，不猜测）。
+    r5 = r5_robustness(records)
+    if r5 is not None:
+        out["r5_stats"] = r5
+        out["independent_days"] = r5["days"]
+        # 保守成本后净 edge 为正即视为"现实成交口径仍为正"（与 R2 滑点保守档
+        # 同源思想）；供 R4 canary 多维门槛消费。
+        out["realistic_fill_positive"] = (r5["net_edge_bps"] > 0)
     return out
 
 
@@ -1580,6 +1665,15 @@ def _slim_snapshot(d: dict, source: str = "cron") -> dict:
             "collection_stalled": a.get("collection_stalled"),
             "windows": windows,
         }
+        # R5: carry the offline robustness block and its derived evidence into
+        # the nightly snapshot so the R4 canary preparation (which reads this
+        # history) can consume WFA/DSR/PBO and the orderability hints.
+        r5 = a.get("r5_stats")
+        if r5:
+            row["r5_stats"] = r5
+            row["independent_days"] = a.get("independent_days")
+            row["realistic_fill_positive"] = a.get(
+                "realistic_fill_positive")
         cost = a.get("sv2_cost")
         if cost:
             row["sv2_cost"] = {

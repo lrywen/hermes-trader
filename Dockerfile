@@ -54,6 +54,7 @@ COPY scripts/ip_drift_watch.py scripts/ip_drift_watch.py
 COPY scripts/scheduler.py scripts/scheduler.py
 # scheduler.SCHEDULED_JOBS 每日00:00调用：清理过期 trades-raw 落盘。
 COPY scripts/clean_trades_raw.py scripts/clean_trades_raw.py
+COPY scripts/reconcile_gate_outcomes.py scripts/reconcile_gate_outcomes.py
 COPY scripts/daily_report.py scripts/daily_report.py
 COPY scripts/reconcile_selection_attribution.py scripts/reconcile_selection_attribution.py
 COPY scripts/pullback_shadow_daily.py scripts/pullback_shadow_daily.py
@@ -61,6 +62,7 @@ COPY scripts/reconcile_ta_late_entry_shadow.py scripts/reconcile_ta_late_entry_s
 COPY scripts/reconcile_xs_reversal_shadow.py scripts/reconcile_xs_reversal_shadow.py
 COPY scripts/reconcile_relax_tier_shadow.py scripts/reconcile_relax_tier_shadow.py
 COPY scripts/macro_regime_watch.py scripts/macro_regime_watch.py
+COPY scripts/prepare_canary_promotion.py scripts/prepare_canary_promotion.py
 COPY scripts/regen_param_sweep.py scripts/regen_param_sweep.py
 COPY scripts/shadow_grade.py scripts/shadow_grade.py
 # Shared scripts/-local helper imported by shadow_grade.py and

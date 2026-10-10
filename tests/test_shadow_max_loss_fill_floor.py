@@ -82,7 +82,10 @@ def test_max_loss_normal_fills_at_mark_long(tmp_path):
     assert len(closed) == 1
     fill = closed[0]
     assert fill["reason"] == "max_loss"
-    assert abs(fill["price"] - mark) < 1e-9
+    # R2 conservative taker model: a long close is a sell, so the fill is
+    # marked down 0.05% from the confirming mark (mirrors real taker impact).
+    assert abs(fill["price"] - mark * (1 - 0.0005)) < 1e-9
+    assert fill["mid_px"] == mark
 
 
 def test_max_loss_gap_through_caps_at_backup_trigger_long(tmp_path):
@@ -98,8 +101,17 @@ def test_max_loss_gap_through_caps_at_backup_trigger_long(tmp_path):
 
     assert len(closed) == 1
     fill = closed[0]
-    assert abs(fill["price"] - 97.0) < 1e-9   # capped at backup trigger
-    assert fill["price"] > mark                # better than the post-gap mark
+    # R2: the open already slipped (100 -> 100.05), so the backup-net cap is
+    # computed off that filled entry, then the long-close sell slippage is
+    # applied on top of the cap.
+    pos = book.state["accounts"]["taker"]["fills"][-1]
+    trig = sb._backup_sl_trigger_px(
+        coin=coin, side=side, entry_px=pos["entry_px"], entry_atr_pct=100.0)
+    expected = sb._apply_slippage(
+        trig, side=side, opening=False, slip_pct=sb._taker_slippage_pct())
+    assert abs(fill["price"] - expected) < 1e-9
+    assert fill["mid_px"] == trig            # capped, not the post-gap mark
+    assert fill["price"] > mark              # better than the post-gap mark
 
 
 def test_max_loss_gap_through_caps_at_backup_trigger_short(tmp_path):
@@ -114,7 +126,15 @@ def test_max_loss_gap_through_caps_at_backup_trigger_short(tmp_path):
 
     assert len(closed) == 1
     fill = closed[0]
-    assert abs(fill["price"] - 206.0) < 1e-9
+    # R2: short open slipped downward, so the cap is computed off the filled
+    # entry; the short close is a buy and pays slippage on top of that cap.
+    pos = book.state["accounts"]["taker"]["fills"][-1]
+    trig = sb._backup_sl_trigger_px(
+        coin=coin, side=side, entry_px=pos["entry_px"], entry_atr_pct=100.0)
+    expected = sb._apply_slippage(
+        trig, side=side, opening=False, slip_pct=sb._taker_slippage_pct())
+    assert abs(fill["price"] - expected) < 1e-9
+    assert fill["mid_px"] == trig
     assert fill["price"] < mark
 
 
@@ -131,4 +151,6 @@ def test_non_max_loss_exit_always_fills_at_mark(tmp_path):
     assert len(closed) == 1
     fill = closed[0]
     assert fill["reason"] == "trailing_stop"
-    assert abs(fill["price"] - mark) < 1e-9
+    # R2: long close sells, so the mark is marked down 0.05%.
+    assert abs(fill["price"] - mark * (1 - 0.0005)) < 1e-9
+    assert fill["mid_px"] == mark

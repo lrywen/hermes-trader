@@ -71,6 +71,11 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "clean-trades-raw.log",
     ),
     _daily(
+        "reconcile_gate_outcomes", 0, 25,
+        ("scripts/reconcile_gate_outcomes.py", "--write"),
+        "gate-outcomes-reconcile.log",
+    ),
+    _daily(
         "daily_report", 0, 10,
         ("scripts/daily_report.py", "--push"),
         "daily-report.log",
@@ -99,6 +104,11 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "reconcile_relax_tier_shadow", 0, 50,
         ("scripts/reconcile_relax_tier_shadow.py", "--write"),
         "relax-tier-reconcile.log",
+    ),
+    _daily(
+        "prepare_canary_promotion", 0, 55,
+        ("scripts/prepare_canary_promotion.py", "--write"),
+        "prepare-canary-promotion.log",
     ),
     ScheduledJob(
         name="macro_regime_watch",

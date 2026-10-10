@@ -813,6 +813,18 @@ try:
 except Exception as _bc_err:
     logger.warning(f"[ws:book] start_book_capture failed (non-fatal): {_bc_err}")
 
+# R3: permanent tick tape for BTC/ETH (true CVD + spread). Independent of the
+# launch-driven trade subscriptions; non-fatal.
+try:
+    _tc = config.get("tape_capture") or {}
+    if _tc.get("enabled", True):
+        _ws = _get_ws_mids_instance()
+        if _ws is not None:
+            _tc_coins = _tc.get("coins")
+            _ws.start_tape_capture(list(_tc_coins) if _tc_coins else None)
+except Exception as _tc_err:
+    logger.warning(f"[ws:tape] start_tape_capture failed (non-fatal): {_tc_err}")
+
 # Phase 1 (WS user-fills feasibility): subscribe to the wallet's fill
 # stream on the SAME WS connection as allMids. Callback is LOG-ONLY in
 # Phase 1 — no exit decisions are driven off it yet. Failures are

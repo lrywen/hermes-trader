@@ -19,19 +19,23 @@ from __future__ import annotations
 
 from .significance import (
     CPCVResult,
+    WFAResult,
     block_bootstrap_ci,
     cpcv_paths,
     day_bps_series,
     deflated_sharpe_prob,
     probability_of_backtest_overfitting,
     sharpe,
+    walk_forward_analysis,
 )
 
 __all__ = [
     "CPCVResult",
+    "WFAResult",
     "block_bootstrap_ci",
     "day_bps_series",
     "cpcv_paths",
+    "walk_forward_analysis",
     "deflated_sharpe_prob",
     "probability_of_backtest_overfitting",
     "sharpe",

@@ -107,6 +107,36 @@ def _taker_fee_pct() -> float:
         return 0.025
 
 
+def _taker_slippage_pct() -> float:
+    """Per-fill taker slippage in PERCENT (R2: honest paper fills).
+
+    Paper taker fills otherwise execute exactly at mid, systematically
+    overstating PnL. Defaults to a conservative liquid-market value; set
+    ``shadow_book.taker_slippage_pct = 0`` to disable.
+    """
+    c = _shadow_cfg()
+    try:
+        if c.get("taker_slippage_pct") is not None:
+            return max(0.0, float(c["taker_slippage_pct"]))
+    except (TypeError, ValueError):
+        pass
+    return 0.05
+
+
+def _apply_slippage(px: float, *, side: str, opening: bool,
+                    slip_pct: float) -> float:
+    """Move the fill price against the taker by ``slip_pct``.
+
+    Long open / short close -> buy side (pay more). Short open / long close ->
+    sell side (receive less).
+    """
+    if slip_pct <= 0:
+        return float(px)
+    f = slip_pct / 100.0
+    buying = (side == "long") if opening else (side == "short")
+    return float(px) * (1.0 + f) if buying else float(px) * (1.0 - f)
+
+
 def _maker_fee_pct() -> float:
     """Per-fill maker fee in PERCENT. Prefer the shadow_book override; fall back
     to the live execution maker fee, then to HL's standard 0.01%."""
@@ -725,25 +755,29 @@ class ShadowBook:
                 f"> available {metrics['available']:.2f}")
             return None
 
-        size_coin = size_usd / entry_px
+        # R2: apply taker slippage to the fill (moves price against the taker).
+        slip = _taker_slippage_pct()
+        fill_px = _apply_slippage(entry_px, side=side, opening=True,
+                                  slip_pct=slip)
+        size_coin = size_usd / fill_px
         pid = uuid.uuid4().hex[:12]
         opened_at = _now_ms()
         acc["positions"].append({
             "id": pid, "coin": coin, "side": side,
-            "entry_px": float(entry_px), "size_usd": float(size_usd),
+            "entry_px": float(fill_px), "size_usd": float(size_usd),
             "size_coin": float(size_coin), "leverage": lev,
             "entry_atr_pct": float(entry_atr_pct or 0.0),
             "entry_regime": entry_regime or "",
             "analysis_id": analysis_id or "",
-            "peak_px": float(entry_px), "opened_at": opened_at,
-            "mark_px": float(entry_px),
+            "peak_px": float(fill_px), "opened_at": opened_at,
+            "mark_px": float(fill_px),
             "unrealized_pct": 0.0, "unrealized_roe_pct": 0.0,
             "unrealized_pnl_usd": 0.0,
         })
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
             self._trackers[("taker", self._key(coin, side))] = DSLTracker(
-                coin, side, float(entry_px), opened_at / 1000.0,
+                coin, side, float(fill_px), opened_at / 1000.0,
                 policy=_build_policy(entry_regime), leverage=lev,
                 entry_atr_pct=float(entry_atr_pct or 0.0),
                 entry_regime=entry_regime or "")
@@ -754,7 +788,9 @@ class ShadowBook:
             "type": "open", "id": uuid.uuid4().hex[:12],
             "position_id": pid, "ts": opened_at,
             "coin": coin, "side": side, "qty": float(size_coin),
-            "price": float(entry_px), "notional_usd": float(size_usd),
+            "price": float(fill_px), "mid_px": float(entry_px),
+            "slippage_pct": round(slip, 5),
+            "notional_usd": float(size_usd),
             "leverage": lev, "fee_usd": 0.0, "fill_model": "taker",
             "analysis_id": analysis_id or "",
         }
@@ -766,7 +802,8 @@ class ShadowBook:
         self._append_equity("taker", opened_at, snap, force=True)
         self._save(force=True)
         logger.info(
-            f"[shadow_book] taker OPEN {side} {coin} qty={size_coin:g} @ {entry_px:g} "
+            f"[shadow_book] taker OPEN {side} {coin} qty={size_coin:g} @ {fill_px:g} "
+            f"(mid {entry_px:g}, slip {slip:g}%) "
             f"notional=${size_usd:.2f} lev={lev}x (paper)")
         return fill
 
@@ -944,10 +981,14 @@ class ShadowBook:
         lev = max(1, int(pos.get("leverage", 1)))
 
         fee_pct = _maker_fee_pct() if acct == "maker_shadow" else _taker_fee_pct()
+        # R2: taker paper exits also pay slippage (maker fills are posted).
+        close_slip = 0.0 if acct == "maker_shadow" else _taker_slippage_pct()
+        fill_exit_px = _apply_slippage(exit_px, side=side, opening=False,
+                                       slip_pct=close_slip)
         if side == "long":
-            spot_pct = (exit_px - entry_px) / entry_px * 100.0
+            spot_pct = (fill_exit_px - entry_px) / entry_px * 100.0
         else:
-            spot_pct = (entry_px - exit_px) / entry_px * 100.0
+            spot_pct = (entry_px - fill_exit_px) / entry_px * 100.0
         gross_pnl = notional * spot_pct / 100.0
         fee_usd = notional * fee_pct / 100.0 * _round_trip_fills()
         net_pnl = gross_pnl - fee_usd
@@ -959,7 +1000,9 @@ class ShadowBook:
             "position_id": pos["id"], "ts": closed_at,
             "coin": coin, "side": side,
             "qty": float(pos["size_coin"]), "entry_px": entry_px,
-            "price": float(exit_px), "notional_usd": notional,
+            "price": float(fill_exit_px), "mid_px": float(exit_px),
+            "slippage_pct": round(close_slip, 5),
+            "notional_usd": notional,
             "leverage": lev, "fee_usd": round(fee_usd, 6),
             "spot_pct": round(spot_pct, 4),
             "realized_pnl_pct": round(roe_pct, 4),   # leveraged ROE %

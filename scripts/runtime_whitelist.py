@@ -42,6 +42,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "scheduler.py",
     # scheduler.SCHEDULED_JOBS.
     "clean_trades_raw.py",
+    "reconcile_gate_outcomes.py",
     "daily_report.py",
     "reconcile_selection_attribution.py",
     "pullback_shadow_daily.py",
@@ -49,6 +50,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_xs_reversal_shadow.py",
     "reconcile_relax_tier_shadow.py",
     "macro_regime_watch.py",
+    "prepare_canary_promotion.py",
     # Web UI spawn / lazy import.
     "regen_param_sweep.py",
     "shadow_grade.py",
