@@ -809,6 +809,18 @@ def _record_sizing_clamped(clamp: str) -> None:
         pass
 
 
+# Bounded label set for hermes_risk_gate_blocks_total — must stay in sync with
+# the gate keys documented on the Counter in metrics.py; free-form/unknown gate
+# keys collapse to "other" so Prometheus label cardinality stays flat.
+_RISK_GATE_LABELS = frozenset({
+    "confidence", "max_concurrent", "notional_cap", "daily_loss",
+    "daily_giveback", "liquidity", "short_liquidity", "coin_filter",
+    "cooldown", "coin_circuit", "global_halt", "opposite_guard",
+    "correlation", "equity_risk", "market_regime", "news", "debate",
+    "ta_late_entry", "other",
+})
+
+
 def _record_risk_gate_block(analysis: dict[str, Any],
                             gate_output: dict[str, Any]) -> None:
     """P1-5: durably record a risk-gate block in events.jsonl.
@@ -822,6 +834,19 @@ def _record_risk_gate_block(analysis: dict[str, Any],
     ``risk_gate`` record guarantees a durable per-block line in events.jsonl
     for every caller. Best-effort: never blocks trading.
     """
+    try:
+        # Prometheus counter (bounded gate labels; unknown collapse to "other").
+        # Without this the /system-monitor risk-gate curve is permanently empty:
+        # the counter was declared in metrics.py but never incremented.
+        from hermes_trader.metrics import RISK_GATE_BLOCKS
+        _results = gate_output.get("results") or {}
+        for _gk, _gv in _results.items():
+            if isinstance(_gv, dict) and not _gv.get("pass"):
+                RISK_GATE_BLOCKS.labels(
+                    gate=_gk if _gk in _RISK_GATE_LABELS else "other"
+                ).inc()
+    except Exception:
+        pass
     try:
         from hermes_trader import event_log
         _results = gate_output.get("results") or {}

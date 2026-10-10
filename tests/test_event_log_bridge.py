@@ -170,6 +170,34 @@ def test_risk_gate_block_durably_recorded(tmp_path, monkeypatch):
     assert p["gates"]["cooldown"] == "cooldown active"
 
 
+def test_risk_gate_block_increments_prometheus_counter(tmp_path, monkeypatch):
+    """The /system-monitor risk-gate curve reads hermes_risk_gate_blocks_total;
+    each vetoing gate must increment it once with a bounded label, and unknown
+    gate keys must collapse to 'other' (flat label cardinality)."""
+    from prometheus_client import REGISTRY
+    from hermes_trader.agents import executor
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(tmp_path / "events.jsonl"))
+
+    def _val(gate):
+        return REGISTRY.get_sample_value(
+            "hermes_risk_gate_blocks_total", {"gate": gate}
+        ) or 0.0
+
+    before_cool = _val("cooldown")
+    before_other = _val("other")
+    executor._record_risk_gate_block(
+        {"coin": "BTC", "side": "long"},
+        {"results": {
+            "cooldown": {"pass": False, "reason": "cooldown"},
+            # free-form / future gate key must not leak as a raw label
+            "some_future_gate_xyz": {"pass": False, "reason": "x"},
+            "trend_gate": {"pass": True, "reason": "ok"},
+        }},
+    )
+    assert _val("cooldown") == before_cool + 1.0
+    assert _val("other") == before_other + 1.0
+
+
 def test_dashboard_redact_scrubs_secrets():
     """F17: _redact must mask Authorization/Bearer/api_key fields and a raw
     key string interpolated into a message, before it reaches a response."""
