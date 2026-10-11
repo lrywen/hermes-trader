@@ -218,6 +218,96 @@ def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         logger.debug("[dsl] stop-tuning shadow record failed: %r", e)
 
 
+def _stop_confirm_shadow_cfg() -> Optional[dict]:
+    """Return the stop_confirm_shadow block when record-only mode is ON else None.
+
+    Audit 2026-10-11: the live floor breach requires
+    ``consecutive_breaches_required`` (live=2) AND ``breach_confirm_sec``
+    (live=4s) AND index confirmation. In fast one-way moves that dwell added
+    109-533s and realized stop fills overshot the 1.5% spot cap by up to 1.19pp.
+    This arm records, at every LIVE floor_breach exit, whether a tighter
+    candidate confirmation (default 1 breach / 1.0s, index still required)
+    would have exited earlier and by how much. Pure observation; the live
+    confirmation path is unchanged.
+    """
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        cfg = read_agent_config() or {}
+        blk = ((cfg.get("dsl_exit") or {}).get("stop_confirm_shadow")) or {}
+        if not bool(blk.get("shadow_mode", False)):
+            return None
+        return blk
+    except Exception:
+        return None
+
+
+def _record_stop_confirm_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
+                                live_reason: str, floor: float,
+                                exit_px: float, unrealized_pct: float) -> None:
+    """Append one counter-factual record at a LIVE floor_breach exit.
+
+    Compares the live confirmation gate against a tighter candidate gate.
+    The candidate-eligible instant (first breach tick meeting
+    candidate-consec + candidate-sec + index) is captured on the tracker as
+    shadow-only state (``_sc_first_*``); when absent (e.g. restart mid-trade)
+    the record is skipped rather than fabricated.
+    """
+    blk = _stop_confirm_shadow_cfg()
+    if blk is None:
+        return
+    try:
+        first_ts = getattr(tracker, "_sc_first_ts", None)
+        first_px = getattr(tracker, "_sc_first_px", None)
+        live_first_ts = tracker._first_breach_ts
+        import time as _time
+        now_mono = _time.monotonic()
+        if first_ts is None or first_px is None or live_first_ts is None:
+            return
+        cand_consec = int(blk.get("candidate_consecutive_breaches", 1) or 1)
+        cand_sec = float(blk.get("candidate_breach_confirm_sec", 1.0) or 0.0)
+        sgn = 1 if tracker.side == "long" else -1
+        entry = float(tracker.entry_px)
+        # adverse excursion in spot %, signed against the position
+        cand_exc = sgn * (float(first_px) - entry) / entry * 100.0
+        live_exc = sgn * (float(exit_px) - entry) / entry * 100.0
+        import os
+        from datetime import datetime, timezone
+        from hermes_trader.shadow_log import append_jsonl
+        path = os.environ.get(
+            "HERMES_STOP_CONFIRM_SHADOW_FILE",
+            os.path.expanduser("~/.hermes-trading/stop_confirm_shadow.jsonl"))
+        append_jsonl(path, {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "rule": "stop_confirm",
+            "coin": tracker.coin,
+            "side": tracker.side,
+            "would": "earlier_exit" if now_mono - first_ts > 0.05 else "same",
+            "detail": {
+                "live_consecutive_breaches": int(pol.consecutive_breaches_required),
+                "live_breach_confirm_sec": float(pol.breach_confirm_sec),
+                "candidate_consecutive_breaches": cand_consec,
+                "candidate_breach_confirm_sec": cand_sec,
+                "candidate_first_breach_age_sec": round(now_mono - first_ts, 2),
+                "live_first_breach_age_sec": round(now_mono - live_first_ts, 2),
+                "confirmation_dwell_delta_sec": round(
+                    (now_mono - live_first_ts) - (now_mono - first_ts), 2),
+                "candidate_excursion_spot_pct": round(cand_exc, 4),
+                "live_exit_excursion_spot_pct": round(live_exc, 4),
+                "overshoot_delta_spot_pct": round(live_exc - cand_exc, 4),
+                "entry_px": entry,
+                "candidate_px": float(first_px),
+                "live_exit_px": float(exit_px),
+                "floor_px": float(floor),
+                "leverage": int(getattr(tracker, "leverage", 0) or 0),
+                "entry_regime": tracker.entry_regime or "",
+                "live_reason": str(live_reason)[:160],
+            },
+        }, stream="stop_confirm_shadow")
+    except Exception as e:  # never break the exit hot path
+        logger.debug("[dsl] stop-confirm shadow record failed: %r", e)
+
+
 def _refresh_positions_gauge() -> None:
     """Set hermes_dsl_positions to the current registry size."""
     try:
@@ -974,6 +1064,12 @@ class DSLTracker:
         # on the tighter hard_stop_confirm_sec window. Not persisted (re-arms
         # from the first post-restart tick).
         self._first_hardstop_ts: Optional[float] = None
+        # stop_confirm_shadow (audit 2026-10-11): shadow-only capture of the
+        # first tick at which the tighter CANDIDATE confirmation gate would
+        # have fired. Never affects live exits; not persisted (re-arms after a
+        # restart, and a missing value simply suppresses that one record).
+        self._sc_first_ts: Optional[float] = None
+        self._sc_first_px: Optional[float] = None
 
         # Exchange-side bracket order IDs (for the static backup SL / TP scale-out).
         # Persisted across restarts so the dynamic SL mover (batchModify) can target
@@ -1480,9 +1576,31 @@ class DSLTracker:
                     sgn * (_idx - floor), 0.0, abs_tol=1e-12
                 )
                 index_note = ", idx-confirmed" if index_ok else f", mid-only wick? idx={_idx:.6g} above floor"
+            # stop_confirm_shadow (observation only): capture the FIRST tick a
+            # tighter candidate gate (1 breach / ~1s, index still required)
+            # would have fired. Does not touch any live decision/state.
+            if index_ok and self._sc_first_ts is None:
+                _sc_blk = _stop_confirm_shadow_cfg()
+                if _sc_blk is not None:
+                    try:
+                        _c_consec = int(_sc_blk.get("candidate_consecutive_breaches", 1) or 1)
+                        _c_sec = float(_sc_blk.get("candidate_breach_confirm_sec", 1.0) or 0.0)
+                        if (self.consecutive_breaches >= _c_consec
+                                and (_c_sec <= 0 or breach_elapsed >= _c_sec)):
+                            self._sc_first_ts = now_mono
+                            self._sc_first_px = mark_px
+                    except (TypeError, ValueError):
+                        pass
             if time_gate_ok and count_gate_ok and index_ok:
                 _record_exit("floor_breach")
                 _request_save(force=True)
+                # stop_confirm_shadow (observation only): record the tighter
+                # candidate gate vs this live exit before returning.
+                _record_stop_confirm_shadow(
+                    self, pol,
+                    live_reason=(
+                        f"{self.consecutive_breaches}x consec held {breach_elapsed:.1f}s"),
+                    floor=floor, exit_px=mark_px, unrealized_pct=upct)
                 held_for = (
                     f", held {breach_elapsed:.1f}s"
                     if pol.breach_confirm_sec > 0 else ""

@@ -248,6 +248,7 @@ class _ConfigPatch(BaseModel):
     # are mapped to the camelCase runtime keys by config.py helpers.
     trigger_weights: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_weights"))
     trigger_thresholds: dict[str, Any] = Field(default_factory=lambda: _dict_default("trigger_thresholds"))
+    weight_shadow: dict[str, Any] = Field(default_factory=lambda: _dict_default("weight_shadow"))
     # R13-B9: perception scan budget / pacing knobs (perception.py scan_once).
     # Twelve keys: cache size, market budget split, USD floors, universe
     # sweep, batch rate-limit pacing, thread-pool width, movers % cut-off and
@@ -487,6 +488,14 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "candidate_max_loss_pct": _num_leaf(0.0, 25.0),
         "candidate_breakeven_trigger_pct": _num_leaf(0.0, 50.0),
     },
+    # Audit 2026-10-11: tighter breach-confirmation counter-factual; live
+    # confirmation path unchanged. candidate_consec is an int count, candidate
+    # sec a time gate. Record-only.
+    "stop_confirm_shadow": {
+        "shadow_mode": ("bool",),
+        "candidate_consecutive_breaches": ("int", 1, 100),
+        "candidate_breach_confirm_sec": _num_leaf(0.0, 600.0),
+    },
     # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor ramp. Default OFF
     # (inert); band_pct is the peak-profit % width over which the floor ramps
     # hard-stop → full trailing floor.
@@ -575,6 +584,14 @@ _SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
 
 _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "dsl_exit": _DSL_EXIT_SPEC,
+    # Audit 2026-10-11: counter-factual composite reweight arm (record-only).
+    # candidate_weights is a trigger-name -> weight number map.
+    "weight_shadow": {
+        "shadow_mode": ("bool",),
+        "candidate_momentum_lookback": ("int", 1, 1000),
+        "candidate_momentum_pct": _num_leaf(0.0, 100.0),
+        "candidate_weights": ("num_map", 0.0, 10.0),
+    },
     "completion_cap_shadow": {
         "mode": ("enum", ("off", "shadow", "enforce")),
         "max_completion_tokens": _num_leaf(1, 1_000_000),
@@ -1027,6 +1044,20 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
     elif kind == "str":
         if not isinstance(val, str):
             errors.append(f"{path}: expected string, got {type(val).__name__}")
+    elif kind == "num_map":
+        # Free-form string -> number map (e.g. weight_shadow.candidate_weights
+        # keyed by camelCase trigger name). Keys are arbitrary; every value
+        # must be a number within the shared [lo, hi] rail.
+        if not isinstance(val, dict):
+            errors.append(f"{path}: expected object, got {type(val).__name__}")
+        else:
+            lo, hi = spec[1], spec[2]
+            for mk, mv in val.items():
+                if not isinstance(mk, str) or isinstance(mv, bool) or not isinstance(mv, _NUM):
+                    errors.append(
+                        f"{path}.{mk}: expected number, got {type(mv).__name__}")
+                elif mv < lo or mv > hi:
+                    errors.append(f"{path}.{mk}: must be between {lo} and {hi}")
 
 
 def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True) -> list[str]:

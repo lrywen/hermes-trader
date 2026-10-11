@@ -239,6 +239,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "candidate_max_loss_pct": 0.0,
             "candidate_breakeven_trigger_pct": 0.0,
         },
+        # Audit 2026-10-11: tighter floor-breach confirmation counter-factual.
+        # Live exit requires consecutive_breaches_required (2) + breach_confirm_sec
+        # (4s) + index confirm; in fast moves that dwell overshot the spot cap by
+        # up to 1.19pp (9 max_loss trades, shadow 15d). This arm records whether a
+        # tighter candidate gate (1 breach / 1.0s, index still required) would have
+        # exited earlier and by how much. Default OFF (inert); operator arms it by
+        # setting shadow_mode=true in the override file. Live path never changes.
+        "stop_confirm_shadow": {
+            "shadow_mode": False,
+            "candidate_consecutive_breaches": 1,
+            "candidate_breach_confirm_sec": 1.0,
+        },
         # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor transition.
         # Ramps the phase-2 floor from the hard stop up to the full trailing
         # floor across a peak-profit band of width band_pct instead of snapping
@@ -1418,6 +1430,33 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "uptrend_momentum": 0.20,
         "downtrend_momentum": 0.0,
         "daily_mover": 0.0,
+    },
+    # Audit 2026-10-11: counter-factual composite for the canonical reweight.
+    # Production's override file still pins trend_strength=0.55 /
+    # uptrend_momentum=0 / momentum 2bar-4% (the pre-research values); this arm
+    # scores every coin with the candidate (post-research) weights and momentum
+    # threshold and records only the cases where that flips the composite-gate
+    # decision (would_surface / would_block). Weights here are keyed by the
+    # camelCase trigger name that composite_score indexes. Default OFF (inert);
+    # the operator arms it by setting shadow_mode=true in the override file.
+    "weight_shadow": {
+        "shadow_mode": False,
+        "candidate_momentum_lookback": 3,
+        "candidate_momentum_pct": 3.0,
+        "candidate_weights": {
+            "trendStrength": 0.30,
+            "pctMoveSpike": 0.40,
+            "breakout": 0.30,
+            "volumeSpike": 0.25,
+            "momentumBurst": 0.20,
+            "volumeBuildup1h": 0.15,
+            "higherLows1h": 0.0,
+            "trendFlip1h": 0.0,
+            "rangeCompression": 0.0,
+            "uptrendMomentum": 0.20,
+            "downtrendMomentum": 0.0,
+            "dailyMover": 0.0,
+        },
     },
     # R13-B8: trigger thresholds (TRIGGER_CONFIG["thresholds"], perception.py
     # L272-300). Same registration gap as trigger_weights. Includes the D6

@@ -257,6 +257,75 @@ def _age_decay_metric(mode: str, outcome: str) -> None:
         pass
 
 
+def _weight_shadow_path() -> str:
+    return os.environ.get(
+        "HERMES_WEIGHT_SHADOW_FILE",
+        os.path.expanduser("~/.hermes-trading/weight_shadow.jsonl"),
+    )
+
+
+def _record_weight_shadow(*, coin: str, hits: list, candles: list,
+                          live_weights: dict, live_score: float,
+                          gate: float, fired_count: int,
+                          now_ms: int) -> None:
+    """Audit 2026-10-11: counter-factual composite under the canonical reweight
+    (trendStrength 0.55→0.30, uptrendMomentum 0→0.20, momentumBurst 2bar/4%
+    →3bar/3%). Production currently pins the OLD values in its override file;
+    this arm records, for every scored coin, whether the candidate weighting +
+    momentum threshold would change the composite-gate decision (would-surface
+    / would-block). Pure observation; live score/gate unchanged. Only emits on a
+    live-vs-candidate decision divergence so the JSONL stays signal-rich.
+    """
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        blk = ((read_agent_config() or {}).get("weight_shadow")) or {}
+        if not bool(blk.get("shadow_mode", False)):
+            return
+        cand_weights = dict(blk.get("candidate_weights") or {})
+        if not cand_weights:
+            return
+        cand_lb = int(blk.get("candidate_momentum_lookback", 3) or 3)
+        cand_pct = float(blk.get("candidate_momentum_pct", 3.0) or 3.0)
+        # Rebuild hits with ONLY the momentumBurst definition swapped; weights
+        # alone do not change firing, and other thresholds are unchanged.
+        try:
+            cand_burst = trigger_mod.momentum_burst(candles, cand_lb, cand_pct)
+        except Exception:
+            return
+        alt_hits = []
+        for h in hits:
+            alt_hits.append(cand_burst if h.get("name") == "momentumBurst" else h)
+        alt_score = trigger_mod.composite_score(alt_hits, cand_weights)
+        live_pass = bool(fired_count >= 1 and live_score >= gate)
+        alt_pass = bool(fired_count >= 1 and alt_score >= gate)
+        if live_pass == alt_pass:
+            return
+        from datetime import datetime, timezone
+        from hermes_trader.shadow_log import append_jsonl
+        append_jsonl(_weight_shadow_path(), {
+            "ts": int(now_ms),
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "coin": coin,
+            "rule": "weight_shadow",
+            "would": "would_surface" if (alt_pass and not live_pass) else "would_block",
+            "detail": {
+                "live_score": round(float(live_score), 2),
+                "candidate_score": round(float(alt_score), 2),
+                "gate": round(float(gate), 2),
+                "live_passes_gate": bool(live_pass),
+                "candidate_passes_gate": bool(alt_pass),
+                "fired_triggers": [h["name"] for h in hits if h.get("fired")],
+                "candidate_weights": cand_weights,
+                "candidate_momentum_lookback": cand_lb,
+                "candidate_momentum_pct": cand_pct,
+            },
+        }, stream="weight_shadow")
+    except Exception as _e:
+        logger.debug("[weight-shadow] record failed for %s: %r", coin, _e)
+
+
+
 # Audit 2026-09-12 (sigma_burst_gate): counter-factual surfacing decision for a
 # large σ return/volume spike that falls short of the composite gate.
 # 2026-09-21 cleanup: the observation-only JSONL recorder was retired; the
@@ -825,6 +894,14 @@ def _scan_single_market(
             if fired_count < 1:
                 return (True, None)
             score = trigger_mod.composite_score(hits, _score_weights)
+        # weight_shadow (observation only): compare live composite against the
+        # canonical reweight (0.30/0.20/3bar-3%) — emits only on a gate-decision
+        # divergence. Never affects the live score or surfacing.
+        _record_weight_shadow(
+            coin=market["coin"], hits=hits, candles=candles,
+            live_weights=_score_weights, live_score=float(score),
+            gate=float(min_score), fired_count=fired_count,
+            now_ms=int(now_ms))
         # A confirmed momentum burst is always surfaced — a large, fast move is
         # exactly the signal the composite gate must never filter out.
         burst_fired = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
