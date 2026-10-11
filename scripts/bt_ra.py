@@ -623,9 +623,35 @@ _OPP = {"long": "short", "short": "long"}
 
 # 实验臂 → 信号源臂（baseline 派生）与 DSL 键（main 注入 dsls dict）
 DERIVED_ARMS = ["dsl_t1", "dsl_t2", "fade_live", "fade_tuned",
-                "filt", "filt_s60", "pullback", "filt_ld", "filt_ra"]
+                "filt", "filt_s60", "pullback", "filt_ld", "filt_ra",
+                "wt20", "wt25", "wt30"]
 PULLBACK_PCT = 0.4   # 限价回撤幅度（%）
 PULLBACK_BARS = 24   # 挂单有效期（5m 根数 = 2h）
+
+# Hemostat (2026-10-11)：弱趋势禁追臂 → 4h ADX 阈值。判定式严格对齐生产
+# executor._runner_entry_block_reason（weak_trend_chase）：
+#   adx4h < floor AND 方向对齐的 momentumBurst AND 非 breakout
+# 不引入 recent_breakout 宽限（生产判定不含），ADX 缺失 fail-open（保留）。
+WT_ARM_FLOOR = {"wt20": 20.0, "wt25": 25.0, "wt30": 30.0}
+
+
+def _weak_trend_suppressed(c: "Candidate", floor: float) -> bool:
+    """True 表示该 baseline 候选会被弱趋势禁追规则【剔除】。
+
+    与生产 executor.py weak_trend_chase 同一判据：仅当本信号是 burst 延续
+    （fired 含 momentumBurst）且不是带量区间突破（fired 不含 breakout）时，
+    才用 4h ADX 门槛否决。ADX 快照缺失 → fail-open（不剔除）。
+    """
+    fs = set(c.fired)
+    if "momentumBurst" not in fs or "breakout" in fs:
+        return False
+    adx4h = c.meta.get("adx4h")
+    if adx4h is None:
+        return False
+    try:
+        return float(adx4h) < floor
+    except (TypeError, ValueError):
+        return False
 
 
 def _passes_filter(c: Candidate) -> bool:
@@ -650,6 +676,7 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
         "bars": 0, "fired_ge_1": 0, "surfaced": 0, "no_dir": 0,
         "le_block": 0, "hq_would": 0, "sigma_would": 0,
         "sigma_no_dir": 0, "sigma_le_block": 0,
+        "runner_rsi_block": 0,
         "skip_open_pos": 0, "fetch_error": 0,
     }
     trades: List[Trade] = []
@@ -732,6 +759,11 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                     per_arm[da].append((i, replace(cand, arm=da)))
                 # pullback：限价挂单入场
                 per_arm["pullback"].append((i, replace(cand, arm="pullback")))
+                # Hemostat：弱趋势禁追三阈值臂（同信号、同 live DSL，仅入场过滤）
+                for _wt_arm, _wt_floor in WT_ARM_FLOOR.items():
+                    if not _weak_trend_suppressed(cand, _wt_floor):
+                        per_arm[_wt_arm].append(
+                            (i, replace(cand, arm=_wt_arm)))
                 # 过滤臂
                 if _passes_filter(cand):
                     per_arm["filt"].append((i, replace(cand, arm="filt")))
@@ -811,7 +843,10 @@ ARMS = [("baseline", "baseline（live ≥54+旁路）"),
         ("filt_s60", "E3b 过滤+score≥60"),
         ("pullback", "E4 限价-0.4%挂单(24根)"),
         ("filt_ld", "E3c 过滤+实盘DSL出场"),
-        ("filt_ra", "E3d 过滤+regime感知出场")]
+        ("filt_ra", "E3d 过滤+regime感知出场"),
+        ("wt20", "止血 弱趋势禁追 ADX4h<20"),
+        ("wt25", "止血 弱趋势禁追 ADX4h<25"),
+        ("wt30", "止血 弱趋势禁追 ADX4h<30")]
 
 
 def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
@@ -835,6 +870,7 @@ def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
         for k, v in f.items():
             tot[k] = tot.get(k, 0) + v
     for k in ("bars", "fired_ge_1", "surfaced", "no_dir", "le_block",
+              "runner_rsi_block",
               "hq_would", "sigma_would", "sigma_no_dir", "sigma_le_block",
               "skip_open_pos", "fetch_error"):
         if tot.get(k):
