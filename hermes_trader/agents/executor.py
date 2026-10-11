@@ -5575,6 +5575,39 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         except (TypeError, ValueError):
             pass
 
+    # ── Hemostat (2026-10-11): weak-trend chase veto ──────────────────────
+    # The bleed-out diagnosis (59 max_loss exits, MFE median 0.34%, stopped in
+    # ~24min): breakout/burst CONTINUATION entries admitted into a coin whose
+    # 4h trend has no directional strength (low ADX) are noise — they buy the
+    # top of a chop range and mean-revert into the stop. In a real trend
+    # (ADX >= floor) continuation is the edge and must be allowed, so this only
+    # fires when 4h ADX is below the floor. Same snapshot/fail-open contract as
+    # the RSI/ATR vetoes above: reads the research-pass `adx4h` scalar (same
+    # timebase), and a missing/unparseable value SKIPS the veto (never blocks).
+    # Default OFF (min_adx4h=0) — validated by paired backtest before enabling;
+    # set runner_entry_gate.weak_trend_chase.min_adx4h (suggest 25) to enforce.
+    _wt_cfg = gate.get("weak_trend_chase") or {}
+    _wt_min_adx = float(_wt_cfg.get("min_adx4h", 0.0) or 0.0)
+    if _wt_min_adx > 0 and side in ("long", "short"):
+        _adx4h = analysis.get("adx4h")
+        if _adx4h is not None:
+            try:
+                _adx4h_val = float(_adx4h)
+                # Continuation-style impulse only; a self-volume-confirming
+                # range breakout is evaluated on its own RVOL, not suppressed by
+                # low ADX (a new trend starts from a low-ADX base).
+                _wt_is_continuation = (volume and burst_for_side) or burst_for_side
+                if _adx4h_val < _wt_min_adx and _wt_is_continuation and not breakout:
+                    logger.info(
+                        f"[runner_gate] {coin} BLOCKED: weak-trend chase "
+                        f"(4h ADX {_adx4h_val:.0f} < {_wt_min_adx:.0f}, "
+                        f"{side} burst without breakout)")
+                    return (
+                        f"runner_gate_blocked (weak-trend chase: 4h ADX "
+                        f"{_adx4h_val:.0f} < {_wt_min_adx:.0f}, no trend strength)")
+            except (TypeError, ValueError):
+                pass
+
     if side == "short":
         # E1 (Audit 2026-09-06): allow_shorts may be force-disabled by the
         # choppy-market overlay in enforce+de-risk posture (shadow never does).
@@ -5704,12 +5737,66 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                 _pc_detail["reason"] = (
                     f"repeat entry within {_pc_cfg.get('window_hours', 24)}h "
                     f"with score {score:.1f} < {_repeat_min:.0f}")
+
+            # Hemostat (2026-10-11): non-profit timeout-exit cooldown.
+            # ZEC churn root cause — ignite_timeout/stale_flat force a flat/scratch
+            # exit, realized PnL is ~0 (not <0), so the loss cooldown never arms,
+            # and cooldown_min (10m) expires before the next same-regime impulse.
+            # A position that never launched is a REJECTED setup: re-entering the
+            # same coin while the regime that rejected it persists just re-pays the
+            # 9bp round-trip. This paces re-entry after such an exit regardless of
+            # PnL sign. SHADOW reads the paper ledger (shadow closes never touch
+            # live memory — without this the arm is blind in shadow); LIVE reads
+            # the last live close. Default OFF (timeout_cooldown_min=0); enable
+            # after paired-backtest validation (suggest 30-60 min).
+            _tp_min = float(_pc_cfg.get("timeout_cooldown_min", 0) or 0)
+            if _pc_would is None and _tp_min > 0:
+                _tp_reasons = ("ignite_timeout", "stale_flat_timeout",
+                               "time_scratch", "hard_timeout")
+                _tp_close = None
+                _tp_source = "memory"
+                try:
+                    _run_mode = str(config.get("mode", "OFF")).upper()
+                    if _run_mode == "SHADOW":
+                        from hermes_trader.agents import shadow_book as _sb
+                        _tp_close = _sb.get_book().last_taker_close(coin)
+                        _tp_source = "shadow_book"
+                    else:
+                        _tp_close = memory.last_close_for(coin)
+                except Exception:
+                    _tp_close = None
+                if isinstance(_tp_close, dict):
+                    _tp_reason_raw = str(
+                        _tp_close.get("reason") or _tp_close.get("exit_reason") or "")
+                    _tp_base = _tp_reason_raw.split(" ", 1)[0]
+                    _tp_ts = _tp_close.get("ts") or _tp_close.get("closed_at")
+                    if _tp_base in _tp_reasons and isinstance(_tp_ts, (int, float)):
+                        _age_min = (_now_ms - float(_tp_ts)) / 60_000.0
+                        if 0 <= _age_min < _tp_min:
+                            _pc_would = "block"
+                            _pc_detail["reason"] = (
+                                f"{_tp_base} exit {_age_min:.0f}min ago "
+                                f"< cooldown {_tp_min:.0f}min (non-profit timeout)")
+                            _pc_detail["last_exit_reason"] = _tp_base
+                            _pc_detail["minutes_since_exit"] = round(_age_min, 1)
+                            _pc_detail["cooldown_source"] = _tp_source
+                            # Marker for the enforce decision below: this would
+                            # block came from the hemostat timeout arm, which
+                            # enforces on the active ledger even in SHADOW.
+                            _pc_detail["hemostat_timeout"] = True
+
             if _pc_would:
                 _record_risk_tuning_shadow(
                     rule="per_coin_cooldown", coin=coin, side=side,
                     would=_pc_would, detail=_pc_detail,
                     trace_id=str(analysis.get("id") or ""))
-                if not _pc_shadow:
+                # Hemostat timeout cooldown is a pacing rule for the ledger the
+                # system actually runs (paper in SHADOW, live in LIVE), so it
+                # must ENFORCE in shadow even though the legacy repeat/consec
+                # arms stay observe-only there (shadow_mode=true). Flagged by
+                # detail["hemostat_timeout"], set only by the timeout branch.
+                _tp_enforce = bool(_pc_detail.get("hemostat_timeout"))
+                if (not _pc_shadow) or _tp_enforce:
                     # ENFORCE：真正在 runner gate 拦截本次入场（shadow 记录保留
                     # 用于灰度对账）。
                     logger.info(
@@ -5920,25 +6007,34 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     return ""
 
 
-def close_position_market(coin: str) -> dict[str, Any]:
+def close_position_market(coin: str, reason: str = "") -> dict[str, Any]:
     """Market-close any open perp position for `coin`.
 
     C-M6 (deep audit 2026-08-28): the whole fetch→close→settle sequence runs
     under a per-coin lock so concurrent callers (trading loop + dashboard
     kill-switch + manual API) can't double-close / double-settle the same
     position. Different coins still close in parallel.
+
+    Hemostat (2026-10-11): optional DSL exit ``reason`` is threaded into the
+    outcome close row so a non-profit timeout exit (ignite/stale) can arm a
+    re-entry cooldown even when realized PnL is ~0. Defaults to "" for the
+    many manual/kill-switch callers that have no DSL reason.
     """
     with _get_close_lock(coin):
-        return _close_position_market_locked(coin)
+        return _close_position_market_locked(coin, reason=reason)
 
 
-def _close_position_market_locked(coin: str) -> dict[str, Any]:
+
+def _close_position_market_locked(coin: str, reason: str = "") -> dict[str, Any]:
     """Market-close any open perp position for `coin`. Deregisters the DSL tracker on success.
 
     Returns include `entry_px`, `fill_px`, and `realized_pnl_pct` (leveraged,
     net of taker fees) whenever the close fills with a parseable avgPx — so the
     trading loop can log the actual realized PnL instead of an estimate based
     on the pre-trade mid.
+
+    Hemostat (2026-10-11): ``reason`` is the DSL exit label (if the caller has
+    one) and is persisted on the outcome close row as ``exit_reason``.
     """
     user = resolve_user_address()
     if not user:
@@ -6242,6 +6338,10 @@ def _close_position_market_locked(coin: str) -> dict[str, Any]:
                 # when rate>0). Estimate (entry-rate held constant over the hold).
                 "funding_cost_usd": _funding_cost_usd,
                 "trace_id": _ec.get("trace_id"),
+                # Hemostat (2026-10-11): DSL exit label (canonical base), so a
+                # non-profit timeout exit can arm re-entry cooldown even when
+                # realized PnL is ~0. "" for manual/kill-switch closes.
+                "exit_reason": (reason or "").split(" ", 1)[0],
             }
             memory.record_close(_close_row)
             # Absorbed from TradingAgents: schedule a background qualitative

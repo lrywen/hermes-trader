@@ -382,7 +382,7 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
                     f"hold_min={_hold:.1f} mfe_spot_pct={_mfe:+.2f} "
                     f"exit_spot_pct={ex['unrealized_pct']:+.2f} "
                     f"exit_margin_pct={lpct:+.2f}")
-        res = close_position_market(coin)
+        res = close_position_market(coin, reason=_canon)
         evt = {
             "event": "dsl_exit",
             "coin": coin,

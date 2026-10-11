@@ -532,6 +532,30 @@ class ShadowBook:
                 continue
         return n
 
+    def last_taker_close(self, coin: str) -> Optional[dict[str, Any]]:
+        """Return this coin's most recent TAKER close fill, or None.
+
+        Hemostat (2026-10-11): the SHADOW counterpart of the live
+        ``memory.last_close_for`` used by the runner gate's per-coin cooldown.
+        Shadow entries/closes never touch live memory, so a cooldown reading
+        live memory is blind in SHADOW — this reads the paper ledger the system
+        actually populates in shadow mode. Carries the DSL ``reason`` and
+        ``realized_pnl_usd`` so a non-profit timeout exit can pace re-entry.
+        """
+        self.reload_if_changed()
+        with self._lock:
+            try:
+                fills = list(self._account("taker")["fills"])
+            except Exception:
+                return None
+        last: Optional[dict[str, Any]] = None
+        for f in fills:
+            if f.get("type") != "close" or f.get("coin") != coin:
+                continue
+            if last is None or int(f.get("ts") or 0) >= int(last.get("ts") or 0):
+                last = f
+        return last
+
     def _fresh_state(self) -> dict[str, Any]:
         return {
             "version": _STATE_VERSION,

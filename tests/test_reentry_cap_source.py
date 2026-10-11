@@ -97,3 +97,46 @@ def test_shadow_book_count_method_counts_only_taker_opens():
     assert b.count_openings_since("AAA", 0) == 3
     assert b.count_openings_since("BBB", 0) == 1
     assert b.count_openings_since("XXX", 0) == 0
+
+
+def _book_with_fills(fills):
+    from hermes_trader.agents.shadow_book import ShadowBook
+    b = ShadowBook.__new__(ShadowBook)
+
+    class _Lock:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    b._lock = _Lock()
+    b.reload_if_changed = lambda: False
+    b.state = {"accounts": {"taker": {"fills": fills}}}
+    b._account = lambda name: b.state["accounts"][name]
+    return b
+
+
+def test_last_taker_close_returns_most_recent_for_coin():
+    # Hemostat (2026-10-11): picks the newest CLOSE fill for the coin, ignoring
+    # opens and other coins.
+    b = _book_with_fills([
+        {"type": "open", "coin": "AAA", "ts": 1000},
+        {"type": "close", "coin": "BBB", "ts": 2000, "reason": "max_loss"},
+        {"type": "close", "coin": "AAA", "ts": 3000, "reason": "ignite_timeout (90m)"},
+        {"type": "close", "coin": "AAA", "ts": 2500, "reason": "floor_breach"},
+    ])
+    c = b.last_taker_close("AAA")
+    assert c is not None
+    assert c["ts"] == 3000
+    assert c["reason"].startswith("ignite_timeout")
+
+
+def test_last_taker_close_none_for_unseen_coin():
+    b = _book_with_fills([{"type": "close", "coin": "AAA", "ts": 1}])
+    assert b.last_taker_close("ZZZ") is None
+
+
+def test_last_taker_close_ignores_open_fills():
+    b = _book_with_fills([{"type": "open", "coin": "AAA", "ts": 9999}])
+    assert b.last_taker_close("AAA") is None

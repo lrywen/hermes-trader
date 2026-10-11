@@ -714,6 +714,10 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "trend_rsi_overbought": _num_leaf(0.0, 100.0),
         "rsi_oversold": _num_leaf(0.0, 100.0),
         "max_extension_atr": _num_leaf(0.0, 50.0),
+        # Hemostat (2026-10-11): weak-trend chase veto (0 = off).
+        "weak_trend_chase": {
+            "min_adx4h": _num_leaf(0.0, 100.0),
+        },
         "regime_direction_shadow_path": ("str",),
         "pullback_long": {
             "enabled": ("bool",),
@@ -738,6 +742,8 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "repeat_min_composite": _num_leaf(0.0, 100.0),
             "max_consecutive_losses": ("int", 0, 1000),
             "loss_cooldown_hours": _num_leaf(0.0, 100_000.0),
+            # Hemostat (2026-10-11): non-profit timeout-exit cooldown minutes.
+            "timeout_cooldown_min": _num_leaf(0.0, 100_000.0),
         },
     },
     "ta_late_entry": {

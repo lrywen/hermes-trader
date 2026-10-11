@@ -425,6 +425,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "trend_rsi_overbought": 80.0,
         "rsi_oversold": 25.0,
         "max_extension_atr": 2.5,
+        # Hemostat (2026-10-11): weak-trend chase veto. A burst/continuation
+        # entry (not a self-volume-confirming range breakout) into a coin whose
+        # 4h ADX is below the floor is chop-top noise that mean-reverts into
+        # the stop (the 59-trade max_loss bleed, MFE median 0.34%). Snapshot +
+        # fail-open (mirrors the RSI/ATR vetoes). min_adx4h=0 = OFF; suggested
+        # 25 after paired-backtest validation.
+        "weak_trend_chase": {
+            "min_adx4h": 0.0,
+        },
         # Counter-regime direction probe (observation only): path the
         # would_block verdicts append to. Empty falls back to
         # /data/regime_direction_shadow.jsonl.
@@ -474,6 +483,14 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "repeat_min_composite": 45.0,
             "max_consecutive_losses": 2,
             "loss_cooldown_hours": 24,
+            # Hemostat (2026-10-11): pace re-entry after a NON-PROFIT timeout
+            # exit (ignite/stale/time_scratch/hard_timeout) regardless of PnL
+            # sign. Such an exit (~0 realized) never arms the loss cooldown, so
+            # without this the same rejected setup re-fires on a short cooldown
+            # and re-pays the 9bp round-trip (ZEC churn). SHADOW reads the paper
+            # ledger, LIVE the last live close. 0 = OFF; suggested 30-60 min
+            # after paired-backtest validation.
+            "timeout_cooldown_min": 0,
         },
     },
     "plan_b": {

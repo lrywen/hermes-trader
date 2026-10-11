@@ -317,3 +317,147 @@ def test_pullback_long_overbought_not_admitted(isolated_gate):
     a = _analysis(confidence=0.85, composite_score=40.0,
                   uptrend_momentum_fired=True, slow_burn_count=2, rsi4h=72.0)
     assert "late trend-only chase" in _block(a, _pullback_gate())
+
+
+# ── 9. Hemostat (2026-10-11): weak-trend ADX chase veto ─────────────────────
+
+def _wt_gate(**kw):
+    wt = {"min_adx4h": 25.0}
+    wt.update(kw)
+    return _gate(weak_trend_chase=wt)
+
+
+def test_weak_trend_burst_chase_blocked_long(isolated_gate):
+    # burst (continuation) WITHOUT breakout, 4h ADX below floor → blocked.
+    a = _analysis(confidence=0.9, composite_score=50.0,
+                  momentum_burst_fired=True, adx4h=15.0)
+    assert "weak-trend chase" in _block(a, _wt_gate())
+
+
+def test_weak_trend_burst_chase_blocked_short(isolated_gate):
+    a = _analysis(side="short", confidence=0.9, composite_score=50.0,
+                  momentum_burst_fired=True, adx4h=15.0)
+    assert "weak-trend chase" in _block(a, _wt_gate())
+
+
+def test_strong_trend_burst_admits(isolated_gate):
+    # ADX above floor → veto skipped; volume+burst+slow structure admits.
+    a = _analysis(confidence=0.9, composite_score=35.0,
+                  volume_spike_fired=True, momentum_burst_fired=True,
+                  slow_burn_count=1, adx4h=30.0)
+    assert _block(a, _wt_gate()) == ""
+
+
+def test_weak_trend_does_not_touch_breakout(isolated_gate):
+    # A self-volume-confirming breakout starts a NEW trend from a low-ADX base
+    # and must never be suppressed by this veto.
+    a = _analysis(confidence=0.9, composite_score=35.0,
+                  breakout_fired=True, adx4h=12.0)
+    assert _block(a, _wt_gate()) == ""
+
+
+def test_weak_trend_veto_off_by_default(isolated_gate):
+    # No weak_trend_chase block / min_adx4h=0 → the veto must be inert even at
+    # very low ADX on a burst (volume+burst+slow admits).
+    a = _analysis(confidence=0.9, composite_score=35.0,
+                  volume_spike_fired=True, momentum_burst_fired=True,
+                  slow_burn_count=1, adx4h=5.0)
+    assert _block(a, _gate()) == ""
+
+
+def test_weak_trend_missing_adx_fails_open(isolated_gate):
+    # adx4h absent → fail-open (veto skipped); structure admits.
+    a = _analysis(confidence=0.9, composite_score=35.0,
+                  volume_spike_fired=True, momentum_burst_fired=True,
+                  slow_burn_count=1)
+    assert "adx4h" not in a
+    assert _block(a, _wt_gate()) == ""
+
+
+# ── 10. Hemostat (2026-10-11): non-profit timeout-exit cooldown ─────────────
+
+class _FakeShadowBook:
+    """Stub shadow ledger exposing only last_taker_close."""
+    def __init__(self, close):
+        self._close = close
+
+    def last_taker_close(self, coin):
+        return self._close
+
+
+def _tp_gate(minutes=60.0, shadow_mode=True):
+    return _gate(per_coin_cooldown={
+        "shadow_mode": shadow_mode,
+        "fail_closed": True,
+        "window_hours": 24,
+        "repeat_min_composite": 45.0,
+        "max_consecutive_losses": 2,
+        "loss_cooldown_hours": 24,
+        "timeout_cooldown_min": minutes,
+    })
+
+
+def _install_shadow_close(monkeypatch, close, mode="SHADOW"):
+    import hermes_trader.agents.shadow_book as sb
+    fake = _FakeShadowBook(close)
+    monkeypatch.setattr(sb, "get_book", lambda: fake)
+    cfg = {"mode": mode, "runner_entry_gate": {}}
+    return cfg
+
+
+def test_timeout_exit_paces_shadow_reentry(isolated_gate, monkeypatch):
+    now_ms = int(time.time() * 1000)
+    close = {"type": "close", "coin": "TST", "ts": now_ms - 10 * 60_000,
+             "reason": "ignite_timeout (90min no launch)",
+             "realized_pnl_usd": -0.02}
+    cfg = _tp_gate(minutes=60.0)
+    cfg["mode"] = "SHADOW"
+    import hermes_trader.agents.shadow_book as sb
+    monkeypatch.setattr(sb, "get_book", lambda: _FakeShadowBook(close))
+    # Fresh breakout candidate; only the timeout cooldown should stop it.
+    a = _analysis(confidence=0.9, composite_score=50.0, breakout_fired=True)
+    reason = _block(a, cfg)
+    assert "non-profit timeout" in reason
+    assert "ignite_timeout" in reason
+
+
+def test_timeout_exit_cooldown_expired_allows(isolated_gate, monkeypatch):
+    now_ms = int(time.time() * 1000)
+    close = {"type": "close", "coin": "TST", "ts": now_ms - 120 * 60_000,
+             "reason": "stale_flat_timeout (90min below protect)"}
+    cfg = _tp_gate(minutes=60.0)
+    cfg["mode"] = "SHADOW"
+    import hermes_trader.agents.shadow_book as sb
+    monkeypatch.setattr(sb, "get_book", lambda: _FakeShadowBook(close))
+    a = _analysis(confidence=0.9, composite_score=50.0, breakout_fired=True)
+    assert _block(a, cfg) == ""
+
+
+def test_profitable_trailing_exit_not_cooled(isolated_gate, monkeypatch):
+    # floor_breach (trailing stop) is a WORKING exit, not a rejected setup —
+    # it must NOT arm the timeout cooldown.
+    now_ms = int(time.time() * 1000)
+    close = {"type": "close", "coin": "TST", "ts": now_ms - 5 * 60_000,
+             "reason": "floor_breach", "realized_pnl_usd": 1.25}
+    cfg = _tp_gate(minutes=60.0)
+    cfg["mode"] = "SHADOW"
+    import hermes_trader.agents.shadow_book as sb
+    monkeypatch.setattr(sb, "get_book", lambda: _FakeShadowBook(close))
+    a = _analysis(confidence=0.9, composite_score=50.0, breakout_fired=True)
+    assert _block(a, cfg) == ""
+
+
+def test_timeout_cooldown_off_by_default(isolated_gate, monkeypatch):
+    # timeout_cooldown_min absent/0 → inert regardless of recent timeout exit.
+    now_ms = int(time.time() * 1000)
+    close = {"type": "close", "coin": "TST", "ts": now_ms - 1000,
+             "reason": "ignite_timeout"}
+    cfg = _gate(per_coin_cooldown={
+        "shadow_mode": True, "fail_closed": True, "window_hours": 24,
+        "repeat_min_composite": 45.0, "max_consecutive_losses": 2,
+        "loss_cooldown_hours": 24})
+    cfg["mode"] = "SHADOW"
+    import hermes_trader.agents.shadow_book as sb
+    monkeypatch.setattr(sb, "get_book", lambda: _FakeShadowBook(close))
+    a = _analysis(confidence=0.9, composite_score=50.0, breakout_fired=True)
+    assert _block(a, cfg) == ""
