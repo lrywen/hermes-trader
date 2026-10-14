@@ -2113,6 +2113,20 @@ while True:
                                                  if t.get("fired") and t.get("name")]}
                                    for p in results if p.get("coin")]})
 
+        # P1: append-only decision snapshots for counterfactual replay. Persist
+        # what each triggered perception saw (mid / score / triggers / micro
+        # reads) plus equity, so a blocked intent's context is reconstructible
+        # offline even though no order was placed. Best-effort, never blocks.
+        try:
+            from hermes_trader.agents.decision_snapshot import record_cycle_snapshots
+            record_cycle_snapshots(
+                results,
+                equity=float(state.get("equity", 0) or 0),
+                mode=str(startup_mode or ""),
+            )
+        except Exception as _snap_e:
+            logger.debug("decision snapshot append failed: %s", _snap_e)
+
         # Surge detection: feed every trigger result (score >= gate) to the
         # postmortem watcher. It compares against the previous cycle and fires
         # a postmortem when a coin crosses the gate with a large score jump

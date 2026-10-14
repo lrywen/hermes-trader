@@ -44,6 +44,10 @@ DEFAULT_BOOK_RETENTION_DAYS = 90
 # 放量前的成交/滑点画像使用。逐笔量大但仅 2 币，保留 30 天足以覆盖离线
 # 分析窗口。可用 HERMES_TAPE_RETENTION_DAYS 覆盖。
 DEFAULT_TAPE_RETENTION_DAYS = 30
+# decision-snapshots（P1）是每周期触发币的决策上下文（mid/score/triggers/
+# equity），供 NOFX 式反事实重放。体量小（仅触发币、标量），保留 30 天覆盖
+# canary 分析窗口。可用 HERMES_SNAPSHOT_RETENTION_DAYS 覆盖。
+DEFAULT_SNAPSHOT_RETENTION_DAYS = 30
 
 
 def retention_for(base: Path) -> int:
@@ -53,6 +57,9 @@ def retention_for(base: Path) -> int:
     if base.name == "tape-raw":
         env = os.environ.get("HERMES_TAPE_RETENTION_DAYS")
         return int(env) if env and env.isdigit() else DEFAULT_TAPE_RETENTION_DAYS
+    if base.name == "decision-snapshots":
+        env = os.environ.get("HERMES_SNAPSHOT_RETENTION_DAYS")
+        return int(env) if env and env.isdigit() else DEFAULT_SNAPSHOT_RETENTION_DAYS
     env = os.environ.get("HERMES_TRADES_RETENTION_DAYS")
     return int(env) if env and env.isdigit() else DEFAULT_RETENTION_DAYS
 
@@ -62,10 +69,10 @@ def raw_dir() -> Path:
 
 
 def raw_dirs() -> list[Path]:
-    """本脚本负责清理的全部原始根目录（trades-raw + book-raw + tape-raw）。"""
+    """本脚本负责清理的全部原始根目录（trades/book/tape/decision 快照）。"""
     data_root = Path(os.environ.get("HERMES_DATA_DIR", "/data"))
     return [data_root / "trades-raw", data_root / "book-raw",
-            data_root / "tape-raw"]
+            data_root / "tape-raw", data_root / "decision-snapshots"]
 
 
 def expired_dirs(base: Path, *, today: date, retention_days: int

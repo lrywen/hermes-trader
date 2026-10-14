@@ -822,8 +822,36 @@ _RISK_GATE_LABELS = frozenset({
 })
 
 
+def _clean_proposed(proposed: dict[str, Any] | None) -> dict[str, float]:
+    """Coerce the would-be order plan into a fixed-schema, finite-float dict.
+
+    Only the whitelisted scalar keys are kept (flat cardinality); non-finite or
+    missing values are dropped so the replay ledger never carries NaN/Inf. This is
+    a *proposal* for counterfactual replay, never an order instruction.
+    """
+    keys = (
+        "notional_usd", "leverage", "entry_px", "stop_px", "tp_px",
+        "stop_distance_pct", "size_usd",
+    )
+    out: dict[str, float] = {}
+    if not isinstance(proposed, dict):
+        return out
+    for k in keys:
+        v = proposed.get(k)
+        if v is None:
+            continue
+        try:
+            fv = float(v)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(fv):
+            out[k] = fv
+    return out
+
+
 def _record_risk_gate_block(analysis: dict[str, Any],
-                            gate_output: dict[str, Any]) -> None:
+                            gate_output: dict[str, Any],
+                            proposed: dict[str, Any] | None = None) -> None:
     """P1-5: durably record a risk-gate block in events.jsonl.
 
     Gate blocks were previously visible only via ``logger.debug`` (silent in
@@ -867,6 +895,12 @@ def _record_risk_gate_block(analysis: dict[str, Any],
                 "composite_score": analysis.get("composite_score"),
                 "block_reasons": gate_output.get("block_reasons") or [],
                 "gates": gates,
+                # P1: the order this signal WOULD have placed if every gate had
+                # passed. Sizing is already computed before eval_all_gates; before
+                # this it was discarded on the blocked branch, so a blocked intent
+                # could not be replayed under different gates. All values are the
+                # proposed plan only — nothing here is an order. Bounded scalars.
+                "proposed": _clean_proposed(proposed),
             },
             trace_id=str(analysis.get("trace_id") or ""),
         )
@@ -4478,7 +4512,19 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         # loop logs one with full gate_results) AND — for every caller, not
         # just the loop — the structured `risk_gate` record below (P1-5).
         _record_decision("blocked")
-        _record_risk_gate_block(analysis, gate_output)
+        _record_risk_gate_block(
+            analysis,
+            gate_output,
+            proposed={
+                "notional_usd": trade_notional,
+                "size_usd": trade_notional / float(leverage) if leverage else None,
+                "leverage": leverage,
+                "entry_px": mid_price if mid_price > 0 else analysis.get("entry_px"),
+                "stop_px": stop_px,
+                "tp_px": tp_px,
+                "stop_distance_pct": _h4_stop_distance_pct,
+            },
+        )
         return {
             "executed": False, "mode": mode,
             "analysis_id": analysis["id"],

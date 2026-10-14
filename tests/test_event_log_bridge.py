@@ -198,6 +198,64 @@ def test_risk_gate_block_increments_prometheus_counter(tmp_path, monkeypatch):
     assert _val("other") == before_other + 1.0
 
 
+def test_clean_proposed_keeps_finite_whitelisted_scalars():
+    from hermes_trader.agents import executor
+    out = executor._clean_proposed({
+        "notional_usd": 120.5, "leverage": 3, "entry_px": "81800",
+        "stop_px": None, "tp_px": float("nan"), "stop_distance_pct": 0.04,
+        "size_usd": 40.2, "unexpected": {"x": 1}, "bad": "oops",
+    })
+    assert out == {
+        "notional_usd": 120.5, "leverage": 3.0, "entry_px": 81800.0,
+        "stop_distance_pct": 0.04, "size_usd": 40.2,
+    }
+    # None / non-dict inputs degrade to empty (never raise).
+    assert executor._clean_proposed(None) == {}
+    assert executor._clean_proposed("nope") == {}
+
+
+def test_risk_gate_block_records_proposed_plan(tmp_path, monkeypatch):
+    """P1-a: a blocked intent must carry the WOULD-BE order plan (sizing/
+    leverage/SL/TP) so it can be replayed under different gates; non-finite
+    values are dropped, and it is clearly a proposal, not an order."""
+    from hermes_trader.agents import executor
+    ev_file = tmp_path / "events.jsonl"
+    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev_file))
+
+    executor._record_risk_gate_block(
+        {"coin": "ETH", "side": "short", "verdict": "SHORT"},
+        {"block_reasons": ["notional cap"],
+         "results": {"notional_cap": {"pass": False, "reason": "notional cap"}}},
+        proposed={
+            "notional_usd": 60.0, "leverage": 2, "entry_px": 1800.0,
+            "stop_px": 1850.0, "tp_px": 1700.0, "stop_distance_pct": 0.027,
+            "size_usd": 30.0,
+        },
+    )
+    events = _read_events(str(ev_file))
+    p = [e for e in events if e["event"] == "risk_gate"][0]["payload"]
+    assert p["proposed"]["notional_usd"] == 60.0
+    assert p["proposed"]["leverage"] == 2.0
+    assert p["proposed"]["stop_px"] == 1850.0
+    assert p["proposed"]["tp_px"] == 1700.0
+    assert p["proposed"]["stop_distance_pct"] == 0.027
+
+
+def test_risk_gate_block_proposed_defaults_empty(tmp_path, monkeypatch):
+    """Backward-compat: callers that don't pass proposed still record an empty
+    plan dict (old call sites, e.g. manual/CLI)."""
+    from hermes_trader.agents import executor
+    monkeypatch.setattr(event_log, "EVENTS_FILE",
+                        str(tmp_path / "events.jsonl"))
+    executor._record_risk_gate_block(
+        {"coin": "BTC", "side": "long"},
+        {"results": {"cooldown": {"pass": False, "reason": "x"}}},
+    )
+    events = _read_events(str(tmp_path / "events.jsonl"))
+    p = [e for e in events if e["event"] == "risk_gate"][0]["payload"]
+    assert p["proposed"] == {}
+
+
 def test_dashboard_redact_scrubs_secrets():
     """F17: _redact must mask Authorization/Bearer/api_key fields and a raw
     key string interpolated into a message, before it reaches a response."""
