@@ -28,6 +28,24 @@ from .significance import (
     sharpe,
     walk_forward_analysis,
 )
+from .llm_provenance import (
+    CLEAN,
+    CONTAMINATED,
+    UNKNOWN,
+    LLMProvenance,
+    annotate_contamination,
+    lookup_training_cutoff,
+    parse_utc_date,
+)
+from .microstructure_edge import (
+    HARVEY_MIN_ABS_T,
+    KyleResult,
+    kyles_lambda_with_intercept,
+    ofi_cont_best_level,
+    ofi_depth,
+    paired_t_against_random,
+    permute_flow_within_bars,
+)
 
 __all__ = [
     "CPCVResult",
@@ -39,4 +57,20 @@ __all__ = [
     "deflated_sharpe_prob",
     "probability_of_backtest_overfitting",
     "sharpe",
+    # P0-3 LLM 训练截止日污染标注
+    "CLEAN",
+    "CONTAMINATED",
+    "UNKNOWN",
+    "LLMProvenance",
+    "annotate_contamination",
+    "lookup_training_cutoff",
+    "parse_utc_date",
+    # P0-1/2 微结构 edge 研究原语
+    "HARVEY_MIN_ABS_T",
+    "KyleResult",
+    "kyles_lambda_with_intercept",
+    "ofi_cont_best_level",
+    "ofi_depth",
+    "paired_t_against_random",
+    "permute_flow_within_bars",
 ]
