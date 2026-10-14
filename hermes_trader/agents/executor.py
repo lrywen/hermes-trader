@@ -2868,10 +2868,28 @@ def _register_filled_position(*, analysis: dict[str, Any], config: dict[str, Any
     }
 
 
+def _should_emergency_flatten(*, sl_missing: bool, mode: str,
+                              config: dict[str, Any]) -> bool:
+    """P3 pure policy: whether a fill with no confirmed server-side stop must be
+    market-flattened immediately (NOFX-style zero-naked-position guarantee).
+
+    True only when ALL hold: the stop is genuinely missing, the fill is real
+    LIVE money (never SHADOW/paper — there is no real position to flatten), and
+    the operator has explicitly armed ``flatten_on_sl_missing`` (opt-in, so
+    default behavior stays deferred-re-arm + alert).
+    """
+    return (
+        bool(sl_missing)
+        and str(mode).upper() == "LIVE"
+        and bool(config.get("flatten_on_sl_missing", False))
+    )
+
+
 def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
                               is_buy: bool, trade_side: str, atr: float,
                               entry_px: float, size_in_coin: float,
-                              stop_px: Any, tp_px: Any) -> dict[str, float]:
+                              stop_px: Any, tp_px: Any,
+                              mode: str = "SHADOW") -> dict[str, float]:
     """Place the post-fill server-side bracket: the backup exchange stop-loss
     (fast safety net under the DSL floor, with the post-HYPE ceiling clamp) and
     the take-profit scale-out. Returns {sl_missing, final_sl, final_tp} — the
@@ -2975,6 +2993,39 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
         except Exception as _alert_e:
             logger.error("[executor] fund-safety risk alert failed: %r", _alert_e)
 
+    # P3 (NOFX-style zero-naked-position guarantee): opt-in emergency flatten.
+    # If a REAL LIVE fill ended with no confirmed server-side stop after the
+    # immediate retry/cloid claim, carrying it on only the 60s DSL soft stop
+    # leaves an unhedged gap window. When the operator has explicitly armed
+    # ``flatten_on_sl_missing``, market-close the coin at once rather than hope.
+    # SHADOW/paper fills never reach here (no real position); the deferred
+    # re-arm queue + alert remain in place regardless as the recovery path.
+    emergency_flat = False
+    if _should_emergency_flatten(sl_missing=sl_missing, mode=mode,
+                                 config=config):
+        try:
+            _flat = close_position_market(
+                coin, reason="emergency:backup_sl_missing")
+            emergency_flat = bool(_flat.get("ok")) and not _flat.get("noop")
+            logger.error(
+                "[executor] flatten_on_sl_missing armed for %s: emergency "
+                "market close result ok=%s noop=%s",
+                coin, _flat.get("ok"), _flat.get("noop"))
+            try:
+                from hermes_trader import notify
+                notify.send_text(
+                    f"🛑 {coin} 备份止损挂单失败，已触发紧急市价平仓\n"
+                    f"结果 ok={_flat.get('ok')} noop={_flat.get('noop')}\n"
+                    f"请立即核对持仓与残留挂单",
+                    category="risk")
+            except Exception as _alert_e:
+                logger.error("flatten alert failed: %r", _alert_e)
+        except Exception as _flat_e:
+            # Never let the safety action mask the missing-stop state.
+            logger.error(
+                "[executor] emergency flatten FAILED for %s: %r — naked "
+                "position persists, manual action required", coin, _flat_e)
+
     # Take-profit scale-out — the OFFENSIVE complement to the backup SL. Banks a
     # fraction of the position SERVER-SIDE at the TP target so a winner is
     # CAPTURED at target (instantly, between 60s DSL checks) instead of running
@@ -3019,7 +3070,7 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
         final_tp = tp_px
 
     return {"sl_missing": sl_missing, "final_sl": final_sl, "final_tp": final_tp,
-            "bracket_error": bracket_error}
+            "bracket_error": bracket_error, "emergency_flattened": emergency_flat}
 
 
 def _dispatch_entry_shadow_probes(analysis: dict[str, Any],
@@ -4907,11 +4958,12 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     _brackets = _place_post_fill_brackets(
         config=config, coin=coin, is_buy=is_buy, trade_side=trade_side,
         atr=atr, entry_px=entry_px, size_in_coin=size_in_coin,
-        stop_px=stop_px, tp_px=tp_px)
+        stop_px=stop_px, tp_px=tp_px, mode=mode)
     sl_missing = _brackets["sl_missing"]
     final_sl = _brackets["final_sl"]
     final_tp = _brackets["final_tp"]
     bracket_error = _brackets.get("bracket_error")
+    emergency_flattened = bool(_brackets.get("emergency_flattened"))
 
     _record_decision("executed")
     _record_entry(trade_side)
@@ -4926,6 +4978,10 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         "tp_px": final_tp,
         "dsl_registered": True,
         "sl_missing": sl_missing,
+        # P3: True when opt-in emergency flatten fired because the LIVE fill had
+        # no confirmed server-side stop. The fill still exists in the record, but
+        # the position was immediately market-closed.
+        "emergency_flattened": emergency_flattened,
         # Audit 2026-09-10: surfaced so the loop can log/fork it when the fill
         # is live but one bracket leg failed to arm. Never flips executed to
         # False — the position already exists on the exchange.

@@ -69,6 +69,9 @@ class _ConfigPatch(BaseModel):
     # old open-blocking-only behavior.
     auto_flatten_on_global_halt: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_global_halt"])
     auto_flatten_on_coin_circuit: bool = Field(default=CANONICAL_DEFAULTS["auto_flatten_on_coin_circuit"])
+    # P3: market-flatten a LIVE fill that ends with no confirmed server-side
+    # backup stop (opt-in; default preserves the deferred-re-arm behavior).
+    flatten_on_sl_missing: bool = Field(default=CANONICAL_DEFAULTS["flatten_on_sl_missing"])
     # C3 (HYPE RCA item 5): blow-up-level self-halt on a single trade's ROE loss.
     roe_halt_enabled: bool = Field(default=CANONICAL_DEFAULTS["roe_halt_enabled"])
 

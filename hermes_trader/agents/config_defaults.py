@@ -28,6 +28,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # branch accepts both int and float; the literals just must be float-typed.
     "max_trade_notional_usd": 30.0,
     "tp_scale_fraction": 0.5,
+    # P3 (NOFX-style fund safety): when a LIVE fill ends with NO confirmed
+    # server-side backup stop (placement failed after all retries/cloid claim),
+    # immediately market-flatten the coin instead of carrying a naked position
+    # protected only by the 60s DSL soft stop. Opt-IN (default False = current
+    # behavior: enqueue deferred re-arm + loud risk alert). Only acts on real
+    # LIVE positions; SHADOW/paper fills are never flattened (no real position).
+    "flatten_on_sl_missing": False,
     "max_concurrent": 2,
     "max_total_notional_pct": 2.0,
     # Audit 2026-09-04 P0-3 (dimensional clarity): `max_total_notional_pct` is

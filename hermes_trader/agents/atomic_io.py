@@ -90,6 +90,7 @@ def write_json_atomic(
     fsync: bool = True,
     ebusy_fallback: bool = False,
     default: Callable[[Any], Any] | None = None,
+    allow_nan: bool = True,
 ) -> None:
     """Atomically write ``data`` as JSON to ``path``.
 
@@ -104,6 +105,12 @@ def write_json_atomic(
             bind mount), rewrite the target in place instead of raising.
         default: optional json.dump ``default`` serializer for otherwise
             non-JSON-native values (e.g. ``str`` for Path/datetime).
+        allow_nan: default True preserves legacy behavior. Pass False for
+            research/ledger writes that must never emit the non-standard
+            ``NaN``/``Infinity`` tokens (which strict parsers reject); json then
+            raises ValueError on a non-finite value instead of writing illegal
+            JSON. Not forced globally because shared state writers (memory,
+            positions, config) must keep persisting rather than fail on NaN.
 
     The parent directory is created if missing.
 
@@ -119,7 +126,8 @@ def write_json_atomic(
     fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
     try:
         with os.fdopen(fd, "w") as f:
-            json.dump(data, f, indent=indent, default=default)
+            json.dump(data, f, indent=indent, default=default,
+                      allow_nan=allow_nan)
             f.flush()
             if fsync:
                 os.fsync(f.fileno())
@@ -146,6 +154,7 @@ def locked_write_json_atomic(
     fsync: bool = True,
     ebusy_fallback: bool = False,
     default: Callable[[Any], Any] | None = None,
+    allow_nan: bool = True,
 ) -> None:
     """Like :func:`write_json_atomic` but serialised by a cross-process flock.
 
@@ -159,7 +168,7 @@ def locked_write_json_atomic(
         write_json_atomic(
             path, data,
             indent=indent, fsync=fsync, ebusy_fallback=ebusy_fallback,
-            default=default,
+            default=default, allow_nan=allow_nan,
         )
     finally:
         try:
