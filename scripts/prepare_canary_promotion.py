@@ -68,6 +68,8 @@ def gather_evidence(arm: str, grades: dict, *, killswitch_tested: bool,
         "pbo": stats.get("pbo"),
         "wfr": stats.get("wfr"),
         "realistic_fill_positive": g.get("realistic_fill_positive"),
+        # P2-a: newest graded observation time, for the evidence-freshness gate.
+        "last_record_ms": g.get("last_record_ms"),
         "killswitch_tested": killswitch_tested,
         "orderable": orderable,
     }

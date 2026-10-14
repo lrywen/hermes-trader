@@ -1663,6 +1663,10 @@ def _slim_snapshot(d: dict, source: str = "cron") -> dict:
                              if mature else None,
             "warnings": a.get("warnings", []),
             "collection_stalled": a.get("collection_stalled"),
+            # P2-a: newest observation time so the canary freshness gate can
+            # reject evidence that only describes an old regime.
+            "last_record_ms": a.get("last_record_ms"),
+            "last_record_age_h": a.get("last_record_age_h"),
             "windows": windows,
         }
         # R5: carry the offline robustness block and its derived evidence into

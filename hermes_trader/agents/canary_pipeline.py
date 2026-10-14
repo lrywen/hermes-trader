@@ -59,24 +59,50 @@ DEFAULT_GATES: dict[str, Any] = {
     "require_realistic_fill_positive": True,  # net positive after slippage
     "require_killswitch_tested": True,
     "require_orderable": True,
+    # ── P2 evidence-discipline gates ──────────────────────────────────────
+    # Stale evidence: a positive result measured only on old data may reflect a
+    # regime that has since changed (Vibe-Trading fresh/aging/stale). The newest
+    # graded observation must be within this many days. Relative (not the
+    # A-share-style 730-day coverage floor, which a young SHADOW book can never
+    # meet and which would lock the gate shut forever).
+    "max_evidence_age_days": 14,
+    # Breakeven-fee: the net edge must clear a minimum economic cushion beyond
+    # zero so a "statistically significant" edge cannot evaporate after the
+    # modeled round-trip cost. Conservative taker round-trip floor in bps
+    # (fees + cross + modeled slippage); the r5 net edge is already post-cost,
+    # this is the explicit thickness bar kept in lockstep with min_net_edge_bps.
+    "breakeven_fee_bps": 6.0,
+    # Borderline band: a CI lower bound that clears 0 but sits inside this bps
+    # band does NOT hard-fail (the edge is still positive) but is flagged
+    # borderline so an operator sees a marginal edge rather than silently
+    # queueing it as robust. Does not change pass/fail; surfaced as a marker.
+    "ci_borderline_bps": 3.0,
 }
 
 
 def evaluate_gates(evidence: dict[str, Any],
-                   gates: Optional[dict[str, Any]] = None
+                   gates: Optional[dict[str, Any]] = None,
+                   *,
+                   now_ms: Optional[int] = None,
                    ) -> dict[str, Any]:
-    """Pure gate evaluation. Returns ``{passed, checks}`` with one boolean per
-    dimension plus the human-readable reason for every failed check.
+    """Pure gate evaluation. Returns ``{passed, checks, borderline}`` with one
+    boolean per dimension plus the human-readable reason for every failed check.
 
     ``evidence`` is expected to carry (missing keys fail their check rather
     than raising — an evidence gap must never be auto-promoted):
 
       mature_outcomes, independent_days, net_edge_bps, bb_ci_lo_bps, dsr_p,
-      pbo, wfr, realistic_fill_positive, killswitch_tested, orderable
+      pbo, wfr, realistic_fill_positive, killswitch_tested, orderable,
+      last_record_ms (P2 staleness).
+
+    ``borderline`` is a non-fatal marker list: the arm clears every hard gate
+    but a dimension sits in the pre-registered marginal band (currently the
+    bootstrap CI lower bound inside (0, ci_borderline_bps]).
     """
     g = dict(DEFAULT_GATES)
     if gates:
         g.update(gates)
+    now_ms = int(now_ms if now_ms is not None else time.time() * 1000)
 
     def num(key: str) -> Optional[float]:
         v = evidence.get(key)
@@ -99,12 +125,17 @@ def evaluate_gates(evidence: dict[str, Any],
         f"independent_days={v} >= {g['min_independent_days']}")
 
     v = num("net_edge_bps")
-    add("economic_thickness", v is not None and v >= g["min_net_edge_bps"],
-        f"net_edge_bps={v} >= {g['min_net_edge_bps']}")
+    # P2: a single thickness check must clear BOTH the net-edge floor and the
+    # breakeven-fee cushion (take the stricter of the two configured values).
+    edge_floor = max(float(g["min_net_edge_bps"]),
+                     float(g["breakeven_fee_bps"]))
+    add("economic_thickness", v is not None and v >= edge_floor,
+        f"net_edge_bps={v} >= breakeven floor {edge_floor} "
+        f"(net>={g['min_net_edge_bps']}, fee>={g['breakeven_fee_bps']})")
 
-    v = num("bb_ci_lo_bps")
-    add("bootstrap_ci", v is not None and v > g["min_bb_ci_lo_bps"],
-        f"bb_ci_lo_bps={v} > {g['min_bb_ci_lo_bps']}")
+    ci_lo = num("bb_ci_lo_bps")
+    add("bootstrap_ci", ci_lo is not None and ci_lo > g["min_bb_ci_lo_bps"],
+        f"bb_ci_lo_bps={ci_lo} > {g['min_bb_ci_lo_bps']}")
 
     v = num("dsr_p")
     add("deflated_sharpe", v is not None and v >= g["min_dsr_p"],
@@ -118,6 +149,17 @@ def evaluate_gates(evidence: dict[str, Any],
     # R5 walk-forward efficiency: must strictly EXCEED the threshold.
     add("walk_forward", v is not None and v > g["max_wfr"],
         f"wfr={v} > {g['max_wfr']}")
+
+    # P2-a: evidence freshness. The newest graded observation must be recent
+    # enough that the result still represents the live regime. Missing
+    # last_record_ms fails closed (cannot prove freshness).
+    last_ms = num("last_record_ms")
+    max_age_ms = float(g["max_evidence_age_days"]) * 86_400_000.0
+    age_days = ((now_ms - last_ms) / 86_400_000.0) if last_ms is not None else None
+    fresh = age_days is not None and 0.0 <= age_days <= float(g["max_evidence_age_days"])
+    add("evidence_freshness", fresh,
+        f"newest_evidence_age_days={None if age_days is None else round(age_days, 2)}"
+        f" <= {g['max_evidence_age_days']}")
 
     if g["require_realistic_fill_positive"]:
         ok = bool(evidence.get("realistic_fill_positive"))
@@ -134,8 +176,22 @@ def evaluate_gates(evidence: dict[str, Any],
         add("orderable", ok,
             f"account meets min-order/target size={ok}")
 
+    # P2-c: non-fatal marginal-edge marker. A positive but razor-thin CI lower
+    # bound still passes the hard >0 gate, but the arm is flagged borderline so
+    # the approval record/UI can surface "robust vs marginal". Only meaningful
+    # when the CI gate itself passes.
+    borderline: list[dict[str, Any]] = []
+    band = float(g["ci_borderline_bps"])
+    ci_gate = next(c for c in checks if c["gate"] == "bootstrap_ci")
+    if ci_gate["passed"] and ci_lo is not None and ci_lo < band:
+        borderline.append({
+            "dimension": "bootstrap_ci",
+            "detail": (f"bb_ci_lo_bps={ci_lo} clears 0 but is inside the "
+                       f"borderline band (0, {band}) — marginal, not robust"),
+        })
+
     passed = all(c["passed"] for c in checks)
-    return {"passed": passed, "checks": checks}
+    return {"passed": passed, "checks": checks, "borderline": borderline}
 
 
 def build_pending_record(
@@ -150,7 +206,7 @@ def build_pending_record(
     unqualified arm must never be queued for approval). The record is inert —
     it carries evidence and asks a human to approve; it cannot be traded on.
     """
-    res = evaluate_gates(evidence, gates)
+    res = evaluate_gates(evidence, gates, now_ms=now_ms)
     if not res["passed"]:
         failed = [c["gate"] for c in res["checks"] if not c["passed"]]
         raise ValueError(
@@ -162,6 +218,8 @@ def build_pending_record(
         "arm": arm,
         "evidence": evidence,
         "checks": res["checks"],
+        # P2-c: non-fatal marginal markers (arm passed but sits on a thin edge).
+        "borderline": res["borderline"],
         "config_sha256": config_sha256,
         "created_ms": now_ms,
         "decided_ms": None,
