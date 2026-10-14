@@ -23,6 +23,12 @@ def gate_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _operator_token(monkeypatch):
+    # P4-2: records must verify against an operator-token HMAC.
+    monkeypatch.setenv("HERMES_OPERATOR_TOKEN", "test-operator-token")
+
+
+@pytest.fixture(autouse=True)
 def _reset_cache():
     # Force a fresh TTL window for every test.
     cache = executor._live_gate_cache
@@ -34,8 +40,8 @@ def _reset_cache():
 
 
 def _good_record(cfg):
-    return {
-        "version": 1,
+    rec = {
+        "version": 2,
         "decision": "outcome_a_go_live",
         "arms": ["filt"],
         "block_bootstrap_ci": [1.2, 8.4],
@@ -43,7 +49,9 @@ def _good_record(cfg):
         "config_sha256": live_gate.config_sha256(cfg),
         "operator": "ops",
         "utc_iso": "2026-09-24T00:00:00Z",
+        "not_after": "2031-01-01T00:00:00Z",
     }
+    return live_gate.sign_acceptance_record(rec, token="test-operator-token")
 
 
 def test_non_live_not_evaluated(gate_file):

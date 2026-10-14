@@ -23,15 +23,93 @@ calls :func:`startup_live_gate_errors` before the first scan.
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-RECORD_VERSION = 1
+RECORD_VERSION = 2
 _REQUIRED_FIELDS = (
     "version", "decision", "arms", "block_bootstrap_ci",
     "config_src", "config_sha256", "operator", "utc_iso",
+    "not_after", "sig_algo", "sig",
 )
+
+# P4-2: a LIVE mandate is time-boxed. Default horizon for a freshly minted
+# record; after not_after the record stops authorizing NEW entries (existing
+# positions keep running under their DSL/stop management).
+DEFAULT_TTL_DAYS = 30
+
+_OPERATOR_TOKEN_ENV = "HERMES_OPERATOR_TOKEN"
+SIG_ALGO = "hmac-sha256"
+
+# Timestamp format for not_after / utc_iso parsing ("...Z" or explicit offset).
+_ISO_FORMATS = ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S%z")
+
+
+def _parse_utc(ts: str) -> Optional[datetime]:
+    """Parse an ISO-8601 UTC timestamp; None when malformed."""
+    s = str(ts or "").strip()
+    if not s:
+        return None
+    for fmt in _ISO_FORMATS:
+        try:
+            dt = datetime.strptime(s, fmt)
+        except ValueError:
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    return None
+
+
+def _signing_payload(record: dict[str, Any]) -> bytes:
+    """Canonical bytes covered by the signature: every field except the
+    signature itself (``sig``), sorted, so key order on disk can't matter."""
+    body = {k: v for k, v in record.items() if k != "sig"}
+    return json.dumps(
+        body, sort_keys=True, separators=(",", ":"),
+        ensure_ascii=False, default=str,
+    ).encode("utf-8")
+
+
+def _operator_token() -> str:
+    return os.environ.get(_OPERATOR_TOKEN_ENV, "")
+
+
+def sign_acceptance_record(record: dict[str, Any], *, token: Optional[str] = None) -> dict[str, Any]:
+    """Attach an HMAC-SHA256 signature over the record body.
+
+    Uses HERMES_OPERATOR_TOKEN (or an explicit *token*). This does NOT defend
+    against the trading process signing its own records (it can read the env
+    token); it proves the record was minted by a holder of the operator token
+    and has not been hand-edited / corrupted afterwards. Raises ValueError if
+    no token is configured — a record must never be written unsigned.
+    """
+    secret = token if token is not None else _operator_token()
+    if not secret:
+        raise ValueError(
+            f"refusing to sign: {_OPERATOR_TOKEN_ENV} is not set; a LIVE mandate "
+            "must carry an operator-token HMAC signature")
+    rec = dict(record)
+    rec["sig_algo"] = SIG_ALGO
+    rec.pop("sig", None)
+    rec["sig"] = hmac.new(
+        secret.encode("utf-8"), _signing_payload(rec), hashlib.sha256).hexdigest()
+    return rec
+
+
+def _signature_ok(record: dict[str, Any], *, token: Optional[str] = None) -> bool:
+    """Constant-time verification of the record HMAC. Missing token/record
+    signature -> False (fail closed)."""
+    secret = token if token is not None else _operator_token()
+    sig = record.get("sig")
+    if not secret or not isinstance(sig, str) or record.get("sig_algo") != SIG_ALGO:
+        return False
+    expected = hmac.new(
+        secret.encode("utf-8"), _signing_payload(record), hashlib.sha256).hexdigest()
+    return hmac.compare_digest(expected, sig)
 
 
 def default_gate_path() -> str:
@@ -71,11 +149,17 @@ def evaluate_live_combo(mode: str, env_authorized: bool) -> list[str]:
 
 def validate_acceptance_record(
     record: dict[str, Any], *, expected_config_sha256: Optional[str] = None,
+    now: Optional[datetime] = None, token: Optional[str] = None,
 ) -> list[str]:
     """Validate a parsed acceptance record. Returns human-readable errors
     (empty == valid). Enforces the §5.2 outcome-A shape; it does not itself
     re-run the bootstrap (the recorded CI is the evidence, cross-checked for
-    internal consistency, not blindly trusted)."""
+    internal consistency, not blindly trusted).
+
+    P4-2 additionally enforces: an operator-token HMAC signature (tamper /
+    hand-edit protection) and a ``not_after`` expiry — an expired mandate is
+    invalid for NEW entries.
+    """
     errors: list[str] = []
     for k in _REQUIRED_FIELDS:
         if k not in record:
@@ -86,7 +170,7 @@ def validate_acceptance_record(
     if record.get("version") != RECORD_VERSION:
         errors.append(
             f"B-13: acceptance record version={record.get('version')!r} "
-            f"!= supported {RECORD_VERSION}")
+            f"!= supported {RECORD_VERSION} (re-mint with the current tool)")
     if record.get("decision") != "outcome_a_go_live":
         errors.append(
             "B-13: acceptance record decision is not 'outcome_a_go_live' — only "
@@ -112,8 +196,26 @@ def validate_acceptance_record(
         errors.append("B-13: config_src must name the production config source")
     if not str(record.get("operator", "")).strip():
         errors.append("B-13: operator must identify the authorizing operator/run")
-    if not str(record.get("utc_iso", "")).strip():
-        errors.append("B-13: utc_iso timestamp is required")
+    issued = _parse_utc(record.get("utc_iso", ""))
+    if issued is None:
+        errors.append("B-13: utc_iso must be an ISO-8601 UTC timestamp")
+    not_after = _parse_utc(record.get("not_after", ""))
+    if record.get("not_after") and not_after is None:
+        errors.append("B-13: not_after must be an ISO-8601 UTC timestamp")
+    elif not_after is not None:
+        now_dt = now or datetime.now(timezone.utc)
+        if now_dt >= not_after:
+            errors.append(
+                f"B-13: acceptance record expired at not_after={record['not_after']} "
+                "— the LIVE mandate no longer authorizes NEW entries (existing "
+                "positions keep running under their stops); re-mint to continue")
+        if issued is not None and not_after <= issued:
+            errors.append("B-13: not_after must be later than utc_iso")
+    if not _signature_ok(record, token=token):
+        errors.append(
+            "B-13: acceptance record signature is missing/invalid, or "
+            f"{_OPERATOR_TOKEN_ENV} is unset — records must be minted with a "
+            "valid operator-token HMAC (anti-tamper); re-mint")
     if (expected_config_sha256 and record.get("config_sha256")
             and record["config_sha256"] != expected_config_sha256):
         errors.append(
@@ -138,17 +240,28 @@ def load_acceptance_record(path: Optional[str] = None) -> tuple[
 def build_acceptance_record(
     cfg: dict[str, Any], *, arms: list[str], ci_lo: float, ci_hi: float,
     config_src: str, operator: str, utc_iso: str,
+    ttl_days: int = DEFAULT_TTL_DAYS, token: Optional[str] = None,
     extra: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Construct a §5.2 outcome-A acceptance record bound to *cfg*.
 
-    Raises ValueError if the supplied bootstrap CI is not strictly positive
-    (an outcome-B/C result must never be turned into a LIVE record).
+    The mandate is time-boxed: ``not_after = utc_iso + ttl_days`` (default
+    30d). The record is signed with the operator token and self-validated
+    before return. Raises ValueError if the supplied bootstrap CI is not
+    strictly positive (an outcome-B/C result must never be turned into a LIVE
+    record), the timestamp is malformed, ttl_days is non-positive, or no
+    operator token is available to sign with.
     """
     if not (ci_lo < ci_hi) or ci_lo <= 0:
         raise ValueError(
             f"refusing to build LIVE record: block-bootstrap CI [{ci_lo},{ci_hi}] "
             "must be strictly positive (lo>0); outcome B/C stays in SHADOW")
+    if int(ttl_days) <= 0:
+        raise ValueError(f"ttl_days must be positive, got {ttl_days!r}")
+    issued = _parse_utc(utc_iso)
+    if issued is None:
+        raise ValueError(f"utc_iso must be an ISO-8601 UTC timestamp, got {utc_iso!r}")
+    not_after = issued + timedelta(days=int(ttl_days))
     rec = {
         "version": RECORD_VERSION,
         "decision": "outcome_a_go_live",
@@ -158,11 +271,15 @@ def build_acceptance_record(
         "config_sha256": config_sha256(cfg),
         "operator": operator,
         "utc_iso": utc_iso,
+        "not_after": not_after.strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
     if extra:
         rec.update(extra)
+    secret = token if token is not None else _operator_token()
+    rec = sign_acceptance_record(rec, token=secret)
     # Fail loudly if anything about the assembled record is itself invalid.
-    errs = validate_acceptance_record(rec, expected_config_sha256=config_sha256(cfg))
+    errs = validate_acceptance_record(
+        rec, expected_config_sha256=config_sha256(cfg), now=issued, token=secret)
     if errs:
         raise ValueError("built acceptance record failed validation: " + "; ".join(errs))
     return rec
@@ -170,7 +287,7 @@ def build_acceptance_record(
 
 def startup_live_gate_errors(
     cfg: dict[str, Any], *, env_authorized: Optional[bool] = None,
-    gate_path: Optional[str] = None,
+    gate_path: Optional[str] = None, now: Optional[datetime] = None,
 ) -> tuple[list[str], list[str]]:
     """Boot-time gate used by the trading loop.
 
@@ -195,7 +312,7 @@ def startup_live_gate_errors(
                 "pass + block-bootstrap 95% CI strictly > 0) at the gate path")
         else:
             errs = validate_acceptance_record(
-                record, expected_config_sha256=config_sha256(cfg))
+                record, expected_config_sha256=config_sha256(cfg), now=now)
             if errs:
                 fatal.append(
                     "B-13: mode=LIVE but the acceptance record is invalid; "
@@ -205,6 +322,7 @@ def startup_live_gate_errors(
 
 def live_entry_runtime_error(
     cfg: dict[str, Any], *, gate_path: Optional[str] = None,
+    now: Optional[datetime] = None,
 ) -> Optional[str]:
     """Runtime B-13 guard leaf (T-01/T-02).
 
@@ -214,8 +332,8 @@ def live_entry_runtime_error(
 
     * non-LIVE modes return ``None`` (this guard concerns only real entries;
       SHADOW/OFF are blocked earlier by the mode branch itself)
-    * a missing/invalid acceptance record (bound to *cfg* by sha256) returns
-      ``"live_gate_record_invalid"``
+    * a missing/invalid/expired acceptance record (bound to *cfg* by sha256)
+      returns ``"live_gate_record_invalid"``
 
     Callers MUST perform no order placement when a reason is returned.
     """
@@ -225,7 +343,7 @@ def live_entry_runtime_error(
     if record is None:
         return "live_gate_record_invalid"
     errs = validate_acceptance_record(
-        record, expected_config_sha256=config_sha256(cfg))
+        record, expected_config_sha256=config_sha256(cfg), now=now)
     if errs:
         return "live_gate_record_invalid"
     return None

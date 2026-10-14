@@ -46,6 +46,13 @@ from .microstructure_edge import (
     paired_t_against_random,
     permute_flow_within_bars,
 )
+from .methodology_manifest import (
+    MANIFEST_VERSION,
+    UNAVAILABLE,
+    build_manifest,
+    collect_components,
+    methodology_fingerprint,
+)
 
 __all__ = [
     "CPCVResult",
@@ -73,4 +80,10 @@ __all__ = [
     "ofi_depth",
     "paired_t_against_random",
     "permute_flow_within_bars",
+    # P4-1 方法论指纹
+    "MANIFEST_VERSION",
+    "UNAVAILABLE",
+    "build_manifest",
+    "collect_components",
+    "methodology_fingerprint",
 ]

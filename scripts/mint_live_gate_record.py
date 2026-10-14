@@ -124,10 +124,19 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=20260920)
     ap.add_argument("--n-trials", type=int, default=16)
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
+    ap.add_argument("--ttl-days", type=int, default=live_gate.DEFAULT_TTL_DAYS,
+                    help="mandate horizon; the record stops authorizing NEW "
+                         "entries after utc_iso+ttl (default 30)")
     ap.add_argument("--gate-path", default=live_gate.default_gate_path())
     ap.add_argument("--yes", action="store_true",
                     help="actually write; without it this is a dry run")
     args = ap.parse_args()
+
+    if not os.environ.get("HERMES_OPERATOR_TOKEN", "").strip():
+        raise SystemExit(
+            "refusing to mint: HERMES_OPERATOR_TOKEN is not set. A LIVE mandate "
+            "must be HMAC-signed with the operator token (same token the trading "
+            "process uses to verify). Export it and re-run.")
 
     result = _load_validation_result(args)
     arm = _select_positive_arm(result)
@@ -142,12 +151,14 @@ def main() -> None:
         config_src=getattr(config_store, "CONFIG_PATH", "/data/.agent-config.json"),
         operator=str(args.operator),
         utc_iso=utc_iso,
+        ttl_days=int(args.ttl_days),
     )
 
     payload = json.dumps(record, ensure_ascii=False, indent=2)
     print(f"selected arm : {arm['arm']}  CI [{lo},{hi}]  DSR P={arm['dsr_p']}")
     print(f"gate path    : {args.gate_path}")
     print(f"config sha   : {record['config_sha256']}")
+    print(f"valid until  : {record['not_after']}  (ttl {args.ttl_days}d)")
     if not args.yes:
         print("\n[dry run] no file written. Re-run with --yes to mint.")
         print(payload)
