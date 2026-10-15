@@ -2310,10 +2310,12 @@ while True:
 
         # A1: settle any selection-attribution items whose horizon elapsed
         # (forward returns vs registered base price). Read-only on the market;
-        # best-effort and never fatal.
+        # best-effort and never fatal. Bounded per sweep so a large backlog
+        # (e.g. the 2026-10-14 4.7k+ due-items accumulation) can never stall the
+        # trade hot path on the HL rate limiter and trip the 600s watchdog.
         try:
             from hermes_trader.agents.selection_attribution import settle_due
-            settle_due(now_ms=now_ms)
+            settle_due(now_ms=now_ms, max_per_sweep=20)
         except Exception as _attr_settle_e:
             logger.debug(
                 f"[selection-attribution] settle failed: {_attr_settle_e}")

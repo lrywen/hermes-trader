@@ -166,7 +166,11 @@ def _forward_close(coin: str, start_ms: int, horizon_hours: int) -> Optional[flo
         "coin": coin, "interval": "1h",
         "startTime": grid0 + (horizon_hours - 1) * step,
         "endTime": end}}
-    raw = _http_post("/info", payload)
+    # Observability caller: pass a short max_wait so this synchronous settle
+    # yields the rate budget to the trading path instead of parking the main
+    # thread on the limiter for rate_max_wait_s (30s). A miss is harmless — the
+    # item stays pending and is retried next sweep.
+    raw = _http_post("/info", payload, max_wait=2.0)
     if not isinstance(raw, list) or not raw:
         return None
     target_t = grid0 + horizon_hours * step
@@ -174,11 +178,20 @@ def _forward_close(coin: str, start_ms: int, horizon_hours: int) -> Optional[flo
     return closes.get(target_t)
 
 
-def settle_due(*, now_ms: Optional[int] = None) -> int:
+def settle_due(*, now_ms: Optional[int] = None,
+               max_per_sweep: Optional[int] = None) -> int:
     """Settle every pending item whose horizon elapsed. Returns settled count.
 
     A coin whose forward bar hasn't printed (API gap / still too young) is left
     pending and retried next sweep. Never raises.
+
+    ``max_per_sweep`` caps how many items are settled in a single sweep. The
+    main loop passes a small budget so a large backlog can never stall the
+    trade hot path on the HL rate limiter: each settle fires a synchronous
+    1h candleSnapshot HTTP POST, and with ``rate_max_wait_s`` (30s) behind a
+    just-exhausted scan budget, an unbounded backlog parks the main thread
+    past the 600s watchdog and triggers a re-exec loop (observed 2026-10-14).
+    Default ``None`` = no cap (kept for the CLI / reconcile script / tests).
     """
     try:
         now = now_ms if now_ms is not None else _now_ms()
@@ -191,6 +204,8 @@ def settle_due(*, now_ms: Optional[int] = None) -> int:
                     continue
                 if now < int(it.get("due_ms", 0)):
                     continue
+                if max_per_sweep is not None and settled >= max_per_sweep:
+                    break
                 px = _forward_close(bare_coin(it["coin"]),
                                     int(it["registered_ms"]),
                                     int(it["horizon_hours"]))
