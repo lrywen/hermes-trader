@@ -186,6 +186,12 @@ def _maker_ttl_bars() -> int:
         return 30
 
 
+# Upper bound on 1m candles fetched to resolve one resting maker order. Guards
+# against unbounded fetch for pathologically stale orders; anything older than
+# this is handled by the TTL-age cancel fallback in _resolve_pending_maker_orders.
+_MAX_MAKER_FETCH_BARS = 600  # 10h of 1m bars
+
+
 def _max_positions() -> int:
     """Concurrent-position cap for EACH paper account.
 
@@ -945,24 +951,44 @@ class ShadowBook:
         if not acc["pending_orders"]:
             return
         ttl = _maker_ttl_bars()
-        # Window must span the real post bar through post+TTL. The order has
-        # rested <= TTL bars, so the most recent (TTL + post bar + one slack)
-        # candles always cover it.
-        fetch_n = ttl + 2
+        now_ms = _now_ms()
         for order in list(acc["pending_orders"]):
             coin = order["coin"]
             side = order["side"]
             posted_at = int(order["posted_at"])
+            # Window must span the real post bar through post+TTL. The order
+            # has rested <= TTL bars, so (age_bars + TTL + slack) candles always
+            # cover it. Do NOT fix to ttl+2: a rest that slipped past one cycle
+            # (candle fetch miss / boundary crossing) would age beyond the fixed
+            # window, making locate_posted_bar_idx return None forever and the
+            # order hang unfilled/uncanceled indefinitely.
+            age_bars = max(1, int((now_ms - posted_at) / 60000.0))
+            fetch_n = min(age_bars + ttl, _MAX_MAKER_FETCH_BARS)
             try:
                 bars = fetch_hl_candles(coin, "1m", fetch_n, opportunistic=True)
             except Exception as e:
                 logger.debug(f"[shadow_book] maker candles miss {coin}: {e}")
+                # Fallback: an order that aged past TTL must not hang just
+                # because the candle fetch failed this cycle.
+                if ((now_ms - posted_at) / 60000.0) >= ttl:
+                    acc["pending_orders"] = [
+                        o for o in acc["pending_orders"]
+                        if o["id"] != order["id"]]
+                    self._cancel_maker_order(order, now_ms)
                 continue
             # Locate the real post bar from the order's timestamp instead of
             # hard-coding idx 0. Until at least one bar has closed after
             # posting, the order simply rests (skip this cycle).
             posted_idx = locate_posted_bar_idx(bars, posted_at)
             if posted_idx is None or posted_idx >= len(bars) - 1:
+                # posted bar outside the fetched window (should not happen now
+                # that the window scales with age) or still forming: fall back
+                # to a straight TTL-age cancel so a stale order can never hang.
+                if ((now_ms - posted_at) / 60000.0) >= ttl:
+                    acc["pending_orders"] = [
+                        o for o in acc["pending_orders"]
+                        if o["id"] != order["id"]]
+                    self._cancel_maker_order(order, now_ms)
                 continue
             sim = ShadowMakerOrder(
                 coin=coin,

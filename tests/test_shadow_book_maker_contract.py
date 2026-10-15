@@ -179,6 +179,36 @@ def test_maker_ttl_expiry_cancels_order(tmp_path, monkeypatch):
     assert len(cancels) == 1
 
 
+def test_maker_stale_order_cancels_when_post_bar_outside_window(
+        tmp_path, monkeypatch):
+    """Regression (2026-10-04): a resting maker order whose real post bar is
+    older than the fixed ttl+2 fetch window made locate_posted_bar_idx return
+    None, so every resolve cycle hit ``continue`` and the order hung
+    unfilled/uncanceled for days (observed FIL long, age 70h). The resolve must
+    fall back to a straight TTL-age cancel even when the post bar is not in the
+    window — never hang a stale order."""
+    _patch_cfg(monkeypatch, maker_ttl_bars=30)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    # posted ~2.9 days ago; the fetched 1m window (only recent bars) cannot
+    # locate the post bar -> locate_posted_bar_idx returns None.
+    order = _resting_order(book)
+    order["posted_at"] = _T0 - int(70 * 3600 * 1000)
+    bars = [_candle(i, 100.0, 100.2, 99.99, 100.1) for i in range(0, 5)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+
+    book.mark_to_market({"BTC": 100.0})
+
+    maker = book.state["accounts"]["maker_shadow"]
+    assert maker["pending_orders"] == []
+    assert maker["positions"] == []
+    cancels = [f for f in maker["fills"] if f["type"] == "cancel"]
+    assert len(cancels) == 1
+
+
 # ---------------------------------------------------------------------------
 # account independence + migration
 # ---------------------------------------------------------------------------
