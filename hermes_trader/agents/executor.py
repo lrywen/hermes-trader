@@ -5617,51 +5617,31 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
             return f"runner_gate_blocked ({_block})"
 
     # --- Early late-entry pre-screen: RSI extremes + over-extension (4h) ---
-    # INTENTIONALLY DISTINCT from ta_filter.late_entry_check — this is an
-    # EARLY, WIDE, FAIL-OPEN pre-filter, not a duplicate of the downstream
-    # hard gate. Audit 2026-09-28 (高4) confirmed the two are not the same
-    # rule and must not be merged naively:
-    #   * timebase — reads the snapshot scalars carried in `analysis`
-    #     (rsi4h/atr4h/ema21_4h/close4h), computed by research() on the SAME
-    #     pass as the candidate. late_entry_check re-fetches 4h candles at
-    #     gate-execution, minutes later (timebase drift + an extra fetch).
-    #   * relax rule — here `regime=="up"` widens RSI to 80; the SSOT uses
-    #     ADX>=35 + trend-aligned and widens to 82.
-    #   * missing data — a missing snapshot field here FAILS OPEN (skips the
-    #     veto); late_entry_check defaults to fail_closed.
-    # The authoritative SSOT veto still runs before fill as ta_late_entry_gate
-    # in eval_all_gates(); this just sheds the worst top/bottom-tick chases
-    # earlier. Keep both; do not converge.
+    # An EARLY, WIDE, FAIL-OPEN pre-filter that sheds the worst top/bottom-tick
+    # chases before the order path; the AUTHORITATIVE fail-closed hard veto is
+    # ta_late_entry_gate (late_entry_check) in eval_all_gates() at order time.
+    # Audit P1-1 (2026-10-15): this used to carry its OWN relax rule
+    # (regime=="up" -> RSI 80, longs only) while the SSOT relaxes on
+    # ADX>=35 + EMA8/21 alignment -> RSI 82/18 — two definitions of "strong
+    # aligned trend". It now resolves its RSI/extension limits through the SAME
+    # ta_late_entry config block and SAME relax predicate
+    # (late_entry_limits_from_snapshot), evaluated on the research-pass
+    # snapshot scalars (no extra fetch). Kept distinct from the hard gate by:
+    #   * timebase — snapshot rs/adx/ema/ext from THIS research pass vs the
+    #     gate's fresh candle re-fetch minutes later;
+    #   * fail-open — missing snapshot data skips the veto, whereas the hard
+    #     gate is fail-closed;
+    #   * no 15m MTF override — that remains the hard gate's job.
     rsi4h = analysis.get("rsi4h")
-    rsi_overbought = float(gate.get("rsi_overbought", 75.0))
-    rsi_oversold = float(gate.get("rsi_oversold", 25.0))
-    # 仅趋势市放宽：regime=up 时用更高的超买阈值，避免在强趋势中把
-    # 75-80 的健康延续误杀；震荡/其他市场保持严格阈值。regime 取自研究
-    # 链路快照（与 rsi4h 同一时间基）；快照缺失时不放宽（fail-safe）。
-    if side == "long":
-        if str(analysis.get("regime") or "") == "up":
-            rsi_overbought = float(gate.get("trend_rsi_overbought", 80.0))
-    if rsi4h is not None:
-        try:
-            rsi_val = float(rsi4h)
-            if side == "long" and rsi_val > rsi_overbought:
-                logger.info(f"[runner_gate] {coin} BLOCKED: RSI {rsi_val:.0f} > {rsi_overbought:.0f} (overbought)")
-                return (f"runner_gate_blocked (RSI {rsi_val:.0f} > {rsi_overbought:.0f}, "
-                        f"overbought — late long chase)")
-            if side == "short" and rsi_val < rsi_oversold:
-                logger.info(f"[runner_gate] {coin} BLOCKED: RSI {rsi_val:.0f} < {rsi_oversold:.0f} (oversold)")
-                return (f"runner_gate_blocked (RSI {rsi_val:.0f} < {rsi_oversold:.0f}, "
-                        f"oversold — late short chase)")
-        except (TypeError, ValueError):
-            pass
+    adx4h = analysis.get("adx4h")
+    ema8_4h = analysis.get("ema8_4h")
 
-    ext_mult = float(gate.get("max_extension_atr", 2.5))
-    atr4h = analysis.get("atr4h")
-    ema21_4h = analysis.get("ema21_4h")
-    close4h = analysis.get("close4h")
     # 4h extension in ATR units, computed ONCE from the research snapshot and
     # reused by both this late-entry veto and the pullback-long bypass below
     # (w8: they previously recomputed the identical (c-e)/a separately).
+    atr4h = analysis.get("atr4h")
+    ema21_4h = analysis.get("ema21_4h")
+    close4h = analysis.get("close4h")
     extension_4h: Optional[float] = None
     if atr4h and ema21_4h and close4h:
         try:
@@ -5672,19 +5652,60 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
                 extension_4h = (close_val - ema_val) / atr_val
         except (TypeError, ValueError):
             extension_4h = None
-    if ext_mult > 0 and extension_4h is not None:
-        extension = extension_4h
+
+    # Single-source thresholds: the ta_late_entry block IS the authority. The
+    # runner_entry_gate numeric keys stay only as an emergency fallback if the
+    # block is absent, so the two can never silently diverge in normal config.
+    _le_cfg = config.get("ta_late_entry") or {}
+    if not isinstance(_le_cfg, dict) or not _le_cfg:
+        _le_cfg = {
+            "rsi_ob": gate.get("rsi_overbought", 75.0),
+            "rsi_os": gate.get("rsi_oversold", 25.0),
+            "ext_ob": gate.get("max_extension_atr", 2.5),
+            "ext_os": -abs(float(gate.get("max_extension_atr", 2.5) or 2.5)),
+            "rsi_ob_relaxed": gate.get("trend_rsi_overbought", 82.0),
+            "rsi_os_relaxed": 18.0,
+            "ext_ob_relaxed": 3.5,
+            "ext_os_relaxed": -3.5,
+        }
+
+    def _f(v: Any) -> Optional[float]:
         try:
-            if side == "long" and extension > ext_mult:
-                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR > {ext_mult}x (over-extended long)")
-                return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
-                        f"above EMA21 — over-extended long)")
-            if side == "short" and extension < -ext_mult:
-                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension:.1f}x ATR < -{ext_mult}x (over-extended short)")
-                return (f"runner_gate_blocked (extension {extension:.1f}x ATR "
-                        f"below EMA21 — over-extended short)")
+            return float(v) if v is not None else None
         except (TypeError, ValueError):
-            pass
+            return None
+
+    from hermes_trader.agents.ta_filter import late_entry_limits_from_snapshot
+
+    _lim = late_entry_limits_from_snapshot(
+        side, _f(rsi4h), _f(adx4h), _f(ema8_4h), _f(ema21_4h), extension_4h, _le_cfg)
+    if _lim["data_ok"]:
+        _rsi_limit = _lim["rsi_limit"]
+        _ext_limit = _lim["ext_limit"]
+        _relaxed = _lim["relaxed"]
+        _rsi_val = _f(rsi4h)
+        if _rsi_val is not None and _rsi_limit is not None:
+            if side == "long" and _rsi_val > _rsi_limit:
+                logger.info(f"[runner_gate] {coin} BLOCKED: RSI {_rsi_val:.0f} > {_rsi_limit:.0f} "
+                            f"(overbought{' relaxed' if _relaxed else ''})")
+                return (f"runner_gate_blocked (RSI {_rsi_val:.0f} > {_rsi_limit:.0f}, "
+                        f"overbought — late long chase)")
+            if side == "short" and _rsi_val < _rsi_limit:
+                logger.info(f"[runner_gate] {coin} BLOCKED: RSI {_rsi_val:.0f} < {_rsi_limit:.0f} "
+                            f"(oversold{' relaxed' if _relaxed else ''})")
+                return (f"runner_gate_blocked (RSI {_rsi_val:.0f} < {_rsi_limit:.0f}, "
+                        f"oversold — late short chase)")
+        if extension_4h is not None and _ext_limit is not None and _ext_limit != 0:
+            if side == "long" and extension_4h > _ext_limit:
+                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension_4h:.1f}x ATR > "
+                            f"{_ext_limit}x (over-extended long{' relaxed' if _relaxed else ''})")
+                return (f"runner_gate_blocked (extension {extension_4h:.1f}x ATR "
+                        f"above EMA21 — over-extended long)")
+            if side == "short" and extension_4h < _ext_limit:
+                logger.info(f"[runner_gate] {coin} BLOCKED: extension {extension_4h:.1f}x ATR < "
+                            f"{_ext_limit}x (over-extended short{' relaxed' if _relaxed else ''})")
+                return (f"runner_gate_blocked (extension {extension_4h:.1f}x ATR "
+                        f"below EMA21 — over-extended short)")
 
     # ── Hemostat (2026-10-11): weak-trend chase veto ──────────────────────
     # The bleed-out diagnosis (59 max_loss exits, MFE median 0.34%, stopped in

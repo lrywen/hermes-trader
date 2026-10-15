@@ -742,6 +742,18 @@ try:
 except Exception as _eg_err:  # never let a guard bug block startup
     logger.warning("[startup config] exit-param guard skipped: %s", _eg_err)
 
+# Audit 2026-10-15 P1-1: late-entry single-source guard. The runner pre-screen
+# now derives its RSI/extension thresholds from the authoritative ta_late_entry
+# block; warn if the legacy runner_entry_gate numeric keys still carry divergent
+# values that no longer take effect (they would silently mislead tuning).
+try:
+    from hermes_trader.agents.ta_filter import late_entry_threshold_warnings
+
+    for _msg in late_entry_threshold_warnings(startup_agent_config):
+        logger.warning("[startup config] %s", _msg)
+except Exception as _le_err:  # never let a guard bug block startup
+    logger.warning("[startup config] late-entry guard skipped: %s", _le_err)
+
 # HIP-3 toggle: this startup value only seeds the initial prefetched universe.
 # Audit 2026-09-06 (F4, engineering hygiene): the agent config is hot-reloaded
 # per cycle, and flipping enable_hip3 mid-run is detected in the per-cycle

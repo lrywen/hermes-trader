@@ -2538,9 +2538,13 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         # 4h indicator snapshot — feeds the executor's late-entry veto
         # (RSI extremes + over-extension from EMA21). Already computed above
         # for the AI prompt; carried forward so the executor doesn't refetch.
+        # ema8_4h (audit P1-1) lets the runner pre-screen apply the SAME
+        # strong-trend relax rule as the SSOT ta_late_entry gate (ADX floor +
+        # EMA8/21 alignment) from the snapshot, without a second candle fetch.
         "rsi4h": tf4h.get("rsi14"),
         "adx4h": tf4h.get("adx14"),
         "atr4h": tf4h.get("atr14"),
+        "ema8_4h": tf4h.get("ema8"),
         "ema21_4h": tf4h.get("ema21"),
         "close4h": tf4h.get("last_close"),
         # 1h indicator snapshot — feeds the executor's Plan-B regime-strength

@@ -122,23 +122,32 @@ def test_confidence_at_boundary_passes_floor(isolated_gate):
 # ── 3. RSI late-entry veto ──────────────────────────────────────────────────
 
 def test_long_overbought_rsi_blocked(isolated_gate):
-    # regime 现在取自研究快照 analysis['regime']（与 rsi4h 同一时间基）。
-    # 显式给 regime='up'，使 LONG 超买否决用放宽阈值 trend_rsi_overbought=80
-    # （严格 >）；RSI 81 触发，80-vs-80 边界另在下面钉死。
-    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=81.0, regime="up")
+    # Audit P1-1: relax is now the SSOT rule (adx4h>=35 AND EMA8>EMA21) rather
+    # than regime=="up". With NO trend-alignment snapshot fields the strict
+    # limit 75 applies, so RSI 81 is blocked.
+    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=81.0)
     reason = _block(a, _gate())
     assert "overbought" in reason
 
 
-def test_long_overbought_relaxed_only_in_up_regime(isolated_gate):
-    """非 up regime（如 neutral）仍用严格阈值 75：regime 快照决定放宽与否，
-    RSI 78 在 neutral 下被拦、在 up 下通过。"""
-    a_neutral = _analysis(confidence=0.9, breakout_fired=True,
-                          rsi4h=78.0, regime="neutral")
-    assert "overbought" in _block(a_neutral, _gate())
-    a_up = _analysis(confidence=0.9, breakout_fired=True,
-                     rsi4h=78.0, regime="up")
-    assert "overbought" not in _block(a_up, _gate())
+def test_long_overbought_relaxed_only_in_strong_aligned_trend(isolated_gate):
+    """SSOT-aligned relax (P1-1): RSI 78 is blocked under the strict 75 limit
+    unless 4h ADX>=35 and EMA8>EMA21 (a strong aligned uptrend), which widens
+    the limit to 82. regime alone no longer relaxes."""
+    a_strict = _analysis(confidence=0.9, breakout_fired=True, rsi4h=78.0,
+                         regime="up")  # regime alone must NOT relax anymore
+    assert "overbought" in _block(a_strict, _gate())
+    a_strong = _analysis(confidence=0.9, breakout_fired=True, rsi4h=78.0,
+                         adx4h=40.0, ema8_4h=101.0, ema21_4h=100.0)
+    assert "overbought" not in _block(a_strong, _gate())
+
+
+def test_long_overbought_high_adx_misaligned_does_not_relax(isolated_gate):
+    """High ADX without EMA8/21 alignment is not a strong aligned uptrend →
+    strict limit still applies (mirrors late_entry_check exactly)."""
+    a = _analysis(confidence=0.9, breakout_fired=True, rsi4h=78.0,
+                  adx4h=40.0, ema8_4h=99.0, ema21_4h=100.0)  # ema8<ema21
+    assert "overbought" in _block(a, _gate())
 
 
 def test_short_oversold_rsi_blocked(isolated_gate):

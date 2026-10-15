@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.client.hl_client import fetch_hl_candles
@@ -336,6 +336,117 @@ def late_entry_check(
         f" [{'; '.join(suffix)}]" if suffix else ""
     )
     return result
+
+
+def late_entry_limits_from_snapshot(
+    side: str,
+    rsi4h: Optional[float],
+    adx4h: Optional[float],
+    ema8_4h: Optional[float],
+    ema21_4h: Optional[float],
+    extension_4h: Optional[float],
+    params: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Resolve the SSOT late-entry limits from research-snapshot scalars.
+
+    Audit P1-1 (2026-10-15): the runner's early, fail-OPEN pre-screen used to
+    carry its OWN trend-relax rule (``regime=="up"`` → RSI 80, longs only)
+    while this module's authoritative :func:`late_entry_check` relaxes on
+    ``ADX>=35 AND EMA8/21 trend aligned`` → RSI 82/18. Two rules for "is this
+    a strong aligned trend" is exactly the drift the safety audit flagged.
+
+    The runner must stay an *early* screen (snapshot scalars, no refetch,
+    fail-open), so it cannot call :func:`late_entry_check` directly (that one
+    takes candles, re-derives indicators and is fail-closed at the hard gate).
+    Instead this helper applies the SAME rule-1/rule-2 thresholds and the SAME
+    relax predicate from the SAME ``ta_late_entry`` config block to the
+    snapshot readings. It does NOT implement the 15m MTF continuation override
+    (rule 3) — the runner deliberately has no 15m fetch; that override remains
+    the hard gate's job at order time.
+
+    Returns ``{data_ok, relaxed, rsi_limit, ext_limit}``. ``data_ok=False``
+    means the snapshot lacks usable 4h readings; the fail-open caller must
+    then SKIP its veto (never block on unknown).
+    """
+    p: dict[str, Any] = params or {}
+
+    def _p(key: str, default: Any) -> Any:
+        v = p.get(key, default)
+        return default if v is None else v
+
+    out = {"data_ok": False, "relaxed": False,
+           "rsi_limit": None, "ext_limit": None}
+    if side not in ("long", "short"):
+        return out
+    if rsi4h is None and extension_4h is None:
+        return out
+    out["data_ok"] = True
+
+    is_long = side == "long"
+    relaxed = False
+    if bool(_p("trend_relax_enabled", True)):
+        try:
+            adx_floor = float(_p("adx_trend_threshold", 35))
+            if adx4h is not None and ema8_4h is not None and ema21_4h is not None:
+                aligned = (float(ema8_4h) > float(ema21_4h)) if is_long else (
+                    float(ema8_4h) < float(ema21_4h))
+                if float(adx4h) >= adx_floor and aligned:
+                    relaxed = True
+        except (TypeError, ValueError):
+            relaxed = False
+    out["relaxed"] = relaxed
+
+    if is_long:
+        out["rsi_limit"] = float(_p("rsi_ob_relaxed", 82) if relaxed else _p("rsi_ob", 75))
+        out["ext_limit"] = float(_p("ext_ob_relaxed", 3.5) if relaxed else _p("ext_ob", 2.5))
+    else:
+        out["rsi_limit"] = float(_p("rsi_os_relaxed", 18) if relaxed else _p("rsi_os", 25))
+        out["ext_limit"] = float(_p("ext_os_relaxed", -3.5) if relaxed else _p("ext_os", -2.5))
+    return out
+
+
+def late_entry_threshold_warnings(config: Mapping[str, Any]) -> list[str]:
+    """Warn when the runner legacy numeric keys drift from the SSOT block.
+
+    Audit P1-1 (2026-10-15): the runner pre-screen used to read its OWN
+    ``runner_entry_gate.{rsi_overbought,rsi_oversold,max_extension_atr,
+    trend_rsi_overbought}`` while the hard gate reads ``ta_late_entry.*`` — a
+    silent second threshold set. The runner now derives from ``ta_late_entry``
+    (falling back to the legacy keys only if the block is absent). This helper
+    surfaces a startup WARNING whenever an operator explicitly set the legacy
+    runner keys to values that no longer take effect because the SSOT block is
+    present and authoritative. Warning-only; never raised, never blocks boot.
+    """
+    out: list[str] = []
+    le = config.get("ta_late_entry")
+    if not isinstance(le, dict) or not le:
+        return out  # no SSOT block -> legacy runner keys are the authority
+    runner = config.get("runner_entry_gate")
+    if not isinstance(runner, dict):
+        return out
+
+    def _f(v: Any) -> Optional[float]:
+        try:
+            return float(v) if v is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    pairs = [
+        ("rsi_overbought", "rsi_ob", "long RSI"),
+        ("rsi_oversold", "rsi_os", "short RSI"),
+        ("max_extension_atr", "ext_ob", "long extension"),
+        ("trend_rsi_overbought", "rsi_ob_relaxed", "relaxed long RSI"),
+    ]
+    for runner_key, ssot_key, label in pairs:
+        rv = _f(runner.get(runner_key))
+        sv = _f(le.get(ssot_key))
+        if rv is not None and sv is not None and abs(rv - sv) > 1e-9:
+            out.append(
+                f"late-entry drift: runner_entry_gate.{runner_key}={rv:g} is "
+                f"ignored — the authoritative ta_late_entry.{ssot_key}={sv:g} "
+                f"({label}) now drives the runner pre-screen; align or remove "
+                "the legacy runner key")
+    return out
 
 
 def chase_exhaustion_check(
