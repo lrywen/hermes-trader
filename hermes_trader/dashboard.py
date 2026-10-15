@@ -127,11 +127,61 @@ def _load_max_lev_table() -> dict[str, int]:
 # http2 + keepalive reuse the connection. A tiny circuit breaker stops hammering
 # OpenRouter during an outage: 3 consecutive failures trip it for 5 minutes.
 _LLM_CLIENT: Optional["httpx.AsyncClient"] = None
-_LLM_CB_FAILURES = 0
-_LLM_CB_OPEN_UNTIL = 0.0
-_LLM_CB_LOCK = threading.Lock()
-_LLM_CB_FAIL_THRESHOLD = int(os.environ.get("HERMES_LLM_CB_FAILURES", "3"))
-_LLM_CB_COOLDOWN_S = float(os.environ.get("HERMES_LLM_CB_COOLDOWN_S", "300"))
+# Audit 2026-10-15 P0-2: the chat path used to carry its own hand-copied breaker
+# (separate counter, env thresholds, no metrics) while research had a second.
+# Both now share LLMCircuitBreaker; this process keeps its env-var settings
+# source (so the dashboard operator can tune chat independently) but emits the
+# same Prometheus trip/state gauges as the brain.
+from hermes_trader.agents.llm_circuit_breaker import LLMCircuitBreaker
+
+
+def _llm_cb_env_settings() -> "tuple[int, float]":
+    return (
+        int(os.environ.get("HERMES_LLM_CB_FAILURES", "3")),
+        float(os.environ.get("HERMES_LLM_CB_COOLDOWN_S", "300")),
+    )
+
+
+def _llm_cb_on_trip(threshold: int, cooldown: float) -> None:
+    logger.warning("[dashboard] LLM circuit OPEN for %.0fs after %d consecutive failures",
+                   cooldown, threshold)
+    try:
+        from hermes_trader import metrics
+
+        metrics.LLM_CIRCUIT_TRIPS.inc()
+        metrics.LLM_CIRCUIT_STATE.set(1.0)
+    except Exception:
+        pass
+
+
+def _llm_cb_on_reset() -> None:
+    try:
+        from hermes_trader import metrics
+
+        if not _llm_circuit_open():
+            metrics.LLM_CIRCUIT_STATE.set(0.0)
+    except Exception:
+        pass
+
+
+_llm_breaker = LLMCircuitBreaker(
+    name="dashboard",
+    settings_provider=_llm_cb_env_settings,
+    on_trip=_llm_cb_on_trip,
+    on_reset=_llm_cb_on_reset,
+)
+
+
+def _llm_circuit_open() -> bool:
+    return _llm_breaker.is_open()
+
+
+def _llm_record_success() -> None:
+    _llm_breaker.record_success()
+
+
+def _llm_record_failure() -> None:
+    _llm_breaker.record_failure()
 
 
 def _llm_client() -> "httpx.AsyncClient":
@@ -143,27 +193,6 @@ def _llm_client() -> "httpx.AsyncClient":
             limits=httpx.Limits(max_keepalive_connections=4, max_connections=8),
         )
     return _LLM_CLIENT
-
-
-def _llm_circuit_open() -> bool:
-    return time.time() < _LLM_CB_OPEN_UNTIL
-
-
-def _llm_record_success() -> None:
-    global _LLM_CB_FAILURES
-    with _LLM_CB_LOCK:
-        _LLM_CB_FAILURES = 0
-
-
-def _llm_record_failure() -> None:
-    global _LLM_CB_FAILURES, _LLM_CB_OPEN_UNTIL
-    with _LLM_CB_LOCK:
-        _LLM_CB_FAILURES += 1
-        if _LLM_CB_FAILURES >= _LLM_CB_FAIL_THRESHOLD:
-            _LLM_CB_OPEN_UNTIL = time.time() + _LLM_CB_COOLDOWN_S
-            _LLM_CB_FAILURES = 0
-            logger.warning("[dashboard] LLM circuit OPEN for %.0fs after %d consecutive failures",
-                           _LLM_CB_COOLDOWN_S, _LLM_CB_FAIL_THRESHOLD)
 
 
 # F9: defence-in-depth security headers on every response. Applied by

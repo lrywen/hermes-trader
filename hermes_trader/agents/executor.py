@@ -5486,14 +5486,23 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     is_hip3 = ":" in coin
     side = (analysis.get("side") or "").lower()
     conf = float(analysis.get("confidence", 0) or 0)
-    # A structural override rewrites confidence up to min_ai_confidence, which is
-    # normally the same number as min_confidence — so the floored value clears
-    # this gate by construction and the confidence bar becomes a no-op. Judge on
-    # the model's pre-floor conviction when it is available; plain (non-override)
+    # A structural override rewrites confidence up to min_ai_confidence, which
+    # is — by the confidence_guard single-source rule (P0-1) — the SAME value as
+    # the runner generic bar, so the floored value clears this gate by
+    # construction and the confidence bar would be a no-op. Judge on the
+    # model's pre-floor conviction when it is available; plain (non-override)
     # candidates have no such field and fall back to confidence unchanged.
     gate_conf = float(analysis.get("ai_confidence_raw", conf) or 0)
     score = float(analysis.get("composite_score", 0) or 0)
-    min_conf = float(gate.get("min_confidence", 0.70))
+    # Audit 2026-10-15 P0-1: the generic runner bar is the SAME number as the
+    # canonical min_ai_confidence floor. Read it through the single-source
+    # resolver so the two can never silently diverge again; the nested key is
+    # honoured only for emergency override. Per-situation bars (short/mover)
+    # remain deliberately higher and are read separately below.
+    from hermes_trader.agents.confidence_guard import (
+        resolve_runner_generic_confidence,
+    )
+    min_conf = resolve_runner_generic_confidence(config)
     min_score = float(gate.get("min_composite", 30.0))
     min_hip3_score = float(gate.get("min_hip3_composite", 50.0))
 

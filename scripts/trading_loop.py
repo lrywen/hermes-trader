@@ -717,6 +717,18 @@ if _gate_fatal:
 if startup_mode == "LIVE":
     logger.info("[startup gate] B-13 acceptance record valid — LIVE authorized")
 
+# Audit 2026-10-15 P0-1: confidence-threshold single-source guard. Warn (never
+# block) when min_ai_confidence and runner_entry_gate.min_confidence drift apart
+# — the higher copy silently becomes the real entry bar with no single place
+# naming it. Warning-only so config drift can never stop a safety-critical boot.
+try:
+    from hermes_trader.agents.confidence_guard import confidence_threshold_warnings
+
+    for _msg in confidence_threshold_warnings(startup_agent_config):
+        logger.warning("[startup config] %s", _msg)
+except Exception as _cg_err:  # never let a guard bug block startup
+    logger.warning("[startup config] confidence guard skipped: %s", _cg_err)
+
 # HIP-3 toggle: this startup value only seeds the initial prefetched universe.
 # Audit 2026-09-06 (F4, engineering hygiene): the agent config is hot-reloaded
 # per cycle, and flipping enable_hip3 mid-run is detected in the per-cycle

@@ -23,6 +23,7 @@ from typing import Any, Callable, Optional
 import httpx
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
+from hermes_trader.agents.llm_circuit_breaker import LLMCircuitBreaker
 from hermes_trader.agents.market_regime import _obv_slope_sign
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import extract_fired_triggers
@@ -32,7 +33,6 @@ from hermes_trader.agents.research_schema import (
     structured_to_analysis_fields,
 )
 from hermes_trader.agents.system_prompt import build_system_prompt
-from hermes_trader.shadow_log import append_jsonl
 from hermes_trader.client.hl_client import (
     fetch_account_state,
     fetch_funding_history,
@@ -41,6 +41,7 @@ from hermes_trader.client.hl_client import (
 )
 from hermes_trader.indicators.math import adx, atr, candle_val, ema, rsi
 from hermes_trader.models.types import Candle
+from hermes_trader.shadow_log import append_jsonl
 from hermes_trader.shared_config import load_shared_config
 
 # ── P1-1: one shared thread pool for all research fan-outs ──────────────
@@ -441,42 +442,40 @@ def research_fetch_params(*, config: Optional[dict[str, Any]] = None) -> dict[st
 # every research/debate/HTA call — an avalanche that stalls the loop. After N
 # consecutive hard failures the breaker opens for M seconds and
 # _call_openrouter short-circuits to "" (every caller already degrades
-# gracefully on empty). Mirrors the dashboard chat breaker (F15) but reads its
-# thresholds from canonical config (llm_circuit_breaker.fail_threshold /
-# cooldown_s) with the same env-style fallback the rest of research.py uses.
-_LLM_CB_FAILURES = 0
-_LLM_CB_OPEN_UNTIL = 0.0
-_LLM_CB_LOCK = threading.Lock()
-_LLM_CB_FAIL_THRESHOLD_FALLBACK = 3
-_LLM_CB_COOLDOWN_S_FALLBACK = 300.0
-
-
+# gracefully on empty).
+# Single shared breaker implementation (audit 2026-10-15 P0-2: the dashboard
+# chat path used to carry a hand-copied second breaker with a different
+# threshold source and no metrics). The brain reads its thresholds live from
+# canonical config and additionally feeds the cross-process ai_brain_ready
+# gauge + Prometheus. Mirrors only the *settings provider*; the state machine
+# itself lives in llm_circuit_breaker.LLMCircuitBreaker.
 def _llm_cb_settings() -> tuple[int, float]:
     try:
-        threshold = int(cfg_get("llm_circuit_breaker.fail_threshold",
-                                _LLM_CB_FAIL_THRESHOLD_FALLBACK))
+        threshold = int(cfg_get("llm_circuit_breaker.fail_threshold", 3))
     except (TypeError, ValueError):
-        threshold = _LLM_CB_FAIL_THRESHOLD_FALLBACK
+        threshold = 3
     try:
-        cooldown = float(cfg_get("llm_circuit_breaker.cooldown_s",
-                                 _LLM_CB_COOLDOWN_S_FALLBACK))
+        cooldown = float(cfg_get("llm_circuit_breaker.cooldown_s", 300.0))
     except (TypeError, ValueError):
-        cooldown = _LLM_CB_COOLDOWN_S_FALLBACK
-    if threshold <= 0:
-        threshold = _LLM_CB_FAIL_THRESHOLD_FALLBACK
-    if cooldown <= 0:
-        cooldown = _LLM_CB_COOLDOWN_S_FALLBACK
+        cooldown = 300.0
     return threshold, cooldown
 
 
-def _llm_circuit_open() -> bool:
-    return time.time() < _LLM_CB_OPEN_UNTIL
+def _llm_cb_on_trip(threshold: int, cooldown: float) -> None:
+    logger.warning(
+        "[research] LLM circuit OPEN for %.0fs after %d consecutive failures",
+        cooldown, threshold,
+    )
+    try:
+        from hermes_trader import metrics
+
+        metrics.LLM_CIRCUIT_TRIPS.inc()
+        metrics.LLM_CIRCUIT_STATE.set(1.0)
+    except Exception:
+        pass
 
 
-def _llm_record_success() -> None:
-    global _LLM_CB_FAILURES
-    with _LLM_CB_LOCK:
-        _LLM_CB_FAILURES = 0
+def _llm_cb_on_reset() -> None:
     try:
         from hermes_trader import metrics
 
@@ -484,6 +483,22 @@ def _llm_record_success() -> None:
             metrics.LLM_CIRCUIT_STATE.set(0.0)
     except Exception:
         pass
+
+
+_llm_breaker = LLMCircuitBreaker(
+    name="research",
+    settings_provider=_llm_cb_settings,
+    on_trip=_llm_cb_on_trip,
+    on_reset=_llm_cb_on_reset,
+)
+
+
+def _llm_circuit_open() -> bool:
+    return _llm_breaker.is_open()
+
+
+def _llm_record_success() -> None:
+    _llm_breaker.record_success()
     # P0-2: publish brain liveness for the cross-process ai_brain_ready gauge.
     try:
         from hermes_trader.agents.loop_observability_state import (
@@ -496,19 +511,7 @@ def _llm_record_success() -> None:
 
 
 def _llm_record_failure() -> None:
-    global _LLM_CB_FAILURES, _LLM_CB_OPEN_UNTIL
-    threshold, cooldown = _llm_cb_settings()
-    tripped = False
-    with _LLM_CB_LOCK:
-        _LLM_CB_FAILURES += 1
-        if _LLM_CB_FAILURES >= threshold:
-            _LLM_CB_OPEN_UNTIL = time.time() + cooldown
-            _LLM_CB_FAILURES = 0
-            tripped = True
-            logger.warning(
-                "[research] LLM circuit OPEN for %.0fs after %d consecutive failures",
-                cooldown, threshold,
-            )
+    tripped = _llm_breaker.record_failure()
     # P0-2: surface the breaker to the cross-process ai_brain_ready gauge.
     try:
         from hermes_trader.agents.loop_observability_state import (
@@ -518,15 +521,6 @@ def _llm_record_failure() -> None:
         note_llm_failure(circuit_open=tripped)
     except Exception:
         pass
-    if tripped:
-        # P3-1: count trips and flip the state gauge outside the lock.
-        try:
-            from hermes_trader import metrics
-
-            metrics.LLM_CIRCUIT_TRIPS.inc()
-            metrics.LLM_CIRCUIT_STATE.set(1.0)
-        except Exception:
-            pass
 
 
 def _fired_trigger_direction(perception: dict[str, Any], name: str) -> str:

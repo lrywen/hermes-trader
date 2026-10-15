@@ -431,7 +431,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "enabled": True,
         "allow_shorts": False,
         "bypass_sidestep_overrides": False,
-        "min_confidence": 0.7,
+        # Audit 2026-10-15 P0-1: generic runner bar is the SAME number as the
+        # canonical min_ai_confidence (single source). Drift here silently made
+        # the nested copy the real 0.70 bar while every other floor used 0.60,
+        # cutting 34.7% of candidates. Per-situation bars (short/mover below)
+        # stay deliberately higher. confidence_guard warns on any divergence.
+        "min_confidence": 0.60,
         "min_composite": 45.0,
         "min_hip3_composite": 50.0,
         "min_short_confidence": 0.72,
