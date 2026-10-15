@@ -729,6 +729,19 @@ try:
 except Exception as _cg_err:  # never let a guard bug block startup
     logger.warning("[startup config] confidence guard skipped: %s", _cg_err)
 
+# Audit 2026-10-15 P0-3: regime-aware exit dual-track guard. Warn (never block)
+# which top-level dsl_exit scalars are shadowed by the nested regime_aware block
+# (and per-regime clocks), so tuning a dead-looking top-level stop/clock can't
+# be mistaken for a live change. Reachability is regime-conditional; the guard
+# reports the exact shadowed/reachable regimes.
+try:
+    from hermes_trader.agents.exit_param_guard import exit_shadow_warnings
+
+    for _msg in exit_shadow_warnings(startup_agent_config):
+        logger.warning("[startup config] %s", _msg)
+except Exception as _eg_err:  # never let a guard bug block startup
+    logger.warning("[startup config] exit-param guard skipped: %s", _eg_err)
+
 # HIP-3 toggle: this startup value only seeds the initial prefetched universe.
 # Audit 2026-09-06 (F4, engineering hygiene): the agent config is hot-reloaded
 # per cycle, and flipping enable_hip3 mid-run is detected in the per-cycle
