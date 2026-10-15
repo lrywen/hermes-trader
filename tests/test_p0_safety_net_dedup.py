@@ -16,6 +16,8 @@ from hermes_trader.agents.confidence_guard import (
 from hermes_trader.agents.exit_param_guard import (
     exit_shadow_findings,
     exit_shadow_warnings,
+    stop_width_drift_findings,
+    stop_width_drift_warnings,
 )
 from hermes_trader.agents.llm_circuit_breaker import LLMCircuitBreaker
 
@@ -272,3 +274,56 @@ def test_warnings_are_human_readable():
     msgs = exit_shadow_warnings(_FULL_CFG)
     assert any("dsl_exit.max_loss_pct" in m and "SHADOWED" in m for m in msgs)
     assert all(m.startswith("exit dual-track:") for m in msgs)
+
+
+# ── P1 (SL width): backup-stop-width drift guard ───────────────────────────
+
+
+def test_stop_width_aligned_shared_block_is_silent():
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2}},
+           "sl_atr_mult": 1.2, "sl_floor_pct": 1.2}
+    assert stop_width_drift_findings(cfg) == []
+
+
+def test_stop_width_divergent_override_is_flagged():
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2}},
+           "sl_atr_mult": 1.5}
+    f = stop_width_drift_findings(cfg)
+    assert len(f) == 1
+    assert f[0]["top_key"] == "sl_atr_mult" and f[0]["top_value"] == 1.5
+    assert f[0]["shared_value"] == 1.2
+
+
+def test_stop_width_absent_override_is_silent():
+    # no top-level sl_* -> shared block is the single source (desired state)
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2}}}
+    assert stop_width_drift_findings(cfg) == []
+
+
+def test_stop_width_floor_drift_is_flagged_separately():
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2}},
+           "sl_floor_pct": 1.5}
+    f = stop_width_drift_findings(cfg)
+    assert len(f) == 1 and f[0]["top_key"] == "sl_floor_pct"
+
+
+def test_stop_width_ceiling_divergence_not_flagged():
+    # backup/DSL ceilings are intentionally different -> never warned
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2,
+                                     "ceiling_pct": 3.0}},
+           "sl_ceiling_pct": 3.0}
+    assert stop_width_drift_findings(cfg) == []
+
+
+def test_stop_width_warnings_text():
+    cfg = {"dsl_exit": {"atr_stop": {"atr_mult": 1.2, "floor_pct": 1.2}},
+           "sl_atr_mult": 1.5}
+    msgs = stop_width_drift_warnings(cfg)
+    assert len(msgs) == 1
+    assert "sl_atr_mult=1.5" in msgs[0] and "atr_mult=1.2" in msgs[0]
+    assert "single source" in msgs[0]
+
+
+def test_stop_width_missing_shared_block_is_silent():
+    cfg = {"sl_atr_mult": 1.5}
+    assert stop_width_drift_findings(cfg) == []

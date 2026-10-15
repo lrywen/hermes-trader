@@ -742,6 +742,19 @@ try:
 except Exception as _eg_err:  # never let a guard bug block startup
     logger.warning("[startup config] exit-param guard skipped: %s", _eg_err)
 
+# Audit 2026-10-15 P1 (SL width): the two stop layers already share the
+# dsl_exit.atr_stop canonical block (false redundancy — DSL exit vs exchange
+# backup net; ceilings intentionally differ). Warn only when an EXPLICIT
+# top-level sl_atr_mult/sl_floor_pct override diverges from that shared block
+# (the HYPE-class gap), never suggest deleting the shared keys.
+try:
+    from hermes_trader.agents.exit_param_guard import stop_width_drift_warnings
+
+    for _msg in stop_width_drift_warnings(startup_agent_config):
+        logger.warning("[startup config] %s", _msg)
+except Exception as _sw_err:  # never let a guard bug block startup
+    logger.warning("[startup config] stop-width guard skipped: %s", _sw_err)
+
 # Audit 2026-10-15 P1-1: late-entry single-source guard. The runner pre-screen
 # now derives its RSI/extension thresholds from the authoritative ta_late_entry
 # block; warn if the legacy runner_entry_gate numeric keys still carry divergent

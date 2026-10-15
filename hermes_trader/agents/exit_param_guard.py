@@ -146,3 +146,80 @@ def exit_shadow_warnings(config: Mapping[str, Any]) -> list[str]:
             f"reachable in [{f['reachable_in']}]); tuning the top-level key has "
             "no effect in the shadowed regimes — edit the nested regime value")
     return out
+
+
+# ── Backup-stop-width drift guard (audit 2026-10-15 P1, SL width) ──────────
+#
+# Stop width is NOT a duplicated implementation to collapse:
+#   * ``dsl_exit.atr_stop.{atr_mult,floor_pct,ceiling_pct}`` is the CANONICAL
+#     stop-width block both layers resolve through (_shared_atr_stop_config,
+#     compute_backup_sl_width_pct — auto executor, manual server.py and
+#     shadow_book). Even with atr_stop.enabled=False (409-trade study: "no edge
+#     on/off" for the DSL's OWN ATR width), these keys stay live because they
+#     size the EXCHANGE BACKUP disaster-net. They must never be deleted.
+#   * top-level ``sl_atr_mult`` / ``sl_floor_pct`` are deliberate BACKUP-LAYER
+#     overrides (precedence: explicit sl_* > shared atr_stop > module default).
+#   * the two ceilings are INTENTIONALLY different (DSL 3% vs backup outer-net
+#     clamp) — that divergence is by design and is never warned.
+#
+# The real residual risk is the operator setting the same number in both places
+# and later retuning only one (the HYPE-class gap). This guard warns when an
+# EXPLICIT top-level sl_* multiplier/floor differs from the shared block. It
+# does not fire when the top-level key is absent (then the shared block is the
+# sole source, which is the desired state).
+
+_STOP_WIDTH_DRIFT_EPS = 1e-9
+
+
+def stop_width_drift_findings(config: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """Return explicit backup-layer stop-width overrides that diverge from the
+    shared ``dsl_exit.atr_stop`` canonical block. Empty when the top-level keys
+    are absent (shared block is the single source) or equal."""
+    if not isinstance(config, Mapping):
+        return []
+    dsl = config.get("dsl_exit")
+    shared = dsl.get("atr_stop") if isinstance(dsl, Mapping) else None
+    if not isinstance(shared, Mapping):
+        return []
+
+    def _num(v: Any) -> float | None:
+        try:
+            x = float(v)
+        except (TypeError, ValueError):
+            return None
+        return x if x == x else None  # NaN guard
+
+    pairs = (
+        ("sl_atr_mult", "atr_mult", "backup-SL ATR multiplier"),
+        ("sl_floor_pct", "floor_pct", "backup-SL floor %"),
+    )
+    findings: list[dict[str, Any]] = []
+    for top_key, shared_key, label in pairs:
+        if top_key not in config:
+            continue  # absent -> shared block is the single source; no drift
+        top_v = _num(config.get(top_key))
+        shared_v = _num(shared.get(shared_key))
+        if top_v is None or shared_v is None:
+            continue
+        if abs(top_v - shared_v) > _STOP_WIDTH_DRIFT_EPS:
+            findings.append({
+                "top_key": top_key,
+                "shared_key": f"dsl_exit.atr_stop.{shared_key}",
+                "top_value": top_v,
+                "shared_value": shared_v,
+                "label": label,
+            })
+    return findings
+
+
+def stop_width_drift_warnings(config: Mapping[str, Any]) -> list[str]:
+    """Human-readable startup warnings for stop-width override divergence."""
+    return [
+        f"stop-width drift: top-level {f['top_key']}={f['top_value']:g} overrides "
+        f"the shared {f['shared_key']}={f['shared_value']:g} for the "
+        f"{f['label']}; the two stop layers ({f['top_key']} vs the shared block) "
+        "would size the exchange backup net differently — align them or remove "
+        f"the top-level {f['top_key']} to use the single source. (The separate "
+        "backup/DSL ceilings are intentionally different and are not checked.)"
+        for f in stop_width_drift_findings(config)
+    ]
