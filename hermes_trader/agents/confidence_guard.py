@@ -36,6 +36,14 @@ from typing import Any
 
 _EPS = 1e-9
 
+#: Built-in last-resort generic confidence floor. MUST equal
+#: ``CANONICAL_DEFAULTS["min_ai_confidence"]`` (config_defaults.py = 0.60); it is
+#: only reached when BOTH the nested runner key and the canonical config key are
+#: absent (the merged config normally always carries the canonical value).
+#: Audit 2026-10-15 P3: the old fallback literal 0.70 had drifted from the
+#: canonical 0.60, so a missing-key event silently snapped the bar 0.10 higher.
+DEFAULT_MIN_AI_CONFIDENCE = 0.60
+
 
 def canonical_generic_confidence(config: Mapping[str, Any]) -> float | None:
     """The single generic AI confidence floor (``min_ai_confidence``)."""
@@ -67,7 +75,7 @@ def resolve_runner_generic_confidence(config: Mapping[str, Any]) -> float:
     if nested is not None:
         return nested
     canonical = canonical_generic_confidence(config)
-    return canonical if canonical is not None else 0.70
+    return canonical if canonical is not None else DEFAULT_MIN_AI_CONFIDENCE
 
 
 def confidence_threshold_warnings(config: Mapping[str, Any]) -> list[str]:

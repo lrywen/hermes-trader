@@ -18,6 +18,7 @@ from typing import Any, Callable, NamedTuple, Optional
 
 from hyperliquid.utils.types import Cloid
 
+from hermes_trader.agents.config_defaults import CANONICAL_DEFAULTS
 from hermes_trader.agents.config_store import (
     apply_coin_override,
     cfg_get,
@@ -1039,8 +1040,9 @@ def select_exit_params(dsl_config: dict[str, Any], regime: str) -> tuple[float, 
     base_retrace = float(dsl_config.get("retrace_threshold", cfg_get("dsl_exit.retrace_threshold")))
     base_tiers = dsl_config.get("phase2_tiers")
     # 生产 regime_aware.enabled=true 时 trend 块显式给 4.0、non_trend 块给 1.5，
-    # 故顶层 dsl_exit.max_loss_pct（=1.0）在本出场路径不可达，仅在 non_trend
-    # 块缺省时作为回落默认。它仍被 v1 sizing 读取（见 _v1_stop_width）。
+    # 故顶层 dsl_exit.max_loss_pct（canonical 默认 1.0，活配置 1.5）在本出场路径
+    # 不可达，仅在 trend/non_trend 块缺键时作为回落默认。它另被 _v1_stop_width
+    # 读取，但 sizing_v2=enforce 下该 v1 值仅用于对比日志（见该函数 docstring）。
     base_max_loss = float(dsl_config.get("max_loss_pct", cfg_get("dsl_exit.max_loss_pct")))
     base_max_loss_roe = float(dsl_config.get("max_loss_roe_pct", cfg_get("dsl_exit.max_loss_roe_pct")))
 
@@ -3466,19 +3468,24 @@ def _v1_stop_width(dsl: dict[str, Any], leverage: float) -> float:
     """S9 stage: legacy v1 stop width as a fraction of notional.
 
     ``min(max_loss_pct, max_loss_roe_pct / max(1, leverage)) / 100`` — the
-    top-level DSL stop (live sets 1.0% / 15% at 10x → 1.0% stop). Computed up
-    front so the v2 shadow path can log the v1-vs-v2 comparison while still
-    sizing on v1. Pure leaf extracted in the P1-1 step ③ phase split.
+    top-level DSL stop. Pure leaf extracted in the P1-1 step ③ phase split.
 
-    A-1 澄清（2026-09-20，容器生产配置只读取证）：顶层 ``max_loss_pct`` 在
-    **出场引擎**里不可达——``select_exit_params`` 在 regime_aware.enabled=true
-    下恒返回 per-regime 值（trend 4.0 / non_trend 1.5），DSLTracker 从不读顶层
-    值。但它在**本 v1 sizing 路径**仍然可达并被读取（实盘下单日志
-    "@ 1.00% stop"）。当前因权益极小、notional 恒被 30 美元 notional_cap 钳制，
-    该宽度不改变实际下单量；sizing v2 转正后此值被真实止损宽度 SSOT
-    （resolve_effective_stop_width_pct，T-25）取代。因此顶层 1.0 是历史手动
-    调参遗留（2026-09-08/09 自 2.5 改为 1.0，无 git/审计记录），**不是**纯死值：
-    改它会在放大资金/notional_cap 放开后影响 v1 sizing。勿据「永远不可达」将其删除。
+    现状（audit 2026-10-15 P3 复核，覆盖 2026-09-20 的旧「勿删」结论）：
+    活配置 ``sizing_basis=primary_stop`` 且 ``sizing_v2_mode=enforce``，调用方
+    在 ``if mode == "enforce"`` 分支用 v2 的 SSOT 止损宽度直接覆盖 ``_stop_frac``
+    （见本函数唯一调用点附近），所以本 v1 值**在当前部署只喂 v1-vs-v2 对比日志**，
+    不影响下单量、不影响实际止损、不影响出场。它不再是「放大资金后会重新生效」
+    的潜伏旋钮——enforce 是收口态（shadow/sizing_v2.py 默认即 enforce，PRM-06
+    不再退回 v1 口径）。
+
+    但顶层 ``dsl_exit.max_loss_pct`` **键本身不能删**，它仍是结构性回落：
+      1. ``select_exit_params`` 在 ``regime_aware.max_loss.non_trend`` 缺键时
+         回落到顶层值（trend 块同理）；
+      2. ``dsl_exit._policy_from_config`` 的 base policy 读顶层，regime_aware
+         关闭 / overlay 异常时用它；
+      3. ``backtest/stop_model.py`` 的 regime cap 由该顶层值喂入。
+    出场引擎在 regime_aware.enabled=true 且 trend/non_trend 块齐全时不读它，
+    该遮蔽关系由 exit_param_guard 在启动时告警（reachable_in=nowhere）。
     """
     max_loss = float(dsl.get("max_loss_pct", 1.0) or 1.0)
     max_roe = float(dsl.get("max_loss_roe_pct", 15.0) or 15.0)
@@ -3560,11 +3567,19 @@ def _structural_override_path(analysis: dict[str, Any], config: dict[str, Any],
                    else "breakout+volume (O'Neil)" if breakout_strong
                    else "TA sidestep" if ta_sidestep_strong
                    else f"composite={analysis.get('composite_score'):.0f}>={override_composite:.0f} (momentum force)")
-        # Upgrade to the configured confidence floor (not a hardcoded 0.70) so a
-        # structural/whale override still clears the confidence_gate after the bar
-        # is raised. Otherwise raising min_ai_confidence would silently kill the
-        # whale overrides — empirically the one flat-positive bucket.
-        _conf_floor = float(config.get("min_ai_confidence", 0.70))
+        # Upgrade to the configured confidence floor so a structural/whale
+        # override still clears the confidence_gate after the bar is raised.
+        # Otherwise raising min_ai_confidence would silently kill the whale
+        # overrides — empirically the one flat-positive bucket. P3: read through
+        # the confidence_guard SSOT constant so the missing-key fallback can't
+        # drift from CANONICAL_DEFAULTS["min_ai_confidence"].
+        from hermes_trader.agents.confidence_guard import (
+            DEFAULT_MIN_AI_CONFIDENCE,
+            canonical_generic_confidence,
+        )
+        _conf_floor = canonical_generic_confidence(config)
+        if _conf_floor is None:
+            _conf_floor = DEFAULT_MIN_AI_CONFIDENCE
         _ai_conf_raw = float(analysis.get("confidence", 0) or 0)
         _ai_down = bool(analysis.get("ai_down", False))
         _nlp_parsed = bool(analysis.get("nlp_parsed", False))
@@ -5454,7 +5469,11 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         resolve_runner_generic_confidence,
     )
     min_conf = resolve_runner_generic_confidence(config)
-    min_score = float(gate.get("min_composite", 30.0))
+    # P3: the missing-key fallbacks mirror CANONICAL_DEFAULTS runner_entry_gate
+    # so a malformed/partial gate block can't silently snap to a different bar
+    # (the merged config normally always carries the canonical leaves).
+    _rg_defaults = CANONICAL_DEFAULTS["runner_entry_gate"]
+    min_score = float(gate.get("min_composite", _rg_defaults["min_composite"]))
     min_hip3_score = float(gate.get("min_hip3_composite", 50.0))
 
     volume = bool(analysis.get("volume_spike_fired"))
@@ -5724,8 +5743,12 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
 
     structured_daily_mover = (
         daily_mover
-        and gate_conf >= float(gate.get("mover_min_confidence", 0.80))
-        and score >= float(gate.get("mover_min_composite", 45.0))
+        and gate_conf >= float(gate.get(
+            "mover_min_confidence",
+            CANONICAL_DEFAULTS["runner_entry_gate"]["mover_min_confidence"]))
+        and score >= float(gate.get(
+            "mover_min_composite",
+            CANONICAL_DEFAULTS["runner_entry_gate"]["mover_min_composite"]))
         and (slow_count >= 1 or volume or breakout or burst_aligned_long)
     )
     structured_runner = fresh_impulse and (slow_count >= 1 or score >= min_score)
@@ -6003,10 +6026,14 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     # the late-chase veto; shadow keeps the base switch (no live change).
     if bool(pb_cfg.get("enabled", False)) and _ov_pullback_enabled \
             and not (structured_runner or structured_daily_mover):
-        pb_min_score = float(pb_cfg.get("min_composite", 20.0))
-        pb_max_rsi = float(pb_cfg.get("max_rsi", 70.0))
-        pb_max_ext = float(pb_cfg.get("max_extension_atr", 2.0))
-        pb_min_slow = int(pb_cfg.get("min_slow_burn", 1) or 1)
+        # P3: missing-key fallbacks mirror CANONICAL_DEFAULTS pullback_long
+        # (30/65/2.0/2); the merged block normally carries them.
+        _pb_defaults = CANONICAL_DEFAULTS["runner_entry_gate"]["pullback_long"]
+        pb_min_score = float(pb_cfg.get("min_composite", _pb_defaults["min_composite"]))
+        pb_max_rsi = float(pb_cfg.get("max_rsi", _pb_defaults["max_rsi"]))
+        pb_max_ext = float(pb_cfg.get("max_extension_atr", _pb_defaults["max_extension_atr"]))
+        pb_min_slow = int(pb_cfg.get("min_slow_burn", _pb_defaults["min_slow_burn"])
+                          or _pb_defaults["min_slow_burn"])
         # reuse the 4h ATR extension computed once above (w8).
         pb_extension = extension_4h
         # Audit 2026-09-06 (E2, Q3): the bypass must also align with the MACRO

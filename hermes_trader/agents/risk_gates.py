@@ -11,6 +11,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Collection, Optional
 
+from hermes_trader.agents.config_defaults import CANONICAL_DEFAULTS
 from hermes_trader.agents.config_store import cfg_get
 from hermes_trader.models.types import GateContext
 from hermes_trader.shared_config import load_shared_config
@@ -130,7 +131,10 @@ def late_chase_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
         return {"pass": True}
 
     # Leg 1 — move-state freshness.
-    band = float(cfg.get("fresh_move_band_pct", 8.0) or 0.0)
+    # P3: missing-key fallback mirrors CANONICAL_DEFAULTS late_chase
+    # fresh_move_band_pct (12), not the drifted legacy 8.
+    _lc_defaults = CANONICAL_DEFAULTS["late_chase"]
+    band = float(cfg.get("fresh_move_band_pct", _lc_defaults["fresh_move_band_pct"]) or 0.0)
     from hermes_trader.agents.move_state import entry_allowed as _move_entry_allowed
     allowed, why = _move_entry_allowed(
         coin=ctx.coin, side=side, mid=mid, fresh_max_extension_pct=band)
@@ -138,9 +142,10 @@ def late_chase_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
         logger.info("[risk][gates] late_chase BLOCK %s: %s", ctx.coin, why)
         return {"pass": False, "via": "late_chase_missed_move", "reason": why}
 
-    # Leg 2 — terminal 1h RSI.
-    rsi_high = float(cfg.get("rsi1h_overbought", 85.0) or 0.0)
-    rsi_low = float(cfg.get("rsi1h_oversold", 15.0) or 0.0)
+    # Leg 2 — terminal 1h RSI. P3: fallbacks mirror CANONICAL_DEFAULTS
+    # late_chase (88/12), not the drifted legacy 85/15.
+    rsi_high = float(cfg.get("rsi1h_overbought", _lc_defaults["rsi1h_overbought"]) or 0.0)
+    rsi_low = float(cfg.get("rsi1h_oversold", _lc_defaults["rsi1h_oversold"]) or 0.0)
     if (side == "long" and rsi_high > 0) or (side == "short" and rsi_low > 0):
         rsi1h = _latest_closed_rsi(ctx.coin, "1h")
         if rsi1h is not None:
@@ -2409,11 +2414,13 @@ def eval_all_gates(
         ctx, float(cfg_get("max_signal_price_deviation_pct", config=config) or 0.0))
     # score_invariant: re-verify the composite score on a fresh rescan so the
     # trade isn't booked on a snapshot score the market no longer supports.
-    _runner_gate_cfg = config.get("runner_entry_gate") or {}
+    # P3: the bar is the SAME runner_entry_gate.min_composite the runner gate
+    # uses (canonical 45); resolve via cfg_get so the two gates' missing-key
+    # fallbacks can't diverge again (old local literal was 30).
     results["score_invariant"] = score_invariant_gate(
         ctx,
         bool(cfg_get("score_invariant_enabled", config=config)),
-        float(_runner_gate_cfg.get("min_composite", 30.0)),
+        float(cfg_get("runner_entry_gate.min_composite", config=config)),
     )
     # late_chase: refuse to join an already-missed (over-extended) move or a
     # terminal 1h-RSI blowoff, even when the breakout trigger itself is fresh.

@@ -52,7 +52,11 @@ def test_resolver_honours_explicit_nested_for_emergency_override():
 
 
 def test_resolver_falls_back_when_everything_missing():
-    assert resolve_runner_generic_confidence({}) == 0.70
+    # P3 (2026-10-15): the built-in last-resort fallback now mirrors
+    # CANONICAL_DEFAULTS["min_ai_confidence"] (0.60), not the drifted 0.70.
+    from hermes_trader.agents.confidence_guard import DEFAULT_MIN_AI_CONFIDENCE
+
+    assert resolve_runner_generic_confidence({}) == DEFAULT_MIN_AI_CONFIDENCE == 0.60
 
 
 def test_situation_bar_below_generic_is_flagged():

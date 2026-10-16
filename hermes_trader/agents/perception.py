@@ -1719,7 +1719,14 @@ def current_composite_score(
         from hermes_trader.agents.config_store import read_agent_config
         _cfg = read_agent_config()
         scan_cfg = {**base_cfg, **_cfg}
-        min_score = float(scan_cfg.get("scan", {}).get("minCompositeScore", 30) or 30)
+        # P3: missing-key fallback mirrors CANONICAL_DEFAULTS scan.minCompositeScore
+        # (54), not a drifted 30 that would silently loosen the rescore bar if the
+        # scan block were absent.
+        from hermes_trader.agents.config_defaults import CANONICAL_DEFAULTS
+        _scan_default = CANONICAL_DEFAULTS["scan"]["minCompositeScore"]
+        min_score = float(
+            scan_cfg.get("scan", {}).get("minCompositeScore", _scan_default)
+            or _scan_default)
 
         mids = fetch_all_mids()
         if not mids:

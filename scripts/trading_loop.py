@@ -2216,10 +2216,19 @@ while True:
                         _dir = "up"
                     elif _br.rstrip().endswith("down"):
                         _dir = "down"
-                _band = float((_lc_cfg or {}).get("fresh_move_band_pct", 8.0))
-                _min_age = float((_lc_cfg or {}).get("min_anchor_age_sec", 300.0))
-                _min_ext_reset = float(
-                    (_lc_cfg or {}).get("min_move_extension_pct_for_reset", 3.0))
+                # P3: fallback mirrors CANONICAL_DEFAULTS late_chase
+                # fresh_move_band_pct (12) so the anchor WRITE side stays
+                # byte-aligned with the risk-gate READ side (late_chase_gate),
+                # which resolves the same canonical band.
+                from hermes_trader.agents.config_defaults import CANONICAL_DEFAULTS as _CD
+                _lc_d = _CD["late_chase"]
+                _band = float((_lc_cfg or {}).get(
+                    "fresh_move_band_pct", _lc_d["fresh_move_band_pct"]))
+                _min_age = float((_lc_cfg or {}).get(
+                    "min_anchor_age_sec", _lc_d["min_anchor_age_sec"]))
+                _min_ext_reset = float((_lc_cfg or {}).get(
+                    "min_move_extension_pct_for_reset",
+                    _lc_d["min_move_extension_pct_for_reset"]))
                 _move_observe(
                     coin=_p.get("coin", "?"), mid=float(_p.get("mid") or 0.0),
                     impulse=bool(_brk_hit or _bst_hit), impulse_dir=_dir,

@@ -153,10 +153,15 @@ def _apply_confidence_decay(analysis: dict[str, Any], config: dict[str, Any]) ->
     _outcome = "applied" if factor < 0.999 else "no_change"
     # Confidence gate threshold for the counterfactual "would this entry have
     # been blocked?" tag (aligned with risk_gates' min_ai_confidence read).
-    try:
-        min_conf = float(config.get("min_ai_confidence", 0.70) or 0.70)
-    except (TypeError, ValueError):
-        min_conf = 0.70
+    # P3: resolve through the confidence_guard SSOT so the missing-key fallback
+    # matches CANONICAL_DEFAULTS instead of the old drifted 0.70 literal.
+    from hermes_trader.agents.confidence_guard import (
+        DEFAULT_MIN_AI_CONFIDENCE,
+        canonical_generic_confidence,
+    )
+    min_conf = canonical_generic_confidence(config)
+    if min_conf is None:
+        min_conf = DEFAULT_MIN_AI_CONFIDENCE
     if mode == "enforce":
         # Keep the pre-decay conviction for audit; override/runner code that
         # wants the model's raw opinion reads ai_confidence_raw (set later by
