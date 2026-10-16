@@ -624,7 +624,7 @@ _OPP = {"long": "short", "short": "long"}
 # 实验臂 → 信号源臂（baseline 派生）与 DSL 键（main 注入 dsls dict）
 DERIVED_ARMS = ["dsl_t1", "dsl_t2", "fade_live", "fade_tuned",
                 "filt", "filt_s60", "pullback", "filt_ld", "filt_ra",
-                "wt20", "wt25", "wt30"]
+                "wt20", "wt25", "wt30", "ts4"]
 PULLBACK_PCT = 0.4   # 限价回撤幅度（%）
 PULLBACK_BARS = 24   # 挂单有效期（5m 根数 = 2h）
 
@@ -770,6 +770,8 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                     per_arm["filt_ld"].append((i, replace(cand, arm="filt_ld")))
                     # P6-RA：同信号、同过滤，出场按 BTC regime 动态切换
                     per_arm["filt_ra"].append((i, replace(cand, arm="filt_ra")))
+                    # 趋势止损对照臂：同 filt_ra，仅 trend 止损固定 4.0%/roe20
+                    per_arm["ts4"].append((i, replace(cand, arm="ts4")))
                     if cand.score >= 60:
                         per_arm["filt_s60"].append(
                             (i, replace(cand, arm="filt_s60")))
@@ -788,6 +790,12 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
                 # P6-RA：复现 select_exit_params —— trend(up/down) 走 trend_ride
                 # （宽追踪 + 4.0% 止损天花板），neutral/chop 走 scalp（+1.5% 止损）。
                 _dsl = (dsls["ra_trend"]
+                        if _regime_at(bars[i].t + MS_5M) in ("up", "down")
+                        else dsls["ra_nontrend"])
+            elif arm == "ts4":
+                # 与 filt_ra 同信号同 regime 选择，仅 trend 腿止损强制 4.0%/roe20，
+                # 用于对照线上 trend=1.5% 是否过紧（单跑内严格配对）。
+                _dsl = (dsls["ts4_trend"]
                         if _regime_at(bars[i].t + MS_5M) in ("up", "down")
                         else dsls["ra_nontrend"])
             tr = _simulate_trade(cand, bars, i, _dsl, notional,
@@ -846,7 +854,8 @@ ARMS = [("baseline", "baseline（live ≥54+旁路）"),
         ("filt_ra", "E3d 过滤+regime感知出场"),
         ("wt20", "止血 弱趋势禁追 ADX4h<20"),
         ("wt25", "止血 弱趋势禁追 ADX4h<25"),
-        ("wt30", "止血 弱趋势禁追 ADX4h<30")]
+        ("wt30", "止血 弱趋势禁追 ADX4h<30"),
+        ("ts4", "趋势止损4.0%(线上1.5%对照)")]
 
 
 def report(all_trades: List[Trade], funnels: Dict[str, Dict[str, int]],
@@ -1006,6 +1015,9 @@ def main() -> None:
     dsls["ra_nontrend"] = replace(
         live_dsl, max_loss_pct=float(_nt_ml.get("max_loss_pct", 1.5)))
     dsls["filt_ra"] = dsls["ra_nontrend"]  # 兜底；实际在调用点按 regime 选
+    # ts4：与 ra_trend 完全相同的追踪参数，仅 trend 止损固定 4.0%（ROE 由 lev=1
+    # 回放松弛，见 _simulate_trade eff_max_loss），对照线上 1.5% trend 止损。
+    dsls["ts4_trend"] = replace(dsls["ra_trend"], max_loss_pct=4.0)
 
     now_ms = int(time.time() * 1000)
     end_ms = args.end_ms or (now_ms // MS_5M) * MS_5M - MS_5M
