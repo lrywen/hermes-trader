@@ -950,6 +950,18 @@ class AgentMemory:
             self._analyses.append(a)
             self._retention_sweep_nolock()
             self._dirty = True
+        # P1 (audit 2026-10-15): durable end-to-end trace. The rolling in-memory
+        # list is capped at MAX_ANALYSES (a few hours at scan throughput), so a
+        # fill's analysis_id could no longer be joined once the analysis was
+        # evicted (coverage was 0/290). Mirror the trades/closes pattern: emit a
+        # SLIM, append-only, tamper-evident "analysis" event so a fill/reflection
+        # can be joined to its originating decision over the full retention.
+        # Best-effort — audit storage must never block research.
+        try:
+            from hermes_trader.agents.trace_registry import record_analysis_event
+            record_analysis_event(a)
+        except Exception:
+            pass
 
     def record_trade(self, t: dict[str, Any]) -> None:
         with self._lock:
@@ -2251,7 +2263,14 @@ class AgentMemory:
         for a in analyses:
             if a["id"] == id:
                 return a
-        return None
+        # P1 (audit 2026-10-15): the hot rolling list may have evicted this
+        # analysis (200-cap); fall back to the durable trace ledger so a
+        # historical fill can still be joined to its decision.
+        try:
+            from hermes_trader.agents.trace_registry import lookup_analysis
+            return lookup_analysis(id)
+        except Exception:
+            return None
 
     def get_win_rate(self) -> dict[str, float]:
         # Prefer the realized outcome store; fall back to the legacy (never-
