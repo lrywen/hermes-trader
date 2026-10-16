@@ -454,6 +454,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "trend_rsi_overbought": 80.0,
         "rsi_oversold": 25.0,
         "max_extension_atr": 2.5,
+        # Audit 2026-10-16 (#10): breakout recency window in 5m bars consumed
+        # in executor._runner_entry_block_reason (0 = off). Mirror of the
+        # executor hardcode so config-parity sees it.
+        "breakout_validity_bars": 6,
         # Hemostat (2026-10-11): weak-trend chase veto. A burst/continuation
         # entry (not a self-volume-confirming range breakout) into a coin whose
         # 4h ADX is below the floor is chop-top noise that mean-reverts into
