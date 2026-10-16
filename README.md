@@ -143,12 +143,18 @@ Replicates the Hyperfeed MCP plugin's data directly from HL API:
 
 There are two config files, and they bootstrap **differently**:
 
+> **⚠ Production path (container)** — the live agent reads its strategy config
+> from **`/data/.agent-config.json`** (bind-mounted volume), not the repo copy.
+> The repo-root `.agent-config.json` below is only the **local / dev default**.
+> Set `HERMES_AGENT_CONFIG_FILE` (or mount) to point at `/data` in production.
+> Editing the repo-root copy does **not** change what the container runs.
+
 | File | Ships with repo? | You… | Read |
 |------|------------------|------|------|
-| **`.agent-config.json`** | **Yes — tracked**, comes pre-populated with the live strategy | **edit** it (don't create) | fresh on every trade — no restart |
+| **`.agent-config.json`** | **Yes — tracked** (local/dev default only) | **edit** the file at your *runtime* path (production: `/data/.agent-config.json`) | fresh on every trade — no restart |
 | **`.env.local`** | **No — gitignored** | **create** it: `cp .env.local.example .env.local`, fill in keys | at process start — restart to apply |
 
-So on a fresh clone: `.agent-config.json` is already there (tweak the values); `.env.local` does not exist until you copy the example and add your credentials. If `.agent-config.json` is ever missing or malformed, the loader falls back to `{"mode": "OFF"}` (analyse-only, no orders) — it fails safe, never trades blind.
+So on a fresh clone: `.agent-config.json` is already there as a **local default** (tweak the values **in your runtime path** — production is `/data/.agent-config.json`); `.env.local` does not exist until you copy the example and add your credentials. If the runtime `.agent-config.json` is ever missing or malformed, the loader falls back to `{"mode": "OFF"}` (analyse-only, no orders) — it fails safe, never trades blind.
 
 ### `.env.local` — credentials & runtime
 

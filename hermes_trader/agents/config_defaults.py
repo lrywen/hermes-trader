@@ -287,6 +287,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # must confirm it (dsl_exit.get_index_prices).
         "consecutive_breaches_required": 2,
         "breach_confirm_sec": 4.0,
+        # ExitPolicy class defaults surfaced here so the canonical store type-
+        # checks them on deep-merge (audit 2026-10-16 / problem #10). dsl_exit
+        # and executor read these via .get with the same fallbacks.
+        "hard_stop_confirm_sec": 1.0,
+        "ignite_periods": ("5m", "15m", "1h"),
         "phase2_tiers": [
             {"pct_above_entry": 2.0, "retrace_threshold": 0.35},
             {"pct_above_entry": 6.0, "retrace_threshold": 0.3},

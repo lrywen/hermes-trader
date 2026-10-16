@@ -145,7 +145,10 @@ def enforce_signals(coin: str, side: str, cfg: dict[str, Any]) -> Enforcement:
         return Enforcement()
     is_hip3 = ":" in (coin or "")
     do_veto = bool(en.get("veto", True))
-    do_boost = bool(en.get("boost", True))
+    # fail-closed: default boost off. canonical defaults are "boost": False
+    # (config_defaults.py) — a lost leaf during deep-merge must NOT silently
+    # re-arm the threshold-lowering boost (audit 2026-10-16 / problem #8).
+    do_boost = bool(en.get("boost", False))
 
     veto = False
     veto_reason = ""

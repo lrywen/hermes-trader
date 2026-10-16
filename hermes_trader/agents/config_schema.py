@@ -517,6 +517,10 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
     },
     "consecutive_breaches_required": ("int", 1, 100),
     "breach_confirm_sec": _num_leaf(0.0, 600.0),
+    # Audit 2026-10-16 (#10): surface ExitPolicy class defaults here so the
+    # canonical store type-checks them on deep-merge.
+    "hard_stop_confirm_sec": _num_leaf(0.0, 600.0),
+    "ignite_periods": ("list_of", ("enum", ("1m", "3m", "5m", "15m", "30m", "1h", "4h"))),
     "phase2_tiers": ("list", {
         "pct_above_entry": _num_leaf(0.0, 100.0),
         "retrace_threshold": _num_leaf(0.0, 1.0),
@@ -732,6 +736,9 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "trend_rsi_overbought": _num_leaf(0.0, 100.0),
         "rsi_oversold": _num_leaf(0.0, 100.0),
         "max_extension_atr": _num_leaf(0.0, 50.0),
+        # Audit 2026-10-16 (#10): breakout recency window in 5m bars consumed
+        # in executor._runner_entry_block_reason (default 6, 0 = off).
+        "breakout_validity_bars": ("int", 0, 100_000),
         # Hemostat (2026-10-11): weak-trend chase veto (0 = off).
         "weak_trend_chase": {
             "min_adx4h": _num_leaf(0.0, 100.0),
@@ -1000,6 +1007,17 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
             return
         for i, item in enumerate(val):
             _validate_nested_spec(f"{path}[{i}]", item, ("dict", spec[1]), errors)
+    elif kind == "list_of":
+        # List whose ELEMENTS are validated against an element spec (not a
+        # dict of lists). Used for ignite_periods (list of interval enums).
+        # Accept tuple too: CANONICAL_DEFAULTS keeps some multi-values as
+        # tuples in Python (ignite_periods) while the JSON store uses lists.
+        elem_spec = spec[1]
+        if not isinstance(val, (list, tuple)):
+            errors.append(f"{path}: expected list, got {type(val).__name__}")
+            return
+        for i, item in enumerate(val):
+            _validate_nested_spec(f"{path}[{i}]", item, elem_spec, errors)
     elif kind == "dict_of":
         # Free-form map (e.g. coin_overrides keyed by coin); map keys are
         # arbitrary strings. Only the leaves the runtime actually reads are
