@@ -113,13 +113,27 @@ def test_slippage_no_gap_when_within_cap():
     assert s["gap_through_rows"] == 0
 
 
-def test_slippage_missing_slippage_pct_is_zero():
-    # max_loss closes historically omit slippage_pct (None) -> no fixed component
-    rows = [_close(notional_usd=100.0, slippage_pct=None, spot_pct=-5.0,
-                   realized_pnl_usd=-5.0,
+def test_slippage_missing_slippage_pct_is_pre_era():
+    # Pre-2a8ba70 max_loss closes omit slippage_pct (None). Their fixed-slip is
+    # unknown (reported via pre_era_closes, not assumed 0), but gap-through
+    # overstop is still computed.
+    rows = [_close(ts=1_791_000_000_000, notional_usd=100.0, slippage_pct=None,
+                   spot_pct=-5.0, realized_pnl_usd=-5.0,
                    reason="max_loss (5.0% spot >= 3.00% spot cap)")]
     s = ob.slippage_analysis(rows)
+    assert s["pre_era_closes"] == 1
     assert s["fixed_slippage_usd"] == 0.0
+    assert s["gap_through_usd"] == pytest.approx(2.0)
+
+
+def test_slippage_post_era_missing_slip_is_not_pre_era():
+    # A close after the cutover that still lacks slippage_pct is anomalous, not
+    # a legitimate pre-era record; it should not be counted in pre_era_closes.
+    rows = [_close(ts=ob._SLIP_ERA_MS + 1, notional_usd=100.0, slippage_pct=None,
+                   spot_pct=-5.0, realized_pnl_usd=-5.0,
+                   reason="max_loss (5.0% spot >= 3.00% spot cap)")]
+    s = ob.slippage_analysis(rows)
+    assert s["pre_era_closes"] == 0
     assert s["gap_through_usd"] == pytest.approx(2.0)
 
 

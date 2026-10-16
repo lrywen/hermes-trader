@@ -96,6 +96,15 @@ def group_stats(rows: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+# Epoch-ms cutover when R2 taker slippage accounting landed in shadow_book.py
+# (commit 2a8ba70 "gate-outcome reconciliation, realistic paper fills",
+# 2026-10-10 13:36:28 UTC). Closes BEFORE this carry NO slippage_pct and the
+# field was not recorded at the time — their fixed-slip is unknowable, not 0.
+# Closes AT/AFTER this always carry slippage_pct. Kept as a module constant so
+# the report can separate "pre-slippage-era (unknown)" from "no slippage".
+_SLIP_ERA_MS = 1_791_639_388_000  # 2026-10-10 13:36:28 UTC
+
+
 def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """Fixed-slippage cost + gap-through overstop for max_loss exits.
 
@@ -103,17 +112,29 @@ def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     gap-through is the amount by which |spot_pct| EXCEEDED the stop cap before
     the confirm window elapsed — the true "stop-slippage" cost the problem
     list tried to quantify.
+
+    Fixed-slippage is only summed when the row actually recorded slippage_pct
+    (post-2a8ba70 closes). Pre-cutover closes carry no slippage_pct: that is
+    reported as ``pre_era_closes`` rather than assumed to be 0, so the report
+    does not silently understate historical losses.
     """
     fixed_usd = 0.0
     gap_usd = 0.0
     gap_rows = 0
+    pre_era = 0
     for r in rows:
         notional = _f(r.get("notional_usd"))
-        slip_pct = _f(r.get("slippage_pct"))
-        # max_loss closes historically omit slippage_pct (None); treat missing
-        # as no fixed-slip component rather than guessing.
-        if slip_pct:
-            fixed_usd += notional * slip_pct / 100.0
+        slip_pct = r.get("slippage_pct")
+        ts = _f(r.get("ts"))
+        if slip_pct is None:
+            # Only pre-2a8ba70 closes legitimately lack the field; their fixed
+            # slip is unknowable, but gap-through overstop is still computable.
+            if ts < _SLIP_ERA_MS:
+                pre_era += 1
+        else:
+            sp = _f(slip_pct)
+            if sp:
+                fixed_usd += notional * sp / 100.0
         if _reason_group(r.get("reason", "")) == "max_loss":
             cap = _stop_cap(r.get("reason", ""))
             spot = abs(_f(r.get("spot_pct")))
@@ -127,6 +148,7 @@ def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fixed_slippage_usd": round(fixed_usd, 4),
         "gap_through_usd": round(gap_usd, 4),
         "gap_through_rows": gap_rows,
+        "pre_era_closes": pre_era,
         "slippage_total_usd": round(total, 4),
         "total_pnl_usd": round(sum(_f(r.get("realized_pnl_usd")) for r in rows), 4),
         "gross_loss_usd": round(losses, 4),
@@ -258,6 +280,10 @@ def print_report(book: dict[str, Any]) -> None:
               f"gap-through ${sa['gap_through_usd']:.4f} "
               f"({sa['gap_through_rows']} rows)  "
               f"slippage total ${sa['slippage_total_usd']:.4f}")
+        if sa["pre_era_closes"]:
+            print(f"  * {sa['pre_era_closes']} pre-2a8ba70 closes had no slippage_pct "
+                  f"recorded; their fixed-slip is UNKNOWN, not 0. "
+                  f"Historical losses are understated.")
         print(f"  slippage as % of max_loss gross loss: "
               f"{sa['slippage_of_gross_loss_pct']}%")
         print(f"  (all-trade fixed slippage ${sa['fixed_slippage_usd']:.4f})")
