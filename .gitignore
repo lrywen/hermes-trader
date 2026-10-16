@@ -115,6 +115,9 @@ backtest-trades.csv
 .agent-config.json.lock
 .agent-memory.json.lock
 .dsl-state.json.lock
+# Config-store O(1) sidecars (overview-latency fix 2026-10-05; runtime, not VCS)
+.agent-config.json.integrity
+.agent-config.json.lastwrite
 
 # Shadow book runtime state (Audit 2026-09-07)
 .shadow-book.json

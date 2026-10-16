@@ -1493,6 +1493,32 @@ while True:
             pass
         _beat("account_sync")
 
+        # ── Audit 2026-10-16 / #6: net directional exposure (observation-only) ──
+        # The book never tracked net direction (Σ notional × direction ÷ equity);
+        # longs/shorts could stack one way silently until a flat tape ends. Pure
+        # reporting: prefer live positions, fall back to shadow_book virtual
+        # taker positions in SHADOW so the arm still has data. No beta here.
+        try:
+            from hermes_trader.agents.net_exposure import compute_net_exposure as _netexp
+            _expo_rows = positions or []
+            if not _expo_rows:
+                try:
+                    from hermes_trader.agents import shadow_book as _sb_mod
+                    _sb_rows = list(_sb_mod.get_account().get("positions") or [])
+                    if _sb_rows:
+                        _expo_rows = _sb_rows
+                except Exception as _se:
+                    logger.debug(f"[net_exposure] shadow fallback miss: {_se}")
+            _nexp = _netexp(_expo_rows, equity)
+            if _nexp["n_positions"] > 0:
+                logger.info(
+                    f"[net_exposure] net={_nexp['net_notional']:+.2f}USD "
+                    f"({_nexp['net_frac']:+.3f}x eq) gross={_nexp['gross_frac']:.3f}x "
+                    f"long={_nexp['long_notional']:.2f} short={_nexp['short_notional']:.2f} "
+                    f"n={_nexp['n_positions']:.0f}")
+        except Exception as _ne:
+            logger.debug(f"[net_exposure] skip: {_ne}")
+
         # ── P1-1: active unstucking of underwater positions ──────────────
         # Adapt live positions, then decide whether an account-level trigger
         # (drawdown pressure or full stuck-slots) warrants realising a small
