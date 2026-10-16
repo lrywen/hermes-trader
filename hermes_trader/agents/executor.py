@@ -247,6 +247,11 @@ _DEFAULT_SL_CEILING_PCT = 3.0
 # The backup is a DISASTER NET, not the primary exit — it must sit just outside
 # the DSL blast radius, so it defaults to the DSL atr_stop floor (1.0%).
 _DEFAULT_SL_FLOOR_PCT = 1.0
+# R13-B4: hard upper bound (percent) on the backup-SL ceiling. A backup stop
+# wider than this from entry leaves the same unprotected gap class as the HYPE
+# incident regardless of config. Retained as an import-time fallback for direct
+# callers; the live value comes from canonical key sl_ceiling_hard_max_pct.
+_DEFAULT_SL_CEILING_HARD_MAX_PCT = 15.0
 # C4-3 (HYPE postmortem follow-up): exchange trigger orders fire at MARKET by
 # default — guaranteed to fill, but in a liquidity vacuum the fill can gap far
 # past the trigger (HYPE 2026-08-19). Set sl_limit_band_pct > 0 to arm trigger
@@ -1907,61 +1912,26 @@ def _place_backup_sl(
         sl_px = _signed_price(entry_px, -entry_px * sl_width_pct / 100, is_buy)
         # C4-3: sl_limit_band_pct > 0 arms a trigger LIMIT (worst-case fill
         # capped `band` past the trigger); 0 keeps the market-on-trigger default.
-        _band_kw = {"limit_band_pct": sl_limit_band_pct} if sl_limit_band_pct > 0 else {}
-        # E-2 (P0 audit): ONE cloid for this SL intent, reused across the
-        # immediate retry and the deferred re-arm in retry_pending_sl. The SDK
-        # retries POST 5x on 408/5xx, and our own 2s retry / pending queue add
-        # more attempts — with no cloid, a request that actually reached HL but
-        # whose response was lost would be re-submitted as a DUPLICATE stop.
-        # HL rejects a repeated cloid, so the SL arms exactly once.
-        _sl_cloid = Cloid.from_int(uuid.uuid4().int)
-        _band_kw["cloid"] = _sl_cloid
-        sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
-        # P2-2: a lost placement response (408/timeout/SSL) is ambiguous — the
-        # stop may actually rest under this cloid. Claim it by cloid BEFORE any
-        # retry: reusing the same cloid blindly yields a permanent "duplicate
-        # cloid" error queue, while minting a new one risks arming two stops.
-        _skip_retry = False
-        if not sl_res.get("ok") and sl_res.get("error_code") == "response_unknown":
-            claim = find_open_order_by_cloid(coin, _sl_cloid)
-            if claim.get("found") and claim.get("oid"):
-                logger.warning(
-                    f"[executor] Backup SL place response lost for {coin} but "
-                    f"claimed resting order by cloid: oid={claim.get('oid')} "
-                    f"trigger={claim.get('trigger_px')}"
-                )
-                if claim.get("trigger_px"):
-                    sl_px = float(claim["trigger_px"])
-                sl_res = {"ok": True, "order_id": claim["oid"]}
-            elif claim.get("lookup_ok"):
-                # openOrders readable and the cloid is confirmed NOT resting:
-                # it is safe to mint a fresh cloid and retry once.
-                logger.warning(
-                    f"[executor] Backup SL place response lost for {coin}; "
-                    f"cloid confirmed absent on exchange — retrying once with "
-                    f"a NEW cloid"
-                )
-                _sl_cloid = Cloid.from_int(uuid.uuid4().int)
-                _band_kw["cloid"] = _sl_cloid
-                time.sleep(2)
-                sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
-                _skip_retry = True
-            else:
-                # Lookup itself failed: state is genuinely ambiguous. Do NOT
-                # retry blindly and do NOT mint a new cloid — enqueue with the
-                # original cloid so retry_pending_sl claims it first.
-                logger.error(
-                    f"[executor] Backup SL place response lost for {coin} AND "
-                    f"openOrders lookup failed; preserving cloid for deferred "
-                    f"reconciliation"
-                )
-                _skip_retry = True
-        if not sl_res.get("ok") and not _skip_retry:
-            # One retry after a beat — observed failures are transient 429s; a
-            # position with no server-side stop carries the full gap-through
-            # risk between DSL checks, so a single retry is cheap insurance.
-            time.sleep(2)
-            sl_res = place_hl_trigger_order(is_buy, size_in_coin, sl_px, "sl", coin, **_band_kw)
+        # Audit 2026-10-15 P1: the one-cloid / claim-before-retry / one-retry
+        # state machine is shared with the manual web path via bracket_common
+        # (E-2/P2-2). The deferred queue, metrics and tracker stay here.
+        from hermes_trader.agents.bracket_common import place_backup_stop_once
+
+        def _bracket_log(level: str, msg: str) -> None:
+            getattr(logger, level if level in ("info", "warning", "error") else "info")(
+                f"[executor] {msg}")
+
+        _placed = place_backup_stop_once(
+            is_buy=is_buy, size_in_coin=size_in_coin, sl_px=sl_px, coin=coin,
+            limit_band_pct=sl_limit_band_pct,
+            place_order=place_hl_trigger_order,
+            find_by_cloid=find_open_order_by_cloid,
+            sleep=time.sleep, log=_bracket_log, log_prefix="[executor] Backup SL",
+        )
+        sl_px = _placed["sl_px"]
+        _sl_cloid = _placed["cloid"]
+        sl_res = {"ok": _placed["ok"], "order_id": _placed["order_id"],
+                  "error": _placed.get("error")}
         if sl_res.get("ok"):
             logger.info(f"[executor] Placed backup SL at {sl_px:.6g} "
                         f"({sl_width_pct:.2f}% from entry; atr_mult={sl_atr_mult}, "
@@ -2916,49 +2886,30 @@ def _place_post_fill_brackets(*, config: dict[str, Any], coin: str,
     # top-level sl_* keys remain explicit backup-layer overrides. The ceiling
     # stays backup-specific (outer-net post-HYPE cap) and does NOT inherit the
     # shared atr_stop ceiling.
+    # Audit 2026-10-15 P1: width validation/clamp unified with the manual path
+    # via bracket_common.validate_clamped_sl_widths (post-HYPE rules: hard-max
+    # 15% cap, floor<=ceiling, band<=ceiling).
     _sl_widths = _resolve_sl_width_config(config, coin)
-    sl_atr_mult = _sl_widths["sl_atr_mult"]
-    sl_ceiling_pct = _sl_widths["sl_ceiling_pct"]
-    sl_floor_pct = _sl_widths["sl_floor_pct"]
-    sl_limit_band_pct = _sl_widths["sl_limit_band_pct"]
-    if not (math.isfinite(sl_atr_mult) and sl_atr_mult > 0):
-        logger.warning(f"[executor] invalid sl_atr_mult={sl_atr_mult} — falling back to {_DEFAULT_SL_ATR_MULT}")
-        sl_atr_mult = _DEFAULT_SL_ATR_MULT
-    if not (math.isfinite(sl_ceiling_pct) and sl_ceiling_pct > 0):
-        logger.warning(f"[executor] invalid sl_ceiling_pct={sl_ceiling_pct} — falling back to {_DEFAULT_SL_CEILING_PCT}")
-        sl_ceiling_pct = _DEFAULT_SL_CEILING_PCT
-    if not (math.isfinite(sl_floor_pct) and sl_floor_pct > 0):
-        logger.warning(f"[executor] invalid sl_floor_pct={sl_floor_pct} — falling back to {_DEFAULT_SL_FLOOR_PCT}")
-        sl_floor_pct = _DEFAULT_SL_FLOOR_PCT
-    # Hard upper bound: a backup stop wider than 15% from entry leaves the same
-    # unprotected gap class as the HYPE incident regardless of config.
-    # R13-B4: now driven by canonical key `sl_ceiling_hard_max_pct`
-    # (default 15.0); module constant 15.0 retained as the import-time
-    # fallback so any direct-import caller still resolves to the same number.
-    _SL_CEILING_HARD_MAX_PCT = 15.0
-    _live_hard_max_pct = _resolve_live_float(
-        "sl_ceiling_hard_max_pct", _SL_CEILING_HARD_MAX_PCT, config=config
+    _sl_hard_max = _resolve_live_float(
+        "sl_ceiling_hard_max_pct", _DEFAULT_SL_CEILING_HARD_MAX_PCT, config=config)
+    from hermes_trader.agents.bracket_common import validate_clamped_sl_widths
+    _clamped = validate_clamped_sl_widths(
+        sl_atr_mult=_sl_widths["sl_atr_mult"],
+        sl_ceiling_pct=_sl_widths["sl_ceiling_pct"],
+        sl_floor_pct=_sl_widths["sl_floor_pct"],
+        sl_limit_band_pct=_sl_widths["sl_limit_band_pct"],
+        hard_max_pct=_sl_hard_max,
+        default_atr_mult=_DEFAULT_SL_ATR_MULT,
+        default_ceiling_pct=_DEFAULT_SL_CEILING_PCT,
+        default_floor_pct=_DEFAULT_SL_FLOOR_PCT,
+        default_hard_max_pct=_DEFAULT_SL_CEILING_HARD_MAX_PCT,
+        log=lambda m: logger.warning(f"[executor] {m}"),
+        log_prefix="[executor]",
     )
-    if not (math.isfinite(_live_hard_max_pct) and _live_hard_max_pct > 0):
-        logger.warning(
-            f"[executor] invalid sl_ceiling_hard_max_pct={_live_hard_max_pct} — "
-            f"falling back to {_SL_CEILING_HARD_MAX_PCT}"
-        )
-        _live_hard_max_pct = _SL_CEILING_HARD_MAX_PCT
-    if sl_ceiling_pct > _live_hard_max_pct:
-        logger.warning(f"[executor] sl_ceiling_pct={sl_ceiling_pct}% exceeds hard max "
-                       f"{_live_hard_max_pct}% — clamping")
-        sl_ceiling_pct = _live_hard_max_pct
-    # Floor must never exceed ceiling (would invert the clamp and place a stop
-    # on the wrong side); pin it to ceiling if misconfigured.
-    if sl_floor_pct > sl_ceiling_pct:
-        sl_floor_pct = sl_ceiling_pct
-    # C4-3: band must never exceed the ceiling (the worst-case limit fill would
-    # otherwise print past the post-HYPE outer-net cap); pin it to ceiling.
-    if sl_limit_band_pct > sl_ceiling_pct:
-        logger.warning(f"[executor] sl_limit_band_pct={sl_limit_band_pct}% exceeds "
-                       f"ceiling {sl_ceiling_pct}% — clamping band to ceiling")
-        sl_limit_band_pct = sl_ceiling_pct
+    sl_atr_mult = _clamped["sl_atr_mult"]
+    sl_ceiling_pct = _clamped["sl_ceiling_pct"]
+    sl_floor_pct = _clamped["sl_floor_pct"]
+    sl_limit_band_pct = _clamped["sl_limit_band_pct"]
     # Audit 2026-09-10 (ADA/DOT incident): an exception from the backup-SL
     # placement (e.g. a client signature drift like the cloid TypeError on
     # 2026-09-08) previously propagated out of this whole function, so the

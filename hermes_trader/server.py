@@ -592,42 +592,34 @@ def _place_manual_post_fill_brackets(
 
     trade_side = "long" if is_buy else "short"
 
-    # ── Stop width: same resolution + hard-max clamp as the autonomous path
-    # (executor.py:2437-2479). Trusting raw cfg.get('sl_atr_mult') here was
-    # the manual-path gap: a typo/giant config value armed an inverted or
-    # HYPE-class 40%-away stop.
+    # ── Stop width: same resolution + hard-max clamp as the autonomous path.
+    # Audit 2026-10-15 P1: validation/clamp unified via
+    # bracket_common.validate_clamped_sl_widths (same post-HYPE rules as the
+    # executor). Trusting raw cfg.get('sl_atr_mult') here was the manual-path
+    # gap: a typo/giant config value armed an inverted or HYPE-class stop.
     widths = _resolve_sl_width_config(cfg or {}, coin)
-    sl_mult = float(widths["sl_atr_mult"])
-    ceiling = float(widths["sl_ceiling_pct"])
-    floor = float(widths["sl_floor_pct"])
-    band = float(widths["sl_limit_band_pct"])
-    if not (math.isfinite(sl_mult) and sl_mult > 0):
-        logger.warning("[manual-order] invalid sl_atr_mult=%s — fallback %s",
-                       sl_mult, _DEFAULT_SL_ATR_MULT)
-        sl_mult = _DEFAULT_SL_ATR_MULT
-    if not (math.isfinite(ceiling) and ceiling > 0):
-        logger.warning("[manual-order] invalid sl_ceiling_pct=%s — fallback %s",
-                       ceiling, _DEFAULT_SL_CEILING_PCT)
-        ceiling = _DEFAULT_SL_CEILING_PCT
-    if not (math.isfinite(floor) and floor > 0):
-        logger.warning("[manual-order] invalid sl_floor_pct=%s — fallback %s",
-                       floor, _DEFAULT_SL_FLOOR_PCT)
-        floor = _DEFAULT_SL_FLOOR_PCT
     hard_max = _resolve_live_float("sl_ceiling_hard_max_pct", 15.0, config=cfg)
-    if not (math.isfinite(hard_max) and hard_max > 0):
-        logger.warning("[manual-order] invalid sl_ceiling_hard_max_pct=%s — fallback 15.0",
-                       hard_max)
-        hard_max = 15.0
-    if ceiling > hard_max:
-        logger.warning("[manual-order] sl_ceiling_pct=%s > hard max %s — clamping",
-                       ceiling, hard_max)
-        ceiling = hard_max
-    if floor > ceiling:
-        floor = ceiling
-    if band > ceiling:
-        logger.warning("[manual-order] sl_limit_band_pct=%s > ceiling %s — clamping band",
-                       band, ceiling)
-        band = ceiling
+    from hermes_trader.agents.bracket_common import (
+        place_backup_stop_once,
+        validate_clamped_sl_widths,
+    )
+    _clamped = validate_clamped_sl_widths(
+        sl_atr_mult=float(widths["sl_atr_mult"]),
+        sl_ceiling_pct=float(widths["sl_ceiling_pct"]),
+        sl_floor_pct=float(widths["sl_floor_pct"]),
+        sl_limit_band_pct=float(widths["sl_limit_band_pct"]),
+        hard_max_pct=float(hard_max),
+        default_atr_mult=_DEFAULT_SL_ATR_MULT,
+        default_ceiling_pct=_DEFAULT_SL_CEILING_PCT,
+        default_floor_pct=_DEFAULT_SL_FLOOR_PCT,
+        default_hard_max_pct=15.0,
+        log=lambda m: logger.warning("[manual-order] %s", m),
+        log_prefix="[manual-order]",
+    )
+    sl_mult = _clamped["sl_atr_mult"]
+    ceiling = _clamped["sl_ceiling_pct"]
+    floor = _clamped["sl_floor_pct"]
+    band = _clamped["sl_limit_band_pct"]
 
     # Widen for recent mean adverse exit slip (cap ceiling*0.5), mirroring
     # executor._place_backup_sl.
@@ -686,10 +678,10 @@ def _place_manual_post_fill_brackets(
             "order_id": res.get("order_id"),
         })
 
-    band_kw = {"limit_band_pct": band} if band > 0 else {}
-
-    # ── SL: one cloid, claim-before-retry, one retry (mirrors
-    # executor._place_backup_sl:1574-1654).
+    # ── SL: one cloid, claim-before-retry, one retry. Audit 2026-10-15 P1:
+    # the idempotent placement state machine is shared with the autonomous path
+    # via bracket_common.place_backup_stop_once; the web-process tracker write
+    # (after the load_state above) and alerting stay here.
     if not sl_ok:
         sl_missing = True
         logger.error(
@@ -699,47 +691,20 @@ def _place_manual_post_fill_brackets(
         )
         warnings.append(f"SL not armed: computed stop on wrong side (sl_px={sl_px})")
     else:
-        sl_cloid = Cloid.from_int(uuid.uuid4().int)
-        sl_res = place_hl_trigger_order(
-            is_buy, size_in_coin, sl_px, "sl", coin,
-            cloid=sl_cloid, **band_kw,
+        def _manual_log(level: str, msg: str) -> None:
+            getattr(logger, level if level in ("info", "warning", "error")
+                    else "info")("[manual-order] %s", msg)
+
+        _placed = place_backup_stop_once(
+            is_buy=is_buy, size_in_coin=size_in_coin, sl_px=sl_px, coin=coin,
+            limit_band_pct=band,
+            place_order=place_hl_trigger_order,
+            find_by_cloid=find_open_order_by_cloid,
+            sleep=time.sleep, log=_manual_log, log_prefix="[manual-order] SL",
         )
-        skip_retry = False
-        if not sl_res.get("ok") and sl_res.get("error_code") == "response_unknown":
-            claim = find_open_order_by_cloid(coin, sl_cloid)
-            if claim.get("found") and claim.get("oid"):
-                logger.warning(
-                    "[manual-order] SL response lost for %s but claimed resting "
-                    "order by cloid: oid=%s trigger=%s",
-                    coin, claim.get("oid"), claim.get("trigger_px"),
-                )
-                if claim.get("trigger_px"):
-                    sl_px = float(claim["trigger_px"])
-                sl_res = {"ok": True, "order_id": claim["oid"]}
-            elif claim.get("lookup_ok"):
-                logger.warning(
-                    "[manual-order] SL response lost for %s; cloid confirmed "
-                    "absent — retrying once with a NEW cloid", coin,
-                )
-                sl_cloid = Cloid.from_int(uuid.uuid4().int)
-                time.sleep(2)
-                sl_res = place_hl_trigger_order(
-                    is_buy, size_in_coin, sl_px, "sl", coin,
-                    cloid=sl_cloid, **band_kw,
-                )
-                skip_retry = True
-            else:
-                logger.error(
-                    "[manual-order] SL response lost for %s AND openOrders "
-                    "lookup failed — preserving cloid, no blind retry", coin,
-                )
-                skip_retry = True
-        if not sl_res.get("ok") and not skip_retry:
-            time.sleep(2)
-            sl_res = place_hl_trigger_order(
-                is_buy, size_in_coin, sl_px, "sl", coin,
-                cloid=sl_cloid, **band_kw,
-            )
+        sl_px = _placed["sl_px"]
+        sl_res = {"ok": _placed["ok"], "order_id": _placed["order_id"],
+                  "error": _placed.get("error")}
         _record_bracket("SL", sl_px, sl_res)
         if sl_res.get("ok"):
             try:
@@ -767,6 +732,37 @@ def _place_manual_post_fill_brackets(
                 f"🚨 {coin} 手动开仓止损下单失败\n"
                 f"交易所端无止损单，仅靠 DSL 软止损保护\n"
                 f"请立即手动确认持仓并补单",
+            )
+
+    # P3 (NOFX-style zero-naked-position guarantee), manual-path parity: when
+    # the operator armed flatten_on_sl_missing and this is a real LIVE fill that
+    # ended with no confirmed server-side stop, market-close at once instead of
+    # carrying it on only the 60s DSL soft stop. SHADOW/paper fills and the
+    # default opt-in=False preserve prior behaviour (alert, no flatten).
+    emergency_flattened = False
+    if sl_missing:
+        try:
+            from hermes_trader.agents.executor import _should_emergency_flatten
+            _mode = str((cfg or {}).get("mode") or "SHADOW").upper()
+            if _should_emergency_flatten(sl_missing=True, mode=_mode, config=cfg or {}):
+                _flat = close_position_market(
+                    coin, reason="emergency:manual_backup_sl_missing")
+                emergency_flattened = bool(_flat.get("ok")) and not _flat.get("noop")
+                logger.error(
+                    "[manual-order] flatten_on_sl_missing armed for %s: emergency "
+                    "market close ok=%s noop=%s",
+                    coin, _flat.get("ok"), _flat.get("noop"),
+                )
+                _send_bypass_gates_alert_safe(
+                    coin,
+                    f"🛑 {coin} 手动开仓止损挂单失败，已触发紧急市价平仓\n"
+                    f"结果 ok={_flat.get('ok')} noop={_flat.get('noop')}\n"
+                    f"请立即核对持仓与残留挂单",
+                )
+        except Exception as flat_e:
+            logger.error(
+                "[manual-order] emergency flatten FAILED for %s: %r — naked "
+                "position persists, manual action required", coin, flat_e,
             )
 
     # ── TP: single attempt (offensive order; failure does not leave the
@@ -801,7 +797,8 @@ def _place_manual_post_fill_brackets(
                 coin, tp_px, tp_res.get("error"),
             )
 
-    return {"brackets": brackets, "warnings": warnings, "sl_missing": sl_missing}
+    return {"brackets": brackets, "warnings": warnings,
+            "sl_missing": sl_missing, "emergency_flattened": emergency_flattened}
 
 
 def _flatten_asset_positions(asset_positions: list) -> list[dict]:
