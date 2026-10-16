@@ -1004,7 +1004,9 @@ class ShadowBook:
 
     def _close_position(self, acct: str, pos: dict[str, Any], exit_px: float,
                         reason: str, hold_min: float = 0.0,
-                        mfe_pct: float = 0.0) -> dict[str, Any]:
+                        mfe_pct: float = 0.0,
+                        gap_spot_pct: float = 0.0,
+                        gap_capped: bool = False) -> dict[str, Any]:
         """Book a virtual close + realized PnL. Fee uses the account's口径."""
         acc = self._account(acct)
         coin = pos["coin"]
@@ -1035,6 +1037,14 @@ class ShadowBook:
             "qty": float(pos["size_coin"]), "entry_px": entry_px,
             "price": float(fill_exit_px), "mid_px": float(exit_px),
             "slippage_pct": round(close_slip, 5),
+            # Audit 2026-10-16: real gap-through overshoot on max_loss exits.
+            # gap_spot_pct>0 means the confirming mark gapped past the exchange
+            # backup-SL trigger and the paper fill was capped there; the overshoot
+            # is recorded (not folded silently into slippage_pct) for precise
+            # tracking. gap_capped=False on a max_loss means ATR was missing at
+            # entry, so no live backup-SL existed and any real gap is unknown.
+            "gap_spot_pct": round(float(gap_spot_pct or 0.0), 4),
+            "gap_capped": bool(gap_capped),
             "notional_usd": notional,
             "leverage": lev, "fee_usd": round(fee_usd, 6),
             "spot_pct": round(spot_pct, 4),
@@ -1127,6 +1137,12 @@ class ShadowBook:
                         # is a gap-through past the exchange backup-SL trigger;
                         # cap the paper fill there too.
                         fill_px = float(mark)
+                        # Audit 2026-10-16: record the real gap-through overshoot
+                        # on max_loss exits so it is precisely trackable (the flat
+                        # taker slippage_pct does NOT capture it). Recording-only:
+                        # does not change fill_px / PnL, which are already capped.
+                        gap_spot_pct = 0.0
+                        gap_capped = False
                         if reason.startswith("max_loss"):
                             trig = _backup_sl_trigger_px(
                                 coin=coin, side=side, entry_px=float(pos["entry_px"]),
@@ -1135,9 +1151,19 @@ class ShadowBook:
                                 gapped = (mark < trig) if side == "long" else (mark > trig)
                                 if gapped:
                                     fill_px = float(trig)
+                                    gap_capped = True
+                                    # overshoot = how far mark gapped past the
+                                    # backup trigger, in spot % of entry.
+                                    gap_spot_pct = abs(mark - trig) / float(pos["entry_px"]) * 100.0
+                            else:
+                                # ATR missing: no live backup-SL, so the full mark
+                                # is used and any real gap is UNKNOWN (uncapped).
+                                gap_capped = False
                         closed.append(self._close_position(
                             acct, pos, fill_px, reason or "dsl_exit",
-                            hold_min=hold_min, mfe_pct=mfe))
+                            hold_min=hold_min, mfe_pct=mfe,
+                            gap_spot_pct=gap_spot_pct,
+                            gap_capped=gap_capped))
                     else:
                         if side == "long":
                             upct = (mark - float(pos["entry_px"])) / float(pos["entry_px"]) * 100.0

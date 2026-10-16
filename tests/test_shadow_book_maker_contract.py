@@ -243,6 +243,61 @@ def test_accounts_keep_independent_wallets(tmp_path, monkeypatch):
     assert len(maker["pending_orders"]) == 1
 
 
+def test_max_loss_gap_records_explicit_overshoot(tmp_path, monkeypatch):
+    """Audit 2026-10-16: a max_loss that gaps through the backup-SL trigger must
+    record gap_spot_pct>0 and gap_capped=True on the close fill (the flat
+    taker slippage_pct does not capture the gap)."""
+    _patch_cfg(monkeypatch)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    from hermes_trader.agents.dsl_exit import ExitVerdict
+
+    class _Fake:
+        def check(self, mark, index_px=None):
+            return ExitVerdict(exit=True, reason="max_loss", floor_price=95.0)
+
+    book._trackers[("taker", "BTC_long")] = _Fake()
+    # entry_atr_pct > 0 so the backup-SL trigger is computed (not None).
+    book.state["accounts"]["taker"]["positions"][0]["entry_atr_pct"] = 2.0
+    # mark 93.0 gaps well below entry 100 -> definitely through any backup trigger.
+    closed = book.mark_to_market({"BTC": 93.0})
+
+    assert len(closed) == 1
+    f = closed[0]
+    assert f["reason"] == "max_loss"
+    assert isinstance(f.get("gap_spot_pct"), float)
+    assert f["gap_spot_pct"] > 0.0
+    assert f["gap_capped"] is True
+    # the explicit gap marker is recorded even though slippage_pct is the flat 0.05
+    assert f["slippage_pct"] == 0.05
+
+
+def test_max_loss_no_gap_records_zero_overshoot(tmp_path, monkeypatch):
+    """A max_loss whose confirming mark did NOT gap through records 0 and
+    gap_capped=False."""
+    _patch_cfg(monkeypatch)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    from hermes_trader.agents.dsl_exit import ExitVerdict
+
+    class _Fake:
+        def check(self, mark, index_px=None):
+            return ExitVerdict(exit=True, reason="max_loss", floor_price=98.0)
+
+    book._trackers[("taker", "BTC_long")] = _Fake()
+    book.state["accounts"]["taker"]["positions"][0]["entry_atr_pct"] = 2.0
+    # mark 98.5 - inside the backup trigger, no gap-through.
+    closed = book.mark_to_market({"BTC": 98.5})
+
+    assert len(closed) == 1
+    f = closed[0]
+    assert f["reason"] == "max_loss"
+    assert f["gap_spot_pct"] == 0.0
+    assert f["gap_capped"] is False
+
+
 def test_v1_flat_state_migrates_to_nested_accounts(tmp_path):
     import json
     path = str(tmp_path / "s.json")

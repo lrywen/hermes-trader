@@ -121,6 +121,7 @@ def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
     fixed_usd = 0.0
     gap_usd = 0.0
     gap_rows = 0
+    gap_flagged_rows = 0  # rows carrying the explicit gap_spot_pct marker
     pre_era = 0
     for r in rows:
         notional = _f(r.get("notional_usd"))
@@ -136,11 +137,20 @@ def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
             if sp:
                 fixed_usd += notional * sp / 100.0
         if _reason_group(r.get("reason", "")) == "max_loss":
-            cap = _stop_cap(r.get("reason", ""))
-            spot = abs(_f(r.get("spot_pct")))
-            if cap is not None and spot > cap:
-                gap = spot - cap
-                gap_usd += notional * gap / 100.0
+            # Prefer the explicit gap marker recorded by shadow_book
+            # (post-2026-10-16 audit). Fall back to the |spot_pct|-cap heuristic
+            # only for historical rows that predate the field.
+            gs = r.get("gap_spot_pct")
+            if isinstance(gs, (int, float)):
+                g = max(0.0, float(gs))
+                if g > 0:
+                    gap_flagged_rows += 1
+            else:
+                cap = _stop_cap(r.get("reason", ""))
+                spot = abs(_f(r.get("spot_pct")))
+                g = (spot - cap) if (cap is not None and spot > cap) else 0.0
+            if g > 0:
+                gap_usd += notional * g / 100.0
                 gap_rows += 1
     losses = sum(min(_f(r.get("realized_pnl_usd")), 0.0) for r in rows)
     total = fixed_usd + gap_usd
@@ -148,6 +158,7 @@ def slippage_analysis(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "fixed_slippage_usd": round(fixed_usd, 4),
         "gap_through_usd": round(gap_usd, 4),
         "gap_through_rows": gap_rows,
+        "gap_explicit_rows": gap_flagged_rows,
         "pre_era_closes": pre_era,
         "slippage_total_usd": round(total, 4),
         "total_pnl_usd": round(sum(_f(r.get("realized_pnl_usd")) for r in rows), 4),
