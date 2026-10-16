@@ -118,6 +118,81 @@ flyctl volumes snapshots create hermes_data
 flyctl volumes snapshots list hermes_data
 ```
 
+## Production parameter overrides (rebuild-safe)
+
+There are **two layers of config**, and they must stay separate:
+
+- **`CANONICAL_DEFAULTS`** in `hermes_trader/agents/config_defaults.py` — the
+  audited, sentinel-guarded baseline. It mirrors the code-module literals and
+  is locked by ~40 "no-drift" tests. **Do not put production tuning here.**
+- **`/data/.agent-config.json`** — the live override on the persistent volume,
+  deep-merged over the canonical defaults at read time
+  (`config_store.read_agent_config`). This is where tuning lives.
+
+`deploy/prod_override.json` is a **versioned snapshot of the production tuning**
+(captured from the live host; ~56 strategy leaves over canonical). It lets you
+reproduce the live parameters after a volume reset or container rebuild **without
+touching the canonical baseline**.
+
+### Apply after a rebuild / onto a fresh volume
+
+```bash
+# 1. dry-run first: validates the snapshot + prints every leaf that differs
+#    from canonical (writes nothing)
+python scripts/apply_prod_override.py
+
+# 2. apply for real (backs up the current file, then writes atomically through
+#    config_store)
+python scripts/apply_prod_override.py --apply
+
+# custom snapshot / target path
+python scripts/apply_prod_override.py \
+  --snapshot deploy/prod_override.json \
+  --config  /data/.agent-config.json --apply
+```
+
+On the docker host (192.168.124.65), the repo lives inside the image, so copy the
+snapshot in and run the bundled script there:
+
+```bash
+docker cp deploy/prod_override.json hermes-trader:/tmp/prod_override.json
+docker exec hermes-trader python3 scripts/apply_prod_override.py \
+  --snapshot /tmp/prod_override.json            # dry-run
+docker exec hermes-trader python3 scripts/apply_prod_override.py \
+  --snapshot /tmp/prod_override.json --apply    # write
+```
+
+Config is hot-reloaded by mtime, so no restart is needed; newly opened positions
+pick up the new parameters (existing positions keep the bracket locked at entry).
+
+### Runtime `mode` is deliberately NOT in the snapshot
+
+`mode` (`OFF` / `SHADOW` / `LIVE`) is deployment **state**, not strategy tuning.
+The snapshot excludes it, and `apply_prod_override.py` **strips any `mode` key by
+default**. A rebuilt host therefore inherits the safe canonical default (`OFF`)
+and never starts trading just because a snapshot was applied. After applying,
+flip the mode explicitly in the operator console (or edit `/data/.agent-config.json`).
+
+To deliberately carry the runtime mode (rare; e.g. cloning an exact environment),
+pass `--with-mode` — the script prints a loud warning before writing it.
+
+### Refreshing the snapshot
+
+After intentionally tuning production, re-capture the live override so the repo
+copy stays current:
+
+```bash
+docker exec -i hermes-trader python3 - > deploy/prod_override.json <<'PY'
+import json
+cfg = json.load(open("/data/.agent-config.json"))
+cfg.pop("mode", None)          # never version the runtime trading mode
+print(json.dumps(cfg, ensure_ascii=False, indent=2, sort_keys=True))
+PY
+```
+
+Then dry-run `apply_prod_override.py` to confirm validation is clean before
+committing the updated `deploy/prod_override.json`.
+
 ## Switching to a custom domain
 
 ```bash
