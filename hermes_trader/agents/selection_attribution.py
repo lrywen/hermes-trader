@@ -35,6 +35,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
+
 logger = logging.getLogger(__name__)
 
 _WRITE_LOCK = threading.Lock()
@@ -78,12 +80,13 @@ def _load_state() -> dict[str, Any]:
 
 
 def _save_state(state: dict[str, Any]) -> None:
-    path = _state_path()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    # P2 (audit 2026-10-15): settle attribution is authoritative decision
+    # state (fwd_pct written back onto pending items); a lost write corrupts
+    # attribution. Migrated off the hand-rolled tmp+os.replace (no fsync) to
+    # the shared locked atomic writer for file+dir fsync + cross-process flock.
+    atomic_io.locked_write_json_atomic(
+        _state_path(), state, fsync=True, ebusy_fallback=True,
+        indent=None, default=str)
 
 
 def _dedup_key(source: str, coin: str, cycle_ms: int) -> str:

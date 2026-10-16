@@ -30,6 +30,8 @@ import threading
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
+
 logger = logging.getLogger(__name__)
 
 _LOCK = threading.Lock()
@@ -104,12 +106,13 @@ def is_bypassing(*, now: Optional[float] = None) -> bool:
 
 
 def _persist(state: dict[str, Any]) -> None:
-    path = _state_path()
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False)
-        f.write("\n")
-    os.replace(tmp, path)
+    # P2 (audit 2026-10-15): the risk-bypass switch is authoritative control
+    # state — a lost write silently changes whether cooling gates are skipped.
+    # Migrated off hand-rolled tmp+os.replace (no fsync) to the shared locked
+    # atomic writer (file+dir fsync + cross-process flock).
+    atomic_io.locked_write_json_atomic(
+        _state_path(), state, fsync=True, ebusy_fallback=True,
+        indent=None, default=str)
 
 
 def arm(*, set_by: str = "operator", ttl_seconds: Optional[int] = None,

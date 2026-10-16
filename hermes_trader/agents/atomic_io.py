@@ -142,6 +142,40 @@ def write_json_atomic(
         raise
 
 
+def write_bytes_atomic(
+    path: PathLike,
+    data: bytes | str,
+    *,
+    fsync: bool = True,
+    ebusy_fallback: bool = False,
+) -> None:
+    """Atomically write raw bytes/text to ``path`` (tmp + fsync + replace + dir
+    fsync), mirroring :func:`write_json_atomic` but for pre-serialised payloads
+    such as JSONL streams that cannot be represented as a single JSON value.
+    ``str`` is encoded utf-8.
+    """
+    path = os.fspath(path)
+    parent = os.path.dirname(path) or "."
+    os.makedirs(parent, exist_ok=True)
+    payload = data.encode("utf-8") if isinstance(data, str) else data
+    fd, tmp = tempfile.mkstemp(dir=parent, suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            if fsync:
+                os.fsync(f.fileno())
+        _replace_with_ebusy_fallback(tmp, path, ebusy_fallback=ebusy_fallback)
+        if fsync:
+            _fsync_dir(path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
 def _lock_path(path: PathLike) -> str:
     return os.fspath(path) + ".lock"
 

@@ -239,14 +239,19 @@ def _chain_tail() -> tuple[int, str]:
 
 
 def _write_anchor(seq: int, tail_hash: str) -> None:
-    """Durably persist the chain head so the next generation can anchor to it."""
+    """Durably persist the chain head so the next generation can anchor to it.
+
+    P2 (audit 2026-10-15): migrated off a fixed ``.tmp`` name (not unique,
+    race-prone) + ``os.replace`` (no fsync) to the shared atomic writer
+    (unique mkstemp + file/dir fsync). Caller ``_rotate_if_needed`` already
+    holds the cross-process lock, so the unlocked helper is correct here.
+    """
+    from hermes_trader.agents.atomic_io import write_bytes_atomic
+
     anchor = _anchor_path()
-    tmp = Path(f"{anchor}.tmp")
-    tmp.write_text(
-        json.dumps({"seq": seq, "hash": tail_hash}),
-        encoding="utf-8",
-    )
-    os.replace(str(tmp), str(anchor))
+    write_bytes_atomic(
+        anchor, json.dumps({"seq": seq, "hash": tail_hash}),
+        fsync=True, ebusy_fallback=True)
 
 
 def _now_iso() -> str:
@@ -323,6 +328,11 @@ def append(event: str, payload: Optional[dict[str, Any]] = None,
             with open(EVENTS_FILE, "a", encoding="utf-8") as f:
                 f.write(json.dumps(rec, ensure_ascii=False) + "\n")
                 f.flush()
+                # P2 (audit 2026-10-15): this append is the authoritative,
+                # tamper-evident audit feed (replayed into memory on restart);
+                # flush alone leaves the line in page cache, lost on a crash.
+                # fsync each line — line-atomic under the caller's flock.
+                os.fsync(f.fileno())
             # Refresh the persisted chain head so a crash/rotation before the
             # next append does not strand the chain. Best-effort: a failure
             # here does not invalidate the just-written line.

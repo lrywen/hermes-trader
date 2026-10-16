@@ -26,6 +26,8 @@ import os
 import time
 from typing import Any, Optional
 
+from hermes_trader.agents import atomic_io
+
 # Record format version for the pending-promotion row.
 RECORD_VERSION = 1
 PENDING = "PENDING_APPROVAL"
@@ -302,10 +304,12 @@ def mark_decision(arm: str, state: str, *, operator: str,
             changed = True
     if not changed:
         return False
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as fh:
-        for r in records:
-            fh.write(json.dumps(r, ensure_ascii=False,
-                                separators=(",", ":")) + "\n")
-    os.replace(tmp, path)
+    # P2 (audit 2026-10-15): operator approval/rejection is authoritative
+    # promotion state; a lost write silently corrupts the approval flow.
+    # Migrated off hand-rolled tmp+os.replace (no fsync) to shared atomic
+    # writer (file+dir fsync, EBUSY-safe) preserving the JSONL encoding.
+    blob = "".join(
+        json.dumps(r, ensure_ascii=False, separators=(",", ":")) + "\n"
+        for r in records)
+    atomic_io.write_bytes_atomic(path, blob, fsync=True, ebusy_fallback=True)
     return True
