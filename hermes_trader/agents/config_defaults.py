@@ -143,9 +143,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "launch_capture": {
         "enabled": True,
         "aggression_min": 0.55,       # burst 窗口最低单向主动占比
-        "imbalance_min": 0.2,         # 盘口失衡阈值
-        "compression_pct_max": 20.0,  # BB 带宽分位 ≤ 此值视为压缩
-        "require_key_level": True,    # 要求 HTF 关键位共振
+        # P3 (audit 2026-10-15): removed dead orphan knobs imbalance_min /
+        # compression_pct_max / require_key_level (zero consumers; the real
+        # compression threshold is presubscribe_compress_pct_max below).
         "flow_confirm_min": 0.7,      # CVD 强到可替代 N 根确认
         "breakout_trend_rvol_min": 2.0,  # 强突破据此升级为 trend（宽止损）
         "breakout_trend_rvol_lookback": 3,  # 近N根5m内出现过强RVOL即升级（决策可能晚启动bar一两根）

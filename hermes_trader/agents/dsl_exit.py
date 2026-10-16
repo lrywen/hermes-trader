@@ -272,6 +272,7 @@ def _record_stop_confirm_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         live_exc = sgn * (float(exit_px) - entry) / entry * 100.0
         import os
         from datetime import datetime, timezone
+
         from hermes_trader.shadow_log import append_jsonl
         path = os.environ.get(
             "HERMES_STOP_CONFIRM_SHADOW_FILE",
@@ -2537,27 +2538,11 @@ def _regime_aware_policy_for(regime: str = "") -> ExitPolicy:
     """
     base = _policy_from_config()
     try:
-        import dataclasses
-
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.executor import resolve_regime_clocks, select_exit_params
+        from hermes_trader.agents.regime_exit_common import overlay_regime_exit
         dsl = read_agent_config().get("dsl_exit", {}) or {}
-        _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
-            select_exit_params(dsl, regime or "neutral")
-        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
-        # Audit 2026-09-06 (E3, P2): regime-split lifetime clocks. Returns the
-        # global clock when regime_aware.clocks is disabled (default → inert).
-        _clocks = resolve_regime_clocks(dsl, regime or "neutral")
-        return dataclasses.replace(
-            base,
-            max_loss_pct=float(_ml_pct),
-            max_loss_roe_pct=float(_ml_roe),
-            protect_pct=float(_prot),
-            retrace_threshold=float(_retrace),
-            hard_timeout_minutes=float(_clocks["hard_timeout_minutes"]),
-            stale_flat_timeout_minutes=float(_clocks["stale_flat_timeout_minutes"]),
-            phase2_tiers=_tiers if _tiers else ExitPolicy().phase2_tiers,
-        )
+        policy, _label = overlay_regime_exit(base, dsl, regime or "neutral")
+        return policy
     except Exception as e:
         logger.warning(
             f"[dsl] regime-aware synth policy build failed (regime={regime!r}); "

@@ -247,27 +247,11 @@ def _build_policy(regime: str = ""):
         except Exception:
             return None
     try:
-        import dataclasses
-
         from hermes_trader.agents.config_store import read_agent_config
-        from hermes_trader.agents.dsl_exit import RetraceTier
-        from hermes_trader.agents.executor import resolve_regime_clocks, select_exit_params
+        from hermes_trader.agents.regime_exit_common import overlay_regime_exit
         dsl = read_agent_config().get("dsl_exit", {}) or {}
-        _prot, _retrace, _tiers_raw, _ml_pct, _ml_roe, _label = \
-            select_exit_params(dsl, regime or "neutral")
-        _tiers = [RetraceTier(**t) for t in _tiers_raw] if _tiers_raw else None
-        _clocks = resolve_regime_clocks(dsl, regime or "neutral")
-        from hermes_trader.agents.dsl_exit import ExitPolicy as _EP
-        return dataclasses.replace(
-            base,
-            max_loss_pct=float(_ml_pct),
-            max_loss_roe_pct=float(_ml_roe),
-            protect_pct=float(_prot),
-            retrace_threshold=float(_retrace),
-            hard_timeout_minutes=float(_clocks["hard_timeout_minutes"]),
-            stale_flat_timeout_minutes=float(_clocks["stale_flat_timeout_minutes"]),
-            phase2_tiers=_tiers if _tiers else _EP().phase2_tiers,
-        )
+        policy, _label = overlay_regime_exit(base, dsl, regime or "neutral")
+        return policy
     except Exception as e:
         logger.warning(
             f"[shadow_book] regime-aware policy build failed "
@@ -944,8 +928,7 @@ class ShadowBook:
         the fetched window; the window is sized to cover the resting TTL.
         """
         from hermes_trader.client.hl_client import fetch_hl_candles
-        from hermes_trader.execution.maker_shadow import (
-            ShadowMakerOrder, simulate_shadow_order, locate_posted_bar_idx)
+        from hermes_trader.execution.maker_shadow import ShadowMakerOrder, locate_posted_bar_idx, simulate_shadow_order
 
         acc = self._account("maker_shadow")
         if not acc["pending_orders"]:

@@ -22,7 +22,6 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
 from typing import Optional
 
 from hermes_trader.agents.dsl_exit import ExitPolicy
@@ -52,34 +51,14 @@ def regime_aware_policy(base: ExitPolicy, dsl_config: dict,
 
     选档 / 时钟全部调用生产同源函数；``base`` 提供其余所有旋钮（noise_band /
     smooth / scratch / 确认门等）。返回 (新 policy, 选档标签)。
-    """
-    from hermes_trader.agents.executor import (
-        resolve_regime_clocks,
-        select_exit_params,
-    )
 
-    protect, retrace, tiers_raw, ml_pct, ml_roe, label = \
-        select_exit_params(dsl_config, regime)
-    # 与生产 executor（:2373）同源：select_exit_params 返回 raw dict tiers，
-    # 必须转成 RetraceTier，不能把 dict 直接塞进 phase2_tiers（否则
-    # dsl_exit 读 tier.pct_above_entry 时报 'dict' has no attribute）。
-    if tiers_raw:
-        from hermes_trader.agents.dsl_exit import RetraceTier
-        tiers = [RetraceTier(**t) for t in tiers_raw]
-    else:
-        tiers = list(base.phase2_tiers)
-    clocks = resolve_regime_clocks(dsl_config, regime)
-    policy = replace(
-        base,
-        max_loss_pct=float(ml_pct),
-        max_loss_roe_pct=float(ml_roe),
-        protect_pct=float(protect),
-        retrace_threshold=float(retrace),
-        hard_timeout_minutes=float(clocks["hard_timeout_minutes"]),
-        stale_flat_timeout_minutes=float(clocks["stale_flat_timeout_minutes"]),
-        phase2_tiers=tiers,
-    )
-    return policy, label
+    P3 (audit 2026-10-15): overlay 逻辑收敛到单一实现
+    ``regime_exit_common.overlay_regime_exit``（dsl_exit / shadow_book /
+    backtest 三处共用同一份 RetraceTier 转换与六字段覆盖，消除手抄漂移）。
+    """
+    from hermes_trader.agents.regime_exit_common import overlay_regime_exit
+
+    return overlay_regime_exit(base, dsl_config, regime)
 
 
 def resolve_regime(

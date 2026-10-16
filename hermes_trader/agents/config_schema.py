@@ -680,9 +680,7 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "launch_capture": {
         "enabled": ("bool",),
         "aggression_min": _num_leaf(0.0, 1.0),
-        "imbalance_min": _num_leaf(0.0, 1.0),
-        "compression_pct_max": _num_leaf(0.0, 100.0),
-        "require_key_level": ("bool",),
+        # P3: dead orphan keys imbalance_min/compression_pct_max/require_key_level removed.
         "flow_confirm_min": _num_leaf(0.0, 1.0),
         "breakout_trend_rvol_min": _num_leaf(0.0, 100.0),
         "breakout_trend_rvol_lookback": _num_leaf(1, 6),
