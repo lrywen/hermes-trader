@@ -2952,7 +2952,14 @@ while True:
                                    "regime_via": mr.get("via"),
                                    "counter_regime": mr.get("counter_trend") or mr.get("against_funding"),
                                    "gates": _gates_summary,
-                                   "gate_results": _all_gates})
+                                   "gate_results": _all_gates,
+                                   # P0-5 (audit 2026-10-16): signal→order
+                                   # latency. signal_age_s = time since the
+                                   # analysis was assembled; > signal useful
+                                   # life means the fill decision is stale.
+                                   "signal_ts": analysis.get("signal_ts"),
+                                   "signal_age_s": (time.time() - analysis["signal_ts"])
+                                   if analysis.get("signal_ts") else None})
                         _cycle_outcomes.append((_r_coin, "execute", executed,
                                                result.get("order_id") or
                                                "; ".join(result.get("blocked_by") or []) or

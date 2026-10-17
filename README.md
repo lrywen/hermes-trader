@@ -210,7 +210,7 @@ both resolve (`max_trade_notional_usd` ≡ `maxTradeNotionalUsd`).
   "enable_hip3": true,
   "equity_fraction_per_trade": 0.2,
   "leverage": 12,
-  "max_trade_notional_usd": 800,
+  "max_trade_notional_usd": 30.0,
   "tp_scale_fraction": 0.5,
   "max_concurrent": 10,
   "max_total_notional_pct": 10.0,
@@ -260,24 +260,24 @@ defaults for missing keys; keep the tracked `.agent-config.json` explicit.
 | Key | What it does | Fallback/default |
 |-----|--------------|---------|
 | `mode` | `OFF` = analyse only, no orders · `LIVE` = place real orders | `OFF` |
-| `equity_fraction_per_trade` | Fraction of perp equity committed as margin per trade when ATR risk sizing is disabled — see [Trade Sizing](#trade-sizing) | `0.01` |
-| `leverage` | Leverage **ceiling** — each trade uses `min(this, the coin's own max)`. Coin maxes differ (BOME 3×, BTC 40×). Set high (e.g. 40) to ride each coin's max. Also multiplies position notional. | `5` |
-| `min_ai_confidence` | Minimum AI confidence for a LONG/SHORT to execute | `0.8` |
-| `max_concurrent` | Max simultaneous open positions | `3` |
-| `max_trade_notional_usd` | Hard ceiling on a single trade's notional | `200` |
-| `max_total_notional_pct` | Ceiling on combined open notional, as a multiple of equity | `1.0` |
-| `max_daily_loss_usd` | Daily-loss kill switch (negative number) | `-100` |
+| `equity_fraction_per_trade` | Fraction of perp equity committed as margin per trade when ATR risk sizing is disabled — see [Trade Sizing](#trade-sizing) | `0.2` |
+| `leverage` | Leverage **ceiling** — each trade uses `min(this, the coin's own max)`. Coin maxes differ (BOME 3×, BTC 40×). Set high (e.g. 40) to ride each coin's max. Also multiplies position notional. | `10` |
+| `min_ai_confidence` | Minimum AI confidence for a LONG/SHORT to execute | `0.60` |
+| `max_concurrent` | Max simultaneous open positions | `2` |
+| `max_trade_notional_usd` | Hard ceiling on a single trade's notional | `30.0` |
+| `max_total_notional_pct` | Ceiling on combined open notional, as a multiple of equity | `2.0` |
+| `max_daily_loss_usd` | Daily-loss kill switch (negative number) | `-2.0` |
 | `daily_giveback_halt_pct` | **Give-back breaker**: once the day peaks ≥ `daily_giveback_min_peak_usd`, halt NEW entries if it retraces more than this from peak (existing positions ride their stops; resets at UTC roll). Locks green days from round-tripping | `0` (off) |
-| `daily_giveback_min_peak_usd` | Arm threshold for the give-back breaker — stays disarmed until the day's peak PnL reaches this | `20` |
+| `daily_giveback_min_peak_usd` | Arm threshold for the give-back breaker — stays disarmed until the day's peak PnL reaches this | `2.0` |
 | `tp_scale_fraction` | Fraction auto-banked at the TP target (server-side reduce-only trigger at ~1 ATR); rest rides the trail. Captures profit instead of round-tripping | `0.5` |
 | `crowded_with_min_conf` | **Squeeze caution**: a with-the-crowd aligned trade (short into `SHORT_CROWDED` / long into `LONG_CROWDED`) must clear this conf or it's blocked `via:crowded_squeeze` | `0` (off) |
-| `min_available_margin_pct` | Block new trades when free margin drops below this fraction of equity — caps over-leverage/stacking. Lower = deploys more aggressively | `0.10` |
+| `min_available_margin_pct` | Block new trades when free margin drops below this fraction of equity — caps over-leverage/stacking. Lower = deploys more aggressively | `0.2` |
 | `min_market_volume_usd` | Skip markets below this 24h volume | `5_000_000` |
-| `min_short_volume_usd` | Extra 24h-volume floor for **shorts only** — thin markets squeeze, so shorts need deeper liquidity | `0` |
-| `cooldown_min` | Minutes before re-trading the same coin | `60` |
-| `counter_regime_min_conf` | Confidence bar for a trade **against** the regime (e.g. long in a downtrend) | `0.7` |
-| `aligned_min_conf` | Confidence bar for a trade **with** the regime (trend-aligned) — typically lower than the counter-regime bar | _unset_ |
-| `block_counter_trend_bypass` | When `true`, the slow-burn/force-execute path can't bypass the counter-regime gate — stops long-into-downtrend bleed | `false` |
+| `min_short_volume_usd` | Extra 24h-volume floor for **shorts only** — thin markets squeeze, so shorts need deeper liquidity | `50_000_000` |
+| `cooldown_min` | Minutes before re-trading the same coin | `30` |
+| `counter_regime_min_conf` | Confidence bar for a trade **against** the regime (e.g. long in a downtrend) | `0.82` |
+| `aligned_min_conf` | Confidence bar for a trade **with** the regime (trend-aligned) — typically lower than the counter-regime bar | `0.60` |
+| `block_counter_trend_bypass` | When `true`, the slow-burn/force-execute path can't bypass the counter-regime gate — stops long-into-downtrend bleed | `true` |
 | `whale_scan_bypass` | Let whale-accumulation signals bypass the scan gate so they reach research/execution | `false` |
 | `max_crypto_long_correlated` | Cap on simultaneous correlated crypto positions (concentration guard) | `2` |
 | `coin_allowlist` | If non-empty, **only** these coins are tradeable | `[]` (all) |
@@ -528,7 +528,7 @@ Relevant knobs live in `.agent-config.json`:
 | `atr_risk_sizing.risk_per_trade_pct` | Fraction of equity risked at the primary stop | `0.02` = 2% |
 | `atr_risk_sizing.sizing_basis` | Stop source for sizing | `primary_stop` |
 | `leverage` | Leverage ceiling — each trade uses `min(this, coin's own max)`; pushed to the exchange via `set_leverage` | `10` = up to 10× |
-| `max_trade_notional_usd` | Hard cap on a single trade's notional | `800` |
+| `max_trade_notional_usd` | Hard cap on a single trade's notional | `30.0` |
 | `equity_fraction_per_trade` | Fallback margin fraction when ATR sizing is disabled | `0.20` = 20% |
 
 When ATR sizing is disabled, the fallback formula is:

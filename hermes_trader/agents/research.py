@@ -2480,6 +2480,11 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "id": str(uuid.uuid4()),
         "trace_id": trace_id,
         "perception_id": perception.get("id", "unknown"),
+        # P0-5 (audit 2026-10-16): signal birth timestamp so the execute path
+        # can measure end-to-end signal→order latency. Delays > the signal's
+        # useful life make the fill decision stale; exposing signal_age_s in
+        # the execute event lets monitoring alert on it instead of guessing.
+        "signal_ts": time.time(),
         "coin": coin,
         "verdict": parsed["verdict"],
         "confidence": parsed["confidence"],

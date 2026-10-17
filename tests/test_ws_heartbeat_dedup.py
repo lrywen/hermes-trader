@@ -482,3 +482,89 @@ class TestSnapshotDataclass:
     def test_get_price_returns_float_on_good_value(self) -> None:
         s = RealtimeSnapshot(all_mids={"BTC": "50000.5"})
         assert s.get_price("BTC") == 50000.5
+
+
+# ---------------------------------------------------------------------------
+# P1-12: REAL _reconnect_loop backoff + recovery (not just the reset block)
+# ---------------------------------------------------------------------------
+
+class _NonBlockingStop:
+    """threading.Event stand-in whose ``wait()`` never sleeps, so the real
+    ``_reconnect_loop`` drives through exponential backoff fast enough to
+    unit-test without waiting seconds between attempts."""
+
+    def __init__(self) -> None:
+        self._set = False
+
+    def set(self) -> None:
+        self._set = True
+
+    def is_set(self) -> bool:
+        return self._set
+
+    def clear(self) -> None:
+        self._set = False
+
+    def wait(self, timeout=None):
+        # Non-blocking: report the current state immediately so the loop spins
+        # through the stale-check + backoff without real sleeping.
+        return self._set
+
+
+class TestReconnectLoopBackoff:
+    def test_failures_backoff_then_success_resets(
+        self, ws: HyperliquidWebSocket, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Drive the REAL ``_reconnect_loop``: two failed reconnects grow the
+        exponential backoff, a third succeeds and resets delay + attempts.
+        P1-12 — this exercises the live loop (not a copy of its reset block)."""
+        monkeypatch.setattr(ws_client, "_WS_MAX_STALE_SECONDS", -1)  # always stale
+        monkeypatch.setattr(ws_client, "_WS_RECONNECT_JITTER", 0.0)  # deterministic
+        fake_stop = _NonBlockingStop()
+        monkeypatch.setattr(ws, "_reconnect_stop", fake_stop)
+        ws._reconnect_delay = ws_client._WS_RECONNECT_BASE_DELAY
+        ws._reconnect_attempts = 0
+
+        calls = {"n": 0}
+
+        def _connect() -> None:
+            calls["n"] += 1
+            if calls["n"] <= 2:
+                raise RuntimeError(f"synthetic reconnect failure #{calls['n']}")
+            fake_stop.set()  # successful reconnect -> stop the loop
+
+        monkeypatch.setattr(ws, "_connect_and_subscribe", _connect)
+        monkeypatch.setattr(ws, "_stop_internal", lambda: None)
+
+        ws._reconnect_loop()
+
+        # Two failures exercised the backoff, one success reset it.
+        assert calls["n"] == 3, calls["n"]
+        assert ws._reconnect_attempts == 0
+        assert ws._reconnect_delay == ws_client._WS_RECONNECT_BASE_DELAY
+
+    def test_backoff_capped_at_max_delay(
+        self, ws: HyperliquidWebSocket, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Repeated failures never push the backoff past ``_WS_RECONNECT_MAX_DELAY``."""
+        monkeypatch.setattr(ws_client, "_WS_MAX_STALE_SECONDS", -1)
+        monkeypatch.setattr(ws_client, "_WS_RECONNECT_JITTER", 0.0)
+        fake_stop = _NonBlockingStop()
+        monkeypatch.setattr(ws, "_reconnect_stop", fake_stop)
+        ws._reconnect_delay = ws_client._WS_RECONNECT_BASE_DELAY
+        ws._reconnect_attempts = 0
+
+        failures = {"n": 0}
+
+        def _connect_always_fail() -> None:
+            failures["n"] += 1
+            if failures["n"] >= 8:  # 1->2->4->8->16->32->60 (capped) is enough
+                fake_stop.set()
+            raise RuntimeError("always fails")
+
+        monkeypatch.setattr(ws, "_connect_and_subscribe", _connect_always_fail)
+        monkeypatch.setattr(ws, "_stop_internal", lambda: None)
+
+        ws._reconnect_loop()
+
+        assert ws._reconnect_delay == ws_client._WS_RECONNECT_MAX_DELAY
