@@ -190,7 +190,11 @@ def test_runner_invokes_executor_with_job_and_env_and_returns_state() -> None:
 
     job = executed[0]
     assert job.name == "reconcile_relax_tier_shadow"
-    assert state == {"reconcile_relax_tier_shadow": "2026-09-17"}
+    # P0-3: rc==0 => a last_ok: signal is recorded alongside the slot.
+    assert state == {
+        "reconcile_relax_tier_shadow": "2026-09-17",
+        "last_ok:reconcile_relax_tier_shadow": "2026-09-17",
+    }
 
 
 def test_runner_survives_failing_job_and_still_marks_slot() -> None:
@@ -201,6 +205,29 @@ def test_runner_survives_failing_job_and_still_marks_slot() -> None:
     # Slot is marked so the loop does not hot-retry a broken job every 60s.
     assert state == {"daily_report": "2026-09-17"}
     assert due_jobs(_utc(h=0, m=11), state) == []
+
+
+def test_runner_nonzero_exit_marks_slot_but_no_last_ok() -> None:
+    # P0-3: a job that runs but exits rc=1 is "ran" but NOT "succeeded".
+    def fail(job, **kwargs):
+        return 1
+
+    state = run_due(_utc(h=0, m=10), {}, executor=fail)
+    assert state == {"daily_report": "2026-09-17"}
+    assert "last_ok:daily_report" not in state
+    # Next day reopens (failed job was not last_ok, but slot dedup still applies).
+    assert due_jobs(_utc(d=18, h=0, m=10), state) != []
+
+
+def test_scheduler_state_persist_roundtrip(tmp_path) -> None:
+    # P0-3: slot + last_ok state survives a restart via /data/scheduler_state.json.
+    from scripts.scheduler import _load_scheduler_state, _save_scheduler_state
+    state = {
+        "daily_report": "2026-09-17",
+        "last_ok:daily_report": "2026-09-17",
+    }
+    _save_scheduler_state(str(tmp_path), state)
+    assert _load_scheduler_state(str(tmp_path)) == state
 
 
 def test_runner_nothing_due_runs_nothing() -> None:

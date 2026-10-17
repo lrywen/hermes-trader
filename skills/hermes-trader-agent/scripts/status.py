@@ -148,7 +148,9 @@ def main() -> int:
     print("=== hermes-trader status ===")
     print(f"repo: {ROOT}")
 
-    config = _load_json(ROOT / ".agent-config.json")
+    config = _load_json(Path(os.environ.get(
+        "HERMES_LIVE_CONFIG_PATH",
+        "/data/.agent-config.json" if os.path.isdir("/data") else "")) or ROOT / ".agent-config.json")
     if config is None:
         print("config: .agent-config.json not found (defaults: mode OFF)")
     elif "_error" in config:

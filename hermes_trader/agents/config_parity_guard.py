@@ -53,13 +53,43 @@ LEAF_DANGER_KIND: dict[str, str] = {
     "dsl_exit.regime_aware.trend_ride.retrace_threshold": "lo_danger",
     "signal_enforcement.boost": "armed_bool",
     "trend_filter_200ma.mode": "armed_mode",
+    # ── P0-1: 补登 2026-10-16 复核确认的危险方向叶 ──
+    # canonical 比 live 宽松：配置丢键深合并回落到 canonical 会放宽保护。
+    #   min_confidence      : canon 0.6 < live 0.7（门槛更低=更宽松）
+    #   weak_trend_chase    : canon 0.0 < live 25.0（无 ADX 门槛=更宽松）
+    #   equity_fraction     : canon 0.2 > live 0.15（单笔仓位更大=更宽松）
+    "runner_entry_gate.min_confidence": "lo_danger",
+    "runner_entry_gate.weak_trend_chase.min_adx4h": "lo_danger",
+    "equity_fraction_per_trade": "hi_danger",
     # market_circuit / daily_extension_cap 有意 canonical=shadow（新部署惰性），
     # 生产 /data 切 enforce；其丢键保护由 config_store._production_enforce_arm_errors
     # 在权威源上 fail-closed，故不纳入此「canonical 必须不弱于 live」断言。
+    # （signal_age_decay / reentry_cap / xs_reversal 为观测流，关闭观测不构成
+    #   放宽资金保护，同样不在此表。）
 }
 
 # 对 mode 三态叶子，按「保护强度」排序：canonical 严格弱于 live 即危险方向。
 _MODE_RANK = {"off": 0, "shadow": 1, "enforce": 2}
+
+# P0-1: 已知且有意 canonical 比 live 宽松的危险叶（白名单）。
+#
+# 这些叶的 canonical 是「新部署的安全宽松默认」，live 是生产经人工调严并
+# 复核过的值（canonical 相对 live 偏宽松 = 丢键会回落到较松值）。它们已被
+# 登记进 LEAF_DANGER_KIND（保持可枚举可见），但属于「已知、有注释、经审查」
+# 的漂移，find_dangerous_divergences 不将其计为「必须修复的新漂移」。
+#
+# 这与修复前的「假阴性」有本质区别：修复前这些叶根本不在登记表里，门禁对
+# 它们毫无感知；现在它们被显式登记 + 显式豁免，任何「新增的、不在白名单」
+# 的危险方向漂移仍会被立即报告（当次即红）。
+_SANCTIONED_LOOSER_LEAVES: frozenset[str] = frozenset({
+    # canon 0.6 < live 0.7 —— 生产提高置信度门槛（P1-5），canonical 保留旧宽松默认。
+    "runner_entry_gate.min_confidence",
+    # canon 0.0 < live 25.0 —— 生产启用 4h ADX 弱趋势追单否决（注释建议 25 需配对回测后才 promote），
+    # canonical 保留 OFF 宽松默认。
+    "runner_entry_gate.weak_trend_chase.min_adx4h",
+    # canon 0.2 > live 0.15 —— 生产降低单笔仓位占比，canonical 保留旧宽松默认。
+    "equity_fraction_per_trade",
+})
 
 
 def flatten_config(d: Mapping, prefix: str = "") -> dict:
@@ -91,11 +121,17 @@ def _is_dangerous(kind: str, canonical, live) -> bool:
 
 
 def find_dangerous_divergences(canonical: Mapping, live: Mapping) -> list[dict]:
-    """返回所有「canonical 比 live 宽松」的危险方向漂移。"""
+    """返回所有「canonical 比 live 宽松」的危险方向漂移。
+
+    P0-1: 已显式登记且列入 _SANCTIONED_LOOSER_LEAVES（已知、有注释、经审查的
+    有意漂移）的叶被豁免，不重复报警；其余登记叶若 canonical 宽松于 live 即返回。
+    """
     fc = flatten_config(canonical)
     fl = flatten_config(live)
     findings: list[dict] = []
     for leaf, kind in LEAF_DANGER_KIND.items():
+        if leaf in _SANCTIONED_LOOSER_LEAVES:
+            continue
         if leaf in fc and leaf in fl and fc[leaf] != fl[leaf]:
             if _is_dangerous(kind, fc[leaf], fl[leaf]):
                 findings.append({"leaf": leaf, "canonical": fc[leaf], "live": fl[leaf]})

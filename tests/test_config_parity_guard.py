@@ -65,6 +65,39 @@ def test_equal_values_no_finding():
     assert g.find_dangerous_divergences(c, c) == []
 
 
+def test_sanctioned_looser_leaves_are_registered_and_exempt():
+    """P0-1: 白名单叶必须已登记（可枚举可见），且 find 不将其计为新漂移。"""
+    assert g._SANCTIONED_LOOSER_LEAVES <= set(g.LEAF_DANGER_KIND), (
+        "白名单叶必须登记进 LEAF_DANGER_KIND，否则仍是假阴性"
+    )
+    # 用真实 canonical/live 验证：这 3 个叶 canonical 确实比 live 宽松，
+    # 但白名单豁免使其不被报告（它们是已知、有注释的有意漂移）。
+    import json as _json
+    path = _live_config_path()
+    if path is None:
+        pytest.skip("live 配置不在本环境")
+    with open(path, encoding="utf-8") as f:
+        live = _json.load(f)
+    findings = g.find_dangerous_divergences(CANONICAL_DEFAULTS, live)
+    leaked = sorted(set(g.LEAF_DANGER_KIND) & g._SANCTIONED_LOOSER_LEAVES - {
+        x["leaf"] for x in findings})
+    # 白名单叶不应出现在 findings 中（它们被豁免）。
+    assert not (g._SANCTIONED_LOOSER_LEAVES & {x["leaf"] for x in findings}), leaked
+
+
+def test_unsanctioned_new_dangerous_divergence_is_reported():
+    """P0-1 防复发: 不在白名单的已登记危险叶，若 canonical 宽松于 live 必须报出。"""
+    # max_total_notional_pct 已登记为 hi_danger 且不在白名单。
+    assert "max_total_notional_pct" not in g._SANCTIONED_LOOSER_LEAVES
+    assert g.find_dangerous_divergences(
+        {"max_total_notional_pct": 5.0}, {"max_total_notional_pct": 1.0}) == [
+        {"leaf": "max_total_notional_pct", "canonical": 5.0, "live": 1.0},
+    ]
+    # 反向（canonical 更严）不报。
+    assert g.find_dangerous_divergences(
+        {"max_total_notional_pct": 1.0}, {"max_total_notional_pct": 5.0}) == []
+
+
 def test_unregistered_leaf_ignored():
     assert g.find_dangerous_divergences({"random_leaf": 9}, {"random_leaf": 1}) == []
 

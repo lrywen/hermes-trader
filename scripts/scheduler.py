@@ -19,6 +19,7 @@ fast.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 import subprocess
@@ -146,6 +147,35 @@ def due_jobs(now: datetime, last_runs: dict[str, str]) -> list[ScheduledJob]:
     ]
 
 
+# ── P0-3: last_ok 活性信号 + 状态持久化 ────────────────────────────────────
+# 「已运行」≠「已成功」。仅当 job 以 rc==0 结束时才登记 last_ok，并把状态
+# 持久化到 /data/scheduler_state.json，使调度器活性可观测、可回滚。
+def _scheduler_state_path(data_dir: str) -> Path:
+    return Path(data_dir) / "scheduler_state.json"
+
+
+def _load_scheduler_state(data_dir: str) -> dict[str, str]:
+    """Load persisted slot/last_ok state, tolerating a missing/corrupt file."""
+    try:
+        with open(_scheduler_state_path(data_dir), encoding="utf-8") as f:
+            return json.load(f)
+    except (FileNotFoundError, ValueError, OSError):
+        return {}
+
+
+def _save_scheduler_state(data_dir: str, state: dict[str, str]) -> None:
+    """Atomically persist slot + last_ok state so a crash loses at most one tick."""
+    try:
+        path = _scheduler_state_path(data_dir)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(tmp, path)
+    except OSError:
+        logger.warning("[scheduler] failed to persist state to %s", data_dir)
+
+
 def _run_job(job: ScheduledJob, data_dir: str, repo_root: Path) -> int:
     """Run one job foreground, appending output to its /data log."""
     log_path = Path(data_dir) / job.log_name
@@ -182,6 +212,15 @@ def run_due(
     slot is still marked so a broken script cannot hot-retry every 60s
     (it gets a fresh chance at the next slot, matching the old shell
     block's post-run sleep 120 dedup).
+
+    P0-3: the returned state carries two signals per job:
+      * ``state[job.name] = slot``            — "last ran in slot" (marked
+        regardless of outcome, to keep the anti-hot-retry contract);
+      * ``state["last_ok:" + job.name] = slot`` — "last SUCCEEDED in slot",
+        written ONLY when the job exits rc==0. A job that fails is marked as
+        "ran" but never as "succeeded", so the panel can answer "when did
+        this last succeed" and a watchdog can flag a healthy loop that is
+        silently failing every job.
     """
     run = executor or _run_job
     root = repo_root or REPO_ROOT
@@ -193,6 +232,8 @@ def run_due(
             if rc:
                 logger.error("[scheduler] %s exited rc=%s (see /data/%s)",
                              job.name, rc, job.log_name)
+            else:
+                state[f"last_ok:{job.name}"] = slot_id(job, now)
         except Exception:
             logger.exception("[scheduler] %s raised", job.name)
         state[job.name] = slot_id(job, now)
@@ -204,10 +245,16 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
-    state: dict[str, str] = {}
+    data_dir = os.environ.get("HERMES_DATA_DIR", "/data")
+    state = _load_scheduler_state(data_dir)
     while True:
         try:
-            state = run_due(datetime.now(UTC), state)
+            state = run_due(
+                datetime.now(UTC),
+                state,
+                data_dir=data_dir,
+            )
+            _save_scheduler_state(data_dir, state)
         except Exception:
             logger.exception("[scheduler] tick failed")
         time.sleep(60)

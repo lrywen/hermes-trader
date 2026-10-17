@@ -41,7 +41,14 @@ LOG_FILE = Path(os.environ.get(
 ALERTS_FILE = Path(os.environ.get(
     "CALIB_ALERTS", "/tmp/calibration_guardrail_alerts.jsonl"))
 CRON_SCRIPT = REPO / "scripts" / "weekly_calibrate_regime.sh"
-CONFIG_FILE = REPO / ".agent-config.json"
+# P1-7: prefer the production /data truth source; fall back to the repo copy
+# only when /data is unavailable (host-side run). The repo-root copy is a
+# stale dev artifact and must not be read as the live config.
+CONFIG_FILE = Path(os.environ.get(
+    "HERMES_LIVE_CONFIG_PATH",
+    "/data/.agent-config.json"))
+if not CONFIG_FILE.exists() or not CONFIG_FILE.is_file():
+    CONFIG_FILE = REPO / ".agent-config.json"
 SH_TZ = timezone(timedelta(hours=8))  # Asia/Shanghai
 
 VERDICT_RE = re.compile(r"VERDICT=(PROMOTE|REJECT|DRY_RUN)")
