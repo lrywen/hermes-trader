@@ -409,12 +409,14 @@ def momentum_burst(
     pushed pct_move_spike's bar to fire out of reach.
     """
     if len(candles) < lookback + 1:
-        return {"name": "momentumBurst", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "momentumBurst", "score": 0, "reason": "flat", "fired": False,
+                "direction": "flat"}
 
     start = candle_val(candles[-lookback - 1], "c")
     end = candle_val(candles[-1], "c")
     if start == 0:
-        return {"name": "momentumBurst", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "momentumBurst", "score": 0, "reason": "flat", "fired": False,
+                "direction": "flat"}
 
     move_pct = (end - start) / start * 100
     fired = abs(move_pct) >= pct_threshold
@@ -426,6 +428,10 @@ def momentum_burst(
         "score": score if fired else 0,
         "reason": f"{move_pct:+.1f}% over {lookback} bars {direction}" if fired else "flat",
         "fired": fired,
+        # P0-1: structured direction so downstream consumers (e.g.
+        # research._fired_trigger_direction) need not regex-parse the reason
+        # string. Carried whether fired or not; does not change score/fired.
+        "direction": direction,
     }
 
 

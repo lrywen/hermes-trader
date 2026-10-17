@@ -524,14 +524,21 @@ def _llm_record_failure() -> None:
 
 
 def _fired_trigger_direction(perception: dict[str, Any], name: str) -> str:
-    """Direction ("up"/"down") of a fired trigger from its scored reason.
+    """Direction ("up"/"down") of a fired trigger.
 
-    Triggers such as momentumBurst carry direction in their reason text
-    ("+4.6% over 2 bars up"). Returns "" when the trigger didn't fire or the
-    direction can't be read.
+    P0-1: prefer the structured ``direction`` field that directional triggers
+    (momentumBurst, pctMoveSpike, breakout, uptrend/downtrend momentum,
+    reversal candles) now carry on the hit dict — no string parsing. Only when
+    a trigger omits the structured field do we fall back to parsing the reason
+    text ("+4.6% over 2 bars up"). Returns "" when the trigger didn't fire or
+    the direction can't be read.
     """
     for t in perception.get("triggers") or []:
         if isinstance(t, dict) and t.get("name") == name and t.get("fired"):
+            # Structured direction takes priority; never regex-parse a "flat"
+            # (not fired) value.
+            if isinstance(t.get("direction"), str) and t.get("direction") in ("up", "down"):
+                return t["direction"]
             reason = str(t.get("reason") or "")
             m = re.search(r"\s(up|down)\s*$", reason)
             if m:

@@ -342,3 +342,41 @@ def test_parse_verdict_malformed_json_uses_first_line_keyword():
     txt = 'SHORT setup forming\n{"verdict": broken json,,}'
     v = parse_verdict(txt, "ETH", {"mid": 10})
     assert v["verdict"] == "SHORT" and v["side"] == "short"
+
+
+# ── P0-1: fired-trigger direction resolution ────────────────────────────────
+def test_fired_trigger_direction_prefers_structured_field():
+    """P0-1: a fired trigger's structured ``direction`` wins; no regex parse."""
+    from hermes_trader.agents.research import _fired_trigger_direction
+    perception = {"triggers": [
+        {"name": "momentumBurst", "fired": True, "reason": "some text up",
+         "direction": "up"},
+        {"name": "pctMoveSpike", "fired": True, "reason": "flat", "direction": "down"},
+    ]}
+    assert _fired_trigger_direction(perception, "momentumBurst") == "up"
+    assert _fired_trigger_direction(perception, "pctMoveSpike") == "down"
+
+
+def test_fired_trigger_direction_falls_back_to_reason():
+    """P0-1: when a trigger omits the structured field, fall back to the reason."""
+    from hermes_trader.agents.research import _fired_trigger_direction
+    # Old-format hit: no structured direction, direction only in reason text.
+    perception = {"triggers": [
+        {"name": "momentumBurst", "fired": True,
+         "reason": "+4.6% over 2 bars down"},
+    ]}
+    assert _fired_trigger_direction(perception, "momentumBurst") == "down"
+
+
+def test_fired_trigger_direction_not_fired_or_unknown_is_empty():
+    """P0-1: not-fired, unknown trigger, or unreadable direction → ''."""
+    from hermes_trader.agents.research import _fired_trigger_direction
+    assert _fired_trigger_direction({"triggers": [
+        {"name": "momentumBurst", "fired": False, "reason": "flat",
+         "direction": "flat"}]}, "momentumBurst") == ""
+    # No matching trigger at all.
+    assert _fired_trigger_direction({"triggers": []}, "momentumBurst") == ""
+    # Structured value present but not a valid direction → ignore, use reason.
+    assert _fired_trigger_direction({"triggers": [
+        {"name": "momentumBurst", "fired": True, "direction": "sideways",
+         "reason": "spike up"}]}, "momentumBurst") == "up"

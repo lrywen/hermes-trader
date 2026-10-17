@@ -215,13 +215,18 @@ def test_momentum_burst_fires_on_large_move():
     assert h["fired"] is True
     assert h["score"] > 0
     assert "up" in h["reason"]
+    # P0-1: structured `direction` field so downstream (research
+    # _fired_trigger_direction) need not regex-parse the reason text.
+    assert h.get("direction") == "up"
 
     # a downward burst fires too
     crash = flat[:-2] + [
         Candle(t=8, o=97, h=97, l=97, c=97.0, v=10),
         Candle(t=9, o=94, h=94, l=94, c=94.0, v=10),
     ]
-    assert momentum_burst(crash, lookback=2, pct_threshold=4.0)["fired"] is True
+    h_down = momentum_burst(crash, lookback=2, pct_threshold=4.0)
+    assert h_down["fired"] is True
+    assert h_down.get("direction") == "down"
 
 
 def test_trend_from_closes_up_down_neutral():

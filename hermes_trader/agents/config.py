@@ -75,7 +75,34 @@ TRIGGER_CONFIG: dict[str, Any] = {
 
 def get_config() -> dict[str, Any]:
     """Return the default trigger configuration."""
+    _warn_unvalidated_weights_once()
     return TRIGGER_CONFIG
+
+
+# P0-3: provenance guard for the 2026-09-28 trigger-weight reweight.
+#
+# Those weights were derived from a 1-year Binance-SPOT OHLCV event study
+# (scripts/audit_triggers_1y.py, n=43,795) and have NOT yet been validated in
+# SHADOW against real Hyperliquid-fill ROE (the futures contract is a
+# different execution/microstructure universe from spot). Promoting them to
+# LIVE before that validation would put an unvalidated signal-weight set into
+# production trading. Emit a loud startup/load warning so the operator cannot
+# mistake the active weights for validated ones. This is advisory only — it
+# does not block the (SHADOW-locked) hot path.
+_unvalidated_weights_warned = False
+
+
+def _warn_unvalidated_weights_once() -> None:
+    global _unvalidated_weights_warned
+    if _unvalidated_weights_warned:
+        return
+    _unvalidated_weights_warned = True
+    logger.warning(
+        "[config] P0-3: active trigger_weights are the 2026-09-28 set tuned on "
+        "Binance-SPOT OHLCV (n=43,795), NOT yet validated in SHADOW against "
+        "real HL-fill ROE. Do NOT promote to LIVE before a SHADOW real-fill "
+        "validation pass (per audit P0-3)."
+    )
 
 
 # ── R13-B8: canonical hot-path resolution for weights / thresholds ──────────
