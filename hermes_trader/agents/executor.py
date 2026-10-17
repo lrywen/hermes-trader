@@ -3918,9 +3918,17 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
     if not _sidestep_bypasses_runner:
         runner_block = _runner_entry_block_reason(analysis, config)
         if runner_block:
+            # P1-5 (2026-10-17): runner_entry_gate blocks ~85% of candidates but
+            # its early return omitted `blocked_by`, so the `execute` event left
+            # the field null (88% of rejects un-attributable, only a free-text
+            # `reason`/`detail` remained). Surface the same structured
+            # list[str] attribution the 22 risk gates produce (block_reasons)
+            # so the reject funnel is machine-countable end-to-end.
             return {
                 "executed": False, "mode": mode,
-                "analysis_id": analysis["id"], "reason": runner_block,
+                "analysis_id": analysis["id"],
+                "reason": runner_block,
+                "blocked_by": [runner_block],
             }
 
     # Loss cooldown: refuse re-entry on a coin whose last close was a LOSS and

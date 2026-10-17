@@ -131,11 +131,11 @@ def main(argv=None) -> int:
         tmp = config_store.CONFIG_PATH
         config_store.CONFIG_PATH = args.config
         try:
-            config_store.write_agent_config(snapshot)
+            config_store.write_agent_config(snapshot, via="apply_prod_override")
         finally:
             config_store.CONFIG_PATH = tmp
     else:
-        config_store.write_agent_config(snapshot)
+        config_store.write_agent_config(snapshot, via="apply_prod_override")
     print(f"\napplied snapshot -> {args.config} (previous file backed up).")
     return 0
 

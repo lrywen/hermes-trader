@@ -40,8 +40,8 @@ Fraction of perp equity committed as MARGIN per trade. With leverage, notional =
 
 **Math check**: if `equity_fraction × max_concurrent > 1.0`, you'll fully deploy and start tripping `max_total_notional_pct`. For $250 with 0.10 fraction × 18 concurrent = 180% over-deployment, but with 10–40x leverage the per-trade *margin* commitment stays modest. Watch `available` (free margin) on the dashboard; if it drops below 10% of equity, the executor refuses new trades.
 
-### `leverage` (int, default `5`)
-Max leverage to request per trade. Actual = `min(this, per-coin HL max)`. BTC: 40x, ETH: 25x, mid-cap alts: 5-20x, HIP-3 equity: 5-20x.
+### `leverage` (int, default `10`)
+Max leverage to request per trade. Actual = `min(this, per-coin HL max)`. BTC: 40x, ETH: 25x, mid-cap alts: 5-20x, HIP-3 equity: 5-20x. Code default `10`; production pins `10`.
 
 | Account size | Recommended |
 |---|---|
@@ -58,8 +58,8 @@ Max simultaneous open positions. Trades over this cap are deferred. Production p
 ### `max_total_notional_pct` (float, default `2.0`)
 Combined open notional cap, expressed as a **multiple of aggregate equity** (NOT a percentage — the `_pct` suffix is historical and misleading; the runtime and schema both treat it as an equity multiple). `4.0` = max **400%** of equity in total open notional, `2.0` = 200%. A value like `10.0` means **1000%** of equity, which (stacked on 10x leverage) can reach ~100× nominal exposure — do not set it from the old "10%" reading. `0` disables the cap; `0 < x < 0.5` is rejected by the safety floor (one trade would fill the cap and freeze the rest of the day). Production pins `4.0`.
 
-### `min_available_margin_pct` (float, default `0.10`)
-Refuse new trade if `available / equity < this`. Default 10% leaves headroom for maintenance margin + slippage. Lower = more aggressive deployment, higher risk of HL "insufficient margin" rejections.
+### `min_available_margin_pct` (float, default `0.2`)
+Refuse new trade if `available / equity < this`. Default 20% leaves headroom for maintenance margin + slippage. Lower = more aggressive deployment, higher risk of HL "insufficient margin" rejections.
 
 ### `conviction_sizing` (bool, default `false`)
 Scale position size by AI confidence: a high-conviction setup bets a larger fraction of equity. Set `false` for flat sizing across all trades.
@@ -82,10 +82,11 @@ So at `equity_fraction_per_trade: 0.10`, a 0.90-confidence trade sizes at an eff
 
 ## Risk safety
 
-### `max_daily_loss_usd` (negative number, default `-30`)
+### `max_daily_loss_usd` (negative number, default `-2.0`)
 Hard daily-loss killswitch. When MTM `daily_pnl <= this`, ALL new trades blocked until UTC midnight reset.
 
 **This is an ABSOLUTE-USD outer envelope, not the primary daily stop — calibrate it to equity.**
+Code default is `-2.0` (a conservative value sized for a small test account); production pins `-3`.
 It sits outside the equity-percentage timed halt `circuit_breaker.daily_loss_pct` (default 8% of
 start-of-day equity → 120 min global halt). The percentage halt fires FIRST and gives the book a
 cooldown; the USD kill only stays latched to UTC if the day keeps bleeding after re-arm. Keep the
@@ -114,8 +115,8 @@ days possible; too tight = locks you out on a normal variance day.
 ### `daily_giveback_halt_pct` (float 0-1, default `0` = off)
 **Daily give-back breaker** (2026-06-06). Once the day's PnL has peaked at `>= daily_giveback_min_peak_usd`, block NEW entries if it then retraces more than this fraction from that peak. Existing positions keep riding their own stops; resets at the UTC roll. Locks in green days so a won day can't fully round-trip (e.g. `0.35` = halt after giving back 35% from peak). Measures TRUE account PnL (aggregate equity, not main-dex-only). `0` disables.
 
-### `daily_giveback_min_peak_usd` (float, default `20`)
-Arm threshold for the give-back breaker — it stays disarmed until the day's **realized** (closed-trade) peak PnL reaches this, so a tiny `+$2` peak can't trip a halt. This is an ABSOLUTE-USD size-sensitive gate: set it at **≈ 5% of current equity** so it only arms on a genuinely good day.
+### `daily_giveback_min_peak_usd` (float, default `2.0`)
+Arm threshold for the give-back breaker — it stays disarmed until the day's **realized** (closed-trade) peak PnL reaches this, so a tiny `+$2` peak can't trip a halt. This is an ABSOLUTE-USD size-sensitive gate: set it at **≈ 5% of current equity** so it only arms on a genuinely good day. Code default `2.0`.
 
 | Equity | `daily_giveback_min_peak_usd` (5% of equity) |
 |---|---|
@@ -135,10 +136,10 @@ Minimum minutes between trades on the same coin. Prevents over-trading a single 
 ### `held_research_interval_min` (int, default `10`)
 How often a coin you ALREADY HOLD is re-researched for a possible AI `CLOSE`. Without this, a held position that keeps triggering pays for a "hold" PASS on every ~15s scan. The DSL exit engine still handles fast/loss exits in real time every scan regardless — this only paces the slower "thesis broke → close" judgment. Lower = more responsive AI closes but more token spend; higher = leans more on DSL for exits. Hot-reloaded.
 
-### `min_ai_confidence` (float 0-1, default `0.7`)
-Floor for AI-verdict confidence to execute. Raise to filter out borderline trades; lower to accept more setups. Current default 0.7 with conviction_sizing reducing those bets to 0.7×.
+### `min_ai_confidence` (float 0-1, default `0.6`)
+Floor for AI-verdict confidence to execute. Raise to filter out borderline trades; lower to accept more setups. Code default 0.6 with conviction_sizing reducing those bets to 0.7×.
 
-### `counter_regime_min_conf` (float 0-1, default `0.7`)
+### `counter_regime_min_conf` (float 0-1, default `0.82`)
 For trades against the BTC/SP500 regime trend, AI confidence must clear this OR `composite_score ≥ 50` OR `momentumBurst` fired OR a slow-burn trigger fired. Loosened bypass paths added 2026-05-28. The `composite ≥ 50` path is NOT disabled by `block_counter_trend_bypass` (only the binary-trigger bypass is).
 
 ### `crowded_with_min_conf` (float 0-1, default `0` = off)
@@ -156,7 +157,7 @@ When `true`, the binary-trigger bypass (momentum_burst / slow_burn / whale) can 
 ### `whale_scan_bypass` (bool, default `false`)
 Let whale-accumulation signals (oi_funding_anomaly) surface a coin for research even when it scores below the composite scan gate (whale loads on FLAT price, which scores low on momentum triggers).
 
-### `max_crypto_long_correlated` (int, default `3`)
+### `max_crypto_long_correlated` (int, default `2`)
 Cap on simultaneous correlated crypto longs. Prevents stacking 5 alt longs that all dump together. HIP-3 equity/commodity longs don't count against this.
 
 ## Signal surfacing (gated)

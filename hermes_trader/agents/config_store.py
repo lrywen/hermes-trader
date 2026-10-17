@@ -520,9 +520,16 @@ def _production_noise_band_errors() -> list[str]:
 
 
 # 灰度臂：canonical 口径（新部署惰性）与生产 /data 基线（已 enforce）。
+# P0-2 (2026-10-16 复核)：生产 /data 实测有 5 个 mode=enforce 块；此前仅登记
+# market_circuit / daily_extension_cap 两个，缺 trend_filter_200ma、ta_late_entry、
+# reasoning_effort_rollout —— 它们生产 enforce、canonical shadow，丢键深合并回落
+# 到 shadow 会静默关闭保护，故一并纳入 fail-closed 启动守卫。
 _GRAY_ENFORCE_ARMS: tuple[tuple[str, str], ...] = (
     ("market_circuit", "market_circuit"),
     ("daily_extension_cap", "daily_extension_cap"),
+    ("trend_filter_200ma", "trend_filter_200ma"),
+    ("ta_late_entry", "ta_late_entry"),
+    ("reasoning_effort_rollout", "reasoning_effort_rollout"),
 )
 
 

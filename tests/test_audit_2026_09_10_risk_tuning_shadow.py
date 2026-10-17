@@ -363,9 +363,11 @@ class _NeutralMemory:
         return None
 
 
-def _wire_leverage_case(monkeypatch, tier_cfg):
+def _wire_leverage_case(monkeypatch, tier_cfg, runner_gate_cfg=None):
     """Drive maybe_execute in bot SHADOW (paper) mode; capture the leverage
-    the would-be order is paper-booked with."""
+    the would-be order is paper-booked with. `runner_gate_cfg` (optional)
+    injects a runner_entry_gate block to exercise the runner-gate reject path.
+    """
     from hermes_trader.agents import market_regime, shadow_book
 
     cfg = {
@@ -406,6 +408,8 @@ def _wire_leverage_case(monkeypatch, tier_cfg):
         "atr_risk_sizing": {"enabled": False},
         "leverage_tier_shadow": tier_cfg,
     }
+    if runner_gate_cfg is not None:
+        cfg["runner_entry_gate"] = runner_gate_cfg
     monkeypatch.setattr(executor, "read_agent_config", lambda: dict(cfg))
     monkeypatch.setattr(executor, "memory", _NeutralMemory())
     monkeypatch.setattr(executor, "get_max_leverage", lambda _c: 10)
@@ -479,3 +483,41 @@ def test_leverage_tier_shadow_keeps_live_leverage(monkeypatch):
     r = [x for x in recs if x["rule"] == "leverage_tier"]
     assert len(r) == 1
     assert r[0]["detail"]["enforced"] is False
+
+
+def test_runner_gate_block_populates_blocked_by(monkeypatch):
+    """P1-5: when runner_entry_gate rejects a candidate, the `execute` result
+    must carry a structured `blocked_by` list (same shape as the 22 risk gates'
+    block_reasons) so the reject funnel is machine-countable instead of a
+    null/blank field on ~88% of rejects."""
+    recs = []
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kw: recs.append(kw))
+    # A runner gate bar higher than the analysis confidence forces the reject
+    # path (confidence check runs before fresh-impulse, so no breakout fields
+    # are needed).
+    runner_cfg = {
+        "enabled": True,
+        "min_confidence": 0.95,
+        "min_composite": 45,
+    }
+    captured = _wire_leverage_case(
+        monkeypatch,
+        {"shadow_mode": True, "atr_pct_max": 3.5,
+         "min_composite": 40, "low_leverage": 5},
+        runner_gate_cfg=runner_cfg)
+
+    # Sanity: the same analysis+config really is rejected by the runner gate.
+    cfg = {"runner_entry_gate": runner_cfg, "mode": "SHADOW"}
+    reason = executor._runner_entry_block_reason(_lev_analysis(), cfg)
+    assert reason.startswith("runner_gate_blocked ("), reason
+
+    res = executor.maybe_execute(_lev_analysis())
+    assert res.get("executed") is False
+    bb = res.get("blocked_by")
+    assert isinstance(bb, list) and bb, \
+        f"runner_gate reject must populate blocked_by, got {bb!r}"
+    assert bb[0] == reason
+    # reason and blocked_by stay consistent for human + machine readers.
+    assert res.get("reason") == reason
+
