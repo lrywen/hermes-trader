@@ -170,14 +170,21 @@ def _load_scheduler_state(data_dir: str) -> dict[str, str]:
 
 
 def _save_scheduler_state(data_dir: str, state: dict[str, str]) -> None:
-    """Atomically persist slot + last_ok state so a crash loses at most one tick."""
+    """Persist slot + last_ok state in place.
+
+    scheduler_state.json is a single-file bind mount (/data → host runtime/).
+    The former atomic ``tmp + os.replace`` pattern broke here: the tmp file landed
+    in the named volume (/data) while the target sat on a different device (the
+    host bind mount), so ``os.replace`` raised EXDEV on every tick and the state
+    was never persisted (scheduler logged "failed to persist" every 60s, watchdog
+    stayed STALE). The scheduler is the single writer, so in-place truncate+write
+    is safe; a torn write is tolerated by ``_load_scheduler_state`` (returns {}).
+    """
     try:
         path = _scheduler_state_path(data_dir)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".json.tmp")
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(state, f)
-        os.replace(tmp, path)
     except OSError:
         logger.warning("[scheduler] failed to persist state to %s", data_dir)
 
