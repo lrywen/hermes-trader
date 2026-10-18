@@ -214,13 +214,21 @@ def register_public_routes(app: FastAPI) -> None:
         the other dashboard reads.
         """
         def _serve():
-            from hermes_trader.agents.config_parity_guard import find_dangerous_divergences
+            from hermes_trader.agents.config_parity_guard import (
+                find_dangerous_divergences,
+                uncovered_divergences,
+            )
             from hermes_trader.agents.config_store import CANONICAL_DEFAULTS
 
             def _compute():
                 live = read_agent_config()
-                items = find_dangerous_divergences(CANONICAL_DEFAULTS, live)
-                return {"dangerous_count": len(items), "items": items,
+                dangerous = find_dangerous_divergences(CANONICAL_DEFAULTS, live)
+                uncovered = uncovered_divergences(CANONICAL_DEFAULTS, live)
+                return {"dangerous_count": len(dangerous),
+                        "uncovered_count": len(uncovered),
+                        "items": dangerous,
+                        # 未登记归属 / 已审查值漂移的叶（门禁覆盖盲区）。非空即门禁红。
+                        "uncovered": [{"leaf": x} for x in uncovered],
                         "ts": int(time.time() * 1000)}
 
             return _ttl_cached("config-parity",

@@ -123,16 +123,40 @@ def test_uncovered_divergences_empty_against_live():
 
 
 def test_uncovered_divergences_flags_new_unregistered_leaf():
-    """防复发: 新增一个既不在危险表、也不在白名单/安全表的漂移 → uncovered 非空。"""
-    # 用一个真实 canonical 有、但未登记的叶作为探针。
+    """防复发: 新增一个既不在危险表、也不在白名单/安全表的漂移 → uncovered 非空。
+
+    fix-verification §11③：_REVIEWED_SAFE_DIVERGENCES 改为绑定复核当时的值，
+    叶名已登记但值与登记不一致同样视为「未复核」→ 报出。
+    """
+    # 用真实已登记叶名 + 与登记一致的值 → covered（uncovered 空）。
+    #   _comment 登记 ('', '10 USDC 实盘 · 10倍杠杆 · BTC/ETH增强版 | ...')
+    #   mode     登记 ('OFF', 'SHADOW')
     c = {"_comment": "", "mode": "OFF"}
-    l = {"_comment": "测试", "mode": "SHADOW"}
-    # 这些叶都在 _REVIEWED_SAFE_DIVERGENCES（已登记），故 uncovered 应空。
+    l = {"_comment": "10 USDC 实盘 · 10倍杠杆 · BTC/ETH增强版 | 选择性开启辅助功能",
+         "mode": "SHADOW"}
     assert g.uncovered_divergences(c, l) == []
     # 新增一个未登记的漂移叶 → 必须被报告。
     c2 = {"_comment": "", "mode": "OFF", "brand_new_leaf": 1}
-    l2 = {"_comment": "测试", "mode": "SHADOW", "brand_new_leaf": 2}
+    l2 = {"_comment": "10 USDC 实盘 · 10倍杠杆 · BTC/ETH增强版 | 选择性开启辅助功能",
+          "mode": "SHADOW", "brand_new_leaf": 2}
     assert "brand_new_leaf" in g.uncovered_divergences(c2, l2)
+
+
+def test_uncovered_divergences_flags_value_drift_on_reviewed_leaf():
+    """fix-verification §11③ 根治「三代假绿」：已登记为「已复核安全」的叶，
+    只要值从复核当时漂移（如 max_daily_loss_usd 从 -3 改成 -500）即当次变红。
+    修复前只按叶名登记，值变更完全不可见；绑定 (canonical, live) 后必须报出。
+    """
+    # 登记值 max_daily_loss_usd = (-2.0, -3)。live 仍为 -3 → covered。
+    c = {"max_daily_loss_usd": -2.0}
+    l = {"max_daily_loss_usd": -3}
+    assert g.uncovered_divergences(c, l) == []
+    # live 从 -3 改 -500（更宽松止损/更大的允许亏损）→ 值漂移 → uncovered 报出。
+    l2 = {"max_daily_loss_usd": -500}
+    assert "max_daily_loss_usd" in g.uncovered_divergences(c, l2)
+    # canonical 漂移（repo 默认被改）同样报出。
+    c2 = {"max_daily_loss_usd": -10.0}
+    assert "max_daily_loss_usd" in g.uncovered_divergences(c2, l)
 
 
 def test_uncovered_divergences_empty_on_equal_configs():

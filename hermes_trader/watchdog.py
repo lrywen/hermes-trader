@@ -195,7 +195,14 @@ def check_scheduler_freshness(state_path: str, max_age_s: int, *,
         last_ok = sorted(k[len("last_ok:"):] for k in data
                          if k.startswith("last_ok:"))
 
-    mtime_ms = int(p.stat().st_mtime * 1000)
+    try:
+        mtime_ms = int(p.stat().st_mtime * 1000)
+    except OSError as e:
+        # P0-7/鲁棒性 (2026-10-18): stat 失败（权限/IO）不得抛穿 main() 打死
+        # 整个看门狗 —— 那样会把「看门狗挂了」也变成一个静默故障。降级为 STALE，
+        # 至少保住「无法确认调度器活性」这条告警信号。
+        return WatchdogResult(False, 0, 0.0,
+                              f"调度器停摆: 无法读取 scheduler_state 状态: {type(e).__name__}: {e}")
     age = (now - mtime_ms) / 1000
     if age < 0:
         return WatchdogResult(False, mtime_ms, age,
@@ -255,16 +262,24 @@ def main(argv: list[str] | None = None) -> int:
         results.append(WatchdogResult(False, 0, 0.0, f"[dead-man] {e}"))
 
     if not args.no_scheduler:
-        results.append(check_scheduler_freshness(
-            args.scheduler_state, args.scheduler_max_age))
+        try:
+            results.append(check_scheduler_freshness(
+                args.scheduler_state, args.scheduler_max_age))
+        except Exception as e:  # 任何意外都不得打死看门狗
+            results.append(WatchdogResult(False, 0, 0.0,
+                                          f"[dead-man] scheduler 检查异常: {type(e).__name__}: {e}"))
 
     vacuous: WatchdogResult | None = None
     if not args.no_reconcile:
-        results.append(check_reconcile_freshness(
-            args.reconcile_status, args.reconcile_max_age))
-        vacuous = check_reconcile_vacuous(args.reconcile_status)
-        if vacuous is not None:
-            results.append(vacuous)
+        try:
+            results.append(check_reconcile_freshness(
+                args.reconcile_status, args.reconcile_max_age))
+            vacuous = check_reconcile_vacuous(args.reconcile_status)
+            if vacuous is not None:
+                results.append(vacuous)
+        except Exception as e:
+            results.append(WatchdogResult(False, 0, 0.0,
+                                          f"[dead-man] 对账检查异常: {type(e).__name__}: {e}"))
 
     stale = [r for r in results if not r.ok]
     for r in results:

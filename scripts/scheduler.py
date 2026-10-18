@@ -46,6 +46,12 @@ class ScheduledJob:
     minute_of_hour: Optional[int] = None  # hourly job, 0..59
     extra_env: tuple[tuple[str, str], ...] = ()
     window_minutes: int = 2
+    # P0-7 (recheck 2026-10-18): 单 job 硬超时。此前 _run_job 的 subprocess.run
+    # 无 timeout，且主循环单线程串行 —— 一个 job 挂住会卡死整个循环，后续所有
+    # job 全部错过窗口、活性信号冻结、且无任何告警（只是日志少了 exit 行）。
+    # 给每个 job 一个默认 900s 上限；超时按退出码 124（类似 kill -TERM）处理，
+    # 循环继续推进下一个 job，不再被单个挂死 job 拖垮。
+    timeout_s: int = 900
 
 
 def _daily(
@@ -187,14 +193,25 @@ def _run_job(job: ScheduledJob, data_dir: str, repo_root: Path) -> int:
             f"{' '.join(cmd)}\n"
         )
         log_fh.flush()
-        result = subprocess.run(
-            cmd,
-            cwd=str(repo_root),
-            env=env,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        try:
+            result = subprocess.run(
+                cmd,
+                cwd=str(repo_root),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=job.timeout_s,
+            )
+        except subprocess.TimeoutExpired as e:
+            # P0-7: 单 job 超时不再拖垮整个调度器。按退出码 124（=kill -TERM）
+            # 处理；run_due 据此视为「已运行但未成功」，不写 last_ok。
+            log_fh.write(
+                f"[scheduler] {job.name} TIMEOUT after {job.timeout_s}s"
+                f" (output truncated; stdout above)\n"
+            )
+            log_fh.flush()
+            return 124
         log_fh.write(f"[scheduler] {job.name} exit={result.returncode}\n")
         return result.returncode
 

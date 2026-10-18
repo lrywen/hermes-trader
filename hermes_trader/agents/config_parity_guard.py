@@ -92,77 +92,124 @@ _SANCTIONED_LOOSER_LEAVES: frozenset[str] = frozenset({
 })
 
 
-# recheck 2026-10-18 §5.1: 门禁「有效覆盖为 0」的补强。
+# recheck 2026-10-18 §5.1 / fix-verification 2026-10-18 §11③: 门禁「有效覆盖为 0」
+# 与「三代假绿」的补强。
 #
 # find_dangerous_divergences 只遍历 LEAF_DANGER_KIND（登记表），而真实生产漂移
 # 大多不在登记表里（当前 56 处漂移 vs 28 登记，经白名单后交集为 0），导致门禁
 # 永远返回 []、三层信号同时「健康」——但未登记的漂移（含可能的危险 fail-open）
 # 却毫无感知。这是比「假阴性」更坏的状态：有绿灯就没有人会怀疑。
 #
-# 修复：门禁判据从「已登记内无危险」改为「漂移 ⊆ 登记」。所有实际漂移必须显式
-# 归属三类之一，否则当次即红：
+# 修复：门禁判据从「已登记内无危险」改为「漂移 ⊆ 登记 且值与登记一致」。
+# 所有实际漂移必须显式归属三类之一，且值必须与复核当时一致，否则当次即红：
 #   1. LEAF_DANGER_KIND（危险方向）
 #   2. _SANCTIONED_LOOSER_LEAVES（已知有意 canonical 宽松）
-#   3. _REVIEWED_SAFE_DIVERGENCES（已人工复核为 fail-safe / 无风险的生产漂移）
+#   3. _REVIEWED_SAFE_DIVERGENCES（已人工复核为 fail-safe / 无风险的生产漂移，
+#      且登记复核当时的 (canonical, live) 值）
 #
-# 当前生产 53 处未登记漂移经逐一审阅：全部为 fail-safe 方向（canonical 更严/更
-# 保守）或无风险（shadow 路径/cooldown/模式切换/权重/测试余额），无新的危险
-# fail-open。据此登记为「已复核安全」。任何未来新增、未登记、未复核的漂移都会
-# 使 uncovered_divergences 非空 → 门禁红，迫使 operator 显式审查——这正是防复发。
-_REVIEWED_SAFE_DIVERGENCES: frozenset[str] = frozenset({
+# 值绑定（fix-verification §11③）：_REVIEWED_SAFE_DIVERGENCES 从「只按叶名」改为
+# 记录复核当时的 (canonical, live)。这样 `max_daily_loss_usd` 从 -3 改成 -500 会
+# 因为 live != 登记值 -3 而立刻变红；新增 live-only 叶也会报。只有 operator 显式
+# 重新审查并更新登记值后门禁才会重新变绿——这正是防复发的根治，消除「三代假绿」。
+#
+# 值来自 2026-10-18 对生产 /home/ldy/hermes-deploy/.agent-config.json 的逐一审阅：
+# 全部为 fail-safe 方向（canonical 更严/更保守）或无风险（shadow 路径/cooldown/
+# 模式切换/权重/测试余额），无新的危险 fail-open。
+_REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     # 元数据/账户
-    "_comment", "mode", "coin_blocklist", "shadow_book.starting_balance",
+    "_comment": ("", "10 USDC 实盘 · 10倍杠杆 · BTC/ETH增强版 | 选择性开启辅助功能"),
+    "mode": ("OFF", "SHADOW"),
+    "coin_blocklist": (["TON", "TRX"], []),
+    "shadow_book.starting_balance": (10000.0, 20),
     # shadow 观测流路径与模式开关（关闭/路径变更不构成放宽资金保护）
-    "daily_extension_cap.mode", "daily_extension_cap.shadow_log_path",
-    "reentry_cap.mode", "reentry_cap.shadow_log_path",
-    "signal_age_decay.mode", "signal_age_decay.shadow_log_path",
-    "xs_reversal.mode", "xs_reversal.shadow_log_path",
-    "market_circuit.mode", "regime_risk_overlay.shadow_log_path",
-    "trend_filter_200ma.shadow_log_path", "weight_shadow.shadow_mode",
-    "dsl_exit.stop_confirm_shadow.shadow_mode",
-    "dsl_exit.stop_tuning_shadow.candidate_breakeven_trigger_pct",
-    "dsl_exit.stop_tuning_shadow.candidate_max_loss_pct",
-    "runner_entry_gate.breakout_score_floor.shadow_mode",
-    "runner_entry_gate.per_coin_cooldown.shadow_mode",
-    "runner_entry_gate.pullback_long.shadow_mode",
+    "daily_extension_cap.mode": ("shadow", "enforce"),
+    "daily_extension_cap.shadow_log_path": ("", "/data/daily_extension_cap_shadow.jsonl"),
+    "reentry_cap.mode": ("off", "shadow"),
+    "reentry_cap.shadow_log_path": ("", "/data/reentry_cap_shadow.jsonl"),
+    "signal_age_decay.mode": ("off", "shadow"),
+    "signal_age_decay.shadow_log_path": ("", "/data/signal_age_decay_shadow.jsonl"),
+    "xs_reversal.mode": ("off", "shadow"),
+    "xs_reversal.shadow_log_path": ("", "/data/xs_reversal_shadow.jsonl"),
+    "market_circuit.mode": ("shadow", "enforce"),
+    "regime_risk_overlay.shadow_log_path": ("", "/data/regime_overlay_shadow.jsonl"),
+    "trend_filter_200ma.shadow_log_path": ("", "/data/trend_filter_shadow.jsonl"),
+    "weight_shadow.shadow_mode": (False, True),
+    "dsl_exit.stop_confirm_shadow.shadow_mode": (False, True),
+    "dsl_exit.stop_tuning_shadow.candidate_breakeven_trigger_pct": (0.0, 1),
+    "dsl_exit.stop_tuning_shadow.candidate_max_loss_pct": (0.0, 1.5),
+    "runner_entry_gate.breakout_score_floor.shadow_mode": (False, True),
+    "runner_entry_gate.per_coin_cooldown.shadow_mode": (True, False),
+    "runner_entry_gate.pullback_long.shadow_mode": (False, True),
     # 生产功能开关（live 开启，canonical 关闭；开启更激进，但非保护放宽）
-    "candlestick_patterns.enabled", "debate_research.enabled", "enable_hip3",
-    "launch_capture.trades_capture", "loop_runtime.scan_dynamic",
-    "loop_runtime.ws_fill_wake", "loop_runtime.ws_status_event",
-    "regime_risk_overlay.enabled", "runner_entry_gate.pullback_long.enabled",
+    "candlestick_patterns.enabled": (False, True),
+    "debate_research.enabled": (False, True),
+    "enable_hip3": (False, True),
+    "launch_capture.trades_capture": (False, True),
+    "loop_runtime.scan_dynamic": (False, True),
+    "loop_runtime.ws_fill_wake": (False, True),
+    "loop_runtime.ws_status_event": (False, True),
+    "regime_risk_overlay.enabled": (False, True),
+    "runner_entry_gate.pullback_long.enabled": (False, True),
     # 生产节奏/超时/退避（非保护语义）
-    "held_research_interval_min", "research_cooldown_min",
-    "research_llm.backoff_cap_sec", "crypto_whale.http_timeout_s",
-    "news_catalyst.http_timeout_s", "research_rescore_delta",
-    "scan_budget.parallel_workers",
+    "held_research_interval_min": (10, 20),
+    "research_cooldown_min": (3, 10),
+    "research_llm.backoff_cap_sec": (15.0, 4),
+    "crypto_whale.http_timeout_s": (2.5, 5),
+    "news_catalyst.http_timeout_s": (3.0, 8),
+    "research_rescore_delta": (0.0, 8),
+    "scan_budget.parallel_workers": (32, 24),
     # 生产调优权重/阈值（canonical 更严或非保护）
-    "trigger_weights.trend_strength", "trigger_weights.uptrend_momentum",
-    "momentum_continuation.min_trend_pct", "regime_classifier.chop_adx_max",
-    "regime_classifier.fast_ema", "regime_classifier.slow_ema",
-    "regime_risk_overlay.chop.allow_shorts", "runner_entry_gate.trend_rsi_overbought",
-    "analyst_scoring.analyst5_whale_or_conf",
-    "trigger_thresholds.momentum_lookback", "trigger_thresholds.momentum_pct",
+    "trigger_weights.trend_strength": (0.3, 0.55),
+    "trigger_weights.uptrend_momentum": (0.2, 0),
+    "momentum_continuation.min_trend_pct": (8.0, 5),
+    "regime_classifier.chop_adx_max": (20.0, 25),
+    "regime_classifier.fast_ema": (20, 15),
+    "regime_classifier.slow_ema": (30, 21),
+    "regime_risk_overlay.chop.allow_shorts": (False, True),
+    "runner_entry_gate.trend_rsi_overbought": (80.0, 82.0),
+    "analyst_scoring.analyst5_whale_or_conf": (0.6, 0.62),
+    "trigger_thresholds.momentum_lookback": (3, 2),
+    "trigger_thresholds.momentum_pct": (3.0, 4),
     # 出场/风控生产值（canonical 比 live 严 = fail-safe 方向）
-    "dsl_exit.max_loss_pct", "max_daily_loss_usd", "tp_scale_fraction",
-    "debate_research.use_structured_output",
-})
+    "dsl_exit.max_loss_pct": (1.0, 1.5),
+    "max_daily_loss_usd": (-2.0, -3),
+    "tp_scale_fraction": (0.5, 0.4),
+    "debate_research.use_structured_output": (True, False),
+}
+
+
+def _covered_by_review(leaf: str, canon: object, live: object) -> bool:
+    """判定一个漂移叶是否「已复核安全」——叶名已登记且 (canonical, live) 与复核
+    当时一致。值不一致（如 max_daily_loss_usd 从 -3 改 -500）即视为未复核 → 红。
+    """
+    reg = _REVIEWED_SAFE_DIVERGENCES.get(leaf)
+    if reg is None:
+        return False
+    return reg == (canon, live)
 
 
 def uncovered_divergences(canonical: Mapping[str, object],
                           live: Mapping[str, object]) -> list[str]:
-    """返回所有「实际漂移但未登记归属」的叶——门禁覆盖盲区。
+    """返回所有「实际漂移但未登记归属 / 值已漂移」的叶——门禁覆盖盲区。
 
-    判据（recheck §9#3）：「漂移 ⊆ 登记」。凡 canonical↔live 不一致、且既不在
-    LEAF_DANGER_KIND（危险）、也不在 _SANCTIONED_LOOSER_LEAVES（有意宽松）、
-    也不在 _REVIEWED_SAFE_DIVERGENCES（已复核安全）的漂移，都会被返回。
-    门禁断言它为空；非空即代表存在未审查的新漂移，必须显式登记后才会绿。
+    判据（recheck §9#3 + fix-verification §11③）：「漂移 ⊆ 登记 且值与登记一致」。
+    凡 canonical↔live 不一致、且既不在 LEAF_DANGER_KIND（危险）、也不在
+    _SANCTIONED_LOOSER_LEAVES（有意宽松）、也不在 _REVIEWED_SAFE_DIVERGENCES
+    （已复核安全，但值必须与登记一致）的漂移，都会被返回。值绑定保证：即使叶名
+    已登记为「已复核安全」，只要 live（或 canonical）值变了（如 max_daily_loss_usd
+    从 -3 改成 -500），也会被当作未复核而返回。门禁断言它为空；非空即代表存在
+    未审查的新漂移或已审查值漂移，必须显式登记/更新后才绿。
     """
     fc = flatten_config(canonical)
     fl = flatten_config(live)
-    covered = (set(LEAF_DANGER_KIND) | _SANCTIONED_LOOSER_LEAVES
-               | _REVIEWED_SAFE_DIVERGENCES)
     diff = {k for k in fc if k in fl and fc[k] != fl[k]}
-    return sorted(diff - covered)
+    uncovered: list[str] = []
+    for leaf in diff:
+        if leaf in LEAF_DANGER_KIND or leaf in _SANCTIONED_LOOSER_LEAVES:
+            continue
+        if not _covered_by_review(leaf, fc[leaf], fl[leaf]):
+            uncovered.append(leaf)
+    return sorted(uncovered)
 
 
 def flatten_config(d: Mapping[str, object], prefix: str = "") -> dict[str, object]:

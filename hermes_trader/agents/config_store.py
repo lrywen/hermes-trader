@@ -488,6 +488,12 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
     # 改弱时拒绝启动，而不是静默回落到 canonical 的 shadow（保护被关）。
     errors.extend(_production_enforce_arm_errors())
 
+    # fix-verification §11③: 门禁「漂移 ⊆ 登记 且值与登记一致」接线到启动路径。
+    # _GRAY_ENFORCE_ARMS 只保护已登记 enforce 臂；本守卫对所有 canonical↔live
+    # 漂移做「未登记归属 / 已审查值漂移」检查。非空（如 max_daily_loss_usd 从
+    # -3 改成 -500）即拒绝启动，迫使 operator 显式重新审查登记，根治「三代假绿」。
+    errors.extend(_production_parity_uncovered_errors())
+
     # B-7：配置来源强制断言。生产权威配置＝容器挂载卷 /data/.agent-config.json
     # （2026-09 为 142 顶键）。当实际加载路径就是 /data 权威文件时，校验其
     # 关键键齐全度，防止读到被截断/写错的配置而静默运行。非 /data 部署
@@ -558,6 +564,35 @@ def _production_enforce_arm_errors() -> list[str]:
                     f"deliberately downgrade)")
     except Exception as e:
         logger.error("gray enforce-arm check failed (non-fatal): %s", e)
+    return errors
+
+
+def _production_parity_uncovered_errors() -> list[str]:
+    """fix-verification §11③: 生产 /data 配置与 canonical 的门禁覆盖盲区检查。
+
+    复用 config_parity_guard.uncovered_divergences 的判据「漂移 ⊆ 登记 且值与
+    登记一致」。任何 canonical↔live 漂移既不在危险表/白名单、也未登记为「已复核
+    安全」且值与登记一致（如 max_daily_loss_usd 从 -3 改 -500）都返回为启动错误。
+    非 /data 部署（本地/CI）不检查；读取异常降级为告警而非阻断（与 enforce-arm
+    同口径）。配置在 /data 上被 operator 有意调整时，须同步更新
+    _REVIEWED_SAFE_DIVERGENCES 登记值，否则启动被拒（fail-closed）。
+    """
+    if not _running_from_data_config():
+        return []
+    errors: list[str] = []
+    try:
+        raw = _read_raw_config() or {}
+        from hermes_trader.agents import config_parity_guard as _g
+        uncovered = _g.uncovered_divergences(_g.CANONICAL_DEFAULTS, raw)
+        for leaf in uncovered:
+            errors.append(
+                f"startup safety: config parity drift '{leaf}' on the production "
+                f"/data config is neither registered as a dangerous/whitelisted leaf "
+                f"nor matches the reviewed-safe value in config_parity_guard."
+                f"_REVIEWED_SAFE_DIVERGENCES — re-review and update the registration "
+                f"(or set HERMES_SKIP_STARTUP_SAFETY=1 to deliberately override)")
+    except Exception as e:
+        logger.error("parity uncovered check failed (non-fatal): %s", e)
     return errors
 
 
