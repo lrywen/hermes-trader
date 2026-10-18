@@ -44,6 +44,32 @@ _WRITE_LOCK = threading.Lock()
 # Default settle horizon (hours). Promotion gates read the summary at this.
 DEFAULT_HORIZON_HOURS = 72
 
+# Attribution settles on 1h closes, so the logical "cycle" for one
+# observation is a 1h bucket — not an individual scan tick. Both call sites
+# used to pass a raw wall-clock ms (one per scan), which made the
+# (source, coin, cycle) dedup key unique every tick and re-registered the
+# whole coin universe every ~3-5 min (observed 2026-10-15: items/cycle jumped
+# ~2 -> ~25 and daily registrations rose ~15x to 8-12k, an unbounded backlog).
+# Normalising the cycle onto the 1h grid makes repeated scans inside the same
+# hour collapse to one observation (backlog fix, recheck 2026-10-18).
+CYCLE_BUCKET_MS = 3_600_000
+
+# Wall-clock ms above this is treated as a real epoch timestamp and bucketed;
+# tiny synthetic values (tests use 1_000) are left untouched. 10^11 ms is
+# 1973-03, far below any real run and far above any hand-written fixture.
+_WALLCLOCK_MIN_MS = 100_000_000_000
+
+
+def _logical_cycle_ms(cycle_ms: int) -> int:
+    """Snap a raw cycle timestamp onto the 1h attribution grid.
+
+    Small synthetic values (< _WALLCLOCK_MIN_MS) are returned unchanged so
+    callers/tests that pass an explicit logical cycle id keep full control.
+    """
+    if cycle_ms >= _WALLCLOCK_MIN_MS:
+        return (cycle_ms // CYCLE_BUCKET_MS) * CYCLE_BUCKET_MS
+    return cycle_ms
+
 # Per-file caps so the settled history can't grow unbounded. Settled rows are
 # small; rotation here is by-count (oldest dropped), matching the shadow arms'
 # conservative retention.
@@ -107,12 +133,20 @@ def register_pending(
     ``selections``/``deferrals`` are ``(coin, score)`` pairs. ``base_prices``
     maps coin -> price (mids); coins with no usable base price are skipped (a
     return can't be measured without one). Idempotent per
-    (source, coin, cycle): re-registering the same cycle adds nothing.
+    (source, coin, cycle): re-registering the same cycle adds nothing. A
+    real-epoch ``cycle_ms`` is snapped onto the 1h attribution grid, so several
+    scans within the same hour collapse to one observation; a small synthetic
+    cycle id is used verbatim.
     Returns the number of items added. Never raises.
     """
     try:
         ts = _now_ms()
-        cycle = int(cycle_ms) if cycle_ms else ts
+        raw_cycle = int(cycle_ms) if cycle_ms else ts
+        # Snap onto the 1h grid so several scans inside the same hour are one
+        # observation (they settle against the same +72h 1h close). Without
+        # this the raw per-scan timestamp defeats the dedup key (recheck P0-D
+        # root cause, 2026-10-18).
+        cycle = _logical_cycle_ms(raw_cycle)
         with _WRITE_LOCK:
             state = _load_state()
             seen = {_dedup_key(it.get("source", ""), it.get("coin", ""),

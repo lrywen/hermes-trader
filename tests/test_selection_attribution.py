@@ -156,3 +156,41 @@ def test_summary_empty_source(data_dir):
 def test_bare_coin_helper():
     assert sa.bare_coin("xyz:IREN") == "IREN"
     assert sa.bare_coin("BTC") == "BTC"
+
+
+def test_real_wallclock_cycles_snap_to_hour_grid(data_dir):
+    # Recheck 2026-10-18 root cause: each scan passed a raw wall-clock ms, so
+    # the (source, coin, cycle) dedup key changed every tick and the whole
+    # universe was re-registered every ~3-5 min. Two real epoch timestamps
+    # inside the same 1h bucket must collapse to one observation.
+    prices = {"AAA": "100", "BBB": "50", "CCC": "10"}
+    hour = (1_700_000_000_000 // 3_600_000) * 3_600_000  # an exact hour grid line
+    first = hour + 5 * 60_000      # 00:05
+    second = hour + 50 * 60_000    # 00:50, same logical hour
+    assert sa.register_pending(
+        "signal_ranking",
+        selections=[("AAA", 80.0)], deferrals=[("CCC", 20.0)],
+        base_prices=prices, cycle_ms=first) == 2
+    assert sa.register_pending(
+        "signal_ranking",
+        selections=[("AAA", 80.0)], deferrals=[("CCC", 20.0)],
+        base_prices=prices, cycle_ms=second) == 0
+    state = json.loads((data_dir / "selection_attribution.json").read_text())
+    assert len(state["items"]) == 2
+    # The stored cycle is the snapped hour boundary, not either raw tick.
+    assert {it["cycle"] for it in state["items"]} == {hour}
+
+
+def test_distinct_hour_buckets_remain_distinct(data_dir):
+    prices = {"AAA": "100"}
+    hour = (1_700_000_000_000 // 3_600_000) * 3_600_000  # exact hour grid line
+    assert sa.register_pending("signal_ranking",
+                               selections=[("AAA", 80.0)], deferrals=[],
+                               base_prices=prices, cycle_ms=hour) == 1
+    assert sa.register_pending("signal_ranking",
+                               selections=[("AAA", 80.0)], deferrals=[],
+                               base_prices=prices,
+                               cycle_ms=hour + 3_600_000) == 1
+    state = json.loads((data_dir / "selection_attribution.json").read_text())
+    assert len(state["items"]) == 2
+    assert {it["cycle"] for it in state["items"]} == {hour, hour + 3_600_000}
