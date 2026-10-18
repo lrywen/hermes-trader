@@ -274,9 +274,13 @@ def main(argv: list[str] | None = None) -> int:
         try:
             results.append(check_reconcile_freshness(
                 args.reconcile_status, args.reconcile_max_age))
+            # FND-07 vacuous：报「0 成交窗口却 clean 且有本地交易」。这是 SHADOW
+            # 纸面模式的正常稳态（纸面单不触达交易所），恒红只会淹没真实停摆，故
+            # 改为仅告警不红（打印 WARN，不进入 stale/exit 1/alert）。对账新鲜度
+            # 仍是硬检查。切 LIVE 前需显式重审此语义。
             vacuous = check_reconcile_vacuous(args.reconcile_status)
             if vacuous is not None:
-                results.append(vacuous)
+                print(f"[dead-man] WARN: {vacuous.reason}")
         except Exception as e:
             results.append(WatchdogResult(False, 0, 0.0,
                                           f"[dead-man] 对账检查异常: {type(e).__name__}: {e}"))
