@@ -144,18 +144,43 @@ def _print_session_tail(n: int = 8) -> None:
         print(f"  {_fmt_event(e)}")
 
 
+def _resolve_live_config() -> Path | None:
+    """按优先序找真实配置源，避免静默读仓库根过期 DEV 副本（recheck §5.4）。
+
+    顺序：HERMES_LIVE_CONFIG_PATH 显式指定 → 容器 /data → 宿主机部署目录
+    /home/ldy/hermes-deploy → 仓库根副本。最后一项是过期 DEV 副本，仅作最后
+    兜底，且调用方需提示其可能已过期（P1-7 收尾）。
+    """
+    explicit = os.environ.get("HERMES_LIVE_CONFIG_PATH")
+    if explicit:
+        p = Path(explicit)
+        if p.is_file():
+            return p
+    for cand in ("/data/.agent-config.json", "/home/ldy/hermes-deploy/.agent-config.json"):
+        p = Path(cand)
+        if p.is_file():
+            return p
+    # 兜底：仓库根 DEV 副本（可能过期，调用方需检测 _WARNING）。
+    p = ROOT / ".agent-config.json"
+    if p.is_file():
+        return p
+    return None
+
+
 def main() -> int:
     print("=== hermes-trader status ===")
     print(f"repo: {ROOT}")
 
-    config = _load_json(Path(os.environ.get(
-        "HERMES_LIVE_CONFIG_PATH",
-        "/data/.agent-config.json" if os.path.isdir("/data") else "")) or ROOT / ".agent-config.json")
+    cfg_path = _resolve_live_config()
+    config = _load_json(cfg_path) if cfg_path else None
     if config is None:
         print("config: .agent-config.json not found (defaults: mode OFF)")
     elif "_error" in config:
         print(f"config: unreadable — {config['_error']}")
     else:
+        if cfg_path == ROOT / ".agent-config.json":
+            warn = config.get("_WARNING") or "（仓库根 DEV 副本，可能已过期）"
+            print(f"config: ⚠ 读仓库根 DEV 副本：{warn}")
         print(f"mode  : {config.get('mode', 'OFF')}")
         caps = {k: config[k] for k in (
             "maxTradeNotionalUsd", "max_trade_notional_usd",

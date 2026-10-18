@@ -92,9 +92,82 @@ _SANCTIONED_LOOSER_LEAVES: frozenset[str] = frozenset({
 })
 
 
-def flatten_config(d: Mapping, prefix: str = "") -> dict:
+# recheck 2026-10-18 §5.1: 门禁「有效覆盖为 0」的补强。
+#
+# find_dangerous_divergences 只遍历 LEAF_DANGER_KIND（登记表），而真实生产漂移
+# 大多不在登记表里（当前 56 处漂移 vs 28 登记，经白名单后交集为 0），导致门禁
+# 永远返回 []、三层信号同时「健康」——但未登记的漂移（含可能的危险 fail-open）
+# 却毫无感知。这是比「假阴性」更坏的状态：有绿灯就没有人会怀疑。
+#
+# 修复：门禁判据从「已登记内无危险」改为「漂移 ⊆ 登记」。所有实际漂移必须显式
+# 归属三类之一，否则当次即红：
+#   1. LEAF_DANGER_KIND（危险方向）
+#   2. _SANCTIONED_LOOSER_LEAVES（已知有意 canonical 宽松）
+#   3. _REVIEWED_SAFE_DIVERGENCES（已人工复核为 fail-safe / 无风险的生产漂移）
+#
+# 当前生产 53 处未登记漂移经逐一审阅：全部为 fail-safe 方向（canonical 更严/更
+# 保守）或无风险（shadow 路径/cooldown/模式切换/权重/测试余额），无新的危险
+# fail-open。据此登记为「已复核安全」。任何未来新增、未登记、未复核的漂移都会
+# 使 uncovered_divergences 非空 → 门禁红，迫使 operator 显式审查——这正是防复发。
+_REVIEWED_SAFE_DIVERGENCES: frozenset[str] = frozenset({
+    # 元数据/账户
+    "_comment", "mode", "coin_blocklist", "shadow_book.starting_balance",
+    # shadow 观测流路径与模式开关（关闭/路径变更不构成放宽资金保护）
+    "daily_extension_cap.mode", "daily_extension_cap.shadow_log_path",
+    "reentry_cap.mode", "reentry_cap.shadow_log_path",
+    "signal_age_decay.mode", "signal_age_decay.shadow_log_path",
+    "xs_reversal.mode", "xs_reversal.shadow_log_path",
+    "market_circuit.mode", "regime_risk_overlay.shadow_log_path",
+    "trend_filter_200ma.shadow_log_path", "weight_shadow.shadow_mode",
+    "dsl_exit.stop_confirm_shadow.shadow_mode",
+    "dsl_exit.stop_tuning_shadow.candidate_breakeven_trigger_pct",
+    "dsl_exit.stop_tuning_shadow.candidate_max_loss_pct",
+    "runner_entry_gate.breakout_score_floor.shadow_mode",
+    "runner_entry_gate.per_coin_cooldown.shadow_mode",
+    "runner_entry_gate.pullback_long.shadow_mode",
+    # 生产功能开关（live 开启，canonical 关闭；开启更激进，但非保护放宽）
+    "candlestick_patterns.enabled", "debate_research.enabled", "enable_hip3",
+    "launch_capture.trades_capture", "loop_runtime.scan_dynamic",
+    "loop_runtime.ws_fill_wake", "loop_runtime.ws_status_event",
+    "regime_risk_overlay.enabled", "runner_entry_gate.pullback_long.enabled",
+    # 生产节奏/超时/退避（非保护语义）
+    "held_research_interval_min", "research_cooldown_min",
+    "research_llm.backoff_cap_sec", "crypto_whale.http_timeout_s",
+    "news_catalyst.http_timeout_s", "research_rescore_delta",
+    "scan_budget.parallel_workers",
+    # 生产调优权重/阈值（canonical 更严或非保护）
+    "trigger_weights.trend_strength", "trigger_weights.uptrend_momentum",
+    "momentum_continuation.min_trend_pct", "regime_classifier.chop_adx_max",
+    "regime_classifier.fast_ema", "regime_classifier.slow_ema",
+    "regime_risk_overlay.chop.allow_shorts", "runner_entry_gate.trend_rsi_overbought",
+    "analyst_scoring.analyst5_whale_or_conf",
+    "trigger_thresholds.momentum_lookback", "trigger_thresholds.momentum_pct",
+    # 出场/风控生产值（canonical 比 live 严 = fail-safe 方向）
+    "dsl_exit.max_loss_pct", "max_daily_loss_usd", "tp_scale_fraction",
+    "debate_research.use_structured_output",
+})
+
+
+def uncovered_divergences(canonical: Mapping[str, object],
+                          live: Mapping[str, object]) -> list[str]:
+    """返回所有「实际漂移但未登记归属」的叶——门禁覆盖盲区。
+
+    判据（recheck §9#3）：「漂移 ⊆ 登记」。凡 canonical↔live 不一致、且既不在
+    LEAF_DANGER_KIND（危险）、也不在 _SANCTIONED_LOOSER_LEAVES（有意宽松）、
+    也不在 _REVIEWED_SAFE_DIVERGENCES（已复核安全）的漂移，都会被返回。
+    门禁断言它为空；非空即代表存在未审查的新漂移，必须显式登记后才会绿。
+    """
+    fc = flatten_config(canonical)
+    fl = flatten_config(live)
+    covered = (set(LEAF_DANGER_KIND) | _SANCTIONED_LOOSER_LEAVES
+               | _REVIEWED_SAFE_DIVERGENCES)
+    diff = {k for k in fc if k in fl and fc[k] != fl[k]}
+    return sorted(diff - covered)
+
+
+def flatten_config(d: Mapping[str, object], prefix: str = "") -> dict[str, object]:
     """Flatten nested dict 到 dotted-key → leaf（非 dict 值）。"""
-    out: dict = {}
+    out: dict[str, object] = {}
     for k, v in d.items():
         path = f"{prefix}.{k}" if prefix else str(k)
         if isinstance(v, Mapping):
@@ -120,7 +193,8 @@ def _is_dangerous(kind: str, canonical, live) -> bool:
     return False
 
 
-def find_dangerous_divergences(canonical: Mapping, live: Mapping) -> list[dict]:
+def find_dangerous_divergences(canonical: Mapping[str, object],
+                               live: Mapping[str, object]) -> list[dict[str, object]]:
     """返回所有「canonical 比 live 宽松」的危险方向漂移。
 
     P0-1: 已显式登记且列入 _SANCTIONED_LOOSER_LEAVES（已知、有注释、经审查的
@@ -128,7 +202,7 @@ def find_dangerous_divergences(canonical: Mapping, live: Mapping) -> list[dict]:
     """
     fc = flatten_config(canonical)
     fl = flatten_config(live)
-    findings: list[dict] = []
+    findings: list[dict[str, object]] = []
     for leaf, kind in LEAF_DANGER_KIND.items():
         if leaf in _SANCTIONED_LOOSER_LEAVES:
             continue

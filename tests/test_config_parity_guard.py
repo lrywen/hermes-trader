@@ -102,6 +102,44 @@ def test_unregistered_leaf_ignored():
     assert g.find_dangerous_divergences({"random_leaf": 9}, {"random_leaf": 1}) == []
 
 
+# ── recheck 2026-10-18 §5.1: 门禁判据改为「漂移 ⊆ 登记」 ────────────────────
+def test_uncovered_divergences_empty_against_live():
+    """当前生产 53 处漂移必须全部显式登记归属（危险/白名单/已复核安全）。
+
+    修复前门禁对未登记漂移零感知（有效覆盖 0）；修复后断言「漂移 ⊆ 登记」，
+    任何未登记的新漂移都使 uncovered 非空 → 门禁红。
+    """
+    path = _live_config_path()
+    if path is None:
+        pytest.skip("live 配置不在本环境")
+    with open(path, encoding="utf-8") as f:
+        live = json.load(f)
+    uncovered = g.uncovered_divergences(CANONICAL_DEFAULTS, live)
+    assert uncovered == [], (
+        "以下生产漂移既未登记为危险(LEAF_DANGER_KIND)、也未列入白名单/已复核"
+        "安全(_REVIEWED_SAFE_DIVERGENCES)，门禁对其零感知："
+        + ", ".join(uncovered)
+        + "。请显式审查后登记归属，否则无法保证未来 fail-open 漂移被捕获。")
+
+
+def test_uncovered_divergences_flags_new_unregistered_leaf():
+    """防复发: 新增一个既不在危险表、也不在白名单/安全表的漂移 → uncovered 非空。"""
+    # 用一个真实 canonical 有、但未登记的叶作为探针。
+    c = {"_comment": "", "mode": "OFF"}
+    l = {"_comment": "测试", "mode": "SHADOW"}
+    # 这些叶都在 _REVIEWED_SAFE_DIVERGENCES（已登记），故 uncovered 应空。
+    assert g.uncovered_divergences(c, l) == []
+    # 新增一个未登记的漂移叶 → 必须被报告。
+    c2 = {"_comment": "", "mode": "OFF", "brand_new_leaf": 1}
+    l2 = {"_comment": "测试", "mode": "SHADOW", "brand_new_leaf": 2}
+    assert "brand_new_leaf" in g.uncovered_divergences(c2, l2)
+
+
+def test_uncovered_divergences_empty_on_equal_configs():
+    c = {"max_total_notional_pct": 2.0, "mode": "SHADOW"}
+    assert g.uncovered_divergences(c, c) == []
+
+
 # ── 真实生产配置守卫 ────────────────────────────────────────────────────────
 def _live_config_path() -> str | None:
     candidates = [

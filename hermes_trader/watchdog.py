@@ -167,6 +167,51 @@ def check_reconcile_vacuous(status_path: str) -> WatchdogResult | None:
 
 
 
+def check_scheduler_freshness(state_path: str, max_age_s: int, *,
+                              now_ms: int | None = None) -> WatchdogResult:
+    """判 scheduler 活性：读 scheduler_state.json 的 mtime + last_ok。
+
+    scheduler 主循环每 60s 无条件原子重写状态文件（P0-3），因此文件 mtime
+    是可靠的活性信号——杀掉 scheduler 进程后 mtime 停更，max_age_s 后报
+    STALE（默认 300s，与主循环心跳一致）。
+
+    ``last_ok:*`` 记录每个 job 最后一次 rc==0 的窗口，用于在 reason 里展示
+    "最后成功过的 job"，区分「活着但一切正常」与「活着但 job 全部失败」。
+    判据只取活性（mtime）；job 级成败由 panel 消费 last_ok，避免把
+    「尚未有 job 成功」误报为故障。
+    """
+    p = Path(state_path)
+    now = now_ms if now_ms is not None else int(time.time() * 1000)
+    if not p.exists():
+        return WatchdogResult(False, 0, 0.0,
+                              f"调度器停摆: scheduler_state.json 缺失: {state_path}")
+
+    try:
+        data = json.loads(p.read_text(errors="ignore"))
+    except (json.JSONDecodeError, TypeError):
+        data = None
+    last_ok = []
+    if isinstance(data, dict):
+        last_ok = sorted(k[len("last_ok:"):] for k in data
+                         if k.startswith("last_ok:"))
+
+    mtime_ms = int(p.stat().st_mtime * 1000)
+    age = (now - mtime_ms) / 1000
+    if age < 0:
+        return WatchdogResult(False, mtime_ms, age,
+                              "调度器状态在未来（时钟漂移?）")
+    if age > max_age_s:
+        return WatchdogResult(
+            False, mtime_ms, age,
+            f"调度器停摆: scheduler_state.json 心跳过期 {age:.0f}s > "
+            f"{max_age_s}s（进程被 kill?）; 最后成功 job: "
+            f"{', '.join(last_ok) if last_ok else '无'}")
+    return WatchdogResult(
+        True, mtime_ms, age,
+        f"调度器活性正常 age={age:.0f}s; 最后成功 job: "
+        f"{', '.join(last_ok) if last_ok else '（尚未有 job 成功）'}")
+
+
 def _send_alert(text: str) -> bool:
     try:
         from hermes_trader.notify import send_text
@@ -193,6 +238,12 @@ def main(argv: list[str] | None = None) -> int:
                     help="对账最大允许年龄（秒），默认 129600=36h")
     ap.add_argument("--no-reconcile", action="store_true",
                     help="跳过对账新鲜度/空绿检查（仅检查主循环心跳）")
+    ap.add_argument("--scheduler-state", default="/data/scheduler_state.json",
+                    help="scheduler 状态文件路径（默认 /data/scheduler_state.json）")
+    ap.add_argument("--scheduler-max-age", type=int, default=DEFAULT_MAX_AGE_S,
+                    help="scheduler 状态最大允许年龄（秒），默认 300")
+    ap.add_argument("--no-scheduler", action="store_true",
+                    help="跳过 scheduler 活性检查")
     ap.add_argument("--emergency-close-cmd", default=None,
                     help="STALE 时执行的外部平仓命令（默认不执行任何平仓）")
     args = ap.parse_args()
@@ -202,6 +253,10 @@ def main(argv: list[str] | None = None) -> int:
         results.append(check(args.heartbeat, args.max_age))
     except FileNotFoundError as e:
         results.append(WatchdogResult(False, 0, 0.0, f"[dead-man] {e}"))
+
+    if not args.no_scheduler:
+        results.append(check_scheduler_freshness(
+            args.scheduler_state, args.scheduler_max_age))
 
     vacuous: WatchdogResult | None = None
     if not args.no_reconcile:

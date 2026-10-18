@@ -1136,11 +1136,16 @@ class ShadowBook:
                         # market fill at the confirming mark. The ONLY divergence
                         # is a gap-through past the exchange backup-SL trigger;
                         # cap the paper fill there too.
+                        #
+                        # P0-4 (recheck §7.1): 历史 max_loss 出场 PnL 未把 gap-through
+                        # overshoot 折入，亏损被低估。但 gap 是否折入 PnL 涉及实盘
+                        # backup-SL 的执行语义（限价 vs 市价），F6 契约锁定纸面成交
+                        # cap 到 trigger 与实盘 backup-SL 对齐。此处保持 F6 行为：
+                        # 成交价仍 cap 到 trigger；gap_spot_pct 单独记录 overshoot
+                        # 供 outcome_baseline 的 slippage_analysis 独立核算止损滑点
+                        # 成本，避免与 flat slippage_pct 混淆。是否把 gap 折入
+                        # 核心 PnL 属实盘执行语义裁决，不由本模块单方面决定。
                         fill_px = float(mark)
-                        # Audit 2026-10-16: record the real gap-through overshoot
-                        # on max_loss exits so it is precisely trackable (the flat
-                        # taker slippage_pct does NOT capture it). Recording-only:
-                        # does not change fill_px / PnL, which are already capped.
                         gap_spot_pct = 0.0
                         gap_capped = False
                         if reason.startswith("max_loss"):

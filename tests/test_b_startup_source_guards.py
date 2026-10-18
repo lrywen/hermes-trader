@@ -21,8 +21,12 @@ def _full_prod_raw():
         "runner_entry_gate": {},
         "dsl_exit": {"noise_band": {"enabled": True, "atr_mult": 0.8}},
         # 灰度 enforce 臂：生产基线已 enforce，守卫要求保持。
+        # P0-2 (2026-10-16)：_GRAY_ENFORCE_ARMS 现含 5 个 enforce 块，夹具须覆盖全部。
         "market_circuit": {"mode": "enforce"},
         "daily_extension_cap": {"mode": "enforce"},
+        "trend_filter_200ma": {"mode": "enforce"},
+        "ta_late_entry": {"mode": "enforce"},
+        "reasoning_effort_rollout": {"mode": "enforce"},
     }
 
 

@@ -56,7 +56,7 @@ Per-trade hard cap regardless of formula above. Keep well above intended deploym
 Max simultaneous open positions. Trades over this cap are deferred. Production pins `2`.
 
 ### `max_total_notional_pct` (float, default `2.0`)
-Combined open notional cap, expressed as a **multiple of aggregate equity** (NOT a percentage — the `_pct` suffix is historical and misleading; the runtime and schema both treat it as an equity multiple). `4.0` = max **400%** of equity in total open notional, `2.0` = 200%. A value like `10.0` means **1000%** of equity, which (stacked on 10x leverage) can reach ~100× nominal exposure — do not set it from the old "10%" reading. `0` disables the cap; `0 < x < 0.5` is rejected by the safety floor (one trade would fill the cap and freeze the rest of the day). Production pins `4.0`.
+Combined open notional cap, expressed as a **multiple of aggregate equity** (NOT a percentage — the `_pct` suffix is historical and misleading; the runtime and schema both treat it as an equity multiple). `4.0` = max **400%** of equity in total open notional, `2.0` = 200%. A value like `10.0` means **1000%** of equity, which (stacked on 10x leverage) can reach ~100× nominal exposure — do not set it from the old "10%" reading. `0` disables the cap; `0 < x < 0.5` is rejected by the safety floor (one trade would fill the cap and freeze the rest of the day). Production pins `2.0`.
 
 ### `min_available_margin_pct` (float, default `0.2`)
 Refuse new trade if `available / equity < this`. Default 20% leaves headroom for maintenance margin + slippage. Lower = more aggressive deployment, higher risk of HL "insufficient margin" rejections.

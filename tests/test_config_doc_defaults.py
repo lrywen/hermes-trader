@@ -68,6 +68,76 @@ def test_sensitive_equity_multiple_doc_not_legacy_percentage():
 
 
 # ---------------------------------------------------------------------------
+# recheck 2026-10-18 §5.2: 正文 "Production pins `X`" 必须等于 live 配置
+# ---------------------------------------------------------------------------
+import json as _json
+import os as _os
+
+# `Production pins `X`.` — 在正文句子末尾声明的生产部署值。
+_PIN_PAT = re.compile(r"Production pins\s+`([^`]+)`")
+
+_LIVE_CANDIDATES = (
+    _os.environ.get("HERMES_LIVE_CONFIG_PATH"),
+    "/home/ldy/hermes-deploy/.agent-config.json",
+    "/data/.agent-config.json",
+)
+
+
+def _live_config() -> dict | None:
+    for p in _LIVE_CANDIDATES:
+        if p and Path(p).is_file():
+            try:
+                return _json.loads(Path(p).read_text(encoding="utf-8"))
+            except (OSError, _json.JSONDecodeError):
+                return None
+    return None
+
+
+def test_production_pins_match_live_config():
+    """§5.2: 文档正文的 "Production pins `X`" 是生产部署值的声明，必须与真实
+    live 配置一致。此前 max_total_notional_pct 正文写 "pins 4.0" 而 live=2.0，
+    默认值测试抓不到（它只查 `default X`）。本测试把正文 pin 声明也纳入硬断言，
+    任何文档 pin 与 live 漂移当次即红。
+
+    解析策略：pin 声明紧跟对应 `### key` 标题，取该标题的键与声明值比对。
+    """
+    live = _live_config()
+    if live is None:
+        return  # 无 live 配置时跳过（非本机/容器）
+    text = CONFIG_MD.read_text(encoding="utf-8")
+    mismatches = []
+    checked = 0
+    # 逐段扫描：每个 `### key (...)` 标题到下一个标题之间的正文。
+    for m in _HEADER_PAT.finditer(text):
+        key = m.group(1)
+        seg_end = text.find("### ", m.end())
+        seg = text[m.end(): seg_end if seg_end != -1 else len(text)]
+        pin_m = _PIN_PAT.search(seg)
+        if not pin_m:
+            continue
+        valstr = pin_m.group(1).strip()
+        if key not in live:
+            continue
+        live_val = live[key]
+        if isinstance(live_val, bool):
+            continue
+        try:
+            parsed = int(valstr.replace("_", "")) if isinstance(live_val, int) \
+                else float(valstr.replace("_", ""))
+        except ValueError:
+            continue
+        checked += 1
+        if parsed != live_val:
+            mismatches.append(f"{key}: doc pins {valstr!r} vs live {live_val!r}")
+    assert checked > 0, "CONFIG.md 未解析到任何 'Production pins' 声明，测试可能失效"
+    assert not mismatches, (
+        "CONFIG.md 的 'Production pins' 与 live 配置漂移：\n"
+        + "\n".join(f"  {x}" for x in mismatches)
+        + "\n文档 'Production pins' 必须等于生产部署值；若生产值变更，须同步文档。"
+    )
+
+
+# ---------------------------------------------------------------------------
 # P1-14: README 顶层扁平键的 "Fallback/default" 列必须等于 CANONICAL_DEFAULTS
 # ---------------------------------------------------------------------------
 
