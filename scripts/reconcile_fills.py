@@ -386,16 +386,21 @@ def build_status(r: Dict[str, Any], backfilled: int = 0) -> Dict[str, Any]:
 
 
 def write_status(r: Dict[str, Any], backfilled: int = 0) -> bool:
-    """Atomically persist the reconcile status for the dashboard card.
+    """Persist the reconcile status for the dashboard card.
 
     Best-effort: any failure is logged and swallowed — the cron exit code and
-    the discrepancy alert must never be affected by an unwritable status."""
+    the discrepancy alert must never be affected by an unwritable status.
+    Write in place (not tmp+os.replace): reconcile_status.json is a single-file
+    bind mount (/data -> host runtime/), so an atomic rename of a .tmp file
+    landing in the named volume onto the live bind-mount point raises EBUSY
+    (Errno 16) every run — the status stayed at its last real write (Sep 25) for
+    23 days while the daily cron "succeeded". The cron is the single writer, so
+    in-place truncate+write is safe; a torn write just yields an unreadable card
+    until the next daily run."""
     try:
         payload = build_status(r, backfilled=backfilled)
-        tmp = f"{STATUS_FILE}.tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
+        with open(STATUS_FILE, "w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, STATUS_FILE)
         logger.info(f"[reconcile] status written to {STATUS_FILE}")
         return True
     except Exception as e:
