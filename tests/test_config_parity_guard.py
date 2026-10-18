@@ -200,3 +200,33 @@ def test_risk_per_trade_live_delta_is_safe_direction():
         live = json.load(f)
     canon = CANONICAL_DEFAULTS["atr_risk_sizing"]["risk_per_trade_pct"]
     assert canon <= live["atr_risk_sizing"]["risk_per_trade_pct"]
+
+
+def test_uncovered_divergences_flags_live_looser_on_danger_leaf():
+    """recheck-4 P0-B 防复发：危险叶「live 比 canonical 宽松」（保护被当场放宽）
+    必须被 uncovered 报出。修复前危险叶在 uncovered 里整叶 continue 跳过，而
+    find_dangerous_divergences 只查「canonical 宽松」，数值限制被 live 放宽
+    （如 max_total_notional_pct 2→100）在两侧都不可见。
+    """
+    # hi_danger：live 值更高 = 单笔名义仓位更大 = 更宽松 → 必须报
+    c = {"max_total_notional_pct": 2.0}
+    l = {"max_total_notional_pct": 100.0}
+    assert "max_total_notional_pct" in g.uncovered_divergences(c, l)
+    # 反向（canonical 宽松）仍由 find_dangerous_divergences 管，uncovered 不重复
+    assert g.uncovered_divergences({"max_total_notional_pct": 2.0},
+                                   {"max_total_notional_pct": 1.0}) == []
+
+
+def test_uncovered_divergences_flags_live_only_new_leaf():
+    """recheck-4 P0-C 防复发：只存在于 live 的新叶（canonical 无此键）必须被报出。
+    修复前 diff 只遍历 canonical 的键，live-only 新叶永远进不了判据。
+    """
+    c = {"max_total_notional_pct": 2.0}
+    l = {"max_total_notional_pct": 2.0,
+         "totally_new_risk_key": {"max_loss_pct": 99}}
+    u = g.uncovered_divergences(c, l)
+    assert "totally_new_risk_key.max_loss_pct" in u, u
+    # canonical-only 叶（live 未覆盖，沿用 canonical 默认）不构成「live 新增」不报。
+    # hard_stop 只在 canonical，live 未设置 → 沿用 canonical 默认 → 不算 live 新增。
+    assert g.uncovered_divergences({"max_total_notional_pct": 2.0, "hard_stop": 1.0},
+                                   {"max_total_notional_pct": 2.0}) == []

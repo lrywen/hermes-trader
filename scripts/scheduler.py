@@ -61,6 +61,7 @@ def _daily(
     argv: tuple[str, ...],
     log_name: str,
     extra_env: tuple[tuple[str, str], ...] = (),
+    timeout_s: Optional[int] = None,
 ) -> ScheduledJob:
     return ScheduledJob(
         name=name,
@@ -68,6 +69,7 @@ def _daily(
         log_name=log_name,
         minute_of_day=hour * 60 + minute,
         extra_env=extra_env,
+        timeout_s=timeout_s if timeout_s is not None else 900,
     )
 
 
@@ -91,6 +93,10 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "reconcile_selection_attribution", 0, 15,
         ("scripts/reconcile_selection_attribution.py", "--write"),
         "selection-attribution-verdict.log",
+        # P0-E (recheck-4)：默认 900s 超时 > 每日任务 5min 间隔，reconcile 的
+        # 大积压一跑就吞掉 00:20/00:25 的相邻 job。降到 240s（< 间隔），让本 job
+        # 即使跑不完也不会卡住整批；配合脚本内 max_per_sweep 在窗口内诚实完成。
+        timeout_s=240,
     ),
     _daily(
         "pullback_shadow_daily", 0, 20,

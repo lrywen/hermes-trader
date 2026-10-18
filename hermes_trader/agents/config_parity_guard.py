@@ -175,6 +175,11 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "max_daily_loss_usd": (-2.0, -3),
     "tp_scale_fraction": (0.5, 0.4),
     "debate_research.use_structured_output": (True, False),
+    # recheck-4 P0-C：live-only 叶（canonical 无此键，canonical 侧为 None）。
+    # HYPE 币级 ATR 止损 override，为生产新增的 per-coin 收紧，无风险内容。值绑定
+    # (None, live) 使「新增未被登记的 live-only 叶」或「这些叶值被改」都会变红。
+    "coin_overrides.HYPE.dsl_exit.atr_stop.ceiling_pct": (None, 3),
+    "coin_overrides.HYPE.dsl_exit.atr_stop.floor_pct": (None, 1.5),
 }
 
 
@@ -202,12 +207,35 @@ def uncovered_divergences(canonical: Mapping[str, object],
     """
     fc = flatten_config(canonical)
     fl = flatten_config(live)
-    diff = {k for k in fc if k in fl and fc[k] != fl[k]}
+    # recheck-4 P0-C：原 `diff = {k for k in fc if k in fl and fc[k] != fl[k]}`
+    # 只遍历 canonical 的键且要求键在 live 里存在——只存在于 live 的新叶（如新增的
+    # 风险块）永远不会进入判据，是永久盲区。现改为 set(fc) | set(fl) 同时看两边，
+    # 并区分：
+    #   - canonical-only（live 未覆盖，沿用 canonical 默认）→ 非「live 新增」，不报；
+    #   - live-only / 值漂移 → 纳入检查。
+    all_keys = set(fc) | set(fl)
     uncovered: list[str] = []
-    for leaf in diff:
-        if leaf in LEAF_DANGER_KIND or leaf in _SANCTIONED_LOOSER_LEAVES:
+    for leaf in sorted(all_keys):
+        if leaf in _SANCTIONED_LOOSER_LEAVES:
+            continue  # 已知有意 canonical 宽松，豁免
+        in_c = leaf in fc
+        in_l = leaf in fl
+        if in_c and not in_l:
+            continue  # canonical-only：live 沿用 canonical 默认，不构成 live 新增
+        if in_c and in_l and fc[leaf] == fl[leaf]:
+            continue  # 无漂移
+        if leaf in LEAF_DANGER_KIND:
+            kind = LEAF_DANGER_KIND[leaf]
+            # recheck-4 P0-B：危险叶在此只补「live 比 canonical 宽松」方向。
+            # find_dangerous_divergences 只查 canonical 宽松（丢键回退）方向；数值
+            # 保护限制被 live 放宽（如 max_total_notional_pct 2→100）此前完全不可见。
+            # 仅对 hi/lo_danger 数值限制生效；armed_bool/mode 无「live 放宽」语义，
+            # 由 find_dangerous_divergences 全权覆盖其唯一方向。
+            if kind in ("hi_danger", "lo_danger"):
+                if _is_dangerous(kind, fl.get(leaf), fc.get(leaf)):
+                    uncovered.append(leaf)
             continue
-        if not _covered_by_review(leaf, fc[leaf], fl[leaf]):
+        if not _covered_by_review(leaf, fc.get(leaf), fl.get(leaf)):
             uncovered.append(leaf)
     return sorted(uncovered)
 

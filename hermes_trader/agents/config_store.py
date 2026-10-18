@@ -583,7 +583,11 @@ def _production_parity_uncovered_errors() -> list[str]:
     try:
         raw = _read_raw_config() or {}
         from hermes_trader.agents import config_parity_guard as _g
-        uncovered = _g.uncovered_divergences(_g.CANONICAL_DEFAULTS, raw)
+        # 注意：CANONICAL_DEFAULTS 来自 config_defaults（本文件顶部已 import），
+        # 不能用 _g.CANONICAL_DEFAULTS —— config_parity_guard 没有该属性，会抛
+        # AttributeError 被 except 吞成「non-fatal」，导致启动门禁 100% 不触发
+        #（recheck-4 P0-A，2026-10-18）。门禁必须拿到真实结果；异常不得被吞。
+        uncovered = _g.uncovered_divergences(CANONICAL_DEFAULTS, raw)
         for leaf in uncovered:
             errors.append(
                 f"startup safety: config parity drift '{leaf}' on the production "

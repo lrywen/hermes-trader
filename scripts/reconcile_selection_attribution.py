@@ -107,7 +107,12 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     # Settle mature items first (best-effort).
-    settled = sa.settle_due()
+    # P0-D (recheck-4)：settle_due 默认 max_per_sweep=None（无上限），在 43k 积压 +
+    # 每天 +8~12k 的规模下一次能跑 75+ 分钟，远超调度器给本任务的 240s 超时，
+    # 单次跑不完且积压净增。加 max_per_sweep 上限（~400 条，均值 0.53s/条 ≈ 212s，
+    # 落在 240s 窗口内），让每次运行在窗口内诚实完成（rc=0、写 last_ok）而不是被
+    # 超时砍掉。积压净增问题仍存在，但不再是一个单次 run 就卡死整批。
+    settled = sa.settle_due(max_per_sweep=400)
 
     verdicts = [_verdict_for(src) for src in GATES]
     verdicts.append(_unstucking_verdict())

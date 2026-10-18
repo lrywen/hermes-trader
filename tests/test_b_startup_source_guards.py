@@ -17,7 +17,11 @@ def _full_prod_raw():
     """一份关键键齐全、noise_band 开启的生产原始配置（最小但满足守卫）。"""
     return {
         "mode": "SHADOW", "leverage": 10, "max_concurrent": 2,
-        "max_trade_notional_usd": 30.0, "max_daily_loss_usd": -50.0,
+        "max_trade_notional_usd": 30.0,
+        # max_daily_loss_usd 须等于 config_parity_guard._REVIEWED_SAFE_DIVERGENCES
+        # 登记的复核值 (-3)，否则 P0-A 修复后的启动 parity 门禁会把它当作值漂移
+        # 报红（recheck-4 P0-A，2026-10-18）。
+        "max_daily_loss_usd": -3,
         "runner_entry_gate": {},
         "dsl_exit": {"noise_band": {"enabled": True, "atr_mult": 0.8}},
         # 灰度 enforce 臂：生产基线已 enforce，守卫要求保持。
@@ -40,6 +44,34 @@ def test_b7_full_production_config_passes(monkeypatch):
     monkeypatch.setattr(cs, "_read_raw_config", lambda: _full_prod_raw())
     monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
     assert cs.startup_config_integrity_errors({}) == []
+
+
+def test_parity_gate_reports_value_drift_on_production(monkeypatch):
+    """recheck-4 P0-A 防复发：启动 parity 门禁必须拿到真实结果，异常不得被吞。
+
+    此前 `_production_parity_uncovered_errors` 误用 `_g.CANONICAL_DEFAULTS`
+    （config_parity_guard 无此属性）抛 AttributeError 被 except 记 non-fatal 吞掉，
+    返回 []，启动拦截 100% 失效。本测试强制生产分支，喂一个值漂移的 live 配置
+    （max_daily_loss_usd = -500，登记复核值 -3），必须返回非空且含该叶；喂已复核
+    覆盖的配置必须返回空（无假阳性）。
+    """
+    # 值漂移 → 门禁红
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/data/.agent-config.json")
+    raw_drift = _full_prod_raw()
+    raw_drift["max_daily_loss_usd"] = -500
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: raw_drift)
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
+    errors = cs._production_parity_uncovered_errors()
+    assert errors, "P0-A 门禁应报告值漂移，却返回空（异常被吞？）"
+    assert any("max_daily_loss_usd" in e for e in errors), errors
+
+    # 已复核覆盖 → 门禁绿（无假阳性）
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: _full_prod_raw())
+    assert cs._production_parity_uncovered_errors() == []
+
+    # 非 /data 源 → 不检查
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/home/dev/.agent-config.json")
+    assert cs._production_parity_uncovered_errors() == []
 
 
 def test_b7_missing_required_key_is_startup_error(monkeypatch):
