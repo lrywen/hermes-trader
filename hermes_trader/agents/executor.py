@@ -3128,7 +3128,8 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
                         trade_side: str, mid_price: float, atr: float,
                         trade_notional: float, leverage: float,
                         gate_results: dict[str, Any],
-                        entry_regime: str = "") -> dict[str, Any]:
+                        entry_regime: str = "",
+                        analysis: Optional[dict[str, Any]] = None) -> dict[str, Any]:
     """S11 stage of maybe_execute: the SHADOW-mode terminal branch.
 
     Records the "shadow" decision and paper-books the would-be fill into the
@@ -3154,11 +3155,26 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
             except Exception:
                 _sh_regime = ""
         if _sh_entry > 0:
+            # P0-A instrumentation: pin point-in-time trigger labels onto the
+            # open fill so real shadow fills can later be sliced by fired
+            # trigger -> realized ROE (fired names are NOT on older fills).
+            _sig_meta: dict[str, Any] = {}
+            try:
+                from hermes_trader.agents.perception import extract_fired_triggers
+                a = analysis or {}
+                _sig_meta = {
+                    "fired_names": extract_fired_triggers(a),
+                    "composite_score": a.get("composite_score"),
+                    "ai_confidence": a.get("confidence"),
+                    "trigger_score": a.get("trigger_score"),
+                }
+            except Exception as _sig_e:
+                logger.warning(f"[shadow_book] signal_meta build failed (non-fatal): {_sig_e}")
             shadow_book.shadow_open(
                 coin=coin, side=trade_side, entry_px=_sh_entry,
                 size_usd=trade_notional, leverage=leverage,
                 entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
-                analysis_id=analysis_id,
+                analysis_id=analysis_id, signal_meta=_sig_meta,
             )
     except Exception as _shadow_e:
         logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
@@ -4583,6 +4599,7 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             trade_notional=trade_notional, leverage=leverage,
             gate_results=gate_output["results"],
             entry_regime=str(analysis.get("_decision_regime") or ""),
+            analysis=analysis,
         )
 
     # ── INACTIVE: external HTA (:8766) size-veto channel retired ─────────

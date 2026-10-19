@@ -359,6 +359,40 @@ def _reflection_row(acct: str, fill: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+# P0-A instrumentation (2026-10-19): point-in-time trigger labels pinned on the
+# OPEN fill so future real shadow fills can be sliced by *which perception
+# trigger fired* -> realized ROE. Historical fills predate this and carry none.
+# Kept tiny (a list of names + a few floats); anything malformed is dropped so
+# a bad upstream payload can never break bookkeeping.
+_SIGNAL_META_NUM_KEYS = ("composite_score", "ai_confidence", "trigger_score")
+
+
+def _sanitize_signal_meta(meta: Any) -> dict[str, Any]:
+    """Coerce an untrusted signal-meta payload into a compact persisted dict.
+
+    Returns {} when there is nothing usable. fired_names is a de-duplicated
+    sorted list of non-empty strings; numeric keys are finite floats.
+    """
+    if not isinstance(meta, dict):
+        return {}
+    out: dict[str, Any] = {}
+    raw_names = meta.get("fired_names")
+    if isinstance(raw_names, (list, tuple, set)):
+        names = sorted({str(n) for n in raw_names if n})
+        if names:
+            out["fired_names"] = names
+    for k in _SIGNAL_META_NUM_KEYS:
+        v = meta.get(k)
+        try:
+            fv = float(v) if v is not None else None
+        except (TypeError, ValueError):
+            fv = None
+        if fv is not None and fv == fv and fv not in (float("inf"), float("-inf")):
+            out[k] = fv
+    return out
+
+
+
 def _write_atomic(path: str, data: dict[str, Any]) -> bool:
     # Durability contract (tmp-in-dir + fsync file + replace + fsync dir,
     # serialised by an flock on <path>.lock) lives in agents.atomic_io.
@@ -724,35 +758,41 @@ class ShadowBook:
 
     def shadow_open(self, *, coin: str, side: str, entry_px: float,
                     size_usd: float, leverage: int, entry_atr_pct: float = 0.0,
-                    entry_regime: str = "", analysis_id: str = "") -> Optional[dict[str, Any]]:
+                    entry_regime: str = "", analysis_id: str = "",
+                    signal_meta: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         """Feed one gated decision to BOTH paper accounts.
 
         Returns the taker open fill record (or None if skipped) for backward
         compatibility; the maker_shadow account additionally receives a resting
-        limit order (best-effort)."""
+        limit order (best-effort). ``signal_meta`` (P0-A) is a compact
+        point-in-time trigger snapshot persisted on the open fill."""
         if not _enabled():
             return None
         if not coin or side not in ("long", "short") or entry_px <= 0 or size_usd <= 0:
             return None
+        signal_meta = _sanitize_signal_meta(signal_meta)
         self.reload_if_changed()
         with self._lock:
             taker_fill = self._open_taker(
                 coin=coin, side=side, entry_px=entry_px, size_usd=size_usd,
                 leverage=leverage, entry_atr_pct=entry_atr_pct,
-                entry_regime=entry_regime, analysis_id=analysis_id)
+                entry_regime=entry_regime, analysis_id=analysis_id,
+                signal_meta=signal_meta)
             if _maker_enabled():
                 try:
                     self._post_maker_order(
                         coin=coin, side=side, post_mid=entry_px, size_usd=size_usd,
                         leverage=leverage, entry_atr_pct=entry_atr_pct,
-                        entry_regime=entry_regime, analysis_id=analysis_id)
+                        entry_regime=entry_regime, analysis_id=analysis_id,
+                        signal_meta=signal_meta)
                 except Exception as e:
                     logger.warning(f"[shadow_book] maker post failed {coin}: {e}")
             return taker_fill
 
     def _open_taker(self, *, coin: str, side: str, entry_px: float, size_usd: float,
                     leverage: int, entry_atr_pct: float, entry_regime: str,
-                    analysis_id: str) -> Optional[dict[str, Any]]:
+                    analysis_id: str,
+                    signal_meta: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
         """Immediate mid fill into the taker account."""
         acc = self._account("taker")
         if self._find(acc["positions"], coin, side) is not None:
@@ -787,6 +827,7 @@ class ShadowBook:
             "mark_px": float(fill_px),
             "unrealized_pct": 0.0, "unrealized_roe_pct": 0.0,
             "unrealized_pnl_usd": 0.0,
+            **(signal_meta or {}),
         })
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
@@ -807,6 +848,7 @@ class ShadowBook:
             "notional_usd": float(size_usd),
             "leverage": lev, "fee_usd": 0.0, "fill_model": "taker",
             "analysis_id": analysis_id or "",
+            **(signal_meta or {}),
         }
         acc["fills"].append(fill)
         if len(acc["fills"]) > _MAX_FILLS:
@@ -823,7 +865,8 @@ class ShadowBook:
 
     def _post_maker_order(self, *, coin: str, side: str, post_mid: float,
                           size_usd: float, leverage: int, entry_atr_pct: float,
-                          entry_regime: str, analysis_id: str) -> None:
+                          entry_regime: str, analysis_id: str,
+                          signal_meta: Optional[dict[str, Any]] = None) -> None:
         """Rest a post-only limit (offset inside the spread) in maker_shadow."""
         acc = self._account("maker_shadow")
         # Already filled or already resting for this coin/side → skip.
@@ -845,6 +888,7 @@ class ShadowBook:
             "entry_atr_pct": float(entry_atr_pct or 0.0),
             "entry_regime": entry_regime or "",
             "analysis_id": analysis_id or "",
+            "signal_meta": signal_meta or {},
             "posted_at": _now_ms(),
         })
 
@@ -866,6 +910,7 @@ class ShadowBook:
         lev = max(1, int(order.get("leverage", 1)))
         size_coin = size_usd / fill_px
         pid = uuid.uuid4().hex[:12]
+        sig_meta = _sanitize_signal_meta(order.get("signal_meta"))
         acc["positions"].append({
             "id": pid, "coin": coin, "side": side,
             "entry_px": float(fill_px), "size_usd": float(size_usd),
@@ -877,6 +922,7 @@ class ShadowBook:
             "mark_px": float(fill_px),
             "unrealized_pct": 0.0, "unrealized_roe_pct": 0.0,
             "unrealized_pnl_usd": 0.0,
+            **sig_meta,
         })
         try:
             from hermes_trader.agents.dsl_exit import DSLTracker
@@ -900,6 +946,7 @@ class ShadowBook:
             "resting_bars": selection.get("resting_bars"),
             "maker_edge_bps": selection.get("maker_edge_bps"),
             "post_fill_mid_drift_bps": selection.get("post_fill_mid_drift_bps"),
+            **sig_meta,
         }
         acc["fills"].append(fill)
         logger.info(
