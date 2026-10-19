@@ -36,7 +36,11 @@ _BACKFILL_PATH = os.environ.get("HERMES_USERFILLS_BACKFILL_FILE", "/data/userfil
 
 _OPEN_DIRS = {"Open Long": "long", "Open Short": "short"}
 _CLOSE_DIRS = {"Close Long": "long", "Close Short": "short"}
-_ENTRY_FEE_FRAC = 0.00025  # taker 2.5bps，开仓手续费估算
+# P1-F: estimated OPENING-side taker fee for real fills (HL closedPnl is net of
+# the closing fee only). Measured real-fill rate for the 2026-08 flow = 2.5bps;
+# kept distinct from the shadow-book modeled taker fee (4.5bps) so historical
+# reconciliation is not rewritten. Env-overridable; default preserves old rows.
+_ENTRY_FEE_FRAC = float(os.environ.get("HERMES_EXTERNAL_ENTRY_FEE_FRAC", "0.00025"))
 
 
 def _post(body: dict) -> list[dict]:

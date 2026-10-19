@@ -58,6 +58,17 @@ from hermes_trader.loop_runtime import loop_runtime_params as _loop_runtime_para
 
 _rt = _loop_runtime_params()
 
+# P1-F: opening-fee estimate for externally-triggered real fills (exchange
+# SL/TP/manual/liquidation). HL's closedPnl is net of the CLOSING fee but not
+# the opening fee, so the outcome backfill subtracts an estimated entry fee to
+# match a normal DSL close's realized_pnl_usd. This is the measured real-fill
+# taker rate for the 2026-08 historical flow (2.5 bps) — deliberately NOT wired
+# to the shadow-book modeled taker fee (4.5 bps), which would rewrite historical
+# reconciliation. Overridable via env for rate changes / sensitivity runs; the
+# default keeps historical backfilled rows byte-identical.
+_EXTERNAL_ENTRY_FEE_FRAC = float(
+    os.environ.get("HERMES_EXTERNAL_ENTRY_FEE_FRAC", "0.00025"))
+
 # ── 持久化轮转日志（2026-09-02，替代 compose 的 `tee -a`）────────────────
 # tee 追加的文件无任何轮转机制（14 天涨到 140MB）。这里用
 # RotatingFileHandler 按 50MB × 5 代轮转；stdout/stderr 仍由 basicConfig 的
@@ -1745,7 +1756,7 @@ while True:
                             # fee but NOT the opening fee; subtract the entry
                             # fee estimate so the stored net matches a normal
                             # DSL close's realized_pnl_usd.
-                            _entry_fee = _notional * 0.00025
+                            _entry_fee = _notional * _EXTERNAL_ENTRY_FEE_FRAC
                             _net_usd = round(_closed_pnl - _entry_fee, 4)
                             _hold_min = round((_closed_at / 1000.0
                                                - _tr.entry_time) / 60.0, 1)
@@ -1796,7 +1807,7 @@ while True:
                             # see backfilled external closes. close_source is
                             # preserved on the memory record; this event is the
                             # dashboard-visible mirror.
-                            _fees_pct = (0.00025 * 2 * _lev)
+                            _fees_pct = (_EXTERNAL_ENTRY_FEE_FRAC * 2 * _lev)
                             _gross_pct = _spot_pct * _lev
                             log_event({
                                 "event": "dsl_exit",

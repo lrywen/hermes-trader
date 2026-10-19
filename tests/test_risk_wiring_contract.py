@@ -1345,6 +1345,9 @@ def _run_backfill(*, dropped, fill=None, resolve_raises=None,
             roe_halt or (lambda *a, **k: None),
         "cfg_get": lambda key, config=None: (config or {}).get(key, 0),
         "read_agent_config": lambda: cfg or {},
+        # P1-F: the backfill body reads the module-level opening-fee estimate
+        # constant; bind it in the extracted namespace.
+        "_EXTERNAL_ENTRY_FEE_FRAC": 0.00025,
         "user": "0xUSER",
         "dropped": dropped,
     }
