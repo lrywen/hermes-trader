@@ -3199,10 +3199,27 @@ def _reconstruct_live_positions(state: dict[str, Any],
             szi = float(pos.get("szi") or 0)
             if not _p_coin:
                 continue
+            # P1-B: size positions at CURRENT mark, not at the order coin's
+            # entry price. HL's clearinghouseState position carries
+            # ``positionValue`` = |szi| * markPx (the live notional); use it
+            # whenever it is a usable positive number. Fall back to the legacy
+            # |szi| * entry_px approximation only when the field is absent
+            # (restart snapshots / synthetic test rows don't carry it). The old
+            # code valued EVERY held coin at the single order coin's entryPx,
+            # which distorted the notional/concurrency/correlation gates after
+            # any meaningful price move.
+            mark_notional: Optional[float] = None
+            try:
+                _pv = float(pos.get("positionValue") or 0.0)
+                if _pv > 0:
+                    mark_notional = _pv
+            except (TypeError, ValueError):
+                mark_notional = None
             positions.append({
                 "coin": _p_coin,
                 "side": "long" if szi > 0 else "short",
-                "size_usd": abs(szi) * entry_px,
+                "size_usd": mark_notional if mark_notional is not None
+                            else abs(szi) * entry_px,
             })
         except (AttributeError, TypeError, ValueError):
             logger.warning(f"[executor] skipping malformed asset_position row: {p!r}")

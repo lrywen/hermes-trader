@@ -68,3 +68,40 @@ def test_dsl_tracked_coin_already_live_is_not_duplicated(monkeypatch):
     eth = [p for p in out if p["coin"] == "ETH"]
     assert len(eth) == 1
     assert eth[0]["size_usd"] == 30.0
+
+
+def _row_value(coin, szi, position_value):
+    return {"position": {"coin": coin, "szi": szi,
+                         "positionValue": position_value}}
+
+
+def test_live_position_value_uses_hl_mark_notional(monkeypatch):
+    """P1-B: HL positionValue (= |szi|*markPx) must size each held coin at its
+    own current mark, not at the order coin's entryPx."""
+    monkeypatch.setattr(executor, "active_position_coins", lambda: {})
+    # Order coin entry_px=100 must NOT be applied to BTC; BTC uses its own mark
+    # notional (2000). ETH likewise uses 75 (szi*entry would wrongly give 300).
+    state = {"asset_positions": [
+        _row_value("BTC", "0.02", "2000"),
+        _row_value("ETH", "3", "75"),
+    ]}
+    out = reconstruct(state, entry_px=100.0)
+    by = {p["coin"]: p for p in out}
+    assert by["BTC"]["size_usd"] == 2000.0
+    assert by["ETH"]["size_usd"] == 75.0
+
+
+def test_missing_or_bad_position_value_falls_back_to_entry_approx(monkeypatch):
+    """Rows without a usable positionValue keep the legacy |szi|*entry_px
+    approximation (restart snapshots / synthetic rows)."""
+    monkeypatch.setattr(executor, "active_position_coins", lambda: {})
+    state = {"asset_positions": [
+        {"position": {"coin": "A", "szi": "2", "positionValue": "0"}},
+        {"position": {"coin": "B", "szi": "2", "positionValue": "junk"}},
+        {"position": {"coin": "C", "szi": "2"}},
+    ]}
+    out = reconstruct(state, entry_px=50.0)
+    by = {p["coin"]: p for p in out}
+    assert by["A"]["size_usd"] == 100.0
+    assert by["B"]["size_usd"] == 100.0
+    assert by["C"]["size_usd"] == 100.0
