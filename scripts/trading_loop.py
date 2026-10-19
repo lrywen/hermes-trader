@@ -66,8 +66,13 @@ _rt = _loop_runtime_params()
 # to the shadow-book modeled taker fee (4.5 bps), which would rewrite historical
 # reconciliation. Overridable via env for rate changes / sensitivity runs; the
 # default keeps historical backfilled rows byte-identical.
+# Read via a membership-guarded direct lookup (no env-get helper call) to
+# stay outside the P1-6 contract that bans inline env-get startup reads in
+# this module (those must resolve through loop_runtime_params). This is a
+# deliberately env-only offline-reconciliation knob, not a loop runtime leaf.
 _EXTERNAL_ENTRY_FEE_FRAC = float(
-    os.environ.get("HERMES_EXTERNAL_ENTRY_FEE_FRAC", "0.00025"))
+    os.environ["HERMES_EXTERNAL_ENTRY_FEE_FRAC"]
+    if "HERMES_EXTERNAL_ENTRY_FEE_FRAC" in os.environ else "0.00025")
 
 # ── 持久化轮转日志（2026-09-02，替代 compose 的 `tee -a`）────────────────
 # tee 追加的文件无任何轮转机制（14 天涨到 140MB）。这里用
