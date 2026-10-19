@@ -9,7 +9,7 @@ import logging
 import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Mapping, Optional
+from typing import Any, Collection, Mapping, Optional
 
 from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.client.hl_client import fetch_hl_candles
@@ -822,6 +822,26 @@ def _late_entry_params() -> dict[str, Any]:
     return block if isinstance(block, dict) else {}
 
 
+def long_only_should_skip(
+    coin: str,
+    ta: Mapping[str, Any],
+    held_coins: Collection[str],
+    scan_long_only: bool,
+) -> bool:
+    """Pure predicate for the P0-2 long-only research throttle.
+
+    Returns True only when the candidate is a *pure* short-intent setup, the
+    long-only switch is on, and the coin is not currently held (held coins
+    still need the AI close-check). Any long intent (or ambiguous TA) keeps
+    the candidate, as does a held position or the switch being off.
+    """
+    if not scan_long_only:
+        return False
+    if coin in set(held_coins or ()):
+        return False
+    return bool(ta.get("intend_short")) and not bool(ta.get("intend_long"))
+
+
 def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
     """Run TA validation on a single perception, returning a TA-result dict."""
     coin = perception["coin"]
@@ -847,6 +867,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                 "signal": "REJECTED", "score": 0,
                 "trend1h": "flat", "trend4h": "flat", "trend1d": "flat",
                 "trend_aligned": False,
+                "intend_long": False, "intend_short": False,
                 "rsi4h": None, "atr4pct": None, "adx4h": None,
                 "ema_cross": False, "volume_confirm": False,
                 "extension_atr": None,
@@ -1013,6 +1034,8 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
                     "signal": "REJECTED", "score": 0,
                     "trend1h": t1h, "trend4h": t4h, "trend1d": t1d,
                     "trend_aligned": trend_aligned,
+                    "intend_long": intend_long,
+                    "intend_short": intend_short,
                     "rsi4h": rsi4h, "atr4pct": atr4pct, "adx4h": adx4h,
                     "ema_cross": ema_cross, "volume_confirm": volume_confirm,
                     "extension_atr": extension,
@@ -1068,6 +1091,8 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
             "score": min(100, score),
             "trend1h": t1h, "trend4h": t4h, "trend1d": t1d,
             "trend_aligned": trend_aligned,
+            "intend_long": intend_long,
+            "intend_short": intend_short,
             "rsi4h": rsi4h, "atr4pct": atr4pct, "adx4h": adx4h,
             "ema_cross": ema_cross, "volume_confirm": volume_confirm,
             "extension_atr": extension,
@@ -1080,6 +1105,7 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
             "signal": "REJECTED", "score": 0,
             "trend1h": "flat", "trend4h": "flat", "trend1d": "flat",
             "trend_aligned": False,
+            "intend_long": False, "intend_short": False,
             "rsi4h": None, "atr4pct": None, "adx4h": None,
             "ema_cross": False, "volume_confirm": False,
             "extension_atr": None,

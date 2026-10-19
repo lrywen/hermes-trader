@@ -190,7 +190,7 @@ def _covered_by_review(leaf: str, canon: object, live: object) -> bool:
     reg = _REVIEWED_SAFE_DIVERGENCES.get(leaf)
     if reg is None:
         return False
-    return reg == (canon, live)
+    return _values_equal(reg[0], canon) and _values_equal(reg[1], live)
 
 
 def uncovered_divergences(canonical: Mapping[str, object],
@@ -222,8 +222,8 @@ def uncovered_divergences(canonical: Mapping[str, object],
         in_l = leaf in fl
         if in_c and not in_l:
             continue  # canonical-only：live 沿用 canonical 默认，不构成 live 新增
-        if in_c and in_l and fc[leaf] == fl[leaf]:
-            continue  # 无漂移
+        if in_c and in_l and _values_equal(fc[leaf], fl[leaf]):
+            continue  # 无漂移（元组/列表语义相同不算漂移）
         if leaf in LEAF_DANGER_KIND:
             kind = LEAF_DANGER_KIND[leaf]
             # recheck-4 P0-B：危险叶在此只补「live 比 canonical 宽松」方向。
@@ -238,6 +238,21 @@ def uncovered_divergences(canonical: Mapping[str, object],
         if not _covered_by_review(leaf, fc.get(leaf), fl.get(leaf)):
             uncovered.append(leaf)
     return sorted(uncovered)
+
+
+def _normalize_for_compare(v: object) -> object:
+    """归一化用于值比较：list/tuple 视为等价序列（逐元素归一化），其余原样返回。
+
+    这样「元组 vs 列表」这类仅容器类型不同、语义相同的差异不会被误判为漂移。
+    """
+    if isinstance(v, (list, tuple)):
+        return [_normalize_for_compare(x) for x in v]
+    return v
+
+
+def _values_equal(a: object, b: object) -> bool:
+    """序列归一化后的相等判断（元组列表语义相同视为相等）。"""
+    return _normalize_for_compare(a) == _normalize_for_compare(b)
 
 
 def flatten_config(d: Mapping[str, object], prefix: str = "") -> dict[str, object]:
@@ -281,7 +296,7 @@ def find_dangerous_divergences(canonical: Mapping[str, object],
     for leaf, kind in LEAF_DANGER_KIND.items():
         if leaf in _SANCTIONED_LOOSER_LEAVES:
             continue
-        if leaf in fc and leaf in fl and fc[leaf] != fl[leaf]:
+        if leaf in fc and leaf in fl and not _values_equal(fc[leaf], fl[leaf]):
             if _is_dangerous(kind, fc[leaf], fl[leaf]):
                 findings.append({"leaf": leaf, "canonical": fc[leaf], "live": fl[leaf]})
     return findings

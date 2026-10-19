@@ -60,6 +60,9 @@ class _ConfigPatch(BaseModel):
     ta_sidestep_force_execute: bool = Field(default=CANONICAL_DEFAULTS["ta_sidestep_force_execute"])
     whale_force_execute: bool = Field(default=CANONICAL_DEFAULTS["whale_force_execute"])
     trend_surface_enabled: bool = Field(default=CANONICAL_DEFAULTS["trend_surface_enabled"])
+    # P0-2 (2026-10-19): long-only scan throttle (skip paid research for
+    # short-intent candidates while shorts are disabled).
+    scan_long_only: bool = Field(default=CANONICAL_DEFAULTS["scan_long_only"])
     # Audit 2026-09-06 (D1/D2): daily-candle new-listing floor (int) and the
     # 24h long-extension ceiling (percent float) ported from Pathia.
     min_history_bars: int = Field(default=CANONICAL_DEFAULTS["min_history_bars"], ge=0, le=100_000)

@@ -105,7 +105,7 @@ from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
 from hermes_trader.agents.signal_rank import conjunction_view, rank_jobs, rank_score, select_top_jobs
-from hermes_trader.agents.ta_filter import analyze_perception
+from hermes_trader.agents.ta_filter import analyze_perception, long_only_should_skip
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
     MID_FEED_MAX_STALE_S,
@@ -2575,6 +2575,23 @@ while True:
                 _cycle_outcomes.append((coin, "skip", False, f"TA {ta['signal']}"))
                 continue
             gate = 'CONFIRMED' if ta['signal'] == 'CONFIRMED' else f"{ta['signal']}+burst"
+            # P0-2 (2026-10-19): long-only research throttle. When
+            # scan_long_only is on and the runner gate would reject shorts
+            # anyway (allow_shorts=false), don't pay for the LLM debate on a
+            # short-intent candidate. Held coins are exempt — the AI
+            # close-check for an open position must still run. A candidate
+            # with any long intent is kept (only pure short-intent is cut).
+            if long_only_should_skip(
+                coin, ta, held_coins,
+                bool(cfg_get("scan_long_only", config=_cfg_cd)),
+            ):
+                logger.info(f"{coin}: long-only scan — skip AI research for short-intent setup")
+                log_event({"event": "ta_skip", "coin": coin,
+                           "signal": "LONG_ONLY_SKIP_SHORT",
+                           "score": round(float(score), 1),
+                           "trigger_score": round(float(score), 1)})
+                _cycle_outcomes.append((coin, "skip", False, "long-only skip short"))
+                continue
             # O-2 content-level dedup: TA passed on a setup (coin + closed bar
             # + fired triggers) we already paid AI research for this run →
             # skip the paid LLM re-call. The time throttle re-pays once its

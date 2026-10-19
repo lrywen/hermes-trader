@@ -230,3 +230,19 @@ def test_uncovered_divergences_flags_live_only_new_leaf():
     # hard_stop 只在 canonical，live 未设置 → 沿用 canonical 默认 → 不算 live 新增。
     assert g.uncovered_divergences({"max_total_notional_pct": 2.0, "hard_stop": 1.0},
                                    {"max_total_notional_pct": 2.0}) == []
+
+
+def test_tuple_vs_list_equivalent_is_not_a_divergence():
+    """P0-2 (2026-10-19): canonical 用 tuple、JSON live 用 list 表达同一序列时
+    （如 dsl_exit.ignite_periods），仅是容器类型不同、语义相同，不得误报漂移。"""
+    c = {"dsl_exit": {"ignite_periods": ("5m", "15m", "1h")}}
+    l = {"dsl_exit": {"ignite_periods": ["5m", "15m", "1h"]}}
+    assert g.uncovered_divergences(c, l) == []
+    assert g.find_dangerous_divergences(c, l) == []
+
+
+def test_real_sequence_value_change_is_still_flagged():
+    """序列归一化不得掩盖真实的值漂移：元素不同仍须报出。"""
+    c = {"dsl_exit": {"ignite_periods": ("5m", "15m", "1h")}}
+    l = {"dsl_exit": {"ignite_periods": ["15m", "1h"]}}
+    assert "dsl_exit.ignite_periods" in g.uncovered_divergences(c, l)

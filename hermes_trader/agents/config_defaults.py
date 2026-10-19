@@ -354,6 +354,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "whale_size_multiplier": 1.0,
     "block_counter_trend_bypass": True,
     "trend_surface_enabled": True,
+    # P0-2 (2026-10-19): long-only scan throttle. When true, candidates the TA
+    # layer classifies as short-intent (intend_short and not intend_long) are
+    # skipped in trading_loop BEFORE the paid LLM research call, so no tokens
+    # are spent on setups the runner gate will reject anyway while shorts are
+    # disabled (allow_shorts=false). This is a cost/noise throttle at the
+    # research-admission layer, not an execution gate; the terminal
+    # runner_entry_gate.allow_shorts remains the authoritative short switch.
+    # Held coins are exempt (the AI close-check must still run). Default false
+    # preserves the historical both-directions-researched behaviour.
+    "scan_long_only": False,
     # Audit 2026-09-06 (D1): minimum number of DAILY candles a coin must have
     # for the 200MA trend filter to be considered "established". Production
     # pins min_history_bars=200 so coins without an established daily history
