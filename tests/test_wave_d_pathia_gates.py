@@ -16,9 +16,21 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from hermes_trader.agents import risk_gates as rg
 from hermes_trader.agents.config_schema import validate_config_updates
 from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
+
+
+@pytest.fixture(autouse=True)
+def _isolate_breaker_lkg():
+    """P1-4 parity: the reentry_cap enforce leg now caches an LKG verdict in
+    the module-global breaker cache; clear it around every test so an armed
+    verdict from one case can't leak into another case's blind-read result."""
+    rg.reset_breaker_lkg()
+    yield
+    rg.reset_breaker_lkg()
 
 
 # ── helpers ────────────────────────────────────────────────────────────────

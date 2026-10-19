@@ -55,6 +55,18 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 TRADING_LOOP_SRC = (REPO_ROOT / "scripts" / "trading_loop.py").read_text(encoding="utf-8")
 
 
+@pytest.fixture(autouse=True)
+def _isolate_breaker_lkg():
+    """P1-4 parity: the reentry_cap enforce leg caches an LKG verdict in the
+    module-global breaker cache; clear it around every test so an armed verdict
+    from another case/file can't turn this file's cold-fail-open read into a
+    held block."""
+    from hermes_trader.agents import risk_gates
+    risk_gates.reset_breaker_lkg()
+    yield
+    risk_gates.reset_breaker_lkg()
+
+
 # ── AST harness ────────────────────────────────────────────────────────────
 # importing scripts/trading_loop.py runs the module-level while-True loop, so
 # loop logic is tested by AST-extracting nodes into controlled namespaces

@@ -2331,9 +2331,13 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
 
     Counts openings from the memory trade log (record_trade only records
     entries), via memory.count_openings_since. A memory read failure FAILS
-    OPEN (shared circuit-breaker convention: a transient state-read hiccup
-    must not become a total trading DoS). SHADOW first: mode
-    off/shadow/enforce (env HERMES_REENTRY_CAP_MODE)."""
+    OPEN in SHADOW (probe mode — no protection exists yet). In ENFORCE the
+    gate is protective, so like the five sibling breakers it holds its
+    last-known-good verdict while memory is unreadable (armed BLOCK stays
+    blocking; clear PASS stays passing) and only degrades to the alerted
+    fail-open on a cold/no-LKG read (shared circuit-breaker convention: a
+    transient state-read hiccup must not become a total trading DoS). SHADOW
+    first: mode off/shadow/enforce (env HERMES_REENTRY_CAP_MODE)."""
     blk = config.get("reentry_cap")
     if not isinstance(blk, dict):
         return {"pass": True, "via": "reentry_cap_disabled"}
@@ -2375,12 +2379,21 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
                "state": "data_missing", "openings": None,
                "reentry_would_block": None}
         _record_gate_shadow(rec, path, "reentry_cap")
-        # Q1 batch 4: align with the sibling memory-backed gates
-        # (coin_circuit/global_halt/...): a blind reentry cap used to be a
-        # bare debug log — no metric, no card, no SSE event. Fail-open return
-        # below is unchanged; only the loudness triplet is added.
-        logger.error("[risk][gates] reentry_cap state read failed for %s — "
-                     "cap BLIND, failing open (pass=True): %s", ctx.coin, e)
+        if mode == "enforce":
+            # P1-4 parity (2026-10-19): the gate is protective in enforce.
+            # _breaker_blind_or_lkg emits the loudness triplet itself and holds
+            # the last-known-good verdict (armed stays blocked); cold/no-LKG
+            # degrades to the alerted fail-open below.
+            lkg = _breaker_blind_or_lkg("reentry_cap", ctx, e)
+            if lkg.get("via") == "lkg_fallback":
+                return {**lkg, "via": "reentry_cap_lkg_block"}
+            # clear-LKG replay or cold fail-open: keep the gate's native via.
+            return {"pass": True, "via": "reentry_cap_data_missing",
+                    "reason": f"reentry cap unavailable ({type(e).__name__})"}
+        # shadow/off: probe mode has no protection to preserve. Emit the
+        # loudness triplet, then fail open.
+        logger.error("[risk][gates] reentry_cap state read failed for %s "
+                     "(mode=%s) — cap BLIND, failing open: %s", ctx.coin, mode, e)
         try:
             from hermes_trader import metrics
             metrics.MEMORY_GATE_READ_ERRORS.labels(gate="reentry_cap").inc()
@@ -2398,8 +2411,11 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
            "reentry_would_block": bool(over)}
     _record_gate_shadow(rec, path, "reentry_cap")
     if not over:
-        return {"pass": True, "via": "reentry_cap_ok",
-                "openings": openings, "max_per_coin": max_per_coin}
+        clear_res = {"pass": True, "via": "reentry_cap_ok",
+                     "openings": openings, "max_per_coin": max_per_coin}
+        if mode == "enforce":
+            _breaker_record_lkg("reentry_cap", ctx, clear_res)
+        return clear_res
     reason = (f"{openings} openings on {ctx.coin} within {window_hours:.0f}h "
               f"(>= cap {max_per_coin})")
     if mode == "shadow":
@@ -2410,8 +2426,10 @@ def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
                 "reason": f"SHADOW: {reason}", "openings": openings}
     logger.info(
         "[risk][gates] reentry_cap BLOCK %s: %s", ctx.coin, reason)
-    return {"pass": False, "via": "reentry_cap_block",
-            "reason": f"reentry cap: {reason}", "openings": openings}
+    block_res = {"pass": False, "via": "reentry_cap_block",
+                 "reason": f"reentry cap: {reason}", "openings": openings}
+    _breaker_record_lkg("reentry_cap", ctx, block_res)
+    return block_res
 
 
 # Load cross-component shared config (~/.hermes-trading/config.yaml).

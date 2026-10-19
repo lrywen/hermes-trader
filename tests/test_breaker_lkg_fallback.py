@@ -246,3 +246,79 @@ def test_expired_lkg_degrades_to_fail_open(monkeypatch, tmp_path):
     # With TTL=0 the entry is immediately expired → no replay.
     assert risk_gates._breaker_lkg_result("global_halt", _ctx()) is None
     assert future_key in risk_gates._breaker_lkg  # entry still present, just stale
+
+
+# ── reentry_cap (6th breaker; LKG only in ENFORCE, shadow stays probe) ──────
+
+def _reentry_cfg(tmp_path, mode, **over):
+    cfg = {"reentry_cap": {
+        "mode": mode, "max_per_coin": 2, "window_hours": 24,
+        "shadow_log_path": str(tmp_path / "reentry.jsonl")}}
+    cfg["reentry_cap"].update(over)
+    return cfg
+
+
+def _patch_live_memory(monkeypatch, count=None, raises=False):
+    import hermes_trader.agents.memory as memory_mod
+
+    class _Mem:
+        def count_openings_since(self, coin, since_ms):
+            if raises:
+                raise RuntimeError("memory down")
+            return count
+
+    monkeypatch.setattr(memory_mod, "memory", _Mem())
+
+
+def test_reentry_cap_enforce_holds_armed_block_when_blinded(monkeypatch, tmp_path):
+    """ENFORCE: coin at cap → armed; then memory read raises → keep blocking
+    via the LKG verdict (fail-safe), tagged reentry_cap_lkg_block."""
+    from hermes_trader.agents.risk_gates import reentry_cap_gate
+    _patch_live_memory(monkeypatch, count=2)
+    cfg = _reentry_cfg(tmp_path, "enforce")
+    armed = reentry_cap_gate(_ctx(coin="DOGE"), cfg)
+    assert armed["pass"] is False and armed["via"] == "reentry_cap_block"
+    _patch_live_memory(monkeypatch, raises=True)
+    held = reentry_cap_gate(_ctx(coin="DOGE"), cfg)
+    assert held["pass"] is False and held["via"] == "reentry_cap_lkg_block"
+
+
+def test_reentry_cap_enforce_clear_then_blind_passes(monkeypatch, tmp_path):
+    """ENFORCE: a good under-cap read caches a clear verdict; a later blind read
+    with that clear LKG passes (no phantom block), via stays data_missing."""
+    from hermes_trader.agents.risk_gates import reentry_cap_gate
+    _patch_live_memory(monkeypatch, count=1)
+    cfg = _reentry_cfg(tmp_path, "enforce")
+    assert reentry_cap_gate(_ctx(coin="DOGE"), cfg)["pass"] is True
+    _patch_live_memory(monkeypatch, raises=True)
+    r = reentry_cap_gate(_ctx(coin="DOGE"), cfg)
+    assert r["pass"] is True and r["via"] == "reentry_cap_data_missing"
+
+
+def test_reentry_cap_enforce_cold_blind_fails_open(monkeypatch, tmp_path):
+    """ENFORCE with no prior verdict (cold): blind read degrades to the alerted
+    fail-open, never an invented block."""
+    from hermes_trader.agents.risk_gates import reentry_cap_gate
+    _patch_live_memory(monkeypatch, raises=True)
+    r = reentry_cap_gate(_ctx(coin="DOGE"), _reentry_cfg(tmp_path, "enforce"))
+    assert r["pass"] is True and r["via"] == "reentry_cap_data_missing"
+
+
+def test_reentry_cap_shadow_blind_always_fails_open_and_caches_nothing(monkeypatch, tmp_path):
+    """SHADOW is probe mode: a blind read fails open with no LKG, and it must
+    NOT seed a verdict that later flips the enforce leg."""
+    import hermes_trader.agents.shadow_book as sb_mod
+    from hermes_trader.agents import risk_gates
+    from hermes_trader.agents.risk_gates import reentry_cap_gate
+
+    class _BoomBook:
+        def count_openings_since(self, coin, since_ms):
+            raise RuntimeError("shadow book down")
+
+    monkeypatch.setattr(sb_mod, "get_book", lambda: _BoomBook())
+    _patch_live_memory(monkeypatch, raises=True)
+    cfg = _reentry_cfg(tmp_path, "shadow")
+    r = reentry_cap_gate(_ctx(coin="DOGE"), cfg)
+    assert r["pass"] is True and r["via"] == "reentry_cap_data_missing"
+    # shadow blind path must not have cached any verdict for enforce to inherit
+    assert risk_gates._breaker_lkg_result("reentry_cap", _ctx(coin="DOGE")) is None
