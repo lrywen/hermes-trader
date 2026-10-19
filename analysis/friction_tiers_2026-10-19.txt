@@ -1,0 +1,75 @@
+==============================================================================
+P1-6  REALIZED FRICTION ACROSS NOTIONAL TIERS  (shadow book, read-only)
+==============================================================================
+book         : /data/.shadow-book.json (on host 192.168.124.65 container; snapshot identical)
+tiers (USD)  : $30, $100, $1000
+sz rounding  : enabled (--meta coin->szDecimals)
+
+------------------------------------------------------------------------------
+ACCOUNT taker   fills=149   pre-slip-era fills=143
+------------------------------------------------------------------------------
+size-invariant bp components (per round trip):
+  decision-mid gross : n=  7  median=   54.46bp  mean=   29.61  p10= -219.16  p90=  253.09
+  fill friction vs mid (taker only, <=0 = cost): n=  7  median=  -10.05bp  mean=  -10.02  p10=  -10.25  p90=   -9.78
+  actual-fill gross : n=149  median=  -44.35bp  mean=   13.32  p10= -261.00  p90=  251.74
+  fee               : n=149  median=    5.00bp  mean=    5.16  p10=    5.00  p90=    5.00
+  NET               : n=149  median=  -49.35bp  mean=    8.16  p10= -266.00  p90=  246.74
+
+exit-reason mix at recorded size (TP scale-out visibility):
+    59  max_loss
+    48  floor_breach
+    23  ignite_timeout
+    18  stale_flat_timeout
+     1  hard_timeout
+
+TP scale-out leg feasibility (exit MECHANISM vs size; diagnostic):
+  fills whose MFE reached first tier (+2% spot): 57/149 (38.3%); recorded TP scale-out exits: 0
+  $   30: 40% first-TP leg = $ 12.00  → legal
+  $  100: 40% first-TP leg = $ 40.00  → legal
+  $ 1000: 40% first-TP leg = $400.00  → legal
+
+per-tier dollars (same fills replayed at each intended notional):
+      tier   win%   sumGross    sumFee     sumNet    medNet   fee/RT $10.5floor%  flrUpMed  flrUpMax
+  $     30   47.0      5.826     2.292      3.534   -0.1478   0.0154         0.0      None      None
+  $    100   47.0     19.853     7.694     12.159   -0.4940   0.0516         0.0      None      None
+  $   1000   47.0    198.384    76.903    121.481   -4.9352   0.5161         0.0      None      None
+
+------------------------------------------------------------------------------
+ACCOUNT maker_shadow   fills=69   pre-slip-era fills=64
+------------------------------------------------------------------------------
+size-invariant bp components (per round trip):
+  decision-mid gross : n=0 (n/a for this account)
+  fill friction vs mid (taker only, <=0 = cost): n=0 (n/a for this account)
+  actual-fill gross : n= 69  median=  -81.21bp  mean=   -8.10  p10= -218.46  p90=  210.46
+  fee               : n= 69  median=    2.00bp  mean=    2.07  p10=    2.00  p90=    2.00
+  NET               : n= 69  median=  -83.21bp  mean=  -10.17  p10= -220.46  p90=  208.46
+
+exit-reason mix at recorded size (TP scale-out visibility):
+    28  max_loss
+    21  ignite_timeout
+    12  stale_flat_timeout
+     6  floor_breach
+     2  hard_timeout
+
+TP scale-out leg feasibility (exit MECHANISM vs size; diagnostic):
+  fills whose MFE reached first tier (+2% spot): 17/69 (24.6%); recorded TP scale-out exits: 0
+  $   30: 40% first-TP leg = $ 12.00  → legal
+  $  100: 40% first-TP leg = $ 40.00  → legal
+  $ 1000: 40% first-TP leg = $400.00  → legal
+
+per-tier dollars (same fills replayed at each intended notional):
+      tier   win%   sumGross    sumFee     sumNet    medNet   fee/RT $10.5floor%  flrUpMed  flrUpMax
+  $     30   39.1     -1.732     0.424     -2.156   -0.2495   0.0061         0.0      None      None
+  $    100   39.1     -5.589     1.430     -7.020   -0.8322   0.0207         0.0      None      None
+  $   1000   39.1    -56.018    14.300    -70.317   -8.3211   0.2073         0.0      None      None
+
+notes:
+  * bp components are size-invariant in the shadow model; dollar PnL/fee
+    scale with the real (post-rounding) notional.
+  * FEE ERA: older fills carry 5bp taker / 2bp maker round trip; newer
+    (post slip-era) fills carry 9bp / 3bp. The median fee bp reflects this mix.
+  * pre-slip-era taker fills have NO modeled slippage (unknown, not 0).
+  * fill friction vs mid is only separable for taker (mid stored on fills).
+  * TP leg reach is MFE-based and diagnostic; a scale-out PnL counterfactual
+    needs a K-line replay and is intentionally NOT claimed here.
+  * this is a realized-friction replay, not a new edge estimate.
