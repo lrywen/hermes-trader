@@ -26,6 +26,20 @@ reference peak exists, then fails CLOSED once a real peak is recorded.
 import json
 import time
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _isolate_breaker_lkg():
+    """P1-4: the in-process breaker last-known-good verdict cache is module
+    global and keyed by (gate, coin); clear it around every test so an armed
+    verdict cached by one case can't leak into another case's read-failure
+    expectation."""
+    from hermes_trader.agents import risk_gates
+    risk_gates.reset_breaker_lkg()
+    yield
+    risk_gates.reset_breaker_lkg()
+
 # ── helpers ───────────────────────────────────────────────────────────────
 
 def _ctx(**kw):

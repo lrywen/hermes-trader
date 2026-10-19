@@ -613,6 +613,116 @@ def _alert_memory_gate_blind(gate: str, ctx: "GateContext | None", exc: BaseExce
                      gate, coin, feed_e)
 
 
+# ── P1-4 (2026-10-19): breaker last-known-good (LKG) verdict cache ──────────
+#
+# The memory-backed breakers (coin circuit / global halt / consecutive loss /
+# per-coin daily loss / drawdown) used to fail *blindly open* whenever their
+# memory state-read raised: the protection simply vanished for that tick. The
+# independent breakers still applied, but an armed breaker whose state became
+# unreadable would silently stop blocking. We now remember the last VERDICT
+# each gate successfully computed and, on a read failure, keep enforcing that
+# verdict instead of going blind. Fail-safe posture:
+#   * last verdict was BLOCK (breaker armed) → keep blocking while unreadable;
+#   * last verdict was PASS (breaker clear)  → keep passing (no phantom block
+#     from stale armed state, because a clear tick overwrites the cache);
+#   * never evaluated successfully (cold / no LKG) → original fail-open.
+# LKG is deliberately a short-lived in-process safety net, not a new durable
+# store: an unreadable-memory outage that outlasts _BREAKER_LKG_TTL_S degrades
+# back to the (loud, alerted) fail-open so a long blind spell can't wedge the
+# book closed on a stale block forever. TTL is generous (the arm windows are
+# 60min / daily) but bounded.
+_BREAKER_LKG_TTL_S = float(os.environ.get("HERMES_BREAKER_LKG_TTL_S", "3600"))
+# key -> (monotonic-ish wall s, blocked bool, reason)
+_breaker_lkg: dict[str, tuple[float, bool, str]] = {}
+
+
+def _lkg_key(gate: str, ctx: "GateContext | None") -> str:
+    coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
+    return f"{gate}:{coin}"
+
+
+def reset_breaker_lkg() -> None:
+    """Clear all cached breaker verdicts (tests / forced re-arm baseline)."""
+    _breaker_lkg.clear()
+
+
+def _breaker_record_lkg(gate: str, ctx: "GateContext | None", result: GateResult) -> None:
+    """Cache a successfully-computed breaker verdict. Best-effort, never raises.
+
+    Only PASS/BLOCK verdicts computed from a *good* memory read are recorded
+    (callers invoke this on the success path, never from the except branch).
+    """
+    try:
+        _breaker_lkg[_lkg_key(gate, ctx)] = (
+            time.time(),
+            bool(result.get("pass")) is False,
+            str(result.get("reason", "")),
+        )
+    except Exception:  # pragma: no cover - a cache write must never affect the gate
+        pass
+
+
+def _breaker_lkg_result(
+    gate: str, ctx: "GateContext | None"
+) -> Optional[GateResult]:
+    """Return the last-known-good verdict if fresh, else None.
+
+    A BLOCK is replayed verbatim (tagged via ``lkg_fallback``); a PASS is
+    replayed as a plain pass. Expired / absent entries yield None so the caller
+    falls through to the documented fail-open path.
+    """
+    try:
+        entry = _breaker_lkg.get(_lkg_key(gate, ctx))
+    except Exception:
+        return None
+    if entry is None:
+        return None
+    ts, blocked, reason = entry
+    if (time.time() - ts) > _BREAKER_LKG_TTL_S:
+        return None
+    if blocked:
+        return {
+            "pass": False,
+            "via": "lkg_fallback",
+            "reason": f"{reason} [LKG: memory unreadable, holding last armed verdict]",
+        }
+    return {"pass": True, "via": "lkg_fallback_clear"}
+
+
+def _breaker_blind_or_lkg(
+    gate: str, ctx: GateContext, exc: BaseException
+) -> GateResult:
+    """Shared read-failure handler for the memory-backed breakers (P1-4).
+
+    Order: if a fresh last-known-good verdict exists, enforce it (fail-safe for
+    an armed breaker). Otherwise keep the historical, alerted fail-open so a
+    cold start with no prior verdict never turns a memory hiccup into a total,
+    silent trading DoS. The loudness triplet (error log + metric + Feishu/SSE
+    alert) fires in BOTH branches — an LKG hold is still a degraded, blind gate.
+    """
+    lkg = _breaker_lkg_result(gate, ctx)
+    held = bool(lkg and lkg.get("pass") is False)
+    logger.error(
+        "[risk] %s state read failed for %s — breaker %s (%s): %s",
+        gate,
+        getattr(ctx, "coin", "-"),
+        "HOLDING last-known-good BLOCK" if held else (
+            "using last-known-good CLEAR" if lkg else "BLIND, failing open (pass=True)"),
+        _lkg_key(gate, ctx),
+        exc,
+    )
+    try:
+        from hermes_trader import metrics
+        metrics.MEMORY_GATE_READ_ERRORS.labels(gate=gate).inc()
+    except Exception as metric_e:
+        logger.error("[risk] MEMORY_GATE_READ_ERRORS metric failed for %s: %r",
+                     gate, metric_e)
+    _alert_memory_gate_blind(gate, ctx, exc)
+    if lkg is not None:
+        return lkg
+    return {"pass": True}
+
+
 def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
     """Block re-entry on a single coin while its per-trade loss breaker is armed.
 
@@ -627,33 +737,16 @@ def coin_circuit_breaker_gate(ctx: GateContext) -> GateResult:
         from hermes_trader.agents.memory import memory
         remaining = float(memory.coin_circuit_remaining_min(ctx.coin) or 0.0)
         if remaining > 0:
-            return {"pass": False,
+            res: GateResult = {"pass": False,
                     "reason": f"coin circuit breaker active on {ctx.coin} ({int(remaining)}min remaining)"}
+        else:
+            res = {"pass": True}
+        _breaker_record_lkg("coin_circuit", ctx, res)
+        return res
     except Exception as e:
-        # Convention (shared with the B-F2/F6/F7 gates): a memory state-read
-        # failure FAILS OPEN — the independent circuit breakers still apply and
-        # the spread/opposite-direction entry checks are unaffected. Failing
-        # closed here would turn a transient memory read hiccup into a total
-        # (and silent) trading DoS, which on a shared-state helper could
-        # disarm ALL gates at once. Audit 2026-09-06 (C1) initially flipped
-        # this to fail-closed; reverted to the documented/tested fail-open
-        # convention (test_audit_bf2_bf6_bf7 gates + docstring contract).
-        # Audit 2026-09-06 (C1): keep fail-open but make it LOUD — error log +
-        # metric so a persistently blind breaker is alertable instead of silent.
-        logger.error("[risk] coin-circuit state read failed for %s — breaker "
-                     "BLIND, failing open (pass=True): %s", ctx.coin, e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="coin_circuit").inc()
-        except Exception as metric_e:
-            # H-P3: the breaker is blind (fail-open); a dropped blind-gate
-            # metric removes one of the two non-card signals — log it.
-            logger.error("[risk] MEMORY_GATE_READ_ERRORS metric failed for coin_circuit: %r",
-                         metric_e)
-        # Audit 2026-09-07 (C1): make the blind gate visible via Feishu too
-        # (the metric has no alert rule in this deployment). Never blocks.
-        _alert_memory_gate_blind("coin_circuit", ctx, e)
-    return {"pass": True}
+        # P1-4: hold the last-known-good verdict while memory is unreadable;
+        # only a cold/no-LKG read failure degrades to the alerted fail-open.
+        return _breaker_blind_or_lkg("coin_circuit", ctx, e)
 
 
 def global_halt_gate(ctx: GateContext) -> GateResult:
@@ -668,25 +761,15 @@ def global_halt_gate(ctx: GateContext) -> GateResult:
         from hermes_trader.agents.memory import memory
         remaining = float(memory.global_halt_remaining_min() or 0.0)
         if remaining > 0:
-            return {"pass": False,
+            res: GateResult = {"pass": False,
                     "reason": f"global daily-loss halt active ({int(remaining)}min remaining)"}
+        else:
+            res = {"pass": True}
+        _breaker_record_lkg("global_halt", ctx, res)
+        return res
     except Exception as e:
-        # Fail-open on a memory state-read failure (shared convention with the
-        # coin-circuit / B-F2/F6/F7 gates): the independent breakers and the
-        # USD daily-loss kill switch still protect the book. Failing closed
-        # would convert a transient memory read error into a total DoS.
-        # Audit 2026-09-06 (C1) briefly set fail-closed; reverted to the
-        # documented/tested convention. C1: fail-open but LOUD (error + metric).
-        logger.error("[risk] global-halt state read failed — breaker BLIND, "
-                     "failing open (pass=True): %s", e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="global_halt").inc()
-        except Exception:
-            pass
-        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
-        _alert_memory_gate_blind("global_halt", ctx, e)
-    return {"pass": True}
+        # P1-4: hold last-known-good verdict; cold/no-LKG → alerted fail-open.
+        return _breaker_blind_or_lkg("global_halt", ctx, e)
 
 
 def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
@@ -707,24 +790,17 @@ def consecutive_loss_gate(ctx: GateContext, limit: int) -> GateResult:
         from hermes_trader.agents.memory import memory
         streak = int(memory.consecutive_losses(ctx.coin) or 0)
         if streak >= limit:
-            return {"pass": False,
+            res: GateResult = {"pass": False,
                     "reason": f"consecutive-loss halt: {ctx.coin} has {streak} "
                               f"losing closes in a row (>= {limit}) — no entries "
                               f"until a winning close or UTC roll"}
+        else:
+            res = {"pass": True}
+        _breaker_record_lkg("consecutive_loss", ctx, res)
+        return res
     except Exception as e:
-        # Fail-open on a memory read failure (shared breaker convention);
-        # Audit 2026-09-06 (C1) briefly flipped this to fail-closed, reverted.
-        # C1: fail-open but LOUD (error + metric).
-        logger.error("[risk] consecutive-loss state read failed for %s — "
-                     "breaker BLIND, failing open (pass=True): %s", ctx.coin, e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="consecutive_loss").inc()
-        except Exception:
-            pass
-        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
-        _alert_memory_gate_blind("consecutive_loss", ctx, e)
-    return {"pass": True}
+        # P1-4: hold last-known-good verdict; cold/no-LKG → alerted fail-open.
+        return _breaker_blind_or_lkg("consecutive_loss", ctx, e)
 
 
 def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResult:
@@ -747,26 +823,22 @@ def per_coin_daily_loss_gate(ctx: GateContext, max_loss_pct: float) -> GateResul
         from hermes_trader.agents.memory import memory
         sod_equity = float(memory.get_start_of_day_equity() or 0.0)
         if sod_equity <= 0:
-            return {"pass": True}  # no baseline yet (pre-first-tick) → nothing to measure
+            # No baseline yet (pre-first-tick): not a meaningful breaker
+            # verdict, so deliberately do NOT cache it as a clear LKG.
+            return {"pass": True}
         pnl_pct = float(memory.coin_daily_realized_pnl_pct(ctx.coin, sod_equity) or 0.0)
         if pnl_pct <= -max_loss_pct:
-            return {"pass": False,
+            res: GateResult = {"pass": False,
                     "reason": f"per-coin daily loss halt: {ctx.coin} realized "
                               f"{pnl_pct:.2f}% today (<= -{max_loss_pct:.1f}% of "
                               f"SOD equity) — no more entries on this coin today"}
+        else:
+            res = {"pass": True}
+        _breaker_record_lkg("per_coin_daily_loss", ctx, res)
+        return res
     except Exception as e:
-        # Fail-open on a memory read failure (shared breaker convention).
-        # Audit 2026-09-06 (C1): fail-open but LOUD (error + metric).
-        logger.error("[risk] per-coin daily-loss state read failed for %s — "
-                     "breaker BLIND, failing open (pass=True): %s", ctx.coin, e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="per_coin_daily_loss").inc()
-        except Exception:
-            pass
-        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
-        _alert_memory_gate_blind("per_coin_daily_loss", ctx, e)
-    return {"pass": True}
+        # P1-4: hold last-known-good verdict; cold/no-LKG → alerted fail-open.
+        return _breaker_blind_or_lkg("per_coin_daily_loss", ctx, e)
 
 
 def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
@@ -800,7 +872,10 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
     """
     if max_drawdown_pct <= 0:
         return {"pass": True}
-    try:
+
+    def _evaluate() -> tuple[GateResult, bool]:
+        """Return (result, cacheable). cacheable=False for the 'no baseline yet'
+        passes (equity/peak <= 0) so they are not remembered as a clear LKG."""
         from hermes_trader.agents.memory import memory
         window_days = float(cfg_get(
             "circuit_breaker.drawdown_peak_window_days", 14.0) or 0.0)
@@ -808,7 +883,7 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
             "circuit_breaker.drawdown_cooldown_hours", 24.0) or 0.0)
         equity = ctx.equity
         if equity <= 0:
-            return {"pass": True}
+            return {"pass": True}, False
         # Legacy-memory one-shot: no rolling trail yet (pre-upgrade store).
         # If the OLD all-time peak is already latched beyond threshold,
         # re-baseline to current equity once so the deadlock lifts immediately
@@ -829,7 +904,7 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
                             f"upgraded rolling-peak gate"))
         peak = float(memory.rolling_peak_equity(window_days) or 0.0)
         if peak <= 0:
-            return {"pass": True}  # no reference peak yet
+            return {"pass": True}, False  # no reference peak yet
         dd_pct = (peak - equity) / peak * 100.0
         if dd_pct >= max_drawdown_pct:
             since_ms, newly_frozen = memory.mark_drawdown_frozen()
@@ -863,30 +938,26 @@ def drawdown_gate(ctx: GateContext, max_drawdown_pct: float) -> GateResult:
                 logger.warning(
                     "[risk] drawdown gate cooldown recovery after %.1fh freeze "
                     "— entries re-armed at equity $%.2f", frozen_min / 60.0, equity)
-                return {"pass": True}
+                return {"pass": True}, True
             remain_min = max(0.0, cooldown_hours * 60.0 - frozen_min)
             return {"pass": False,
                     "reason": f"account drawdown halt: equity ${equity:.0f} is "
                               f"{dd_pct:.1f}% below {window_days:.0f}d peak ${peak:.0f} "
                               f"(>= {max_drawdown_pct:.1f}%) — new entries frozen "
-                              f"for {frozen_min / 60:.1f}h (re-arm in {remain_min / 60:.1f}h)"}
+                              f"for {frozen_min / 60:.1f}h (re-arm in {remain_min / 60:.1f}h)"}, True
         # Below threshold: ensure a stale freeze episode clears on recovery.
         memory.clear_drawdown_freeze()
+        return {"pass": True}, True
+
+    try:
+        res, cacheable = _evaluate()
+        if cacheable:
+            _breaker_record_lkg("drawdown", ctx, res)
+        return res
     except Exception as e:
-        # Fail-open on a memory read failure (shared breaker convention); the
-        # equity<=0 / peak<=0 "no baseline" passes above are also legitimate.
-        # Audit 2026-09-06 (C1) briefly set fail-closed here; reverted.
-        # C1: fail-open but LOUD (error + metric).
-        logger.error("[risk] drawdown state read failed — breaker BLIND, "
-                     "failing open (pass=True): %s", e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="drawdown").inc()
-        except Exception:
-            pass
-        # Audit 2026-09-07 (C1): Feishu visibility for the blind gate. Never blocks.
-        _alert_memory_gate_blind("drawdown", ctx, e)
-    return {"pass": True}
+        # P1-4: hold last-known-good verdict; cold/no-LKG (or only no-baseline
+        # passes observed) → alerted fail-open.
+        return _breaker_blind_or_lkg("drawdown", ctx, e)
 
 
 def liquidation_buffer_gate(
