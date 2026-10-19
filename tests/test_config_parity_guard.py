@@ -70,7 +70,7 @@ def test_sanctioned_looser_leaves_are_registered_and_exempt():
     assert g._SANCTIONED_LOOSER_LEAVES <= set(g.LEAF_DANGER_KIND), (
         "白名单叶必须登记进 LEAF_DANGER_KIND，否则仍是假阴性"
     )
-    # 用真实 canonical/live 验证：这 3 个叶 canonical 确实比 live 宽松，
+    # 用真实 canonical/live 验证：这些叶 canonical 确实比 live 宽松，
     # 但白名单豁免使其不被报告（它们是已知、有注释的有意漂移）。
     import json as _json
     path = _live_config_path()

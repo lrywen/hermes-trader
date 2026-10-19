@@ -55,10 +55,11 @@ LEAF_DANGER_KIND: dict[str, str] = {
     "trend_filter_200ma.mode": "armed_mode",
     # ── P0-1: 补登 2026-10-16 复核确认的危险方向叶 ──
     # canonical 比 live 宽松：配置丢键深合并回落到 canonical 会放宽保护。
-    #   min_confidence      : canon 0.6 < live 0.7（门槛更低=更宽松）
     #   weak_trend_chase    : canon 0.0 < live 25.0（无 ADX 门槛=更宽松）
     #   equity_fraction     : canon 0.2 > live 0.15（单笔仓位更大=更宽松）
-    "runner_entry_gate.min_confidence": "lo_danger",
+    # 注：runner_entry_gate.min_confidence 曾登记为 canon 0.6 < live 0.7，但
+    # 2026-10-19 P0-1 已把生产门槛恢复到 canonical 0.6（快照去毒），该叶不再有
+    # 漂移，登记同步移除；将来若生产再次调门槛，应作为新决策重新登记。
     "runner_entry_gate.weak_trend_chase.min_adx4h": "lo_danger",
     "equity_fraction_per_trade": "hi_danger",
     # market_circuit / daily_extension_cap 有意 canonical=shadow（新部署惰性），
@@ -82,8 +83,6 @@ _MODE_RANK = {"off": 0, "shadow": 1, "enforce": 2}
 # 它们毫无感知；现在它们被显式登记 + 显式豁免，任何「新增的、不在白名单」
 # 的危险方向漂移仍会被立即报告（当次即红）。
 _SANCTIONED_LOOSER_LEAVES: frozenset[str] = frozenset({
-    # canon 0.6 < live 0.7 —— 生产提高置信度门槛（P1-5），canonical 保留旧宽松默认。
-    "runner_entry_gate.min_confidence",
     # canon 0.0 < live 25.0 —— 生产启用 4h ADX 弱趋势追单否决（注释建议 25 需配对回测后才 promote），
     # canonical 保留 OFF 宽松默认。
     "runner_entry_gate.weak_trend_chase.min_adx4h",
