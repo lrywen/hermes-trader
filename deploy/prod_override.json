@@ -759,6 +759,7 @@
     "parallel_workers": 24,
     "universe_sweep": 0
   },
+  "scan_long_only": true,
   "score_invariant_enabled": true,
   "shadow_book": {
     "enabled": true,

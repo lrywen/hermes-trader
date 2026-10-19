@@ -150,6 +150,10 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "loop_runtime.ws_status_event": (False, True),
     "regime_risk_overlay.enabled": (False, True),
     "runner_entry_gate.pullback_long.enabled": (False, True),
+    # P0-2 (2026-10-19)：long-only 研究节流。live=true 让 loop 在付费 LLM research
+    # 前砍掉纯空头候选（allow_shorts=false 时反正会被末端闸门拒），只省 token/降噪，
+    # 不放宽任何资金保护；terminal runner_entry_gate.allow_shorts 仍是权威空头开关。
+    "scan_long_only": (False, True),
     # 生产节奏/超时/退避（非保护语义）
     "held_research_interval_min": (10, 20),
     "research_cooldown_min": (3, 10),
