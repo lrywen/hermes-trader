@@ -1,5 +1,5 @@
 {
-  "_comment": "PRODUCTION PARAMETER OVERRIDE SNAPSHOT (192.168.124.65 hermes-trader, 2026-10-16). Deep-merged over CANONICAL_DEFAULTS by scripts/apply_prod_override.py. Holds STRATEGY TUNING ONLY: the runtime 'mode' (OFF/SHADOW/LIVE) is deliberately NOT versioned here, so a rebuild defaults to the safe canonical OFF and never starts trading by accident. Set SHADOW/LIVE explicitly on the host after applying.",
+  "_comment": "PRODUCTION PARAMETER OVERRIDE SNAPSHOT (192.168.124.65 hermes-trader, 2026-10-16). Deep-merged over CANONICAL_DEFAULTS by scripts/apply_prod_override.py. Holds STRATEGY TUNING ONLY: the runtime 'mode' (OFF/SHADOW/LIVE) is deliberately NOT versioned here, so a rebuild defaults to the safe canonical OFF and never starts trading by accident. Set SHADOW/LIVE explicitly on the host after applying. DETOX 2026-10-18: removed runner_entry_gate.min_confidence (was pinned 0.7, a silent revert that froze throughput; now inherits canonical 0.6 = min_ai_confidence single floor).",
   "against_funding_min_conf": 0.85,
   "against_funding_min_score": 60,
   "aligned_min_conf": 0.6,
@@ -699,7 +699,6 @@
     "enabled": true,
     "max_extension_atr": 2.5,
     "min_composite": 45,
-    "min_confidence": 0.7,
     "min_hip3_composite": 50,
     "min_short_composite": 45,
     "min_short_confidence": 0.72,
