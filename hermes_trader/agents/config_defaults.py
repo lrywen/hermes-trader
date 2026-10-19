@@ -1541,7 +1541,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "max_markets_hip3": 25,
         "max_markets_movers": 10,
         "movers_vol_floor_usd": 300_000.0,
-        "hip3_movers_floor_usd": 50_000.0,
+        # Audit 2026-10-19 (gate review): HIP-3 |24h%|-movers floor raised
+        # $50k -> $1M. At $50k a tokenized-equity pumper entered PAID research
+        # but was then always rejected at execution by min_hip3_volume_usd
+        # ($5M) — a 100x scan-vs-execute mismatch that wasted LLM calls
+        # (xyz:* took ~77% of research with a 2.7% long hit). $1M is 1/5 of
+        # the execution floor: still admits genuinely-moving HIP-3 names while
+        # filtering pico-cap noise a $200 print can move. Execution floor is
+        # unchanged.
+        "hip3_movers_floor_usd": 1_000_000.0,
         "universe_sweep": 0,
         "batch_size": 20,
         "batch_sleep_sec": 0.3,

@@ -84,7 +84,7 @@ def test_r13_b9_individual_leaf_values_sentinel():
     assert b["max_markets_hip3"] == 25
     assert b["max_markets_movers"] == 10
     assert b["movers_vol_floor_usd"] == 300_000.0
-    assert b["hip3_movers_floor_usd"] == 50_000.0
+    assert b["hip3_movers_floor_usd"] == 1_000_000.0  # audit 2026-10-19: 50k->1M
     assert b["universe_sweep"] == 0
     assert b["batch_size"] == 20
     assert b["batch_sleep_sec"] == 0.3
@@ -269,7 +269,7 @@ def test_r13_b9_legacy_env_vol_floor_override(monkeypatch):
     monkeypatch.setenv("HERMES_MOVERS_VOL_FLOOR_USD", "1000000")
     p = scan_budget_params(config={})
     assert p["movers_vol_floor_usd"] == 1_000_000.0
-    assert p["hip3_movers_floor_usd"] == 50_000.0  # 另一叶不受影响
+    assert p["hip3_movers_floor_usd"] == 1_000_000.0  # 另一叶不受 movers env 影响
 
 
 def test_r13_b9_legacy_env_cache_max_flows(monkeypatch):

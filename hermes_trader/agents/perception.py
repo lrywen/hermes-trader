@@ -1081,7 +1081,7 @@ _SCAN_BUDGET_DEFAULTS: dict[str, Any] = {
     "max_markets_hip3": 25,
     "max_markets_movers": 10,
     "movers_vol_floor_usd": 300_000.0,
-    "hip3_movers_floor_usd": 50_000.0,
+    "hip3_movers_floor_usd": 1_000_000.0,  # audit 2026-10-19: 50k->1M, see config_defaults
     "universe_sweep": 0,
     "batch_size": 20,
     "batch_sleep_sec": 0.3,

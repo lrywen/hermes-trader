@@ -161,6 +161,11 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "news_catalyst.http_timeout_s": (3.0, 8),
     "research_rescore_delta": (0.0, 8),
     "scan_budget.parallel_workers": (32, 24),
+    # HIP-3 audit 2026-10-19：canonical movers floor 50k→1M（执行层流动性门仍是
+    # 5M），修复 100x scan-vs-execute 预算错配。live 暂留 50k（旧值），登记为
+    # fail-safe 临时漂移——live 更宽只会多喂低流动候选（末端被风控门拒），不放宽
+    # 任何资金保护；部署后经审计通道把 live 抬到 1M，届时此登记可删（两侧相等）。
+    "scan_budget.hip3_movers_floor_usd": (1_000_000.0, 50_000),
     # 生产调优权重/阈值（canonical 更严或非保护）
     "trigger_weights.trend_strength": (0.3, 0.55),
     "trigger_weights.uptrend_momentum": (0.2, 0),

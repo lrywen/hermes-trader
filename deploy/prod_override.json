@@ -750,7 +750,7 @@
     "batch_sleep_sec": 0.3,
     "cache_max": 512,
     "future_timeout_sec": 60,
-    "hip3_movers_floor_usd": 50000,
+    "hip3_movers_floor_usd": 1000000,
     "max_markets": 60,
     "max_markets_hip3": 25,
     "max_markets_movers": 10,
