@@ -487,6 +487,10 @@ def startup_config_integrity_errors(cfg: dict[str, Any]) -> list[str]:
     # 与改 canonical 不同，这里用守卫保证：生产基线既为 enforce，配置被截断/
     # 改弱时拒绝启动，而不是静默回落到 canonical 的 shadow（保护被关）。
     errors.extend(_production_enforce_arm_errors())
+    # Audit P1-1: production /data must keep the six force/fail-open override
+    # levers physically OFF (runtime backstop for a file armed outside the audited
+    # write path). Local/CI is not checked.
+    errors.extend(_production_forbidden_override_errors())
 
     # fix-verification §11③: 门禁「漂移 ⊆ 登记 且值与登记一致」接线到启动路径。
     # _GRAY_ENFORCE_ARMS 只保护已登记 enforce 臂；本守卫对所有 canonical↔live
@@ -597,6 +601,37 @@ def _production_parity_uncovered_errors() -> list[str]:
                 f"(or set HERMES_SKIP_STARTUP_SAFETY=1 to deliberately override)")
     except Exception as e:
         logger.error("parity uncovered check failed (non-fatal): %s", e)
+    return errors
+
+
+def _production_forbidden_override_errors() -> list[str]:
+    """Audit P1-1: physically lock the six 'skip a safety check' levers OFF on
+    the production authority config.
+
+    The write path already refuses to arm one without ``override_requires_ai``
+    in the same/merged state (FORBIDDEN_OVERRIDE), but a file edited OUTSIDE the
+    audited write path (or restored from a hand-built JSON) could still carry an
+    armed lever. On the production /data source there is no legitimate reason
+    to ever arm these, so any true value is a hard startup refusal regardless of
+    the AI-agreement flag. Local/CI deployments are not checked (they may arm a
+    lever deliberately in a test). The escape hatch is the same
+    HERMES_SKIP_STARTUP_SAFETY ack used by the other production guards.
+    """
+    if not _running_from_data_config():
+        return []
+    errors: list[str] = []
+    try:
+        from hermes_trader.agents.config_schema import FORCE_OVERRIDE_KEYS
+        raw = _read_raw_config() or {}
+        for fkey in FORCE_OVERRIDE_KEYS:
+            if raw.get(fkey) is True:
+                errors.append(
+                    f"startup safety: {fkey}=true on the production /data config — "
+                    f"force-execute / fail-open override levers must stay OFF in "
+                    f"production. Clear it from /data/.agent-config.json (or set "
+                    f"HERMES_SKIP_STARTUP_SAFETY=1 to deliberately override)")
+    except Exception as e:
+        logger.error("forbidden-override boot check failed (non-fatal): %s", e)
     return errors
 
 

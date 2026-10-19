@@ -133,3 +133,36 @@ def test_enforce_arm_missing_block_is_startup_error(monkeypatch):
 def test_enforce_arm_non_data_source_enforces_nothing(monkeypatch):
     monkeypatch.setattr(cs, "CONFIG_PATH", "/home/dev/.agent-config.json")
     assert cs._production_enforce_arm_errors() == []
+
+
+def test_forbidden_override_armed_on_production_refuses_boot(monkeypatch):
+    """Audit P1-1: a force-execute / fail-open lever armed on the production
+    /data config (even via an out-of-band file edit) must be a hard boot
+    refusal; a clean config passes; non-/data is never checked."""
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/data/.agent-config.json")
+    armed = _full_prod_raw()
+    armed["spread_gate_fail_open"] = True
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: armed)
+    errors = cs._production_forbidden_override_errors()
+    assert any("spread_gate_fail_open" in e for e in errors), errors
+
+    monkeypatch.setattr(cs.os.path, "exists", lambda p: True)
+    integrated = cs.startup_config_integrity_errors({})
+    assert any("spread_gate_fail_open=true" in e for e in integrated), integrated
+
+    monkeypatch.setattr(cs, "_read_raw_config", lambda: _full_prod_raw())
+    assert cs._production_forbidden_override_errors() == []
+
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/home/dev/.agent-config.json")
+    assert cs._production_forbidden_override_errors() == []
+
+
+def test_each_of_six_force_levers_is_guarded(monkeypatch):
+    from hermes_trader.agents.config_schema import FORCE_OVERRIDE_KEYS
+    monkeypatch.setattr(cs, "CONFIG_PATH", "/data/.agent-config.json")
+    for key in FORCE_OVERRIDE_KEYS:
+        raw = _full_prod_raw()
+        raw[key] = True
+        monkeypatch.setattr(cs, "_read_raw_config", lambda raw=raw: raw)
+        errors = cs._production_forbidden_override_errors()
+        assert any(key in e for e in errors), (key, errors)
