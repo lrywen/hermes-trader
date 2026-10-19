@@ -1,0 +1,62 @@
+====================================================================================================
+P0-A  REAL Hyperliquid shadow fills — coarse directional-edge check (2026-10-19)
+====================================================================================================
+closed round-trips: 218 (accounts: {'taker': 149, 'maker_shadow': 69})
+fees are already inside realized_pnl_pct/usd (net ROE).
+
+LIMITATION: fired trigger names are not on the fills and only 7 fills overlap the
+post-10-14 decision snapshots, so per-WEIGHT validation is not possible. This is a
+chain-level directional-edge test using only fill-stored PIT fields (regime/side).
+
+----------------------------------------------------------------------------------------------------
+ACCOUNT: taker
+  OVERALL                n=149  win= 47.0% (p=0.512)  ROE med=  -3.09% [ -4.90,  2.11]  mean=   0.60% netUSD=$   1.881
+  trend-ALIGNED          n=105  win= 50.5% (p=1.000)  ROE med=   0.16% [ -4.86,  3.87]  mean=   1.25% netUSD=$   0.262
+  counter/non-trend      n= 44  win= 38.6% (p=0.175)  ROE med=  -4.31% [ -6.57,  1.54]  mean=  -0.97% netUSD=$   1.619
+  aligned-vs-counter Mann-Whitney two-sided p = 0.3676
+  side=long              n=130  win= 47.7% (p=0.661)  ROE med=  -2.73% [ -4.91,  3.02]  mean=   0.97% netUSD=$   3.128
+  side=short             n= 19  win= 42.1% (p=0.646)  ROE med=  -3.14% [ -9.77,  4.14]  mean=  -1.99% netUSD=$  -1.246
+
+  by entry_regime:
+  regime=up            n= 94  win= 50.0% (p=1.000)  ROE med=  -0.24% [ -4.88,  4.43]  mean=   1.24% netUSD=$  -0.142
+  regime=down          n= 21  win= 42.9% (p=0.663)  ROE med=  -4.66% [ -5.97,  3.02]  mean=  -1.22% netUSD=$  -0.218
+  regime=chop          n= 10  win= 50.0% (p=1.000)  ROE med=  -1.46% [ -9.99, 13.14]  mean=   1.16% netUSD=$   0.509
+  regime=neutral       n= 24  win= 37.5% (p=0.307)  ROE med=  -3.27% [ -6.63,  3.83]  mean=  -0.56% netUSD=$   1.732
+
+----------------------------------------------------------------------------------------------------
+ACCOUNT: maker_shadow
+  OVERALL                n= 69  win= 39.1% (p=0.092)  ROE med=  -3.98% [ -5.09,  0.06]  mean=  -0.40% netUSD=$  -2.009
+  trend-ALIGNED          n= 53  win= 39.6% (p=0.170)  ROE med=  -3.98% [ -5.09,  1.92]  mean=   0.38% netUSD=$   0.175
+  counter/non-trend      n= 16  win= 37.5% (p=0.453)  ROE med=  -4.05% [ -7.90,  1.50]  mean=  -2.98% netUSD=$  -2.185
+  aligned-vs-counter Mann-Whitney two-sided p = 0.3819
+  side=long              n= 57  win= 36.8% (p=0.064)  ROE med=  -4.28% [ -5.10, -0.69]  mean=  -0.52% netUSD=$  -2.057
+  side=short             n= 12  win= 50.0% (p=1.000)  ROE med=  -0.23% [ -8.19,  4.20]  mean=   0.16% netUSD=$   0.048
+
+  by entry_regime:
+  regime=up            n= 43  win= 37.2% (p=0.127)  ROE med=  -4.16% [ -5.09,  2.85]  mean=   0.46% netUSD=$   0.192
+  regime=down          n= 14  win= 35.7% (p=0.423)  ROE med=  -7.30% [-11.78,  1.86]  mean=  -3.47% netUSD=$  -2.635
+  regime=chop          n=  2  win= 50.0% (p=1.000)  ROE med=  -0.85% [ -3.20,  1.50]  mean=  -0.85% netUSD=$  -0.102
+  regime=neutral       n= 10  win= 50.0% (p=1.000)  ROE med=  -1.10% [ -6.24,  5.67]  mean=   0.28% netUSD=$   0.536
+
+----------------------------------------------------------------------------------------------------
+ADVISORY ONLY — research confidence recovered for 123/218 (56%); async nearest-event, may mislabel.
+  confidence >=0.70      n= 75  win= 48.0% (p=0.817)  ROE med=  -0.69% [ -4.76,  2.11]  mean=   0.75% netUSD=$   2.898
+  confidence  <0.70      n= 48  win= 35.4% (p=0.061)  ROE med=  -3.83% [ -5.60, -0.64]  mean=  -0.78% netUSD=$  -2.814
+
+----------------------------------------------------------------------------------------------------
+exit reason mix (taker):
+   59  medROE=  -9.60%  max_loss
+   48  medROE=  10.54%  floor_breach
+   23  medROE=   1.52%  ignite_timeout
+   18  medROE=  -1.39%  stale_flat_timeout
+    1  medROE=  23.10%  hard_timeout
+
+====================================================================================================
+READING
+----------------------------------------------------------------------------------------------------
+  [no statistically separable edge] taker: aligned median 0.16% vs counter -4.31% (MWU p=0.368)
+  [no statistically separable edge] maker_shadow: aligned median -3.98% vs counter -4.05% (MWU p=0.382)
+  A positive OVERALL median with CI above 0 = the chain prints positive net expectancy
+  on real fills; trend-ALIGNED >> counter is the directional edge P0-A asks about.
+  Small per-cell n (esp. shorts/counter) means absence of significance is NOT proof of no edge.
+====================================================================================================
