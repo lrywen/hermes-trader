@@ -1550,7 +1550,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # filtering pico-cap noise a $200 print can move. Execution floor is
         # unchanged.
         "hip3_movers_floor_usd": 1_000_000.0,
-        "universe_sweep": 0,
+        # Audit 2026-10-20 (L1 scan deep-dive P0-a): rotating long-tail
+        # coverage. With universe_sweep=0 the picker only ever saw top-vol +
+        # same-day movers: ~72% of the 370 eligible markets were never scanned
+        # (single-day coverage ~33%), and 32 coins were scanned every cycle at
+        # a ~2% surface rate. 8 sweep slots rotate through the eligible pool
+        # (full pass ~ceil(370/8)=47 cycles) CARVED OUT OF the crypto-by-volume
+        # residual (25 -> 17) inside the max_markets=60 cap — the sweep block
+        # hard-caps total scan at 60, so HL's ~1200 weight/min budget is
+        # unaffected. Movers and the HIP-3 split are untouched.
+        "universe_sweep": 8,
         "batch_size": 20,
         "batch_sleep_sec": 0.3,
         "parallel_workers": 32,

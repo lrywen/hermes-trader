@@ -85,7 +85,7 @@ def test_r13_b9_individual_leaf_values_sentinel():
     assert b["max_markets_movers"] == 10
     assert b["movers_vol_floor_usd"] == 300_000.0
     assert b["hip3_movers_floor_usd"] == 1_000_000.0  # audit 2026-10-19: 50k->1M
-    assert b["universe_sweep"] == 0
+    assert b["universe_sweep"] == 8  # audit 2026-10-20 P0-a: rotating coverage, carved inside 60 cap
     assert b["batch_size"] == 20
     assert b["batch_sleep_sec"] == 0.3
     assert b["parallel_workers"] == 32

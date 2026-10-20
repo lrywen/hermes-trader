@@ -1082,7 +1082,7 @@ _SCAN_BUDGET_DEFAULTS: dict[str, Any] = {
     "max_markets_movers": 10,
     "movers_vol_floor_usd": 300_000.0,
     "hip3_movers_floor_usd": 1_000_000.0,  # audit 2026-10-19: 50k->1M, see config_defaults
-    "universe_sweep": 0,
+    "universe_sweep": 8,  # audit 2026-10-20 P0-a: rotating long-tail coverage, carved inside the 60 cap
     "batch_size": 20,
     "batch_sleep_sec": 0.3,
     "parallel_workers": 32,
@@ -1434,8 +1434,16 @@ def scan_once(
             return vol_pick, movers_pick
 
         if include_crypto and include_hip3:
+            # P0-a (audit 2026-10-20): reserve the rotating sweep slots out of
+            # the crypto-by-volume residual BEFORE it is computed, otherwise
+            # crypto_vol = M - hip3 - movers always absorbs the full budget
+            # (base == max_markets) and the sweep below has zero room. The sweep
+            # rotates long-tail coverage, so it carves from the static top-volume
+            # slots (2% surface rate), never from movers or the HIP-3 split.
+            sweep_reserve = max(0, int(budget.get("universe_sweep", 0) or 0))
             crypto_budget = max(0, max_markets - max_markets_hip3)
-            crypto_vol_budget = max(0, crypto_budget - max_markets_movers)
+            crypto_vol_budget = max(
+                0, crypto_budget - max_markets_movers - sweep_reserve)
             crypto = [m for m in eligible if not m.get("dex")]
             hip3 = [m for m in eligible if m.get("dex")]
             crypto_top, crypto_movers = _pick_with_movers(crypto, crypto_vol_budget,
@@ -1459,7 +1467,10 @@ def scan_once(
                 logger.info(f"[scan] HIP-3-movers: {sample}")
         else:
             pool = eligible
-            vol_budget = max(0, max_markets - max_markets_movers)
+            # P0-a: reserve sweep slots from the by-volume residual so rotation
+            # is carved inside the cap in single-class mode too.
+            sweep_reserve = max(0, int(budget.get("universe_sweep", 0) or 0))
+            vol_budget = max(0, max_markets - max_markets_movers - sweep_reserve)
             # Use the appropriate floor for the single-class mode.
             floor = hip3_movers_floor if include_hip3 else movers_vol_floor
             chosen, movers = _pick_with_movers(pool, vol_budget, max_markets_movers, floor)
@@ -1478,6 +1489,7 @@ def scan_once(
         # ~1200 weight/min budget. universe_sweep=0 disables (default).
         # R13-B9: resolved via scan_budget_params() above.
         sweep_n = int(budget["universe_sweep"])
+        ordered: list[dict[str, Any]] = []
         if sweep_n > 0 and eligible:
             global _sweep_offset
             sweep_pool = [
@@ -1489,19 +1501,43 @@ def scan_once(
             ordered = sorted(sweep_pool, key=lambda m: m.get("coin", ""))
             if not ordered:
                 logger.info("[scan] universe sweep: no markets above liquidity floor")
-                ordered = []
         if sweep_n > 0 and eligible and ordered:
             n = len(ordered)
             off = _sweep_offset % n
-            window = ordered[off:off + sweep_n]
-            if len(window) < sweep_n:                      # wrap-around
-                window += ordered[: sweep_n - len(window)]
+            # CARVE, DO NOT APPEND (audit 2026-10-20 P0-a): sweep rotates coverage
+            # INSIDE the max_markets cap. The previous `markets + added` appended
+            # on top of the ~60 bucket picks with no ceiling, so universe_sweep=8
+            # made a 68-market scan and blew HL's ~1200 weight/min budget. Room is
+            # whatever headroom the (possibly reduced) bucket budgets leave; the
+            # hard cap guarantees the scan count can never exceed max_markets.
+            room = max(0, int(max_markets) - len(markets))
+            take = min(sweep_n, room)
             have = {m["coin"] for m in markets}
-            added = [m for m in window if m.get("coin") not in have]
+            # Walk FORWARD around the rotating ring from a persistent cursor and
+            # take the next `take` coins not already bucket-picked (wrap at most
+            # once), then park the cursor just past the last position examined.
+            # Advancing by consumed ring positions (rather than a fixed window) is
+            # what makes coverage actually rotate when the early names are the
+            # static top-volume picks that are held every cycle.
+            added: list[dict[str, Any]] = []
+            j = off
+            steps = 0
+            while take > 0 and len(added) < take and steps < n:
+                cand = ordered[j % n]
+                if cand.get("coin") not in have:
+                    added.append(cand)
+                    have.add(cand["coin"])
+                j = (j + 1) % n
+                steps += 1
             markets = markets + added
-            _sweep_offset = (off + sweep_n) % n
-            logger.info(f"[scan] universe sweep: +{len(added)} new (offset {off}/{n}, "
-                        f"full coverage ~{(n + sweep_n - 1) // sweep_n} cycles)")
+            # Park at the next ring position after the walk; wrap-to-0 once a
+            # full pass completes so every market is seen on a stable cadence.
+            _sweep_offset = 0 if steps >= n else j
+            logger.info(
+                f"[scan] universe sweep: +{len(added)} new (requested {sweep_n}, "
+                f"room {room}, cursor {off}->{_sweep_offset}/{n}, "
+                f"full coverage ~{(n + sweep_n - 1) // sweep_n} cycles, "
+                f"total scan {len(markets)}/{max_markets})")
 
     # ── P1-2: Forager-inspired continuous coin selection ──────────────────
     # Rank the full eligible pool on one continuous score (turnover + momentum

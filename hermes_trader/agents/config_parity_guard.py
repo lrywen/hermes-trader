@@ -166,6 +166,11 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     # fail-safe 临时漂移——live 更宽只会多喂低流动候选（末端被风控门拒），不放宽
     # 任何资金保护；部署后经审计通道把 live 抬到 1M，届时此登记可删（两侧相等）。
     "scan_budget.hip3_movers_floor_usd": (1_000_000.0, 50_000),
+    # P0-a (2026-10-20)：canonical universe_sweep 0→8 开启全宇宙轮转覆盖
+    # （在 max_markets=60 内从 crypto-by-volume 残额切槽，不追加、不碰限流）。
+    # live 暂留 0（旧值，关闭轮转）——这只是"暂不扩大扫描视野"，不放宽任何资金/
+    # 流动性保护，反而是更保守的少扫。部署后经审计把 live 置 8，届时此登记可删。
+    "scan_budget.universe_sweep": (8, 0),
     # 生产调优权重/阈值（canonical 更严或非保护）
     "trigger_weights.trend_strength": (0.3, 0.55),
     "trigger_weights.uptrend_momentum": (0.2, 0),
