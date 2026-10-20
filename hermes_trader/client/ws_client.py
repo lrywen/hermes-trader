@@ -130,6 +130,41 @@ _TAPE_RAW_DIR = os.path.join(os.environ.get("HERMES_DATA_DIR", "/data"), "tape-r
 _TAPE_DEFAULT_COINS = ("BTC", "ETH")
 
 
+def _seed_hip3_ws_remap(info: Any) -> int:
+    """Add cached HIP-3 coin names to the SDK Info subscription-remap map.
+
+    The SDK builds ``Info.name_to_coin`` from the main-dex ``meta`` only. For
+    HIP-3 perpDex coins (``xyz:SKHX`` ...) the key is missing, so its
+    ``_remap_coin_subscription`` raises ``KeyError('xyz:X')`` before the
+    subscribe frame is sent — even though the public trades/l2Book WS feeds
+    accept those names. Populating the map as name -> name makes the SDK pass
+    the coin through unchanged and the frame actually go out.
+
+    Cache-only (no per-dex POSTs on the reconnect hot path) and fail-open:
+    returns the number of names added; any error is logged and returns 0, and
+    a still-missing coin later fails inside subscribe_trades/subscribe_book
+    exactly as before (logged, non-fatal).
+    """
+    try:
+        from hermes_trader.client.universe import hip3_coin_names
+        added = 0
+        existing = getattr(info, "name_to_coin", None)
+        if not isinstance(existing, dict):
+            return 0
+        for name in hip3_coin_names():
+            if name not in existing:
+                existing[name] = name
+                added += 1
+        if added:
+            logger.info(f"[ws] seeded {added} HIP-3 coin names into WS "
+                        f"subscription remap")
+        return added
+    except Exception as e:
+        logger.warning(f"[ws] HIP-3 WS remap seeding failed (non-fatal, "
+                       f"HIP-3 trade/orderflow feed will stay absent): {e}")
+        return 0
+
+
 class HLSSLOptWebsocketManager(WebsocketManager):
     """WebsocketManager that passes certifi SSL context to run_forever()."""
 
@@ -1207,6 +1242,16 @@ class HyperliquidWebSocket:
         except Exception as e:
             logger.error(f"[ws] Failed to create Info: {e}")
             raise
+
+        # HIP-3 (xyz:/km:/... perpDex) coins are absent from the main-dex
+        # ``meta`` above, so the SDK's Info.name_to_coin map lacks them. Its
+        # _remap_coin_subscription then raises KeyError('xyz:X') BEFORE the
+        # subscribe frame is sent — the public trades/l2Book WS feeds
+        # themselves accept namespaced coins fine. Seed the remap map from the
+        # cached HIP-3 meta (allow/block-filtered, no extra POSTs here) so the
+        # frame actually goes out. Fail-open: any lookup miss still raises
+        # inside subscribe_trades/subscribe_book, which already log+return False.
+        _seed_hip3_ws_remap(self._info)
 
         try:
             self._ws_manager = HLSSLOptWebsocketManager(self._info.base_url)

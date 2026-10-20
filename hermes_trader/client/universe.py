@@ -193,6 +193,42 @@ def list_hip3_dexes(force_refresh: bool = False) -> list[str]:
     return dexes
 
 
+def _allowed_hip3_dexes() -> list[str]:
+    """Registered HIP-3 dexes after the same allow/block filter the scanner
+    and account aggregator use (hip3_dex_allowlist / hip3_dex_blocklist)."""
+    dexes = list_hip3_dexes()
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        cfg = read_agent_config()
+    except Exception:
+        cfg = {}
+    allow = {d for d in (cfg.get("hip3_dex_allowlist") or []) if d}
+    block = {d for d in (cfg.get("hip3_dex_blocklist") or []) if d}
+    if allow:
+        dexes = [d for d in dexes if d in allow]
+    if block:
+        dexes = [d for d in dexes if d not in block]
+    return dexes
+
+
+def hip3_coin_names() -> list[str]:
+    """Namespaced HIP-3 perp coin names (e.g. ``xyz:SKHX``) for the dexes
+    the scanner actually uses, from the on-disk per-dex meta cache.
+
+    Used to populate the WS SDK ``Info.name_to_coin`` map so the SDK's
+    ``_remap_coin_subscription`` stops raising ``KeyError('xyz:...')`` before
+    the subscribe frame is even sent. Cache-only by design: the WS connect
+    path must not fan out one ``meta`` POST per dex on every reconnect. A
+    missing cache simply yields fewer names (the scanner refresh repopulates
+    it) and that coin's trade feed fails open as before.
+    """
+    names: list[str] = []
+    for dex in _allowed_hip3_dexes():
+        meta, _ctx, _fetched = _fetch_hip3_meta(dex, force_refresh=False)
+        names.extend(meta.keys())
+    return names
+
+
 def _fetch_hip3_meta(dex: str, force_refresh: bool = False) -> tuple[dict[str, Any], dict[str, Any], float]:
     """Fetch one HIP-3 perpDex universe + asset contexts, shape-compatible with `_fetch_perp_meta`.
 
