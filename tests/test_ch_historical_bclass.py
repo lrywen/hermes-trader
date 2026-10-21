@@ -91,3 +91,33 @@ def test_btc_regime_series_aligned(tmp_path):
     assert all(r in ("up", "down", "chop", "neutral") for _, r in out)
     ts = [a for a, _ in out]
     assert ts == sorted(ts)
+
+
+def test_regime_faithful_variant_mapping():
+    """Mirror ch_exit_param_grid_regime: a non_trend regime only moves on the
+    nontrend variants; a trend regime only moves on the trend variants. This
+    guards against accidentally applying protect to the wrong regime bucket."""
+    import dataclasses
+    from hermes_trader.agents.dsl_exit import ExitPolicy
+
+    def candidates(pol0, is_trend):
+        return {
+            "nontrend_1.0": dataclasses.replace(pol0, protect_pct=1.0)
+            if not is_trend else pol0,
+            "trend_1.5": dataclasses.replace(pol0, protect_pct=1.5)
+            if is_trend else pol0,
+            "both": dataclasses.replace(pol0, protect_pct=1.5 if is_trend else 1.0),
+        }
+
+    nontrend = candidates(ExitPolicy(protect_pct=1.5), is_trend=False)
+    trend = candidates(ExitPolicy(protect_pct=2.5), is_trend=True)
+
+    # non_trend: nontrend_1.0 changes to 1.0; trend variant is inert (stays 1.5)
+    assert nontrend["nontrend_1.0"].protect_pct == 1.0
+    assert nontrend["trend_1.5"].protect_pct == 1.5
+    assert nontrend["both"].protect_pct == 1.0
+    # trend: trend_1.5 moves 2.5->1.5; nontrend variant inert (stays 2.5)
+    assert trend["trend_1.5"].protect_pct == 1.5
+    assert trend["nontrend_1.0"].protect_pct == 2.5
+    assert trend["both"].protect_pct == 1.5
+

@@ -168,6 +168,69 @@ cooldown + max-concurrent), which the new front-loaded cooldown shadow record
    redundancy verdict to the new structured shadow stream / a gated sequential
    replay.
 
+## Addendum — regime-FAITHFUL re-test against the actual production policy
+
+The first grid varied protect against one neutral baseline (protect 1.5, stale
+90). Checking the live `/data/.agent-config.json` showed production actually
+**overlays per regime** via `overlay_regime_exit`, so that baseline was wrong:
+
+* `up`/`down` → trend_ride: **protect 2.5**, retrace 0.4, stops 4.0%/20 ROE,
+  stale **120**, hard 240
+* `chop`/`neutral` → non_trend: **protect 1.5**, stops 1.5%/15 ROE,
+  stale **60**, hard 120
+
+`ch_exit_param_grid_regime.py` rebuilds each signal's REAL policy from the live
+dsl block + its BTC-proxy regime and re-runs the paired grid (`ch_grid_regime_result.json`,
+8,264 entries; trend bucket n=4,298, non_trend n=3,966):
+
+| variant | overall med ROE | mean | win | arm | non_trend med / win | trend med / win |
+|---|---:|---:|---:|---:|---|---|
+| baseline (production) | −2.40 | −1.828 | 32.7% | 31.5% | −2.20 / 32.3% | −2.71 / 33.0% |
+| non_trend protect→1.0 | −2.28 | −1.701 | 34.2% | 37.6% | **−1.93 / 35.5%** | unchanged |
+| non_trend protect→0.75 | −2.19 | −1.634 | 35.2% | 41.2% | −1.71 / 37.6% | unchanged |
+| trend protect 2.5→1.5 | −2.23 | −1.671 | 34.0% | 40.3% | unchanged | **−2.27 / 35.6%** |
+| **combined (trend1.5 + nontrend1.0)** | **−2.09** | **−1.544** | **35.6%** | 46.4% | −1.93 / 35.5% | −2.27 / 35.6% |
+
+The improvement survives the corrected policy and appears in BOTH regimes:
+lowering protect converts stale-timeout cuts into floor_breach exits
+(overall stale 33.2%→26.6%, floor 11.0%→18.2%). Magnitude is modest —
+**+0.28pp mean ROE per 3x trade (~0.095% gross), +2.9pp win rate (~241 flipped
+trades / 31d)** — and **every arm is still net negative**.
+
+### Can trading behaviour be changed directly now? — NO (but a narrow, reversible exception)
+
+Evidence FOR a direct change: large paired sample (8,264, same entries), correct
+production regime policy, monotone in both regimes, exact mechanism, and the
+change is risk-REDUCING in intent (lock profit earlier), not a leverage/size
+increase.
+
+Evidence AGAINST flipping it straight into the binding LIVE exit:
+
+1. **The system is in SHADOW and unproven end-to-end; there is no LIVE capital
+   yet.** A protect_pct change cannot improve realised P&L until LIVE exists, and
+   SHADOW simulation is not fills.
+2. **Simulation fidelity gaps are largest exactly where this knob acts.**
+   protect/arm/floor outcomes depend on sub-15m path, wick vs floor timing, and
+   the oracle index confirmation; the replay feeds two ticks/bar (adverse first)
+   and approximates fills. bar-MFE is an upper bound vs real floor execution, so
+   the "would have armed earlier" rate can be overstated. The +0.28pp/trade edge
+   is well inside plausible fill-model error.
+3. **It does not fix the NO-GO cause.** Best case leaves the strategy mean
+   −1.54%/trade net negative; tuning the exit while entries are negative is
+   polishing the leak, not the source.
+4. **Real tagged fills for the arms are still <5.** The whole P0 instrumentation
+   rationale was that these decisions should be made on realised exits.
+
+**Recommended path (reversible, no LIVE risk):**
+land protect_pct as a SHADOW-ONLY config A/B using the per-exit shadow writer
+already deployed — run TWO shadow policies (production vs trend1.5/nontrend1.0)
+on the same live signals and compare REAL tagged exit outcomes for ~2–4 weeks
+(the dual-policy evaluation is simulation-free because both arms observe actual
+market prints; only fills are paper). Promote to LIVE only if the real-outcome
+arm reproduces the direction. Do not edit the binding exit before that. This
+keeps "evidence before behaviour change" while no longer waiting passively.
+
+
 ## Reproduce
 
 ```
