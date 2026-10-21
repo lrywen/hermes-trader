@@ -14,6 +14,7 @@ import re
 import threading
 import time
 import uuid
+from functools import wraps
 from typing import Any, Callable, NamedTuple, Optional
 
 from hyperliquid.utils.types import Cloid
@@ -5455,7 +5456,99 @@ def _drop_client_forming(candles, interval):
     return closed_candles_only(candles, interval)
 
 
+def _runner_gate_fresh_src(*, breakout: bool, recent_breakout: bool,
+                           volume: bool, burst_for_side: bool,
+                           score: float, min_score: float) -> str:
+    """Provenance of the ``fresh_impulse`` OR (A3 observability).
+
+    Mirrors the SAME precedence as the ``fresh_impulse`` expression so the JSONL
+    record says WHICH leg fired (brk | recent_brk | vol_burst | burst_score),
+    instead of logging only a 0/1. Pure read-only labelling; never changes the
+    gate decision. Returns "" when fresh_impulse is False.
+    """
+    if breakout:
+        return "brk"
+    if recent_breakout:
+        return "recent_brk"
+    if volume and burst_for_side:
+        return "vol_burst"
+    if burst_for_side and score >= min_score:
+        return "burst_score"
+    return ""
+
+
+# A3/P0 observability (2026-10-21 redundancy plan): the runner gate evaluates
+# ~14 sub-rules but only emits free-text logs, so attribution required regex-
+# parsing production logs. This thread-local carries the per-evaluation feature
+# vector (fresh_src + trigger flags) from inside the impl to the recording
+# wrapper, which writes ONE structured JSONL verdict per evaluation. It changes
+# no return value and no threshold; a write failure is best-effort.
+_runner_gate_ctx = threading.local()
+
+_RUNNER_GATE_SHADOW_FILE = os.environ.get(
+    "HERMES_RUNNER_GATE_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/runner_gate_shadow.jsonl"),
+)
+
+
+def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None:
+    """Append one structured runner-gate verdict. Best-effort, never raises.
+
+    ``decision`` is the raw impl result ("" admitted, str blocked, None for the
+    disabled-gate / non-long-short short-circuit). Feature fields are read from
+    the per-evaluation thread-local the impl populated; missing values degrade
+    to None rather than failing.
+    """
+    try:
+        feats = getattr(_runner_gate_ctx, "feats", None) or {}
+        if decision is None:
+            admitted = None  # gate disabled / not evaluated
+            rule = "not_evaluated"
+        else:
+            admitted = (decision == "")
+            rule = "" if admitted else str(decision)
+        rec = {
+            "ts": int(time.time() * 1000),
+            "coin": analysis.get("coin") or "",
+            "side": (analysis.get("side") or "").lower(),
+            "admitted": admitted,
+            "rule": rule,
+            "composite_score": feats.get("score"),
+            "min_composite": feats.get("min_score"),
+            "confidence": feats.get("gate_conf"),
+            "min_confidence": feats.get("min_conf"),
+            "slow_burn_count": feats.get("slow_count"),
+            "fresh_impulse": feats.get("fresh_impulse"),
+            "fresh_src": feats.get("fresh_src", ""),
+            "vol": feats.get("volume"),
+            "brk": feats.get("breakout"),
+            "burst": feats.get("burst"),
+            "dMover": feats.get("daily_mover"),
+            "up": feats.get("uptrend"),
+            "down": feats.get("downtrend"),
+            "whale": feats.get("whale"),
+            "forced": feats.get("forced"),
+            "is_hip3": ":" in str(analysis.get("coin") or ""),
+        }
+        from hermes_trader.shadow_log import append_jsonl
+        append_jsonl(_RUNNER_GATE_SHADOW_FILE, rec, stream="runner_gate")
+    except Exception as _rg_rec_e:  # never break the trade path
+        logger.debug("[runner_gate] structured record failed: %s", _rg_rec_e)
+
+
 def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any]) -> str:
+    @wraps(_runner_entry_block_reason_impl)
+    def _wrapped(analysis: dict[str, Any], config: dict[str, Any]) -> str:
+        # Ensure no stale feature vector leaks from a previous evaluation on a
+        # re-entrant / reused thread.
+        _runner_gate_ctx.feats = None
+        decision = _runner_entry_block_reason_impl(analysis, config)
+        _record_runner_gate_verdict(analysis, decision)
+        return decision
+    return _wrapped(analysis, config)
+
+
+def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, Any]) -> str:
     """Block entries that are not fresh runner setups.
 
     The live ledger's repeated loss mode is not "no runners exist"; it is broad
@@ -5609,6 +5702,35 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         except Exception:
             pass
 
+    # A3: WHICH fresh_impulse leg fired (same precedence as the OR above),
+    # accounting for a terminal-burst veto that forced fresh_impulse back off.
+    fresh_src = _runner_gate_fresh_src(
+        breakout=breakout, recent_breakout=recent_breakout, volume=volume,
+        burst_for_side=burst_for_side, score=score, min_score=min_score,
+    ) if fresh_impulse else ""
+
+    # Snapshot the feature vector for the recording wrapper (best-effort JSONL).
+    try:
+        _runner_gate_ctx.feats = {
+            "score": round(float(score), 3),
+            "min_score": float(min_score),
+            "gate_conf": round(float(gate_conf), 4),
+            "min_conf": float(min_conf),
+            "slow_count": int(slow_count),
+            "fresh_impulse": bool(fresh_impulse),
+            "fresh_src": fresh_src,
+            "volume": bool(volume),
+            "breakout": bool(breakout),
+            "burst": bool(burst),
+            "daily_mover": bool(daily_mover),
+            "uptrend": bool(uptrend),
+            "downtrend": bool(downtrend),
+            "whale": bool(whale),
+            "forced": bool(forced),
+        }
+    except Exception:
+        _runner_gate_ctx.feats = None
+
     logger.info(
         f"[runner_gate] {coin} side={side} conf={gate_conf:.2f}/{min_conf:.2f} "
         f"score={score:.1f}/{min_score:.0f} slow={slow_count} | "
@@ -5616,6 +5738,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         f"{('/'+burst_dir) if burst_dir else ''} "
         f"dMover={int(daily_mover)} up={int(uptrend)} down={int(downtrend)} "
         f"whale={int(whale)} forced={int(forced)} → fresh_impulse={int(fresh_impulse)}"
+        f"{('/'+fresh_src) if fresh_src else ''}"
     )
 
     if gate_conf < min_conf:

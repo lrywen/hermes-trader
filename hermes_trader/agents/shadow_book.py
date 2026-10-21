@@ -492,6 +492,35 @@ def _migrate_payload(payload: dict[str, Any]) -> dict[str, Any]:
 # the book
 # ---------------------------------------------------------------------------
 
+def _tracker_policy_snapshot(tracker: Any) -> dict[str, Any]:
+    """Read-only snapshot of the EFFECTIVE exit policy a DSLTracker ran.
+
+    L5 observability (2026-10-21 redundancy plan): the configured regime clocks
+    (stale 60/120, hard 120/240) and fixed ignite grace are only knowable from
+    the live policy object, so pin the handful of clock/stop knobs onto the
+    close fill for regime/clock-split reconciliation. Best-effort; any missing
+    attribute degrades to None and this never raises into the close path.
+    """
+    try:
+        pol = getattr(tracker, "policy", None)
+        if pol is None:
+            return {}
+        lev = int(getattr(tracker, "leverage", 1) or 1)
+        snap = {
+            "leverage": lev,
+            "entry_atr_pct": round(float(getattr(tracker, "entry_atr_pct", 0.0) or 0.0), 4),
+            "protect_pct": getattr(pol, "protect_pct", None),
+            "max_loss_pct": getattr(pol, "max_loss_pct", None),
+            "max_loss_roe_pct": getattr(pol, "max_loss_roe_pct", None),
+            "hard_timeout_minutes": getattr(pol, "hard_timeout_minutes", None),
+            "stale_flat_timeout_minutes": getattr(pol, "stale_flat_timeout_minutes", None),
+            "ignite_grace_minutes": getattr(pol, "ignite_grace_minutes", None),
+        }
+        return snap
+    except Exception:
+        return {}
+
+
 class ShadowBook:
     """In-process singleton wrapping the two virtual accounts + DSL trackers."""
 
@@ -1053,7 +1082,8 @@ class ShadowBook:
                         reason: str, hold_min: float = 0.0,
                         mfe_pct: float = 0.0,
                         gap_spot_pct: float = 0.0,
-                        gap_capped: bool = False) -> dict[str, Any]:
+                        gap_capped: bool = False,
+                        policy_snapshot: Optional[dict[str, Any]] = None) -> dict[str, Any]:
         """Book a virtual close + realized PnL. Fee uses the account's口径."""
         acc = self._account(acct)
         coin = pos["coin"]
@@ -1101,6 +1131,11 @@ class ShadowBook:
             "reason": reason or "",
             "hold_minutes": round(hold_min, 2),
             "mfe_pct": round(mfe_pct, 4),
+            # L5 observability (2026-10-21 redundancy plan): pin the EFFECTIVE
+            # exit policy the DSL tracker actually ran, so realized exits can be
+            # split by regime/clock without guessing from dates. Pure attribution;
+            # does not touch PnL or the exit decision.
+            "exit_policy": dict(policy_snapshot or {}),
             "fill_model": acct,
             "entry_regime": pos.get("entry_regime", ""),
             "analysis_id": pos.get("analysis_id", ""),
@@ -1215,7 +1250,8 @@ class ShadowBook:
                             acct, pos, fill_px, reason or "dsl_exit",
                             hold_min=hold_min, mfe_pct=mfe,
                             gap_spot_pct=gap_spot_pct,
-                            gap_capped=gap_capped))
+                            gap_capped=gap_capped,
+                            policy_snapshot=_tracker_policy_snapshot(tracker)))
                     else:
                         if side == "long":
                             upct = (mark - float(pos["entry_px"])) / float(pos["entry_px"]) * 100.0
@@ -1266,7 +1302,10 @@ class ShadowBook:
                     continue
                 px = float(exit_px) if exit_px else float(p.get("mark_px") or p["entry_px"])
                 hold = (time.time() - float(p["opened_at"]) / 1000.0) / 60.0
-                fill = self._close_position("taker", p, px, reason, hold_min=hold)
+                _trk = self._trackers.get(("taker", self._key(p["coin"], p["side"])))
+                fill = self._close_position(
+                    "taker", p, px, reason, hold_min=hold,
+                    policy_snapshot=_tracker_policy_snapshot(_trk))
                 self._save(force=True)
                 return fill
         return None
