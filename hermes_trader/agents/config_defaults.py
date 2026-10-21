@@ -179,6 +179,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     "max_crypto_long_correlated": 2,
     "min_market_volume_usd": 5_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
     "min_hip3_volume_usd": 5_000_000.0,    # F4: float per schema (supplemental audit 2026-08-31)
+    # A4 (2026-10-21): DORMANT under allow_shorts=false, not unconsumed — it is
+    # the short_liquidity gate's floor (risk_gates builds that gate every run)
+    # and is referenced by schema / config_parity_guard / MCP. Removing it would
+    # silently collapse the short liquidity floor to 0. Keep.
     "min_short_volume_usd": 50_000_000.0,  # F4: float per schema (supplemental audit 2026-08-31)
     "coin_allowlist": [],
     "coin_blocklist": ["TON", "TRX"],
@@ -342,6 +346,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # default is False — arming it is an explicit operator decision (and is
     # caught by the FORBIDDEN_OVERRIDE config gate).
     "ta_sidestep_force_execute": False,
+    # A4 (2026-10-21): NON-BINDING, not unconsumed — executor reads it at the
+    # ta-sidestep branch, but 99 is above any realistic slow_burn_count so the
+    # sidestep path is effectively disabled in prod. Lower the value to arm it;
+    # do not delete the key.
     "ta_sidestep_min_slow_burn_count": 99,
     "force_execute_slow_burn_count": 2,
     "conviction_sizing": False,
@@ -454,6 +462,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_confidence": 0.60,
         "min_composite": 45.0,
         "min_hip3_composite": 50.0,
+        # A4 (2026-10-21 redundancy plan): DORMANT, not dead. The two short
+        # bars below are consumed in executor._runner_entry_block_reason
+        # (short confidence / short composite), but only AFTER the allow_shorts
+        # early-return, so with allow_shorts=false (current prod) they are
+        # unreachable. They become live the moment shorts are re-enabled, so do
+        # NOT delete them as "unconsumed keys".
         "min_short_confidence": 0.72,
         "min_short_composite": 45.0,
         "mover_min_confidence": 0.72,
@@ -1563,6 +1577,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "batch_size": 20,
         "batch_sleep_sec": 0.3,
         "parallel_workers": 32,
+        # A4 (2026-10-21): NON-BINDING, not unconsumed — perception's mover
+        # picker filters `abs(24h pct) >= movers_min_pct`, but selected movers
+        # actually moved +8.7%~+19.4% in the measured window, so 1.0 never
+        # rejects anything. It is a live filter with a positive-floor guard;
+        # raise it to tighten mover selection, do not delete the key.
         "movers_min_pct": 1.0,
         "future_timeout_sec": 60,
     },

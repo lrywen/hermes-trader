@@ -31,7 +31,8 @@ from typing import Any, Optional
 _SLIM_FIELDS = (
     "coin", "verdict", "confidence", "side", "entry_px", "stop_px", "tp_px",
     "created_at", "composite_score", "regime", "analyst_model",
-    "debate_used", "ai_down", "nlp_parsed", "json_parsed", "degraded",
+    "debate_used", "debate_state", "ai_down", "nlp_parsed", "json_parsed",
+    "degraded",
     "perception_id",
 )
 

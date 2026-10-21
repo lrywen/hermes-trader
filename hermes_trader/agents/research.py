@@ -2138,9 +2138,18 @@ def _debate_metric(
 def _debate_research(
     coin: str, ctx_msg: str, perception: dict[str, Any], *, atr_abs: Optional[float],
     config: Optional[dict[str, Any]] = None,
+    reason_holder: Optional[dict[str, str]] = None,
 ) -> Optional[dict[str, Any]]:
     """Run bull/bear in parallel, then synthesize. Returns mapped fields or
-    None on any failure/timeout so the caller falls back to the single path."""
+    None on any failure/timeout so the caller falls back to the single path.
+
+    A3 (2026-10-21 redundancy plan): when ``reason_holder`` is provided and the
+    debate degrades to None, the concrete fallback reason is written into
+    ``reason_holder["reason"]`` (bull_bear_failed / synth_failed / synth_empty)
+    so the caller can persist a three-state debate marker on the analysis
+    record instead of the ~55% silent degradation being indistinguishable from
+    "debate disabled". Observation-only; never changes routing.
+    """
     dcfg = _debate_cfg()
     ttl = dcfg["cache_ttl_s"]
     now = time.time()
@@ -2209,6 +2218,8 @@ def _debate_research(
             {"stage": "bull_bear", "outcome": "failed"}, max(0.0, time.time() - bb_start),
         )
         _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "bull_bear_failed"})
+        if reason_holder is not None:
+            reason_holder["reason"] = "bull_bear_failed"
         return None
 
     bb_elapsed = int((time.time() - bb_start) * 1000)
@@ -2249,6 +2260,8 @@ def _debate_research(
             {"stage": "synth", "outcome": "failed"}, max(0.0, time.time() - synth_start),
         )
         _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "synth_failed"})
+        if reason_holder is not None:
+            reason_holder["reason"] = "synth_failed"
         return None
 
     if not sv:
@@ -2261,6 +2274,8 @@ def _debate_research(
             {"stage": "synth", "outcome": "empty"}, max(0.0, time.time() - synth_start),
         )
         _debate_metric("inc", "DEBATE_FALLBACKS", {"reason": "synth_empty"})
+        if reason_holder is not None:
+            reason_holder["reason"] = "synth_empty"
         return None
 
     _debate_metric(
@@ -2468,7 +2483,9 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
                     as_of_date: Optional[str],
                     fired_names: set,
                     tf1h: dict[str, Any], tf4h: dict[str, Any],
-                    c1h: list[Any]) -> dict[str, Any]:
+                    c1h: list[Any],
+                    debate_state: str = "disabled",
+                    debate_fallback_reason: str = "") -> dict[str, Any]:
     """Assemble the persisted analysis record from the researched verdict.
 
     Pure assembly — every field is carried verbatim from the parsed verdict,
@@ -2508,6 +2525,13 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "degraded": "[DEGRADED" in (ai_text or ""),
         # Native multi-perspective debate provenance (replaces external HTA).
         "debate_used": debate_used,
+        # A3 (2026-10-21): explicit three-state marker so an enabled-but-degraded
+        # debate (debate_used=False) is distinguishable from a disabled one.
+        # debate_fallback=True only on the enabled→single-LLM degradation path.
+        "debate_state": debate_state,
+        "debate_fallback": debate_state == "fallback",
+        "fallback_reason": (debate_fallback_reason
+                            if debate_state == "fallback" else ""),
         "structured": bool(parsed.get("structured")),
         "conviction": parsed.get("conviction"),
         "bull_case": parsed.get("bull_case", ""),
@@ -2776,6 +2800,12 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     dcfg = _debate_cfg()
     parsed: Optional[dict[str, Any]] = None
     debate_used = False
+    # A3: three-state debate provenance persisted on the analysis record —
+    # "disabled" / "succeeded" / "fallback" (plus debate_fallback +
+    # fallback_reason). Previously an enabled-but-degraded debate was
+    # indistinguishable from a disabled one (~55% of attempts timed out).
+    debate_state = "disabled"
+    debate_fallback_reason = ""
     if dcfg["enabled"]:
         logger.info(
             f"[debate] research() entry ENABLED | coin={coin} trace_id={trace_id} "
@@ -2785,9 +2815,11 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         # Audit 2026-09-06 (C13): tag LLM-stage failures (stage="llm") so the
         # HTTP error payload distinguishes debate/completion failures from
         # prefetch (candles/funding/news) failures.
+        _debate_why: dict[str, str] = {}
         try:
             debate_fields = _debate_research(
-                coin, user_message, perception, atr_abs=_atr_4h, config=config
+                coin, user_message, perception, atr_abs=_atr_4h, config=config,
+                reason_holder=_debate_why,
             )
         except Exception as _e:
             if not getattr(_e, "research_stage", None):
@@ -2796,14 +2828,17 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         if debate_fields is not None:
             parsed = debate_fields
             debate_used = True
+            debate_state = "succeeded"
             logger.info(
                 f"[debate] research() debate SUCCEEDED | coin={coin} "
                 f"verdict={parsed.get('verdict')} side={parsed.get('side')}"
             )
         else:
+            debate_state = "fallback"
+            debate_fallback_reason = _debate_why.get("reason", "unknown")
             logger.warning(
                 f"[debate] research() debate returned None → single-LLM fallback | "
-                f"coin={coin}"
+                f"coin={coin} reason={debate_fallback_reason}"
             )
     else:
         logger.debug(
@@ -2852,6 +2887,8 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         as_of_date=as_of_date,
         fired_names=fired_names,
         tf1h=tf1h, tf4h=tf4h, c1h=c1h_closed,
+        debate_state=debate_state,
+        debate_fallback_reason=debate_fallback_reason,
     )
 
     memory.record_analysis(analysis)

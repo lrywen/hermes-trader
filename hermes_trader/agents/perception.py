@@ -973,6 +973,13 @@ def _scan_single_market(
             logger.debug(f"[sigma-burst] eval failed for "
                          f"{market.get('coin', '?')} (fail-open): {_sb_e}")
             sigma_burst_bypass = False
+        # A7 (2026-10-21 redundancy plan): the configured scan.minCompositeScore
+        # (prod 54) is NOT the real selector. It only gates the residual
+        # score-only path — in the 2026-10-21 12.2h window just 0.3% of surfaced
+        # coins cleared 54 on score alone, while ~82% entered via trend_bypass
+        # above (which deliberately ignores score). Do not read this gate as the
+        # entry bar. trend_bypass is reversible via trend_surface_enabled; its
+        # go/no-go is decided by PIT forward-return buckets (plan C1), not here.
         if (score < min_score and not burst_fired and not whale_bypass
                 and not trend_bypass and not pattern_bypass and not daily_mover_bypass
                 and not sigma_burst_bypass):
