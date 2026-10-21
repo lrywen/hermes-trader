@@ -5485,26 +5485,36 @@ def _runner_gate_fresh_src(*, breakout: bool, recent_breakout: bool,
 # no return value and no threshold; a write failure is best-effort.
 _runner_gate_ctx = threading.local()
 
-def _default_runner_gate_shadow_file() -> str:
-    """runner-gate 结构化归因日志的落盘路径。
+def _default_shadow_log_path(env_name: str, filename: str) -> str:
+    """Resolve a best-effort shadow-attribution JSONL path.
 
-    A1 (2026-10-21 redundancy plan): 默认写入持久卷 ``${HERMES_DATA_DIR:-/data}``
-    而非 HOME——HOME 在容器重建时会丢，导致归因数据无法跨重建积累
-    （2026-10-21 03:53 重建已丢过一次）。显式 ``HERMES_RUNNER_GATE_SHADOW_FILE``
-    仍最高优先；数据目录不可写时回退 HOME，保证记录 best-effort 不打断交易路径。
+    A1/A1b (2026-10-21 redundancy plan): default onto the persistent volume
+    ``${HERMES_DATA_DIR:-/data}`` rather than HOME. In the deployed container
+    ``~/.hermes-trading`` is a READ-ONLY bind mount, so a shadow arm whose
+    default points there silently collects zero records (every append raises
+    Errno 30 and is swallowed by the best-effort logger). The explicit env
+    override wins; when the data dir is absent/unwritable (local dev/tests),
+    fall back to the legacy HOME path so recording never breaks the trading
+    path.
     """
-    explicit = os.environ.get("HERMES_RUNNER_GATE_SHADOW_FILE")
+    explicit = os.environ.get(env_name)
     if explicit:
         return explicit
     data_dir = os.environ.get("HERMES_DATA_DIR") or "/data"
-    candidate = os.path.join(data_dir, "runner_gate_shadow.jsonl")
+    candidate = os.path.join(data_dir, filename)
     try:
         if os.path.isdir(data_dir) and os.access(data_dir, os.W_OK):
             return candidate
     except OSError:
         pass
     # 本地/测试环境无 /data 或不可写 → 回退旧的 HOME 路径。
-    return os.path.expanduser("~/.hermes-trading/runner_gate_shadow.jsonl")
+    return os.path.expanduser(os.path.join("~/.hermes-trading", filename))
+
+
+def _default_runner_gate_shadow_file() -> str:
+    """runner-gate 结构化归因日志的落盘路径。"""
+    return _default_shadow_log_path(
+        "HERMES_RUNNER_GATE_SHADOW_FILE", "runner_gate_shadow.jsonl")
 
 
 _RUNNER_GATE_SHADOW_FILE = _default_runner_gate_shadow_file()
@@ -5695,9 +5705,13 @@ def _record_per_coin_cooldown_shadow(analysis: dict[str, Any],
                      _pc_rec_e)
 
 
-_PER_COIN_COOLDOWN_SHADOW_FILE = os.environ.get(
+# A1b (2026-10-21): same read-only-HOME fix as runner_gate — default onto the
+# persistent /data volume so the per-coin cooldown counterfactual actually
+# persists in the deployed container (the HOME default silently collected zero
+# records against the read-only ~/.hermes-trading bind mount).
+_PER_COIN_COOLDOWN_SHADOW_FILE = _default_shadow_log_path(
     "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/per_coin_cooldown_shadow.jsonl"),
+    "per_coin_cooldown_shadow.jsonl",
 )
 
 

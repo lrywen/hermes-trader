@@ -40,6 +40,65 @@ def test_a1_falls_back_to_home_when_data_dir_missing(monkeypatch, tmp_path):
     assert ".hermes-trading" in out
 
 
+# ── A1b: per-coin cooldown shadow path uses the same /data resolver ───────
+
+def test_a1b_per_coin_explicit_env_wins(monkeypatch, tmp_path):
+    explicit = tmp_path / "pc.jsonl"
+    monkeypatch.setenv("HERMES_PER_COIN_COOLDOWN_SHADOW_FILE", str(explicit))
+    monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path / "data"))
+    assert executor._PER_COIN_COOLDOWN_SHADOW_FILE is not None
+    assert executor._default_shadow_log_path(
+        "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
+        "per_coin_cooldown_shadow.jsonl") == str(explicit)
+
+
+def test_a1b_per_coin_uses_writable_data_dir(monkeypatch, tmp_path):
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.delenv("HERMES_PER_COIN_COOLDOWN_SHADOW_FILE", raising=False)
+    monkeypatch.setenv("HERMES_DATA_DIR", str(data))
+    out = executor._default_shadow_log_path(
+        "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
+        "per_coin_cooldown_shadow.jsonl")
+    assert out == str(data / "per_coin_cooldown_shadow.jsonl")
+
+
+def test_a1b_per_coin_falls_back_to_home(monkeypatch, tmp_path):
+    monkeypatch.delenv("HERMES_PER_COIN_COOLDOWN_SHADOW_FILE", raising=False)
+    monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path / "nope"))
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    out = executor._default_shadow_log_path(
+        "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
+        "per_coin_cooldown_shadow.jsonl")
+    assert out.endswith("per_coin_cooldown_shadow.jsonl")
+    assert ".hermes-trading" in out
+
+
+def test_a1b_per_coin_recorder_writes_resolved_data_path(monkeypatch, tmp_path):
+    """End-to-end: with a writable HERMES_DATA_DIR and no override, the
+    per-coin cooldown counterfactual is actually appended under /data rather
+    than the read-only HOME bind mount (the production zero-collection bug)."""
+    import json as _json
+    data = tmp_path / "data"
+    data.mkdir()
+    monkeypatch.setenv("HERMES_DATA_DIR", str(data))
+    monkeypatch.delenv("HERMES_PER_COIN_COOLDOWN_SHADOW_FILE", raising=False)
+    target = executor._default_shadow_log_path(
+        "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
+        "per_coin_cooldown_shadow.jsonl")
+    monkeypatch.setattr(executor, "_PER_COIN_COOLDOWN_SHADOW_FILE", target)
+    cfg = {"runner_entry_gate": {"per_coin_cooldown": {
+        "shadow_mode": True, "window_hours": 24, "repeat_min_composite": 45,
+        "max_consecutive_losses": 2}}}
+    executor._record_per_coin_cooldown_shadow(
+        {"coin": "ZZZ", "side": "long", "composite_score": 50.0,
+         "confidence": 0.9}, cfg)
+    rows = _json.loads((data / "per_coin_cooldown_shadow.jsonl").read_text()
+                       .splitlines()[-1])
+    assert rows["coin"] == "ZZZ"
+    assert rows["side"] == "long"
+
+
 # ── A2: "already open" skip is INFO, not DEBUG ────────────────────────────
 
 def test_a2_already_open_logged_at_info():
