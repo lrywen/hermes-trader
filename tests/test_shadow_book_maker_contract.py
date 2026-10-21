@@ -365,3 +365,154 @@ def test_maker_stats_aggregate_adverse_selection(tmp_path, monkeypatch):
     assert sel["fill_rate_pct"] == 100.0
     assert sel["avg_maker_edge_bps"] is not None
     assert sel["avg_resting_bars"] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# deferred post-fill drift backfill (2026-10-21): a fill on the most recent
+# bar has no next-bar mid yet; the metric is parked in pending_drift and
+# backfilled on a later cycle. Statistics only — never touches price/PnL.
+# ---------------------------------------------------------------------------
+
+def _book_with_pending_drift(tmp_path, monkeypatch, coin, side, fill_px,
+                             fill_bar_t, now_ms):
+    _patch_cfg(monkeypatch)
+    monkeypatch.setattr(sb, "_now_ms", lambda: now_ms)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    with book._lock:
+        order = {"coin": coin, "side": side, "size_usd": 1000.0,
+                 "leverage": 1, "entry_atr_pct": 0.0, "entry_regime": "",
+                 "analysis_id": "a1", "signal_meta": {}}
+        # fill with NO drift / fill_bar_t -> the fill parks a pending_drift row
+        f = book._fill_maker_order(order, fill_px, fill_bar_t, selection={})
+    return book, f
+
+
+def test_drift_backfilled_on_later_cycle(tmp_path, monkeypatch):
+    fill_t = _T0 - 10 * 60_000
+    now_ms = fill_t + 2 * 60_000  # within the 3-bar wait window, target closed
+    book, f = _book_with_pending_drift(
+        tmp_path, monkeypatch, "BTC", "long", 99.95, fill_t, now_ms)
+    acc = book.state["accounts"]["maker_shadow"]
+    assert len(acc["pending_drift"]) == 1
+    assert f["post_fill_mid_drift_bps"] is None
+
+    # next bar (fill_t+60s) closed; mid dips to (99.90+99.80)/2 = 99.85 ->
+    # buy-side adverse drift = (99.95-99.85)/99.95 ~ +10bps.
+    bars = [Candle(t=fill_t, o=100.0, h=100.0, l=99.90, c=99.96, v=1.0),
+            Candle(t=fill_t + 60_000, o=99.96, h=99.90, l=99.80, c=99.85, v=1.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    with book._lock:
+        book._resolve_pending_drift()
+
+    assert acc["pending_drift"] == []
+    assert f["post_fill_mid_drift_bps"] is not None
+    assert f["post_fill_mid_drift_bps"] > 0
+    # price/PnL fields are untouched by the statistics backfill
+    assert f["price"] == 99.95
+    assert f["notional_usd"] == 1000.0
+
+
+def test_drift_waits_while_next_bar_still_forming(tmp_path, monkeypatch):
+    fill_t = _T0 - 10 * 60_000
+    # "now" is exactly the target bar's close boundary minus 1ms: bar exists
+    # in the window but has not closed -> must stay pending.
+    now_ms = fill_t + 60_000 - 1
+    book, f = _book_with_pending_drift(
+        tmp_path, monkeypatch, "BTC", "long", 99.95, fill_t, now_ms)
+    bars = [Candle(t=fill_t, o=100.0, h=100.0, l=99.90, c=99.96, v=1.0),
+            Candle(t=fill_t + 60_000, o=99.96, h=99.99, l=99.90, c=99.95, v=1.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    with book._lock:
+        book._resolve_pending_drift()
+    acc = book.state["accounts"]["maker_shadow"]
+    assert len(acc["pending_drift"]) == 1
+    assert f["post_fill_mid_drift_bps"] is None
+
+
+def test_drift_abandoned_after_deadline(tmp_path, monkeypatch):
+    fill_t = _T0 - 10 * 60_000
+    now_ms = fill_t + (sb._MAKER_DRIFT_WAIT_BARS + 1) * 60_000
+    book, f = _book_with_pending_drift(
+        tmp_path, monkeypatch, "BTC", "long", 99.95, fill_t, now_ms)
+    called = {"n": 0}
+    def _fetch(*a, **k):
+        called["n"] += 1
+        return []
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles", _fetch)
+    with book._lock:
+        book._resolve_pending_drift()
+    acc = book.state["accounts"]["maker_shadow"]
+    assert acc["pending_drift"] == []      # dropped, queue cannot grow
+    assert f["post_fill_mid_drift_bps"] is None
+    assert called["n"] == 0                # deadline path skips the fetch
+
+
+def test_drift_fetch_miss_keeps_pending(tmp_path, monkeypatch):
+    fill_t = _T0 - 10 * 60_000
+    now_ms = fill_t + 2 * 60_000
+    book, f = _book_with_pending_drift(
+        tmp_path, monkeypatch, "BTC", "long", 99.95, fill_t, now_ms)
+    def _boom(*a, **k):
+        raise RuntimeError("cache miss")
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles", _boom)
+    with book._lock:
+        book._resolve_pending_drift()
+    acc = book.state["accounts"]["maker_shadow"]
+    assert len(acc["pending_drift"]) == 1  # retried next cycle
+    assert f["post_fill_mid_drift_bps"] is None
+
+
+def test_drift_pending_survives_reload(tmp_path, monkeypatch):
+    fill_t = _T0 - 2 * 60_000
+    path = str(tmp_path / "s.json")
+    now_ms = _T0  # 2 min after fill, still inside the 3-bar wait window
+    _patch_cfg(monkeypatch)
+    monkeypatch.setattr(sb, "_now_ms", lambda: now_ms)
+    book = sb.ShadowBook(path=path)
+    with book._lock:
+        order = {"coin": "BTC", "side": "long", "size_usd": 1000.0,
+                 "leverage": 1, "entry_atr_pct": 0.0, "entry_regime": "",
+                 "analysis_id": "a1", "signal_meta": {}}
+        book._fill_maker_order(order, 99.95, fill_t, selection={})
+        book._save(force=True)
+
+    # new process (same fake clock): pending_drift reloads and is backfilled
+    book2 = sb.ShadowBook(path=path)
+    acc = book2.state["accounts"]["maker_shadow"]
+    assert len(acc["pending_drift"]) == 1
+    bars = [Candle(t=fill_t, o=100.0, h=100.0, l=99.90, c=99.96, v=1.0),
+            Candle(t=fill_t + 60_000, o=99.96, h=99.90, l=99.80, c=99.85, v=1.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    with book2._lock:
+        book2._resolve_pending_drift()
+    of = [x for x in acc["fills"] if x["type"] == "open"][0]
+    assert acc["pending_drift"] == []
+    assert of["post_fill_mid_drift_bps"] is not None and of["post_fill_mid_drift_bps"] > 0
+
+
+def test_immediate_drift_does_not_queue_pending(tmp_path, monkeypatch):
+    """When the simulator already has a next bar (drift non-None), no
+    pending_drift row is created — the deferred path is only for the
+    fill-on-last-bar case."""
+    _patch_cfg(monkeypatch, maker_ttl_bars=30)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    book.shadow_open(coin="BTC", side="long", entry_px=100.0,
+                     size_usd=1000.0, leverage=1)
+    _resting_order(book)["posted_at"] = _T0 + 60_000
+    bars = [_candle(0, 100.0, 100.1, 99.98, 100.0),
+            _candle(1, 100.0, 100.0, 99.90, 99.96),
+            _candle(2, 99.96, 100.0, 99.94, 100.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    book.mark_to_market({"BTC": 100.0})
+    acc = book.state["accounts"]["maker_shadow"]
+    assert acc["pending_drift"] == []

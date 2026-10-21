@@ -190,6 +190,9 @@ def _maker_ttl_bars() -> int:
 # against unbounded fetch for pathologically stale orders; anything older than
 # this is handled by the TTL-age cancel fallback in _resolve_pending_maker_orders.
 _MAX_MAKER_FETCH_BARS = 600  # 10h of 1m bars
+# How many 1m bars after the fill bar we wait for the "next-bar mid" needed to
+# compute post-fill adverse-selection drift before giving up (metric stays None).
+_MAKER_DRIFT_WAIT_BARS = 3
 
 
 def _max_positions() -> int:
@@ -432,6 +435,8 @@ def _fresh_account() -> dict[str, Any]:
         "wallet_balance": bal,     # starting + realized PnL (fees deducted on close)
         "positions": [],
         "pending_orders": [],      # maker_shadow-only: resting unfilled limits
+        "pending_drift": [],       # maker_shadow-only: filled opens awaiting the
+                                   # next 1m bar to backfill post-fill mid drift
         "fills": [],
         "equity_curve": [],
         "closed_count": 0,
@@ -650,6 +655,7 @@ class ShadowBook:
                     "wallet_balance": float(raw.get("wallet_balance", start_bal)),
                     "positions": raw.get("positions") if isinstance(raw.get("positions"), list) else [],
                     "pending_orders": raw.get("pending_orders") if isinstance(raw.get("pending_orders"), list) else [],
+                    "pending_drift": raw.get("pending_drift") if isinstance(raw.get("pending_drift"), list) else [],
                     "fills": raw.get("fills") if isinstance(raw.get("fills"), list) else [],
                     "equity_curve": raw.get("equity_curve") if isinstance(raw.get("equity_curve"), list) else [],
                     "closed_count": int(raw.get("closed_count", 0) or 0),
@@ -993,6 +999,24 @@ class ShadowBook:
             **sig_meta,
         }
         acc["fills"].append(fill)
+        # Adverse-selection drift needs the NEXT 1m bar, which does not exist
+        # yet when a live cycle fills on the most recent bar. Defer the metric
+        # (statistics only) to a later cycle instead of freezing it at None.
+        if fill["post_fill_mid_drift_bps"] is None:
+            fill_bar_t = selection.get("fill_bar_t")
+            try:
+                fill_bar_t = int(fill_bar_t) if fill_bar_t is not None else int(filled_at)
+            except (TypeError, ValueError):
+                fill_bar_t = int(filled_at)
+            acc["pending_drift"].append({
+                "fill_id": fill["id"],
+                "coin": coin,
+                "is_buy": side == "long",
+                "fill_px": float(fill_px),
+                "fill_bar_t": fill_bar_t,
+                # Give up after the next few bars; the entry then stays None.
+                "deadline_t": fill_bar_t + _MAKER_DRIFT_WAIT_BARS * 60_000,
+            })
         logger.info(
             f"[shadow_book] maker FILLED {side} {coin} qty={size_coin:g} @ {fill_px:g} "
             f"notional=${size_usd:.2f} lev={lev}x (paper)")
@@ -1084,6 +1108,7 @@ class ShadowBook:
                         "resting_bars": verdict.resting_bars,
                         "maker_edge_bps": verdict.maker_edge_bps,
                         "post_fill_mid_drift_bps": verdict.post_fill_mid_drift_bps,
+                        "fill_bar_t": verdict.fill_ms,
                     })
             elif verdict.canceled:
                 # TTL of resting time elapsed without a touch.
@@ -1092,6 +1117,60 @@ class ShadowBook:
                     acc["pending_orders"] = [
                         o for o in acc["pending_orders"] if o["id"] != order["id"]]
                     self._cancel_maker_order(order, _now_ms())
+
+    def _resolve_pending_drift(self) -> None:
+        """Backfill post-fill mid drift for maker opens that filled before the
+        next 1m bar existed. Statistics ONLY: writes ``post_fill_mid_drift_bps``
+        onto the existing open fill; never touches fill price, size, or PnL.
+
+        For each pending entry we need the bar starting at ``fill_bar_t + 60s``
+        to have CLOSED, then use its (h+l)/2 as the post-fill mid. A fetch miss
+        leaves the entry pending for another cycle; past ``deadline_t`` the
+        metric is permanently abandoned (stays None) so the queue can't grow.
+        Caller holds self._lock. Best-effort, never raises.
+        """
+        from hermes_trader.client.hl_client import fetch_hl_candles
+
+        acc = self._account("maker_shadow")
+        pending = acc.get("pending_drift")
+        if not pending:
+            return
+        now_ms = _now_ms()
+        # index open fills by id for the backfill
+        fills_by_id = {f.get("id"): f for f in acc["fills"]
+                       if f.get("type") == "open"}
+        remaining: list[dict[str, Any]] = []
+        for pend in list(pending):
+            fill_id = pend.get("fill_id")
+            target_t = int(pend["fill_bar_t"]) + 60_000
+            fill_px = float(pend["fill_px"])
+            # Open fill vanished (shouldn't happen) or deadline passed → drop.
+            if fill_id not in fills_by_id or now_ms >= int(pend["deadline_t"]):
+                continue
+            # Need the target bar closed: fetch a small window ending at/after it.
+            age_bars = max(2, int((now_ms - int(pend["fill_bar_t"])) / 60_000.0) + 1)
+            try:
+                bars = fetch_hl_candles(
+                    pend["coin"], "1m", min(age_bars, _MAX_MAKER_FETCH_BARS),
+                    opportunistic=True)
+            except Exception as e:
+                logger.debug(f"[shadow_book] drift candles miss {pend['coin']}: {e}")
+                remaining.append(pend)
+                continue
+            post_bar = next((b for b in bars if int(b.t) == target_t), None)
+            # Bar not present, or it is the still-forming last bar → wait.
+            if post_bar is None or int(post_bar.t) + 60_000 > now_ms:
+                remaining.append(pend)
+                continue
+            post_mid = (float(post_bar.h) + float(post_bar.l)) / 2.0
+            if post_mid <= 0 or fill_px <= 0:
+                continue  # drop the junk entry rather than looping forever
+            if pend.get("is_buy", True):
+                drift = (fill_px - post_mid) / fill_px * 1e4
+            else:
+                drift = (post_mid - fill_px) / fill_px * 1e4
+            fills_by_id[fill_id]["post_fill_mid_drift_bps"] = round(float(drift), 4)
+        acc["pending_drift"] = remaining
 
     def _close_position(self, acct: str, pos: dict[str, Any], exit_px: float,
                         reason: str, hold_min: float = 0.0,
@@ -1202,6 +1281,10 @@ class ShadowBook:
                     self._resolve_pending_maker_orders(mids)
                 except Exception as e:
                     logger.warning(f"[shadow_book] maker resolve failed: {e}")
+                try:
+                    self._resolve_pending_drift()
+                except Exception as e:
+                    logger.warning(f"[shadow_book] maker drift backfill failed: {e}")
             index_prices = index_prices or {}
             for acct in ACCOUNTS:
                 acc = self._account(acct)
