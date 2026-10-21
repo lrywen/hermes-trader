@@ -714,6 +714,13 @@ if _safety_errors:
             len(_safety_errors))
         sys.exit(78)  # EX_CONFIG
 logger.info("[startup safety] envelope check passed (0 breaches)")
+# L5-A2 (2026-10-21 redundancy plan): non-fatal clock-reachability self-check.
+# Warns when config arithmetic makes an exit clock unreachable (e.g. non_trend
+# stale_flat < ignite_grace makes the ignite gate dead there). Never refuses to
+# start; surfaces "a gate can never fire" mechanically instead of by audit.
+from hermes_trader.agents.config_store import exit_clock_reachability_warnings
+for _cw in exit_clock_reachability_warnings(startup_agent_config):
+    logger.warning("[startup clock-reachability] %s", _cw)
 # B-12/B-13 (G3, 2026-09-20): LIVE acceptance gate at BOOT time, on top of the
 # per-order P0-1 env grant. B-12 logs contradictory HERMES_ENABLE_LIVE×mode
 # combos; B-13 makes mode=LIVE a hard startup refusal unless a valid §5.2
@@ -2544,6 +2551,32 @@ while True:
                                         f"re-research after {_elapsed_min:.1f}min "
                                         f"(hot burst {_hot_dbg}) — bypass long window")
                                     _jumped = True  # admit through the bypass branch
+                                else:
+                                    # R10 (2026-10-21 redundancy plan): shadow_mode
+                                    # computed _would_admit but discarded it, so the
+                                    # arm spun ~600x/9h with no evidence of whether
+                                    # a short hot-coin window would add research.
+                                    # Land the counterfactual (never changes the
+                                    # throttle decision here). Best-effort.
+                                    try:
+                                        _rca_log = str(_rca.get("log_path") or "") \
+                                            or os.path.join(
+                                                _DATA_DIR,
+                                                "research_cooldown_adaptive.jsonl")
+                                        append_jsonl(_rca_log, {
+                                            "ts": now_ms,
+                                            "coin": coin,
+                                            "score": round(float(score), 2),
+                                            "elapsed_min": round(_elapsed_min, 2),
+                                            "active_min": _active_min,
+                                            "window_min": round(
+                                                research_cooldown_ms / 60_000, 2),
+                                            "hot_debug": str(_hot_dbg),
+                                            "shadow_mode": True,
+                                            "would_admit": True,
+                                        }, stream="cooldown_adaptive")
+                                    except Exception:
+                                        pass
                     except Exception as _rca_e:
                         logger.debug(f"[cooldown-adaptive] eval failed for "
                                      f"{coin} (fail-safe, keep long window): {_rca_e}")

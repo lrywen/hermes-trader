@@ -5536,12 +5536,160 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
         logger.debug("[runner_gate] structured record failed: %s", _rg_rec_e)
 
 
+# A2 (2026-10-21 redundancy plan): the per-coin cooldown's would-block eval sits
+# MID-gate (after confidence / late-entry / short returns), so candidates blocked
+# earlier never get a cooldown shadow record — leaving no evidence for "are the
+# six cooldown arms redundant?". This pure evaluator mirrors the SAME thresholds
+# and is run ONCE at the gate entry purely to record what the cooldown WOULD say,
+# independent of the downstream enforce path (which is left byte-identical). It
+# never blocks; failures degrade to an "unavailable" verdict, never raise.
+def _per_coin_cooldown_would_block(
+    *, coin: str, side: str, score: float, gate_conf: float,
+    gate: dict[str, Any], config: dict[str, Any],
+    now_ms: Optional[int] = None,
+) -> dict[str, Any]:
+    """Return {would_block: bool, reason, ...detail} for the cooldown arms.
+
+    Read-only counterfactual. Mirrors the consec-loss / repeat-score / hemostat
+    timeout arms evaluated by the live enforce block below. Any lookup failure is
+    reported as verdict="unavailable" (matching the gate's fail posture) rather
+    than raised.
+    """
+    pc = gate.get("per_coin_cooldown") or {}
+    base = {
+        "configured": bool(pc),
+        "shadow_mode": bool(pc.get("shadow_mode", False)),
+        "would_block": False,
+        "reason": "",
+        "composite_score": round(float(score), 4),
+        "confidence": round(float(gate_conf), 4),
+    }
+    if not pc or side not in ("long", "short"):
+        return base
+    try:
+        _now = int(now_ms if now_ms is not None else time.time() * 1000)
+        window_ms = float(pc.get("window_hours", 24)) * 3600_000
+        loss_hours = float(pc.get("loss_cooldown_hours", 24))  # noqa: F841
+        repeat_min = float(pc.get("repeat_min_composite", score))
+        max_consec = int(pc.get("max_consecutive_losses", 2))
+
+        closes = [
+            c for c in memory.get_closes(limit=200)
+            if str(c.get("coin")) == coin
+            and isinstance(c.get("closed_at"), (int, float))
+        ]
+        recent = [c for c in closes if _now - float(c["closed_at"]) <= window_ms]
+        try:
+            consec = int(memory.consecutive_losses(coin) or 0)
+        except Exception:
+            consec = 0
+
+        detail = {
+            "entries_in_window": len(recent),
+            "window_hours": float(pc.get("window_hours", 24)),
+            "consecutive_losses": consec,
+            "repeat_min_composite": repeat_min,
+        }
+        if closes:
+            last_ms = max(float(c["closed_at"]) for c in closes)
+            detail["hours_since_last_close"] = round((_now - last_ms) / 3600_000.0, 2)
+        base.update(detail)
+
+        if consec >= max_consec:
+            base["would_block"] = True
+            base["reason"] = (
+                f"consecutive_losses {consec} >= {max_consec}")
+            return base
+        if len(recent) >= 1 and score < repeat_min:
+            base["would_block"] = True
+            base["reason"] = (
+                f"repeat entry within {pc.get('window_hours', 24)}h "
+                f"with score {score:.1f} < {repeat_min:.0f}")
+            return base
+
+        # Hemostat non-profit timeout arm (same reason families / source as the
+        # enforce path; SHADOW reads the paper book, LIVE reads live memory).
+        tp_min = float(pc.get("timeout_cooldown_min", 0) or 0)
+        if tp_min > 0:
+            tp_reasons = ("ignite_timeout", "stale_flat_timeout",
+                          "time_scratch", "hard_timeout")
+            tp_close = None
+            try:
+                if str(config.get("mode", "OFF")).upper() == "SHADOW":
+                    from hermes_trader.agents import shadow_book as _sb
+                    tp_close = _sb.get_book().last_taker_close(coin)
+                else:
+                    tp_close = memory.last_close_for(coin)
+            except Exception:
+                tp_close = None
+            if isinstance(tp_close, dict):
+                raw = str(tp_close.get("reason") or tp_close.get("exit_reason") or "")
+                fam = raw.split(" ", 1)[0]
+                tp_ts = tp_close.get("ts") or tp_close.get("closed_at")
+                if fam in tp_reasons and isinstance(tp_ts, (int, float)):
+                    age_min = (_now - float(tp_ts)) / 60_000.0
+                    if 0 <= age_min < tp_min:
+                        base["would_block"] = True
+                        base["reason"] = (
+                            f"{fam} exit {age_min:.0f}min ago < cooldown "
+                            f"{tp_min:.0f}min (non-profit timeout)")
+                        base["hemostat_timeout"] = True
+        return base
+    except Exception as e:  # never raise into the entry path
+        base["verdict"] = "unavailable"
+        base["error"] = type(e).__name__
+        base["would_block"] = False
+        return base
+
+
+def _record_per_coin_cooldown_shadow(analysis: dict[str, Any],
+                                     config: dict[str, Any]) -> None:
+    """A2: record the cooldown counterfactual ONCE at gate entry.
+
+    Runs for EVERY evaluated candidate (including ones the gate blocks earlier on
+    other rules), so reconciliation can answer "how often would a cooldown arm
+    have blocked, and was it masked by an earlier rule?". Best-effort JSONL, never
+    changes the decision.
+    """
+    try:
+        gate = config.get("runner_entry_gate") or {}
+        pc = gate.get("per_coin_cooldown") or {}
+        if not pc:
+            return
+        coin = analysis.get("coin") or ""
+        side = (analysis.get("side") or "").lower()
+        if side not in ("long", "short"):
+            return
+        score = float(analysis.get("composite_score", 0) or 0)
+        conf = float(analysis.get("confidence", 0) or 0)
+        verdict = _per_coin_cooldown_would_block(
+            coin=coin, side=side, score=score, gate_conf=conf,
+            gate=gate, config=config)
+        rec = {"ts": int(time.time() * 1000), "coin": coin, "side": side}
+        rec.update(verdict)
+        from hermes_trader.shadow_log import append_jsonl
+        append_jsonl(_PER_COIN_COOLDOWN_SHADOW_FILE, rec,
+                     stream="per_coin_cooldown_frontload")
+    except Exception as _pc_rec_e:
+        logger.debug("[runner_gate] cooldown front-load record failed: %s",
+                     _pc_rec_e)
+
+
+_PER_COIN_COOLDOWN_SHADOW_FILE = os.environ.get(
+    "HERMES_PER_COIN_COOLDOWN_SHADOW_FILE",
+    os.path.expanduser("~/.hermes-trading/per_coin_cooldown_shadow.jsonl"),
+)
+
+
 def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any]) -> str:
     @wraps(_runner_entry_block_reason_impl)
     def _wrapped(analysis: dict[str, Any], config: dict[str, Any]) -> str:
         # Ensure no stale feature vector leaks from a previous evaluation on a
         # re-entrant / reused thread.
         _runner_gate_ctx.feats = None
+        # A2: record the per-coin cooldown counterfactual up-front for EVERY
+        # candidate (before any early block), independent of the decision.
+        _record_per_coin_cooldown_shadow(analysis, config)
         decision = _runner_entry_block_reason_impl(analysis, config)
         _record_runner_gate_verdict(analysis, decision)
         return decision

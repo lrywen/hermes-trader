@@ -510,6 +510,64 @@ def _running_from_data_config() -> bool:
     return os.path.abspath(CONFIG_PATH) == "/data/.agent-config.json"
 
 
+def exit_clock_reachability_warnings(cfg: dict[str, Any]) -> list[str]:
+    """Non-fatal clock-reachability self-check (L5-A2, redundancy plan 2026-10-21).
+
+    Flags configuration arithmetic where one exit clock can NEVER fire because
+    another clock always fires first. These are WARNs only — they never refuse
+    startup (the production config intentionally runs non_trend
+    stale=60 < ignite_grace=90, a known dead ignite gate being measured).
+
+    Checks (only when regime_aware.clocks.enabled):
+      * for each regime bucket, ignite_grace must be < stale_flat_timeout,
+        otherwise a position is always stale-flat-exited before the ignite grace
+        window elapses (ignite launch can never be credited there);
+      * hard_timeout should be > the largest stale_flat_timeout (it is meant to
+        be a backstop assertion, not the binding clock).
+    Returns human-readable warning strings; empty when clocks are reachable.
+    """
+    warnings: list[str] = []
+    try:
+        dsl = cfg.get("dsl_exit") or {}
+        ra = dsl.get("regime_aware") or {}
+        clocks = ra.get("clocks") or {}
+        if not bool(clocks.get("enabled", False)):
+            return warnings
+
+        def _f(v: Any, default: float) -> float:
+            try:
+                return float(v) if v is not None else float(default)
+            except (TypeError, ValueError):
+                return float(default)
+
+        base_stale = _f(dsl.get("stale_flat_timeout_minutes"), 90.0)
+        base_hard = _f(dsl.get("hard_timeout_minutes"), 240.0)
+        ignite = _f(dsl.get("ignite_grace_minutes"), 90.0)
+
+        stale_by_bucket: dict[str, float] = {}
+        for bucket in ("trend", "non_trend"):
+            b = clocks.get(bucket) or {}
+            stale_by_bucket[bucket] = _f(
+                b.get("stale_flat_timeout_minutes"), base_stale)
+            hard = _f(b.get("hard_timeout_minutes"), base_hard)
+            if ignite >= stale_by_bucket[bucket]:
+                warnings.append(
+                    f"exit-clock reachability: {bucket}: ignite_grace_minutes="
+                    f"{ignite:g} >= stale_flat_timeout_minutes="
+                    f"{stale_by_bucket[bucket]:g} — a position is stale-flat "
+                    "exited before the ignite grace elapses, so the ignite "
+                    "launch can never be credited in this regime")
+            if hard <= stale_by_bucket[bucket]:
+                warnings.append(
+                    f"exit-clock reachability: {bucket}: hard_timeout_minutes="
+                    f"{hard:g} <= stale_flat_timeout_minutes="
+                    f"{stale_by_bucket[bucket]:g} — hard timeout is not a "
+                    "backstop (the stale clock binds first)")
+    except Exception as e:  # self-check must never block startup
+        logger.debug("exit clock reachability check failed (non-fatal): %s", e)
+    return warnings
+
+
 def _production_noise_band_errors() -> list[str]:
     """B-10：仅在生产权威 /data 源上要求 noise_band 保持开启。canonical
     默认已 enabled=true；非 /data 部署（本地/CI）不检查。"""
