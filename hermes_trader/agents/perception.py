@@ -721,7 +721,8 @@ def _scan_single_market(
             trigger_mod.range_compression(candles_15m, thresholds["bbLength"], thresholds["bbStdDev"]),
             trigger_mod.trend_strength(candles_1h, thresholds["adxPeriod"]),
             trigger_mod.momentum_burst(candles, thresholds["momentumLookback"], thresholds["momentumPct"]),
-            trigger_mod.volume_buildup_1h(candles_1h, thresholds.get("volBuildupRatio", 2.5)),
+            trigger_mod.volume_buildup_1h(candles_1h, thresholds.get("volBuildupRatio", 2.5),
+                                          interval_minutes=60),
             trigger_mod.trend_flip_1h(candles_1h, thresholds.get("trendFlipBars", 3)),
             trigger_mod.higher_lows_1h(candles_1h, thresholds.get("higherLowsRequired", 4)),
             # Symmetric directional surfacing (weight 0 → no composite-denominator

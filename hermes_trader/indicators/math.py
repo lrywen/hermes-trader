@@ -14,8 +14,17 @@ def candle_val(c: Candle | dict[str, float], key: str) -> float:
     return getattr(c, key, 0)
 
 
+def _check_period(period: int) -> None:
+    # B10: every lookback indicator divides/iterates by period; a non-positive
+    # period previously returned silent garbage (atr(-1) ~ -8.6e17, adx(-1)
+    # ~ -4e20). Reject it explicitly at the boundary.
+    if not isinstance(period, int) or period < 1:
+        raise ValueError(f"period must be a positive int, got {period!r}")
+
+
 def ema(values: list[float], period: int) -> list[float]:
     """Exponential moving average."""
+    _check_period(period)
     k = 2 / (period + 1)
     out = [float("nan")] * len(values)
     if not values:
@@ -31,6 +40,7 @@ def ema(values: list[float], period: int) -> list[float]:
 
 def sma(values: list[float], period: int) -> list[float]:
     """Simple moving average."""
+    _check_period(period)
     out = [float("nan")] * len(values)
     acc = 0.0
     for i in range(len(values)):
@@ -44,6 +54,7 @@ def sma(values: list[float], period: int) -> list[float]:
 
 def atr(candles: list[Candle], period: int = 14) -> list[float]:
     """Average true range."""
+    _check_period(period)
     tr = [0.0] * len(candles)
     for i in range(1, len(candles)):
         h, l = candle_val(candles[i], "h"), candle_val(candles[i], "l")
@@ -63,6 +74,7 @@ def atr(candles: list[Candle], period: int = 14) -> list[float]:
 
 def _rsi_from_closes(closes: list[float], period: int = 14) -> list[float]:
     """Wilder RSI series from close prices (first `period` values are NaN)."""
+    _check_period(period)
     out = [float("nan")] * len(closes)
     if len(closes) <= period:
         return out
@@ -107,6 +119,7 @@ def rsi_last(closes: list[float], period: int = 14) -> float | None:
 
 def adx(candles: list[Candle], period: int = 14) -> list[float]:
     """Average directional index."""
+    _check_period(period)
     n = len(candles)
     out = [float("nan")] * n
     if n <= period * 2:

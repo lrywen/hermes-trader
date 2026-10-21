@@ -8,6 +8,12 @@ from typing import Any
 
 from hermes_trader.indicators.math import atr, candle_val
 
+# B11: hard ceiling on ATR-derived bin count. The default atr_multiple=0.25
+# yields a handful of bins on real data; anything resolving past this cap is a
+# misconfiguration (pathologically small atr_multiple) that would otherwise
+# allocate an unbounded list before the OOM killer intervenes.
+_MAX_ATR_BINS = 10_000
+
 
 @dataclass(frozen=True)
 class VolumeProfile:
@@ -94,6 +100,15 @@ def volume_profile(
     """
     if len(candles) < 1 or bins <= 0:
         return None
+    # B11: atr_bins derives bin count from ATR*atr_multiple; a non-positive
+    # multiple makes dynamic_size <= 0 -> a gigantic bin allocation (e.g.
+    # atr_multiple=1e-9 -> ~1.8e9 bins / 11GB+ before OOM-kill). Positive but
+    # tiny multiples also explode; cap at a hard bin ceiling and return None
+    # like any other unusable input.
+    if atr_bins and (atr_multiple <= 0.0 or atr_period < 1):
+        return None
+    if not 0.0 < value_area_pct <= 100.0:
+        return None
 
     lows = [_candle_value(c, "l") for c in candles]
     highs = [_candle_value(c, "h") for c in candles]
@@ -105,6 +120,8 @@ def volume_profile(
     bin_size, resolved_bins, atr_last = _resolve_bin_size(
         candles, int(bins), lo, hi, atr_bins, atr_period, atr_multiple,
     )
+    if resolved_bins <= 0 or resolved_bins > _MAX_ATR_BINS:
+        return None
     counts = [0.0] * resolved_bins
     edges = [lo + i * bin_size for i in range(resolved_bins + 1)]
 

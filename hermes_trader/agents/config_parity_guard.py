@@ -136,6 +136,11 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "dsl_exit.stop_confirm_shadow.shadow_mode": (False, True),
     "dsl_exit.stop_tuning_shadow.candidate_breakeven_trigger_pct": (0.0, 1),
     "dsl_exit.stop_tuning_shadow.candidate_max_loss_pct": (0.0, 1.5),
+    # D6 (2026-10-21)：record-only protect 候选（dsl_exit._candidate_protect_for_regime
+    # 只记录反事实出场，从不改真实止损/下单）。生产 /data 与 canonical 当前同值
+    # (1.5/1.0)；仍做值绑定登记——一旦生产改值而未复核，启动门禁立即变红。
+    "dsl_exit.stop_tuning_shadow.candidate_protect_pct_by_regime.trend": (1.5, 1.5),
+    "dsl_exit.stop_tuning_shadow.candidate_protect_pct_by_regime.non_trend": (1.0, 1),
     "runner_entry_gate.breakout_score_floor.shadow_mode": (False, True),
     "runner_entry_gate.per_coin_cooldown.shadow_mode": (True, False),
     "runner_entry_gate.pullback_long.shadow_mode": (False, True),

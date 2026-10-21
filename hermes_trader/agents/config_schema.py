@@ -1092,6 +1092,29 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
                     errors.append(f"{path}.{mk}: must be between {lo} and {hi}")
 
 
+def validate_nested_blocks(cfg: dict[str, Any]) -> list[str]:
+    """Whole-view range/kind validation of every nested safety block.
+
+    The patch gate :func:`validate_config_updates` only deep-validates the
+    nested blocks a write *touched*. Direct ``write_agent_config`` / restore
+    paths run the whole-view gate :func:`validate_config_dict`, whose per-key
+    kind table only sees the top-level block (``circuit_breaker`` is a dict),
+    so an out-of-range *leaf* arriving outside the HTTP patch path — e.g. a
+    hand-edited ``circuit_breaker.max_drawdown_pct=999`` — persisted and
+    silently disabled drawdown protection (D5, audit 2026-10-21).
+
+    This applies the same ``_NESTED_BLOCK_SPECS`` leaf matrix to the blocks
+    present in a merged whole view.
+    """
+    errors: list[str] = []
+    if not isinstance(cfg, dict):
+        return errors
+    for block, spec in _NESTED_BLOCK_SPECS.items():
+        if block in cfg and isinstance(cfg[block], dict):
+            _validate_nested_spec(block, cfg[block], ("dict", spec), errors)
+    return errors
+
+
 def validate_config_updates(updates: dict[str, Any], *, strict_keys: bool = True) -> list[str]:
     """Validate a partial config update. Returns a list of error strings.
 

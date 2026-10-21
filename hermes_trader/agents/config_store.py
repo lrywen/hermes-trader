@@ -366,9 +366,16 @@ def validate_config_dict(cfg: dict[str, Any], *, strict_keys: bool = True) -> li
     # 3. Delegate the F27 range / mode-enum / FORBIDDEN_OVERRIDE matrix
     # to the critical-only gate (sees the merged view, not the patch).
     # dedupe against the kind-check errors above (F27 also reports
-    # "leverage: expected int" for the same key) so the operator sees
+    # "leverage: expected int" for the same key) so the operator sees the
     # one error per problem, not two.
     critical_errors = _validate_critical(cfg)
+    # D5 (audit 2026-10-21): the per-key table above only checks top-level
+    # kinds, so nested blocks pass as plain dicts and an out-of-range leaf
+    # (e.g. circuit_breaker.max_drawdown_pct=999) reaching write_agent_config
+    # outside the HTTP patch gate persisted. Deep-validate nested blocks on
+    # the whole view too.
+    from hermes_trader.agents.config_schema import validate_nested_blocks
+    critical_errors = critical_errors + validate_nested_blocks(cfg)
     seen = set(errors)
     for ce in critical_errors:
         if ce not in seen:

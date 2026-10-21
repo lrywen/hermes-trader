@@ -62,6 +62,7 @@ def test_batch2_stop_tuning_shadow_registered():
     assert set(tun) == {
         "shadow_mode", "candidate_max_loss_pct",
         "candidate_breakeven_trigger_pct",
+        "candidate_protect_pct_by_regime",
     }
 
 

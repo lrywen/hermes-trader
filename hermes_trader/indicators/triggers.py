@@ -12,6 +12,11 @@ from typing import Optional
 from hermes_trader.indicators.math import adx, atr, candle_val, ema, sma
 from hermes_trader.models.types import Candle, TriggerHit
 
+# B8: per-bar return std (fraction) below which prior vol is economically zero.
+# 5e-5 = 0.005%/bar — far below even the ~19bp round-trip taker cost, so a
+# "spike" measured against such a baseline is noise, not a tradeable signal.
+_SPIKE_STD_MIN = 5e-5
+
 
 def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHit:
     """Current-bar return z-score vs trailing 96-bar std."""
@@ -21,12 +26,18 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
 
     returns = []
     for i in range(1, len(candles)):
-        returns.append((candle_val(candles[i], "c") - candle_val(candles[i - 1], "c")) / candle_val(candles[i - 1], "c"))
+        prev_close = candle_val(candles[i - 1], "c")
+        # B7: a zero/non-positive prior close makes the return undefined
+        # (would raise ZeroDivisionError). Fail closed — drop this pair; if no
+        # valid return can be built the caller's length guards return flat.
+        if prev_close <= 0:
+            continue
+        returns.append((candle_val(candles[i], "c") - prev_close) / prev_close)
 
-    current_return = returns[-1]
+    current_return = returns[-1] if returns else 0.0
     prior = returns[:-1][-96:]  # up to 96 trailing bars
 
-    if len(prior) < 2:
+    if not returns or len(prior) < 2:
         return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
                 "z": 0.0, "direction": "flat"}
 
@@ -34,7 +45,12 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
     variance = sum((v - mean) ** 2 for v in prior) / len(prior)
     std = variance ** 0.5
 
-    if std == 0:
+    # B8: an exact-zero check misses near-zero prior vol (e.g. std 1.6e-5 on a
+    # near-flat low-liquidity coin), which then inflates an ordinary +0.01% bar
+    # to a 6σ "spike". Returns are fractions (1e-4 = 0.01%/bar); a per-bar
+    # return std below this absolute floor is economically zero volatility, so
+    # a z-score against it is meaningless regardless of the (equally tiny) mean.
+    if std < _SPIKE_STD_MIN:
         return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
                 "z": 0.0, "direction": "flat"}
 
@@ -345,6 +361,14 @@ def range_compression(
     history = bandwidths[-100:]
     sorted_bw = sorted(history)
 
+    # B9: a perfectly flat series makes every bandwidth equal, so
+    # ``sorted_bw[i] < current_bw`` is never true and percentile defaults to 0
+    # -> a false "BB squeeze (P0)" with score 10. When there is no spread in
+    # the bandwidth history there is no compression *relative* to anything;
+    # return flat rather than emit a phantom squeeze.
+    if sorted_bw[-1] - sorted_bw[0] <= 1e-12:
+        return {"name": "rangeCompression", "score": 0, "reason": "flat", "fired": False}
+
     percentile = 0.0
     for i in range(len(sorted_bw)):
         if sorted_bw[i] < current_bw:
@@ -573,16 +597,41 @@ def bullish_reversal_candle(candles: list[Candle], wick_body_ratio: float = 2.0,
     }
 
 
-def volume_buildup_1h(candles: list[Candle], ratio_threshold: float = 2.5) -> TriggerHit:
+def _candle_cadence_matches(candles: list[Candle], interval_minutes: int) -> bool:
+    """B6: True when the median inter-candle spacing matches the requested
+    cadence (within 1.5×), so a 5m series cannot masquerade as 1h. Uses the
+    median to tolerate an occasional gap."""
+    ts = [int(candle_val(c, "t")) for c in candles if candle_val(c, "t") > 0]
+    if len(ts) < 4:
+        return True  # no trustworthy spacing info — don't false-block
+    deltas = sorted(b - a for a, b in zip(ts, ts[1:]) if b > a)
+    if not deltas:
+        return False
+    median = deltas[len(deltas) // 2]
+    expected = interval_minutes * 60_000
+    return expected * 0.5 <= median <= expected * 1.5
+
+
+def volume_buildup_1h(candles: list[Candle], ratio_threshold: float = 2.5,
+                      interval_minutes: Optional[int] = None) -> TriggerHit:
     """Notional-volume surge in the last 4h vs the prior 20h baseline.
 
     Catches accumulation phases where size is loading into a market before
     price has moved much. Empirically present in 8/10 of the +10% movers
     we missed yesterday (HMSTR 10×, SEI 7.6×, DYDX 6.2×, JTO 21×, ...).
     Needs 1h candles; returns flat if input is anything else or too short.
+
+    B6: pass ``interval_minutes=60`` from the caller to enforce the cadence.
+    When supplied, the median spacing of the candle timestamps must match it
+    (within one cadence); otherwise the "4h vs 20h" label is arithmetically a
+    different window (e.g. 20min vs 100min on 5m bars), so the trigger returns
+    flat rather than emit a mislabeled signal. ``None`` keeps legacy callers
+    working without enforcement.
     """
     if len(candles) < 24:
         return {"name": "volumeBuildup1h", "score": 0, "reason": "insufficient_history", "fired": False}
+    if interval_minutes is not None and not _candle_cadence_matches(candles, interval_minutes):
+        return {"name": "volumeBuildup1h", "score": 0, "reason": "interval_mismatch", "fired": False}
     recent = sum(candle_val(c, "v") * candle_val(c, "c") for c in candles[-4:])
     prior = sum(candle_val(c, "v") * candle_val(c, "c") for c in candles[-24:-4]) / 20
     if prior <= 0:
@@ -612,15 +661,19 @@ def trend_flip_1h(candles: list[Candle], lookback_bars: int = 3) -> TriggerHit:
     e21 = ema(closes, 21)
     if len(e8) < lookback_bars + 1 or len(e21) < lookback_bars + 1:
         return {"name": "trendFlip1h", "score": 0, "reason": "insufficient_history", "fired": False}
-    # Look for a cross in the last N bars: prior bar e8<=e21, current bar e8>e21
-    for i in range(-lookback_bars, 0):
+    # Look for a cross in the last N bars: prior bar e8<=e21, current bar e8>e21.
+    # B4: scan NEWEST first (-1 .. -N) so two crosses in the window report the
+    # most recent one; the old range(-N, 0) iterated oldest-first and returned
+    # the stale cross, and bars_ago could never be 0 (so the score-8 branch was
+    # dead). bars_ago is 1..N; most recent (1h ago) scores 6.
+    for i in range(-1, -lookback_bars - 1, -1):
         prev_diff = e8[i - 1] - e21[i - 1]
         cur_diff = e8[i] - e21[i]
         if prev_diff <= 0 and cur_diff > 0:
             bars_ago = -i
             return {
                 "name": "trendFlip1h",
-                "score": 8 if bars_ago == 0 else max(4, 8 - bars_ago * 2),
+                "score": max(4, 8 - bars_ago * 2),
                 "reason": f"EMA8/21 cross up {bars_ago}h ago",
                 "fired": True,
             }

@@ -23,24 +23,25 @@
 
 来源：`hermes_trader/agents/config.py`（`TRIGGER_CONFIG`）+ `perception.py` + 环境变量。
 
-### 1.1 触发权重（`TRIGGER_CONFIG.weights`，2026-06-02 重校准）
+### 1.1 触发权重（`TRIGGER_CONFIG.weights`，2026-09-28 重校准）
 
 | 触发器 | 权重 | 说明 |
 |--------|------|------|
-| `trendStrength` | **0.55** | 最佳信号，lift +2.08%（原 0.10） |
-| `pctMoveSpike` | **0.40** | lift +1.49% |
-| `breakout` | **0.30** | lift +1.29% |
-| `volumeSpike` | **0.25** | lift +1.05% |
-| `momentumBurst` | **0.20** | lift +0.77%（n=9，保留温和权重） |
-| `volumeBuildup1h` | **0.15** | lift +0.41%（原 0.60，过度加权） |
-| `higherLows1h` | **0** | lift -0.51%，已剔除 |
+| `pctMoveSpike` | **0.40** | 价格异动 |
+| `trendStrength` | **0.30** | 原 0.55——1 年事件研究（n=43,795）显示其 43% 触发率、负 EV，故降权 |
+| `breakout` | **0.30** | 突破 |
+| `volumeSpike` | **0.25** | 放量 |
+| `momentumBurst` | **0.20** | 动量爆发 |
+| `uptrendMomentum` | **0.20** | 原 0.0——1 年研究中唯一 train/test 稳定的正 EV 触发器，**进评分分母** |
+| `volumeBuildup1h` | **0.15** | 1h 蓄量 |
+| `higherLows1h` | **0** | 2026-06-02 n=497 实测 lift -0.51%，已剔除 |
 | `trendFlip1h` | **0** | lift -2.10%，净亏损，已剔除 |
 | `rangeCompression` | **0** | lift -3.08%，最差，已剔除 |
-| `uptrendMomentum` | **0** | 对称趋势浮出（不进评分分母） |
-| `downtrendMomentum` | **0** | 对称趋势浮出 |
-| `dailyMover` | **0** | 对称趋势浮出 |
+| `downtrendMomentum` | **0** | 空头对称浮出（long-only 下不评分） |
+| `dailyMover` | **0** | 日波动者浮出（走独立 surface，不走此分母） |
 
-> 权重基于实测边际提升（fired vs not-fired ROE，n=497 笔交易）重新校准；净负收益触发器权重清零。
+> **非零权重之和 = 1.80**，即复合分动态归一的分母（见 `triggers.composite_score`：`Σ(score×weight)/Σweight×10`）。
+> 2026-09-28 轮基于 Binance 现货 1 年事件研究（5bps、持有 1h），取代 2026-06-02 n=497 真实成交 ROE 校准；两套数据口径不同，新权重需经 SHADOW 验证后方可作为实盘依据（生产 /data 暂留旧权重 0.55/0.0，已在 `config_parity_guard` 登记为 fail-safe 漂移）。
 
 ### 1.2 扫描阈值（`TRIGGER_CONFIG.thresholds`）
 
@@ -53,8 +54,8 @@
 | `bbLength` | **20** | 布林带长度 |
 | `bbStdDev` | **2** | 布林带标准差倍数 |
 | `adxPeriod` | **14** | ADX 周期 |
-| `momentumLookback` | **2** | momentum_burst 窗口（5m bar → 10 分钟） |
-| `momentumPct` | **4.0** | 该窗口最低 % 波动触发 momentum_burst |
+| `momentumLookback` | **3** | momentum_burst 窗口（5m bar → 15 分钟）；原 2——1 年研究中 2bar/4% 仅触发 9 次，过死 |
+| `momentumPct` | **3.0** | 该窗口最低 % 波动触发 momentum_burst；原 4.0 |
 | `volBuildupRatio` | **2.5** | 4h vs 前 20h 均量（1h K 线） |
 | `trendFlipBars` | **3** | 最近 N 根 1h bar 内 EMA8/21 交叉 |
 | `higherLowsRequired` | **4** | 最近 6 根 1h bar 中抬高低点数量 |
@@ -63,7 +64,7 @@
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
-| `minCompositeScore` | **54** | 复合分门槛（新权重校准，等价旧 35 选择率） |
+| `minCompositeScore` | **54** | scan 浮出层复合分门槛。旧权重和 2.85→清零 3 个触发器后分母 ≈1.85，同一信号复合分约放大 1.54×，故门槛按 35×1.54≈54 折算以保持旧 35 的选择率，并非独立回测优选值。注意 runner 末端闸门另用 `runner_entry_gate.min_composite`（canonical **45**），两者是不同层的门槛，勿混 |
 | `candleInterval` | **5m** | 扫描 K 线周期 |
 | `candleCount` | **100** | 拉取 K 线数量 |
 | `cacheTtlMs` | **50,000** | 缓存 TTL（50s） |

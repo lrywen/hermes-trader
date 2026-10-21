@@ -99,6 +99,15 @@ def _minimal_live_wire(monkeypatch):
         raise _DeniedOrder("place_hl_order must never be called here")
 
     monkeypatch.setattr(executor, "place_hl_order", _forbid_order)
+    # The account-state preflight (equity/margin floors) was added AFTER the
+    # P0-1 gate and runs BEFORE the leverage lookup; without a stub it makes a
+    # live network call that returns $0 and short-circuits at
+    # "equity_unavailable" before the control branch can be observed.
+    monkeypatch.setattr(
+        executor, "_read_account_state",
+        lambda _u, _c: executor._AccountStateRead(
+            state={}, equity=1_000.0, available=1_000.0,
+            agg_equity=1_000.0, total_open_notional=0.0, target_dex=""))
 
 
 def _analysis():
@@ -138,6 +147,14 @@ def test_p01_maybe_execute_shadow_unaffected_without_env(monkeypatch):
     monkeypatch.setattr(executor, "get_max_leverage",
                         lambda _c: (_ for _ in ()).throw(
                             ValueError("Unknown coin P0TEST")))
+    # Same account-state preflight as the LIVE control case (see
+    # _minimal_live_wire): stub it so the leverage fail-closed branch is what
+    # the assertion observes rather than a $0 live account read.
+    monkeypatch.setattr(
+        executor, "_read_account_state",
+        lambda _u, _c: executor._AccountStateRead(
+            state={}, equity=1_000.0, available=1_000.0,
+            agg_equity=1_000.0, total_open_notional=0.0, target_dex=""))
     res = executor.maybe_execute(_analysis())
     assert res["reason"] == "unknown_max_leverage_P0TEST"
 
