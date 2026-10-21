@@ -317,6 +317,95 @@ def test_stop_tuning_shadow_disabled_writes_nothing(monkeypatch, tmp_path):
     assert not f.exists()
 
 
+# ── L5-A3 (redundancy plan 2026-10-21): per-exit outcome recording ────────
+
+def test_exit_outcome_records_on_profitable_floor_breach(monkeypatch, tmp_path):
+    """A profitable floor_breach (the majority exit cluster) now contributes
+    breakeven-arm evidence even though it is NOT a max_loss path."""
+    import json as _json
+    f = tmp_path / "eo.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"stop_tuning_shadow": {
+            "shadow_mode": True, "candidate_max_loss_pct": 1.5,
+            "candidate_breakeven_trigger_pct": 1.0}}})
+    # MFE 3.4% -> would arm a 1.0% candidate breakeven; exit at +2.1% spot.
+    t, pol = _make_tracker(monkeypatch, tmp_path, peak_px=1.034)
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "floor_breach", unrealized_pct=2.1,
+        effective_max_loss=0.80, spot_cap_display=0.80, atr_active=False)
+    rec = _json.loads(f.read_text().strip())
+    assert rec["rule"] == "exit_outcome"
+    assert rec["exit_reason"] == "floor_breach"
+    assert rec["detail"]["breakeven_would_have_armed"] is True
+    assert rec["detail"]["mfe_spot_pct"] > 3.0
+    # A profitable exit must never be flagged as survive_wider_cap.
+    assert rec["detail"]["survive_wider_cap"] is False
+    assert rec["would"] == "breakeven_would_arm"
+
+
+def test_exit_outcome_records_timeout_with_mfe_and_reason(monkeypatch, tmp_path):
+    """A stale-flat timeout (never armed, small adverse drift) is recorded with
+    its reason — previously completely invisible to stop tuning."""
+    import json as _json
+    f = tmp_path / "eo2.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"stop_tuning_shadow": {
+            "shadow_mode": True, "candidate_max_loss_pct": 1.5,
+            "candidate_breakeven_trigger_pct": 1.0}}})
+    t, pol = _make_tracker(monkeypatch, tmp_path, peak_px=1.004)  # MFE 0.4%
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "stale_flat_timeout", unrealized_pct=-0.3,
+        effective_max_loss=0.80, spot_cap_display=0.80, atr_active=False)
+    rec = _json.loads(f.read_text().strip())
+    assert rec["rule"] == "exit_outcome"
+    assert rec["exit_reason"] == "stale_flat_timeout"
+    assert rec["would"] == "no_candidate_change"
+    assert rec["detail"]["realized_spot_pct"] == -0.3
+    assert rec["detail"]["breakeven_would_have_armed"] is False
+
+
+def test_exit_outcome_disabled_writes_nothing(monkeypatch, tmp_path):
+    f = tmp_path / "eo3.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"stop_tuning_shadow": {"shadow_mode": False}}})
+    t, pol = _make_tracker(monkeypatch, tmp_path, peak_px=1.01)
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "hard_timeout", 0.2, 0.8, 0.8, False)
+    assert not f.exists()
+
+
+# ── L3-A4: would_execute_dropped counter on duplicate open ────────────────
+
+def test_would_execute_dropped_counter(tmp_path, monkeypatch):
+    import hermes_trader.agents.shadow_book as sb
+    # isolate: taker path only, no maker resting-order side effects.
+    monkeypatch.setattr(sb, "_maker_enabled", lambda: False)
+    monkeypatch.setenv("HERMES_SHADOW_BOOK_FILE", str(tmp_path / "isolated.json"))
+    book = sb.ShadowBook(str(tmp_path / "book.json"))
+    book.reload_if_changed()
+    with book._lock:
+        acc = book._account("taker")
+        acc["positions"].append({
+            "id": "p1", "coin": "DUP", "side": "long", "entry_px": 100.0,
+            "size_usd": 1000.0, "size_coin": 10.0, "leverage": 3,
+            "opened_at": __import__("time").time() * 1000,
+            "entry_regime": "", "analysis_id": ""})
+    assert book.would_execute_dropped() == 0
+    # A second admitted open for the same coin/side must be dropped + counted.
+    f1 = book.shadow_open(coin="DUP", side="long", entry_px=101.0,
+                          size_usd=1000.0, leverage=3)
+    f2 = book.shadow_open(coin="DUP", side="long", entry_px=102.0,
+                          size_usd=1000.0, leverage=3)
+    assert f1 is None and f2 is None
+    assert book.would_execute_dropped() == 2
+
+
 # ── (6) leverage tier: ENFORCE really de-levers (full maybe_execute) ─────
 
 class _NeutralMemory:

@@ -5485,10 +5485,29 @@ def _runner_gate_fresh_src(*, breakout: bool, recent_breakout: bool,
 # no return value and no threshold; a write failure is best-effort.
 _runner_gate_ctx = threading.local()
 
-_RUNNER_GATE_SHADOW_FILE = os.environ.get(
-    "HERMES_RUNNER_GATE_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/runner_gate_shadow.jsonl"),
-)
+def _default_runner_gate_shadow_file() -> str:
+    """runner-gate 结构化归因日志的落盘路径。
+
+    A1 (2026-10-21 redundancy plan): 默认写入持久卷 ``${HERMES_DATA_DIR:-/data}``
+    而非 HOME——HOME 在容器重建时会丢，导致归因数据无法跨重建积累
+    （2026-10-21 03:53 重建已丢过一次）。显式 ``HERMES_RUNNER_GATE_SHADOW_FILE``
+    仍最高优先；数据目录不可写时回退 HOME，保证记录 best-effort 不打断交易路径。
+    """
+    explicit = os.environ.get("HERMES_RUNNER_GATE_SHADOW_FILE")
+    if explicit:
+        return explicit
+    data_dir = os.environ.get("HERMES_DATA_DIR") or "/data"
+    candidate = os.path.join(data_dir, "runner_gate_shadow.jsonl")
+    try:
+        if os.path.isdir(data_dir) and os.access(data_dir, os.W_OK):
+            return candidate
+    except OSError:
+        pass
+    # 本地/测试环境无 /data 或不可写 → 回退旧的 HOME 路径。
+    return os.path.expanduser("~/.hermes-trading/runner_gate_shadow.jsonl")
+
+
+_RUNNER_GATE_SHADOW_FILE = _default_runner_gate_shadow_file()
 
 
 def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None:
@@ -5520,6 +5539,7 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
             "slow_burn_count": feats.get("slow_count"),
             "fresh_impulse": feats.get("fresh_impulse"),
             "fresh_src": feats.get("fresh_src", ""),
+            "runner_carrier": feats.get("runner_carrier", ""),
             "vol": feats.get("volume"),
             "brk": feats.get("breakout"),
             "burst": feats.get("burst"),
@@ -6064,7 +6084,30 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
             CANONICAL_DEFAULTS["runner_entry_gate"]["mover_min_composite"]))
         and (slow_count >= 1 or volume or breakout or burst_aligned_long)
     )
+    # A7 (2026-10-21 redundancy plan): the ``score >= min_score`` (prod 45) leg
+    # of this OR is empirically nearly dead — over 268 fresh_impulse evaluations
+    # in the 12.2h window it fired on the score leg once; the real carrier is
+    # ``slow_count >= 1`` (~82%). So runner_entry_gate.min_composite=45 is not
+    # the binding entry selector in practice (and it is also the L4
+    # score_invariant floor — see risk_gates score_invariant_gate). Kept as an
+    # explicit OR for the rare high-score/no-slow-burn case; do not "simplify"
+    # it without reading the runner_gate_shadow.jsonl fresh_src distribution.
     structured_runner = fresh_impulse and (slow_count >= 1 or score >= min_score)
+    # A5 (redundancy plan 2026-10-21): tag WHICH leg carries structured_runner so
+    # the near-dead ``score >= min_score`` (prod 45) leg is independently
+    # countable in runner_gate_shadow.jsonl (audit: fired ~1/268). Attribution
+    # only; best-effort onto the per-evaluation feature vector.
+    try:
+        if structured_runner and isinstance(
+                getattr(_runner_gate_ctx, "feats", None), dict):
+            if slow_count < 1 and score >= min_score:
+                _runner_gate_ctx.feats["runner_carrier"] = "score_only"
+            elif slow_count >= 1 and score >= min_score:
+                _runner_gate_ctx.feats["runner_carrier"] = "slow_and_score"
+            elif slow_count >= 1:
+                _runner_gate_ctx.feats["runner_carrier"] = "slow_only"
+    except Exception:
+        pass
 
     # ── Shadow (4): breakout-path weak-score floor ──
     # Audit 2026-09-10 (ZEC 26.5 admitted via breakout+slow vs min_composite

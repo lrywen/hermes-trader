@@ -218,6 +218,92 @@ def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         logger.debug("[dsl] stop-tuning shadow record failed: %r", e)
 
 
+def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
+                                reason: str, unrealized_pct: float,
+                                effective_max_loss: float,
+                                spot_cap_display: float,
+                                atr_active: bool) -> None:
+    """L5-A3 (redundancy plan 2026-10-21): record stop-tuning context on EVERY
+    realized exit, not just max_loss.
+
+    The wider-cap / lower-breakeven candidate needs >=30 outcomes to judge, but
+    the old max_loss-only writer produced ~0.2 record/day (14d -> 3 max_loss
+    exits). This appends one row per close with the excursion (MFE + current
+    realized spot/ROE), the binding cap, and pre-computed counterfactual flags,
+    so floor_breach / timeout exits (the majority, and the profitable cluster)
+    finally contribute breakeven-arm evidence. Pure observation; never changes
+    the exit. Best-effort, never raises. Reuses the risk_tuning jsonl so the
+    existing reconciler keeps reading one file (distinguished by rule/record).
+    """
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        cfg = read_agent_config() or {}
+        tun = ((cfg.get("dsl_exit") or {}).get("stop_tuning_shadow")) or {}
+        if not bool(tun.get("shadow_mode", False)):
+            return
+
+        try:
+            wider_cap = float(tun.get("candidate_max_loss_pct")) \
+                if tun.get("candidate_max_loss_pct") is not None else None
+        except (TypeError, ValueError):
+            wider_cap = None
+        try:
+            cand_be = float(tun.get("candidate_breakeven_trigger_pct")) \
+                if tun.get("candidate_breakeven_trigger_pct") is not None else None
+        except (TypeError, ValueError):
+            cand_be = None
+
+        lev = max(1, int(getattr(tracker, "leverage", 1) or 1))
+        mfe_pct = float(tracker._peak_profit_pct())
+        loss_pct = float(unrealized_pct)        # signed favorable spot %
+        roe_pct = loss_pct * lev
+        be_would_arm = cand_be is not None and mfe_pct >= cand_be
+        # "would survive a wider cap" only meaningful for an adverse stop-out.
+        would_survive = (
+            wider_cap is not None and loss_pct < 0
+            and abs(loss_pct) < wider_cap
+            and abs(loss_pct) >= effective_max_loss
+        )
+        token = (reason or "").split(" ", 1)[0].split("(", 1)[0]
+
+        import os
+        from datetime import datetime, timezone
+
+        from hermes_trader.shadow_log import append_jsonl
+        path = os.environ.get(
+            "HERMES_RISK_TUNING_SHADOW_FILE",
+            os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"))
+        append_jsonl(path, {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "rule": "exit_outcome",
+            "coin": tracker.coin,
+            "side": tracker.side,
+            "exit_reason": token,
+            "would": ("survive_wider_cap" if would_survive
+                      else ("breakeven_would_arm" if be_would_arm
+                            else "no_candidate_change")),
+            "detail": {
+                "realized_spot_pct": round(loss_pct, 4),
+                "realized_roe_pct": round(roe_pct, 4),
+                "mfe_spot_pct": round(mfe_pct, 4),
+                "live_spot_cap_pct": round(float(spot_cap_display), 4),
+                "effective_max_loss_pct": round(float(effective_max_loss), 4),
+                "atr_stop_active": bool(atr_active),
+                "candidate_max_loss_pct": wider_cap,
+                "candidate_breakeven_trigger_pct": cand_be,
+                "live_breakeven_trigger_pct": float(pol.breakeven_trigger_pct),
+                "breakeven_would_have_armed": bool(be_would_arm),
+                "survive_wider_cap": bool(would_survive),
+                "entry_px": float(tracker.entry_px),
+                "leverage": lev,
+                "entry_regime": getattr(tracker, "entry_regime", "") or "",
+            },
+        }, stream="risk_tuning")
+    except Exception as e:  # never break the exit hot path
+        logger.debug("[dsl] exit-outcome shadow record failed: %r", e)
+
+
 def _stop_confirm_shadow_cfg() -> Optional[dict]:
     """Return the stop_confirm_shadow block when record-only mode is ON else None.
 
@@ -1301,6 +1387,9 @@ class DSLTracker:
                 and not self.ignited
                 and elapsed_min >= pol.ignite_grace_minutes):
             _record_exit("ignite_timeout")
+            _record_exit_outcome_shadow(
+                self, pol, "ignite_timeout", upct, effective_max_loss,
+                spot_cap_display, atr_active)
             _request_save(force=True)
             return self._verdict(
                 exit=True,
@@ -1317,6 +1406,9 @@ class DSLTracker:
             peak_profit = self._peak_profit_pct()
             if peak_profit < pol.protect_pct:
                 _record_exit("stale_flat_timeout")
+                _record_exit_outcome_shadow(
+                    self, pol, "stale_flat_timeout", upct, effective_max_loss,
+                    spot_cap_display, atr_active)
                 _request_save(force=True)
                 return self._verdict(
                     exit=True,
@@ -1341,6 +1433,9 @@ class DSLTracker:
                     and upct > 0
                     and (peak_profit - upct) >= pol.time_scratch_giveback_pct):
                 _record_exit("time_scratch")
+                _record_exit_outcome_shadow(
+                    self, pol, "time_scratch", upct, effective_max_loss,
+                    spot_cap_display, atr_active)
                 _request_save(force=True)
                 return self._verdict(
                     exit=True,
@@ -1353,6 +1448,9 @@ class DSLTracker:
         # ── Hard timeout ──────────────────────────────────────────────
         if elapsed_min >= pol.hard_timeout_minutes:
             _record_exit("hard_timeout")
+            _record_exit_outcome_shadow(
+                self, pol, "hard_timeout", upct, effective_max_loss,
+                spot_cap_display, atr_active)
             _request_save(force=True)
             return self._verdict(
                 exit=True, reason=f"hard_timeout ({elapsed_min:.0f}min)",
@@ -1415,6 +1513,9 @@ class DSLTracker:
                 _record_stop_tuning_shadow(
                     self, pol, effective_max_loss, loss_pct, roe_loss,
                     atr_active, spot_cap_display)
+                _record_exit_outcome_shadow(
+                    self, pol, "max_loss", loss_pct, effective_max_loss,
+                    spot_cap_display, atr_active)
                 _request_save(force=True)
                 return self._verdict(
                     exit=True,
@@ -1594,6 +1695,9 @@ class DSLTracker:
                         pass
             if time_gate_ok and count_gate_ok and index_ok:
                 _record_exit("floor_breach")
+                _record_exit_outcome_shadow(
+                    self, pol, "floor_breach", upct, effective_max_loss,
+                    spot_cap_display, atr_active)
                 _request_save(force=True)
                 # stop_confirm_shadow (observation only): record the tighter
                 # candidate gate vs this live exit before returning.

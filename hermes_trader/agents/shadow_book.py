@@ -533,6 +533,12 @@ class ShadowBook:
         self._last_equity_ts = 0.0
         self._last_snapshot: dict[str, Any] = {}
         self._last_mtime = 0.0
+        # A4 (2026-10-21 redundancy plan): count would-execute opens that the
+        # book silently dropped because an identical position was already open.
+        # In-process only (not persisted): the quantity that matters is the live
+        # loop's suppression rate since boot; avoiding a persisted mutable
+        # counter also sidesteps cross-process save/reload merge races.
+        self._would_execute_dropped = 0
         self.state: dict[str, Any] = self._fresh_state()
         self._load()
 
@@ -825,7 +831,16 @@ class ShadowBook:
         """Immediate mid fill into the taker account."""
         acc = self._account("taker")
         if self._find(acc["positions"], coin, side) is not None:
-            logger.debug(f"[shadow_book] skip taker open {coin} {side}: already open")
+            # A2 (2026-10-21 redundancy plan): INFO not DEBUG — a gated decision
+            # that reached the book but opened no new position is a real
+            # admit→fill funnel loss (5 admits → 1 open observed), it must be
+            # visible at production log level so 放行数 = 开仓数 + 跳过数.
+            # A4: also keep a running would_execute_dropped count for the
+            # dashboard / reconciliation without grep-counting free-text logs.
+            self._would_execute_dropped += 1
+            logger.info(
+                f"[shadow_book] skip taker open {coin} {side}: already open "
+                f"(would_execute_dropped={self._would_execute_dropped})")
             return None
         if len(acc["positions"]) >= _max_positions():
             logger.info(f"[shadow_book] skip taker open {coin}: max_positions reached")
@@ -1499,6 +1514,10 @@ class ShadowBook:
             "avg_post_fill_drift_bps": round(sum(drifts) / len(drifts), 3) if drifts else None,
             "avg_resting_bars": round(sum(rests) / len(rests), 2) if rests else None,
         }
+
+    def would_execute_dropped(self) -> int:
+        """A4: live-loop count of admitted opens dropped as already-open."""
+        return int(self._would_execute_dropped)
 
 
 # ---------------------------------------------------------------------------
