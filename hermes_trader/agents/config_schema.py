@@ -493,6 +493,16 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "shadow_mode": ("bool",),
         "candidate_max_loss_pct": _num_leaf(0.0, 25.0),
         "candidate_breakeven_trigger_pct": _num_leaf(0.0, 50.0),
+        # Record-only lower protect_pct counterfactual (redundancy plan
+        # 2026-10-21). Scalar applies to every regime; the by-regime map
+        # overrides it for trend / non_trend buckets. Never moves a stop; the
+        # binding ExitPolicy.protect_pct is unchanged. 0.0 / omitted = inert.
+        "candidate_protect_pct": _num_leaf(0.0, 50.0),
+        "candidate_protect_pct_by_regime": ("dict", {
+            "trend": _num_leaf(0.0, 50.0),
+            "non_trend": _num_leaf(0.0, 50.0),
+            "default": _num_leaf(0.0, 50.0),
+        }),
     },
     # Audit 2026-10-11: tighter breach-confirmation counter-factual; live
     # confirmation path unchanged. candidate_consec is an int count, candidate

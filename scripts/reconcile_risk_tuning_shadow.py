@@ -24,6 +24,18 @@ HERMES_RISK_TUNING_SHADOW_FILE) and grades each counter-factual rule:
       survives to a profit / times out at a profit, or just stops out later at
       a bigger loss — the central "noise stop vs real stop" question.
 
+  * exit_outcome (one row per REAL close, L5-A3):
+      Self-contained — carries the realized spot/ROE, observed MFE, live vs
+      candidate protect_pct, and the pre-computed record-only counterfactual
+      tags (protect_arms_earlier / protect_would_unlock_phase2) keyed by entry
+      regime. No candle fetch or grading is needed; this report aggregates the
+      real outcomes directly. NOTE: protect_would_unlock_phase2 only says the
+      trade's real peak would have crossed a LOWER arming threshold; it is not
+      a price-path replay and does NOT by itself prove a better exit. It sizes
+      the affected population; the realized-ROE split across the tagged groups
+      is the directional evidence (does the would-unlock cluster actually have
+      positive MFE / recoverable ROE?).
+
 Pure paper reconciliation: never places orders. Default is a dry-run report;
 pass --write to stamp outcome fields back into the JSONL.
 
@@ -307,6 +319,107 @@ def grade_record(r: dict, dsl_cfg: dict, closes_by_coin: Dict[str, list]) -> boo
     return True
 
 
+def _regime_bucket(entry_regime: str) -> str:
+    """Mirror dsl_exit._candidate_protect_for_regime bucketing.
+
+    trend-family prefix -> trend; everything else (neutral/chop/"") ->
+    non_trend. "non_trend" contains the substring "trend", so do NOT use a
+    naive substring test.
+    """
+    r = str(entry_regime or "").lower()
+    return "trend" if r.startswith(("uptrend", "downtrend", "trend")) \
+        else "non_trend"
+
+
+def _avg(xs: List[float]) -> float:
+    return sum(xs) / len(xs) if xs else 0.0
+
+
+def _summarize_exit_outcomes(records: List[dict]) -> None:
+    """Aggregate the per-real-close exit_outcome rows (record-only protect A/B).
+
+    No grading / candles: each row already carries realized ROE, observed MFE
+    and the counterfactual tags. We bucket by trend vs non_trend (the map's
+    keys) and, within each, split by whether the lower candidate protect would
+    have newly armed / unlocked phase-2. Printed numbers are REALIZED live ROE
+    and observed MFE only — a precondition check, not a counterfactual PnL.
+    """
+    rows = [r for r in records if r.get("rule") == "exit_outcome"
+            and isinstance(r.get("detail"), dict)]
+    if not rows:
+        print("\n[exit_outcome]  (no real-close rows recorded yet)")
+        return
+
+    print(f"\n[exit_outcome]  real closes recorded = {len(rows)}")
+    by_bucket: Dict[str, List[dict]] = {}
+    for r in rows:
+        d = r["detail"]
+        by_bucket.setdefault(
+            _regime_bucket(d.get("entry_regime", "")), []).append(r)
+
+    def _stat(sub: List[dict]) -> str:
+        roe = [float(s["detail"].get("realized_roe_pct") or 0) for s in sub]
+        spot = [float(s["detail"].get("realized_spot_pct") or 0) for s in sub]
+        mfe = [float(s["detail"].get("mfe_spot_pct") or 0) for s in sub]
+        wins = sum(1 for p in spot if p > 0)
+        return (f"n={len(sub):3}  realized ROE mean={_avg(roe):+6.2f}%  "
+                f"spot mean={_avg(spot):+6.2f}%  win={wins/len(sub)*100:4.1f}%  "
+                f"MFE mean={_avg(mfe):5.2f}%")
+
+    for bucket in ("trend", "non_trend"):
+        sub = by_bucket.get(bucket)
+        if not sub:
+            print(f"\n  [{bucket}] no rows")
+            continue
+        # Live protect in effect for this bucket (take the first row's value;
+        # it is regime-constant within a deployment).
+        live_p = sub[0]["detail"].get("live_protect_pct")
+        cand_p = sub[0]["detail"].get("candidate_protect_pct")
+        print(f"\n  [{bucket}] live protect={live_p}  "
+              f"candidate protect={cand_p}  "
+              f"(inert = candidate None means no rows are tagged)")
+        print(f"    ALL            {_stat(sub)}")
+        if cand_p is None:
+            continue
+        earlier = [s for s in sub
+                   if s["detail"].get("protect_arms_earlier")]
+        unlock = [s for s in sub
+                  if s["detail"].get("protect_would_unlock_phase2")]
+        already = [s for s in sub
+                   if s["detail"].get("protect_arms_earlier")
+                   and not s["detail"].get("protect_would_unlock_phase2")]
+        never = [s for s in sub
+                 if not s["detail"].get("protect_arms_earlier")]
+        print(f"    arms earlier   {_stat(earlier) if earlier else '(none)'}")
+        print(f"      -> unlock*   {_stat(unlock) if unlock else '(none)'}")
+        print(f"      -> already   {_stat(already) if already else '(none)'}")
+        print(f"    never arms     {_stat(never) if never else '(none)'}")
+        if unlock:
+            mfe_u = [float(s['detail'].get('mfe_spot_pct') or 0) for s in unlock]
+            roe_u = [float(s['detail'].get('realized_roe_pct') or 0)
+                     for s in unlock]
+            print(f"    *unlock = real peak crossed candidate {cand_p}% but "
+                  f"never reached live {live_p}%: the population a lower protect")
+            print(f"     would newly convert into phase-2. Their MFE mean "
+                  f"{_avg(mfe_u):.2f}% vs realized ROE mean {_avg(roe_u):+.2f}% "
+                  f"sizes the give-back that an earlier floor MIGHT retain.")
+
+    # Exit-reason composition, tagged vs not (the historical replay predicted a
+    # stale_flat_timeout -> floor_breach migration under lower protect).
+    print("\n  exit_reason composition (all real closes):")
+    reason_tot: Dict[str, int] = {}
+    reason_unlock: Dict[str, int] = {}
+    for r in rows:
+        d = r["detail"]
+        token = str(r.get("exit_reason") or "?")
+        reason_tot[token] = reason_tot.get(token, 0) + 1
+        if d.get("protect_would_unlock_phase2"):
+            reason_unlock[token] = reason_unlock.get(token, 0) + 1
+    for token, n in sorted(reason_tot.items(), key=lambda kv: -kv[1]):
+        u = reason_unlock.get(token, 0)
+        print(f"    {token:22} {n:4}   of which would-unlock phase2: {u}")
+
+
 def _summary(records: List[dict]) -> None:
     by_rule: Dict[str, List[dict]] = {}
     for r in records:
@@ -316,6 +429,7 @@ def _summary(records: List[dict]) -> None:
             by_rule.setdefault(r["rule"], []).append(r)
 
     print("\n=== risk-tuning shadow reconciliation ===")
+    _summarize_exit_outcomes(records)
     for rule, rows in sorted(by_rule.items()):
         graded = [r for r in rows if r.get("outcome") not in (None, "")]
         print(f"\n[{rule}]  graded={len(graded)} / total={len(rows)}")
@@ -349,6 +463,8 @@ def _summary(records: List[dict]) -> None:
 
     print("\n  per-record detail:")
     for r in sorted(records, key=lambda x: x.get("timestamp", "")):
+        if r.get("rule") == "exit_outcome":
+            continue  # self-contained; summarized in the section above
         if r.get("outcome"):
             d = r.get("detail") or {}
             extra = ""
@@ -383,8 +499,13 @@ def main() -> int:
     dsl_cfg = read_agent_config() or {}
     closes_by_coin = _load_real_closes()
 
-    graded = pending = 0
+    graded = pending = skipped = 0
     for r in records:
+        # exit_outcome rows are self-contained real-close observations; they
+        # need no candle grading and are aggregated directly by _summary.
+        if r.get("rule") == "exit_outcome":
+            skipped += 1
+            continue
         if r.get("outcome") is not None:
             continue
         ts = _parse_iso(r.get("timestamp", ""))
@@ -397,7 +518,8 @@ def main() -> int:
             pending += 1
 
     print(f"total={len(records)}  newly_graded={graded}  "
-          f"pending(immature/unmatched)={pending}")
+          f"pending(immature/unmatched)={pending}  "
+          f"exit_outcome(observed, no grading)={skipped}")
     _summary(records)
 
     if args.write:

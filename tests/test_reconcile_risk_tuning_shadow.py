@@ -129,3 +129,73 @@ def test_stop_tuning_wider_cap_no_network_flags(tmp_path, monkeypatch):
     assert ok is True
     assert "wider_cap_sim" in r
     assert r["wider_cap_sim"]["pnl_pct"] > r["live_cap_sim"]["pnl_pct"]
+
+
+# ── exit_outcome record-only protect A/B aggregation (2026-10-21) ─────────
+
+def _exit_row(regime, reason, spot, roe, mfe, live_p, cand_p,
+              earlier, unlock):
+    return {"rule": "exit_outcome", "coin": "X", "side": "long",
+            "exit_reason": reason,
+            "detail": {"entry_regime": regime, "realized_spot_pct": spot,
+                       "realized_roe_pct": roe, "mfe_spot_pct": mfe,
+                       "live_protect_pct": live_p,
+                       "candidate_protect_pct": cand_p,
+                       "protect_arms_earlier": earlier,
+                       "protect_would_unlock_phase2": unlock}}
+
+
+def test_regime_bucket_avoids_non_trend_substring_trap():
+    # "non_trend" contains the substring "trend"; prefix classification must
+    # still land it in the non_trend bucket.
+    assert mod._regime_bucket("uptrendMomentum") == "trend"
+    assert mod._regime_bucket("downtrendMomentum") == "trend"
+    assert mod._regime_bucket("trend_ride") == "trend"
+    assert mod._regime_bucket("non_trend") == "non_trend"
+    assert mod._regime_bucket("neutral") == "non_trend"
+    assert mod._regime_bucket("chop") == "non_trend"
+    assert mod._regime_bucket("") == "non_trend"
+
+
+def test_exit_outcome_summary_buckets_and_tags(capsys):
+    records = [
+        # trend: one would-unlock (peak 1.8 < live 2.5, >= cand 1.5)
+        _exit_row("uptrendMomentum", "stale_flat_timeout", -0.4, -1.2, 1.8,
+                  2.5, 1.5, True, True),
+        # trend: already armed live (winner, floor breach)
+        _exit_row("downtrendMomentum", "floor_breach", 3.0, 9.0, 4.0,
+                  2.5, 1.5, True, False),
+        # non_trend: one would-unlock at the 1.0 candidate
+        _exit_row("neutral", "stale_flat_timeout", -0.2, -0.6, 1.2,
+                  1.5, 1.0, True, True),
+        # non_trend: never arms
+        _exit_row("chop", "max_loss", -1.6, -4.8, 0.5,
+                  1.5, 1.0, False, False),
+    ]
+    mod._summarize_exit_outcomes(records)
+    out = capsys.readouterr().out
+    assert "real closes recorded = 4" in out
+    assert "[trend]" in out and "[non_trend]" in out
+    # each bucket has 2 rows
+    assert "[trend] live protect=2.5  candidate protect=1.5" in out
+    assert "[non_trend] live protect=1.5  candidate protect=1.0" in out
+    # the two stale timeouts are flagged as would-unlock phase-2
+    assert "stale_flat_timeout" in out
+    stale_line = [ln for ln in out.splitlines()
+                  if ln.strip().startswith("stale_flat_timeout")][0]
+    assert stale_line.rstrip().endswith("would-unlock phase2: 2")
+
+
+def test_exit_outcome_summary_inert_without_candidate(capsys):
+    records = [_exit_row("trend", "floor_breach", 1.0, 3.0, 3.0,
+                         2.5, None, False, False)]
+    mod._summarize_exit_outcomes(records)
+    out = capsys.readouterr().out
+    assert "real closes recorded = 1" in out
+    # no candidate -> no arms/unlock split printed
+    assert "arms earlier" not in out
+
+
+def test_exit_outcome_summary_empty(capsys):
+    mod._summarize_exit_outcomes([])
+    assert "no real-close rows recorded yet" in capsys.readouterr().out

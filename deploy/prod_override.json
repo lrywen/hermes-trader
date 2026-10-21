@@ -311,7 +311,11 @@
     "stop_tuning_shadow": {
       "candidate_breakeven_trigger_pct": 1,
       "candidate_max_loss_pct": 1.5,
-      "shadow_mode": true
+      "shadow_mode": true,
+      "candidate_protect_pct_by_regime": {
+        "trend": 1.5,
+        "non_trend": 1.0
+      }
     },
     "time_scratch": {
       "enabled": false,
