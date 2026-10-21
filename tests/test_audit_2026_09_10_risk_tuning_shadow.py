@@ -380,6 +380,102 @@ def test_exit_outcome_disabled_writes_nothing(monkeypatch, tmp_path):
     assert not f.exists()
 
 
+# ── B-class pre-study (2026-10-21): lower protect_pct counterfactual ─────
+
+def _protect_cfg():
+    return {"dsl_exit": {"stop_tuning_shadow": {
+        "shadow_mode": True,
+        "candidate_protect_pct_by_regime": {"trend": 1.5, "non_trend": 1.0}}}}
+
+
+def test_protect_counterfactual_unlocks_never_armed_non_trend(monkeypatch, tmp_path):
+    """non_trend live protect 1.25; a stale trade with MFE 1.1% never armed
+    phase-2 live, but the 1.0% non_trend candidate WOULD arm it (unlock)."""
+    import json as _json
+    f = tmp_path / "pc1.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _protect_cfg())
+    t, pol = _make_tracker(monkeypatch, tmp_path, peak_px=1.011)  # MFE 1.1%
+    t.entry_regime = "non_trend"
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "stale_flat_timeout", unrealized_pct=-0.3,
+        effective_max_loss=0.8, spot_cap_display=0.8, atr_active=False)
+    d = _json.loads(f.read_text().strip())["detail"]
+    assert d["candidate_protect_pct"] == pytest.approx(1.0)
+    assert d["live_protect_pct"] == pytest.approx(pol.protect_pct)
+    assert d["protect_arms_earlier"] is True
+    assert d["protect_would_unlock_phase2"] is True
+
+
+def test_protect_counterfactual_trend_regime_uses_trend_candidate(monkeypatch, tmp_path):
+    import json as _json
+    f = tmp_path / "pc2.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _protect_cfg())
+    pol = dsl_exit.ExitPolicy(protect_pct=2.5)  # trend live protect
+    state = tmp_path / "dsl2.json"
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE", str(state))
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_LOCK_FILE", str(state) + ".lock")
+    monkeypatch.setattr(dsl_exit, "_LAST_SAVE_TS", 0.0)
+    monkeypatch.setattr(dsl_exit, "_SAVE_DIRTY", False)
+    dsl_exit._active_positions.clear()
+    dsl_exit._loaded_from_disk = False
+    t = dsl_exit.register_position("ETH", "long", entry_px=1.0, policy=pol)
+    t.peak_px = 1.018   # MFE 1.8%: below live 2.5, above candidate 1.5
+    t.entry_regime = "uptrend"
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "stale_flat_timeout", unrealized_pct=-0.2,
+        effective_max_loss=0.8, spot_cap_display=0.8, atr_active=False)
+    d = _json.loads(f.read_text().strip())["detail"]
+    assert d["candidate_protect_pct"] == pytest.approx(1.5)
+    assert d["protect_would_unlock_phase2"] is True
+
+
+def test_protect_counterfactual_inert_without_config_map(monkeypatch, tmp_path):
+    """With no candidate map (legacy/other config), fields are None/False and
+    nothing breaks."""
+    import json as _json
+    f = tmp_path / "pc3.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"stop_tuning_shadow": {"shadow_mode": True}}})
+    t, pol = _make_tracker(monkeypatch, tmp_path, peak_px=1.02)
+    t.entry_regime = "trend"
+    dsl_exit._record_exit_outcome_shadow(
+        t, pol, "floor_breach", unrealized_pct=1.0,
+        effective_max_loss=0.8, spot_cap_display=0.8, atr_active=False)
+    d = _json.loads(f.read_text().strip())["detail"]
+    assert d["candidate_protect_pct"] is None
+    assert d["protect_arms_earlier"] is False
+    assert d["protect_would_unlock_phase2"] is False
+    # binding protect must be reported but unchanged
+    assert d["live_protect_pct"] == pytest.approx(pol.protect_pct)
+
+
+def test_candidate_protect_for_regime_helper_buckets_and_guards():
+    # lightweight stand-in for the tracker (helper only reads entry_regime)
+    class _T:
+        def __init__(self, r): self.entry_regime = r
+    tun = {"candidate_protect_pct_by_regime": {"trend": 1.5, "non_trend": 1.0}}
+    assert dsl_exit._candidate_protect_for_regime(tun, _T("uptrend")) == 1.5
+    assert dsl_exit._candidate_protect_for_regime(tun, _T("neutral")) == 1.0
+    assert dsl_exit._candidate_protect_for_regime(tun, _T("")) == 1.0
+    # scalar fallback
+    assert dsl_exit._candidate_protect_for_regime(
+        {"candidate_protect_pct": 1.2}, _T("trend")) == 1.2
+    # inert / invalid
+    assert dsl_exit._candidate_protect_for_regime({}, _T("trend")) is None
+    assert dsl_exit._candidate_protect_for_regime(
+        {"candidate_protect_pct": 0}, _T("trend")) is None
+    assert dsl_exit._candidate_protect_for_regime(
+        {"candidate_protect_pct": "x"}, _T("trend")) is None
+
+
 # ── L3-A4: would_execute_dropped counter on duplicate open ────────────────
 
 def test_would_execute_dropped_counter(tmp_path, monkeypatch):

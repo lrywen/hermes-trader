@@ -218,6 +218,37 @@ def _record_stop_tuning_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         logger.debug("[dsl] stop-tuning shadow record failed: %r", e)
 
 
+def _candidate_protect_for_regime(tun: dict, tracker: "DSLTracker"):
+    """Resolve the record-only lower protect_pct candidate for a trade's regime.
+
+    Reads optional stop_tuning_shadow config:
+      * candidate_protect_pct_by_regime: {"trend": x, "non_trend": y}
+      * fallback scalar candidate_protect_pct applied to every regime.
+    Regime is bucketed from tracker.entry_regime ("trend" substring -> trend,
+    anything else -> non_trend). Returns a positive float, or None when inert /
+    unparseable. Never raises.
+    """
+    try:
+        regime = str(getattr(tracker, "entry_regime", "") or "").lower()
+        # NB: "non_trend" CONTAINS the substring "trend", so a naive
+        # ``"trend" in regime`` would misbucket it. Classify by trend-family
+        # prefix; everything else (incl. neutral/chop/range/empty) is non_trend.
+        bucket = "trend" if regime.startswith(("uptrend", "downtrend", "trend")) \
+            else "non_trend"
+        by_regime = tun.get("candidate_protect_pct_by_regime")
+        raw = None
+        if isinstance(by_regime, dict):
+            raw = by_regime.get(bucket, by_regime.get("default"))
+        if raw is None:
+            raw = tun.get("candidate_protect_pct")
+        if raw is None:
+            return None
+        val = float(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
                                 reason: str, unrealized_pct: float,
                                 effective_max_loss: float,
@@ -253,8 +284,27 @@ def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         except (TypeError, ValueError):
             cand_be = None
 
-        lev = max(1, int(getattr(tracker, "leverage", 1) or 1))
+        # B-class pre-study (redundancy plan 2026-10-21): lower protect_pct
+        # counterfactual, record-only. Historical 15m replay (ch_historical_bclass
+        # 2026-10-21) suggested trend 2.5->1.5 / non_trend 1.5->1.0, but all
+        # variants stayed net-negative and real arm n<5, so the BINDING value in
+        # ExitPolicy is NOT changed (M-1 gated). Here we only tag, on every real
+        # exit, whether the trade's REAL peak excursion would have armed phase-2
+        # under a lower protect threshold, keyed by entry regime. Phase-2 arms iff
+        # peak_profit >= protect_pct, so this needs no price-path replay — the
+        # tracker's observed MFE is sufficient. Inert unless the config map is set.
+        cand_protect = _candidate_protect_for_regime(tun, tracker)
+        live_protect = float(pol.protect_pct)
         mfe_pct = float(tracker._peak_profit_pct())
+        protect_arms_earlier = (
+            cand_protect is not None and cand_protect < live_protect
+            and mfe_pct >= cand_protect
+        )
+        protect_would_unlock = (
+            protect_arms_earlier and mfe_pct < live_protect
+        )
+
+        lev = max(1, int(getattr(tracker, "leverage", 1) or 1))
         loss_pct = float(unrealized_pct)        # signed favorable spot %
         roe_pct = loss_pct * lev
         be_would_arm = cand_be is not None and mfe_pct >= cand_be
@@ -298,6 +348,14 @@ def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
                 "entry_px": float(tracker.entry_px),
                 "leverage": lev,
                 "entry_regime": getattr(tracker, "entry_regime", "") or "",
+                "live_protect_pct": round(live_protect, 4),
+                "candidate_protect_pct": (round(cand_protect, 4)
+                                          if cand_protect is not None else None),
+                "protect_arms_earlier": bool(protect_arms_earlier),
+                # True only where the candidate flips a trade that NEVER armed
+                # phase-2 live (peak below the live protect) into one that does —
+                # the population the historical replay says benefits most.
+                "protect_would_unlock_phase2": bool(protect_would_unlock),
             },
         }, stream="risk_tuning")
     except Exception as e:  # never break the exit hot path

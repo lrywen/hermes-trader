@@ -249,6 +249,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "shadow_mode": True,
             "candidate_max_loss_pct": 0.0,
             "candidate_breakeven_trigger_pct": 0.0,
+            # Record-only lower protect_pct counterfactual (redundancy plan
+            # 2026-10-21; ch_historical_bclass replay suggested trend 2.5->1.5,
+            # non_trend 1.5->1.0). Tagged per real exit in the risk_tuning jsonl;
+            # the BINDING ExitPolicy.protect_pct is unchanged (M-1 gated). Set to
+            # 0.0 / omitted to make inert. Observation only, never moves a stop.
+            "candidate_protect_pct_by_regime": {"trend": 1.5, "non_trend": 1.0},
         },
         # Audit 2026-10-11: tighter floor-breach confirmation counter-factual.
         # Live exit requires consecutive_breaches_required (2) + breach_confirm_sec
