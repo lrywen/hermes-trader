@@ -93,29 +93,38 @@ def default_heuristic_config(*, warmup: int = 100) -> HeuristicConfig:
 
 
 def evaluate_window(
-    window: Sequence[Candle], th: dict[str, Any], weights: dict[str, float]
+    window: Sequence[Candle],
+    th: dict[str, Any],
+    weights: dict[str, float],
+    *,
+    candles_1h: Optional[Sequence[Candle]] = None,
+    candles_15m: Optional[Sequence[Candle]] = None,
 ) -> tuple[float, list[dict[str, Any]]]:
     """Run the live trigger stack + composite score on a trailing window.
 
     B1 (2026-10-22): delegates to the same orchestration the live scanner uses
     (:func:`hermes_trader.indicators.triggers.build_hits`) so the two cannot
-    drift. The single-feed backtest has no 1h/15m candles, so those triggers
-    get empty inputs and return flat. Known behaviour differences vs the
-    pre-B1 six-trigger stack (all intended, see review §4):
+    drift. By default the backtest has no 1h/15m candles, so those triggers
+    get empty inputs and return flat; callers that supply the extra feeds
+    (``candles_1h``, ``candles_15m``) will get the full live trigger set.
+    Known behaviour differences vs the pre-B1 six-trigger stack (all intended,
+    see review §4):
 
-    1. ``trendStrength`` is fed no 1h candles → always flat. Previously it ran
-       on the 5m window and its 0.30 weight could score; that was a
-       live/backtest mismatch (live scores ADX on 1h).
-    2. ``rangeCompression`` is fed no 15m candles → always flat (weight 0, and
-       squeeze-breakout coupling consequently never applies in backtest).
-    3. ``breakout`` now uses ``confirm_bars`` from thresholds (prod value 3)
+    1. ``trendStrength`` on a single feed → always flat (needs 1h candles).
+    2. ``rangeCompression`` on a single feed → always flat (needs 15m candles).
+    3. ``breakout`` uses ``confirm_bars`` from thresholds (prod value 3)
        like live; the old backtest call omitted it (function default 2).
 
     The additional surface-only triggers (volumeBuildup1h/trendFlip1h/
     higherLows1h/uptrendMomentum/downtrendMomentum, candlestick, dailyMover,
-    momentumContinuation1h) are empty/off here and do not fire.
+    momentumContinuation1h) are empty/off when the corresponding feed is
+    absent and do not fire.
     """
-    hits, score_weights = trig.build_hits(window, th, weights)
+    hits, score_weights = trig.build_hits(
+        window, th, weights,
+        candles_1h=list(candles_1h) if candles_1h is not None else None,
+        candles_15m=list(candles_15m) if candles_15m is not None else None,
+    )
     return trig.composite_score(hits, score_weights), hits
 
 
