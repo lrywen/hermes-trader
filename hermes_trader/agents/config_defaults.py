@@ -752,7 +752,11 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     },
     # 人工干预需AI二次研判
     "override_requires_ai": True,
-    # 鲸鱼扫描绕过趋势检查
+    # Whale-accumulation scan bypass. NOT a dead key: perception.scan_once
+    # hot-reads it every cycle (no restart) and _scan_single_market surfaces a
+    # whale-signal coin below the composite gate when true. Default False keeps
+    # the arm DORMANT; even when enabled it only bypasses composite surfacing —
+    # min_ai_confidence and every risk gate still apply. Do not delete the key.
     "whale_scan_bypass": False,
     # 持仓评分变化豁免研判冷却
     "research_rescore_delta": 0.0,  # F4: float per schema (supplemental audit 2026-08-31)
@@ -1585,9 +1589,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # residual (25 -> 17) inside the max_markets=60 cap — the sweep block
         # hard-caps total scan at 60, so HL's ~1200 weight/min budget is
         # unaffected. Movers and the HIP-3 split are untouched.
-        "universe_sweep": 8,
+        "universe_sweep": 8,  # value mirrors the perception literal default, but the key is LIVE (see the P0-a note above and perception._sweep_offset); keep registered — do not delete
         "batch_size": 20,
         "batch_sleep_sec": 0.3,
+        # C3 (2026-10-22): LIVE scan-pool width consumed by the perception
+        # thread pool. The canonical literal is 32 but the live file pins 24,
+        # so deleting this leaf WOULD change behaviour (revert 24 -> 32); it is
+        # registered in config_parity_guard. Definitely not a dead key.
         "parallel_workers": 32,
         # A4 (2026-10-21): NON-BINDING, not unconsumed — perception's mover
         # picker filters `abs(24h pct) >= movers_min_pct`, but selected movers
@@ -1853,6 +1861,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # the old "log-only" shadow behaviour (no paper positions).
         "enabled": True,
         # Virtual USDC the paper account starts with (operator-configurable).
+        # C11 (2026-10-22): read ONLY when the shadow book is (re)built/reset
+        # (shadow_book._starting_balance); changing it has no effect on a
+        # running book — no live fill or gate reads it. The live file pins 20
+        # (vs this canonical 10000.0), intentionally registered as a reviewed
+        # safe divergence in config_parity_guard._REVIEWED_SAFE_DIVERGENCES,
+        # so the parity gate stays green only while that exact 20 holds.
         "starting_balance": 10000.0,
         # Per-fill taker fee in PERCENT, modeled on close across the round trip
         # (mirrors execution.taker_fee_pct; HL tier-0 perp = 0.045% per fill).
@@ -1880,6 +1894,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
     # comment documents 0.78 as the LONG-side calibration. Enable it at 0.60 —
     # below the production min_ai_confidence=0.62 — so a WITH-TREND entry gets
     # a genuine lower bar while neutral/counter-trend keep the default 0.62.
+    # C8 (2026-10-22): this is a SEPARATE top-level key from min_ai_confidence
+    # on purpose — risk_gates reads the two independently and takes min(), so
+    # do NOT alias/merge them. Canonical and live both pin 0.60 today, equal to
+    # min_ai_confidence=0.60, which makes the with-trend discount a deliberate
+    # no-op (min(0.60,0.60)). Lowering ONLY this key re-enables the discount;
+    # changing both together silently defeats it. The runner generic-floor
+    # drift is separately guarded by confidence_guard (audit 2026-10-15 P0-1).
     "aligned_min_conf": 0.60,
     # P1-6: trading_loop runtime knobs (scripts/trading_loop.py). Eighteen
     # leaves covering the loop log file path, the surge-postmortem notify
@@ -1909,6 +1930,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "meta_prewarm_timeout_s": 3.0,
         "universe_refresh_s": 1800,
         "startup_grace_s": 12.0,
+        # Base scan cadence in seconds — a LIVE key consumed by trading_loop
+        # (_effective_scan_interval / _cycle_sleep each cycle), not a dead key.
+        # C2 (2026-10-22): canonical/live both carry 15 and live additionally
+        # sets scan_dynamic=true (fast 8s on WS-fresh / slow 20s on REST
+        # fallback); the leaf must stay registered even though its value equals
+        # the literal default — deleting it would silently hand the value back
+        # to the loop's env/literal channel. Do not remove.
         "scan_interval": 15,
         "scan_dynamic": False,
         "scan_fresh_s": 10.0,

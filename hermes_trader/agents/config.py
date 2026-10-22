@@ -51,7 +51,16 @@ TRIGGER_CONFIG: dict[str, Any] = {
         "higherLowsRequired": 4, # of last 6 1h bars
     },
     "scan": {
-        "minCompositeScore": 54,  # recalibrated for new weights: P230 zeroed 3 triggers -> denom 2.85->1.85 -> scores ~1.54x. 54 preserves the old-35 selectivity (35*1.54). Without this the gate silently loosened.
+        # recalibrated for new weights: P230 zeroed 3 triggers -> denom 2.85->1.85 -> scores ~1.54x.
+        # 54 preserves the old-35 selectivity (35*1.54). Without this the gate silently loosened.
+        # Selectivity (B12): composite_score divides by the SUM OF ALL WEIGHTS, not just fired
+        # ones (indicators/triggers.py composite_score). With the current nonzero weights summing
+        # to 1.80 (trendStrength .30 + pctMoveSpike .40 + breakout .30 + volumeSpike .25 +
+        # momentumBurst .20 + volumeBuildup1h .15 + uptrendMomentum .20), a single max-score
+        # trigger caps at ~22 and even the two heaviest (.40+.30) at ~39, so 54 effectively
+        # demands >= 3 nonzero-weight triggers firing together (.40+.30+.30 -> ~55.6). Raising/
+        # zeroing weights changes this arithmetic; re-derive the gate if the weights move.
+        "minCompositeScore": 54,
         "candleInterval": "5m",
         "candleCount": 100,
         "cacheTtlMs": 50_000,
