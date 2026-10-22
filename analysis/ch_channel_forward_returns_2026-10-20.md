@@ -91,3 +91,62 @@ Quality degrades with score; the (small) ≥54 set is the only near-flat/positiv
 - Mark-to-market forward returns ≠ realized trade PnL (no stops, fees, funding). Bounded by the replay next.
 - AI verdict join is advisory (async, ~56% nearest-neighbour hit) and is not used in the channel-vs-gate tests.
 - 15m resolution under-models intrabar stop triggers; the replay feeds bar high/low to the production DSL tracker to address this conservatively.
+
+---
+
+## Reproduction on refreshed data — 2026-10-21 (UTC)
+
+Independent re-run of the same PIT pipeline against the concatenated session-log
+through 2026-10-21 (current + 5 rotated gz), priced offline (network-free) from
+the local 15m candle cache.
+
+- **34,326 distinct (coin,15m-bar) signals / 242 coins** after dedup; channel
+  shares unchanged: trend 74.3%, mover 13.7%, pattern 9.3%, burst 1.9%,
+  gate 0.8%.
+- **29,332 rows priced, 0 fetch failures** (`CH_OFFLINE=1`, cache
+  `coin|15m`, 153 coins). Wall time 2m23s, peak RSS 360 MB. (Running the same
+  job *inside* the live container stalled >60 min purely on its 1 GB cgroup
+  memory limit / swap thrash — not algorithm cost; run analysis on the host.)
+
+### Raw long forward returns (reproduction)
+
+| channel | n | coins | 24h median | 24h win | 48h median | 48h win |
+|---|--:|--:|--:|--:|--:|--:|
+| **gate (≥54)** | 127 | 53 | **+0.89%** | **61.5%** | +0.25% | 50.8% |
+| trend | 21,978 | 156 | −0.89% | 44.8% | −1.46% | 43.5% |
+| **mover** | 3,693 | 66 | **−3.62%** | **29.9%** | **−5.45%** | **23.4%** |
+| pattern | 2,950 | 148 | −0.42% | 47.0% | −0.99% | 45.4% |
+| burst | 584 | 96 | −2.30% | 43.3% | −4.56% | 35.4% |
+
+Fade (short convention) win rates: mover **70.1% at 24h / 76.6% at 48h**;
+trend 55.2% / 56.5%.
+
+### Coin-clustered contrasts vs the genuine gate (reproduction)
+
+**mover vs gate** — remains negative at every horizon and survives de-meaning
+(35–36 independent coins):
+
+| horizon | raw diff (CI), p | de-meaned diff (CI), p |
+|---|---|---|
+| 4h | −1.67% [−2.49,−0.88], .001 | −0.75% [−1.45,+0.01], .052 |
+| 12h | −3.95% [−5.49,−2.54], .001 | −1.48% [−2.56,−0.46], .001 |
+| 24h | −5.54% [−7.91,−3.27], .001 | **−3.08% [−4.76,−1.32], .002** |
+| 48h | −6.37% [−9.14,−3.73], .001 | **−4.53% [−6.58,−2.44], .001** |
+
+**trend vs gate** — small gap, significant only at 24h/48h after de-meaning
+(52 coins): 24h −1.26% [−2.15,−0.36] p=.006; 48h −2.06% [−3.54,−0.58] p=.008;
+4h/12h not significant (p=.98 / .19 de-meaned).
+
+Composite bands (24h long) preserve the ordering: ≥54 −0.07%/49.7% (n=358) is
+the only near-flat band; 45–54 −1.25%, 35–45 −0.93%, 25–35 −1.36%, <25 −1.09%.
+
+### Reproduction verdict
+
+The 2026-10-20 result is independently confirmed on the refreshed window.
+**dailyMover remains the clear, de-mean-robust, coin-clustered leak; trend is
+the broad weak pool (keep, at most a modest trend-only score floor); the ≥54
+gate is not reliably positive, so lowering it stays unsupported.** No sign
+flip and no gate change until the cost/stop-inclusive event-time replay
+prices the mover fade against the ~19 bp taker round trip (fees 9 bp +
+slippage 10 bp) and DSL exit timing.
+
