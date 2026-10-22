@@ -512,6 +512,19 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "candidate_consecutive_breaches": ("int", 1, 100),
         "candidate_breach_confirm_sec": _num_leaf(0.0, 600.0),
     },
+    # D2 (2026-10-22): record-only earlier ignite-grace counter-factual.
+    # Live ignite_grace_minutes and the reachability warnings are untouched;
+    # enabling only appends an ignite_grace_cf snapshot at the bucket cutoff.
+    "ignite_grace_shadow": {
+        "shadow_mode": ("bool",),
+        "candidate_grace_minutes": _num_leaf(0.0, 100_000.0),
+        "candidate_grace_minutes_by_bucket": ("dict", {
+            "trend": _num_leaf(0.0, 100_000.0),
+            "non_trend": _num_leaf(0.0, 100_000.0),
+            "default": _num_leaf(0.0, 100_000.0),
+        }),
+        "applies_only_when_unignited": ("bool",),
+    },
     # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor ramp. Default OFF
     # (inert); band_pct is the peak-profit % width over which the floor ramps
     # hard-stop → full trailing floor.

@@ -36,6 +36,16 @@ HERMES_RISK_TUNING_SHADOW_FILE) and grades each counter-factual rule:
       is the directional evidence (does the would-unlock cluster actually have
       positive MFE / recoverable ROE?).
 
+  * ignite_grace_cf (D2, one snapshot per STILL-UNIGNITED non_trend position at
+      the candidate earlier 45-min grace, paired to its real exit):
+      Self-contained join on (coin, side, entry_ts) — no candles. cf net ROE at
+      the snapshot vs realized net ROE at the live exit gives the paired delta
+      of cutting the drifter before the 60-min stale-flat. Pre-registered gate:
+      n>=30 joined non_trend pairs, 15-min entry-block bootstrap (B=10000, fixed
+      seed) 95% CI lower bound strictly > 0, one-sided Wilcoxon p<0.05, shorter
+      cf median hold, majority improved, and overall net delta positive despite
+      the floor_breach give-up cluster. No verdict is printed below n=30.
+
 Pure paper reconciliation: never places orders. Default is a dry-run report;
 pass --write to stamp outcome fields back into the JSONL.
 
@@ -47,7 +57,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import random
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -76,6 +88,16 @@ MEMORY_FILE = os.environ.get(
 ROUND_TRIP_FEE_BPS = 5.0
 SIM_BARS = 180          # max 1h bars walked per signal (7.5 days)
 JOIN_WINDOW_MS = 6 * 3600_000   # match a real close within 6h of the signal
+
+# D2 (ignite_grace_cf) decision constants — fixed BEFORE seeing outcomes so the
+# n>=30 / CI gate cannot be tuned on the accumulating sample.
+D2_MIN_PAIRS = 30            # first promotion read only after >=30 joined pairs
+D2_BOOT_BOOTSTRAPS = 10000
+D2_BOOT_SEED = 20261022
+D2_BLOCK_SECONDS = 15 * 60   # resample whole 15-min entry-time blocks
+D2_ENTRY_TS_TOL_MS = 2_000   # exact entry_ts join tolerance (same open)
+D2_FALLBACK_WINDOW_MS = 12 * 3600_000  # nearest-exit fallback for legacy rows
+D2_MATURING_MS = 8 * 3600_000          # cf younger than 8h may still be open
 
 
 def _parse_iso(ts: str) -> Optional[datetime]:
@@ -420,6 +442,290 @@ def _summarize_exit_outcomes(records: List[dict]) -> None:
         print(f"    {token:22} {n:4}   of which would-unlock phase2: {u}")
 
 
+def _net_roe_pct(gross_roe_pct: float, leverage: float) -> float:
+    """Net a gross ROE % for one round trip at ROUND_TRIP_FEE_BPS taker fees.
+
+    Fee is charged on notional per side (5 bps round trip = 0.05% of notional),
+    i.e. 0.05 * leverage ROE points. Applied identically to both arms of a
+    pair, so the paired delta is fee-invariant; netting only makes each arm's
+    headline ROE comparable to the live book.
+    """
+    return float(gross_roe_pct) - (ROUND_TRIP_FEE_BPS / 10000.0 * 100.0) \
+        * max(1.0, float(leverage or 1))
+
+
+def _median(xs: List[float]) -> float:
+    s = sorted(xs)
+    n = len(s)
+    if n == 0:
+        return 0.0
+    mid = n // 2
+    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
+
+
+def _block_bootstrap_mean_ci(pairs: List[dict], boot: int,
+                             seed: int) -> Tuple[float, float]:
+    """95% CI for the mean paired net delta via 15-min entry-block resampling.
+
+    Units that share an entry-time block (bursty same-tape entries) are
+    resampled together, preventing within-block correlation from shrinking
+    the interval. Deterministic seed -> reproducible verdict.
+    """
+    blocks: Dict[int, List[float]] = {}
+    for p in pairs:
+        b = int(float(p["entry_ts"]) // D2_BLOCK_SECONDS)
+        blocks.setdefault(b, []).append(float(p["delta_net_roe"]))
+    keys = list(blocks.keys())
+    rng = random.Random(seed)
+    means: List[float] = []
+    for _ in range(boot):
+        acc = 0.0
+        cnt = 0
+        for _ in range(len(keys)):
+            vals = blocks[rng.choice(keys)]
+            acc += sum(vals)
+            cnt += len(vals)
+        means.append(acc / cnt if cnt else 0.0)
+    means.sort()
+    lo = means[int(0.025 * boot)]
+    hi = means[min(boot - 1, int(0.975 * boot))]
+    return lo, hi
+
+
+def _wilcoxon_one_sided(deltas: List[float]) -> Optional[float]:
+    """One-sided Wilcoxon signed-rank p (H1: median delta > 0).
+
+    Self-contained normal approximation (drops zero deltas, tie-corrected
+    variance incl. zero ranks). Returns None when there is no information
+    (all zeros or fewer than one non-zero pair).
+    """
+    d = [x for x in deltas if x != 0.0]
+    n = len(d)
+    if n == 0:
+        return None
+    order = sorted(range(n), key=lambda i: abs(d[i]))
+    ranks = [0.0] * n
+    i = 0
+    while i < n:
+        j = i
+        a = abs(d[order[i]])
+        while j + 1 < n and abs(d[order[j + 1]]) == a:
+            j += 1
+        avg = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg
+        i = j + 1
+    w_plus = sum(r for r, x in zip(ranks, d) if x > 0)
+    tie_groups: Dict[float, int] = {}
+    for r in ranks:
+        tie_groups[r] = tie_groups.get(r, 0) + 1
+    tie_adj = sum(t ** 3 - t for t in tie_groups.values() if t > 1)
+    var = (n * (n + 1) * (2 * n + 1) - tie_adj / 2.0) / 24.0
+    if var <= 0:
+        return None
+    mean = n * (n + 1) / 4.0
+    z = (w_plus - mean - 0.5) / math.sqrt(var)  # continuity correction
+    # H1: median delta > 0 -> upper-tail p = 1 - Phi(z).
+    return 0.5 * (1.0 - math.erf(z / math.sqrt(2.0)))
+
+
+def _summarize_ignite_grace_cf(records: List[dict]) -> None:
+    """D2: pair each 45-min unignited snapshot with its REAL exit and size the
+    counterfactual of an earlier non_trend ignite cut.
+
+    Both arms are the SAME position (join on coin+side+entry_ts):
+      cf   = mark at the candidate grace (detail.cf_unrealized_roe_pct)
+      real = realized ROE at the live exit (exit_outcome row)
+    delta_net = net(cf) - net(real). Positive means cutting the drifter at the
+    candidate grace beats holding to the real exit. No candles / simulation:
+    the snapshot freezes the unrealized PnL at the cutoff, and the real close
+    is already recorded. Guard rails (n>=30, block-bootstrap CI lower bound
+    strictly > 0, one-sided Wilcoxon, shorter hold, floor_breach give-up) are
+    pre-registered; with fewer than 30 joined pairs NO verdict is rendered.
+    """
+    cf_rows = [r for r in records if r.get("rule") == "ignite_grace_cf"
+               and isinstance(r.get("detail"), dict)]
+    ex_rows = [r for r in records if r.get("rule") == "exit_outcome"
+               and isinstance(r.get("detail"), dict)]
+    print("\n[ignite_grace_cf]  D2 record-only earlier non_trend ignite cut")
+    if not cf_rows:
+        print("  (no ignite_grace_cf snapshots recorded yet; arm is DEFAULT OFF)")
+        return
+
+    now_ms = datetime.now(timezone.utc).timestamp() * 1000.0
+    ex_index: Dict[Tuple[str, str], List[dict]] = {}
+    for r in ex_rows:
+        ex_index.setdefault((r.get("coin"), str(r.get("side") or "").lower()),
+                            []).append(r)
+
+    pairs: List[dict] = []
+    used_exit_ids = set()
+    maturing = gap = 0
+    for r in cf_rows:
+        d = r["detail"]
+        coin = r.get("coin")
+        side = str(r.get("side") or "").lower()
+        entry_ts = d.get("entry_ts")
+        cf_ts = (_parse_iso(r.get("timestamp", "")) or
+                 datetime.fromtimestamp(1, tz=timezone.utc))
+        cf_ms = cf_ts.timestamp() * 1000.0
+        match = None
+        how = ""
+        cands = ex_index.get((coin, side), [])
+        if isinstance(entry_ts, (int, float)):
+            best = None
+            for e in cands:
+                ets = (e.get("detail") or {}).get("entry_ts")
+                if not isinstance(ets, (int, float)):
+                    continue
+                dt = abs(ets - float(entry_ts)) * 1000.0
+                if dt <= D2_ENTRY_TS_TOL_MS and (best is None or dt < best[0]):
+                    best = (dt, e)
+            if best:
+                match, how = best[1], "entry_ts"
+        if match is None:
+            # Legacy exit rows (pre entry_ts) only: nearest same coin/side
+            # close strictly after the snapshot within the fallback window.
+            best = None
+            for e in cands:
+                ex_ts = _parse_iso(e.get("timestamp", ""))
+                if ex_ts is None:
+                    continue
+                ex_ms = ex_ts.timestamp() * 1000.0
+                dt = ex_ms - cf_ms
+                if 0 <= dt <= D2_FALLBACK_WINDOW_MS and (
+                        best is None or dt < best[0]):
+                    best = (dt, e)
+            if best:
+                match, how = best[1], "nearest"
+        if match is None:
+            if now_ms - cf_ms < D2_MATURING_MS:
+                maturing += 1
+            else:
+                gap += 1
+            continue
+        if id(match) in used_exit_ids:
+            gap += 1
+            continue
+        used_exit_ids.add(id(match))
+
+        ed = match.get("detail") or {}
+        lev = float(d.get("leverage") or ed.get("leverage") or 1)
+        cf_gross = float(d.get("cf_unrealized_roe_pct") or 0.0)
+        real_gross = float(ed.get("realized_roe_pct") or 0.0)
+        cf_net = _net_roe_pct(cf_gross, lev)
+        real_net = _net_roe_pct(real_gross, lev)
+        ex_ts = _parse_iso(match.get("timestamp", ""))
+        real_hold_min = (
+            (ex_ts.timestamp() - float(entry_ts)) / 60.0
+            if isinstance(entry_ts, (int, float)) and ex_ts is not None
+            else float("nan"))
+        pairs.append({
+            "entry_ts": float(entry_ts) if isinstance(
+                entry_ts, (int, float)) else cf_ts.timestamp(),
+            "coin": coin,
+            "regime_bucket": d.get("regime_bucket")
+            or _regime_bucket(d.get("entry_regime", "")),
+            "candidate_min": float(d.get("candidate_grace_minutes") or 0.0),
+            "cf_close_min": float(d.get("cf_close_min") or 0.0),
+            "real_hold_min": real_hold_min,
+            "cf_net_roe": cf_net,
+            "real_net_roe": real_net,
+            "delta_net_roe": cf_net - real_net,
+            "exit_reason": str(match.get("exit_reason") or "?"),
+            "join": how,
+        })
+
+    print(f"  snapshots={len(cf_rows)}  joined_pairs={len(pairs)}  "
+          f"maturing(open,<8h)={maturing}  unmatched_gap={gap}")
+    if not pairs:
+        print("  (no paired real exits yet — every arm needs its close)")
+        return
+
+    non_trend = [p for p in pairs if p["regime_bucket"] == "non_trend"]
+    trend = [p for p in pairs if p["regime_bucket"] != "non_trend"]
+    if trend:
+        print(f"  NOTE: {len(trend)} pairs bucketed trend (candidate targets "
+              f"non_trend only; excluded from the verdict)")
+    if not non_trend:
+        print("\n  [non_trend] no paired non_trend exits yet "
+              "(candidate targets non_trend only); no verdict.")
+        return
+    n = len(non_trend)
+    deltas = [p["delta_net_roe"] for p in non_trend]
+    cf_hold = [p["cf_close_min"] for p in non_trend]
+    real_hold = [p["real_hold_min"] for p in non_trend
+                 if not math.isnan(p["real_hold_min"])]
+    improved = sum(1 for x in deltas if x > 0)
+    worse = sum(1 for x in deltas if x < 0)
+    floor_give = [p for p in non_trend
+                  if p["exit_reason"] == "floor_breach"
+                  and p["real_net_roe"] > p["cf_net_roe"]]
+    floor_give_sum = sum(p["real_net_roe"] - p["cf_net_roe"]
+                         for p in floor_give)
+
+    print(f"\n  [non_trend] n={n}  (promote read requires n>={D2_MIN_PAIRS})")
+    print(f"    paired net dROE  mean={_avg(deltas):+6.2f} pp  "
+          f"median={_median(deltas):+6.2f} pp  sum={sum(deltas):+7.2f} pp")
+    print(f"    cf arm  net ROE mean={_avg([p['cf_net_roe'] for p in non_trend]):+6.2f}%  "
+          f"median={_median([p['cf_net_roe'] for p in non_trend]):+6.2f}%")
+    print(f"    real    net ROE mean={_avg([p['real_net_roe'] for p in non_trend]):+6.2f}%  "
+          f"median={_median([p['real_net_roe'] for p in non_trend]):+6.2f}%")
+    print(f"    pairs improved={improved}  worse={worse}  "
+          f"flat={n - improved - worse}  "
+          f"improve rate={improved/n*100:4.1f}%")
+    if real_hold:
+        print(f"    hold minutes  cf median={_median(cf_hold):5.1f}  "
+              f"real median={_median(real_hold):5.1f}  "
+              f"(shorter under cf: "
+              f"{'YES' if _median(cf_hold) < _median(real_hold) else 'NO'})")
+    print(f"    floor_breach give-up cluster: {len(floor_give)} pairs, "
+          f"foregone sum={floor_give_sum:+.2f} pp")
+
+    lo = hi = None
+    pval = _wilcoxon_one_sided(deltas)
+    if n >= D2_MIN_PAIRS:
+        lo, hi = _block_bootstrap_mean_ci(
+            non_trend, D2_BOOT_BOOTSTRAPS, D2_BOOT_SEED)
+        print(f"\n    block bootstrap (15-min entry blocks, B={D2_BOOT_BOOTSTRAPS}, "
+              f"seed={D2_BOOT_SEED})")
+        print(f"      mean dROE 95% CI = [{lo:+.2f}, {hi:+.2f}] pp  "
+              f"(lower bound strictly > 0 required)")
+        if pval is not None:
+            print(f"    one-sided paired Wilcoxon p = {pval:.4f}")
+        else:
+            print("    Wilcoxon: undefined (all-zero deltas)")
+
+    print("\n    PROMOTE GATE (all must hold; pre-registered):")
+    checks = [
+        (f"n={n} >= {D2_MIN_PAIRS} paired non_trend pairs", n >= D2_MIN_PAIRS),
+        ("block-bootstrap 95% CI lower bound > 0",
+         lo is not None and lo > 0.0),
+        ("one-sided Wilcoxon p < 0.05",
+         pval is not None and pval < 0.05),
+        ("cf median hold shorter than real",
+         bool(real_hold) and _median(cf_hold) < _median(real_hold)),
+        ("majority of pairs improved", improved > n / 2),
+        ("overall net dROE positive incl. floor_breach give-up",
+         sum(deltas) > 0.0),
+    ]
+    for label, ok in checks:
+        print(f"      [{'PASS' if ok else 'WAIT'}] {label}")
+    if n < D2_MIN_PAIRS:
+        print(f"\n    NO VERDICT: only {n}/{D2_MIN_PAIRS} pairs. Do not tune "
+              f"the candidate or read interim significance until the natural "
+              f"sample reaches {D2_MIN_PAIRS} (other cutoffs, e.g. 30 min, "
+              f"stay post-hoc hypotheses and do not share this alpha).")
+    elif all(ok for _, ok in checks):
+        print("\n    ALL GATES PASS — eligible for a SEPARATE regime-aware "
+              "change that sets the non_trend binding ignite grace < 60 min "
+              "(trend untouched). Code/config promotion still needs its own "
+              "review; this report is evidence only.")
+    else:
+        print("\n    GATE NOT MET — keep the binding ignite grace unchanged; "
+              "continue record-only collection.")
+
+
 def _summary(records: List[dict]) -> None:
     by_rule: Dict[str, List[dict]] = {}
     for r in records:
@@ -430,6 +736,7 @@ def _summary(records: List[dict]) -> None:
 
     print("\n=== risk-tuning shadow reconciliation ===")
     _summarize_exit_outcomes(records)
+    _summarize_ignite_grace_cf(records)
     for rule, rows in sorted(by_rule.items()):
         graded = [r for r in rows if r.get("outcome") not in (None, "")]
         print(f"\n[{rule}]  graded={len(graded)} / total={len(rows)}")
@@ -463,8 +770,8 @@ def _summary(records: List[dict]) -> None:
 
     print("\n  per-record detail:")
     for r in sorted(records, key=lambda x: x.get("timestamp", "")):
-        if r.get("rule") == "exit_outcome":
-            continue  # self-contained; summarized in the section above
+        if r.get("rule") in ("exit_outcome", "ignite_grace_cf"):
+            continue  # self-contained; summarized in the sections above
         if r.get("outcome"):
             d = r.get("detail") or {}
             extra = ""
@@ -501,9 +808,9 @@ def main() -> int:
 
     graded = pending = skipped = 0
     for r in records:
-        # exit_outcome rows are self-contained real-close observations; they
-        # need no candle grading and are aggregated directly by _summary.
-        if r.get("rule") == "exit_outcome":
+        # exit_outcome / ignite_grace_cf rows are self-contained observations;
+        # they need no candle grading and are aggregated directly by _summary.
+        if r.get("rule") in ("exit_outcome", "ignite_grace_cf"):
             skipped += 1
             continue
         if r.get("outcome") is not None:
@@ -519,7 +826,7 @@ def main() -> int:
 
     print(f"total={len(records)}  newly_graded={graded}  "
           f"pending(immature/unmatched)={pending}  "
-          f"exit_outcome(observed, no grading)={skipped}")
+          f"observed(no grading)={skipped}")
     _summary(records)
 
     if args.write:

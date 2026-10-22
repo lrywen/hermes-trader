@@ -348,6 +348,12 @@ def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
                 "entry_px": float(tracker.entry_px),
                 "leverage": lev,
                 "entry_regime": getattr(tracker, "entry_regime", "") or "",
+                # D2 join key: pairs this real close to its ignite_grace_cf
+                # snapshot for the same position (coin can re-enter later).
+                "entry_ts": float(tracker.entry_time),
+                "entry_iso": datetime.fromtimestamp(
+                    tracker.entry_time, timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"),
                 "live_protect_pct": round(live_protect, 4),
                 "candidate_protect_pct": (round(cand_protect, 4)
                                           if cand_protect is not None else None),
@@ -360,6 +366,107 @@ def _record_exit_outcome_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         }, stream="risk_tuning")
     except Exception as e:  # never break the exit hot path
         logger.debug("[dsl] exit-outcome shadow record failed: %r", e)
+
+
+def _ignite_grace_shadow_cutoff(tracker: "DSLTracker") -> Optional[float]:
+    """D2: resolve the record-only candidate ignite-grace cutoff (minutes) for
+    a tracker's regime bucket, or None when inert / unparseable / no candidate.
+
+    The canonical ``ignite_grace_minutes`` (None -> ExitPolicy 90 min) is
+    unreachable in the non_trend bucket because stale_flat fires first at
+    60 min. This reads the SEPARATE ``ignite_grace_shadow`` block, so the live
+    clock and exit_clock_reachability_warnings are untouched. Mirrors the
+    trend/non_trend bucketing in :func:`_candidate_protect_for_regime` (classify
+    by trend-family prefix; "non_trend" contains the substring "trend").
+    """
+    try:
+        from hermes_trader.agents.config_store import read_agent_config
+        cfg = read_agent_config() or {}
+        blk = ((cfg.get("dsl_exit") or {}).get("ignite_grace_shadow")) or {}
+        if not bool(blk.get("shadow_mode", False)):
+            return None
+        if bool(blk.get("applies_only_when_unignited", True)) and tracker.ignited:
+            return None
+        regime = str(getattr(tracker, "entry_regime", "") or "").lower()
+        bucket = "trend" if regime.startswith(("uptrend", "downtrend", "trend")) \
+            else "non_trend"
+        by_bucket = blk.get("candidate_grace_minutes_by_bucket")
+        raw = None
+        if isinstance(by_bucket, dict):
+            raw = by_bucket.get(bucket, by_bucket.get("default"))
+        if raw is None:
+            raw = blk.get("candidate_grace_minutes")
+        if raw is None:
+            return None
+        val = float(raw)
+        return val if val > 0 else None
+    except (TypeError, ValueError):
+        return None
+    except Exception:
+        return None
+
+
+def _record_ignite_grace_shadow(tracker: "DSLTracker", elapsed_min: float,
+                                mark_px: float) -> None:
+    """D2 (2026-10-22): one-time record-only snapshot at the candidate (earlier)
+    ignite-grace cutoff for a STILL-UNIGNITED position.
+
+    Live exits are unchanged. On the first tick ``elapsed_min`` crosses the
+    bucket's candidate cutoff (e.g. non_trend 45 min, before the live 60 min
+    stale-flat) while the position has not ignited, append ONE risk_tuning row
+    (rule="ignite_grace_cf") with the unrealized spot/ROE at that instant. An
+    offline reconciler joins it to the real exit to size the counterfactual
+    delta. A persisted ``ignite_cf_recorded`` guard makes it at-most-once across
+    restarts. Best-effort; never raises and never touches the exit hot path.
+    """
+    try:
+        if getattr(tracker, "ignite_cf_recorded", False):
+            return
+        cutoff = _ignite_grace_shadow_cutoff(tracker)
+        if cutoff is None or elapsed_min < cutoff:
+            return
+        tracker.ignite_cf_recorded = True
+        _request_save(force=False)
+
+        upct = tracker._unrealized_pct(mark_px)
+        lev = max(1, int(getattr(tracker, "leverage", 1) or 1))
+        regime = str(getattr(tracker, "entry_regime", "") or "")
+        bucket = "trend" if regime.lower().startswith(
+            ("uptrend", "downtrend", "trend")) else "non_trend"
+
+        import os
+        from datetime import datetime, timezone
+
+        from hermes_trader.shadow_log import append_jsonl
+        path = os.environ.get(
+            "HERMES_RISK_TUNING_SHADOW_FILE",
+            os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"))
+        append_jsonl(path, {
+            "timestamp": datetime.now(timezone.utc).strftime(
+                "%Y-%m-%dT%H:%M:%SZ"),
+            "rule": "ignite_grace_cf",
+            "coin": tracker.coin,
+            "side": tracker.side,
+            "would": "earlier_ignite_exit",
+            "detail": {
+                "entry_ts": float(tracker.entry_time),
+                "entry_iso": datetime.fromtimestamp(
+                    tracker.entry_time, timezone.utc).strftime(
+                        "%Y-%m-%dT%H:%M:%SZ"),
+                "entry_regime": regime,
+                "regime_bucket": bucket,
+                "candidate_grace_minutes": round(float(cutoff), 4),
+                "cf_close_min": round(float(elapsed_min), 3),
+                "cf_unrealized_spot_pct": round(float(upct), 4),
+                "cf_unrealized_roe_pct": round(float(upct) * lev, 4),
+                "was_ignited": bool(tracker.ignited),
+                "entry_px": float(tracker.entry_px),
+                "mark_px": float(mark_px),
+                "leverage": lev,
+            },
+        }, stream="risk_tuning")
+    except Exception as e:  # never break the exit hot path
+        logger.debug("[dsl] ignite-grace shadow record failed: %r", e)
 
 
 def _stop_confirm_shadow_cfg() -> Optional[dict]:
@@ -1208,6 +1315,11 @@ class DSLTracker:
         self.ignite_ts: Optional[float] = None
         # Which timeframe fired the earliest igniting bar ("5m"/"15m"/"1h").
         self.ignite_period: Optional[str] = None
+        # D2 record-only shadow (2026-10-22): at-most-once guard for the
+        # candidate shorter ignite-grace snapshot. Persisted so a restart past
+        # the cutoff does not emit a duplicate ignite_grace_cf row. Has no
+        # effect on any live exit.
+        self.ignite_cf_recorded: bool = False
         # monotonic() timestamp of the first tick in the current sustained
         # breach run; None while not breached or after recovery. Used by the
         # time-based breach_confirm_sec gate (P2-7). Not persisted: on
@@ -1448,6 +1560,12 @@ class DSLTracker:
             spot_cap_display = pol.max_loss_pct if pol.max_loss_pct > 0 else float("inf")
         # Reason string surfaces both inputs so it's obvious post-hoc
         # which cap was binding for a given exit.
+
+        # D2 (2026-10-22): record-only snapshot at the candidate shorter
+        # non_trend ignite grace. Runs BEFORE any live clock exit so the
+        # counterfactual instant is captured whichever real rule wins; inert
+        # unless ignite_grace_shadow.shadow_mode is on. Never moves a stop.
+        _record_ignite_grace_shadow(self, elapsed_min, mark_px)
 
         # ── Launch-ignition timeout ───────────────────────────────────
         # No volume+breakout launch within the post-entry grace → close as
@@ -1917,6 +2035,7 @@ def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
         "ignited": t.ignited,
         "ignite_ts": t.ignite_ts,
         "ignite_period": t.ignite_period,
+        "ignite_cf_recorded": t.ignite_cf_recorded,
         "last_floor": t._last_floor,
         "policy": asdict(t.policy),
         # v2: exchange bracket order IDs / prices (None when no resting order).
@@ -2049,6 +2168,9 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
     t.ignited = bool(d.get("ignited", False))
     t.ignite_ts = _opt_float(d.get("ignite_ts"))
     t.ignite_period = d.get("ignite_period")
+    # D2 record-only guard; absent in older state files -> False (snapshots
+    # once after upgrade if the position is still un-ignited past the cutoff).
+    t.ignite_cf_recorded = bool(d.get("ignite_cf_recorded", False))
     # Audit 2026-09-06 (E5, P2): validate a persisted last_floor before
     # trusting it as the ratchet anchor. The floor is always a positive PRICE
     # (long: a stop below entry that ratchets up; short: a stop above entry

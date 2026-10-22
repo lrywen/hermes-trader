@@ -268,6 +268,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "candidate_consecutive_breaches": 1,
             "candidate_breach_confirm_sec": 1.0,
         },
+        # D2 (2026-10-22): record-only counterfactual for a SHORTER non_trend
+        # ignite grace. The canonical ignite_grace_minutes stays UNSET (None ->
+        # ExitPolicy 90 min), which is unreachable in the non_trend bucket
+        # because stale_flat fires first at 60 min (a deliberately measured
+        # dead gate; see exit_clock_reachability_warnings). This arm never moves
+        # a stop: on the first tick a still-UNIGNITED position crosses its
+        # bucket's candidate cutoff it appends ONE risk_tuning row
+        # (rule="ignite_grace_cf") snapshotting the unrealized ROE at that
+        # earlier instant; an offline reconciler joins it to the real exit to
+        # size the delta. DEFAULT OFF (inert); arm only in SHADOW. Buckets with
+        # no candidate (trend) are not observed. See the D2 pre-registration for
+        # the n>=30 / block-bootstrap promote gate. Do NOT set this < 60 in the
+        # binding key without that evidence.
+        "ignite_grace_shadow": {
+            "shadow_mode": False,
+            "candidate_grace_minutes_by_bucket": {"non_trend": 45.0},
+            "applies_only_when_unignited": True,
+        },
         # Audit 2026-09-06 (E4, P2): smooth phase1→phase2 floor transition.
         # Ramps the phase-2 floor from the hard stop up to the full trailing
         # floor across a peak-profit band of width band_pct instead of snapping

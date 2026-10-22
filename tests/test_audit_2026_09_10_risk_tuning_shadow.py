@@ -706,3 +706,204 @@ def test_runner_gate_block_populates_blocked_by(monkeypatch):
     # reason and blocked_by stay consistent for human + machine readers.
     assert res.get("reason") == reason
 
+
+# ── D2 (2026-10-22): ignite_grace_cf record-only snapshot ────────────────
+
+def _ignite_shadow_cfg(regime_map=None, shadow_mode=True,
+                       applies_only_when_unignited=True):
+    return {"dsl_exit": {"ignite_grace_shadow": {
+        "shadow_mode": shadow_mode,
+        "candidate_grace_minutes_by_bucket":
+            regime_map if regime_map is not None else {"non_trend": 45.0},
+        "applies_only_when_unignited": applies_only_when_unignited}}}
+
+
+def test_ignite_grace_cutoff_buckets_regime_prefix(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg(
+            {"trend": 30.0, "non_trend": 45.0, "default": 60.0}))
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.0)
+    for regime, expect in [("uptrendMomentum", 30.0), ("downtrend", 30.0),
+                           ("trend", 30.0), ("neutral", 45.0),
+                           ("chop", 45.0), ("non_trend", 45.0),
+                           ("", 45.0)]:
+        t.entry_regime = regime
+        assert dsl_exit._ignite_grace_shadow_cutoff(t) == \
+            pytest.approx(expect), regime
+
+
+def test_ignite_grace_cutoff_scalar_fallback_and_inert(monkeypatch, tmp_path):
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.0)
+    t.entry_regime = "neutral"
+    # scalar candidate_grace_minutes fallback when no bucket map
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"ignite_grace_shadow": {
+            "shadow_mode": True, "candidate_grace_minutes": 40.0}}})
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) == pytest.approx(40.0)
+    # scalar fallback applies to every bucket by design
+    t.entry_regime = "uptrend"
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) == pytest.approx(40.0)
+    # no map and no scalar -> None for either bucket
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"ignite_grace_shadow": {
+            "shadow_mode": True,
+            "candidate_grace_minutes_by_bucket": {"non_trend": 45.0}}}})
+    t.entry_regime = "uptrend"
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) is None
+    # non-positive candidate is invalid
+    t.entry_regime = "neutral"
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {"ignite_grace_shadow": {
+            "shadow_mode": True, "candidate_grace_minutes": 0}}})
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) is None
+
+
+def test_ignite_grace_shadow_inert_when_disabled_or_absent(
+        monkeypatch, tmp_path):
+    f = tmp_path / "ig.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.0)
+    t.entry_regime = "neutral"
+    # explicit shadow_mode=False
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg(shadow_mode=False))
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) is None
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=50.0, mark_px=1.01)
+    assert not f.exists()
+    assert t.ignite_cf_recorded is False
+    # block entirely absent -> still inert
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: {"dsl_exit": {}})
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) is None
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=50.0, mark_px=1.01)
+    assert not f.exists()
+
+
+def test_ignite_grace_shadow_skips_already_ignited(monkeypatch, tmp_path):
+    f = tmp_path / "ig.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg())
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.0)
+    t.entry_regime = "neutral"
+    t.mark_ignited()
+    assert dsl_exit._ignite_grace_shadow_cutoff(t) is None
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=50.0, mark_px=1.01)
+    assert not f.exists()
+    assert t.ignite_cf_recorded is False
+
+
+def test_ignite_grace_shadow_records_once_at_cutoff(monkeypatch, tmp_path):
+    import json as _json
+    f = tmp_path / "ig.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg())
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.02)
+    t.entry_regime = "neutral"
+    # before the 45min cutoff: nothing
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=44.9, mark_px=1.01)
+    assert not f.exists()
+    assert t.ignite_cf_recorded is False
+    # crossing the cutoff while unignited: exactly one snapshot
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=45.2, mark_px=1.01)
+    lines = f.read_text().strip().splitlines()
+    assert len(lines) == 1
+    rec = _json.loads(lines[0])
+    assert rec["rule"] == "ignite_grace_cf"
+    assert rec["coin"] == "ADA" and rec["side"] == "long"
+    assert rec["would"] == "earlier_ignite_exit"
+    d = rec["detail"]
+    assert d["entry_ts"] == pytest.approx(t.entry_time)
+    assert d["entry_regime"] == "neutral"
+    assert d["regime_bucket"] == "non_trend"
+    assert d["candidate_grace_minutes"] == pytest.approx(45.0)
+    assert d["cf_close_min"] == pytest.approx(45.2)
+    assert d["was_ignited"] is False
+    assert d["entry_px"] == pytest.approx(1.0)
+    assert d["mark_px"] == pytest.approx(1.01)
+    assert d["cf_unrealized_spot_pct"] == pytest.approx(1.0)
+    # default register_position leverage is 1 -> roe == spot
+    assert d["leverage"] == 1
+    assert d["cf_unrealized_roe_pct"] == pytest.approx(1.0)
+    assert t.ignite_cf_recorded is True
+    # later ticks must never emit a second row (at-most-once, persisted guard)
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=80.0, mark_px=1.03)
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=120.0, mark_px=0.99)
+    assert len(f.read_text().strip().splitlines()) == 1
+
+
+def test_ignite_grace_shadow_roe_scales_with_leverage(monkeypatch, tmp_path):
+    import json as _json
+    f = tmp_path / "ig.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg())
+    state = tmp_path / "dsl_lev.json"
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_FILE", str(state))
+    monkeypatch.setattr(dsl_exit, "DSL_STATE_LOCK_FILE", str(state) + ".lock")
+    monkeypatch.setattr(dsl_exit, "_LAST_SAVE_TS", 0.0)
+    monkeypatch.setattr(dsl_exit, "_SAVE_DIRTY", False)
+    dsl_exit._active_positions.clear()
+    dsl_exit._loaded_from_disk = False
+    t = dsl_exit.register_position(
+        "SOL", "long", entry_px=100.0, policy=dsl_exit.ExitPolicy(),
+        leverage=5, entry_regime="chop")
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=46.0, mark_px=101.0)
+    d = _json.loads(f.read_text().strip())["detail"]
+    assert d["leverage"] == 5
+    assert d["cf_unrealized_spot_pct"] == pytest.approx(1.0)
+    assert d["cf_unrealized_roe_pct"] == pytest.approx(5.0)
+    assert d["regime_bucket"] == "non_trend"
+
+
+def test_ignite_grace_cf_recorded_roundtrip_persistence(
+        monkeypatch, tmp_path):
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.0)
+    t.entry_regime = "neutral"
+    # default payload omits nothing: False round-trips
+    payload = dsl_exit._tracker_to_dict(t)
+    assert payload["ignite_cf_recorded"] is False
+    rt = dsl_exit._tracker_from_dict(payload)
+    assert rt.ignite_cf_recorded is False
+    # a recorded snapshot survives the restart rehydrate
+    t.ignite_cf_recorded = True
+    payload = dsl_exit._tracker_to_dict(t)
+    assert payload["ignite_cf_recorded"] is True
+    rt = dsl_exit._tracker_from_dict(payload)
+    assert rt.ignite_cf_recorded is True
+    # legacy payload without the key hydrates conservatively to False
+    del payload["ignite_cf_recorded"]
+    assert dsl_exit._tracker_from_dict(payload).ignite_cf_recorded is False
+
+
+def test_ignite_grace_shadow_recording_has_no_verdict_side_effect(
+        monkeypatch, tmp_path):
+    """D2 is record-only: calling the snapshot helper must not mutate any
+    exit-driving tracker state (peak/ignited/floor/breach counters)."""
+    f = tmp_path / "ig.jsonl"
+    monkeypatch.setenv("HERMES_RISK_TUNING_SHADOW_FILE", str(f))
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config",
+        lambda: _ignite_shadow_cfg())
+    t, _ = _make_tracker(monkeypatch, tmp_path, peak_px=1.02)
+    t.entry_regime = "neutral"
+    before = (t.peak_px, t.ignited, t.consecutive_breaches,
+              t._first_breach_ts, t._last_floor, t.sl_px)
+    dsl_exit._record_ignite_grace_shadow(t, elapsed_min=50.0, mark_px=1.03)
+    after = (t.peak_px, t.ignited, t.consecutive_breaches,
+             t._first_breach_ts, t._last_floor, t.sl_px)
+    assert before == after
+    # snapshot fired but the live tracker state is untouched
+    assert t.ignite_cf_recorded is True
+    assert t.ignited is False
+
