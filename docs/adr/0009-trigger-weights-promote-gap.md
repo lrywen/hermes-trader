@@ -1,6 +1,6 @@
 # ADR-0009：trigger_weights canonical→生产 promote 遗漏（trend_strength 0.55 vs 0.30）
 
-- 状态：Accepted（漂移事实确认；修复动作待用户确认后执行）
+- 状态：Accepted（已执行：`2026-10-22T19:03:54Z` config_write `adr-0009-promote-trigger-weights`，验收 4 条全部满足）
 - 日期：2026-10-23（Asia/Shanghai）
 - 决策者：用户指令（「现在就把漂移写进 ADR 或 promote 队列」），会话评审取证
 - 关联：终版裁决 `.review/final_ruling_2026-10-23.md` §0.2 / §3-1；

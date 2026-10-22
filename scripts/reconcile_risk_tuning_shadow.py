@@ -75,8 +75,24 @@ from hermes_trader.models.types import Candle
 
 SHADOW_FILE = os.environ.get(
     "HERMES_RISK_TUNING_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl"),
+    # D2-fix (2026-10-23): default to /data/ (the container volume, single
+    # source of truth).  The old default (~/.hermes-trading/) pointed to the
+    # host bind-mount which the container cannot see, causing a silent split
+    # where the container wrote /data/ and the reconciler read ~/.hermes-trading/.
+    # When running outside the container, set HERMES_RISK_TUNING_SHADOW_FILE
+    # explicitly or mount /data/ to the same path.
+    "/data/risk_tuning_shadow.jsonl",
 )
+if not os.path.isfile(SHADOW_FILE):
+    # Fallback for host-side runs where /data/ is not mounted.
+    _host_fallback = os.path.expanduser("~/.hermes-trading/risk_tuning_shadow.jsonl")
+    if os.path.isfile(_host_fallback):
+        print(f"[reconcile] WARNING: {SHADOW_FILE} not found, "
+              f"falling back to host file {_host_fallback}")
+        SHADOW_FILE = _host_fallback
+    else:
+        print(f"[reconcile] WARNING: shadow file not found at {SHADOW_FILE} "
+              f"or {_host_fallback}")
 MEMORY_FILE = os.environ.get(
     "HERMES_MEMORY_FILE",
     # Mirror agents/memory.py: env override (the live container sets

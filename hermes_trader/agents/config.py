@@ -51,7 +51,7 @@ TRIGGER_CONFIG: dict[str, Any] = {
         "higherLowsRequired": 4, # of last 6 1h bars
     },
     "scan": {
-        # recalibrated for new weights: P230 zeroed 3 triggers -> denom 2.85->1.85 -> scores ~1.54x.
+        # recalibrated for new weights: P230 zeroed 3 triggers -> denom 2.85->1.80 -> scores ~1.54x.
         # 54 preserves the old-35 selectivity (35*1.54). Without this the gate silently loosened.
         # Selectivity (B12): composite_score divides by the SUM OF ALL WEIGHTS, not just fired
         # ones (indicators/triggers.py composite_score). With the current nonzero weights summing

@@ -216,6 +216,8 @@ def heuristic_signals(
     *,
     context_fn: Optional[ContextFn] = None,
     bar_ms: int = BAR_MS_5M,
+    candles_1h: Optional[Sequence[Candle]] = None,
+    candles_15m: Optional[Sequence[Candle]] = None,
 ) -> list[Signal]:
     """Scan every closed bar PIT and emit entry signals at bar closes.
 
@@ -224,16 +226,52 @@ def heuristic_signals(
     when supplied, is called with the bar's CLOSE ms (``t + bar_ms``) to attach
     ``entry_atr_pct`` / ``entry_regime``. ``bar_ms`` only timestamps that
     context lookup; pass the real interval (15m/1h/4h/1d) for non-5m feeds.
+
+    P0-1 (2026-10-23): when ``candles_1h`` / ``candles_15m`` are supplied, the
+    corresponding higher-timeframe windows are sliced point-in-time (only
+    candles closed at or before the current bar's close) and forwarded to
+    :func:`evaluate_window`, so ``trendStrength`` (1h) and ``rangeCompression``
+    (15m) score identically to the live scanner.  When omitted those triggers
+    remain flat (legacy single-feed behaviour).
     """
     cfg = config or default_heuristic_config()
     signals: list[Signal] = []
     n = len(bars)
+
+    # Pre-sort HTF feeds once; the PIT slice pointer advances monotonically.
+    htf_1h = sorted(candles_1h, key=lambda c: c.t) if candles_1h else None
+    htf_15m = sorted(candles_15m, key=lambda c: c.t) if candles_15m else None
+    # Pointers into htf_1h / htf_15m: index of first candle NOT yet closed.
+    ptr_1h = 0
+    ptr_15m = 0
+    MS_1H = 3_600_000
+    MS_15M = 900_000
+
     for i in range(cfg.warmup, n - 1):
         # Cap the prefix to a fixed tail: the triggers only inspect this tail,
         # so scores are unchanged but each evaluation is bounded (O(n) overall).
         lo = max(0, i + 1 - _WINDOW_LOOKBACK)
         window = bars[lo: i + 1]
-        score, hits = evaluate_window(window, cfg.thresholds, cfg.weights)
+        bar_close_ms = bars[i].t + bar_ms
+
+        # Advance PIT pointers: a HTF candle is "closed" when its t + period_ms
+        # is <= the current bar's close time.
+        w1h = None
+        w15m = None
+        if htf_1h is not None:
+            while ptr_1h < len(htf_1h) and htf_1h[ptr_1h].t + MS_1H <= bar_close_ms:
+                ptr_1h += 1
+            w1h = htf_1h[:ptr_1h]
+        if htf_15m is not None:
+            while ptr_15m < len(htf_15m) and htf_15m[ptr_15m].t + MS_15M <= bar_close_ms:
+                ptr_15m += 1
+            w15m = htf_15m[:ptr_15m]
+
+        score, hits = evaluate_window(
+            window, cfg.thresholds, cfg.weights,
+            candles_1h=w1h,
+            candles_15m=w15m,
+        )
         bullish, atr_pct, adx14 = trend_and_atr_pct(window)
         side = heuristic_verdict(
             score, hits, bullish, atr_pct,
