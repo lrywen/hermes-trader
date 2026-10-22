@@ -541,23 +541,14 @@ def _drop_forming_bar(candles: list[Candle], interval: str) -> tuple[list[Candle
 
 
 def _apply_squeeze_breakout_coupling(hits: list[dict[str, Any]]) -> None:
-    """Mutate `hits` in place: when a Bollinger squeeze (rangeCompression)
-    fired alongside a fired breakout, BOOST the breakout hit's score by +2
-    (cap 10) and tag the reason. A breakout resolving out of a squeeze is a
-    higher-conviction setup than one from already-wide bands (which is more
-    often a late chase / stop run). rangeCompression itself carries weight 0,
-    so the boost is expressed on the breakout hit instead."""
-    squeeze_fired = any(
-        (h.get("name") == "rangeCompression") and h.get("fired") for h in hits
-    )
-    if not squeeze_fired:
-        return
-    for h in hits:
-        if h.get("name") == "breakout" and h.get("fired"):
-            h["score"] = min(10.0, float(h.get("score", 0)) + 2.0)
-            reason = h.get("reason") or ""
-            if "[squeeze-resolved]" not in reason:
-                h["reason"] = f"{reason} [squeeze-resolved]".strip()
+    """Back-compat alias.
+
+    B1 (2026-10-22): the canonical implementation now lives in the indicators
+    layer as ``trigger_mod.apply_squeeze_breakout_coupling`` so the backtest
+    kernel can share it. Scripts/tests still import this name from perception,
+    so keep a thin delegating alias. See the canonical docstring for semantics.
+    """
+    trigger_mod.apply_squeeze_breakout_coupling(hits)
 
 
 # ── Scan single market (returns result or (False, error)) ────────────────────
@@ -630,8 +621,13 @@ def _scan_single_market(
         # 1h candles for slow-burn / accumulation triggers. Cached far longer
         # than 5m (1h bars don't change intra-hour). Failure here doesn't
         # block the scan — slow-burn triggers just won't fire.
+        # B5 (2026-10-22): 48 -> 100 closed bars. Wilder ADX (trendStrength and
+        # the regime-chop check) is a running recurrence; with 48 bars its last
+        # value differed from the 200-bar reference by 10.96% mean / 25.62% max
+        # (see review §3.3). 100 bars brings the relative error under 1%; it also
+        # fills rangeCompression's intended 100-bandwidth history window.
         candles_1h = _fetch_candles_sync(
-            market["coin"], "1h", 48,
+            market["coin"], "1h", 100,
             scan_cfg.get("cacheTtlMs1h", 600_000),
         ) or []
         if scan_cfg.get("evaluateClosedBarsOnly", True) and candles_1h:
@@ -639,8 +635,11 @@ def _scan_single_market(
 
         # 15m candles for rangeCompression (w6: upgraded from 5m so the squeeze
         # read filters 5m noise). Failure is non-fatal — the trigger just won't fire.
+        # B5 (2026-10-22): 48 -> 100 bars to fill rangeCompression's documented
+        # 100-bandwidth percentile window (it slices bandwidths[-100:]; 48 bars
+        # yielded only 47 samples, truncating the squeeze-percentile history).
         candles_15m = _fetch_candles_sync(
-            market["coin"], "15m", 48,
+            market["coin"], "15m", 100,
             scan_cfg.get("cacheTtlMs15m", 300_000),
         ) or []
         if scan_cfg.get("evaluateClosedBarsOnly", True) and candles_15m:
@@ -704,77 +703,6 @@ def _scan_single_market(
                 "distance_from_poc_atr": _vp.distance_from_poc_atr(mid, _atr_last),
                 "chase_risk": _vp.chase_risk(mid, _atr_last),
             }
-        hits = [
-            trigger_mod.pct_move_spike(candles, thresholds["sigmaThreshold"]),
-            trigger_mod.volume_spike(candles, thresholds["sigmaThreshold"]),
-            trigger_mod.breakout(
-                candles,
-                thresholds["breakoutLookback"],
-                min_rvol=thresholds.get("breakoutMinRvol", 1.5),
-                rvol_window=thresholds.get("breakoutRvolWindow", 20),
-                atr_score_mult=thresholds.get("breakoutAtrScoreMult", 3.0),
-                confirm_bars=thresholds.get("breakoutConfirmBars", 2),
-                flow_confirm=_flow_confirm,
-                flow_confirm_min=float(
-                    (config.get("launch_capture") or {}).get("flow_confirm_min", 0.7)),
-            ),
-            trigger_mod.range_compression(candles_15m, thresholds["bbLength"], thresholds["bbStdDev"]),
-            trigger_mod.trend_strength(candles_1h, thresholds["adxPeriod"]),
-            trigger_mod.momentum_burst(candles, thresholds["momentumLookback"], thresholds["momentumPct"]),
-            trigger_mod.volume_buildup_1h(candles_1h, thresholds.get("volBuildupRatio", 2.5),
-                                          interval_minutes=60),
-            trigger_mod.trend_flip_1h(candles_1h, thresholds.get("trendFlipBars", 3)),
-            trigger_mod.higher_lows_1h(candles_1h, thresholds.get("higherLowsRequired", 4)),
-            # Symmetric directional surfacing (weight 0 → no composite-denominator
-            # impact). uptrend/downtrend momentum surface a coin in a sustained
-            # intraday trend for research REGARDLESS of the bullish-biased composite
-            # gate — the down side is what lets us short selloffs (the weighted
-            # triggers are all long-structured, so down-movers scored ~0 and never
-            # reached the AI). Acts as a bypass below; the AI + aligned-conf bar +
-            # short floor + counter-regime gate adjudicate direction/execution.
-            trigger_mod.uptrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
-                                         thresholds.get("trendMomentumPct", 5.0)),
-            trigger_mod.downtrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
-                                           thresholds.get("trendMomentumPct", 5.0)),
-        ]
-
-        # Squeeze-breakout coupling: a breakout that resolves out of a Bollinger
-        # squeeze is a higher-conviction setup (boost breakout +2, cap 10).
-        # rangeCompression carries weight 0 standalone, so the boost is applied
-        # to the breakout hit. Factored into _apply_squeeze_breakout_coupling.
-        _apply_squeeze_breakout_coupling(hits)
-
-        # Momentum-continuation trigger (LEAK #2) — OFF by default. Catches a coin
-        # in a sustained multi-hour uptrend that is now consolidating (already-
-        # extended movers that print no fresh 5m spike, so the other triggers miss
-        # them). Gated so it has ZERO scoring effect when off: only when enabled is
-        # the hit appended AND its weight added to the denominator. LONG-biased —
-        # enable only when the macro regime is up/neutral (counter-trend gate backs it up).
-        _mc = config.get("momentum_continuation", {}) or {}
-        _score_weights = config["weights"]
-        if _mc.get("enabled"):
-            hits.append(trigger_mod.momentum_continuation_1h(
-                candles_1h,
-                _mc.get("min_trend_pct", 8.0),
-                _mc.get("max_pullback_pct", 6.0),
-            ))
-            _score_weights = {**config["weights"],
-                              "momentumContinuation1h": _mc.get("weight", 0.4)}
-
-        # Candlestick reversal patterns — OFF by default. Shooting-star / bearish-
-        # engulfing (top of an advance → SHORT) and hammer / bullish-engulfing
-        # (bottom of a decline → LONG). The momentum/breakout triggers are weak at
-        # calling tops & bottoms; these catch exhaustion/reversal. Surfacing bypass
-        # (weight 0, like uptrend/downtrend) — the AI (which now also sees raw OHLC)
-        # adjudicates direction/execution. Gated so it's reversible without code.
-        _cp = config.get("candlestick_patterns", {}) or {}
-        if _cp.get("enabled"):
-            _wbr = _cp.get("wick_body_ratio", 2.0)
-            _ctx_lb = int(_cp.get("context_lookback", 6))
-            _ctx_pct = _cp.get("context_pct", 1.5)
-            hits.append(trigger_mod.bearish_reversal_candle(candles, _wbr, _ctx_lb, _ctx_pct))
-            hits.append(trigger_mod.bullish_reversal_candle(candles, _wbr, _ctx_lb, _ctx_pct))
-
         # Daily mover surfacing: the scan already reserves slots for top 24h
         # movers, but the trigger gate can still drop an orderly runner once the
         # fresh spike/breakout bar has passed. Surface large liquid movers to AI
@@ -802,12 +730,24 @@ def _scan_single_market(
                     if daily_mover_fired
                     else f"{move_pct:+.1f}% 24h / vol ${vol/1e6:.2f}M"
                 )
-        hits.append({
-            "name": "dailyMover",
-            "score": 10 if daily_mover_fired else 0,
-            "reason": daily_mover_reason or "not a configured 24h mover",
-            "fired": daily_mover_fired,
-        })
+
+        # B1 (2026-10-22): trigger orchestration shared with the backtest kernel
+        # via trigger_mod.build_hits — one source of truth, no live/backtest drift.
+        _mc = config.get("momentum_continuation", {}) or {}
+        _cp = config.get("candlestick_patterns", {}) or {}
+        hits, _score_weights = trigger_mod.build_hits(
+            candles,
+            thresholds,
+            config["weights"],
+            candles_1h=candles_1h,
+            candles_15m=candles_15m,
+            flow_confirm=_flow_confirm,
+            flow_confirm_min=float(
+                (config.get("launch_capture") or {}).get("flow_confirm_min", 0.7)),
+            momentum_continuation=_mc,
+            candlestick_patterns=_cp,
+            daily_mover=(daily_mover_fired, daily_mover_reason),
+        )
 
         # Stable bar identity for the scored CLOSED bar (see O-2 note below).
         # Computed before the early returns so setup-age decay can key on it.

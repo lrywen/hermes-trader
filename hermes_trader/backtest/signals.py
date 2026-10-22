@@ -95,24 +95,28 @@ def default_heuristic_config(*, warmup: int = 100) -> HeuristicConfig:
 def evaluate_window(
     window: Sequence[Candle], th: dict[str, Any], weights: dict[str, float]
 ) -> tuple[float, list[dict[str, Any]]]:
-    """Run the six live triggers + composite score on a trailing window.
+    """Run the live trigger stack + composite score on a trailing window.
 
-    Mirrors ``scripts/backtest.py::_evaluate``.
+    B1 (2026-10-22): delegates to the same orchestration the live scanner uses
+    (:func:`hermes_trader.indicators.triggers.build_hits`) so the two cannot
+    drift. The single-feed backtest has no 1h/15m candles, so those triggers
+    get empty inputs and return flat. Known behaviour differences vs the
+    pre-B1 six-trigger stack (all intended, see review §4):
+
+    1. ``trendStrength`` is fed no 1h candles → always flat. Previously it ran
+       on the 5m window and its 0.30 weight could score; that was a
+       live/backtest mismatch (live scores ADX on 1h).
+    2. ``rangeCompression`` is fed no 15m candles → always flat (weight 0, and
+       squeeze-breakout coupling consequently never applies in backtest).
+    3. ``breakout`` now uses ``confirm_bars`` from thresholds (prod value 3)
+       like live; the old backtest call omitted it (function default 2).
+
+    The additional surface-only triggers (volumeBuildup1h/trendFlip1h/
+    higherLows1h/uptrendMomentum/downtrendMomentum, candlestick, dailyMover,
+    momentumContinuation1h) are empty/off here and do not fire.
     """
-    hits = [
-        trig.pct_move_spike(window, th["sigmaThreshold"]),
-        trig.volume_spike(window, th["sigmaThreshold"]),
-        trig.breakout(
-            window, th["breakoutLookback"],
-            min_rvol=th.get("breakoutMinRvol", 1.5),
-            rvol_window=th.get("breakoutRvolWindow", 20),
-            atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
-        ),
-        trig.range_compression(window, th["bbLength"], th["bbStdDev"]),
-        trig.trend_strength(window, th["adxPeriod"]),
-        trig.momentum_burst(window, th["momentumLookback"], th["momentumPct"]),
-    ]
-    return trig.composite_score(hits, weights), hits
+    hits, score_weights = trig.build_hits(window, th, weights)
+    return trig.composite_score(hits, score_weights), hits
 
 
 def trend_and_atr_pct(

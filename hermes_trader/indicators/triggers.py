@@ -57,7 +57,11 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
     z_score = abs(current_return - mean) / std
     fired = z_score >= sigma_threshold
     score = min(10, max(0, z_score))
-    direction = "up" if current_return > mean else "down"
+    # B3 (2026-10-22): direction is the bar's actual up/down move, not the
+    # sign of the deviation from the prior-return mean. In a positively-drifting
+    # tape a +0.5% bar (below a ~+1% mean) was labelled "down", contradicting
+    # momentum_burst (move_pct > 0) and every other trigger's direction.
+    direction = "up" if current_return > 0 else "down"
 
     return {
         "name": "pctMoveSpike",
@@ -165,13 +169,22 @@ def breakout(
     prior_start = len(candles) - lookback - confirm_bars
     prior_end = len(candles) - confirm_bars
 
+    # B2 (2026-10-22): fail closed on non-finite prior-range edges. NaN
+    # compares False against every number, so a NaN high/low is silently
+    # excluded from the extremum scan, collapsing the prior range and letting
+    # an ordinary close forge a "confirmed breakout" entry. A single NaN in
+    # the prior window forces flat; all-finite input is unchanged.
     prior_high = float("-inf")
     prior_low = float("inf")
     for i in range(prior_start, prior_end):
-        if candle_val(candles[i], "h") > prior_high:
-            prior_high = candle_val(candles[i], "h")
-        if candle_val(candles[i], "l") < prior_low:
-            prior_low = candle_val(candles[i], "l")
+        bar_high = candle_val(candles[i], "h")
+        bar_low = candle_val(candles[i], "l")
+        if not (math.isfinite(bar_high) and math.isfinite(bar_low)):
+            return {"name": "breakout", "score": 0, "reason": "flat", "fired": False}
+        if bar_high > prior_high:
+            prior_high = bar_high
+        if bar_low < prior_low:
+            prior_low = bar_low
 
     # Confirmation: every bar in the confirm window must close beyond the
     # same edge (up or down). This is what rejects a one-bar fakeout.
@@ -744,6 +757,155 @@ def momentum_continuation_1h(
                    if fired else f"trend {trend_pct:+.1f}% / pullback {pullback_pct:.1f}% / stacked={stacked}"),
         "fired": fired,
     }
+
+
+def apply_squeeze_breakout_coupling(hits: list[TriggerHit]) -> None:
+    """Mutate `hits` in place: when a Bollinger squeeze (rangeCompression)
+    fired alongside a fired breakout, BOOST the breakout hit's score by +2
+    (cap 10) and tag the reason. A breakout resolving out of a squeeze is a
+    higher-conviction setup than one from already-wide bands (which is more
+    often a late chase / stop run). rangeCompression itself carries weight 0,
+    so the boost is expressed on the breakout hit instead.
+
+    B1 (2026-10-22): canonical implementation shared by the live scanner and
+    the backtest kernel (``agents.perception`` keeps a same-name alias for the
+    scripts/tests that import it from there)."""
+    squeeze_fired = any(
+        (h.get("name") == "rangeCompression") and h.get("fired") for h in hits
+    )
+    if not squeeze_fired:
+        return
+    for h in hits:
+        if h.get("name") == "breakout" and h.get("fired"):
+            h["score"] = min(10.0, float(h.get("score", 0)) + 2.0)
+            reason = h.get("reason") or ""
+            if "[squeeze-resolved]" not in reason:
+                h["reason"] = f"{reason} [squeeze-resolved]".strip()
+
+
+def build_hits(
+    candles: Optional[list[Candle]],
+    thresholds: dict,
+    weights: dict,
+    *,
+    candles_1h: Optional[list[Candle]] = None,
+    candles_15m: Optional[list[Candle]] = None,
+    flow_confirm=None,
+    flow_confirm_min: float = 0.7,
+    momentum_continuation: Optional[dict] = None,
+    candlestick_patterns: Optional[dict] = None,
+    daily_mover: Optional[tuple[bool, str]] = None,
+) -> tuple[list[TriggerHit], dict]:
+    """Build the full trigger-hit list with the exact orchestration the live
+    scanner (``agents.perception._scan_single_market``) uses.
+
+    B1 (2026-10-22): single source of truth shared by live perception and the
+    backtest kernel (``backtest.signals.evaluate_window``) so the two trigger
+    stacks can no longer drift apart.
+
+    Pure: all inputs (candles, resolved config values, pre-computed
+    microstructure/daily-mover context) are passed explicitly; this function
+    never reads config, the network, or the clock. Every trigger is safe on an
+    empty/short series (returns a flat hit), so backtests without 1h/15m feeds
+    simply pass ``None``.
+
+    Returns ``(hits, score_weights)`` where ``score_weights`` is the base
+    ``weights`` plus the dynamic ``momentumContinuation1h`` entry, mirroring
+    the live denominator handling.
+
+    Order is contractually fixed: 11 base hits (pctMoveSpike, volumeSpike,
+    breakout, rangeCompression, trendStrength, momentumBurst,
+    volumeBuildup1h, trendFlip1h, higherLows1h, uptrendMomentum,
+    downtrendMomentum) — squeeze coupling mutates the breakout in place —
+    then optional momentumContinuation1h, the two candlestick hits, and the
+    terminal dailyMover hit.
+
+    ``daily_mover`` is the pre-computed ``(fired, reason)`` pair; ``None``
+    (or a ``(False, "")`` pair) reproduces the "surface disabled" hit.
+    """
+    candles = candles or []
+    candles_1h = candles_1h or []
+    candles_15m = candles_15m or []
+    mc = momentum_continuation or {}
+    cp = candlestick_patterns or {}
+
+    hits: list[TriggerHit] = [
+        pct_move_spike(candles, thresholds["sigmaThreshold"]),
+        volume_spike(candles, thresholds["sigmaThreshold"]),
+        breakout(
+            candles,
+            thresholds["breakoutLookback"],
+            min_rvol=thresholds.get("breakoutMinRvol", 1.5),
+            rvol_window=thresholds.get("breakoutRvolWindow", 20),
+            atr_score_mult=thresholds.get("breakoutAtrScoreMult", 3.0),
+            confirm_bars=thresholds.get("breakoutConfirmBars", 2),
+            flow_confirm=flow_confirm,
+            flow_confirm_min=float(flow_confirm_min),
+        ),
+        range_compression(candles_15m, thresholds["bbLength"], thresholds["bbStdDev"]),
+        trend_strength(candles_1h, thresholds["adxPeriod"]),
+        momentum_burst(candles, thresholds["momentumLookback"], thresholds["momentumPct"]),
+        volume_buildup_1h(candles_1h, thresholds.get("volBuildupRatio", 2.5),
+                          interval_minutes=60),
+        trend_flip_1h(candles_1h, thresholds.get("trendFlipBars", 3)),
+        higher_lows_1h(candles_1h, thresholds.get("higherLowsRequired", 4)),
+        # Symmetric directional surfacing (weight 0 → no composite-denominator
+        # impact). uptrend/downtrend momentum surface a coin in a sustained
+        # intraday trend for research REGARDLESS of the bullish-biased composite
+        # gate — the down side is what lets us short selloffs (the weighted
+        # triggers are all long-structured, so down-movers scored ~0 and never
+        # reached the AI). Acts as a bypass below; the AI + aligned-conf bar +
+        # short floor + counter-regime gate adjudicate direction/execution.
+        uptrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
+                         thresholds.get("trendMomentumPct", 5.0)),
+        downtrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
+                           thresholds.get("trendMomentumPct", 5.0)),
+    ]
+
+    # Squeeze-breakout coupling: a breakout that resolves out of a Bollinger
+    # squeeze is a higher-conviction setup (boost breakout +2, cap 10).
+    # rangeCompression carries weight 0 standalone, so the boost is applied
+    # to the breakout hit.
+    apply_squeeze_breakout_coupling(hits)
+
+    # Momentum-continuation trigger — OFF by default. Catches a coin in a
+    # sustained multi-hour uptrend that is now consolidating (already-extended
+    # movers that print no fresh 5m spike). Gated so it has ZERO scoring effect
+    # when off: only when enabled is the hit appended AND its weight added to
+    # the denominator.
+    score_weights = weights
+    if mc.get("enabled"):
+        hits.append(momentum_continuation_1h(
+            candles_1h,
+            mc.get("min_trend_pct", 8.0),
+            mc.get("max_pullback_pct", 6.0),
+        ))
+        score_weights = {**weights,
+                         "momentumContinuation1h": mc.get("weight", 0.4)}
+
+    # Candlestick reversal patterns — OFF by default. Shooting-star /
+    # bearish-engulfing (top of an advance → SHORT) and hammer /
+    # bullish-engulfing (bottom of a decline → LONG). Surfacing bypass
+    # (weight 0). Gated so it's reversible without code.
+    if cp.get("enabled"):
+        wbr = cp.get("wick_body_ratio", 2.0)
+        ctx_lb = int(cp.get("context_lookback", 6))
+        ctx_pct = cp.get("context_pct", 1.5)
+        hits.append(bearish_reversal_candle(candles, wbr, ctx_lb, ctx_pct))
+        hits.append(bullish_reversal_candle(candles, wbr, ctx_lb, ctx_pct))
+
+    # Daily mover surfacing (weight-0 terminal hit). The live scanner computes
+    # fired/reason from the market snapshot; a backtest without that context
+    # passes None and gets the flat "not a configured 24h mover" hit.
+    daily_mover_fired = bool(daily_mover[0]) if daily_mover is not None else False
+    daily_mover_reason = daily_mover[1] if daily_mover is not None else ""
+    hits.append({
+        "name": "dailyMover",
+        "score": 10 if daily_mover_fired else 0,
+        "reason": daily_mover_reason or "not a configured 24h mover",
+        "fired": daily_mover_fired,
+    })
+    return hits, score_weights
 
 
 def composite_score(hits: list[TriggerHit], weights: dict[str, float]) -> float:

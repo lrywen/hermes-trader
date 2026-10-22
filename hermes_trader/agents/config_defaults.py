@@ -302,6 +302,12 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # and executor read these via .get with the same fallbacks.
         "hard_stop_confirm_sec": 1.0,
         "ignite_periods": ("5m", "15m", "1h"),
+        # D2 (2026-10-22): surfaced as a canonical key so the schema/store see
+        # it, but intentionally left UNSET (None). Read sites fall back to the
+        # ExitPolicy dataclass default (90 min), so adding the key changes no
+        # runtime behaviour. Setting a value < 60 (to make ignite_timeout
+        # reachable in non_trend) is a later A/B decision, not this change.
+        "ignite_grace_minutes": None,
         "phase2_tiers": [
             {"pct_above_entry": 2.0, "retrace_threshold": 0.35},
             {"pct_above_entry": 6.0, "retrace_threshold": 0.3},

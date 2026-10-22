@@ -916,11 +916,26 @@ def analyze_perception(perception: dict[str, Any]) -> dict[str, Any]:
             "breakout", "momentumBurst", "uptrendMomentum",
             "trendFlip1h", "higherLows1h", "volumeBuildup1h", "dailyMover",
         }
-        # momentumBurst is direction-agnostic by name; disambiguate using the
-        # extension sign (price below EMA21 => the burst was down). Audit
-        # 2026-09-06 (F5): dropped the dead `burst_up` binding — intent only
-        # consumes burst_down below (trading logic unchanged).
-        burst_down = "momentumBurst" in fired_names and (extension or 0) < 0
+        # B3 (2026-10-22): single source of truth for burst direction — the
+        # structured "direction" field on the fired hit (the same field
+        # research._fired_trigger_direction reads), NOT the ATR-extension sign.
+        # The extension measures distance from EMA21 on the 4h screen series,
+        # which can disagree with the burst's actual up/down move (e.g. an
+        # upward impulse that is still below EMA21 was mislabelled "down").
+        # Fallback to the extension sign only for legacy hits that omit the
+        # structured field.
+        burst_hit = next(
+            (t for t in (perception.get("triggers") or [])
+             if isinstance(t, dict) and t.get("name") == "momentumBurst"
+             and t.get("fired")),
+            None,
+        )
+        _burst_dir = burst_hit.get("direction") if isinstance(burst_hit, dict) else None
+        if _burst_dir in ("up", "down"):
+            burst_down = _burst_dir == "down"
+        else:
+            # Legacy/backtest payload without structured direction.
+            burst_down = "momentumBurst" in fired_names and (extension or 0) < 0
         intend_long = bool(bullish_triggers) and not burst_down
         intend_short = bool(fired_names & {"downtrendMomentum"}) or burst_down
 

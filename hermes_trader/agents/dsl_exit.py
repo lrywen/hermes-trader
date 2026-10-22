@@ -1124,6 +1124,17 @@ class ExitPolicy:
     time_scratch_giveback_pct: float = 0.3
 
 
+def _ignite_grace_from_cfg(raw: Any) -> float:
+    """D2 (2026-10-22): canonical dsl_exit.ignite_grace_minutes ships as an
+    explicit None stub ("key exists, unset"). ``.get(...) or 0.0`` cannot tell
+    that stub from a real 0 and would silently DISABLE the ignite gate, so the
+    None stub must fall back to the ExitPolicy default (90 min). An explicit 0
+    still means off; absent key still means default."""
+    if raw is None:
+        return ExitPolicy.ignite_grace_minutes
+    return float(raw)
+
+
 def resolve_effective_stop_width_pct(
     *,
     regime_max_loss_pct: float,
@@ -2006,9 +2017,8 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
         stale_flat_timeout_minutes=float(
             pol_raw.get("stale_flat_timeout_minutes", ExitPolicy.stale_flat_timeout_minutes)
             or 0.0),
-        ignite_grace_minutes=float(
-            pol_raw.get("ignite_grace_minutes", ExitPolicy.ignite_grace_minutes)
-            or 0.0),
+        ignite_grace_minutes=_ignite_grace_from_cfg(
+            pol_raw.get("ignite_grace_minutes", ExitPolicy.ignite_grace_minutes)),
         ignite_vol_mult=pol_raw.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult),
         ignite_periods=_parse_ignite_periods(
             pol_raw.get("ignite_periods", ExitPolicy.ignite_periods)),
@@ -2659,9 +2669,9 @@ def _policy_from_dsl_dict(dsl: dict) -> ExitPolicy:
             stale_flat_timeout_minutes=float(
                 dsl.get("stale_flat_timeout_minutes",
                         ExitPolicy.stale_flat_timeout_minutes) or 0.0),
-            ignite_grace_minutes=float(
+            ignite_grace_minutes=_ignite_grace_from_cfg(
                 dsl.get("ignite_grace_minutes",
-                        ExitPolicy.ignite_grace_minutes) or 0.0),
+                        ExitPolicy.ignite_grace_minutes)),
             ignite_vol_mult=float(dsl.get("ignite_vol_mult", ExitPolicy.ignite_vol_mult)),
             ignite_periods=_parse_ignite_periods(
                 dsl.get("ignite_periods", ExitPolicy.ignite_periods)),

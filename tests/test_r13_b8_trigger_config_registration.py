@@ -365,7 +365,8 @@ def test_r13_b8_d6_default_threshold_rejects_3_7pct_move():
 
 def test_r13_b8_d6_no_three_point_zero_dead_fallback_in_sources():
     """perception / triggers 源码不得再残留 trendMomentumPct/pct_threshold
-    的 3.0 死兜底。"""
+    的 3.0 死兜底。B1 之后 hit 编排统一搬进 triggers.build_hits，5.0 兜底的
+    唯一真源随之在 triggers；perception 不得再残留任何 trendMomentumPct 字面量。"""
     perc_src = inspect.getsource(config_mod.perception) if hasattr(config_mod, "perception") else None
     if perc_src is None:
         import hermes_trader.agents.perception as perception_mod
@@ -374,7 +375,9 @@ def test_r13_b8_d6_no_three_point_zero_dead_fallback_in_sources():
     trig_src = inspect.getsource(triggers_mod)
 
     assert 'trendMomentumPct", 3.0' not in perc_src, "perception 仍有 3.0 死兜底"
-    assert 'trendMomentumPct", 5.0' in perc_src, "perception 应对齐 5.0"
+    assert 'trendMomentumPct", 3.0' not in trig_src, "triggers 仍有 3.0 死兜底"
+    assert "trendMomentumPct" not in perc_src, "B1 后 perception 不应再直读该阈值"
+    assert 'trendMomentumPct", 5.0' in trig_src, "build_hits 应对齐 5.0"
     assert "pct_threshold: float = 3.0" not in trig_src, "triggers 签名默认仍是 3.0"
     assert "pct_threshold: float = 5.0" in trig_src
 

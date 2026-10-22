@@ -534,6 +534,10 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
     # canonical store type-checks them on deep-merge.
     "hard_stop_confirm_sec": _num_leaf(0.0, 600.0),
     "ignite_periods": ("list_of", ("enum", ("1m", "3m", "5m", "15m", "30m", "1h", "4h"))),
+    # D2 (2026-10-22): canonical key exists but ships unset (None); the read
+    # seam falls back to the ExitPolicy dataclass default (90 min). A numeric
+    # value is bounds-checked; None means "use built-in default".
+    "ignite_grace_minutes": ("num_or_none", 0.0, 100_000.0),
     "phase2_tiers": ("list", {
         "pct_above_entry": _num_leaf(0.0, 100.0),
         "retrace_threshold": _num_leaf(0.0, 1.0),
@@ -1066,6 +1070,17 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
     elif kind == "num":
         if isinstance(val, bool) or not isinstance(val, _NUM):
             errors.append(f"{path}: expected number, got {type(val).__name__}")
+        elif val < spec[1] or val > spec[2]:
+            errors.append(
+                f"{path}: must be between {spec[1]} and {spec[2]} (got {val})"
+            )
+    elif kind == "num_or_none":
+        # D2 (2026-10-22): None = unset → built-in dataclass fallback; same
+        # bounds as the "num" leaf when a value is provided.
+        if val is None:
+            pass
+        elif isinstance(val, bool) or not isinstance(val, _NUM):
+            errors.append(f"{path}: expected number or null, got {type(val).__name__}")
         elif val < spec[1] or val > spec[2]:
             errors.append(
                 f"{path}: must be between {spec[1]} and {spec[2]} (got {val})"
