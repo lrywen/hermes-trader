@@ -510,7 +510,8 @@ def judge(name: str, res: dict, *, primary: bool, p_thr: float,
     lines.append(f"  判据1 CI下界>0: {'yes' if c1 else 'no'}")
     lines.append(f"  判据2 方向不翻号(mean>0): {'yes' if c2 else 'no'}")
     lines.append(f"  判据3 主口径单独成立: {'yes' if c3 else 'no'}")
-    lines.append(f"  判据4 单侧p<{p_thr}: {'yes' if c4 else 'no'}")
+    lines.append(f"  判据4 单侧p<{p_thr}: {'yes' if c4 else 'no'}"
+                 "（仅报告不门控，§7.7.2：判据1已隐含 p<0.025）")
 
     c5 = False
     if rob is None:
@@ -528,7 +529,10 @@ def judge(name: str, res: dict, *, primary: bool, p_thr: float,
     lines.append(f"  样本量 n>={MIN_TRADES}: {'yes' if ok_n else 'no'}")
     lines.append(f"  经济阈值 mean>={MIN_ECON_BP}bp: {'yes' if ok_econ else 'no'}")
 
-    passed = (c1 and c2 and c3 and c4 and ok_n and ok_econ
+    # §7.7.2：判据 4 只报 p，不重复门控（lo>0 与 p<0.025 严格等价，
+    # c4 纳入 passed 既冗余又会误导读者的通过门槛）。仅 H2 的 Holm
+    # 上界 p<0.025 由 c1 的 CI 隐含，同样无需 c4 门控。
+    passed = (c1 and c2 and c3 and ok_n and ok_econ
               and (c5 if rob is not None else True))
     return passed, lines
 
