@@ -108,6 +108,25 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --write
   echo "$(ts) relax_tier shadow backfill exit=$?"
 
+  # Audit 2026-10-23 (weight_shadow / stop_confirm outcome gap): both
+  # reconcilers were shipped in the image but NEVER scheduled, so their shadow
+  # rows were only ever read by hand. They read the arm files the perception /
+  # dsl_exit writers place in the bind-mounted ~/.hermes-trading directory
+  # (HOME=/home/hermes in-container). Paths are passed explicitly so a HOME
+  # change cannot silently point the reconciliation at an empty directory.
+  # Pure paper summaries; best-effort like the rest of this block.
+  echo "$(ts) weight_shadow reconcile start (window=${HERMES_WEIGHT_SHADOW_WINDOW:-168}h)"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_weight_shadow.py \
+    --file "${HERMES_WEIGHT_SHADOW_FILE:-/home/hermes/.hermes-trading/weight_shadow.jsonl}" \
+    --window-hours "${HERMES_WEIGHT_SHADOW_WINDOW:-168}"
+  echo "$(ts) weight_shadow reconcile exit=$?"
+
+  echo "$(ts) stop_confirm shadow reconcile start (window=${HERMES_STOP_CONFIRM_WINDOW:-168}h)"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_stop_confirm_shadow.py \
+    --file "${HERMES_STOP_CONFIRM_SHADOW_FILE:-/home/hermes/.hermes-trading/stop_confirm_shadow.jsonl}" \
+    --window-hours "${HERMES_STOP_CONFIRM_WINDOW:-168}"
+  echo "$(ts) stop_confirm shadow reconcile exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1

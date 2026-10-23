@@ -230,6 +230,44 @@ def queue_buildup_slope(snap: dict, *, n_levels: int = 10) -> Optional[float]:
     return num / den / tot
 
 
+def _depth_slope(levels: Sequence[Level]) -> Optional[float]:
+    """单侧逐档挂量对档位序号的 LS 斜率 ÷ 该侧总挂量。
+
+    样本 < 2 档或总挂量 <= 0 返回 None。逐档**原始**挂量（不是累积量）。
+    """
+    n = len(levels)
+    if n < 2:
+        return None
+    tot = sum(sz for _, sz in levels)
+    if tot <= 0:
+        return None
+    xs = list(range(1, n + 1))
+    ys = [sz for _, sz in levels]
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    if den <= 0:
+        return None
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return num / den / tot
+
+
+def depth_slope_diff(snap: dict, *, n_levels: int = 10) -> Optional[float]:
+    """深度曲线斜率差 s_b − s_a（§7.7.8，C10）。
+
+    s_b/s_a 为各侧逐档挂量对档位序号的 LS 斜率 ÷ 该侧总挂量；>0 表示买盘
+    远端更厚。任一侧样本 < 2 档或总挂量 <= 0 返回 None。
+
+    与 ``queue_buildup_slope`` 不同：后者是「累积(bid−ask) 对档位序号的单一
+    斜率 ÷ 总深度」，不是双侧斜率差，不可复用。
+    """
+    sb = _depth_slope(_side_levels(snap, "bid", n_levels))
+    sa = _depth_slope(_side_levels(snap, "ask", n_levels))
+    if sb is None or sa is None:
+        return None
+    return sb - sa
+
+
 def ofi_mid_divergence(prev: dict, cur: dict) -> Optional[float]:
     """OFI 与中间价的方向背离：best-OFI 与 Δmid 同向返回 +1，反向返回 -1，
     任一为 0/缺帧返回 0。
@@ -255,6 +293,7 @@ FACTORS: dict[str, tuple[str, object]] = {
     "queue_withdrawal": ("edge", lambda prev, cur: queue_withdrawal(prev, cur, n_levels=10)),
     "depth_imbalance": ("frame", depth_imbalance),
     "buildup_slope": ("frame", queue_buildup_slope),
+    "depth_slope_diff": ("frame", depth_slope_diff),
     "ofi_mid_divergence": ("edge", ofi_mid_divergence),
 }
 

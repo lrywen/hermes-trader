@@ -19,15 +19,19 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import gzip
 import json
 import math
 import os
 import random
+import statistics
 import sys
 import time
 from collections import defaultdict
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 _REPO = Path(__file__).resolve().parents[1]
 if str(_REPO) not in sys.path:
@@ -52,6 +56,9 @@ FIRST_ANALYSIS_DATE = "2026-10-28"
 
 DAY_S = 86400
 MS = 1000
+HIST_S = 30 * DAY_S            # §7.2 expanding 上限 30 天
+MIN_XSECTION = 5               # §7.3 补充 / §7.7.10
+K_FRAC = 0.10                  # 每侧 k = floor(0.10 × n_coins)
 
 
 # ── 数据加载 ────────────────────────────────────────────────────────────────
@@ -120,64 +127,156 @@ def _stream_raw_points(book_root: Path, days: list[str], coin: str):
             yield r
 
 
-def stream_coin_samples(book_root: Path, days: list[str], coin: str, *,
-                        w_s: int, h_s: int):
-    """流式构建"每 h 一条"的稀疏样本，O(w_s) 内存、单币常驻后即释放。
+@dataclass(slots=True)
+class SlotRec:
+    """单个 h 槽、单个币的全部固定特征（槽末一帧计算，只用 t 及之前数据）。"""
+    t: int
+    bid: float
+    ask: float
+    ofi: float                    # 窗口 Σe
+    n_frames: int                 # 窗口内逐秒帧数
+    std_within: float             # 窗口内逐秒 e 的样本标准差（ddof=1）
+    z_main: Optional[float]       # §7.2.1 主口径 z
+    z_hist: Optional[float]       # 稳健性：expanding-30d 历史标准差分母
+    rv_slot: float                # §7.7.3 槽内路径 RV
+    rv_30m: Optional[float]       # §7.7.6 最近 6 个槽末 mid 的 RV
+    di: Optional[float]           # depth_imbalance（§1 H2 特征）
+    slope_diff: Optional[float]   # §7.7.8 depth_slope_diff
+    di_extreme: int               # -1 低带 / +1 高带 / 0 不在带
+    rv_narrow: bool               # RV_30m <= expanding 30 分位
 
-    滚动维护最近 w_s 秒的逐帧 edge OFI；以信号 epoch 对齐（slot=t//h_s），
-    在每个 h 槽内取该槽最后一帧为信号帧：
-      * 窗口 OFI = 落在 [t-w_s, t] 的 edge e 之和（首帧无前置则该窗可能为 None）；
-      * forward 行情 = 下一个 h 槽的信号帧（t+h），由调用方按列表相邻关系取。
-    返回样本 dict 列表（每币约 days*86400/h_s 条）：
-      {t, bid, ask, ofi}
-    bid/ask=该信号帧 best 价。
+
+def _prune_sorted(history, sorted_vals: list[float], cutoff: int) -> None:
+    """按 30 天窗口淘汰历史值，并同步删除排序副本中的同一元素。"""
+    while history and history[0][0] < cutoff:
+        _, v = history.popleft()
+        i = bisect.bisect_left(sorted_vals, v)
+        if i < len(sorted_vals) and sorted_vals[i] == v:
+            del sorted_vals[i]
+
+
+def build_coin_slots(book_root: Path, days: list[str], coin: str, *,
+                     w_s: int, h_s: int) -> list[SlotRec]:
+    """逐币流式构建每个 h 槽的固定特征（O(w_s) 内存，单币处理完即释放）。
+
+    §7.2：所有分位/z/历史统计只用**严格早于当前槽**的数据。
+    跨日重置 prev_snap（不拼跨日相邻帧增量），槽号 slot=t//h_s 跨日连续。
     """
     from collections import deque
 
-    # edge ring: (t, e)，仅保留可能进入窗口的项（>=t-w_s）
-    ring: deque = deque()
+    ring: deque = deque()          # (t, e)，窗口可能用到的逐秒增量
+    hist: deque = deque()          # (t, 窗口 Σe)，30 天内
+    di_hist: deque = deque()       # (t, depth_imbalance)
+    di_sorted: list[float] = []
+    rv_hist: deque = deque()       # (t, RV_30m)
+    rv_sorted: list[float] = []
+    hist_sum = hist_sq = 0.0
+    ends: deque = deque(maxlen=6)  # (slot, 槽末 mid)
+    out: list[SlotRec] = []
+
     prev_snap = None
     cur_slot = None
     cur_frame = None
-    cur_window_edges: list[float] = []
+    rv_ssq = 0.0
+    prev_mid = None
 
-    samples: list[dict] = []
-
-    def flush_slot(slot, frame, edges):
+    def flush(slot, frame):
+        nonlocal hist_sum, hist_sq
         if frame is None:
             return
-        t, bid, ask = frame
-        # 窗口 OFI：用已收集到本槽的 edges（逐帧 e），取落在 [t-w_s,t] 的和
-        total = sum(e for et, e in edges if et >= t - w_s)
-        samples.append({"t": t, "bid": bid, "ask": ask, "ofi": total})
+        t, bid, ask, mid_px, snap = frame
+        ends.append((slot, mid_px))
 
-    for r in _stream_raw_points(book_root, days, coin):
-        t = int(r.get("t", 0)) // MS
-        ba = _best_ba(r)
-        if ba is None:
-            continue
-        bp, bq, ap, aq = ba
-        snap = {"b": [[bp, bq]], "a": [[ap, aq]]}
-        e = ofi_mod.best_ofi_two_sided(prev_snap, snap) if prev_snap is not None else 0.0
-        prev_snap = snap
+        win = [e for et, e in ring if et >= t - w_s]
+        nf = len(win)
+        ofi = float(sum(win))
+        std = statistics.stdev(win) if nf >= 2 else 0.0
+        z_main = ofi / std if (nf >= 10 and std > 0) else None
 
-        slot = t // h_s
-        if cur_slot is None:
+        n_h = len(hist)
+        z_hist = None
+        if n_h >= 2:
+            var = (hist_sq - hist_sum * hist_sum / n_h) / (n_h - 1)
+            sd = math.sqrt(var) if var > 0 else 0.0
+            z_hist = ofi / sd if sd > 0 else None
+
+        di = ofi_mod.depth_imbalance(snap)
+        di_extreme = 0
+        if di is not None and len(di_sorted) >= 2:
+            if di <= quantile(di_sorted, Q_LOW):
+                di_extreme = -1
+            elif di > quantile(di_sorted, Q_HIGH):
+                di_extreme = 1
+
+        rv30 = None
+        if len(ends) == 6 and all(mv > 0 for _, mv in ends):
+            ms = [mv for _, mv in ends]
+            rv30 = math.sqrt(sum(math.log(ms[k] / ms[k - 1]) ** 2
+                                 for k in range(1, 6)))
+        rv_narrow = (rv30 is not None and len(rv_sorted) >= 2
+                     and rv30 <= quantile(rv_sorted, 0.30))
+
+        out.append(SlotRec(
+            t=t, bid=bid, ask=ask, ofi=ofi, n_frames=nf, std_within=std,
+            z_main=z_main, z_hist=z_hist, rv_slot=math.sqrt(rv_ssq),
+            rv_30m=rv30, di=di, slope_diff=ofi_mod.depth_slope_diff(snap),
+            di_extreme=di_extreme, rv_narrow=rv_narrow))
+
+        # 以下写入均严格晚于当前槽，供后续槽使用
+        hist.append((t, ofi))
+        hist_sum += ofi
+        hist_sq += ofi * ofi
+        while hist and hist[0][0] < t - HIST_S:
+            _, old = hist.popleft()
+            hist_sum -= old
+            hist_sq -= old * old
+        if di is not None:
+            bisect.insort(di_sorted, di)
+            di_hist.append((t, di))
+            _prune_sorted(di_hist, di_sorted, t - HIST_S)
+        if rv30 is not None:
+            bisect.insort(rv_sorted, rv30)
+            rv_hist.append((t, rv30))
+            _prune_sorted(rv_hist, rv_sorted, t - HIST_S)
+
+    for day in days:
+        prev_snap = None           # 跨日不拼相邻帧增量
+        for r in load_coin_day(book_root, day, coin):
+            try:
+                t = int(r.get("t", 0)) // MS
+            except (TypeError, ValueError):
+                continue
+            ba = _best_ba(r)
+            if ba is None:
+                continue
+            bp, bq, ap, aq = ba
+            snap = {"b": r.get("b") or [[bp, bq]],
+                    "a": r.get("a") or [[ap, aq]]}
+            e = (ofi_mod.best_ofi_two_sided(prev_snap, snap)
+                 if prev_snap is not None else 0.0)
+            prev_snap = snap
+
+            slot = t // h_s
+            if cur_slot is not None and slot != cur_slot:
+                flush(cur_slot, cur_frame)
+                cur_slot, cur_frame = None, None
+                rv_ssq, prev_mid = 0.0, None
             cur_slot = slot
-        if slot != cur_slot:
-            # 收尾上一槽
-            flush_slot(cur_slot, cur_frame, ring)
-            cur_slot = slot
 
-        cur_frame = (t, bp, ap)
-        ring.append((t, e))
-        # 丢弃绝不可能再进入窗口的旧 edge
-        while ring and ring[0][0] < t - w_s - h_s:
-            ring.popleft()
+            mid_px = (bp + ap) / 2.0
+            if prev_mid is not None and prev_mid > 0 and mid_px > 0:
+                rv_ssq += math.log(mid_px / prev_mid) ** 2
+            prev_mid = mid_px
+            cur_frame = (t, bp, ap, mid_px, snap)
+
+            ring.append((t, e))
+            # 丢弃绝不可能再进入窗口的旧 edge
+            while ring and ring[0][0] < t - w_s - h_s:
+                ring.popleft()
 
     if cur_frame is not None:
-        flush_slot(cur_slot, cur_frame, ring)
-    return samples
+        flush(cur_slot, cur_frame)
+    return out
 
 
 # ── 分位（只用 train / 该时点过去数据）──────────────────────────────────────
@@ -197,9 +296,14 @@ def quantile(sorted_vals: list[float], q: float) -> float:
 
 def block_bootstrap_ci(vals: list[tuple[int, float]], *, block_s: int,
                        b: int, seed: int):
-    """vals = (t_s, net_bp)，按时间排序。以时间块重采样，返回 (mean, lo, hi)。"""
+    """vals = (t_s, net_bp)，按时间排序。以时间块重采样，返回
+    (mean, lo, hi, p)。
+
+    §7.7.2：单侧 p = #{重采样均值 <= 0} / B，与 CI **共用同一次重采样**，
+    故 lo = means[249]（B=10000 的 2.5% 位）与 p < 0.025 严格等价。
+    """
     if not vals:
-        return float("nan"), float("nan"), float("nan")
+        return float("nan"), float("nan"), float("nan"), float("nan")
     vals = sorted(vals)
     t0 = vals[0][0]
     # 编号到时间块
@@ -222,78 +326,211 @@ def block_bootstrap_ci(vals: list[tuple[int, float]], *, block_s: int,
     obs = sum(v for _, v in vals) / n
     lo = means[int(0.025 * (b - 1))]
     hi = means[int(0.975 * (b - 1))]
-    return obs, lo, hi
+    p = bisect.bisect_right(means, 0.0) / b
+    return obs, lo, hi, p
 
 
-# ── 主检验（单个配置）──────────────────────────────────────────────────────
+# ── 横截面选择与主检验（§7.3 补充 / §7.7）─────────────────────────────────
+
+def _net_bp(rec: SlotRec, fwd: SlotRec, side: int) -> float:
+    """可执行净 bps：taker 双边 + 开仓 cross 半价差（§1）。"""
+    if side == 1:
+        gross = (fwd.bid - rec.ask) / rec.ask * 1e4
+        cross = (rec.ask - rec.bid) / 2 / rec.ask * 1e4
+    else:
+        gross = (rec.bid - fwd.ask) / rec.bid * 1e4
+        cross = (rec.ask - rec.bid) / 2 / rec.bid * 1e4
+    return gross - cross - 2 * TAKER_FEE_BP_PER_SIDE
+
+
+def _select(coin_slots: dict[str, list[SlotRec]], *, test_start_s: int,
+            h_s: int, kind: str) -> dict:
+    """先逐币时序 z，再同槽跨币排序；每侧 k = floor(0.10 × n_coins)。
+
+    §7.3 补充 / §7.7.10：n_coins < 5 的槽不触发；无有效 z 的币不参与排序。
+    kind="h1"（z_main）/ "h1_hist"（历史标准差稳健性）/ "h2"（depth_imbalance，
+    额外要求时序极端带 + 窄幅；§7.7.5/§7.7.6）。
+    """
+    key_attr = {"h1": "z_main", "h1_hist": "z_hist", "h2": "di"}[kind]
+    by_slot: dict[int, list[tuple[str, int, float]]] = defaultdict(list)
+    for coin, recs in coin_slots.items():
+        for i, rec in enumerate(recs):
+            v = getattr(rec, key_attr)
+            if v is not None:
+                by_slot[rec.t // h_s].append((coin, i, v))
+
+    trades: list[tuple[int, float]] = []
+    detail: list[dict] = []
+    slot_rv: dict[int, float] = {}
+    n_slots = 0
+    for slot in sorted(by_slot):
+        if slot * h_s < test_start_s:          # 只报告 test 段
+            continue
+        rows = by_slot[slot]
+        n = len(rows)
+        slot_rv[slot] = sum(coin_slots[c][i].rv_slot for c, i, _ in rows) / n
+        n_slots += 1
+        if n < MIN_XSECTION:
+            continue
+        k = int(K_FRAC * n)                    # floor
+        if k < 1:
+            continue
+        rows.sort(key=lambda x: x[2])
+        sel = [(c, i, 1) for c, i, _ in rows[-k:]] \
+            + [(c, i, -1) for c, i, _ in rows[:k]]
+        for coin, i, side in sel:
+            recs = coin_slots[coin]
+            if i + 1 >= len(recs):
+                continue
+            rec, fwd = recs[i], recs[i + 1]
+            if fwd.t // h_s != slot + 1:       # forward 必须是紧邻下一槽（t+h）
+                continue
+            if kind == "h2" and (rec.di_extreme != side or not rec.rv_narrow):
+                continue
+            net = _net_bp(rec, fwd, side)
+            trades.append((rec.t, net))
+            detail.append({"t": rec.t, "slot": slot, "coin": coin,
+                           "side": side, "net_bp": net})
+    return {"h_s": h_s, "trades": trades, "detail": detail,
+            "slot_rv": slot_rv, "n_slots": n_slots}
+
+
+def _boot(trades):
+    """15m 主块 + 1h 稳健块；p 与 CI 共用同一次重采样（§7.7.2）。"""
+    if not trades:
+        return None
+    return {
+        "15m": block_bootstrap_ci(trades, block_s=BLOCK_MIN_BOOT_S,
+                                  b=BOOT_B, seed=BOOT_SEED),
+        "1h": block_bootstrap_ci(trades, block_s=BLOCK_HOUR_S,
+                                 b=BOOT_B, seed=BOOT_SEED),
+    }
+
+
+def _mean(vals: list[float]) -> float:
+    return sum(vals) / len(vals) if vals else float("nan")
+
+
+def _robustness(res: dict, hist_mean: float) -> dict:
+    """§3 判据 5 四项 + §7.2.1 历史标准差（§7.7.3/§7.7.4 口径）。
+
+    翻号判定统一为「净均值 < 0」（§7.7.9），不另设显著性门槛。
+    """
+    trades, detail = res["trades"], res["detail"]
+    if not trades:
+        return {}
+    h_s = res["h_s"]
+    mean_all = _mean([v for _, v in trades])
+
+    # ① 换 1h 块
+    block1h = block_bootstrap_ci(trades, block_s=BLOCK_HOUR_S,
+                                 b=BOOT_B, seed=BOOT_SEED)[0]
+
+    # ② 剔最高波动 10% 时段（整槽、跨币一起剔；RV 阈值取 test 段全部槽分布）
+    rv_cut = quantile(sorted(res["slot_rv"].values()), 0.90)
+    kept = [v for t, v in trades if res["slot_rv"][t // h_s] <= rv_cut]
+
+    # ③ 只看 BTC/ETH 子集
+    be = [d["net_bp"] for d in detail if d["coin"] in ("BTC", "ETH")]
+
+    # ④ 剔单一最大贡献币：Σ net_bp 与 leave-one-out 影响两种都必须过
+    sums: dict[str, float] = defaultdict(float)
+    cnts: dict[str, int] = defaultdict(int)
+    for d in detail:
+        sums[d["coin"]] += d["net_bp"]
+        cnts[d["coin"]] += 1
+    top_sum = max(sums, key=lambda c: sums[c])
+    drop_sum = _mean([d["net_bp"] for d in detail if d["coin"] != top_sum])
+    loo = {c: cnts[c] * (sums[c] / cnts[c] - mean_all) for c in sums}
+    top_loo = max(loo, key=lambda c: loo[c])
+    drop_loo = _mean([d["net_bp"] for d in detail if d["coin"] != top_loo])
+
+    return {
+        "block1h": block1h,
+        "trim_vol_top10": _mean(kept),
+        "btc_eth": _mean(be),
+        "drop_max_sum": drop_sum,
+        "drop_max_loo": drop_loo,
+        "hist_std": hist_mean,
+        "top_sum_coin": top_sum,
+        "top_loo_coin": top_loo,
+    }
+
 
 def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int) -> dict:
-    """对全部币做 walk-forward，train 前半定分位，test 后半唯一报告。
+    """一次流式建槽，产出 H1 主口径 / H1 历史标准差 / H2 三组结果。
 
-    内存安全：流式稀疏采样，逐币处理、处理完即释放；只保留全局 train 特征池
-    （标量）与 test 成交（标量 bp）。扫描步进=h_s（预注册去重叠）。
-    forward 行情直接取下一个 h 槽样本（t+h），无需保留 1s 帧。
+    内存：每币仅保留每槽的标量记录（约 days*86400/h_s 条），处理完即释放
+    1s 帧与原始行。
     """
-    half = len(days) // 2
-    train_days, test_days = days[:half], days[half:]
-
     import calendar
+    half = len(days) // 2
+    y, m, d = map(int, days[half].split("-"))
+    test_start_s = calendar.timegm((y, m, d, 0, 0, 0))
 
-    def boundary(day_list):
-        y, m, d = map(int, day_list[0].split("-"))
-        return calendar.timegm((y, m, d, 0, 0, 0))
+    all_coins: set[str] = set()
+    for dd in days:
+        all_coins |= coins_present(book_root, dd)
 
-    test_start_s = boundary(test_days)
+    coin_slots = {c: build_coin_slots(book_root, days, c, w_s=w_s, h_s=h_s)
+                  for c in sorted(all_coins)}
+    out: dict[str, dict] = {}
+    for name, kind in (("h1", "h1"), ("h1_hist", "h1_hist"), ("h2", "h2")):
+        res = _select(coin_slots, test_start_s=test_start_s, h_s=h_s, kind=kind)
+        res["n"] = len(res["trades"])
+        res["boot"] = _boot(res["trades"])
+        out[name] = res
+    hist_boot = out["h1_hist"]["boot"]
+    out["h1"]["robust"] = _robustness(
+        out["h1"], hist_boot["15m"][0] if hist_boot else float("nan"))
+    return out
 
-    all_coins = set()
-    for d in days:
-        all_coins |= coins_present(book_root, d)
 
-    def coin_samples(coin):
-        return stream_coin_samples(book_root, days, coin,
-                                   w_s=w_s, h_s=h_s)
+ROBUST_KEYS = ("block1h", "trim_vol_top10", "btc_eth",
+               "drop_max_sum", "drop_max_loo", "hist_std")
 
-    # Pass 1：收集 train（t<test_start）窗口 OFI 特征，分位用。
-    feat_pool: list[float] = []
-    for coin in sorted(all_coins):
-        for s in coin_samples(coin):
-            if s["t"] < test_start_s:
-                feat_pool.append(s["ofi"])
-    feat_pool_sorted = sorted(feat_pool)
-    lo_q = quantile(feat_pool_sorted, Q_LOW)
-    hi_q = quantile(feat_pool_sorted, Q_HIGH)
 
-    # Pass 2：test（t>=test_start）逐槽判定；t+h 行情=下一个槽。
-    trades: list[tuple[int, float]] = []
-    for coin in sorted(all_coins):
-        samples = coin_samples(coin)
-        for i, s in enumerate(samples):
-            if s["t"] < test_start_s:
-                continue
-            z = s["ofi"]
-            side = 1 if z > hi_q else (-1 if z < lo_q else 0)
-            if side == 0 or i + 1 >= len(samples):
-                continue
-            fwd = samples[i + 1]
-            ask0, bid0 = s["ask"], s["bid"]
-            ask1, bid1 = fwd["ask"], fwd["bid"]
-            if side == 1:
-                gross_bp = (bid1 - ask0) / ask0 * 1e4
-                cross_half = (ask0 - bid0) / 2 / ask0 * 1e4
-            else:
-                gross_bp = (bid0 - ask1) / bid0 * 1e4
-                cross_half = (ask0 - bid0) / 2 / bid0 * 1e4
-            net_bp = gross_bp - cross_half - 2 * TAKER_FEE_BP_PER_SIDE
-            trades.append((s["t"], net_bp))
+def judge(name: str, res: dict, *, primary: bool, p_thr: float,
+          rob: Optional[dict] = None) -> tuple[bool, list[str]]:
+    """逐条给出 §3 五条判据 yes/no（§7.5）；不输出单一布尔。"""
+    if not res.get("boot"):
+        return False, [f"[{name}] n=0 → 全部判据不可判定（延长采集）"]
 
-    res = {"n": len(trades)}
-    if trades:
-        for label, block in (("block15m", BLOCK_MIN_BOOT_S),
-                             ("block1h", BLOCK_HOUR_S)):
-            mean, lo, hi = block_bootstrap_ci(
-                trades, block_s=block, b=BOOT_B, seed=BOOT_SEED)
-            res[label] = (mean, lo, hi)
-    return res
+    lines: list[str] = []
+    mean, lo, hi, p = res["boot"]["15m"]
+    c1 = lo > 0
+    c2 = mean > 0
+    c3 = primary
+    c4 = p < p_thr
+    ok_n = res["n"] >= MIN_TRADES
+    ok_econ = mean >= MIN_ECON_BP
+
+    lines.append(f"[{name}] n={res['n']} mean={mean:.2f}bp "
+                 f"CI95(15m块)=[{lo:.2f},{hi:.2f}] p={p:.4f}")
+    lines.append(f"  判据1 CI下界>0: {'yes' if c1 else 'no'}")
+    lines.append(f"  判据2 方向不翻号(mean>0): {'yes' if c2 else 'no'}")
+    lines.append(f"  判据3 主口径单独成立: {'yes' if c3 else 'no'}")
+    lines.append(f"  判据4 单侧p<{p_thr}: {'yes' if c4 else 'no'}")
+
+    c5 = False
+    if rob is None:
+        lines.append("  判据5 稳健性: n/a（§3 判据5 只对 H1）")
+    else:
+        c5 = True
+        for k in ROBUST_KEYS:
+            v = rob.get(k, float("nan"))
+            ok = isinstance(v, float) and not math.isnan(v) and v >= 0
+            c5 = c5 and ok
+            lines.append(f"  判据5[{k}]: {v:+.2f}bp {'yes' if ok else 'no'}")
+        lines.append(f"    (剔除的币: Σ={rob.get('top_sum_coin')} "
+                     f"LOO={rob.get('top_loo_coin')})")
+
+    lines.append(f"  样本量 n>={MIN_TRADES}: {'yes' if ok_n else 'no'}")
+    lines.append(f"  经济阈值 mean>={MIN_ECON_BP}bp: {'yes' if ok_econ else 'no'}")
+
+    passed = (c1 and c2 and c3 and c4 and ok_n and ok_econ
+              and (c5 if rob is not None else True))
+    return passed, lines
 
 
 # ── 多因子分层 IC（探索性报告，不参与 H1 主判定；2026-10-07 增补）────────────
@@ -675,17 +912,11 @@ def print_trade_factor_report(res: dict) -> None:
               f"{r['long']:>10.2f}{r['short']:>10.2f}{r['ls']:>9.2f}")
 
 
-def verdict(res: dict) -> tuple[bool, str]:
-    if res["n"] < MIN_TRADES:
-        return False, f"样本不足：{res['n']} < {MIN_TRADES}，延长采集"
-    mean, lo, hi = res["block15m"]
-    ok_ci = lo > 0
-    ok_econ = mean >= MIN_ECON_BP
-    passed = ok_ci and ok_econ
-    return passed, (f"n={res['n']} mean={mean:.2f}bp CI95=[{lo:.2f},{hi:.2f}] "
-                    f"1h块 mean={res['block1h'][0]:.2f} CI=[{res['block1h'][1]:.2f},"
-                    f"{res['block1h'][2]:.2f}] | CI下界>0={ok_ci} 经济阈值"
-                    f"≥{MIN_ECON_BP}bp={ok_econ}")
+def print_block(title: str, res: dict, *, primary: bool, p_thr: float,
+                rob: Optional[dict] = None) -> bool:
+    passed, lines = judge(title, res, primary=primary, p_thr=p_thr, rob=rob)
+    print("\n".join(lines))
+    return passed
 
 
 def main() -> int:
@@ -713,18 +944,21 @@ def main() -> int:
         return 2
     print(f"[m1-eval] 天数={len(days)} {days[0]}~{days[-1]}")
 
-    print("\n== 主口径 W=60s h=300s ==")
+    print("\n== 主口径 W=60s h=300s（唯一决定 H1 的配置）==")
     r = evaluate(book_root, days, w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
-    passed, txt = verdict(r)
-    print(("H1 通过 ✓ " if passed else "H1 未通过 ✗ ") + txt)
+    h1_passed = print_block("H1 主口径", r["h1"], primary=True,
+                            p_thr=0.05, rob=r["h1"]["robust"])
+    h2_passed = print_block("H2 次要假设 5m（Holm/Bonferroni 0.025）", r["h2"],
+                            primary=True, p_thr=0.025)
 
-    print("\n== 稳健性 W=300s h=900s（不决定主结论）==")
+    print("\n== 稳健性格子 W=300s h=900s（不决定主结论，§3 判据 3）==")
     r2 = evaluate(book_root, days, w_s=W_ROBUST_S, h_s=H_ROBUST_S)
-    print(txt if False else f"n={r2['n']} " + (
-        f"mean={r2['block15m'][0]:.2f} CI=[{r2['block15m'][1]:.2f},"
-        f"{r2['block15m'][2]:.2f}]" if r2['n'] else "(无交易)"))
+    print_block("H1 稳健格子", r2["h1"], primary=False, p_thr=0.05)
+    print_block("H2 参考 15m（§7.7.7）", r2["h2"], primary=False, p_thr=0.025)
 
-    print("\n结论：" + ("进入 §5 交付" if passed else "关闭该方向，不产出策略包装"))
+    print("\n结论：" + ("进入 §5 交付" if h1_passed
+                      else "关闭该方向，不产出策略包装")
+          + ("；H2 亦通过" if h2_passed else "；H2 未通过"))
 
     if args.factor_ic:
         fr = evaluate_factors(book_root, days,
