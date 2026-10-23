@@ -31,10 +31,15 @@ import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 
-SHADOW_FILE = os.environ.get(
-    "HERMES_WEIGHT_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/weight_shadow.jsonl"),
-)
+# U8 (2026-10-23): prefer /data unconditionally (the writer uses /data inside
+# the container); only fall back to the host path when /data is absent, same
+# as reconcile_pullback_shadow.py.
+SHADOW_FILE = os.environ.get("HERMES_WEIGHT_SHADOW_FILE", "/data/weight_shadow.jsonl")
+if not os.environ.get("HERMES_WEIGHT_SHADOW_FILE") and not os.path.isfile(SHADOW_FILE):
+    _host = os.path.expanduser("~/.hermes-trading/weight_shadow.jsonl")
+    if os.path.isfile(_host):
+        print(f"[reconcile] WARNING: {SHADOW_FILE} not found, falling back to {_host}")
+        SHADOW_FILE = _host
 
 
 def _parse_ts(s: str) -> float:
