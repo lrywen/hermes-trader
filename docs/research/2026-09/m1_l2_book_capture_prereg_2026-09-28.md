@@ -10,7 +10,8 @@
 ## 0. 采集器事实（已部署，2026-09-28）
 
 - 代码：`hermes_trader/client/ws_client.py`（`start_book_capture` / `_on_book` / `_book_flush_loop`，含断线重订）；启动入口 `scripts/trading_loop.py`（读 `config["book_capture"]`，默认 enabled）。
-- 落盘：`${HERMES_DATA_DIR:-/data}/book-raw/date=YYYY-MM-DD/COIN.jsonl`，UTC 分日，保留 14 天，由 `scripts/clean_trades_raw.py` 与 trades-raw 同一每日 job 清理。
+- 落盘：`${HERMES_DATA_DIR:-/data}/book-raw/date=YYYY-MM-DD/COIN.jsonl[.gz]`（非当日目录归档为 `.gz`），UTC 分日，**保留 90 天**，由 `scripts/clean_trades_raw.py` 的 `DEFAULT_BOOK_RETENTION_DAYS` 与 trades-raw 同一每日 job 清理（trades-raw 自身仍只保留 3 天）。
+  > **订正 2026-10-23**：原文写「保留 14 天」，与代码不符。90 天是为覆盖 2026-10-28 首次检验与 2026-11-27 的 60 天确认而设，避免滚动删除截断预注册窗口。本节仅陈述采集事实，不涉及 §1–§3 的任何假设、特征、切分或判定口径。
 - 行结构（每行一条 1s 快照）：
   ```json
   {"t": <flush wall ms>, "bt": <book event exchange ms>,
