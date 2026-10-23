@@ -28,6 +28,10 @@ Call sites that justify each entry (verified 2026-09-18):
       cron_shadow_grade.sh -> shadow_grade.py (already listed)
   * Deploy smoke (scripts/deploy_prod.sh `docker exec ... postdeploy_smoke.py`):
       postdeploy_smoke.py
+  * One-shot in-container research runner (2026-10-23, U1):
+      m1_ofi_eval.py  (M-1 OFI evaluator; NOT in the trading runtime path —
+      shipped only because the host cannot read the /data docker volume, so
+      the 2026-10-28 sample-out evaluation runs via `docker exec`)
 
 tests/test_runtime_scripts_whitelist.py enforces that every entry exists, that
 no research/backtest script is listed, and that the Dockerfile COPYs exactly
@@ -68,6 +72,9 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # Audit 2026-10-11 shadow A/B arms.
     "reconcile_stop_confirm_shadow.py",
     "reconcile_weight_shadow.py",
+    # M-1 OFI evaluator (research tool, not in the trading runtime path);
+    # runs one-shot via `docker exec` against the /data volume.
+    "m1_ofi_eval.py",
     # Deploy smoke path.
     "postdeploy_smoke.py",
 )
