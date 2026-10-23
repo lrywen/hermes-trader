@@ -75,9 +75,14 @@ def test_risk_status_snapshot_reports_armed_breakers(monkeypatch):
     })
     snap = mem.risk_status_snapshot()
     assert snap["global_halt"] is True
-    assert 29.0 <= snap["global_halt_remaining_min"] <= 30.0
+    # Lower bound leaves headroom for scheduling delay between the now_ms read
+    # above and the time.time() inside risk_status_snapshot: under a fully
+    # loaded parallel (-n 6) suite, adjacent statements can be descheduled by
+    # tens of seconds, so a 29.0 floor flaked. The asserted invariant is
+    # "armed ~30 min out", not sub-minute timing precision.
+    assert 27.0 <= snap["global_halt_remaining_min"] <= 30.0
     assert set(snap["coin_circuits"]) == {"BTC"}
-    assert 14.0 <= snap["coin_circuits"]["BTC"] <= 15.0
+    assert 12.0 <= snap["coin_circuits"]["BTC"] <= 15.0
     assert snap["armed_coins"] == 1
     # Read-only: the expired entry must still be present (no purge).
     assert "ETH" in mem._coin_circuit

@@ -39,6 +39,15 @@ os.environ["SESSION_LOG_PATH"] = os.path.join(_tmp, "session-log.jsonl")
 # /data/userfills-backfill.jsonl，污染断言。需要该源的测试用 monkeypatch 指向自己
 # 构造的文件。
 os.environ["HERMES_USERFILLS_BACKFILL_FILE"] = os.path.join(_tmp, "userfills-backfill.jsonl")
+# xdist parallel isolation (2026-10-23 R7 order-dependency root cause): each
+# worker is a separate process, and the non-blocking cross-process entry flock
+# (hermes_trader.client.lock EntryOrderLock) defaults to a single shared
+# ~/.hermes/hermes-entry-order.lock. Concurrent workers driving the real entry
+# path raced on it; the loser received reason="entry_lock_busy" and its
+# downstream `result["size"]` assertions failed — the recurring parallel-only
+# failures in test_cleanup_executor / test_audit_h6_cm3. Give every process a
+# unique lock dir (must be set before executor.py imports and bakes the path).
+os.environ["HERMES_LOCK_DIR"] = os.path.join(_tmp, "locks")
 # Redirect the ta_late_entry shadow JSONL: gate/prefilter tests that omit
 # shadow_log_path would otherwise append to the developer's real
 # ~/.hermes-trading/ta_late_entry_shadow.jsonl (late_entry_shadow_path falls

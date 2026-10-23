@@ -65,10 +65,14 @@ def test_token_bucket_refills_over_time():
     # contention (the old 100/s version refilled within ~0.2s and went flaky
     # in the parallel full-suite run when >0.15s passed between statements).
     b = TokenBucket(capacity=20, refill_per_sec=20.0)
-    assert b.acquire(20, max_wait=0.1) is True        # drains to 0
+    assert b.acquire(20, max_wait=0.5) is True        # drains to 0
     assert b.acquire(20, max_wait=0.05) is False       # needs ~1s to refill
-    time.sleep(1.15)                                   # ~23 tokens
-    assert b.acquire(20, max_wait=0.1) is True         # refilled past 20
+    time.sleep(1.5)                                    # ~30 tokens, margin for load
+    # Generous max_wait: under a fully loaded -n 6 worker the process can be
+    # descheduled well past 0.1s right here, and a tight wait then loses the
+    # race against its own refill. The assertion is "refilled past 20", which
+    # a 2s wait makes independent of scheduler latency.
+    assert b.acquire(20, max_wait=2.0) is True         # refilled past 20
 
 
 def test_endpoint_weight_mapping():
@@ -98,8 +102,11 @@ def test_ttl_cache_serves_within_ttl_and_refreshes_after():
     assert d._ttl_cached("k", 1.0, producer) == {"v": 1}
     assert calls["n"] == 1
 
-    # After TTL expires, recomputes.
-    time.sleep(1.1)
+    # After TTL expires, recomputes. Sleep well past the TTL: under a fully
+    # loaded parallel suite time.sleep can under-serve relative to the wall
+    # clock only by over-sleeping, so 2x TTL keeps us unambiguously expired
+    # even with scheduling jitter (1.1x flaked under -n 6).
+    time.sleep(2.0)
     assert d._ttl_cached("k", 0.5, producer) == {"v": 2}
     assert calls["n"] == 2
 

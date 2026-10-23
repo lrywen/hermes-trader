@@ -21,7 +21,15 @@ _DEFAULT_LOCK_DIR = os.path.expanduser("~/.hermes")
 
 
 def _lock_path(name: str, lock_dir: Optional[str] = None) -> Path:
-    base = Path(lock_dir or _DEFAULT_LOCK_DIR)
+    # Test isolation: the xdist parallel suite runs several independent worker
+    # PROCESSES that all drive the real entry path. Without an override they
+    # contend on the one non-blocking flock below (~/.hermes), so a worker
+    # that loses the race gets entry_lock_busy and its size/assertions fail
+    # — a flake that only appears under -n. Tests point this env at a unique
+    # per-process temp dir (conftest.py). Production leaves it unset.
+    if lock_dir is None:
+        lock_dir = os.environ.get("HERMES_LOCK_DIR") or _DEFAULT_LOCK_DIR
+    base = Path(lock_dir)
     base.mkdir(parents=True, exist_ok=True)
     return base / f"hermes-{name}.lock"
 
