@@ -492,6 +492,9 @@ _WIRING_CONFIG = {
     "block_counter_trend_bypass": False,
     "crowded_with_min_conf": 0.0,
     "news_blackout": {"enabled": False},
+    # R7-A: daily-extension cap would fail-closed on the missing universe
+    # snapshot; off so a clean ctx stays clean.
+    "daily_extension_cap": {"mode": "off"},
     # The three new gates — wired through the circuit_breaker block:
     "circuit_breaker": {
         "consecutive_loss_limit": 3,

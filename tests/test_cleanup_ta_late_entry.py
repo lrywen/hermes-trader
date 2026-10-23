@@ -923,7 +923,10 @@ def test_ta_late_entry_registered_in_eval_all_gates(monkeypatch):
     # trade_notional_usd=10 stays under the P1-14 canonical per-trade cap ($30)
     # so the chain isn't blocked by an unrelated gate.
     out2 = risk_gates.eval_all_gates(
-        _ctx(trade_notional_usd=10), {"debate_gate": {"enabled": False}})
+        _ctx(trade_notional_usd=10), {"debate_gate": {"enabled": False},
+                                      # R7-A: daily-extension cap fails closed
+                                      # without a universe snapshot.
+                                      "daily_extension_cap": {"mode": "off"}})
     assert out2["results"]["ta_late_entry"]["via"] == "ta_late_entry_disabled"
     assert out2["blocked"] is False
 

@@ -156,6 +156,9 @@ def _h6_like_baseline(monkeypatch):
         "max_crypto_long_correlated": 5, "min_market_volume_usd": 5_000_000,
         "min_hip3_volume_usd": 500_000, "conviction_sizing": True,
         "debate_gate": {"enabled": False},
+        # R7-A: daily-extension cap (shadow+fail_closed without a universe
+        # snapshot) must not block these lock/reconcile paths.
+        "daily_extension_cap": {"mode": "off"},
         "dsl_exit": {"max_loss_pct": 2.0, "max_loss_roe_pct": 30.0,
                      "protect_pct": 0.5, "retrace_threshold": 0.3,
                      "hard_timeout_minutes": 180.0},

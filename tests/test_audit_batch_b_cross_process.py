@@ -217,8 +217,16 @@ def _live_harness(monkeypatch, *, lev_calls):
                                    "best_bid": 99.99, "best_ask": 100.01})
     # Patch only sleep; the rest of the real time module (perf_counter,
     # monotonic, …) must keep working on the longer retry-success path.
-    monkeypatch.setattr(executor.time, "sleep",
-                        lambda s: lev_calls.setdefault("sleeps", []).append(s))
+    # R7-B (2026-10-23): time.sleep is global — the hl_client rate limiter
+    # also sleeps on this path now, so record only sleeps initiated from
+    # executor.py (the set_leverage retry this contract is about).
+    import sys as _sys
+
+    def _rec_sleep(s):
+        caller = _sys._getframe(1).f_code.co_filename
+        if caller.endswith("agents/executor.py"):
+            lev_calls.setdefault("sleeps", []).append(s)
+    monkeypatch.setattr(executor.time, "sleep", _rec_sleep)
 
     def _set_lev(c, lev):
         lev_calls["n"] = lev_calls.get("n", 0) + 1

@@ -51,6 +51,9 @@ _DISABLED_CONFIG = {
     "counter_regime_min_conf": 0.7,
     "block_counter_trend_bypass": False,
     "crowded_with_min_conf": 0.0,
+    # R7-A: daily-extension cap is shadow+fail_closed and there is no universe
+    # snapshot in tests → off, like every other gate irrelevant to this file.
+    "daily_extension_cap": {"mode": "off"},
 }
 
 

@@ -244,6 +244,9 @@ def _h6_baseline(monkeypatch, cfg_overrides=None):
                      "protect_pct": 0.5, "retrace_threshold": 0.3,
                      "hard_timeout_minutes": 180.0},
         "debate_gate": {"enabled": False},
+        # R7-A: keep the daily-extension cap (shadow+fail_closed on missing
+        # 24h data) out of these reconcile-path tests.
+        "daily_extension_cap": {"mode": "off"},
         "circuit_breaker": {"resp_unknown_halt_n": 3,
                             "resp_unknown_halt_min": 60.0},
     }

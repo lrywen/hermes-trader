@@ -72,6 +72,10 @@ def _exec_baseline(monkeypatch, cfg_overrides=None, state_overrides=None):
                      "protect_pct": 0.5, "retrace_threshold": 0.3,
                      "hard_timeout_minutes": 180.0},
         "debate_gate": {"enabled": False},
+        # R7-A: the daily-extension cap (canonical cap=30%, shadow+fail_closed)
+        # blocks a clean ctx when the universe cache has no prevDayPx; these
+        # tests exercise other paths, so take the gate out of the way.
+        "daily_extension_cap": {"mode": "off"},
     }
     cfg.update(cfg_overrides or {})
     state = {"equity": 1000.0, "available": 500.0, "total_ntl": 0.0,

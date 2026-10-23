@@ -65,7 +65,10 @@ def test_risk_gates_pass_and_block():
            # debate_gate is fail-closed default-on (P0-A) with analyst3 default
            # False (P0-D); this case exercises the generic gates, so opt out
            # explicitly instead of relying on implicit debate defaults.
-           "debate_gate": {"enabled": False}}
+           "debate_gate": {"enabled": False},
+           # R7-A: daily-extension cap fails closed without a universe
+           # snapshot; not the gate under test here.
+           "daily_extension_cap": {"mode": "off"}}
     assert eval_all_gates(_ctx(), cfg)["blocked"] is False
     blocked = eval_all_gates(_ctx(confidence=0.1), cfg)
     assert blocked["blocked"] is True
