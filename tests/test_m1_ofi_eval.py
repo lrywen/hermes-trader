@@ -26,6 +26,7 @@ from m1_ofi_eval import (  # noqa: E402
     _select,
     _reference_build_coin_slots,
     build_coin_slots_dual,
+    judge,
 )
 
 DAY = "2026-10-01"
@@ -206,6 +207,7 @@ class _FakeFile:
     def __enter__(self): return self
     def __exit__(self, *a): pass
     def read(self) -> str: return self._content
+    def __iter__(self): return iter(self._content.splitlines(keepends=True))
 
 
 def _fake_open(fake_files: dict[str, str]):
@@ -227,12 +229,30 @@ def test_default_jobs_respects_cgroup_quota(monkeypatch):
         "/sys/fs/cgroup/cpu.max":   "2000000 1000000",  # 2/1 = 2 核
         "/sys/fs/cgroup/memory.max": str(1 * 1024 ** 3),
     }))
-    # 1GiB / 300MiB = 3; min(3, 2) = 2
+    # free anon = 1GiB (no memory.stat in this fake) / 450MiB = 2; min(2, 2核) = 2
     assert _default_jobs() == 2
 
 
+def test_default_jobs_subtracts_live_anon(monkeypatch):
+    """R1：预算必须用「剩余 anon」而非 memory.max 总量。
+
+    生产实测 memory.max=1GiB、anon=549MiB ⇒ free≈475MiB ⇒ 只够 1 个
+    worker（450MiB/worker）。若按总量算会得到 2，与实盘循环抢同一 GiB。
+    """
+    import os
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: list(range(4)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 4)
+    monkeypatch.setattr("builtins.open", _fake_open({
+        "/sys/fs/cgroup/cpu.max":    "400000 100000",          # 4 核配额
+        "/sys/fs/cgroup/memory.max": str(1024 * 1024 ** 2),
+        "/sys/fs/cgroup/memory.stat": "anon 574619648\nfile 300000000\n",
+    }))
+    assert _default_jobs() == 1
+
+
 def test_default_jobs_unlimited_cpu_caps_by_memory(monkeypatch):
-    """cpu.max=max → 核数不约束；内存 512MiB → 512//300=1 worker。"""
+    """cpu.max=max → 核数不约束；内存 512MiB → 512//450=1 worker。"""
     import os
     monkeypatch.setattr(os, "sched_getaffinity",
                         lambda pid: list(range(16)), raising=False)
@@ -241,7 +261,7 @@ def test_default_jobs_unlimited_cpu_caps_by_memory(monkeypatch):
         "/sys/fs/cgroup/cpu.max":   "max",
         "/sys/fs/cgroup/memory.max": str(512 * 1024 ** 2),
     }))
-    assert _default_jobs() == 1  # 512MiB / 300MiB floor 1
+    assert _default_jobs() == 1  # 512MiB / 450MiB floor 1
 
 
 def test_default_jobs_ceiling_8_on_host(monkeypatch):
@@ -255,3 +275,24 @@ def test_default_jobs_ceiling_8_on_host(monkeypatch):
         "/proc/meminfo": "MemTotal: 15728640 kB\n",
     }))
     assert _default_jobs() == 8
+
+
+# ── R4：判据 2 分腿只报告、不门控（§7.8）──────────────────────────────────
+
+def test_judge_reports_side_split_without_gating():
+    """多头腿为负、空头腿暴赚时合并均值仍 >0；分腿只是揭示，不改判定。"""
+    res = {
+        "n": 400,
+        "boot": {"15m": (5.0, 0.5, 9.0, 0.010),
+                 "1h": (5.0, 0.5, 9.0, 0.010)},
+        "trades": [(0, 1.0)] * 400,
+        "detail": ([{"side": 1, "net_bp": -5.0}] * 200
+                   + [{"side": -1, "net_bp": 15.0}] * 200),
+    }
+    passed, lines = judge("H1 主口径", res, primary=True, p_thr=0.05)
+    text = "\n".join(lines)
+    assert "判据2 分腿" in text
+    assert "long n=200 mean=-5.00bp" in text
+    assert "short n=200 mean=+15.00bp" in text
+    # 分腿不改 passed：判据 2 仍按 §7.5 的合并均值口径判定
+    assert passed is True

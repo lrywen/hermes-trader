@@ -85,6 +85,13 @@ for _arm_env, _arm_file in (
     # (coin "OOS") to the developer's real ~/.hermes-trading/risk_tuning_
     # shadow.jsonl — the same file the D2 arm and the reconciler read.
     ("HERMES_RISK_TUNING_SHADOW_FILE", "risk_tuning_shadow.jsonl"),
+    # 2026-10-23 (R6): weight_shadow and stop_confirm_shadow were the last two
+    # arms still missing here. weight_shadow writes only on a gate-decision
+    # divergence and stop_confirm only on a live floor_breach, so neither has
+    # leaked yet — but a test driving either branch without an explicit path
+    # would append synthetic rows to the developer's real file.
+    ("HERMES_WEIGHT_SHADOW_FILE", "weight_shadow.jsonl"),
+    ("HERMES_STOP_CONFIRM_SHADOW_FILE", "stop_confirm_shadow.jsonl"),
 ):
     os.environ[_arm_env] = os.path.join(_tmp, _arm_file)
 

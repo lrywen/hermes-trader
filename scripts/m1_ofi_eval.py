@@ -463,31 +463,63 @@ def _default_jobs() -> int:
                 cpu = min(cpu, max(1, q // p))
     except Exception:
         pass
-    # Memory cap (cgroup v2 first, v1 fallback)
-    mem: Optional[int] = None
+    # Memory cap (cgroup v2 first, v1 fallback) and *already used* anon.
+    # Budgeting against the cap alone over-commits: the live loop already
+    # holds ≈550 MiB anon in the production container, so a 1 GiB cap must
+    # not be read as "1 GiB free". Measured 2026-10-23: live anon 549 MiB +
+    # runner peak anon 905 MiB = 1454 MiB against a 1024 MiB cap (no OOM-kill
+    # because MemorySwap=2 GiB, but the whole run thrashes swap and starves
+    # the trading loop — same symptom as the old --jobs 8: 4.35% CPU).
+    cap: Optional[int] = None
     for p in ("/sys/fs/cgroup/memory.max",
               "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         try:
             v = open(p).read().strip()
             if v != "max":
-                mem = int(v)
+                cap = int(v)
                 break
         except Exception:
             continue
-    if mem is None:
+    used = 0
+    for p in ("/sys/fs/cgroup/memory.stat",
+              "/sys/fs/cgroup/memory/memory.stat"):
+        try:
+            with open(p) as _f:
+                for line in _f:
+                    if line.startswith("anon "):
+                        used = int(line.split()[1])
+                        break
+        except Exception:
+            used = 0
+        if used:
+            break
+    if not used:
+        # v1 / no memory.stat: fall back to the whole usage counter (includes
+        # reclaimable page cache, so this is the conservative direction).
+        for p in ("/sys/fs/cgroup/memory.current",
+                  "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            try:
+                used = int(open(p).read().strip())
+                break
+            except Exception:
+                continue
+    if cap is None:
         try:
             with open("/proc/meminfo") as f:
                 for line in f:
                     if line.startswith("MemTotal:"):
-                        mem = int(line.split()[1]) * 1024
+                        cap = int(line.split()[1]) * 1024
                         break
         except Exception:
             pass
-    # Each worker holds the full day × N-coins rows + slots + overhead →
-    # budget one worker per 300 MiB of memory, floor 1 so a tiny container
-    # still does useful work rather than collapsing to 1.
-    if mem:
-        cpu = min(cpu, max(1, mem // (300 * 1024 * 1024)))
+    # One worker per 450 MiB of *free* anon budget. Measured on the 1 GiB /
+    # 2-core production caps: --jobs 2 peaked at 905 MiB anon ⇒ ≈450 MiB per
+    # worker (each holds a full day of 86k snapshot dicts). The old 300 MiB
+    # constant under-estimated by ~1.5x and would have allowed 3 workers on a
+    # 4-core 1 GiB box (1350 MiB, over cap) — right answer, wrong reason.
+    if cap:
+        free = max(0, cap - used)
+        cpu = min(cpu, max(1, free // (450 * 1024 * 1024)))
     return max(1, min(8, cpu))
 
 
@@ -716,6 +748,24 @@ ROBUST_KEYS = ("block1h", "trim_vol_top10", "btc_eth",
                "drop_max_sum", "drop_max_loo", "hist_std")
 
 
+def _side_split(detail: list[dict]) -> str:
+    """判据 2 的多空分腿净均值（纯报告，不参与 passed）。
+
+    §3 判据 2 的方向定义是「OFI+ → 收益+」，指向多头腿；而 c2 判的是多空
+    合并均值，极端情形下多头腿为负、空头腿暴赚仍可 >0。§7.5 已明文判据 2
+    由判据 1 的 CI 下界隐含，故此处只补证据强度所需的分腿数字。
+    """
+    by: dict[int, list[float]] = {1: [], -1: []}
+    for d in detail:
+        by.setdefault(int(d.get("side", 0)), []).append(float(d["net_bp"]))
+    parts = []
+    for side, label in ((1, "long"), (-1, "short")):
+        vals = by.get(side) or []
+        parts.append(f"{label} n={len(vals)} mean={_mean(vals):+.2f}bp"
+                     if vals else f"{label} n=0 mean=n/a")
+    return " | ".join(parts)
+
+
 def judge(name: str, res: dict, *, primary: bool, p_thr: float,
           rob: Optional[dict] = None) -> tuple[bool, list[str]]:
     """逐条给出 §3 五条判据 yes/no（§7.5）；不输出单一布尔。"""
@@ -735,6 +785,10 @@ def judge(name: str, res: dict, *, primary: bool, p_thr: float,
                  f"CI95(15m块)=[{lo:.2f},{hi:.2f}] p={p:.4f}")
     lines.append(f"  判据1 CI下界>0: {'yes' if c1 else 'no'}")
     lines.append(f"  判据2 方向不翻号(mean>0): {'yes' if c2 else 'no'}")
+    # §3 判据2 的方向定义指向多头腿，而 c2 用的是多空合并均值：多头腿为负、
+    # 空头腿暴赚时合并均值仍可 >0。§7.5 已明文「判据2 由 CI 下界>0 隐含」，
+    # 故判定口径不动，只补分腿数字以支撑证据强度（§7.8 仅报告、不参与判定）。
+    lines.append(f"  判据2 分腿（仅报告）: {_side_split(res.get('detail') or [])}")
     lines.append(f"  判据3 主口径单独成立: {'yes' if c3 else 'no'}")
     lines.append(f"  判据4 单侧p<{p_thr}: {'yes' if c4 else 'no'}"
                  "（仅报告不门控，§7.7.2：判据1已隐含 p<0.025）")

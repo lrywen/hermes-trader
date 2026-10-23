@@ -270,11 +270,23 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
                           now_ms: int) -> None:
     """Audit 2026-10-11: counter-factual composite under the canonical reweight
     (trendStrength 0.55→0.30, uptrendMomentum 0→0.20, momentumBurst 2bar/4%
-    →3bar/3%). Production currently pins the OLD values in its override file;
-    this arm records, for every scored coin, whether the candidate weighting +
-    momentum threshold would change the composite-gate decision (would-surface
-    / would-block). Pure observation; live score/gate unchanged. Only emits on a
-    live-vs-candidate decision divergence so the JSONL stays signal-rich.
+    →3bar/3%).
+
+    2026-10-23 (ADR-0009): production already PROMOTED those values on
+    2026-10-22 — `trigger_weights` now equals `weight_shadow.candidate_weights`
+    key for key. The only variable left in this arm is the momentum-burst
+    definition (2bar/4% → 3bar/3%). A zero-row JSONL therefore means "no
+    divergence under the momentum swap"; it must NOT be read as "the weight
+    candidates show no disagreement".
+
+    Caveat (2026-10-23): `_weight_shadow_path()` falls back to
+    ~/.hermes-trading, which is a READ-ONLY bind mount inside the container,
+    and production does not set HERMES_WEIGHT_SHADOW_FILE — so an emit cannot
+    currently be persisted at all. Zero rows is expected even on a divergence
+    until that path is pointed at /data.
+
+    Pure observation; live score/gate unchanged. Only emits on a live-vs-
+    candidate decision divergence so the JSONL stays signal-rich.
     """
     try:
         from hermes_trader.agents.config_store import read_agent_config
