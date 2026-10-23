@@ -956,9 +956,15 @@ def main() -> int:
     print_block("H1 稳健格子", r2["h1"], primary=False, p_thr=0.05)
     print_block("H2 参考 15m（§7.7.7）", r2["h2"], primary=False, p_thr=0.025)
 
-    print("\n结论：" + ("进入 §5 交付" if h1_passed
-                      else "关闭该方向，不产出策略包装")
-          + ("；H2 亦通过" if h2_passed else "；H2 未通过"))
+    if r["h1"]["n"] < MIN_TRADES:
+        # §7.5：样本不足时不得给出方向性结论，只能要求延长采集
+        verdict = f"样本不足（n={r['h1']['n']} < {MIN_TRADES}），延长采集，不下结论"
+    elif h1_passed:
+        verdict = "进入 §5 交付" + ("；H2 亦通过" if h2_passed else "；H2 未通过")
+    else:
+        verdict = "关闭该方向，不产出策略包装" + \
+                   ("；H2 亦通过" if h2_passed else "；H2 未通过")
+    print("\n结论：" + verdict)
 
     if args.factor_ic:
         fr = evaluate_factors(book_root, days,
@@ -977,7 +983,7 @@ def main() -> int:
                                          w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
             print_trade_factor_report(tfr)
 
-    return 0 if passed else 1
+    return 0 if h1_passed else 1
 
 
 if __name__ == "__main__":
