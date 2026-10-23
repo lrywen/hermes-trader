@@ -14,7 +14,11 @@
 标签用 mid；可执行口径=按 t 当根 ask 买、t+h 当根 bid 卖，扣 taker 费 +
 开仓 cross 半价差（均取实测值）。
 
-本脚本为研究工具，不进运行时镜像。
+退出码（§7.7.11）：0=H1 通过；1=证伪；2=数据/日期闸不满足；3=样本不足
+（n<300，延长采集，不可判定）。
+
+本脚本为研究工具，不进交易运行时路径；仅因宿主机读不到 /data 卷才随
+镜像分发，供容器内一次性执行。
 """
 from __future__ import annotations
 
@@ -157,10 +161,14 @@ def _prune_sorted(history, sorted_vals: list[float], cutoff: int) -> None:
 
 def build_coin_slots(book_root: Path, days: list[str], coin: str, *,
                      w_s: int, h_s: int) -> list[SlotRec]:
-    """逐币流式构建每个 h 槽的固定特征（O(w_s) 内存，单币处理完即释放）。
+    """逐币流式构建每个 h 槽的固定特征（逐日逐行解压处理）。
 
     §7.2：所有分位/z/历史统计只用**严格早于当前槽**的数据。
     跨日重置 prev_snap（不拼跨日相邻帧增量），槽号 slot=t//h_s 跨日连续。
+
+    内存说明：单日原始行经 load_coin_day 整日驻留（约 86k dict/活跃币日），
+    帧级 ring 仅保留 w_s+h_s 秒；输出为每槽一条 SlotRec。全量提速见
+    build_coin_slots_dual（两套口径共享一趟帧循环，输出逐位一致）。
     """
     from collections import deque
 
@@ -277,6 +285,159 @@ def build_coin_slots(book_root: Path, days: list[str], coin: str, *,
     if cur_frame is not None:
         flush(cur_slot, cur_frame)
     return out
+
+
+# ── 双口径单遍建槽（性能版；与 build_coin_slots 逐位等价）────────────────────
+#
+# 性能事实（2026-10-23 cProfile，BTC 单日 86,092 帧）：
+#   _to_levels 6.2s（每帧最多 6 次重复解析同一快照）+ json 4.1s + _best_ba 2.8s。
+# 优化手段（全部保持逐位等价，不改变任何输出比特）：
+#   1. 每帧 b/a 只解析一次；e 的算式逐字符复制 best_ofi 的 bid/ask 两侧公式，
+#      best 取「过滤后首档」（与 _best 语义一致），bid/ask 价取 max/min（与
+#      _best_ba 一致）；snap 直接保存解析后档位（_to_levels 幂等，下游一致）。
+#   2. W=60/h=300 与 W=300/h=900 两套槽在同一趟帧循环里产出：ring 共享
+#      （按 max(w_s+h_s) 淘汰），e/解析/json 各只做一次；每套口径独立维护
+#      hist/di/rv/ends/rv_ssq/prev_mid 状态，flush 逻辑与原实现逐行一致。
+# tests/test_m1_ofi_eval.py 内含 dual vs 单口径参考实现的逐 SlotRec 相等断言。
+
+_DUAL_CONFIGS = ((W_PRIMARY_S, H_PRIMARY_S), (W_ROBUST_S, H_ROBUST_S))
+
+
+def _new_slot_state() -> dict:
+    from collections import deque
+    return {"hist": deque(), "di_hist": deque(), "di_sorted": [],
+            "rv_hist": deque(), "rv_sorted": [], "hist_sum": 0.0,
+            "hist_sq": 0.0, "ends": deque(maxlen=6), "cur_slot": None,
+            "cur_frame": None, "rv_ssq": 0.0, "prev_mid": None, "out": []}
+
+
+def _flush_state(st: dict, slot: int, frame, w_s: int, ring) -> None:
+    """与 build_coin_slots 内嵌 flush 逐行一致，仅把闭包状态换成 dict。"""
+    if frame is None:
+        return
+    t, bid, ask, mid_px, snap = frame
+    st["ends"].append((slot, mid_px))
+
+    win = [e for et, e in ring if et >= t - w_s]
+    nf = len(win)
+    ofi = float(sum(win))
+    std = statistics.stdev(win) if nf >= 2 else 0.0
+    z_main = ofi / std if (nf >= 10 and std > 0) else None
+
+    n_h = len(st["hist"])
+    z_hist = None
+    if n_h >= 2:
+        var = (st["hist_sq"] - st["hist_sum"] * st["hist_sum"] / n_h) / (n_h - 1)
+        sd = math.sqrt(var) if var > 0 else 0.0
+        z_hist = ofi / sd if sd > 0 else None
+
+    di = ofi_mod.depth_imbalance(snap)
+    di_extreme = 0
+    if di is not None and len(st["di_sorted"]) >= 2:
+        if di <= quantile(st["di_sorted"], Q_LOW):
+            di_extreme = -1
+        elif di > quantile(st["di_sorted"], Q_HIGH):
+            di_extreme = 1
+
+    ends = st["ends"]
+    rv30 = None
+    if len(ends) == 6 and all(mv > 0 for _, mv in ends):
+        ms = [mv for _, mv in ends]
+        rv30 = math.sqrt(sum(math.log(ms[k] / ms[k - 1]) ** 2
+                             for k in range(1, 6)))
+    rv_narrow = (rv30 is not None and len(st["rv_sorted"]) >= 2
+                 and rv30 <= quantile(st["rv_sorted"], 0.30))
+
+    st["out"].append(SlotRec(
+        t=t, bid=bid, ask=ask, ofi=ofi, n_frames=nf, std_within=std,
+        z_main=z_main, z_hist=z_hist, rv_slot=math.sqrt(st["rv_ssq"]),
+        rv_30m=rv30, di=di, slope_diff=ofi_mod.depth_slope_diff(snap),
+        di_extreme=di_extreme, rv_narrow=rv_narrow))
+
+    # 以下写入均严格晚于当前槽，供后续槽使用
+    st["hist"].append((t, ofi))
+    st["hist_sum"] += ofi
+    st["hist_sq"] += ofi * ofi
+    while st["hist"] and st["hist"][0][0] < t - HIST_S:
+        _, old = st["hist"].popleft()
+        st["hist_sum"] -= old
+        st["hist_sq"] -= old * old
+    if di is not None:
+        bisect.insort(st["di_sorted"], di)
+        st["di_hist"].append((t, di))
+        _prune_sorted(st["di_hist"], st["di_sorted"], t - HIST_S)
+    if rv30 is not None:
+        bisect.insort(st["rv_sorted"], rv30)
+        st["rv_hist"].append((t, rv30))
+        _prune_sorted(st["rv_hist"], st["rv_sorted"], t - HIST_S)
+
+
+def build_coin_slots_dual(book_root: Path, days: list[str], coin: str,
+                          configs=_DUAL_CONFIGS) -> list[list[SlotRec]]:
+    """一趟帧循环产出多套 (w_s, h_s) 口径的槽序列，与逐次调用
+    build_coin_slots 的输出逐 SlotRec 相等（单测锁定）。"""
+    from collections import deque
+
+    max_span = max(w_s + h_s for w_s, h_s in configs)
+    ring: deque = deque()
+    states = [_new_slot_state() for _ in configs]
+
+    for day in days:
+        prev_bl = prev_al = None       # 跨日不拼相邻帧增量
+        for r in load_coin_day(book_root, day, coin):
+            try:
+                t = int(r.get("t", 0)) // MS
+            except (TypeError, ValueError):
+                continue
+            bl = ofi_mod._to_levels(r.get("b"))
+            al = ofi_mod._to_levels(r.get("a"))
+            if not bl or not al:
+                continue               # prev 保持上一好帧（与原实现一致）
+            bp, bq = max(bl)
+            ap, aq = min(al)
+            snap = {"b": bl, "a": al}  # _to_levels 幂等，下游结果一致
+            if prev_bl is None:
+                e = 0.0
+            else:
+                # 逐字符复制 ofi.best_ofi 两侧公式（best=过滤后首档）
+                pbb, pqb = prev_bl[0]
+                cbb, cqb = bl[0]
+                e = (1.0 if cbb >= pbb else 0.0) * cqb \
+                    - (1.0 if cbb <= pbb else 0.0) * pqb
+                pba, pqa = prev_al[0]
+                cba, cqa = al[0]
+                e += (-1.0 if cba <= pba else 0.0) * cqa \
+                    + (1.0 if cba >= pba else 0.0) * pqa
+            prev_bl, prev_al = bl, al
+
+            mid_px = (bp + ap) / 2.0
+            for st, (w_s, h_s) in zip(states, configs):
+                slot = t // h_s
+                if st["cur_slot"] is not None and slot != st["cur_slot"]:
+                    _flush_state(st, st["cur_slot"], st["cur_frame"], w_s, ring)
+                    st["cur_slot"], st["cur_frame"] = None, None
+                    st["rv_ssq"], st["prev_mid"] = 0.0, None
+                st["cur_slot"] = slot
+                if st["prev_mid"] is not None and st["prev_mid"] > 0 \
+                        and mid_px > 0:
+                    st["rv_ssq"] += math.log(mid_px / st["prev_mid"]) ** 2
+                st["prev_mid"] = mid_px
+                st["cur_frame"] = (t, bp, ap, mid_px, snap)
+
+            ring.append((t, e))
+            while ring and ring[0][0] < t - max_span:
+                ring.popleft()
+
+    for st, (w_s, _) in zip(states, configs):
+        if st["cur_frame"] is not None:
+            _flush_state(st, st["cur_slot"], st["cur_frame"], w_s, ring)
+    return [st["out"] for st in states]
+
+
+def _dual_one(arg) -> tuple[str, list[list[SlotRec]]]:
+    """ProcessPoolExecutor worker（顶层定义以便 pickle）。"""
+    book_root, days, coin = arg
+    return coin, build_coin_slots_dual(book_root, days, coin)
 
 
 # ── 分位（只用 train / 该时点过去数据）──────────────────────────────────────
@@ -457,23 +618,25 @@ def _robustness(res: dict, hist_mean: float) -> dict:
     }
 
 
-def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int) -> dict:
-    """一次流式建槽，产出 H1 主口径 / H1 历史标准差 / H2 三组结果。
+def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int,
+             coin_slots: Optional[dict] = None) -> dict:
+    """产出 H1 主口径 / H1 历史标准差 / H2 三组结果。
 
-    内存：每币仅保留每槽的标量记录（约 days*86400/h_s 条），处理完即释放
-    1s 帧与原始行。
+    coin_slots 为 None 时自行逐币建槽（每币仅保留每槽标量记录，处理完即
+    释放 1s 帧与原始行）；调用方也可注入 build_coin_slots_dual 的产物，
+    以便两套口径共享同一趟帧循环（输出与分别建槽逐位一致）。
     """
     import calendar
     half = len(days) // 2
     y, m, d = map(int, days[half].split("-"))
     test_start_s = calendar.timegm((y, m, d, 0, 0, 0))
 
-    all_coins: set[str] = set()
-    for dd in days:
-        all_coins |= coins_present(book_root, dd)
-
-    coin_slots = {c: build_coin_slots(book_root, days, c, w_s=w_s, h_s=h_s)
-                  for c in sorted(all_coins)}
+    if coin_slots is None:
+        all_coins: set[str] = set()
+        for dd in days:
+            all_coins |= coins_present(book_root, dd)
+        coin_slots = {c: build_coin_slots(book_root, days, c, w_s=w_s, h_s=h_s)
+                      for c in sorted(all_coins)}
     out: dict[str, dict] = {}
     for name, kind in (("h1", "h1"), ("h1_hist", "h1_hist"), ("h2", "h2")):
         res = _select(coin_slots, test_start_s=test_start_s, h_s=h_s, kind=kind)
@@ -933,6 +1096,8 @@ def main() -> int:
                     help="追加多因子分层 IC 探索报告（不参与 H1 主判定）")
     ap.add_argument("--trade-factor-ic", action="store_true",
                     help="追加基于 trades-raw 的成交流因子 IC（探索性）")
+    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1),
+                    help="建槽并行进程数（按币分片；1=串行，输出不变）")
     args = ap.parse_args()
 
     today = time.strftime("%Y-%m-%d", time.gmtime())
@@ -948,15 +1113,39 @@ def main() -> int:
         return 2
     print(f"[m1-eval] 天数={len(days)} {days[0]}~{days[-1]}")
 
+    print("\n== 建槽（单遍双口径，--jobs 并行按币分片）==")
+    t0 = time.time()
+    all_coins: set[str] = set()
+    for dd in days:
+        all_coins |= coins_present(book_root, dd)
+    coins = sorted(all_coins)
+    slots_primary: dict[str, list[SlotRec]] = {}
+    slots_robust: dict[str, list[SlotRec]] = {}
+    if args.jobs > 1 and len(coins) > 1:
+        from concurrent.futures import ProcessPoolExecutor
+        with ProcessPoolExecutor(max_workers=args.jobs) as ex:
+            for coin, (s1, s2) in ex.map(
+                    _dual_one, [(book_root, days, c) for c in coins]):
+                slots_primary[coin] = s1
+                slots_robust[coin] = s2
+    else:
+        for coin in coins:
+            s1, s2 = build_coin_slots_dual(book_root, days, coin)
+            slots_primary[coin] = s1
+            slots_robust[coin] = s2
+    print(f"[m1-eval] 建槽完成 {len(coins)} 币，{time.time() - t0:.1f}s")
+
     print("\n== 主口径 W=60s h=300s（唯一决定 H1 的配置）==")
-    r = evaluate(book_root, days, w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
+    r = evaluate(book_root, days, w_s=W_PRIMARY_S, h_s=H_PRIMARY_S,
+                 coin_slots=slots_primary)
     h1_passed = print_block("H1 主口径", r["h1"], primary=True,
                             p_thr=0.05, rob=r["h1"]["robust"])
     h2_passed = print_block("H2 次要假设 5m（Holm/Bonferroni 0.025）", r["h2"],
                             primary=True, p_thr=0.025)
 
     print("\n== 稳健性格子 W=300s h=900s（不决定主结论，§3 判据 3）==")
-    r2 = evaluate(book_root, days, w_s=W_ROBUST_S, h_s=H_ROBUST_S)
+    r2 = evaluate(book_root, days, w_s=W_ROBUST_S, h_s=H_ROBUST_S,
+                  coin_slots=slots_robust)
     print_block("H1 稳健格子", r2["h1"], primary=False, p_thr=0.05)
     print_block("H2 参考 15m（§7.7.7）", r2["h2"], primary=False, p_thr=0.025)
 
@@ -987,7 +1176,7 @@ def main() -> int:
                                          w_s=W_PRIMARY_S, h_s=H_PRIMARY_S)
             print_trade_factor_report(tfr)
 
-    return 0 if h1_passed else 1
+    return 0 if h1_passed else (3 if r["h1"]["n"] < MIN_TRADES else 1)
 
 
 if __name__ == "__main__":

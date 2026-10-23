@@ -24,6 +24,7 @@ from m1_ofi_eval import (  # noqa: E402
     TAKER_FEE_BP_PER_SIDE,
     _select,
     build_coin_slots,
+    build_coin_slots_dual,
 )
 
 DAY = "2026-10-01"
@@ -158,3 +159,40 @@ def test_cross_day_edge_reset(tmp_path):
     last = recs[-1]
     assert last.n_frames == 30
     assert last.ofi == pytest.approx(15 * 2.0 + 14 * 1.0)
+
+
+def test_dual_matches_reference_bit_for_bit(tmp_path):
+    """双口径单遍建槽必须与逐次调用参考实现逐 SlotRec 相等（浮点逐位）。
+
+    覆盖：多币、跨日、主口径 (60,300) 与稳健格子 (300,900) 同时产出。
+    """
+    day2 = "2026-10-02"
+    for coin, (x, y) in PATTERNS.items():
+        _write(tmp_path, coin, _rows(T0, 2 * H_S, x, y))
+        _write(tmp_path, coin, _rows(T0 + 86400, H_S, x, y), day=day2)
+    days = [DAY, day2]
+    for coin in PATTERNS:
+        s1, s2 = build_coin_slots_dual(tmp_path, days, coin)
+        r1 = build_coin_slots(tmp_path, days, coin, w_s=60, h_s=300)
+        r2 = build_coin_slots(tmp_path, days, coin, w_s=300, h_s=900)
+        assert s1 == r1, f"{coin} primary mismatch"
+        assert s2 == r2, f"{coin} robust mismatch"
+
+
+def test_main_exit_code_3_on_insufficient_sample(tmp_path, monkeypatch,
+                                                 capsys):
+    """n<300 时 main() 返回 3（样本不足），与证伪的 1 区分（§7.7.11）。"""
+    import m1_ofi_eval as M
+    for coin, (x, y) in PATTERNS.items():
+        _write(tmp_path, coin, _rows(T0, 2 * H_S, x, y))
+        _write(tmp_path, coin, _rows(T0 + 86400, H_S, x, y),
+               day="2026-10-02")
+    monkeypatch.setattr(M.time, "strftime",
+                        lambda fmt, t: "2026-10-28")   # 过日期闸
+    monkeypatch.setattr(
+        sys, "argv", ["m1_ofi_eval.py", "--book-root", str(tmp_path),
+                      "--jobs", "1"])
+    rc = M.main()
+    out = capsys.readouterr().out
+    assert rc == 3
+    assert "样本不足" in out
