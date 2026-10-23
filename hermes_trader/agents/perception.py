@@ -258,10 +258,20 @@ def _age_decay_metric(mode: str, outcome: str) -> None:
 
 
 def _weight_shadow_path() -> str:
-    return os.environ.get(
-        "HERMES_WEIGHT_SHADOW_FILE",
-        os.path.expanduser("~/.hermes-trading/weight_shadow.jsonl"),
-    )
+    """Shadow JSONL path: env override > /data (container volume) > dev home.
+
+    The old default was ~/.hermes-trading, which the container mounts
+    READ-ONLY — every emit there failed silently, so a zero-row file proved
+    nothing about the arm. Prefer /data exactly like reconcile_weight_shadow
+    already does (U8), and keep the host path only as a fallback for runs
+    outside the container (where /data does not exist).
+    """
+    env = os.environ.get("HERMES_WEIGHT_SHADOW_FILE")
+    if env:
+        return env
+    if os.path.isdir("/data"):
+        return "/data/weight_shadow.jsonl"
+    return os.path.expanduser("~/.hermes-trading/weight_shadow.jsonl")
 
 
 def _record_weight_shadow(*, coin: str, hits: list, candles: list,
@@ -279,11 +289,10 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
     divergence under the momentum swap"; it must NOT be read as "the weight
     candidates show no disagreement".
 
-    Caveat (2026-10-23): `_weight_shadow_path()` falls back to
-    ~/.hermes-trading, which is a READ-ONLY bind mount inside the container,
-    and production does not set HERMES_WEIGHT_SHADOW_FILE — so an emit cannot
-    currently be persisted at all. Zero rows is expected even on a divergence
-    until that path is pointed at /data.
+    Path (2026-10-23): `_weight_shadow_path()` now defaults to /data, the
+    container volume. The old ~/.hermes-trading default is a READ-ONLY bind
+    mount inside the container, so every emit there failed silently and a
+    zero-row file proved nothing about this arm.
 
     Pure observation; live score/gate unchanged. Only emits on a live-vs-
     candidate decision divergence so the JSONL stays signal-rich.

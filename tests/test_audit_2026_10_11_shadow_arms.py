@@ -212,3 +212,24 @@ def test_weight_shadow_disabled_writes_nothing(monkeypatch, tmp_path):
         live_weights={"x": 1.0}, live_score=10.0, gate=54.0, fired_count=1,
         now_ms=int(time.time() * 1000))
     assert not f.exists()
+
+
+# ── R8 (2026-10-23): writer path must not default to the read-only HOME ──
+
+def test_weight_shadow_path_prefers_data_volume(monkeypatch):
+    """Env override > /data > dev home.
+
+    ~/.hermes-trading is a READ-ONLY bind mount inside the container, so the
+    old default made every emit fail silently (a zero-row file proved
+    nothing). /data is the only writable location there.
+    """
+    monkeypatch.delenv("HERMES_WEIGHT_SHADOW_FILE", raising=False)
+    monkeypatch.setattr(perception.os.path, "isdir", lambda p: p == "/data")
+    assert perception._weight_shadow_path() == "/data/weight_shadow.jsonl"
+
+    monkeypatch.setattr(perception.os.path, "isdir", lambda p: False)
+    assert perception._weight_shadow_path().endswith(
+        "/.hermes-trading/weight_shadow.jsonl")
+
+    monkeypatch.setenv("HERMES_WEIGHT_SHADOW_FILE", "/tmp/w.jsonl")
+    assert perception._weight_shadow_path() == "/tmp/w.jsonl"

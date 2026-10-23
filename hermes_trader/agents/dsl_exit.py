@@ -525,9 +525,14 @@ def _record_stop_confirm_shadow(tracker: "DSLTracker", pol: "ExitPolicy",
         from datetime import datetime, timezone
 
         from hermes_trader.shadow_log import append_jsonl
-        path = os.environ.get(
-            "HERMES_STOP_CONFIRM_SHADOW_FILE",
-            os.path.expanduser("~/.hermes-trading/stop_confirm_shadow.jsonl"))
+        # Env override > /data (container volume) > dev home. The old default
+        # was ~/.hermes-trading, a READ-ONLY bind mount inside the container,
+        # so the append raised and was swallowed — the arm could never record.
+        path = os.environ.get("HERMES_STOP_CONFIRM_SHADOW_FILE")
+        if not path:
+            path = ("/data/stop_confirm_shadow.jsonl" if os.path.isdir("/data")
+                    else os.path.expanduser(
+                        "~/.hermes-trading/stop_confirm_shadow.jsonl"))
         append_jsonl(path, {
             "timestamp": datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ"),
