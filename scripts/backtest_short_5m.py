@@ -6,14 +6,14 @@ runs on 5m bars (scan.candleInterval="5m", candleCount=100), so the intraday
 volume/momentum edge the desk trades is INVISIBLE on 1h aggregates. This
 script replays the EXACT production trigger stack on closed 5m bars:
 
-  - the 12 triggers from hermes_trader.indicators.triggers, called with the
-    live thresholds (trigger_thresholds_params) and weighted with the live
-    camelCase weights (trigger_weights_params) — same dicts perception injects
-  - squeeze-breakout coupling (perception._apply_squeeze_breakout_coupling)
-  - candlestick reversal patterns (live: enabled)
+  - the trigger stack assembled by hermes_trader.indicators.triggers.build_hits
+    (the same orchestration live perception runs) with the live thresholds
+    (trigger_thresholds_params) and camelCase weights
+    (trigger_weights_params) — same dicts perception injects; squeeze-breakout
+    coupling, candlestick reversals and the dailyMover terminal hit included
   - surfacing rule: score >= minCompositeScore (54) OR momentumBurst OR
     trend bypass (downtrendMomentum fired AND own-1h regime != "chop",
-    classified with market_regime.classify_candles on the last 48 closed 1h
+    classified with market_regime.classify_candles on the last 100 closed 1h
     bars — the same window the scan fetches) OR bearishReversalCandle
   - SHORT direction proxy (the LLM verdict is not replayable): a candidate
     needs bearish directional evidence = downtrendMomentum fired OR
@@ -94,7 +94,8 @@ from hermes_trader.models.types import Candle
 
 SCAN_SCORES = (20.0, 25.0, 30.0, 40.0)  # variant-E min_short_composite sweep
 W4_WINDOW = 60     # trailing 4h suffix fed to late_entry_check
-H1_WINDOW = 48     # production scan fetches 48 1h bars (slow-burn + chop)
+H1_WINDOW = 100    # production scan fetches 100 1h bars (B5: slow-burn + chop)
+H15_WINDOW = 100   # production scan fetches 100 15m bars (rangeCompression)
 CHUNK_MS = 60 * 86_400_000   # fetch_candle_range caps at 20k bars/request
 
 # --- Binance spot klines (data-api.binance.vision) -------------------------
@@ -247,26 +248,13 @@ def _macro_regime_series(closes: List[float], fast_p: int, slow_p: int,
     return out
 
 
-def _squeeze_coupling(hits: List[Dict[str, Any]]) -> None:
-    """perception._apply_squeeze_breakout_coupling, copied verbatim."""
-    squeeze_fired = any(
-        (h.get("name") == "rangeCompression") and h.get("fired") for h in hits
-    )
-    if not squeeze_fired:
-        return
-    for h in hits:
-        if h.get("name") == "breakout" and h.get("fired"):
-            h["score"] = min(10.0, float(h.get("score", 0)) + 2.0)
-            reason = h.get("reason") or ""
-            if "[squeeze-resolved]" not in reason:
-                h["reason"] = f"{reason} [squeeze-resolved]".strip()
-
-
 def _scan_candidates(coin: str, candles: List[Candle],
-                     candles_1h: List[Candle], candles_4h: List[Candle],
+                     candles_1h: List[Candle], candles_15m: List[Candle],
+                     candles_4h: List[Candle],
                      macro_close_ts: List[int], macro_regime: List[str],
                      weights: Dict[str, float], thresholds: Dict[str, Any],
-                     cp: Dict[str, Any], min_score: float, candle_count: int,
+                     cp: Dict[str, Any], mc: Dict[str, Any],
+                     min_score: float, candle_count: int,
                      trend_surface_enabled: bool,
                      le_params: Dict[str, Any], i0: int, sim_ms: int,
                      tm_lookback: int, tm_pct: float,
@@ -279,6 +267,7 @@ def _scan_candidates(coin: str, candles: List[Candle],
     mirror does not veto. Records per-variant filter inputs."""
     closes = [c.c for c in candles]
     t1 = [c.t + 3_600_000 for c in candles_1h]   # 1h close times
+    t15 = [c.t + 900_000 for c in candles_15m]   # 15m close times
     t4 = [c.t for c in candles_4h]
     closes4 = [c.c for c in candles_4h]
     ema8_4 = ind.ema(closes4, 8) if len(closes4) >= 8 else []
@@ -313,49 +302,30 @@ def _scan_candidates(coin: str, candles: List[Candle],
         bar = candles[i]
         decision_ms = bar.t + sim_ms
         window = candles[i + 1 - candle_count: i + 1]
-        # Last H1_WINDOW 1h bars closed by the decision instant.
+        # Last H1_WINDOW 1h bars / H15_WINDOW 15m bars closed by the decision
+        # instant (production fetches 100 of each).
         j1 = bisect.bisect_right(t1, decision_ms)
         c1h = candles_1h[max(0, j1 - H1_WINDOW): j1]
+        j15 = bisect.bisect_right(t15, decision_ms)
+        c15m = candles_15m[max(0, j15 - H15_WINDOW): j15]
 
         th = thresholds
-        hits = [
-            trig.pct_move_spike(window, th["sigmaThreshold"]),
-            trig.volume_spike(window, th["sigmaThreshold"]),
-            trig.breakout(
-                window,
-                th["breakoutLookback"],
-                min_rvol=th.get("breakoutMinRvol", 1.5),
-                rvol_window=th.get("breakoutRvolWindow", 20),
-                atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
-                confirm_bars=th.get("breakoutConfirmBars", 2),
-            ),
-            trig.range_compression(window, th["bbLength"], th["bbStdDev"]),
-            trig.trend_strength(window, th["adxPeriod"]),
-            trig.momentum_burst(window, th["momentumLookback"], th["momentumPct"]),
-            trig.volume_buildup_1h(c1h, th.get("volBuildupRatio", 2.5)),
-            trig.trend_flip_1h(c1h, th.get("trendFlipBars", 3)),
-            trig.higher_lows_1h(c1h, th.get("higherLowsRequired", 4)),
-            trig.uptrend_momentum(window, th.get("trendMomentumLookback", 72),
-                                  th.get("trendMomentumPct", 5.0)),
-            trig.downtrend_momentum(window, th.get("trendMomentumLookback", 72),
-                                    th.get("trendMomentumPct", 5.0)),
-        ]
-        _squeeze_coupling(hits)
-        # momentum_continuation disabled in live config -> not appended.
-        if cp.get("enabled"):
-            _wbr = cp.get("wick_body_ratio", 2.0)
-            _ctx_lb = int(cp.get("context_lookback", 6))
-            _ctx_pct = float(cp.get("context_pct", 1.5))
-            hits.append(trig.bearish_reversal_candle(window, _wbr, _ctx_lb, _ctx_pct))
-            hits.append(trig.bullish_reversal_candle(window, _wbr, _ctx_lb, _ctx_pct))
-        # runner_mover_surface disabled in live config -> dailyMover never fires.
-        hits.append({"name": "dailyMover", "score": 0,
-                     "reason": "disabled in live config", "fired": False})
+        # T3 (2026-10-23): single source of truth — the same orchestration the
+        # live scanner runs (perception._scan_single_market -> build_hits), so
+        # squeeze coupling / candlesticks / the dailyMover terminal hit can no
+        # longer drift from live.
+        hits, score_weights = trig.build_hits(
+            window, th, weights,
+            candles_1h=c1h,
+            candles_15m=c15m,
+            momentum_continuation=mc,
+            candlestick_patterns=cp,
+        )
 
         if not any(h["fired"] for h in hits):
             continue
         stats["fired"] += 1
-        score = trig.composite_score(hits, weights)
+        score = trig.composite_score(hits, score_weights)
 
         burst_fired = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
         dt_fired = any(h["name"] == "downtrendMomentum" and h["fired"] for h in hits)
@@ -579,6 +549,7 @@ def main() -> int:
     weights = trigger_weights_params(config=live)
     thresholds = trigger_thresholds_params(config=live)
     cp = live.get("candlestick_patterns") or {}
+    mc = live.get("momentum_continuation") or {}
     trend_surface_enabled = bool(live.get("trend_surface_enabled", True))
 
     tm_lookback = int(thresholds.get("trendMomentumLookback", 72))
@@ -596,6 +567,7 @@ def main() -> int:
     warmup_bars = candle_count + tm_lookback + 10
     fetch_start = window_start - warmup_bars * sim_ms
     need_1h_start = window_start - (H1_WINDOW + 30) * 3_600_000
+    need_15m_start = window_start - (H15_WINDOW + 30) * 900_000
     need_4h_start = window_start - (W4_WINDOW + 30) * bt._MS_PER["4h"]
 
     hc.set_cache_file(args.cache_file)
@@ -677,6 +649,7 @@ def main() -> int:
                 print(f"  {coin}: only {len(candles)} bars — skipped")
                 continue
             candles_1h = fetch(coin, "1h", need_1h_start, last_closed_open)
+            candles_15m = fetch(coin, "15m", need_15m_start, last_closed_open)
             candles_4h = fetch(coin, "4h", need_4h_start, last_closed_open)
         except Exception as e:
             print(f"  {coin}: fetch failed: {e} — skipped")
@@ -686,10 +659,11 @@ def main() -> int:
         i0 = max(bisect.bisect_left(ts, window_start), candle_count,
                  tm_lookback + 1)
         cands, stats = _scan_candidates(
-            coin, candles, candles_1h, candles_4h, macro_close_ts, macro_regime,
-            weights, thresholds, cp, min_score, candle_count,
-            trend_surface_enabled, le_params, i0, sim_ms,
-            tm_lookback, tm_pct, mom_lookback, mom_pct, ctx_lookback, ctx_pct)
+            coin, candles, candles_1h, candles_15m, candles_4h,
+            macro_close_ts, macro_regime, weights, thresholds, cp, mc,
+            min_score, candle_count, trend_surface_enabled, le_params, i0,
+            sim_ms, tm_lookback, tm_pct, mom_lookback, mom_pct,
+            ctx_lookback, ctx_pct)
         for k in total_stats:
             total_stats[k] += stats[k]
         for label in variant_labels:

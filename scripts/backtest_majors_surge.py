@@ -80,7 +80,6 @@ from hermes_trader.agents.config import (
 )
 from hermes_trader.agents.market_regime import classify_candles
 from hermes_trader.agents.perception import (
-    _apply_squeeze_breakout_coupling,
     _sigma_burst_decision,
     extract_fired_triggers,
 )
@@ -97,6 +96,7 @@ from hermes_trader.models.types import Candle
 MAJORS = ["BTC", "ETH", "SOL", "BNB", "XRP", "DOGE", "ADA", "AVAX"]
 
 MS_5M = 5 * 60_000
+MS_15M = 15 * 60_000
 MS_1H = 60 * 60_000
 MS_4H = 4 * 3_600_000
 MS_DAY = 24 * 3_600_000
@@ -169,6 +169,7 @@ def _resolve_params(cfg: Dict[str, Any]) -> Dict[str, Any]:
         "min_score": float(scan.get("minCompositeScore", 54)),
         "sigma_burst": dict(cfg.get("sigma_burst_gate") or {}),
         "candlestick": dict(cfg.get("candlestick_patterns") or {}),
+        "momentum_continuation": dict(cfg.get("momentum_continuation") or {}),
         "ta_late_entry": ta_le,
         "breakout_exemption": dict(ta_le.get("breakout_exemption") or {}),
         "trend_surface_enabled": bool(cfg.get("trend_surface_enabled", True)),
@@ -275,52 +276,29 @@ class Candidate:
 
 
 def _eval_bar(coin: str, window5m: List[Candle], c1h: List[Candle],
-              c4h: List[Candle], P: Dict[str, Any],
+              c15m: List[Candle], c4h: List[Candle], P: Dict[str, Any],
               funnel: Dict[str, int]) -> List[Candidate]:
     """单 bar 信号评估。返回各臂候选（0 或多个）。复刻 perception
     :539-568 触发器列表/:573 squeeze 耦合/:723-805 旁路丢弃链 +
     analyze_perception :782-793 方向推断 + late_entry/#7 流程。"""
     th = P["thresholds"]
-    hits = [
-        trig.pct_move_spike(window5m, th["sigmaThreshold"]),
-        trig.volume_spike(window5m, th["sigmaThreshold"]),
-        trig.breakout(
-            window5m,
-            th["breakoutLookback"],
-            min_rvol=th.get("breakoutMinRvol", 1.5),
-            rvol_window=th.get("breakoutRvolWindow", 20),
-            atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
-            confirm_bars=th.get("breakoutConfirmBars", 2),
-        ),
-        trig.range_compression(window5m, th["bbLength"], th["bbStdDev"]),
-        trig.trend_strength(window5m, th["adxPeriod"]),
-        trig.momentum_burst(window5m, th["momentumLookback"], th["momentumPct"]),
-        trig.volume_buildup_1h(c1h, th.get("volBuildupRatio", 2.5)),
-        trig.trend_flip_1h(c1h, th.get("trendFlipBars", 3)),
-        trig.higher_lows_1h(c1h, th.get("higherLowsRequired", 4)),
-        trig.uptrend_momentum(window5m, th.get("trendMomentumLookback", 72),
-                              th.get("trendMomentumPct", 5.0)),
-        trig.downtrend_momentum(window5m, th.get("trendMomentumLookback", 72),
-                                th.get("trendMomentumPct", 5.0)),
-    ]
-    _apply_squeeze_breakout_coupling(hits)
-    # momentum_continuation：live off → 不 append（权重也不入分母）。
     cp = P["candlestick"]
-    if cp.get("enabled"):
-        hits.append(trig.bearish_reversal_candle(
-            window5m, cp.get("wick_body_ratio", 2.0),
-            int(cp.get("context_lookback", 6)), cp.get("context_pct", 1.5)))
-        hits.append(trig.bullish_reversal_candle(
-            window5m, cp.get("wick_body_ratio", 2.0),
-            int(cp.get("context_lookback", 6)), cp.get("context_pct", 1.5)))
-    # dailyMover：runner_mover_surface live off → 恒不 fire，跳过。
+    # T3 (2026-10-23): 单一真源 —— 与 live perception 同一编排
+    # (build_hits 内含 squeeze 耦合 / candlestick / dailyMover 终止命中)。
+    hits, score_weights = trig.build_hits(
+        window5m, th, P["weights"],
+        candles_1h=c1h,
+        candles_15m=c15m,
+        momentum_continuation=P["momentum_continuation"],
+        candlestick_patterns=cp,
+    )
 
     fired_count = sum(1 for h in hits if h.get("fired"))
     if fired_count < 1:  # perception :723-725（age-decay 键不存在时的路径）
         return []
     funnel["fired_ge_1"] += 1
 
-    score = trig.composite_score(hits, P["weights"])
+    score = trig.composite_score(hits, score_weights)
     min_score = P["min_score"]
 
     # ── 旁路链（:729-771；whale/dailyMover live off → 恒 False）──
@@ -704,13 +682,15 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
     fetch = _fetch_binance_chunked if source == "binance" else _fetch_chunked
     try:
         bars = fetch(coin, "5m", start_ms - 120 * MS_5M, end_ms, MS_5M)
-        c1h_all = fetch(coin, "1h", start_ms - 60 * MS_1H, end_ms, MS_1H)
+        c1h_all = fetch(coin, "1h", start_ms - 130 * MS_1H, end_ms, MS_1H)
+        c15m_all = fetch(coin, "15m", start_ms - 130 * MS_15M, end_ms, MS_15M)
         c4h_all = fetch(coin, "4h", start_ms - 110 * MS_4H, end_ms, MS_4H)
     except Exception as e:
         print(f"  [fetch-error] {coin}: {e}")
         funnel["fetch_error"] += 1
         return trades, funnel
     ts_1h = [c.t for c in c1h_all]
+    ts_15m = [c.t for c in c15m_all]
     ts_4h = [c.t for c in c4h_all]
     if len(bars) < 60:
         print(f"  [skip] {coin}: 5m 数据不足（{len(bars)} 根）")
@@ -730,9 +710,11 @@ def replay_coin(coin: str, start_ms: int, end_ms: int, P: Dict[str, Any],
             continue
         funnel["bars"] += 1
         decision_ms = bars[i].t + MS_5M
-        c1h = _closed_prefix(c1h_all, ts_1h, decision_ms, MS_1H, 48)
+        # production scan fetches 100 bars of each higher TF (B5).
+        c1h = _closed_prefix(c1h_all, ts_1h, decision_ms, MS_1H, 100)
+        c15m = _closed_prefix(c15m_all, ts_15m, decision_ms, MS_15M, 100)
         c4h = _closed_prefix(c4h_all, ts_4h, decision_ms, MS_4H, 100)
-        for cand in _eval_bar(coin, window, c1h, c4h, P, funnel):
+        for cand in _eval_bar(coin, window, c1h, c15m, c4h, P, funnel):
             cand.bar_idx = i
             per_arm[cand.arm].append((i, cand))
             if cand.arm == "baseline":
