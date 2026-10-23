@@ -159,16 +159,21 @@ def _prune_sorted(history, sorted_vals: list[float], cutoff: int) -> None:
             del sorted_vals[i]
 
 
-def build_coin_slots(book_root: Path, days: list[str], coin: str, *,
-                     w_s: int, h_s: int) -> list[SlotRec]:
+def _reference_build_coin_slots(book_root: Path, days: list[str], coin: str, *,
+                                 w_s: int, h_s: int) -> list[SlotRec]:
     """逐币流式构建每个 h 槽的固定特征（逐日逐行解压处理）。
 
     §7.2：所有分位/z/历史统计只用**严格早于当前槽**的数据。
     跨日重置 prev_snap（不拼跨日相邻帧增量），槽号 slot=t//h_s 跨日连续。
 
+    此函数保留为 **reference 实现**：
+      - 主路径用 build_coin_slots_dual（单遍双口径），性能高 2.4×
+      - evaluate 的 coin_slots=None 回退路径也已改调 _dual_one 的产物
+      - 本实现仅供 ``test_dual_matches_reference_bit_for_bit`` 做逐位
+        比对测试（保证 dual 与 reference 永久等价）。
+
     内存说明：单日原始行经 load_coin_day 整日驻留（约 86k dict/活跃币日），
-    帧级 ring 仅保留 w_s+h_s 秒；输出为每槽一条 SlotRec。全量提速见
-    build_coin_slots_dual（两套口径共享一趟帧循环，输出逐位一致）。
+    帧级 ring 仅保留 w_s+h_s 秒；输出为每槽一条 SlotRec。
     """
     from collections import deque
 
@@ -287,7 +292,7 @@ def build_coin_slots(book_root: Path, days: list[str], coin: str, *,
     return out
 
 
-# ── 双口径单遍建槽（性能版；与 build_coin_slots 逐位等价）────────────────────
+# ── 双口径单遍建槽（主路径；逐 SlotRec 等价于 _reference_build_coin_slots）─
 #
 # 性能事实（2026-10-23 cProfile，BTC 单日 86,092 帧）：
 #   _to_levels 6.2s（每帧最多 6 次重复解析同一快照）+ json 4.1s + _best_ba 2.8s。
@@ -312,7 +317,7 @@ def _new_slot_state() -> dict:
 
 
 def _flush_state(st: dict, slot: int, frame, w_s: int, ring) -> None:
-    """与 build_coin_slots 内嵌 flush 逐行一致，仅把闭包状态换成 dict。"""
+    """与 _reference_build_coin_slots 内嵌 flush 逐行一致，仅把闭包状态换成 dict。"""
     if frame is None:
         return
     t, bid, ask, mid_px, snap = frame
@@ -375,7 +380,7 @@ def _flush_state(st: dict, slot: int, frame, w_s: int, ring) -> None:
 def build_coin_slots_dual(book_root: Path, days: list[str], coin: str,
                           configs=_DUAL_CONFIGS) -> list[list[SlotRec]]:
     """一趟帧循环产出多套 (w_s, h_s) 口径的槽序列，与逐次调用
-    build_coin_slots 的输出逐 SlotRec 相等（单测锁定）。"""
+    输出逐 SlotRec 与 _reference_build_coin_slots 相等（单测锁定）。"""
     from collections import deque
 
     max_span = max(w_s + h_s for w_s, h_s in configs)
@@ -432,6 +437,58 @@ def build_coin_slots_dual(book_root: Path, days: list[str], coin: str,
         if st["cur_frame"] is not None:
             _flush_state(st, st["cur_slot"], st["cur_frame"], w_s, ring)
     return [st["out"] for st in states]
+
+
+def _default_jobs() -> int:
+    """Cgroup-aware default parallelism for ProcessPoolExecutor.
+
+    A process holds the full ``rows`` list (≈170 MiB per coin-day on the
+    26-day span); defaulting to ``os.cpu_count()`` breaks inside containers
+    where the host exposes 12+ cores but cgroup caps RAM at 1 GiB (verified
+    on hermes-trader: 2 workers ≈ 697 MiB peak, 4 workers OOM). Cap workers by
+    both the cgroup CPU quota and available memory, floor 1, ceiling 8.
+
+    cgroup v2 (``/sys/fs/cgroup/``) exposes ``cpu.max`` as ``quota period``
+    (``max`` = unlimited) and ``memory.max`` (``max`` = unlimited).
+    """
+    cpu = len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") \
+        else (os.cpu_count() or 1)
+    # cgroup v2 CPU quota
+    try:
+        raw = open("/sys/fs/cgroup/cpu.max").read().strip()
+        if raw != "max":
+            q_str, p_str = raw.split()
+            q, p = int(q_str), int(p_str)
+            if q > 0 and p > 0:
+                cpu = min(cpu, max(1, q // p))
+    except Exception:
+        pass
+    # Memory cap (cgroup v2 first, v1 fallback)
+    mem: Optional[int] = None
+    for p in ("/sys/fs/cgroup/memory.max",
+              "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
+        try:
+            v = open(p).read().strip()
+            if v != "max":
+                mem = int(v)
+                break
+        except Exception:
+            continue
+    if mem is None:
+        try:
+            with open("/proc/meminfo") as f:
+                for line in f:
+                    if line.startswith("MemTotal:"):
+                        mem = int(line.split()[1]) * 1024
+                        break
+        except Exception:
+            pass
+    # Each worker holds the full day × N-coins rows + slots + overhead →
+    # budget one worker per 300 MiB of memory, floor 1 so a tiny container
+    # still does useful work rather than collapsing to 1.
+    if mem:
+        cpu = min(cpu, max(1, mem // (300 * 1024 * 1024)))
+    return max(1, min(8, cpu))
 
 
 def _dual_one(arg) -> tuple[str, list[list[SlotRec]]]:
@@ -625,6 +682,9 @@ def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int,
     coin_slots 为 None 时自行逐币建槽（每币仅保留每槽标量记录，处理完即
     释放 1s 帧与原始行）；调用方也可注入 build_coin_slots_dual 的产物，
     以便两套口径共享同一趟帧循环（输出与分别建槽逐位一致）。
+
+    主路径统一用 build_coin_slots_dual（U11 收敛：不再暴露旧单口径实现，
+    旧实现改名 _reference_build_coin_slots 仅供比对测试）。
     """
     import calendar
     half = len(days) // 2
@@ -635,7 +695,10 @@ def evaluate(book_root: Path, days: list[str], *, w_s: int, h_s: int,
         all_coins: set[str] = set()
         for dd in days:
             all_coins |= coins_present(book_root, dd)
-        coin_slots = {c: build_coin_slots(book_root, days, c, w_s=w_s, h_s=h_s)
+        # Dual slots are (primary, hist) = (w=60,h=300) + (w=300,h=900).
+        # evaluate 只消费 primary for its w_s/h_s args; callers in main()
+        # always pass pre-built dual slots so both slots share one scan pass.
+        coin_slots = {c: build_coin_slots_dual(book_root, days, c)[0]
                       for c in sorted(all_coins)}
     out: dict[str, dict] = {}
     for name, kind in (("h1", "h1"), ("h1_hist", "h1_hist"), ("h2", "h2")):
@@ -1096,8 +1159,10 @@ def main() -> int:
                     help="追加多因子分层 IC 探索报告（不参与 H1 主判定）")
     ap.add_argument("--trade-factor-ic", action="store_true",
                     help="追加基于 trades-raw 的成交流因子 IC（探索性）")
-    ap.add_argument("--jobs", type=int, default=min(8, os.cpu_count() or 1),
-                    help="建槽并行进程数（按币分片；1=串行，输出不变）")
+    ap.add_argument("--jobs", type=int, default=_default_jobs(),
+                    help="建槽并行进程数（按币分片；1=串行，输出不变。"
+                         "容器默认按 cgroup CPU+内存预算：1GiB/2核 → 2，"
+                         "8GiB/8核 → 8）")
     args = ap.parse_args()
 
     today = time.strftime("%Y-%m-%d", time.gmtime())

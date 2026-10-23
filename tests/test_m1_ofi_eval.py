@@ -22,8 +22,9 @@ sys.path.insert(0, str(_REPO / "scripts"))
 
 from m1_ofi_eval import (  # noqa: E402
     TAKER_FEE_BP_PER_SIDE,
+    _default_jobs,
     _select,
-    build_coin_slots,
+    _reference_build_coin_slots,
     build_coin_slots_dual,
 )
 
@@ -57,7 +58,7 @@ def _write(root: Path, coin: str, rows: list[dict], day: str = DAY) -> None:
 
 def _coin_slots(root: Path, coins: dict[str, tuple[float, float]],
                 days: list[str] | None = None) -> dict:
-    return {c: build_coin_slots(root, days or [DAY], c, w_s=W_S, h_s=H_S)
+    return {c: _reference_build_coin_slots(root, days or [DAY], c, w_s=W_S, h_s=H_S)
             for c in coins}
 
 
@@ -86,15 +87,15 @@ def test_guard_std_zero_and_short_window(tmp_path):
     """std_within=0（挂量不变）与 n_frames<10 都不得产生有效 z。"""
     _write(tmp_path, "FLAT", _rows(T0, 2 * H_S, 0.0, 0.0))
     _write(tmp_path, "SHORT", _rows(T0, 5, 2.0, 1.0))
-    flat = build_coin_slots(tmp_path, [DAY], "FLAT", w_s=W_S, h_s=H_S)
-    short = build_coin_slots(tmp_path, [DAY], "SHORT", w_s=W_S, h_s=H_S)
+    flat = _reference_build_coin_slots(tmp_path, [DAY], "FLAT", w_s=W_S, h_s=H_S)
+    short = _reference_build_coin_slots(tmp_path, [DAY], "SHORT", w_s=W_S, h_s=H_S)
     assert flat and all(r.std_within == 0.0 and r.z_main is None for r in flat)
     assert short and short[0].n_frames < 10 and short[0].z_main is None
 
 
 def test_z_is_within_window_sample_std(ten_coins):
     """z = Σe / stdev(e in window, ddof=1)，且与挂量绝对尺度无关。"""
-    recs = build_coin_slots(ten_coins, [DAY], "c9", w_s=W_S, h_s=H_S)
+    recs = _reference_build_coin_slots(ten_coins, [DAY], "c9", w_s=W_S, h_s=H_S)
     rec = recs[0]
     # 窗口 [t-w_s, t] 闭区间 → 61 帧；末帧 t 为奇数序号 → 多一个 21
     window = [21.0] * 31 + [20.0] * 30
@@ -154,7 +155,7 @@ def test_cross_day_edge_reset(tmp_path):
     day2 = "2026-10-02"
     _write(tmp_path, "C", _rows(T0, 1, 2.0, 1.0), day=day1)
     _write(tmp_path, "C", _rows(T0 + 86400, 30, 2.0, 1.0), day=day2)
-    recs = build_coin_slots(tmp_path, [day1, day2], "C", w_s=W_S, h_s=H_S)
+    recs = _reference_build_coin_slots(tmp_path, [day1, day2], "C", w_s=W_S, h_s=H_S)
     # 第二日只有 30 帧，全部落在窗口内
     last = recs[-1]
     assert last.n_frames == 30
@@ -173,8 +174,8 @@ def test_dual_matches_reference_bit_for_bit(tmp_path):
     days = [DAY, day2]
     for coin in PATTERNS:
         s1, s2 = build_coin_slots_dual(tmp_path, days, coin)
-        r1 = build_coin_slots(tmp_path, days, coin, w_s=60, h_s=300)
-        r2 = build_coin_slots(tmp_path, days, coin, w_s=300, h_s=900)
+        r1 = _reference_build_coin_slots(tmp_path, days, coin, w_s=60, h_s=300)
+        r2 = _reference_build_coin_slots(tmp_path, days, coin, w_s=300, h_s=900)
         assert s1 == r1, f"{coin} primary mismatch"
         assert s2 == r2, f"{coin} robust mismatch"
 
@@ -196,3 +197,61 @@ def test_main_exit_code_3_on_insufficient_sample(tmp_path, monkeypatch,
     out = capsys.readouterr().out
     assert rc == 3
     assert "样本不足" in out
+
+
+# ── U2 收敛：cgroup-aware 默认并行度 ──────────────────────────────────────
+
+class _FakeFile:
+    def __init__(self, content: str): self._content = content
+    def __enter__(self): return self
+    def __exit__(self, *a): pass
+    def read(self) -> str: return self._content
+
+
+def _fake_open(fake_files: dict[str, str]):
+    def _open(path, *a, **kw):
+        if path in fake_files:
+            return _FakeFile(fake_files[path])
+        raise FileNotFoundError(path)
+    return _open
+
+
+def test_default_jobs_respects_cgroup_quota(monkeypatch):
+    """cgroup CPU 配额为 min(2/2=1) 个配额核 + 内存 1GiB → cap 到 2
+    （每 worker 300MiB 预算），floor 1，ceiling 8。"""
+    import os, m1_ofi_eval as M
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: list(range(12)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 12)
+    monkeypatch.setattr("builtins.open", _fake_open({
+        "/sys/fs/cgroup/cpu.max":   "2000000 1000000",  # 2/1 = 2 核
+        "/sys/fs/cgroup/memory.max": str(1 * 1024 ** 3),
+    }))
+    # 1GiB / 300MiB = 3; min(3, 2) = 2
+    assert _default_jobs() == 2
+
+
+def test_default_jobs_unlimited_cpu_caps_by_memory(monkeypatch):
+    """cpu.max=max → 核数不约束；内存 512MiB → 512//300=1 worker。"""
+    import os
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: list(range(16)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 16)
+    monkeypatch.setattr("builtins.open", _fake_open({
+        "/sys/fs/cgroup/cpu.max":   "max",
+        "/sys/fs/cgroup/memory.max": str(512 * 1024 ** 2),
+    }))
+    assert _default_jobs() == 1  # 512MiB / 300MiB floor 1
+
+
+def test_default_jobs_ceiling_8_on_host(monkeypatch):
+    """宿主机无 cgroup v2 → 回退 /proc/meminfo MemTotal；15GiB 足够 50+
+    workers，ceiling 8 生效。"""
+    import os
+    monkeypatch.setattr(os, "sched_getaffinity",
+                        lambda pid: list(range(32)), raising=False)
+    monkeypatch.setattr(os, "cpu_count", lambda: 32)
+    monkeypatch.setattr("builtins.open", _fake_open({
+        "/proc/meminfo": "MemTotal: 15728640 kB\n",
+    }))
+    assert _default_jobs() == 8
