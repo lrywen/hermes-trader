@@ -130,7 +130,8 @@ def _scan_candidates(coin: str, candles: List[Candle],
                      macro_ts: List[int], macro_regime: List[str],
                      th: Dict[str, Any], weights: Dict[str, float],
                      le_params: Dict[str, Any],
-                     warmup: int, sim_ms: int) -> tuple:
+                     warmup: int, sim_ms: int,
+                     candles_1h: Optional[List[Candle]] = None) -> tuple:
     """Pass 1 (run ONCE per coin): every bar where the BASE short signal fires
     — bearish heuristic verdict + ta_confirmed proxy + live ta_late short
     hard gate. Records the per-variant filter inputs so variants can replay
@@ -139,11 +140,17 @@ def _scan_candidates(coin: str, candles: List[Candle],
     closes4 = [c.c for c in candles_4h] if candles_4h else []
     ema8_4 = ind.ema(closes4, 8) if len(closes4) >= 8 else []
     ema21_4 = ind.ema(closes4, 21) if len(closes4) >= 21 else []
+    t1h = [c.t for c in candles_1h] if candles_1h else []
     cands: List[Dict[str, Any]] = []
     stats = {"bearish": 0, "signal": 0, "ta_conf": 0, "late_veto": 0}
     for i in range(warmup, len(candles) - 1):
         window = candles[: i + 1]
-        score, hits = ksig.evaluate_window(window, th, weights)
+        decision_ms = candles[i].t + sim_ms
+        # P0-1: trendStrength scores on 1h in live; feed only the 1h bars that
+        # have CLOSED by the decision instant (same rule as the 4h slice below).
+        w1h = (_closed_slice(candles_1h, t1h, decision_ms, _MS_PER["1h"])
+               if candles_1h else None)
+        score, hits = ksig.evaluate_window(window, th, weights, candles_1h=w1h)
         bullish, atr_pct, adx14 = ksig.trend_and_atr_pct(window)
         if bullish is None or bullish:
             continue  # shorts only; None = insufficient data
@@ -156,7 +163,6 @@ def _scan_candidates(coin: str, candles: List[Candle],
         if not ksig.ta_confirmed(bullish, atr_pct, adx14, score) and not burst:
             continue
         stats["ta_conf"] += 1
-        decision_ms = candles[i].t + sim_ms
         # Live ta_late_entry hard gate (short mirror), closed 4h bars only.
         if le_params and candles_4h:
             w4 = _closed_slice(candles_4h, t4, decision_ms, _MS_PER["4h"])
@@ -411,13 +417,18 @@ def main() -> int:
                 print(f"  {coin}: only {len(candles)} bars — skipped")
                 continue
             candles_4h = fetch_hl_candles(coin, "4h", need_4h)
+            # P0-1 (2026-10-23): trendStrength scores on 1h in live; feeding
+            # only the base window left it permanently flat. 1h is the base
+            # interval by default, so reuse it instead of a second request.
+            candles_1h = candles if interval == "1h" else fetch_hl_candles(
+                coin, "1h", 2000)
         except Exception as e:
             print(f"  {coin}: fetch failed: {e} — skipped")
             continue
         candles_by_coin[coin] = candles
         cands, cstats = _scan_candidates(
             coin, candles, candles_4h, macro_ts, macro_regime, th, weights,
-            le_params, warmup=100, sim_ms=sim_ms)
+            le_params, warmup=100, sim_ms=sim_ms, candles_1h=candles_1h)
         for k in total_stats:
             total_stats[k] += cstats[k]
 

@@ -117,7 +117,12 @@ def main() -> int:
         base_cfg = ksig.default_heuristic_config(warmup=100)
         for label, spec in CONFIGS.items():
             cfg = replace(base_cfg, **spec["sig"])
-            sigs = ksig.heuristic_signals(candles, cfg, bar_ms=3_600_000)
+            # P0-1 (2026-10-23): the sweep's decision feed IS the 1h series, so
+            # trendStrength must score on it (live scores ADX/EMA on 1h);
+            # without this it stayed permanently flat and every variant was
+            # ranked on a trigger set the live scanner never has.
+            sigs = ksig.heuristic_signals(
+                candles, cfg, bar_ms=3_600_000, candles_1h=candles)
             if spec["long_only"]:
                 sigs = [s for s in sigs if s.side == "long"]
             coin_policy = replace(policy, **spec["pol"])

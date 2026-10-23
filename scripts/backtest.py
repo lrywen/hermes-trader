@@ -440,16 +440,21 @@ def main() -> int:
                     return need_4h
                 if period == "15m":
                     return need_15m
+                if period == "1h":
+                    return 2000        # 1h bars for trendStrength (ADX/EMA)
                 return 5000
 
-            for period in ("4h", "15m", "5m"):
+            for period in ("4h", "15m", "5m", "1h"):
                 if period == args.interval:
                     continue
                 # Only fetch what a consumer can use: the gate needs 4h/15m;
-                # ignition needs the policy's ignite_periods. Skip others.
+                # ignition needs the policy's ignite_periods; the heuristic
+                # signal scan always needs 1h (trendStrength scores on 1h in
+                # live, so a 5m-only backtest would leave it permanently flat).
                 used_by_gate = bool(late_entry_params) and period in ("4h", "15m")
                 used_by_ign = period in base_policy.ignite_periods
-                if not (used_by_gate or used_by_ign):
+                used_by_scan = period == "1h"
+                if not (used_by_gate or used_by_ign or used_by_scan):
                     continue
                 try:
                     series[period] = fetch_hl_candles(coin, period, _need(period))
@@ -458,6 +463,10 @@ def main() -> int:
                     print(f"  {coin:8} {period} unavailable ({e}); consumers skip that layer")
             candles_4h = series.get("4h") if late_entry_params else None
             candles_15m = series.get("15m") if late_entry_params else None
+            # P0-1: when the scan runs on 1h bars themselves, the decision feed
+            # IS the 1h series — no second fetch, no look-ahead (the slice
+            # logic still trims to closed candles).
+            candles_1h = candles if args.interval == "1h" else series.get("1h")
             # H-7: per-coin realized adverse exit slip (when enabled and the
             # coin has enough live closes), else the CLI/default value.
             coin_exit_slip = exit_slip_bps
@@ -496,6 +505,7 @@ def main() -> int:
             signals = ksig.heuristic_signals(
                 candles, ksig.default_heuristic_config(warmup=100),
                 context_fn=_ctx, bar_ms=sim_ms,
+                candles_1h=candles_1h,
             )
 
             # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live
