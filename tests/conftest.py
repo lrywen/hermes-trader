@@ -80,6 +80,11 @@ for _arm_env, _arm_file in (
     ("HERMES_REENTRY_CAP_SHADOW_FILE", "reentry_cap_shadow.jsonl"),
     ("HERMES_XS_REVERSAL_SHADOW_FILE", "xs_reversal_shadow.jsonl"),
     ("HERMES_REGIME_OVERLAY_SHADOW_FILE", "regime_overlay_shadow.jsonl"),
+    # 2026-10-23: risk_tuning was added after this list and was missed, so
+    # kernel/DSL tests that omit an explicit path appended synthetic rows
+    # (coin "OOS") to the developer's real ~/.hermes-trading/risk_tuning_
+    # shadow.jsonl — the same file the D2 arm and the reconciler read.
+    ("HERMES_RISK_TUNING_SHADOW_FILE", "risk_tuning_shadow.jsonl"),
 ):
     os.environ[_arm_env] = os.path.join(_tmp, _arm_file)
 

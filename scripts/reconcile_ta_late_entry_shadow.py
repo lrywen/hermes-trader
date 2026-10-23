@@ -48,10 +48,17 @@ sys.path.insert(0, str(_REPO))
 from hermes_trader.client.hl_client import _http_post
 from hermes_trader.models.types import Candle
 
+# D2-fix (2026-10-23): the writer keys off HERMES_TA_LATE_ENTRY_SHADOW_FILE
+# (=/data in the container) while this reader used ~/.hermes-trading, so the two
+# could see different files. Prefer /data and fall back to the host path only
+# when /data is not present (host-side runs).
 SHADOW_FILE = os.environ.get(
-    "HERMES_TA_LATE_ENTRY_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/ta_late_entry_shadow.jsonl"),
-)
+    "HERMES_TA_LATE_ENTRY_SHADOW_FILE", "/data/ta_late_entry_shadow.jsonl")
+if not os.environ.get("HERMES_TA_LATE_ENTRY_SHADOW_FILE") and not os.path.isfile(SHADOW_FILE):
+    _host = os.path.expanduser("~/.hermes-trading/ta_late_entry_shadow.jsonl")
+    if os.path.isfile(_host):
+        print(f"[reconcile] WARNING: {SHADOW_FILE} not found, falling back to {_host}")
+        SHADOW_FILE = _host
 # Round-trip taker fees, bps (matches reconcile_pullback_shadow.py).
 ROUND_TRIP_FEE_BPS = 5.0
 HOLD_BARS = 2

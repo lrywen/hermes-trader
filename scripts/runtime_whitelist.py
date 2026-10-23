@@ -62,6 +62,9 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_change_arms_shadow.py",
     "reconcile_pullback_shadow.py",
     "reconcile_daily_extension_cap_shadow.py",
+    # D2 (2026-10-23): ignite_grace_cf outcome join. Its default path is
+    # /data/risk_tuning_shadow.jsonl (the file the container writes).
+    "reconcile_risk_tuning_shadow.py",
     # Audit 2026-10-11 shadow A/B arms.
     "reconcile_stop_confirm_shadow.py",
     "reconcile_weight_shadow.py",

@@ -134,6 +134,10 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "trend_filter_200ma.shadow_log_path": ("", "/data/trend_filter_shadow.jsonl"),
     "weight_shadow.shadow_mode": (False, True),
     "dsl_exit.stop_confirm_shadow.shadow_mode": (False, True),
+    # D2 (2026-10-23): ignite-grace record-only counterfactual arm. Only writes
+    # an extra shadow row when an unignited position first crosses the cutoff;
+    # it never alters real exits or orders.
+    "dsl_exit.ignite_grace_shadow.shadow_mode": (False, True),
     "dsl_exit.stop_tuning_shadow.candidate_breakeven_trigger_pct": (0.0, 1),
     "dsl_exit.stop_tuning_shadow.candidate_max_loss_pct": (0.0, 1.5),
     # D6 (2026-10-21)：record-only protect 候选（dsl_exit._candidate_protect_for_regime

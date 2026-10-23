@@ -316,3 +316,95 @@ def test_capped_window_matches_full_prefix() -> None:
         for a, b in zip(hits_full, hits_tail):
             assert a["fired"] == b["fired"]
             assert a["score"] == b["score"]
+
+
+# ── P0-1 PIT slicing of the higher-timeframe feeds (2026-10-23) ──────────────
+
+def _flat_bars(n: int, bar_ms: int = BAR_MS, t0: int = T0) -> list[Candle]:
+    """Flat 5m bars: only ``t`` matters for the PIT pointer test."""
+    return [Candle(t=t0 + i * bar_ms, o=100.0, h=101.0, l=99.0, c=100.0, v=1.0)
+            for i in range(n)]
+
+
+def _htf(n: int, bar_ms: int, t0: int = T0) -> list[Candle]:
+    return [Candle(t=t0 + i * bar_ms, o=100.0, h=101.0, l=99.0, c=100.0, v=1.0)
+            for i in range(n)]
+
+
+def _capture_slices(monkeypatch) -> list[tuple[int, int, int]]:
+    """Record (bar_close_ms, n_1h_visible, n_15m_visible) at every evaluation."""
+    from hermes_trader.backtest import signals as S
+
+    seen: list[tuple[int, int, int]] = []
+
+    def _fake(window, th, weights, *, candles_1h=None, candles_15m=None):
+        seen.append((window[-1].t + BAR_MS,
+                     len(candles_1h or ()), len(candles_15m or ())))
+        return 0.0, []
+
+    monkeypatch.setattr(S, "evaluate_window", _fake)
+    return seen
+
+
+def test_heuristic_signals_no_htf_feeds_passes_none(monkeypatch) -> None:
+    """Omitting the HTF feeds must keep the legacy single-feed call (None)."""
+    from hermes_trader.backtest.signals import HeuristicConfig
+
+    seen = _capture_slices(monkeypatch)
+    heuristic_signals(_flat_bars(6), HeuristicConfig(thresholds={}, weights={}, warmup=0))
+    assert seen and all(n1 == 0 and n15 == 0 for _c, n1, n15 in seen)
+
+
+def test_heuristic_signals_pit_slices_1h_never_look_ahead(monkeypatch) -> None:
+    """A 1h candle is visible only once its close is <= the bar's close."""
+    from hermes_trader.backtest.signals import HeuristicConfig
+
+    seen = _capture_slices(monkeypatch)
+    bars = _flat_bars(40)                 # 5m, closes T0+5m .. T0+200m
+    h1 = _htf(3, 3_600_000)               # closes T0+60m/120m/180m
+    heuristic_signals(bars, HeuristicConfig(thresholds={}, weights={}, warmup=0),
+                      candles_1h=h1)
+    counts = [n1 for _c, n1, _n15 in seen]
+    # bar i (loop 0..38) closes at T0+5m*(i+1)
+    assert counts[:11] == [0] * 11        # close < T0+60m
+    assert counts[11:23] == [1] * 12      # T0+60m closed
+    assert counts[23:35] == [2] * 12      # T0+120m closed
+    assert counts[35:] == [3] * 4         # T0+180m closed
+    # Every visible candle really closed before the decision.
+    for close, n1, _n15 in seen:
+        assert all(c.t + 3_600_000 <= close for c in h1[:n1])
+        if n1 < len(h1):
+            assert h1[n1].t + 3_600_000 > close
+
+
+def test_heuristic_signals_pit_slices_15m_and_edge_equality(monkeypatch) -> None:
+    """15m slicing uses the same rule; a candle closing exactly at the bar
+    close counts as visible (<=, not <)."""
+    from hermes_trader.backtest.signals import HeuristicConfig
+
+    seen = _capture_slices(monkeypatch)
+    bars = _flat_bars(40)
+    q = _htf(3, 900_000)                  # closes T0+15m/30m/45m
+    heuristic_signals(bars, HeuristicConfig(thresholds={}, weights={}, warmup=0),
+                      candles_15m=q)
+    counts = [n15 for _c, _n1, n15 in seen]
+    assert counts[:2] == [0, 0]           # close T0+5m / T0+10m
+    assert counts[2] == 1                 # close T0+15m == candle close → visible
+    assert counts[5] == 2                 # close T0+30m
+    assert counts[-1] == 3
+
+
+def test_heuristic_signals_htf_input_order_is_irrelevant(monkeypatch) -> None:
+    """Feeds are sorted once, so a reversed list yields identical slices."""
+    from hermes_trader.backtest.signals import HeuristicConfig
+
+    cfg = HeuristicConfig(thresholds={}, weights={}, warmup=0)
+    bars = _flat_bars(40)
+
+    seen_asc = _capture_slices(monkeypatch)
+    heuristic_signals(bars, cfg, candles_1h=_htf(3, 3_600_000))
+    monkeypatch.undo()
+
+    seen_desc = _capture_slices(monkeypatch)
+    heuristic_signals(bars, cfg, candles_1h=list(reversed(_htf(3, 3_600_000))))
+    assert seen_asc == seen_desc

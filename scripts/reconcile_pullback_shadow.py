@@ -35,12 +35,16 @@ from hermes_trader.models.types import Candle
 # Audit 2026-09-10 (M12): default to the writable /data path the runtime actually
 # writes (shadow_log reroutes the read-only ~/.hermes-trading home to /data in
 # container). Overridable via HERMES_PULLBACK_SHADOW_FILE or --file.
-SHADOW_FILE = os.environ.get(
-    "HERMES_PULLBACK_SHADOW_FILE",
-    os.path.expanduser("~/.hermes-trading/pullback_shadow.jsonl")
-    if os.access(os.path.expanduser("~/.hermes-trading"), os.W_OK)
-    else "/data/pullback_shadow.jsonl",
-)
+# D2-fix (2026-10-23): the old `os.access(~/.hermes-trading, W_OK)` probe picked
+# the host bind-mount inside the container (it IS writable there), splitting the
+# reader from the writer which uses HERMES_PULLBACK_SHADOW_FILE=/data. Prefer
+# /data unconditionally and only fall back to the host path when /data is absent.
+SHADOW_FILE = os.environ.get("HERMES_PULLBACK_SHADOW_FILE", "/data/pullback_shadow.jsonl")
+if not os.environ.get("HERMES_PULLBACK_SHADOW_FILE") and not os.path.isfile(SHADOW_FILE):
+    _host = os.path.expanduser("~/.hermes-trading/pullback_shadow.jsonl")
+    if os.path.isfile(_host):
+        print(f"[reconcile] WARNING: {SHADOW_FILE} not found, falling back to {_host}")
+        SHADOW_FILE = _host
 ROUND_TRIP_FEE_BPS = 5.0
 
 

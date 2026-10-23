@@ -72,6 +72,8 @@ COPY scripts/reconcile_fills.py scripts/reconcile_fills.py
 COPY scripts/reconcile_change_arms_shadow.py scripts/reconcile_change_arms_shadow.py
 COPY scripts/reconcile_pullback_shadow.py scripts/reconcile_pullback_shadow.py
 COPY scripts/reconcile_daily_extension_cap_shadow.py scripts/reconcile_daily_extension_cap_shadow.py
+# D2 (2026-10-23): ignite_grace_cf outcome join, run from cron_reconcile.sh.
+COPY scripts/reconcile_risk_tuning_shadow.py scripts/reconcile_risk_tuning_shadow.py
 COPY scripts/reconcile_stop_confirm_shadow.py scripts/reconcile_stop_confirm_shadow.py
 COPY scripts/reconcile_weight_shadow.py scripts/reconcile_weight_shadow.py
 COPY scripts/postdeploy_smoke.py scripts/postdeploy_smoke.py

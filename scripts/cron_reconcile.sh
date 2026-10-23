@@ -60,6 +60,16 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --window-hours "${HERMES_PULLBACK_WINDOW:-48}" --write
   echo "$(ts) pullback shadow backfill exit=$?"
 
+  # D2 (2026-10-23): ignite_grace_cf outcome join. The script existed but was
+  # never in the image nor scheduled, so ignite_grace_cf rows had no joined
+  # exit and the n>=30 promotion gate could never be read. Reads the same
+  # /data file the container writes. Pure paper; best-effort like the above.
+  echo "$(ts) risk_tuning shadow reconcile start (window=${HERMES_RISK_TUNING_WINDOW:-48}h)"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_risk_tuning_shadow.py \
+    --file "${HERMES_RISK_TUNING_SHADOW_FILE:-/data/risk_tuning_shadow.jsonl}" \
+    --window-hours "${HERMES_RISK_TUNING_WINDOW:-48}" --write
+  echo "$(ts) risk_tuning shadow reconcile exit=$?"
+
   # Audit 2026-09-11 (xs_reversal outcome gap): this arm's reconcile script
   # existed but was NEVER scheduled, so all shadow rows stayed outcome-less and
   # the 00:45 grader reported "outcome 回填 0/44". The script also emitted the
