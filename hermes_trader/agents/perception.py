@@ -796,8 +796,13 @@ def _scan_single_market(
                 market["coin"], _fired_names, scored_bar_close_ms,
                 _halflife_ms, _onset_ttl_ms,
             )
-            if fired_count < 1:
-                return (True, None)
+            # R7-D second copy (v6 2026-10-23): do NOT early-return here on
+            # fired_count < 1. This branch is the one production takes
+            # (signal_age_decay.mode == "shadow"), so the return made the
+            # shared bypass-evaluation + guard below (whale/sigma-burst/
+            # pattern/daily-mover) unreachable whenever no PRICE trigger
+            # fired — exactly the flat-price OI case the whale bypass exists
+            # for. The unified guard after bypass evaluation drops the coin.
             raw_score = trigger_mod.composite_score(hits, _score_weights)
             decayed_score = trigger_mod.composite_score_aged(
                 hits, _score_weights, scored_bar_close_ms, _onset_ms, _halflife_ms,

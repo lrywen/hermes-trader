@@ -92,6 +92,13 @@ for _arm_env, _arm_file in (
     # would append synthetic rows to the developer's real file.
     ("HERMES_WEIGHT_SHADOW_FILE", "weight_shadow.jsonl"),
     ("HERMES_STOP_CONFIRM_SHADOW_FILE", "stop_confirm_shadow.jsonl"),
+    # 2026-10-23 (v6): these two were missed too and were actively polluting
+    # the developer's real ~/.hermes-trading/ files (runner_gate: 408+ rows
+    # with coin "TEST", per_coin_cooldown: synthetic ZEC/TST rows) every time
+    # the host suite ran. Neither arm has a reconciler or cron consumer, so
+    # the pollution never affected decisions — hygiene only.
+    ("HERMES_PER_COIN_COOLDOWN_SHADOW_FILE", "per_coin_cooldown_shadow.jsonl"),
+    ("HERMES_RUNNER_GATE_SHADOW_FILE", "runner_gate_shadow.jsonl"),
 ):
     os.environ[_arm_env] = os.path.join(_tmp, _arm_file)
 

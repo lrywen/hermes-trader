@@ -18,6 +18,8 @@ not change score/fired/reason, which existing composite scoring relies on).
 
 from __future__ import annotations
 
+import pytest
+
 from hermes_trader.agents.cooldown_adaptive import coin_is_hot
 from hermes_trader.indicators.triggers import pct_move_spike, volume_spike
 from hermes_trader.models.types import Candle
@@ -227,7 +229,8 @@ def test_sigma_burst_shadow_does_not_surface(monkeypatch):
     assert ok is True and out is None  # shadow → still dropped
 
 
-def test_sigma_burst_enforce_surfaces(monkeypatch):
+@pytest.mark.parametrize("decay_mode", ["off", "shadow"])
+def test_sigma_burst_enforce_surfaces(monkeypatch, decay_mode):
     from hermes_trader.agents import perception
 
     _wire_scan(monkeypatch, _quiet_candles())
@@ -238,6 +241,10 @@ def test_sigma_burst_enforce_surfaces(monkeypatch):
 
     cfg = _base_config()
     cfg["sigma_burst_gate"]["shadow_mode"] = False
+    # R7-D second copy: with signal_age_decay != off the scan took a different
+    # branch whose own fired_count<1 early return ran before the sigma-burst
+    # bypass; production config has mode="shadow". Must surface in both.
+    cfg["signal_age_decay"] = {"mode": decay_mode}
     ok, out = perception._scan_single_market(
         {"coin": "ETH", "sz_decimals": 2, "type": "perp"}, 100.0, cfg, min_score=54.0)
     assert ok is True

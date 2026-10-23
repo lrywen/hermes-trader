@@ -47,7 +47,8 @@ def _candles(n=150):
 # ── models ──────────────────────────────────────────────────────────────
 
 
-def test_whale_scan_bypass_surfaces_subgate_accumulation(monkeypatch):
+@pytest.mark.parametrize("decay_mode", ["off", "shadow"])
+def test_whale_scan_bypass_surfaces_subgate_accumulation(monkeypatch, decay_mode):
     """A whale-flagged coin that scores BELOW the composite gate must be:
       - dropped when whale_scan_bypass is OFF (default), and
       - surfaced (with whale_signal attached) when whale_scan_bypass is ON.
@@ -55,11 +56,17 @@ def test_whale_scan_bypass_surfaces_subgate_accumulation(monkeypatch):
     Regression for the dead-path bug: oi_funding_anomaly fires on FLAT price,
     which scores ~0 on momentum/breakout triggers, so without the bypass the
     coin never reaches the executor where the whale override lives.
+
+    Parametrised over signal_age_decay mode: the age-decay branch historically
+    had its OWN fired_count<1 early return (R7-D second copy, fixed
+    2026-10-23), so the bypass must be reachable in BOTH branches. Production
+    runs mode="shadow"; the off-only variant hid that regression.
     """
     from hermes_trader.agents import perception
     from hermes_trader.agents.config import get_config
 
     cfg = get_config()
+    cfg["signal_age_decay"] = {"mode": decay_mode}
     gate = cfg["scan"]["minCompositeScore"]
     # Flat candles → no momentum/breakout/trend triggers fire → score below gate.
     flat = [Candle(t=i, o=100.0, h=100.0, l=100.0, c=100.0, v=10.0) for i in range(120)]
