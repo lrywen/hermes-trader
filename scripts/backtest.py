@@ -449,11 +449,12 @@ def main() -> int:
                     continue
                 # Only fetch what a consumer can use: the gate needs 4h/15m;
                 # ignition needs the policy's ignite_periods; the heuristic
-                # signal scan always needs 1h (trendStrength scores on 1h in
-                # live, so a 5m-only backtest would leave it permanently flat).
+                # signal scan always needs 1h and 15m (trendStrength scores on
+                # 1h and rangeCompression on 15m in live, so a single-feed
+                # backtest would leave both permanently flat).
                 used_by_gate = bool(late_entry_params) and period in ("4h", "15m")
                 used_by_ign = period in base_policy.ignite_periods
-                used_by_scan = period == "1h"
+                used_by_scan = period in ("1h", "15m")
                 if not (used_by_gate or used_by_ign or used_by_scan):
                     continue
                 try:
@@ -462,7 +463,9 @@ def main() -> int:
                     series[period] = None
                     print(f"  {coin:8} {period} unavailable ({e}); consumers skip that layer")
             candles_4h = series.get("4h") if late_entry_params else None
-            candles_15m = series.get("15m") if late_entry_params else None
+            # U5 (2026-10-23): 15m feeds both the late-entry gate AND the
+            # signal scan (rangeCompression); fetch is unconditional now.
+            candles_15m = series.get("15m")
             # P0-1: when the scan runs on 1h bars themselves, the decision feed
             # IS the 1h series — no second fetch, no look-ahead (the slice
             # logic still trims to closed candles).
@@ -506,6 +509,7 @@ def main() -> int:
                 candles, ksig.default_heuristic_config(warmup=100),
                 context_fn=_ctx, bar_ms=sim_ms,
                 candles_1h=candles_1h,
+                candles_15m=candles_15m,
             )
 
             # ta_late_entry parity (deep audit 高危项, 2026-08-30): the live

@@ -134,7 +134,8 @@ def _scan_candidates(coin: str, candles: List[Candle],
                      th: Dict[str, Any], weights: Dict[str, float],
                      le_params: Dict[str, Any],
                      warmup: int, sim_ms: int,
-                     candles_1h: Optional[List[Candle]] = None) -> tuple:
+                     candles_1h: Optional[List[Candle]] = None,
+                     candles_15m: Optional[List[Candle]] = None) -> tuple:
     """Pass 1 (run ONCE per coin): every bar where the BASE short signal fires
     — bearish heuristic verdict + ta_confirmed proxy + live ta_late short
     hard gate. Records the per-variant filter inputs so variants can replay
@@ -144,6 +145,7 @@ def _scan_candidates(coin: str, candles: List[Candle],
     ema8_4 = ind.ema(closes4, 8) if len(closes4) >= 8 else []
     ema21_4 = ind.ema(closes4, 21) if len(closes4) >= 21 else []
     t1h = [c.t for c in candles_1h] if candles_1h else []
+    t15 = [c.t for c in candles_15m] if candles_15m else []
     cands: List[Dict[str, Any]] = []
     stats = {"bearish": 0, "signal": 0, "ta_conf": 0, "late_veto": 0}
     for i in range(warmup, len(candles) - 1):
@@ -151,9 +153,13 @@ def _scan_candidates(coin: str, candles: List[Candle],
         decision_ms = candles[i].t + sim_ms
         # P0-1: trendStrength scores on 1h in live; feed only the 1h bars that
         # have CLOSED by the decision instant (same rule as the 4h slice below).
+        # U5 (2026-10-23): rangeCompression scores on 15m in live — same rule.
         w1h = (_closed_slice(candles_1h, t1h, decision_ms, _MS_PER["1h"])
                if candles_1h else None)
-        score, hits = ksig.evaluate_window(window, th, weights, candles_1h=w1h)
+        w15m = (_closed_slice(candles_15m, t15, decision_ms, _MS_PER["15m"])
+                if candles_15m else None)
+        score, hits = ksig.evaluate_window(window, th, weights, candles_1h=w1h,
+                                           candles_15m=w15m)
         bullish, atr_pct, adx14 = ksig.trend_and_atr_pct(window)
         if bullish is None or bullish:
             continue  # shorts only; None = insufficient data
@@ -354,6 +360,7 @@ def main() -> int:
     sim_ms = _MS_PER[interval]
     total_bars = args.days * 24 + 100  # + warmup
     need_4h = math.ceil(total_bars * sim_ms / _MS_PER["4h"]) + 40
+    need_15m = math.ceil(total_bars * sim_ms / _MS_PER["15m"]) + 30
 
     # Trigger thresholds/weights the live scanner uses.
     cfg = get_config()
@@ -425,13 +432,17 @@ def main() -> int:
             # interval by default, so reuse it instead of a second request.
             candles_1h = candles if interval == "1h" else fetch_hl_candles(
                 coin, "1h", 2000)
+            # U5 (2026-10-23): rangeCompression scores on 15m in live; feed it
+            # PIT-sliced like the 1h feed or it stays permanently flat.
+            candles_15m = fetch_hl_candles(coin, "15m", need_15m)
         except Exception as e:
             print(f"  {coin}: fetch failed: {e} — skipped")
             continue
         candles_by_coin[coin] = candles
         cands, cstats = _scan_candidates(
             coin, candles, candles_4h, macro_ts, macro_regime, th, weights,
-            le_params, warmup=100, sim_ms=sim_ms, candles_1h=candles_1h)
+            le_params, warmup=100, sim_ms=sim_ms, candles_1h=candles_1h,
+            candles_15m=candles_15m)
         for k in total_stats:
             total_stats[k] += cstats[k]
 

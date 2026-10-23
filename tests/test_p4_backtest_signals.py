@@ -15,6 +15,7 @@ from hermes_trader.backtest.signals import (
     ReplayConfig,
     admit_analysis,
     default_heuristic_config,
+    evaluate_window,
     heuristic_signals,
     heuristic_verdict,
     replay_signals,
@@ -408,3 +409,36 @@ def test_heuristic_signals_htf_input_order_is_irrelevant(monkeypatch) -> None:
     seen_desc = _capture_slices(monkeypatch)
     heuristic_signals(bars, cfg, candles_1h=list(reversed(_htf(3, 3_600_000))))
     assert seen_asc == seen_desc
+
+
+def _squeeze_15m(n_wide: int = 70, n_tight: int = 50) -> list[Candle]:
+    """15m series: wide ±4 sawtooth, then a tight ±0.05 band — the trailing
+    Bollinger bandwidth lands in the bottom decile of its own history."""
+    bars: list[Candle] = []
+    for i in range(n_wide + n_tight):
+        amp = 4.0 if i < n_wide else 0.05
+        c = 100.0 + (amp if i % 2 == 0 else -amp)
+        bars.append(Candle(t=T0 + i * 900_000, o=c, h=c, l=c, c=c, v=1.0))
+    return bars
+
+
+def test_evaluate_window_range_compression_fires_with_15m_feed() -> None:
+    """U5 (2026-10-23): with a 15m feed present, rangeCompression can fire;
+    without the feed it stays flat. Pins the caller-side 15m plumbing that
+    backtest.py / backtest_short_regime.py were missing."""
+    from hermes_trader.agents.config import (
+        trigger_thresholds_params,
+        trigger_weights_params,
+    )
+
+    th = trigger_thresholds_params(config={})
+    w = trigger_weights_params(config={})
+    base = _trend_bars(60)                          # 5m decision feed
+
+    _, hits = evaluate_window(base, th, w, candles_15m=_squeeze_15m())
+    rc = next(h for h in hits if h["name"] == "rangeCompression")
+    assert rc["fired"] is True and rc["score"] > 0
+
+    _, hits_none = evaluate_window(base, th, w)
+    rc_none = next(h for h in hits_none if h["name"] == "rangeCompression")
+    assert rc_none["fired"] is False
