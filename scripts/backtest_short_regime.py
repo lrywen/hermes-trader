@@ -80,7 +80,10 @@ from hermes_trader.models.types import Candle
 
 _MS_PER: Dict[str, int] = {
     "5m": 5 * 60_000, "15m": 15 * 60_000, "1h": 60 * 60_000,
-    "4h": 4 * 60_000, "1d": 24 * 60_000,
+    # T3 review (2026-10-23): these were 4*60_000 / 24*60_000 (4min / 24min),
+    # which made _closed_slice admit bars that had not closed yet (look-ahead)
+    # and inflated need_4h by 60x.
+    "4h": 4 * 3_600_000, "1d": 24 * 3_600_000,
 }
 
 W4_WINDOW = 60     # trailing 4h suffix fed to late_entry_check
