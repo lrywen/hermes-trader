@@ -41,6 +41,13 @@ same universe, same candle data — the ONLY difference is the entry gate.
 Usage:
     HERMES_BACKTEST=1 python3 scripts/backtest_ab_compare.py
     HERMES_BACKTEST=1 python3 scripts/backtest_ab_compare.py --days 30 --coins 25
+
+口径变更（2026-10-23, U7）：入场触发器改走 triggers.build_hits 单源（与实盘
+  perception 同一装配）——rangeCompression 由 1h 代理改读真实 15m 已收盘前缀，
+  并补齐 volumeBuildup1h/trendFlip1h/higherLows1h/uptrend/downtrendMomentum
+  五个生产触发器；squeeze 耦合由 build_hits 内部统一处理，OLD 列以
+  candles_15m=None 保持「无耦合」语义。本改动之前产出的一切结论作废，
+  重跑前不得引用。
 """
 from __future__ import annotations
 
@@ -315,40 +322,31 @@ def _evaluate_entry(
     use_new_rules: bool,
     rsi_variant: str = "strict",
     plan_b_enabled: bool = True,
+    window_15m: Optional[List[Candle]] = None,
 ) -> Tuple[Optional[str], float, float, float, str, float, str]:
     th = cfg["thresholds"]
     closes_1h = [c.c for c in window_1h]
     if len(closes_1h) < 50:
         return None, 50, 0, 0, "", 1.0, ""
 
-    # --- Triggers (shared computation; breakout confirm_bars differs) ---
+    # --- Triggers via the production orchestration (U7, 2026-10-23) --------
+    # build_hits is the single source of truth shared with live perception
+    # (_scan_single_market): rangeCompression reads the closed 15m prefix,
+    # trendStrength/volumeBuildup/trendFlip/higherLows read the 1h window,
+    # squeeze coupling / dailyMover are handled inside. OLD vs NEW differs in
+    # breakout confirm_bars (1 vs 2); OLD additionally gets candles_15m=None
+    # so rangeCompression stays flat and the coupling can never fire (the OLD
+    # rules predate it). Pre-change results are void.
     confirm_bars = 2 if use_new_rules else 1
-    hits = [
-        trig.pct_move_spike(window_1h, th["sigmaThreshold"]),
-        trig.volume_spike(window_1h, th["sigmaThreshold"]),
-        trig.breakout(
-            window_1h, th["breakoutLookback"],
-            min_rvol=th.get("breakoutMinRvol", 1.5),
-            rvol_window=th.get("breakoutRvolWindow", 20),
-            atr_score_mult=th.get("breakoutAtrScoreMult", 3.0),
-            confirm_bars=confirm_bars,
-        ),
-        trig.range_compression(window_1h, th["bbLength"], th["bbStdDev"]),
-        trig.trend_strength(window_1h, th["adxPeriod"]),
-        trig.momentum_burst(window_1h, th["momentumLookback"], th["momentumPct"]),
-    ]
+    hits, score_weights = trig.build_hits(
+        window_1h,
+        {**th, "breakoutConfirmBars": confirm_bars},
+        cfg["weights"],
+        candles_1h=window_1h,
+        candles_15m=window_15m if use_new_rules else None,
+    )
 
-    # NEW: squeeze-breakout coupling
-    if use_new_rules:
-        squeeze_fired = any(
-            (h.get("name") == "rangeCompression") and h.get("fired") for h in hits
-        )
-        if squeeze_fired:
-            for h in hits:
-                if h.get("name") == "breakout" and h.get("fired"):
-                    h["score"] = min(10.0, float(h.get("score", 0)) + 2.0)
-
-    score = trig.composite_score(hits, cfg["weights"])
+    score = trig.composite_score(hits, score_weights)
     burst = any(h["name"] == "momentumBurst" and h["fired"] for h in hits)
     breakout_fired = any(h["name"] == "breakout" and h["fired"] for h in hits)
 
@@ -611,6 +609,7 @@ def _simulate(
     veto_log: Optional[List[Dict[str, Any]]] = None,
     rsi_variant: str = "strict",
     plan_b_enabled: bool = True,
+    candles_15m: Optional[List[Candle]] = None,
     entry_slip_bps: float = DEFAULT_ENTRY_SLIP_BPS,
     exit_slip_bps: float = DEFAULT_EXIT_SLIP_BPS,
     stop_delay_slip_bps: float = DEFAULT_STOP_DELAY_SLIP_BPS,
@@ -639,6 +638,10 @@ def _simulate(
 
         bar = candles_1h[i]
         next_bar = candles_1h[i + 1]
+        # 15m prefix closed by the current 1h bar (production rangeCompression
+        # feed); None when the harness was run without a 15m fetch.
+        window_15m = ([c for c in candles_15m if c.t <= t_now]
+                      if candles_15m else None)
 
         # Manage open position
         if open_t and open_dsl:
@@ -666,6 +669,7 @@ def _simulate(
         verdict, rsi, ext_atr, adx_v, block, size_mult, regime_label = _evaluate_entry(
             window_1h, window_4h, cfg, use_new_rules=use_new_rules,
             rsi_variant=rsi_variant, plan_b_enabled=plan_b_enabled,
+            window_15m=window_15m,
         )
 
         if block and veto_log is not None:
@@ -1045,11 +1049,15 @@ def main() -> int:
                 pass
         try:
             candles = fetch_hl_candles(coin, "1h", total_bars)
+            # U7: real 15m feed for the production rangeCompression trigger
+            # (4x the 1h bar count; ~52d retention caps --days at ~50).
+            candles_15m = fetch_hl_candles(coin, "15m", total_bars * 4)
             if len(candles) < 150:
                 print(f"  {coin:10s} skip ({len(candles)} bars)")
                 continue
             ot = _simulate(
                 coin, candles, max_lev, equity=args.equity,
+                candles_15m=candles_15m,
                 equity_fraction=equity_fraction, lev_ceiling=lev_ceiling,
                 cfg=cfg, use_new_rules=False,
                 max_loss_pct=max_loss, protect_pct=protect,
@@ -1059,6 +1067,7 @@ def main() -> int:
             )
             nt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
+                candles_15m=candles_15m,
                 equity_fraction=equity_fraction, lev_ceiling=lev_ceiling,
                 cfg=cfg, use_new_rules=True,
                 max_loss_pct=max_loss, protect_pct=protect,
@@ -1069,6 +1078,7 @@ def main() -> int:
             )
             dt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
+                candles_15m=candles_15m,
                 equity_fraction=equity_fraction, lev_ceiling=lev_ceiling,
                 cfg=cfg, use_new_rules=True,
                 max_loss_pct=max_loss, protect_pct=protect,
@@ -1079,6 +1089,7 @@ def main() -> int:
             )
             gt = _simulate(
                 coin, candles, max_lev, equity=args.equity,
+                candles_15m=candles_15m,
                 equity_fraction=equity_fraction, lev_ceiling=lev_ceiling,
                 cfg=cfg, use_new_rules=True,
                 max_loss_pct=max_loss, protect_pct=protect,
