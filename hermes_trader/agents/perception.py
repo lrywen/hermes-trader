@@ -853,8 +853,11 @@ def _scan_single_market(
                 logger.debug(f"[age-decay] shadow record failed for {market['coin']}: {_e}")
             score = decayed_score if _dec_mode == "enforce" else raw_score
         else:
-            if fired_count < 1:
-                return (True, None)
+            # NOTE: no early return on fired_count < 1 here — the whale /
+            # sigma-burst / pattern / daily-mover bypasses below must still be
+            # evaluated. The OI-accumulation signals the whale bypass exists
+            # for fire on FLAT price, i.e. fired_count == 0 by construction;
+            # returning here made that bypass unreachable (found via R7-D).
             score = trigger_mod.composite_score(hits, _score_weights)
         # weight_shadow (observation only): compare live composite against the
         # canonical reweight (0.30/0.20/3bar-3%) — emits only on a gate-decision
@@ -935,6 +938,15 @@ def _scan_single_market(
             logger.debug(f"[sigma-burst] eval failed for "
                          f"{market.get('coin', '?')} (fail-open): {_sb_e}")
             sigma_burst_bypass = False
+        # R7-D (2026-10-23): the fired_count<1 early return moved here, AFTER
+        # the bypass evaluation. burst/trend/pattern/daily-mover bypasses all
+        # imply fired_count >= 1 (their triggers are in `hits`), so the only
+        # bypass this guard can suppress is whale (OI-based, flat price) and
+        # sigma-burst (score-band qualification). A coin with no fired price
+        # trigger AND no bypass still exits before the gate arithmetic below.
+        if (fired_count < 1 and not whale_bypass and not sigma_burst_bypass
+                and not pattern_bypass and not daily_mover_bypass):
+            return (True, None)
         # A7 (2026-10-21 redundancy plan): the configured scan.minCompositeScore
         # (prod 54) is NOT the real selector. It only gates the residual
         # score-only path — in the 2026-10-21 12.2h window just 0.3% of surfaced
