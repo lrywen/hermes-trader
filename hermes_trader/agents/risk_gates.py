@@ -2290,7 +2290,13 @@ def daily_extension_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateRe
     path = _gate_shadow_path(blk, "HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE",
                              "daily_extension_cap_shadow.jsonl")
     if ext is None:
-        fail_closed = bool(blk.get("fail_closed", True))
+        # fail_closed only bites in enforce mode. In shadow the gate is
+        # observe-only: an over-cap read already passes (via
+        # daily_ext_cap_shadow_block below), so a MISSING read must pass too —
+        # otherwise a "shadow" gate can stall the order path whenever the
+        # universe cache is cold (e.g. first tick after a container restart),
+        # which contradicts the data policy documented above. 2026-10-23 R7.
+        fail_closed = bool(blk.get("fail_closed", True)) and mode == "enforce"
         rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
                "cap_pct": cap, "state": "data_missing",
                "daily_change_pct": None, "ext_would_block": None}

@@ -328,6 +328,19 @@ def test_d2_unknown_change_fail_closed(monkeypatch):
     assert r2["pass"] and r2["via"] == "daily_ext_cap_data_missing"
 
 
+def test_d2_unknown_change_shadow_fail_open(monkeypatch):
+    # R7 (2026-10-23): shadow mode is observe-only end to end. fail_closed
+    # must not block on missing 24h data in shadow — otherwise a "shadow"
+    # gate stalls the order path on a cold universe cache. Enforce keeps the
+    # fail-closed contract (test_d2_unknown_change_fail_closed above).
+    _patch_universe(monkeypatch)  # no market
+    r = rg.daily_extension_cap_gate(
+        _ctx(),
+        {"override_max_daily_extension_pct": 30.0,
+         "daily_extension_cap": {"mode": "shadow", "fail_closed": True}})
+    assert r["pass"] and r["via"] == "daily_ext_cap_data_missing"
+
+
 def test_d2_defaults_to_shadow_without_mode_block(monkeypatch):
     # Pathia ships a scalar only; gate must default to shadow (probe, not block).
     _patch_universe(monkeypatch, prev=100.0, mid=200.0)  # +100%

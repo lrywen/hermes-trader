@@ -60,10 +60,14 @@ def test_token_bucket_refills_over_time():
     import time
 
     from hermes_trader.client.rate_limit import TokenBucket
-    b = TokenBucket(capacity=20, refill_per_sec=100.0)  # refills fast
+    # 20 tokens / 20 per sec → a full refill needs ~1.0s, so the "not enough
+    # yet" acquire with max_wait=0.05 stays False even under heavy CPU
+    # contention (the old 100/s version refilled within ~0.2s and went flaky
+    # in the parallel full-suite run when >0.15s passed between statements).
+    b = TokenBucket(capacity=20, refill_per_sec=20.0)
     assert b.acquire(20, max_wait=0.1) is True        # drains to 0
-    assert b.acquire(20, max_wait=0.05) is False       # not enough yet
-    time.sleep(0.25)                                    # 0.25s × 100/s = 25 tokens
+    assert b.acquire(20, max_wait=0.05) is False       # needs ~1s to refill
+    time.sleep(1.15)                                   # ~23 tokens
     assert b.acquire(20, max_wait=0.1) is True         # refilled past 20
 
 
@@ -88,12 +92,14 @@ def test_ttl_cache_serves_within_ttl_and_refreshes_after():
         return {"v": calls["n"]}
 
     # First call computes; second within TTL serves cache (no recompute).
-    assert d._ttl_cached("k", 0.5, producer) == {"v": 1}
-    assert d._ttl_cached("k", 0.5, producer) == {"v": 1}
+    # TTL 1.0s: adjacent-statement scheduling delays under parallel test load
+    # stay far below the expiry boundary (the old 0.5s TTL was flaky there).
+    assert d._ttl_cached("k", 1.0, producer) == {"v": 1}
+    assert d._ttl_cached("k", 1.0, producer) == {"v": 1}
     assert calls["n"] == 1
 
     # After TTL expires, recomputes.
-    time.sleep(0.55)
+    time.sleep(1.1)
     assert d._ttl_cached("k", 0.5, producer) == {"v": 2}
     assert calls["n"] == 2
 
