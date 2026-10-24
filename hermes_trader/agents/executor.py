@@ -5544,6 +5544,9 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
             "rule": rule,
             "composite_score": feats.get("score"),
             "min_composite": feats.get("min_score"),
+            "candidate_floor": feats.get("candidate_floor"),
+            "would_clear_candidate_score": feats.get(
+                "would_clear_candidate_score"),
             "confidence": feats.get("gate_conf"),
             "min_confidence": feats.get("min_conf"),
             "slow_burn_count": feats.get("slow_count"),
@@ -5892,10 +5895,23 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     ) if fresh_impulse else ""
 
     # Snapshot the feature vector for the recording wrapper (best-effort JSONL).
+    # candidate_gate_shadow (2026-10-24 v11 §2.1): record the PURE score relation
+    # to the candidate floor so runner_gate_shadow rows are machine-countable for
+    # the 40-vs-45 question. This is attribution only — it never changes the
+    # admit/block decision (the live floor stays ``min_score``).
+    _cgs = gate.get("candidate_gate_shadow") or {}
+    try:
+        _cand_floor = float(_cgs.get("min_composite", 40.0))
+    except (TypeError, ValueError):
+        _cand_floor = 40.0
+    _cand_enabled = bool(_cgs.get("enabled", False))
     try:
         _runner_gate_ctx.feats = {
             "score": round(float(score), 3),
             "min_score": float(min_score),
+            "candidate_floor": (_cand_floor if _cand_enabled else None),
+            "would_clear_candidate_score": (
+                bool(score >= _cand_floor) if _cand_enabled else None),
             "gate_conf": round(float(gate_conf), 4),
             "min_conf": float(min_conf),
             "slow_count": int(slow_count),

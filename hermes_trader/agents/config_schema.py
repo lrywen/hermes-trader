@@ -790,6 +790,19 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "shadow_mode": ("bool",),
             "min_composite": _num_leaf(0.0, 100.0),
         },
+        # Weight x min_composite recalibration (2026-10-24, v11 §2.1). Record-only
+        # arm that pays for ONE isolated research LLM verdict on a pre-research
+        # candidate whose composite lands in [min_composite, max_composite) and
+        # which the normal flow would NOT research, so the 40-vs-45 gate question
+        # gets real AI-gated samples. Never routes, trades, books, or cools down —
+        # the verdict is written to a standalone JSONL and discarded. Disabled by
+        # default; enabled=false must make the path a strict no-op.
+        "candidate_gate_shadow": {
+            "enabled": ("bool",),
+            "min_composite": _num_leaf(0.0, 100.0),
+            "max_composite": _num_leaf(0.0, 100.0),
+            "log_path": ("str",),
+        },
         "per_coin_cooldown": {
             "shadow_mode": ("bool",),
             "fail_closed": ("bool",),

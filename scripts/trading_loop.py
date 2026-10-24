@@ -2649,6 +2649,24 @@ while True:
                            "reason": ta.get("reason"),
                            "trigger_score": round(float(score), 1)})
                 _cycle_outcomes.append((coin, "skip", False, f"TA {ta['signal']}"))
+                # candidate_gate_shadow (v11 §2.1, 2026-10-24): this is a
+                # pre-research candidate the normal flow will NOT pay an LLM for.
+                # When the record-only arm is enabled and its composite is in the
+                # [40,45) recalibration band (long-intent, TA not REJECTED), buy
+                # ONE isolated verdict to a standalone JSONL. It is never routed,
+                # booked, cooled-down or added to _research_jobs — the skip below
+                # is unchanged. Strict no-op when disabled / out of band.
+                try:
+                    from hermes_trader.agents.candidate_gate_shadow import (
+                        maybe_shadow_research,
+                    )
+                    maybe_shadow_research(
+                        coin=coin, perception=perception, score=float(score),
+                        ta=ta, held=(coin in held_coins),
+                        fingerprint=signal_fingerprint(perception),
+                        config=_cfg_cd, data_dir=_DATA_DIR, research_fn=research)
+                except Exception as _cgs_e:
+                    logger.debug(f"[candidate_gate_shadow] skip {coin}: {_cgs_e}")
                 continue
             gate = 'CONFIRMED' if ta['signal'] == 'CONFIRMED' else f"{ta['signal']}+burst"
             # P0-2 (2026-10-19): long-only research throttle. When

@@ -561,6 +561,19 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             # Aligned to live breakout floor (production pins 31.5).
             "min_composite": 31.5,
         },
+        # candidate_gate_shadow (2026-10-24 weight x min_composite recalibration,
+        # v11 §2.1): record-only pre-research LLM shadow. OFF by default — when
+        # enabled it buys one isolated research verdict for pre-research long
+        # candidates whose composite is in [min_composite, max_composite) and
+        # writes it to a standalone JSONL; the verdict never routes/trades/books/
+        # cools. The 40/45 window matches the offline counterfactual's suggested
+        # recalibration point; production must opt in explicitly.
+        "candidate_gate_shadow": {
+            "enabled": False,
+            "min_composite": 40.0,
+            "max_composite": 45.0,
+            "log_path": "",
+        },
         "per_coin_cooldown": {
             "shadow_mode": True,
             # Audit 2026-09-21 (#4): on a memory/history read failure, fail
