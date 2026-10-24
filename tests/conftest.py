@@ -12,7 +12,16 @@ import tempfile
 
 import pytest
 
-_tmp = tempfile.mkdtemp(prefix="hermes-test-state-")
+# Root the throwaway state dir on tmpfs when available. The event feed does
+# a per-line fsync under a cross-process flock (tamper-evident audit chain);
+# under pytest -n every worker is a separate process emitting many such lines,
+# and on a spinning/journalled ext4 /tmp each fsync is a device-wide barrier
+# that serialises ALL workers, occasionally stalling one for 30s+ — which
+# surfaced as the parallel-only hangs and drift-set wall-clock flakes
+# (2026-10-23 R7 root-cause). On tmpfs fsync is a no-op (data already in RAM),
+# removing the contention without touching production durability semantics.
+_TMP_ROOT = "/dev/shm" if os.path.isdir("/dev/shm") and os.access("/dev/shm", os.W_OK) else None
+_tmp = tempfile.mkdtemp(prefix="hermes-test-state-", dir=_TMP_ROOT)
 # Clean up the throwaway dir at interpreter exit so each pytest session removes
 # its own state instead of leaking a hermes-test-state-* dir in /tmp (253 dirs /
 # 16MB accumulated before this). ignore_errors: cleanup must never mask test
@@ -123,6 +132,22 @@ _GATE_TEST_FILES = (
     "test_live_gate_write_guard.py",
     "test_live_gate_b12_b13.py",
 )
+
+
+@pytest.fixture(autouse=True)
+def _reset_dsl_active_positions():
+    # The DSL active-position registry is a process-global dict
+    # (dsl_exit._active_positions) rehydrated from disk. HERMES_DSL_STATE_FILE
+    # above isolates the on-disk file per worker, but an in-memory register from
+    # an earlier test in the SAME worker survives into the next. server
+    # _flatten_asset_positions merges active_position_coins() into live
+    # positions as a re-entry backstop, so a leaked tracker (e.g. coin "ADA")
+    # surfaced as a phantom position in unrelated manual-order tests under -n.
+    # Clear before every test for hermetic isolation (2026-10-23 R7).
+    from hermes_trader.agents import dsl_exit
+    dsl_exit._active_positions.clear()
+    yield
+    dsl_exit._active_positions.clear()
 
 
 @pytest.fixture(autouse=True)

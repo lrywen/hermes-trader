@@ -68,6 +68,12 @@ def test_risk_status_snapshot_reports_armed_breakers(monkeypatch):
     view: armed global halt + remaining minutes, and the per-coin map."""
     from hermes_trader.agents.memory import memory as mem
     now_ms = int(time.time() * 1000)
+    # Pin the breaker fields AND suppress the disk hydration the snapshot does
+    # first (cross-process freshness). Under -n another test in the same worker
+    # can advance MEMORY_FILE's mtime, so refresh would overwrite the in-memory
+    # halt stamp below and randomly read global_halt=False. This test asserts
+    # the snapshot's pure read/format logic on fields we set explicitly.
+    monkeypatch.setattr(mem, "refresh_risk_state_from_disk", lambda: None)
     monkeypatch.setattr(mem, "_global_halt_until_ms", now_ms + 30 * 60_000)
     monkeypatch.setattr(mem, "_coin_circuit", {
         "BTC": now_ms + 15 * 60_000,

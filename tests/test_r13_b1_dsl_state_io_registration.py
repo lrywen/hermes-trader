@@ -18,10 +18,10 @@ _SAVE_BACKOFF_BASE_SEC=0.1）通过 ``os.environ.get(HERMES_DSL_*, <literal>)``
   * canonical env 路由 ``HERMES_CFG_DSL_STATE_IO__*`` 也可工作
 """
 
-import importlib
-import importlib.util
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -34,7 +34,46 @@ from hermes_trader.agents.config_store import (
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-DSL_EXIT_PATH = REPO_ROOT / "hermes_trader" / "agents" / "dsl_exit.py"
+
+
+# The five module-load constants are evaluated ONCE at import from env/config.
+# Verifying that an env var changes them therefore used to require
+# ``importlib.reload(dsl_exit)`` in-process. That reload RE-DEFINES the
+# RetraceTier / ExitPolicy / DSLTracker class objects, so any sibling test
+# module that did ``from hermes_trader.agents.dsl_exit import RetraceTier``
+# before the reload kept a STALE class: ``isinstance(t, RetraceTier)`` then
+# returned False for freshly-built tiers even though their repr was identical
+# (order-dependent failure of test_p3_regime_exit_common under pytest-xdist).
+# These constant-resolution tests instead run in a fresh short-lived SUBPROCESS,
+# which re-imports dsl_exit cleanly with the desired env and never disturbs the
+# class identity of the pytest worker process.
+
+
+def _read_const_subprocess(const_name: str, *, extra_env: dict | None = None):
+    """Import dsl_exit in a clean subprocess and return its module constant.
+
+    The subprocess inherits conftest's isolated env (state files on tmpfs) and
+    any extra_env overrides; HERMES_DSL_* / HERMES_CFG_DSL_STATE_IO__* from the
+    host are stripped so each case observes exactly the vars it sets.
+    """
+    env = dict(os.environ)
+    for k in list(env):
+        if k.startswith(("HERMES_DSL_", "HERMES_CFG_DSL_STATE_IO__")):
+            del env[k]
+    if extra_env:
+        env.update(extra_env)
+    env["PYTHONPATH"] = str(REPO_ROOT)
+    code = (
+        "import json, hermes_trader.agents.dsl_exit as d;"
+        f"print(json.dumps(d.{const_name}))"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=str(REPO_ROOT), env=env, capture_output=True, text=True, timeout=120,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return json.loads(proc.stdout.strip())
+
 
 
 # ── canonical 登记：dsl_state_io 块 5 字段默认值与现有 literals 一致 ─────
@@ -157,121 +196,82 @@ def test_r13_b1_config_patch_knows_dsl_state_io_field():
 
 
 # ── dsl_exit.py 接线验证：5 个常量实际从 cfg_get / env 读取 ──────────────
+# 见文件顶部说明：这些常量在 import 时求值，env 覆盖测试在隔离子进程里重新
+# import，避免 importlib.reload 在 pytest 进程内重定义 RetraceTier 等类。
 
-def _reload_dsl_exit(monkeypatch, *, preserve: bool = False):
-    """带 env 清理的 reload（保持模块对象身份不变）。
-
-    默认行为：pop 掉所有可能干扰的 HERMES_DSL_* 与 HERMES_CFG_DSL_STATE_IO__*
-    key（用 monkeypatch.delenv 走 monkeypatch 回滚路径）。当 ``preserve=True``
-    时（如 canonical env 覆盖测试），保留 monkeypatch.setenv 已设的 key，只
-    pop 显式列出的 legacy HERMES_DSL_* key。
-
-    Uses ``importlib.reload`` on the SAME module object (never pops it out of
-    ``sys.modules``): deleting/inserting a fresh module instance splits the
-    reference held by sibling modules such as ``executor`` and leaves a second
-    set of module globals in the process, contaminating later test modules.
-    Re-running the module body on the same object also resets the module-level
-    registries to their initial empty state.
-    """
-    for k in list(os.environ):
-        if k.startswith("HERMES_DSL_") and not (preserve and k in os.environ and os.environ[k]):
-            monkeypatch.delenv(k, raising=False)
-        if k.startswith("HERMES_CFG_DSL_STATE_IO__") and not preserve:
-            monkeypatch.delenv(k, raising=False)
-    mod = importlib.import_module("hermes_trader.agents.dsl_exit")
-    return importlib.reload(mod)
-
-
-@pytest.fixture(autouse=True)
-def _restore_default_dsl_exit_module():
-    """After each test, reload dsl_exit with a clean env so module-level
-    registries and the canonical-config constants are restored for later
-    modules in the same process (module object identity preserved)."""
-    yield
-    for k in list(os.environ):
-        if k.startswith(("HERMES_DSL_", "HERMES_CFG_DSL_STATE_IO__")):
-            os.environ.pop(k, None)
-    importlib.reload(importlib.import_module("hermes_trader.agents.dsl_exit"))
-
-
-def test_r13_b1_dsl_exit_min_save_interval_uses_canonical(monkeypatch):
+def test_r13_b1_dsl_exit_min_save_interval_uses_canonical():
     """无 env 时，_MIN_SAVE_INTERVAL_SEC = 2.0（canonical 默认）。"""
-    dsl = _reload_dsl_exit(monkeypatch)
-    assert dsl._MIN_SAVE_INTERVAL_SEC == 2.0
+    assert _read_const_subprocess("_MIN_SAVE_INTERVAL_SEC") == 2.0
 
 
-def test_r13_b1_dsl_exit_force_load_ttl_uses_canonical(monkeypatch):
-    dsl = _reload_dsl_exit(monkeypatch)
-    assert dsl._FORCE_LOAD_TTL_S == 1.0
+def test_r13_b1_dsl_exit_force_load_ttl_uses_canonical():
+    assert _read_const_subprocess("_FORCE_LOAD_TTL_S") == 1.0
 
 
-def test_r13_b1_dsl_exit_policy_cache_ttl_uses_canonical(monkeypatch):
-    dsl = _reload_dsl_exit(monkeypatch)
-    assert dsl._POLICY_CACHE_TTL_S == 5.0
+def test_r13_b1_dsl_exit_policy_cache_ttl_uses_canonical():
+    assert _read_const_subprocess("_POLICY_CACHE_TTL_S") == 5.0
 
 
-def test_r13_b1_dsl_exit_save_max_attempts_uses_canonical(monkeypatch):
-    dsl = _reload_dsl_exit(monkeypatch)
-    assert dsl._SAVE_MAX_ATTEMPTS == 3
+def test_r13_b1_dsl_exit_save_max_attempts_uses_canonical():
+    assert _read_const_subprocess("_SAVE_MAX_ATTEMPTS") == 3
 
 
-def test_r13_b1_dsl_exit_save_backoff_base_uses_canonical(monkeypatch):
-    dsl = _reload_dsl_exit(monkeypatch)
-    assert dsl._SAVE_BACKOFF_BASE_SEC == 0.1
+def test_r13_b1_dsl_exit_save_backoff_base_uses_canonical():
+    assert _read_const_subprocess("_SAVE_BACKOFF_BASE_SEC") == 0.1
 
 
 # ── 优先级：legacy HERMES_DSL_* env 仍然生效（operator override 保留） ───
 
-def test_r13_b1_legacy_env_save_interval_wins(monkeypatch):
+def test_r13_b1_legacy_env_save_interval_wins():
     """HERMES_DSL_SAVE_INTERVAL_SEC=10 必须盖掉 canonical 2.0 默认。"""
-    monkeypatch.setenv("HERMES_DSL_SAVE_INTERVAL_SEC", "10")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._MIN_SAVE_INTERVAL_SEC == 10.0
+    assert _read_const_subprocess(
+        "_MIN_SAVE_INTERVAL_SEC",
+        extra_env={"HERMES_DSL_SAVE_INTERVAL_SEC": "10"}) == 10.0
 
 
-def test_r13_b1_legacy_env_save_max_attempts_wins(monkeypatch):
-    monkeypatch.setenv("HERMES_DSL_SAVE_MAX_ATTEMPTS", "8")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._SAVE_MAX_ATTEMPTS == 8
+def test_r13_b1_legacy_env_save_max_attempts_wins():
+    assert _read_const_subprocess(
+        "_SAVE_MAX_ATTEMPTS",
+        extra_env={"HERMES_DSL_SAVE_MAX_ATTEMPTS": "8"}) == 8
 
 
-def test_r13_b1_legacy_env_save_backoff_base_wins(monkeypatch):
-    monkeypatch.setenv("HERMES_DSL_SAVE_BACKOFF_BASE_SEC", "0.5")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._SAVE_BACKOFF_BASE_SEC == 0.5
+def test_r13_b1_legacy_env_save_backoff_base_wins():
+    assert _read_const_subprocess(
+        "_SAVE_BACKOFF_BASE_SEC",
+        extra_env={"HERMES_DSL_SAVE_BACKOFF_BASE_SEC": "0.5"}) == 0.5
 
 
-def test_r13_b1_legacy_env_force_load_ttl_wins(monkeypatch):
-    monkeypatch.setenv("HERMES_DSL_FORCE_LOAD_TTL_S", "3.0")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._FORCE_LOAD_TTL_S == 3.0
+def test_r13_b1_legacy_env_force_load_ttl_wins():
+    assert _read_const_subprocess(
+        "_FORCE_LOAD_TTL_S",
+        extra_env={"HERMES_DSL_FORCE_LOAD_TTL_S": "3.0"}) == 3.0
 
 
-def test_r13_b1_legacy_env_policy_cache_ttl_wins(monkeypatch):
-    monkeypatch.setenv("HERMES_DSL_POLICY_CACHE_TTL_S", "30.0")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._POLICY_CACHE_TTL_S == 30.0
+def test_r13_b1_legacy_env_policy_cache_ttl_wins():
+    assert _read_const_subprocess(
+        "_POLICY_CACHE_TTL_S",
+        extra_env={"HERMES_DSL_POLICY_CACHE_TTL_S": "30.0"}) == 30.0
 
 
 # ── 优先级：canonical env (HERMES_CFG_*) 也可工作（无 legacy env 时） ───
 
-def test_r13_b1_canonical_env_save_min_interval(monkeypatch):
-    monkeypatch.setenv("HERMES_CFG_DSL_STATE_IO__SAVE_MIN_INTERVAL_SEC", "0.25")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._MIN_SAVE_INTERVAL_SEC == 0.25
+def test_r13_b1_canonical_env_save_min_interval():
+    assert _read_const_subprocess(
+        "_MIN_SAVE_INTERVAL_SEC",
+        extra_env={"HERMES_CFG_DSL_STATE_IO__SAVE_MIN_INTERVAL_SEC": "0.25"}) == 0.25
 
 
-def test_r13_b1_canonical_env_save_max_attempts(monkeypatch):
-    monkeypatch.setenv("HERMES_CFG_DSL_STATE_IO__SAVE_MAX_ATTEMPTS", "6")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._SAVE_MAX_ATTEMPTS == 6
+def test_r13_b1_canonical_env_save_max_attempts():
+    assert _read_const_subprocess(
+        "_SAVE_MAX_ATTEMPTS",
+        extra_env={"HERMES_CFG_DSL_STATE_IO__SAVE_MAX_ATTEMPTS": "6"}) == 6
 
 
 # ── 优先级：legacy env 盖过 canonical env（向后兼容） ──────────────────
 
-def test_r13_b1_legacy_env_beats_canonical_env(monkeypatch):
+def test_r13_b1_legacy_env_beats_canonical_env():
     """两者都设时，legacy HERMES_DSL_* 必须赢。"""
-    monkeypatch.setenv("HERMES_DSL_SAVE_INTERVAL_SEC", "10")
-    monkeypatch.setenv("HERMES_CFG_DSL_STATE_IO__SAVE_MIN_INTERVAL_SEC", "0.25")
-    dsl = _reload_dsl_exit(monkeypatch, preserve=True)
-    assert dsl._MIN_SAVE_INTERVAL_SEC == 10.0
+    assert _read_const_subprocess(
+        "_MIN_SAVE_INTERVAL_SEC",
+        extra_env={"HERMES_DSL_SAVE_INTERVAL_SEC": "10",
+                   "HERMES_CFG_DSL_STATE_IO__SAVE_MIN_INTERVAL_SEC": "0.25"}) == 10.0

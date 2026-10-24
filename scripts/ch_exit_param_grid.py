@@ -87,54 +87,68 @@ def replay_one(*, bars, i_entry, policy, dsl_module, tracker_cls,
         coin="R", side="long", entry_px=entry_px,
         entry_time=bars[i_entry][0] / 1000.0, policy=policy,
         leverage=leverage, entry_atr_pct=0.0, entry_regime="")
+    # Swap ONLY the ``time`` NAME on the dsl module for a shim; the stdlib
+    # ``time`` module is a process-wide singleton, so reassigning
+    # ``dsl_module.time.time`` would freeze the clock for every other module
+    # (and never get restored here), leaking the synthetic bar epoch into
+    # unrelated tests under pytest-xdist. Restored in ``finally`` below.
+    import types
+    real_time_mod = dsl_module.time
     end = min(len(bars), i_entry + 1 + max_hold)
     mfe = mae = 0.0
     armed_protect = False
     ignited = False
-    for j in range(i_entry + 1, end):
-        t, o, h, l, c = bars[j][:5]
-        bar_time_s = t / 1000.0 + STEP / 1000.0
-        # true excursion from the bar extremes (long)
-        mfe = max(mfe, (h / entry_px - 1.0) * 100.0)
-        mae = min(mae, (l / entry_px - 1.0) * 100.0)
-        if mfe >= float(policy.protect_pct):
-            armed_protect = True
-        if not ignited and rp._ignition_bar(bars, j, is_long=True,
-                                            entry_idx=i_entry):
-            try:
-                tracker.mark_ignited(t / 1000.0, period="15m")
-                ignited = True
-            except Exception:
-                pass
-        verdict = None
-        trig_px = None
-        for px in (l, h):  # adverse first
-            dsl_module.time.time = lambda bt=bar_time_s: bt
-            dsl_module.time.monotonic = lambda bt=bar_time_s: bt
-            vv = tracker.check(float(px), None)
-            if getattr(vv, "exit", False):
-                verdict = vv
-                floor = getattr(vv, "floor_price", None)
-                if floor and floor > 0:
-                    trig_px = min(floor, h)
-                    if trig_px < l:
-                        trig_px = l
-                else:
-                    trig_px = px
-                break
-        if verdict is not None:
-            exit_px = float(trig_px)
-            gross = exit_px / entry_px - 1.0
-            net = gross - 2.0 * fee_pct
-            return {
-                "reason": str(getattr(verdict, "reason", "") or "").split(" ", 1)[0],
-                "roe": 100.0 * net * leverage,
-                "ret": 100.0 * net,
-                "bars": j - i_entry,
-                "mfe": round(mfe, 3), "mae": round(mae, 3),
-                "armed_protect": armed_protect, "ignited": ignited,
-            }
-    return None
+    try:
+        for j in range(i_entry + 1, end):
+            t, o, h, l, c = bars[j][:5]
+            bar_time_s = t / 1000.0 + STEP / 1000.0
+            # Pin the DSL clock to this bar's close (wall + monotonic share
+            # the same synthetic instant) before the ticks.
+            dsl_module.time = types.SimpleNamespace(
+                time=lambda bt=bar_time_s: bt,
+                monotonic=lambda bt=bar_time_s: bt,
+                sleep=real_time_mod.sleep)
+            # true excursion from the bar extremes (long)
+            mfe = max(mfe, (h / entry_px - 1.0) * 100.0)
+            mae = min(mae, (l / entry_px - 1.0) * 100.0)
+            if mfe >= float(policy.protect_pct):
+                armed_protect = True
+            if not ignited and rp._ignition_bar(bars, j, is_long=True,
+                                                entry_idx=i_entry):
+                try:
+                    tracker.mark_ignited(t / 1000.0, period="15m")
+                    ignited = True
+                except Exception:
+                    pass
+            verdict = None
+            trig_px = None
+            for px in (l, h):  # adverse first
+                vv = tracker.check(float(px), None)
+                if getattr(vv, "exit", False):
+                    verdict = vv
+                    floor = getattr(vv, "floor_price", None)
+                    if floor and floor > 0:
+                        trig_px = min(floor, h)
+                        if trig_px < l:
+                            trig_px = l
+                    else:
+                        trig_px = px
+                    break
+            if verdict is not None:
+                exit_px = float(trig_px)
+                gross = exit_px / entry_px - 1.0
+                net = gross - 2.0 * fee_pct
+                return {
+                    "reason": str(getattr(verdict, "reason", "") or "").split(" ", 1)[0],
+                    "roe": 100.0 * net * leverage,
+                    "ret": 100.0 * net,
+                    "bars": j - i_entry,
+                    "mfe": round(mfe, 3), "mae": round(mae, 3),
+                    "armed_protect": armed_protect, "ignited": ignited,
+                }
+        return None
+    finally:
+        dsl_module.time = real_time_mod
 
 
 def _summ(rows):

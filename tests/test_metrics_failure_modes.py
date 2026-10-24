@@ -125,8 +125,14 @@ def test_arm_heartbeat_one_missing_does_not_blind_others(rendered, tmp_path, mon
 def test_data_disk_free(rendered, tmp_path, monkeypatch):
     monkeypatch.setattr(metrics, "_WRITABLE_DATA_DIR", str(tmp_path))
     s = rendered()
+    # The metric and the assertion each call shutil.disk_usage at a different
+    # instant. Under pytest -n the state dir lives on shared tmpfs (/dev/shm)
+    # and six workers flush concurrently, so free space can move by a few
+    # hundred KB between the two reads; a 1e-6 (~22 KB) tolerance flaked
+    # there. 1e-3 (~22 MB) still pins the invariant (right filesystem, same
+    # free-space magnitude) without asserting sub-second byte equality.
     assert _value(s, "hermes_data_disk_free_bytes") == pytest.approx(
-        float(shutil.disk_usage(str(tmp_path)).free), rel=1e-6)
+        float(shutil.disk_usage(str(tmp_path)).free), rel=1e-3)
 
 
 # ── drawdown (memory peakEquity) ───────────────────────────────────────

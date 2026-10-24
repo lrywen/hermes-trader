@@ -132,58 +132,73 @@ def simulate_trade(*, bars, i_entry, side, entry_atr_pct, policy, leverage,
         entry_time=entry_time_s, policy=policy, leverage=leverage,
         entry_atr_pct=float(entry_atr_pct), entry_regime="")
 
+    # Swap ONLY the ``time`` NAME on the dsl module for a shim; the stdlib
+    # ``time`` module is a process-wide singleton, so reassigning
+    # ``dsl_module.time.time`` would freeze the clock for every other module
+    # (and never get restored here), leaking the synthetic bar epoch into
+    # unrelated tests under pytest-xdist. Restored in ``finally`` below.
+    import types
+    real_time_mod = dsl_module.time
+
     end = min(len(bars), i_entry + 1 + max_hold)
-    for j in range(i_entry + 1, end):
-        t, o, h, l, c = bars[j][:5]
-        bar_time_s = t / 1000.0 + STEP / 1000.0   # moment this bar has closed
-        # Mark a 15m volume+breakout launch BEFORE the stop check, exactly as
-        # production refresh_ignition_states does between scan ticks.
-        if use_ignition and not tracker.ignited and _ignition_bar(
-                bars, j, is_long=is_long, entry_idx=i_entry):
-            try:
-                tracker.mark_ignited(t / 1000.0, period="15m")
-            except Exception:
-                pass
-        # feed adverse extreme first (conservative stop trigger order)
-        ticks = (l, h) if is_long else (h, l)
-        verdict = None
-        trig_px = None
-        for px in ticks:
-            dsl_module.time.time = lambda bt=bar_time_s: bt
-            dsl_module.time.monotonic = lambda bt=bar_time_s: bt
-            v = tracker.check(float(px), None)
-            if getattr(v, "exit", False):
-                verdict = v
-                # floor stops fill at the floor; cap gap-through to this bar's
-                # adverse extreme so we never invent a fill outside the bar range
-                floor = getattr(v, "floor_price", None)
-                if floor and floor > 0:
-                    trig_px = min(floor, h) if is_long else max(floor, l)
-                    if is_long and trig_px < l:
-                        trig_px = l
-                    if not is_long and trig_px > h:
-                        trig_px = h
-                else:
-                    trig_px = px          # timeout / non-floor exit at the tick
-                break
-        if verdict is not None:
-            exit_px = float(trig_px)
-            gross = (exit_px / entry_px - 1.0) if is_long \
-                else (1.0 - exit_px / entry_px)
-            cost = 2.0 * fee_pct
-            net = gross - cost
-            return {
-                "entry_idx": i_entry, "exit_idx": j,
-                "bars_held": j - i_entry,
-                "entry_px": entry_px, "exit_px": exit_px,
-                "side": side, "gross_pct": round(100 * gross, 4),
-                "fee_roundtrip_pct": round(100 * cost, 4),
-                "roe_pct": round(100 * net * leverage, 3),
-                "ret_pct": round(100 * net, 4),
-                "reason": str(getattr(verdict, "reason", "") or "").split(" ", 1)[0],
-                "mfe_pct": round(100 * float(getattr(verdict, "mfe_pct", 0) or 0), 3),
-            }
-    return None  # never exited within available series (right-censored)
+    try:
+        for j in range(i_entry + 1, end):
+            t, o, h, l, c = bars[j][:5]
+            bar_time_s = t / 1000.0 + STEP / 1000.0   # moment this bar has closed
+            # Pin the DSL clock to this bar's close for the whole bar (wall +
+            # monotonic share the same synthetic instant), then run the ticks.
+            dsl_module.time = types.SimpleNamespace(
+                time=lambda bt=bar_time_s: bt,
+                monotonic=lambda bt=bar_time_s: bt,
+                sleep=real_time_mod.sleep)
+            # Mark a 15m volume+breakout launch BEFORE the stop check, exactly as
+            # production refresh_ignition_states does between scan ticks.
+            if use_ignition and not tracker.ignited and _ignition_bar(
+                    bars, j, is_long=is_long, entry_idx=i_entry):
+                try:
+                    tracker.mark_ignited(t / 1000.0, period="15m")
+                except Exception:
+                    pass
+            # feed adverse extreme first (conservative stop trigger order)
+            ticks = (l, h) if is_long else (h, l)
+            verdict = None
+            trig_px = None
+            for px in ticks:
+                v = tracker.check(float(px), None)
+                if getattr(v, "exit", False):
+                    verdict = v
+                    # floor stops fill at the floor; cap gap-through to this bar's
+                    # adverse extreme so we never invent a fill outside the bar range
+                    floor = getattr(v, "floor_price", None)
+                    if floor and floor > 0:
+                        trig_px = min(floor, h) if is_long else max(floor, l)
+                        if is_long and trig_px < l:
+                            trig_px = l
+                        if not is_long and trig_px > h:
+                            trig_px = h
+                    else:
+                        trig_px = px          # timeout / non-floor exit at the tick
+                    break
+            if verdict is not None:
+                exit_px = float(trig_px)
+                gross = (exit_px / entry_px - 1.0) if is_long \
+                    else (1.0 - exit_px / entry_px)
+                cost = 2.0 * fee_pct
+                net = gross - cost
+                return {
+                    "entry_idx": i_entry, "exit_idx": j,
+                    "bars_held": j - i_entry,
+                    "entry_px": entry_px, "exit_px": exit_px,
+                    "side": side, "gross_pct": round(100 * gross, 4),
+                    "fee_roundtrip_pct": round(100 * cost, 4),
+                    "roe_pct": round(100 * net * leverage, 3),
+                    "ret_pct": round(100 * net, 4),
+                    "reason": str(getattr(verdict, "reason", "") or "").split(" ", 1)[0],
+                    "mfe_pct": round(100 * float(getattr(verdict, "mfe_pct", 0) or 0), 3),
+                }
+        return None  # never exited within available series (right-censored)
+    finally:
+        dsl_module.time = real_time_mod
 
 
 def _load_cache(path, interval="15m"):

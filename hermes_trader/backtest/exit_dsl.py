@@ -27,15 +27,15 @@ after the entry open). The bar cadence is configurable via ``bar_ms`` so
 non-5m backtests still measure timeouts in real minutes (the production DSL
 cadence is fixed wall-clock time, not a bar count).
 
-Clock injection note: production ``check()`` reads module-level ``time``; until
-P1 adds an explicit clock seam we freeze ``time.time``/``time.monotonic``
-process-wide ONLY inside the two synchronous ``check()`` calls and restore them
-in ``finally``. Backtests run in a dedicated single-threaded process.
+Clock injection note: production ``check()`` reads ``dsl_exit.time``. Inside the
+synchronous ``check()`` calls we temporarily rebind ``time.time``/``time.monotonic``
+on the ``dsl_exit`` MODULE ONLY (never the shared stdlib ``time`` module) via
+:func:`_frozen_clock` and restore them in ``finally``, so the frozen instant can
+never leak to other modules or across tests.
 """
 from __future__ import annotations
 
 import contextlib
-import time
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -66,15 +66,30 @@ def _shared_time_index(period: str, bars: object) -> list[int]:
 
 @contextlib.contextmanager
 def _frozen_clock(wall: float, mono: float):
-    """Temporarily pin time.time/monotonic; restored even if check() raises."""
-    real_time, real_mono = time.time, time.monotonic
-    time.time = lambda: wall
-    time.monotonic = lambda: mono
+    """Pin the clock the DSL hot path reads; restored even if check() raises.
+
+    Production ``check()`` resolves ``time`` as the module global in
+    ``dsl_exit``; ``dsl_exit.time`` itself is the shared stdlib ``time``
+    module singleton, so reassigning ``dsl_exit.time.time`` would mutate that
+    singleton for EVERY module that did ``import time`` (the previous bug:
+    the frozen instant leaked process-wide for the whole window — and
+    permanently if the context was abandoned mid-rebind — stamping 1970
+    epochs into the session log / sidecars of unrelated tests under
+    pytest-xdist). Instead we swap ONLY the ``time`` NAME in the
+    ``dsl_exit`` globals for a tiny shim and restore the binding in
+    ``finally``; the stdlib module object is never touched.
+    """
+    import types
+
+    real_mod = dx.time
+    # Forward sleep: check() may reach save-backoff code that sleeps.
+    fake = types.SimpleNamespace(
+        time=lambda: wall, monotonic=lambda: mono, sleep=real_mod.sleep)
+    dx.time = fake
     try:
         yield
     finally:
-        time.time = real_time
-        time.monotonic = real_mono
+        dx.time = real_mod
 
 
 @contextlib.contextmanager
@@ -169,7 +184,7 @@ class DslBarExit:
             return
         best_ms: Optional[int] = None
         best_period: Optional[str] = None
-        now_ms = int(time.time() * 1000)
+        now_ms = int(dx.time.time() * 1000)
         entry_ms = self.entry_time_ms
         for period, bars in self.ignition_series.items():
             cfg = dx.IGNITE_PERIOD_DEFAULTS.get(period)

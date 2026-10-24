@@ -243,13 +243,22 @@ def replay_engine(policy, prints, entry_px, entry_t_ms, leverage):
         # 60s loop would act on), with time injected to that print's wall clock.
         ts, mark = rows[-1]
         last_ts, last_mark = ts, mark
+        import types
         import hermes_trader.agents.dsl_exit as dmod
-        _real_time = dmod.time.time
-        dmod.time.time = (lambda t=ts: t / 1000.0)
+        # Swap only the ``time`` NAME on the dsl module for a shim; the stdlib
+        # ``time`` module is a process-wide singleton, so reassigning
+        # ``dmod.time.time`` would freeze the clock for every other module
+        # during this check (leaking into parallel tests). Restore the binding
+        # in ``finally``.
+        _real_time_mod = dmod.time
+        dmod.time = types.SimpleNamespace(
+            time=lambda t=ts: t / 1000.0,
+            monotonic=_real_time_mod.monotonic,
+            sleep=_real_time_mod.sleep)
         try:
             v = tr.check(mark)
         finally:
-            dmod.time.time = _real_time
+            dmod.time = _real_time_mod
         if v.exit:
             return {
                 "exit": True, "kind": "trailing", "ts": ts, "px": mark,
