@@ -37,6 +37,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -328,6 +329,11 @@ def update_llm_profile(pid: str, data: dict[str, Any]) -> list[str]:
             prof["api_key"] = new_key.strip()
         doc["llm"]["profiles"][pid] = prof
         _write_raw(doc)
+        was_default = doc["llm"].get("default_profile_id") == pid
+    # N4-a: editing the active default profile changes live routing — apply it
+    # to this process now and flag that trading_loop needs a container recreate.
+    if was_default:
+        live_apply_default_llm_profile(doc)
     return []
 
 
@@ -351,6 +357,9 @@ def set_default_llm_profile(pid: str) -> list[str]:
             return ["profile 不存在"]
         doc["llm"]["default_profile_id"] = pid
         _write_raw(doc)
+    # N4-a: hot-apply to THIS (server) process immediately; the independent
+    # trading_loop process still needs a container recreate (warning inside).
+    live_apply_default_llm_profile(doc)
     return []
 
 
@@ -447,3 +456,131 @@ def bootstrap_env() -> None:
         _setdefault_nonempty("OPENROUTER_API_KEY", prof.get("api_key"))
         _setdefault_nonempty("OPENROUTER_BASE_URL", prof.get("base_url"))
         _setdefault_nonempty("OPENROUTER_MODEL", prof.get("model"))
+
+
+# 默认 LLM profile -> 当前进程 OPENROUTER_* 的实时映射（N4-a）。
+_LLM_PROFILE_ENV_MAP = {
+    "api_key": "OPENROUTER_API_KEY",
+    "base_url": "OPENROUTER_BASE_URL",
+    "model": "OPENROUTER_MODEL",
+}
+
+
+def live_apply_default_llm_profile(doc: Optional[dict[str, Any]] = None) -> bool:
+    """把默认 LLM profile 立即写入**当前进程** ``os.environ``。
+
+    与 :func:`bootstrap_env` 的区别：bootstrap 用 ``setdefault`` 且只在启动
+    时补齐缺失值；本函数在操作员通过界面**切换/编辑默认 profile 后**调用，
+    因此对非空值做实时覆盖，让 server 进程立刻生效。
+
+    重要限制：docker-compose 下 ``hermes_trader.server`` 与
+    ``scripts/trading_loop.py`` 是**两个独立进程**，本函数只能影响调用方
+    （server）。真正下单/调用 LLM 的交易循环要等容器重建才会重新 bootstrap，
+    故此处显式 WARNING 提示，避免"界面已改、交易仍旧值"的静默错觉。
+
+    返回是否找到并应用了某个默认 profile。
+    """
+    if doc is None:
+        doc = _read_raw()
+    llm = doc.get("llm") or {}
+    pid = llm.get("default_profile_id")
+    prof = (llm.get("profiles") or {}).get(pid) if pid else None
+    if not isinstance(prof, dict):
+        return False
+    applied: list[str] = []
+    for leaf, env in _LLM_PROFILE_ENV_MAP.items():
+        s = str(prof.get(leaf) or "").strip()
+        if s:
+            os.environ[env] = s
+            applied.append(env)
+    if applied:
+        logger.warning(
+            "[secrets] default LLM profile '%s' hot-applied to THIS process "
+            "(%s); the separate trading_loop process keeps the old value until "
+            "the container is recreated (docker compose up -d --force-recreate "
+            "hermes-trader)",
+            pid,
+            ",".join(sorted(applied)),
+        )
+    return bool(applied)
+
+
+def _fingerprint(value: str) -> str:
+    """短、非可逆的密钥指纹（sha256 前 8 位），仅用于来源比对，不泄露明文。"""
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+
+
+def _env_local_value(key: str) -> str:
+    """从 .env.local 读单个键的原始值（不经过 os.environ）。文件缺失返回 ''。
+
+    与 trading_loop/server 的加载口径一致：忽略空行/注释/行内空白，第一个 '='
+    分隔。仅用于启动期来源比对。
+    """
+    for cand in (
+        ".env.local",
+        os.path.join(_PROJECT_ROOT, ".env.local"),
+    ):
+        try:
+            with open(cand, "r") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, _, v = line.partition("=")
+                        if k.strip() == key:
+                            return v.strip()
+        except OSError:
+            continue
+    return ""
+
+
+def warn_on_secret_source_divergence() -> dict[str, str]:
+    """N4-c：启动时比对三处 LLM 密钥源，存在分歧则 WARNING。
+
+    三个可能来源：
+      - ``env``     进程实际生效的 ``OPENROUTER_API_KEY``（真实容器 env 或
+                    ``.env.local`` 经 env_file/加载器注入后的最终值）
+      - ``file``    本进程直接解析 ``.env.local`` 得到的原始值
+      - ``secrets`` ``.secrets.json`` 默认 LLM profile 的 api_key
+
+    仅比较**实际提供了非空值**的来源；缺一则跳过（那是 bootstrap 的正常补齐
+    场景，不是冲突）。两个及以上来源都有值却不一致时报警（只打指纹与掩码），
+    返回 ``{source: fingerprint}`` 便于测试。绝不抛出、绝不打印明文。
+    """
+    try:
+        sources: dict[str, str] = {}
+
+        env_val = (os.environ.get("OPENROUTER_API_KEY") or "").strip()
+        if env_val:
+            sources["env"] = env_val
+
+        file_val = _env_local_value("OPENROUTER_API_KEY").strip()
+        if file_val:
+            sources["file"] = file_val
+
+        try:
+            doc = _read_raw()
+            llm = doc.get("llm") or {}
+            dpid = llm.get("default_profile_id")
+            dprof = (llm.get("profiles") or {}).get(dpid) if dpid else None
+            sec_val = str((dprof or {}).get("api_key") or "").strip()
+        except Exception:
+            sec_val = ""
+        if sec_val:
+            sources["secrets"] = sec_val
+
+        fps = {name: _fingerprint(v) for name, v in sources.items()}
+        if len(set(fps.values())) > 1:
+            detail = ", ".join(
+                f"{name}=fp:{fp} {mask(sources[name])}" for name, fp in sorted(fps.items())
+            )
+            logger.warning(
+                "[secrets] LLM API key differs across configured sources — "
+                "%s; effective routing uses the process env value; reconcile to "
+                "one source to avoid ambiguous live/shadow behaviour",
+                detail,
+            )
+        return fps
+    except Exception as e:  # 启动观测绝不能阻断交易
+        logger.debug("[secrets] divergence check skipped: %s", e)
+        return {}
+

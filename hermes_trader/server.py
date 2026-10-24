@@ -47,9 +47,15 @@ _load_env_local_early()
 # hermes_trader 模块导入前注入 os.environ。放在 .env.local 之后并用
 # setdefault，因此真实环境变量 / K8s Secret 优先级最高，secret 文件只补齐。
 try:
-    from hermes_trader.agents.secret_store import bootstrap_env as _bootstrap_secrets
+    from hermes_trader.agents.secret_store import (
+        bootstrap_env as _bootstrap_secrets,
+    )
+    from hermes_trader.agents.secret_store import (
+        warn_on_secret_source_divergence as _warn_secret_divergence,
+    )
 
     _bootstrap_secrets()
+    _warn_secret_divergence()
 except Exception as _e:  # 绝不能因 secret 加载问题阻断启动
     import logging as _logging
 

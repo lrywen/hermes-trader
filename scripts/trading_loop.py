@@ -23,7 +23,13 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-# Load .env.local (CWD-relative, matches skill restart command).
+# Load .env.local (CWD-relative, matches skill restart command). Use setdefault
+# (N4-e): docker-compose already injects this same file via `env_file:`, and a
+# real container/K8s env var must win over the file. Unconditional "=" here used
+# to clobber injected env AND made it impossible for .secrets.json to fill
+# gaps. Mirrors hermes_trader/server.py::_load_env_local_early exactly so the
+# server and trading-loop processes resolve secrets with identical precedence:
+# real env > .env.local > .secrets.json (bootstrap below) > in-code default.
 env_path = '.env.local'
 if os.path.exists(env_path):
     with open(env_path) as f:
@@ -31,7 +37,28 @@ if os.path.exists(env_path):
             line = line.strip()
             if line and not line.startswith('#') and '=' in line:
                 key, _, val = line.partition('=')
-                os.environ[key.strip()] = val.strip()
+                os.environ.setdefault(key.strip(), val.strip())
+
+# N4-e: the trading loop is a SEPARATE process from hermes_trader.server (see
+# docker-entrypoint.sh), so it never inherited the server's bootstrap_env().
+# Without this, secrets saved only to .secrets.json were invisible to the
+# process that actually places trades. setdefault keeps .env.local/real-env
+# authoritative; failures must never block startup (same contract as server).
+try:
+    from hermes_trader.agents.secret_store import (
+        bootstrap_env as _bootstrap_secrets,
+    )
+    from hermes_trader.agents.secret_store import (
+        warn_on_secret_source_divergence as _warn_secret_divergence,
+    )
+
+    _bootstrap_secrets()
+    _warn_secret_divergence()
+except Exception as _e:  # 绝不能因 secret 加载问题阻断启动
+    import logging as _logging
+
+    _logging.getLogger("hermes-secrets").debug("secret bootstrap skipped: %s", _e)
+
 
 # Tolerant argparse — `--env prod --daemon` were silently dropped before.
 # Now they're parsed (and ignored) instead of raising on stray flags some

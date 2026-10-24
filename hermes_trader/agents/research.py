@@ -1303,6 +1303,40 @@ def _call_openrouter(
         content = choice.get("message", {}).get("content", "") or ""
         finish_reason = choice.get("finish_reason") or ""
 
+        # N4-f: a 200 with EMPTY content is NOT a success. The two distinct
+        # causes used to be indistinguishable (the debate leg logged every
+        # empty body as "(timeout/HTTP error)", and a reasoning model that
+        # burns the whole max_tokens budget on chain-of-thought returns
+        # finish_reason="length" with content="" — which the continuation
+        # guard below can't recover from because it requires non-empty seed
+        # content). Classify explicitly so this is diagnosable from logs and
+        # the breaker/metrics treat it as a failure rather than outcome="ok".
+        if not content.strip():
+            usage = data.get("usage") or {}
+            reasoning_tokens = int(
+                (usage.get("completion_tokens_details") or {}).get(
+                    "reasoning_tokens"
+                )
+                or 0
+            )
+            if finish_reason == "length":
+                logger.error(
+                    "[research] LLM empty content with finish_reason=length "
+                    f"(reasoning_tokens={reasoning_tokens} budget={max_tokens}) "
+                    "— reasoning exhausted the token budget before any answer; "
+                    "raise debate/max_tokens or use a lower-reasoning model"
+                )
+                _llm_metric_outcome(path, "length_empty", _t_started)
+            else:
+                logger.error(
+                    f"[research] LLM returned 200 with empty content "
+                    f"(finish_reason={finish_reason or 'none'} "
+                    f"reasoning_tokens={reasoning_tokens})"
+                )
+                _llm_metric_outcome(path, "empty", _t_started)
+            _llm_record_failure()  # P3-2: empty body is not a usable success
+            return ""
+
         # P2-5: truncated output (finish_reason=length). Ask the model to keep
         # going from where it stopped and concatenate the raw chunks, so a JSON
         # object cut mid-stream is reassembled into something parse_structured
@@ -2035,12 +2069,16 @@ def _debate_direct(
         raise
     # _call_openrouter swallows HTTP/timeout errors and returns "" — treat that
     # as a failure so the debate path falls back instead of feeding an empty
-    # string into the arbiter (which would always parse-fail).
+    # string into the arbiter (which would always parse-fail). The underlying
+    # cause (HTTP error / timeout / empty body / finish_reason=length with the
+    # budget spent on reasoning) is logged by _call_openrouter; N4-f stopped
+    # mislabelling every empty body here as a "(timeout/HTTP error)".
     if not out or not out.strip():
         elapsed = int((time.time() - t0) * 1000)
         logger.warning(
             f"[debate] call EMPTY | role={role} elapsed_ms={elapsed} "
-            f"(timeout/HTTP error from LLM endpoint)"
+            f"model={role_model or '<default>'} — see the [research] line "
+            "above for the classified cause (http/timeout/empty/length)"
         )
         try:
             from hermes_trader import metrics
