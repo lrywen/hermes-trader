@@ -89,7 +89,12 @@ def _rsi_from_closes(closes: list[float], period: int = 14) -> list[float]:
 
     avg_g = g / period
     avg_l = l / period
-    out[period] = 100 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
+    # Full-checkup 2026-10-24 (P1-1): ``avg_l == 0`` conflates "no down bars"
+    # (genuine RSI 100) with "no movement at all" (avg_g == avg_l == 0), which
+    # is mathematically no information, not maximum overbought. A flat tape
+    # returning RSI 100 can falsely trip the late_chase 1h-RSI blowoff gate.
+    # Flat -> neutral 50; strictly-nonnegative moves with zero losses -> 100.
+    out[period] = 100 if avg_l == 0 and avg_g > 0 else (50 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
 
     for i in range(period + 1, len(closes)):
         d = closes[i] - closes[i - 1]
@@ -98,7 +103,7 @@ def _rsi_from_closes(closes: list[float], period: int = 14) -> list[float]:
         # `d if d < 0 else -d` fed negatives in and drove RSI below 0.
         avg_g = (avg_g * (period - 1) + (d if d > 0 else 0)) / period
         avg_l = (avg_l * (period - 1) + (-d if d < 0 else 0)) / period
-        out[i] = 100 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l)
+        out[i] = 100 if avg_l == 0 and avg_g > 0 else (50 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
 
     return out
 

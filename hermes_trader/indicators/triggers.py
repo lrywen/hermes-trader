@@ -24,6 +24,18 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
         return {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
                 "z": 0.0, "direction": "flat"}
 
+    # Indicator full-checkup 2026-10-24 (P1-3): the CURRENT bar's return must be
+    # defined. A zero/non-positive prior close (candles[-2].c) makes it undefined.
+    # The loop below drops such pairs with ``continue`` (correct for the baseline
+    # sample), but if the dropped pair is the *current* one, ``returns[-1]`` then
+    # silently aliases an earlier bar's return and that stale value is scored as
+    # "now" — observed fabricating a ~170-sigma phantom -100% down spike. Guard
+    # the current pair explicitly up front.
+    _flat = {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
+             "z": 0.0, "direction": "flat"}
+    if candle_val(candles[-2], "c") <= 0:
+        return _flat
+
     returns = []
     for i in range(1, len(candles)):
         prev_close = candle_val(candles[i - 1], "c")
@@ -96,7 +108,17 @@ def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHi
     variance = sum((v - mean) ** 2 for v in window) / len(window)
     std = variance ** 0.5
 
-    if std == 0:
+    # B8 follow-up (indicator full-checkup 2026-10-24): an exact ``std == 0``
+    # guard misses near-zero baseline dispersion the same way the return side
+    # did. A window that is economically constant (e.g. alternating
+    # 100.0/100.0001) yields std ~ 5e-5 while a +0.02% current bar measures
+    # ~399 sigma and would grab a full composite 10. Volume carries units (a
+    # BTC's 1 != an altcoin's 1), so the return-side absolute floor 5e-5 does
+    # NOT transfer; use the dimensionless coefficient of variation instead.
+    # CV < 0.1% means the baseline is effectively flat, so a z against it is
+    # noise regardless of scale. mean<=0 also fails closed (no baseline scale).
+    _VOL_CV_MIN = 1e-3
+    if mean <= 0 or std < mean * _VOL_CV_MIN:
         return {"name": "volumeSpike", "score": 0, "reason": "flat", "fired": False,
                 "z": 0.0}
 
@@ -956,6 +978,13 @@ def composite_score(hits: list[TriggerHit], weights: dict[str, float]) -> float:
     total_weight = sum(weights.values()) or 1
     weighted_sum = sum(h["score"] * weights.get(h["name"], 0) for h in fired_hits)
     raw = (weighted_sum / total_weight) * 10
+    # Indicator full-checkup 2026-10-24 (P2-1): a NaN/inf propagated from any
+    # fired hit's score is fail-OPEN under plain clamp — Python's min(100, nan)
+    # returns 100 (``nan < 100`` is False), so a single NaN scores a coin at the
+    # 100 ceiling ("strongest coin"). The codebase convention is fail-closed;
+    # clamp an unfinite aggregate to 0 rather than surface a phantom max score.
+    if not math.isfinite(raw):
+        return 0.0
     return max(0, min(100, raw))
 
 

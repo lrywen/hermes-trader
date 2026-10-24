@@ -200,6 +200,72 @@ def test_composite_score_in_range():
     assert composite_score([], weights) == 0
 
 
+def test_rsi_flat_tape_is_neutral_not_overbought():
+    """Indicator full-checkup 2026-10-24 P1-1: a perfectly flat series
+    (avg_gain == avg_loss == 0) carries no information and must read RSI 50,
+    not 100. Returning 100 falsely trips the late_chase 1h-RSI blowoff gate
+    (rsi_high=88) on a coin that has simply not moved. Strictly monotone series
+    with zero losses must still read 100 (genuine overbought)."""
+    from hermes_trader.indicators.math import rsi
+    flat = [Candle(t=i, o=100, h=100, l=100, c=100.0, v=10) for i in range(40)]
+    assert abs(rsi(flat, 14)[-1] - 50.0) < 1e-9
+    up = [Candle(t=i, o=100 + i, h=100 + i, l=100 + i, c=100.0 + i, v=10) for i in range(40)]
+    assert abs(rsi(up, 14)[-1] - 100.0) < 1e-9
+
+
+def test_volume_spike_near_constant_baseline_does_not_fire():
+    """P1-2: with only an exact-zero guard, a near-constant volume window
+    (alternating 100.0/100.0001, CV~5e-7) inflated a +0.02% bar to a ~399 sigma
+    "spike" worth a full composite 10. The dimensionless CV floor (<0.1%) must
+    reject it, while a real ~3x spike against a naturally variable baseline
+    still fires."""
+    from hermes_trader.indicators.triggers import volume_spike
+    # near-constant baseline + tiny current change -> flat, not 399 sigma
+    near = [Candle(t=i, o=100, h=100, l=100, c=100.0,
+                   v=100.0 if i % 2 == 0 else 100.0001) for i in range(20)]
+    near.append(Candle(t=20, o=100.02, h=100.02, l=100.02, c=100.02, v=100.02))
+    h = volume_spike(near, 3)
+    assert h["fired"] is False and h["reason"] == "flat"
+    # naturally variable baseline (CV ~35%) + ~3x volume still fires
+    vols = [590.0, 1452.0, 970.0, 1332.0, 651.0, 766.0, 1100.0, 1490.0, 820.0, 700.0]
+    vols = vols * 2  # 20 bars, mean ~957, pstdev well above CV floor
+    var = [Candle(t=i, o=100, h=100, l=100, c=100.0, v=v) for i, v in enumerate(vols)]
+    var.append(Candle(t=20, o=101, h=101, l=100, c=101.0, v=3200.0))
+    assert volume_spike(var, 3)["fired"] is True
+
+
+def test_pct_move_spike_undefined_current_return_fails_closed():
+    """P1-3: if the current bar's prior close (candles[-2].c) is non-positive,
+    the current return is undefined. The loop drops that pair via continue,
+    after which returns[-1] aliases an EARLIER bar and was scored as 'now',
+    fabricating a phantom ~170 sigma down spike. It must return flat instead."""
+    from hermes_trader.indicators.triggers import pct_move_spike
+    # 39 valid random-walk bars, then a zero close as the penultimate bar
+    import random
+    random.seed(1)
+    px = 100.0
+    rows = []
+    for i in range(39):
+        px *= (1 + random.uniform(-0.01, 0.01))
+        rows.append(Candle(t=i, o=px, h=px, l=px, c=px, v=10))
+    rows.append(Candle(t=39, o=0, h=0, l=0, c=0.0, v=10))   # bad prior close
+    rows.append(Candle(t=40, o=95, h=95, l=95, c=95.0, v=10))  # current bar
+    h = pct_move_spike(rows, 3)
+    assert h["fired"] is False and h["reason"] == "flat"
+
+
+def test_composite_score_nan_is_fail_closed():
+    """P2-1: plain ``max(0, min(100, raw))`` is fail-OPEN on NaN because
+    min(100, nan) returns 100 — a single NaN fired-hit score ranked the coin at
+    the 100 ceiling. An unfinite aggregate must clamp to 0."""
+    from hermes_trader.indicators.triggers import composite_score
+    w = {"x": 1.0}
+    assert composite_score([{"name": "x", "score": float("nan"), "fired": True}], w) == 0.0
+    assert composite_score([{"name": "x", "score": float("inf"), "fired": True}], w) == 0.0
+    # finite behaviour unchanged
+    assert composite_score([{"name": "x", "score": 5.0, "fired": True}], w) == 50.0
+
+
 def test_momentum_burst_fires_on_large_move():
     from hermes_trader.indicators.triggers import momentum_burst
     flat = [Candle(t=i, o=100, h=100, l=100, c=100.0, v=10) for i in range(10)]
