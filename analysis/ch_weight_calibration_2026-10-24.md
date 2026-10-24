@@ -1,5 +1,21 @@
 # 权重 × min_composite 联合标定反事实回测 — 2026-10-24
 
+> **ADDENDUM 2026-10-24（ADX 曲线变更后复核，commit 831fd33）**
+> 本报告的 composite 用的是 **legacy ADX 曲线**（硬分支 `adx>45 → ×0.5`，
+> f51ce79/831fd33 之前）。当天晚些时候 trendStrength 的 ADX 晚期惩罚改为
+> 对称渐变带 `[43,47)`。用 **当前生产新权重（Σ=1.80）** 在完全相同的
+> 26,699 个 fired 5m bar 上对两条曲线双列重跑（`ch_adx_curve_baseline_rerun.py`）：
+>
+> | 曲线 | 过45门 | 过45(无bypass) | 过54门 |
+> |---|---:|---:|---:|
+> | legacy（旧断崖） | **26** | 8 | 12 |
+> | taper[43,47)（现网） | **26** | 8 | 12 |
+>
+> **完全相同——本报告的过闸计数与结论在新曲线下不变。** 旧权重(Σ=1.85)下
+> legacy=100 / taper=99（仅 −1），说明曲线影响只有在 trendStrength 权重高
+> (0.55)时才显现 1 条，生产权重 0.30 下被完全吸收。报告正文为 legacy 口径，
+> 结论（权重 promote 净砍信号、真正的 edge 在 regime 而非分数）方向不变。
+
 回答 v11 评估 §2.1 留下的唯一"需回测确认"：`trigger_weights` 把
 `trend_strength 0.55→0.30`、新增 `uptrend_momentum 0→0.20` 之后，
 `min_composite` 仍停在 **45** 没动——这次权重 promote 是不是在静默掐断原本能进场的信号？
