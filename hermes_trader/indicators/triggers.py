@@ -398,6 +398,16 @@ def range_compression(
     }
 
 
+# Semantic version of the trigger composite scoring scale. Bump whenever the
+# score->ADX (or any trigger-score) mapping changes in a way that makes
+# composite_score values incomparable across the boundary. Recorded on scored
+# perceptions so cross-period A/B analyses can split samples by scoring scale
+# (e.g. before/after the ADX late-trend taper). Human-readable on purpose: a
+# sha would be opaque and churn on unrelated refactors.
+#   pre-2026-10-24: legacy hard branch (adx>45 -> x0.5); implicit "legacy".
+SCORE_VERSION = "adx_taper_43_47_v1"
+
+
 def trend_strength(candles: list[Candle], adx_period: int = 14) -> TriggerHit:
     """Trend strength via ADX(14)."""
     if len(candles) < adx_period * 2 + 1:
@@ -410,32 +420,48 @@ def trend_strength(candles: list[Candle], adx_period: int = 14) -> TriggerHit:
         return {"name": "trendStrength", "score": 0, "reason": "flat", "fired": False}
 
     fired = last_adx >= 25
-    # ADX is non-linear across a trend's lifecycle:
-    #   25-40  = early/mature trend            -> full score
-    #   40-50  = extending into exhaustion     -> score ramps 1.0x -> 0.5x
-    #   >=50   = late/extended trend           -> HALF score (chase risk)
-    # The raw `last_adx / 4` map would keep rewarding higher ADX all the way
-    # to 50+, which systematically surfaced coins already at trend exhaustion.
+    # ADX late-trend score taper (symmetric band centred on the legacy cliff).
     #
-    # 2026-10-24 (indicator-param review): the previous hard branch
-    # ``>45 -> x0.5`` created a score cliff — ADX 45.0 scored 10 but 45.1 scored
-    # 5, a 0.1-reading swing halving a 0.30-weight trigger, non-monotonically
-    # (46 then scored *below* 44). Replace it with a continuous linear taper
-    # over [40,50): multiplier 1.0 at <=40, 0.5 at >=50. No new config knob and
-    # no weight change; only the discontinuity is removed.
-    if last_adx <= 40:
+    # Legacy map (R1/R2 tuning, commit 6e6cae9) hard-branched at ADX>45 to HALF
+    # the raw `adx/4` score, deliberately suppressing trend-exhaustion names
+    # ("systematically surfaced coins already at trend exhaustion"). That hard
+    # branch was discontinuous: ADX 45.0 scored 10 but ADX 45.1 scored 5 — a
+    # 0.1-reading swing halving a 0.30-weight trigger, non-monotonically.
+    #
+    # 2026-10-24 (f51ce79 follow-up; selection review): replace the cliff with a
+    # linear taper over the narrow symmetric band [43,47), multiplier 1.0x at
+    # ADX<=43 ramping to 0.5x at ADX>=47. The band is symmetric about the legacy
+    # breakpoint 45, so f(45)=7.5 splits the 5-point drop evenly (2.5 each side).
+    # That midpoint placement is minimax-optimal: max |score delta| vs the
+    # legacy curve is the irreducible 2.5 (composite 2.5 * 0.30/1.80 * 10 =
+    # 4.167, 9.3% of the 45 gate) for ANY continuous replacement; an asymmetric
+    # band that held the left side flat ([45,55)) would dump the whole 5 points
+    # on the right and peak at ~+8.3 composite while never lowering a score — a
+    # one-directional loosening that effectively disabled the chase guard. The
+    # narrow half-width 2 minimises the blast radius (fewest coins move) at the
+    # same irreducible peak.
+    #
+    # KNOWN BEHAVIOUR CHANGE, not a pure no-op fix: scores redistribute inside
+    # ADX 43-47 (peak +-2.5 score / +-4.167 composite). Live 50-coin snapshot:
+    # 11 coins affected, mean shift -0.008 (neutral), no directional bias, and
+    # current candidates sit far below the gate so admission impact is nil
+    # today. This is a registered, to-be-validated alpha hypothesis (tracked via
+    # score_version "adx_taper_43_47_v1"), not a zero-alpha refactor. No new
+    # config knob and no trigger-weight change; the >=25 fire threshold and the
+    # 0.5x exhaustion floor (now at ADX>=47) are preserved.
+    if last_adx <= 43:
         late_mult = 1.0
-    elif last_adx >= 50:
+    elif last_adx >= 47:
         late_mult = 0.5
     else:
-        late_mult = 1.0 - 0.5 * (last_adx - 40) / 10
+        late_mult = 1.0 - 0.5 * (last_adx - 43) / 4
     base = min(10, max(0, last_adx / 4)) * late_mult
 
     return {
         "name": "trendStrength",
         "score": base if fired else 0,
         "reason": (f"ADX {last_adx:.1f} trending" +
-                   (" (late/extended)" if last_adx > 40 else ""))
+                   (" (late/extended)" if last_adx > 43 else ""))
         if fired else "flat",
         "fired": fired,
     }

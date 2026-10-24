@@ -92,7 +92,13 @@ def _run_all_hits(c5m: list[Candle], c1h: list[Candle],
             confirm_bars=th["breakoutConfirmBars"],
         ),
         trigger_mod.range_compression(c5m, th["bbLength"], th["bbStdDev"]),
-        trigger_mod.trend_strength(c5m, th["adxPeriod"]),
+        # Production build_hits feeds trend_strength the 1h series (triggers.py
+        # build_hits L870), not 5m. ADX is scale-sensitive and the late-trend
+        # taper is non-linear, so scoring it on 5m made this audit incomparable
+        # to production; use the 1h window. (range_compression above still uses
+        # 5m here because this script fetches no 15m series; production feeds it
+        # 15m — a known residual mismatch, not changed without a 15m fetch.)
+        trigger_mod.trend_strength(c1h, th["adxPeriod"]),
         trigger_mod.momentum_burst(c5m, th["momentumLookback"], th["momentumPct"]),
         trigger_mod.volume_buildup_1h(c1h, th["volBuildupRatio"]),
         trigger_mod.trend_flip_1h(c1h, th["trendFlipBars"]),

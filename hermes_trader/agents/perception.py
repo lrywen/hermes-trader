@@ -1029,6 +1029,10 @@ def _scan_single_market(
             "mid": mid,
             "triggers": hits,
             "composite_score": score,
+            # Scoring-scale tag so cross-period analyses can split composite
+            # values before/after a trigger-score mapping change (see
+            # triggers.SCORE_VERSION). Flows into scan / snapshot / gate logs.
+            "score_version": trigger_mod.SCORE_VERSION,
             "volume_profile": _volume_profile_info,
             "cvd_divergence": _cvd_divergence_info,
             "whale_signal": whale,  # None unless coin is in oi_funding_anomaly hits

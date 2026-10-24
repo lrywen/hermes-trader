@@ -534,9 +534,10 @@ def test_breakout_confirm_bars_equals_one_restores_old_behavior():
     assert r["fired"] is True
 
 
-def test_trend_strength_halves_score_above_adx_50(monkeypatch):
-    """ADX>=50 is a late/extended trend — its score must be HALF the raw
-    last_adx/4 map, so the composite stops surfacing trend-exhaustion names."""
+def test_trend_strength_halves_score_above_taper_end(monkeypatch):
+    """ADX>=47 is the late/extended end of the taper band — at and above it the
+    score is HALF the raw (capped) last_adx/4 map, so the composite stops
+    surfacing trend-exhaustion names. ADX 50 -> raw 12.5 capped 10 -> x0.5 = 5."""
     from hermes_trader.indicators import triggers
     cs = _trend_candles(100)
     # Force a finite, very high ADX reading.
@@ -548,11 +549,11 @@ def test_trend_strength_halves_score_above_adx_50(monkeypatch):
     assert abs(r["score"] - 5.0) < 1e-9
 
 
-def test_trend_strength_score_is_continuous_across_old_adx_45_cliff(monkeypatch):
-    """2026-10-24 indicator-param review: the former hard branch ``adx>45 ->
-    x0.5`` made ADX 45.0 score 10 and 45.1 score 5 — a 0.1-reading swing halved
-    a 0.30-weight trigger, non-monotonically. The taper over [40,50) must be
-    continuous and non-increasing in ADX."""
+def test_trend_strength_taper_symmetric_band_anchors_and_continuity(monkeypatch):
+    """2026-10-24 f51ce79 follow-up (selection review): the cliff replacement is
+    a linear taper over the narrow SYMMETRIC band [43,47), centred on the legacy
+    breakpoint 45. Anchors: 43 -> full 10, 45 -> midpoint 7.5, 47 -> half 5. The
+    curve must be continuous (no 5-point jump) and non-increasing in ADX."""
     from hermes_trader.indicators import triggers
     cs = _trend_candles(100)
 
@@ -563,17 +564,53 @@ def test_trend_strength_score_is_continuous_across_old_adx_45_cliff(monkeypatch)
                 [float("nan")] * (len(candles) - 1) + [a])
         return triggers.trend_strength(cs)["score"]
 
-    # No jump across the old boundary.
+    # Anchors: full at/below 43, midpoint at 45, half at/above 47.
+    assert abs(score_for(43.0) - 10.0) < 1e-9
     assert abs(score_for(45.0) - 7.5) < 1e-9
-    assert abs(score_for(45.1) - 7.45) < 1e-9
-    assert score_for(45.0) - score_for(45.1) < 0.1  # tiny delta, not a 5-pt cliff
-    # Monotonic non-increasing across the whole taper band.
-    vals = [score_for(a) for a in (40.0, 42.0, 44.0, 46.0, 48.0, 50.0)]
-    assert all(vals[i] >= vals[i + 1] - 1e-9 for i in range(len(vals) - 1))
-    # Full score retained at and below 40; half at/above 50.
-    assert abs(score_for(40.0) - 10.0) < 1e-9
-    assert abs(score_for(50.0) - 5.0) < 1e-9
+    assert abs(score_for(47.0) - 5.0) < 1e-9
     assert abs(score_for(60.0) - 5.0) < 1e-9
+    # 45.1 no longer falls off a cliff: it sits just below the 45 midpoint.
+    assert abs(score_for(45.1) - 7.375) < 1e-9
+    assert score_for(45.0) - score_for(45.1) < 0.2  # tiny delta, not a 5-pt cliff
+    # Monotonic non-increasing across and around the taper band.
+    vals = [score_for(a) for a in (43.0, 44.0, 45.0, 46.0, 47.0, 50.0)]
+    assert all(vals[i] >= vals[i + 1] - 1e-9 for i in range(len(vals) - 1))
+
+
+def test_trend_strength_taper_never_exceeds_minimax_deviation(monkeypatch):
+    """Guard against silently widening/offsetting the band (e.g. regressing to an
+    asymmetric [45,55) band). Any continuous replacement of the legacy 5-point
+    cliff has an irreducible peak deviation of 2.5 score points (splitting the
+    drop evenly at the 45 midpoint). A one-sided band that holds the left flat
+    pushes the whole drop to the right and peaks near 5 (composite ~+8.3). Sweep
+    ADX and assert the new curve never deviates from the legacy curve by more
+    than the minimax bound."""
+    from hermes_trader.indicators import triggers
+    cs = _trend_candles(100)
+
+    def legacy_score(a):
+        if a < 25:
+            return 0.0
+        raw = min(10, max(0, a / 4))
+        return raw * (0.5 if a > 45 else 1.0)
+
+    def score_for(adx_val):
+        monkeypatch.setattr(
+            triggers, "adx",
+            lambda candles, period, a=adx_val:
+                [float("nan")] * (len(candles) - 1) + [a])
+        return triggers.trend_strength(cs)["score"]
+
+    a = 25.0
+    while a <= 60.0 + 1e-9:
+        assert abs(score_for(a) - legacy_score(a)) <= 2.5 + 1e-9
+        a += 0.1
+
+    # Maximum adjacent 0.1-ADX step stays bounded (taper slope 1.25 score/ADX ->
+    # 0.125 per 0.1 step), far below the legacy 5.0 jump.
+    steps = [abs(score_for(round(a, 1)) - score_for(round(a - 0.1, 1)))
+             for a in [25.0 + 0.1 * i for i in range(1, 360)]]
+    assert max(steps) <= 0.2
 
 
 def test_trend_strength_full_score_in_mature_trend(monkeypatch):
