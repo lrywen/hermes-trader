@@ -118,6 +118,43 @@ def test_ema_sma():
     assert ema([], 8) == []
 
 
+def test_sma_nan_poisons_only_covering_windows_then_recovers():
+    """Indicator full-checkup 2026-10-24 P1-4: a single non-finite bar must make
+    exactly the `period` windows that contain it NaN, then the SMA recovers once
+    the bar slides out. The old running accumulator did ``acc += nan`` once and
+    stayed NaN forever (100 -> 31 valid range_compression bandwidths). All-finite
+    output must remain bit-identical to the accumulator path."""
+    import math
+    from hermes_trader.indicators.math import sma
+
+    p = 20
+    vals = [1.0] * 60
+    vals[20] = float("nan")
+    s = sma(vals, p)
+    # warmup (i<19) NaN; windows i=20..39 cover idx20 and are NaN; i>=40 recover.
+    for i in range(p - 1, 20):
+        assert math.isfinite(s[i])          # windows before the dirty bar valid
+    for i in range(20, 40):
+        assert math.isnan(s[i])             # the 20 windows covering idx20
+    assert all(math.isfinite(s[i]) and s[i] == 1.0 for i in range(40, 60))
+
+    # All-finite bit-identity with the original accumulator algorithm.
+    def old_sma(values, period):
+        out = [float("nan")] * len(values)
+        acc = 0.0
+        for i in range(len(values)):
+            acc += values[i]
+            if i >= period:
+                acc -= values[i - period]
+            if i >= period - 1:
+                out[i] = acc / period
+        return out
+
+    seq = [float(x) for x in range(120)]
+    new, old = sma(seq, p), old_sma(seq, p)
+    assert all((math.isnan(a) and math.isnan(b)) or a == b for a, b in zip(new, old))
+
+
 def test_directional_momentum_triggers_are_symmetric():
     """uptrend_momentum fires on a sustained UP move, downtrend_momentum on a
     sustained DOWN move, and each stays silent on the opposite/flat — the

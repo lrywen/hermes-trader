@@ -39,16 +39,41 @@ def ema(values: list[float], period: int) -> list[float]:
 
 
 def sma(values: list[float], period: int) -> list[float]:
-    """Simple moving average."""
+    """Simple moving average.
+
+    A window containing any non-finite value is NaN (the mean is undefined), but
+    NaN no longer POISONS every later window: once the bad sample has slid out
+    of the trailing window the SMA recovers. Full-checkup 2026-10-24 (P1-4): the
+    previous running-accumulator form did ``acc += NaN`` once and then every
+    subsequent ``acc - x`` stayed NaN, so one dirty bar wiped 69% of a
+    range_compression bandwidth history (100 -> 31 valid) silently.
+
+    On all-finite input this is bit-identical to the old accumulator path (it
+    uses the same incremental add/subtract), so normal-data output is unchanged.
+    """
     _check_period(period)
     out = [float("nan")] * len(values)
-    acc = 0.0
-    for i in range(len(values)):
-        acc += values[i]
-        if i >= period:
-            acc -= values[i - period]
-        if i >= period - 1:
-            out[i] = acc / period
+    # Indexes of non-finite samples; only when the input is dirty do we take the
+    # (slightly more expensive) per-window NaN-membership path.
+    dirty = [i for i, x in enumerate(values) if not isinstance(x, (int, float)) or not math.isfinite(x)]
+    if not dirty:
+        acc = 0.0
+        for i in range(len(values)):
+            acc += values[i]
+            if i >= period:
+                acc -= values[i - period]
+            if i >= period - 1:
+                out[i] = acc / period
+        return out
+
+    dirty_set = set(dirty)
+    for i in range(period - 1, len(values)):
+        lo = i - period + 1
+        # Window is valid only if none of its `period` samples is dirty. Check
+        # membership against the (typically tiny) dirty index set.
+        if any(j in dirty_set for j in range(lo, i + 1)):
+            continue
+        out[i] = sum(values[lo: i + 1]) / period
     return out
 
 
