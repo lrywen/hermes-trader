@@ -2230,6 +2230,8 @@ while True:
         log_event({"event": "scan",
                    "perceptions": len(results),
                    "triggers": len(results),
+                   "score_version": next((p.get("score_version") for p in results
+                                          if p.get("score_version")), None),
                    "start_ts_ms": _scan_started_ms,
                    "scan_duration_ms": max(0, _scan_done_ms - _scan_started_ms),
                    "coins": [p.get("coin") for p in results if p.get("coin")],

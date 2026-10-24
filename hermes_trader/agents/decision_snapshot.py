@@ -87,6 +87,10 @@ def build_snapshot_record(
             "coin": str(coin),
             "mid": _finite(perception.get("mid")),
             "composite_score": _finite(perception.get("composite_score")),
+            # Scoring-scale tag (triggers.SCORE_VERSION) so counterfactual
+            # replay can split composite values across score-mapping changes.
+            # Absent/None on old rows means the pre-taper legacy curve.
+            "score_version": perception.get("score_version"),
             "triggers": _compact_triggers(perception.get("triggers")),
         }
         # Microstructure reads are optional nested blobs; keep only if present.
