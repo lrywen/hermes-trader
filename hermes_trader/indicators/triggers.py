@@ -411,23 +411,31 @@ def trend_strength(candles: list[Candle], adx_period: int = 14) -> TriggerHit:
 
     fired = last_adx >= 25
     # ADX is non-linear across a trend's lifecycle:
-    #   25-30  = early trend (best entry window) -> full score
-    #   30-45  = mature trend                    -> standard score
-    #   >45    = extended/ late trend            -> HALF score (chase risk)
+    #   25-40  = early/mature trend            -> full score
+    #   40-50  = extending into exhaustion     -> score ramps 1.0x -> 0.5x
+    #   >=50   = late/extended trend           -> HALF score (chase risk)
     # The raw `last_adx / 4` map would keep rewarding higher ADX all the way
     # to 50+, which systematically surfaced coins already at trend exhaustion.
-    if last_adx > 45:
-        base = min(10, max(0, last_adx / 4)) * 0.5
-    elif last_adx >= 25:
-        base = min(10, max(0, last_adx / 4))
+    #
+    # 2026-10-24 (indicator-param review): the previous hard branch
+    # ``>45 -> x0.5`` created a score cliff — ADX 45.0 scored 10 but 45.1 scored
+    # 5, a 0.1-reading swing halving a 0.30-weight trigger, non-monotonically
+    # (46 then scored *below* 44). Replace it with a continuous linear taper
+    # over [40,50): multiplier 1.0 at <=40, 0.5 at >=50. No new config knob and
+    # no weight change; only the discontinuity is removed.
+    if last_adx <= 40:
+        late_mult = 1.0
+    elif last_adx >= 50:
+        late_mult = 0.5
     else:
-        base = 0
+        late_mult = 1.0 - 0.5 * (last_adx - 40) / 10
+    base = min(10, max(0, last_adx / 4)) * late_mult
 
     return {
         "name": "trendStrength",
         "score": base if fired else 0,
         "reason": (f"ADX {last_adx:.1f} trending" +
-                   (" (late/extended)" if last_adx > 45 else ""))
+                   (" (late/extended)" if last_adx > 40 else ""))
         if fired else "flat",
         "fired": fired,
     }

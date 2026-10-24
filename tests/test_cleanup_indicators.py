@@ -534,8 +534,8 @@ def test_breakout_confirm_bars_equals_one_restores_old_behavior():
     assert r["fired"] is True
 
 
-def test_trend_strength_halves_score_above_adx_45(monkeypatch):
-    """ADX>45 is a late/extended trend — its score must be HALF the raw
+def test_trend_strength_halves_score_above_adx_50(monkeypatch):
+    """ADX>=50 is a late/extended trend — its score must be HALF the raw
     last_adx/4 map, so the composite stops surfacing trend-exhaustion names."""
     from hermes_trader.indicators import triggers
     cs = _trend_candles(100)
@@ -544,8 +544,36 @@ def test_trend_strength_halves_score_above_adx_45(monkeypatch):
     r = triggers.trend_strength(cs)
     assert r["fired"] is True
     assert "late/extended" in r["reason"]
-    # raw 50/4 = 12.5 -> capped 10 -> halved = 5.0
+    # raw 50/4 = 12.5 -> capped 10 -> taper multiplier 0.5 = 5.0
     assert abs(r["score"] - 5.0) < 1e-9
+
+
+def test_trend_strength_score_is_continuous_across_old_adx_45_cliff(monkeypatch):
+    """2026-10-24 indicator-param review: the former hard branch ``adx>45 ->
+    x0.5`` made ADX 45.0 score 10 and 45.1 score 5 — a 0.1-reading swing halved
+    a 0.30-weight trigger, non-monotonically. The taper over [40,50) must be
+    continuous and non-increasing in ADX."""
+    from hermes_trader.indicators import triggers
+    cs = _trend_candles(100)
+
+    def score_for(adx_val):
+        monkeypatch.setattr(
+            triggers, "adx",
+            lambda candles, period, a=adx_val:
+                [float("nan")] * (len(candles) - 1) + [a])
+        return triggers.trend_strength(cs)["score"]
+
+    # No jump across the old boundary.
+    assert abs(score_for(45.0) - 7.5) < 1e-9
+    assert abs(score_for(45.1) - 7.45) < 1e-9
+    assert score_for(45.0) - score_for(45.1) < 0.1  # tiny delta, not a 5-pt cliff
+    # Monotonic non-increasing across the whole taper band.
+    vals = [score_for(a) for a in (40.0, 42.0, 44.0, 46.0, 48.0, 50.0)]
+    assert all(vals[i] >= vals[i + 1] - 1e-9 for i in range(len(vals) - 1))
+    # Full score retained at and below 40; half at/above 50.
+    assert abs(score_for(40.0) - 10.0) < 1e-9
+    assert abs(score_for(50.0) - 5.0) < 1e-9
+    assert abs(score_for(60.0) - 5.0) < 1e-9
 
 
 def test_trend_strength_full_score_in_mature_trend(monkeypatch):
