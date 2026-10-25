@@ -80,5 +80,17 @@ def test_volume_profile_atr_bins_and_chase_risk():
 
     assert vp is not None
     assert vp.bin_size > 0
-    assert vp.chase_risk(vp.vah, atr_value=1.0) >= 0.5
+    # V2: signed ATR distance is positive above POC, negative below.
     assert vp.distance_from_poc_atr(vp.poc + 2.0, atr_value=1.0) == pytest.approx(2.0)
+    assert vp.distance_from_poc_atr(vp.poc - 2.0, atr_value=1.0) == pytest.approx(-2.0)
+
+    # V1: at/below POC is never a chase -> 0 (the old abs() version flagged it).
+    assert vp.chase_risk(vp.poc, atr_value=1.0) == 0.0
+    assert vp.chase_risk(vp.poc - 5.0, atr_value=1.0) == 0.0
+
+    # V2: one VA half-width above POC saturates to 1.0; the mapping is
+    # continuous and stays inside [0, 1] (no more fixed-ladder jump).
+    half = (vp.vah - vp.val) / 2.0
+    assert vp.chase_risk(vp.poc + half) == pytest.approx(1.0)
+    assert 0.0 < vp.chase_risk(vp.poc + half / 2.0) < 1.0
+    assert 0.0 <= vp.chase_risk(vp.poc + half * 10.0) <= 1.0

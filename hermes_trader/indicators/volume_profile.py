@@ -38,30 +38,41 @@ class VolumeProfile:
 
     def distance_from_poc_atr(self, price: float, atr_value: float | None
                                ) -> float | None:
+        # Signed: >0 above POC, <0 below POC. The old abs() made "chasing up"
+        # indistinguishable from "dipping below POC" (full review 2026-10-25
+        # V1: 52.6% of risk==1.0 samples were actually below POC). Observational
+        # callers that need a magnitude take abs() themselves.
         if atr_value is None or atr_value <= 0:
             return None
-        return abs(price - self.poc) / atr_value
+        return (price - self.poc) / atr_value
 
     def chase_risk(self, price: float, atr_value: float | None = None
                    ) -> float:
-        """返回0-1的追单风险，只用于观测/评分，不直接触发交易。"""
-        pos = self.position_pct(price)
-        if pos is None:
-            return 0.0
-        risk = 0.0
-        if pos >= 40.0:
-            risk = min(0.25, (pos - 40.0) / 40.0 * 0.25)
-        if pos >= 60.0:
-            risk = max(risk, 0.25 + (pos - 60.0) / 20.0 * 0.25)
-        if pos >= 80.0:
-            risk = max(risk, 0.5 + (pos - 80.0) / 20.0 * 0.5)
+        """Signed chase risk in [0, 1]; observation only, never triggers trades.
 
-        atr_distance = self.distance_from_poc_atr(price, atr_value)
-        if atr_distance is not None and atr_distance >= 1.5:
-            risk = max(risk, 1.0)
-        elif atr_distance is not None and atr_distance >= 1.0:
-            risk = max(risk, 0.7)
-        return round(min(1.0, risk), 4)
+        V1 (full review 2026-10-25): only prices ABOVE the POC are a chase, so
+        anything at/below POC returns 0.0 outright.
+
+        V2: normalize the POC extension by the value-area half-width
+        ``(vah-val)/2`` and map it continuously — extension of one VA half-width
+        above POC maps to 1.0. The old code combined a discontinuous position_pct
+        ladder with a hard ATR-distance clamp that saturated at risk=1.0 for
+        ~64% of samples, so it carried almost no information. ATR stays the
+        fallback scale when the value area is degenerate.
+        """
+        if price <= self.poc:
+            return 0.0
+
+        rng = self.vah - self.val
+        half_width = rng / 2.0 if rng > 0 else 0.0
+        if half_width > 0:
+            extension = (price - self.poc) / half_width
+        elif atr_value is not None and atr_value > 0:
+            # Degenerate VA: fall back to one ATR == full risk.
+            extension = (price - self.poc) / atr_value
+        else:
+            return 0.0
+        return round(min(1.0, max(0.0, extension)), 4)
 
 
 def _candle_value(c: Any, key: str) -> float:
