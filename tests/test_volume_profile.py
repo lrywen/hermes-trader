@@ -41,7 +41,9 @@ def test_volume_profile_distributes_volume_by_price_overlap():
     vp = volume_profile(candles, bins=10, value_area_pct=70.0)
 
     assert vp is not None
-    assert sum(volume for _, volume in vp.bins) == pytest.approx(100.0)
+    # V7: the per-bin counts array is no longer materialised on the result
+    # (test-only field removed); overlap weighting is still observable via the
+    # POC landing in the lowest price bin for this single wide candle.
     assert vp.poc == pytest.approx(91.0)
     assert vp.vah >= vp.poc
     assert vp.val <= vp.poc
@@ -57,9 +59,13 @@ def test_volume_profile_position_and_distance_helpers():
 
     assert vp is not None
     if vp.vah > vp.val:
+        rng = vp.vah - vp.val
         assert vp.position_pct(vp.val) == pytest.approx(0.0)
         assert vp.position_pct(vp.vah) == pytest.approx(100.0)
         assert vp.position_pct((vp.val + vp.vah) / 2) == pytest.approx(50.0)
+        # V4: no clamp — extension past VAL/VAH is preserved with its sign.
+        assert vp.position_pct(vp.vah + rng) == pytest.approx(200.0)
+        assert vp.position_pct(vp.val - rng) == pytest.approx(-100.0)
     else:
         assert vp.position_pct(vp.val) is None
     assert vp.distance_from_poc_pct(vp.poc * 1.01) == pytest.approx(1.0)

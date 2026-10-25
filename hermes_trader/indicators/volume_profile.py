@@ -21,15 +21,22 @@ class VolumeProfile:
     vah: float
     val: float
     bin_size: float
-    bins: list[tuple[float, float]]
     atr_last: float | None = None
 
     def position_pct(self, price: float) -> float | None:
-        """VAL处为0，VAH处为100；范围为空时返回None。"""
+        """Signed position within the value area: VAL=0, VAH=100.
+
+        Not clamped (V4, full review 2026-10-25): prices below VAL return a
+        negative value and above VAH a value over 100, preserving how far price
+        extends past the value area instead of flattening every breakout to the
+        boundary. Existing consumers threshold on ``<= low`` / ``>= high``,
+        whose decision is unchanged by removing the clamp. Returns None when
+        the value-area range is empty.
+        """
         rng = self.vah - self.val
         if rng <= 0:
             return None
-        return max(0.0, min(100.0, (price - self.val) / rng * 100.0))
+        return (price - self.val) / rng * 100.0
 
     def distance_from_poc_pct(self, price: float) -> float | None:
         if self.poc <= 0:
@@ -181,6 +188,5 @@ def volume_profile(
         vah=center(vah_i),
         val=center(val_i),
         bin_size=bin_size,
-        bins=[(center(i), counts[i]) for i in range(resolved_bins)],
         atr_last=atr_last,
     )
