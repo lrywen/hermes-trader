@@ -103,11 +103,30 @@ def test_partial_ic_survives_independent_information():
 
 
 def test_ic_by_volatility_group_buckets():
-    rows = [{"v": float(i), "f": float(i), "r": float(i)}
+    rows = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
             for i in range(120)]
     g = ic_by_volatility_group(rows, "f", "r", "v", n_groups=3, min_per_group=20)
     assert set(g.groups) == {"low", "mid", "high"}
     assert g.consistent is True  # all strongly positive
+
+
+def test_ic_by_volatility_group_raises_without_coin_identity():
+    # Regression guard for the residual pooling leak: rows with no coin key
+    # (or all coin=None) must fail fast instead of collapsing to one group and
+    # returning pooled IC=1.0 / consistent=True for a scale factor.
+    no_coin = [{"v": float(i), "f": float(i), "r": float(i)}
+               for i in range(30)]
+    with pytest.raises(ValueError, match="coin"):
+        ic_by_volatility_group(no_coin, "f", "r", "v", min_per_group=5)
+    all_none = [{"coin": None, "v": float(i), "f": float(i), "r": float(i)}
+                for i in range(30)]
+    with pytest.raises(ValueError, match="coin"):
+        ic_by_volatility_group(all_none, "f", "r", "v", min_per_group=5)
+    # A single explicitly-named coin is allowed (degenerate but intentional).
+    one_coin = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
+                for i in range(30)]
+    g = ic_by_volatility_group(one_coin, "f", "r", "v", min_per_group=5)
+    assert g.n == 30
 
 
 def test_ic_by_volatility_group_rejects_pure_coin_scale_factor():

@@ -183,6 +183,17 @@ def ic_by_volatility_group(
     every bucket and a false "consistent".
     """
     data = _finite_rows(rows, [feature_key, ret_key, vol_key])
+    # Fail fast if coin identity is missing/None on every row: demeaning would
+    # then collapse every row into one coin=None group and silently degrade to
+    # a pooled IC, which is exactly the scale-factor leak this gate removes.
+    # (A single real coin is a legitimate — if degenerate — explicit input.)
+    coin_vals = [r.get(coin_key) for r in data]
+    if not data or all(c is None for c in coin_vals):
+        raise ValueError(
+            f"ic_by_volatility_group requires a usable {coin_key!r} on every "
+            "row for within-coin demeaning; got no coin identity (missing key "
+            "or all None). Pass coin_key= or add the coin field instead of "
+            "silently pooling.")
     f_resid, y_resid = _within_coin_demean(data, feature_key, ret_key, coin_key)
     order = sorted(range(len(data)), key=lambda i: data[i][vol_key])
     size = max(1, len(order) // n_groups)
