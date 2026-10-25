@@ -33,6 +33,27 @@ def test_slim_missing_join_keys_are_empty_strings():
     slim = tr.slim_analysis({"coin": "X"})
     assert slim["id"] == "" and slim["trace_id"] == ""
     assert slim["coin"] == "X"
+    # fired_triggers always lands as a list even when absent on the source.
+    assert slim["fired_triggers"] == []
+
+
+def test_slim_keeps_fired_triggers_compact_and_bounded():
+    # Audit 2026-10-25 §2.3: the trigger set that caused the surfacing must be
+    # attributable directly from the durable events.jsonl analysis record.
+    slim = tr.slim_analysis({"id": "A", "coin": "ETH",
+                             "fired_triggers": ["breakout", "volumeSpike"]})
+    assert slim["fired_triggers"] == ["breakout", "volumeSpike"]
+
+    # Defensive: de-dupe, drop non-strings/empties, cap length, trim tokens.
+    messy = ["a", "a", "", "b", 7, None, "  c  "] + [f"t{i}" for i in range(40)]
+    out = tr.slim_analysis({"id": "A", "fired_triggers": messy})["fired_triggers"]
+    assert out[:3] == ["a", "b", "c"]
+    assert len(out) == tr._MAX_FIRED_TRIGGERS
+    assert all(isinstance(x, str) and len(x) <= 48 for x in out)
+
+    # A non-iterable / wrong-typed value degrades to [] rather than raising.
+    assert tr.slim_analysis({"id": "A", "fired_triggers": "breakout"})[
+        "fired_triggers"] == []
 
 
 # ── durable append + index/lookup (event_log monkeypatched) ──────────────────

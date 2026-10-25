@@ -34,7 +34,36 @@ _SLIM_FIELDS = (
     "debate_used", "debate_state", "ai_down", "nlp_parsed", "json_parsed",
     "degraded",
     "perception_id",
+    # Audit 2026-10-25 §2.3: the fired-trigger set already exists on the full
+    # in-memory analysis (research._build_analysis) but was dropped here, so
+    # production events.jsonl could not attribute a surfacing to the trigger
+    # that caused it without an offline replay. A compact list of short names
+    # is cheap and bounded (projected defensively in slim_analysis).
+    "fired_triggers",
 )
+
+# Trigger names are short camelCase tokens; cap the durable list so a malformed
+# perception can never bloat the per-verdict ledger line.
+_MAX_FIRED_TRIGGERS = 16
+
+
+def _compact_fired_triggers(value: Any) -> list[str]:
+    """Project a fired_triggers value to a bounded list[str] of short names."""
+    if not isinstance(value, (list, tuple, set)):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for name in value:
+        if not isinstance(name, str):
+            continue
+        token = name.strip()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        out.append(token[:48])
+        if len(out) >= _MAX_FIRED_TRIGGERS:
+            break
+    return out
 
 
 def slim_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
@@ -51,6 +80,9 @@ def slim_analysis(analysis: dict[str, Any]) -> dict[str, Any]:
     for k in _SLIM_FIELDS:
         if k in analysis:
             out[k] = analysis[k]
+    # Bounded, type-safe projection (never trust the perception payload shape).
+    out["fired_triggers"] = _compact_fired_triggers(
+        analysis.get("fired_triggers"))
     return out
 
 
