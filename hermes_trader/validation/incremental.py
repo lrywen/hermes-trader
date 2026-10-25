@@ -138,21 +138,52 @@ class VolGroupIC:
     consistent: bool           # same sign in all populated groups
 
 
+def _within_coin_demean(
+    data: list[dict], feature_key: str, ret_key: str, coin_key: str
+) -> tuple[list[float], list[float]]:
+    """Subtract each coin's own mean from BOTH feature and return (iron-law #2).
+
+    Mirrors ``fixed_effect_ic`` so a pure per-coin scale/membership factor has
+    zero within-coin variation and cannot look predictive inside a bucket.
+    Coins with a single finite observation demean to exactly 0.0 on both axes.
+    """
+    sum_f: dict = {}
+    sum_y: dict = {}
+    cnt: dict = {}
+    cs = [r.get(coin_key) for r in data]
+    for c, r in zip(cs, data):
+        fv, yv = float(r[feature_key]), float(r[ret_key])
+        sum_f[c] = sum_f.get(c, 0.0) + fv
+        sum_y[c] = sum_y.get(c, 0.0) + yv
+        cnt[c] = cnt.get(c, 0) + 1
+    mean_f = {c: sum_f[c] / cnt[c] for c in cnt}
+    mean_y = {c: sum_y[c] / cnt[c] for c in cnt}
+    f_resid = [float(r[feature_key]) - mean_f[c] for c, r in zip(cs, data)]
+    y_resid = [float(r[ret_key]) - mean_y[c] for c, r in zip(cs, data)]
+    return f_resid, y_resid
+
+
 def ic_by_volatility_group(
     rows: list[dict],
     feature_key: str,
     ret_key: str,
     vol_key: str,
+    coin_key: str = "coin",
     n_groups: int = 3,
     min_per_group: int = 20,
 ) -> VolGroupIC:
-    """Within-group Spearman IC after bucketing rows by ``vol_key`` quantile.
+    """Within-coin Spearman IC after bucketing rows by ``vol_key`` quantile.
 
-    Rows are ranked globally by volatility then split into ``n_groups`` equal
-    buckets (low/mid/high); IC is computed per bucket. ``consistent`` requires
-    the IC sign to agree across every populated bucket.
+    Both the feature and the forward return are de-meaned by coin FIRST (the
+    fixed-effect control of iron-law #2), then rows are ranked globally by
+    volatility and split into ``n_groups`` equal buckets (low/mid/high); IC is
+    computed per bucket on the within-coin residuals. ``consistent`` requires
+    the IC sign to agree across every populated bucket. Without the de-meaning
+    a pure scale factor (different coin -> different level) returns IC ~= 1 in
+    every bucket and a false "consistent".
     """
     data = _finite_rows(rows, [feature_key, ret_key, vol_key])
+    f_resid, y_resid = _within_coin_demean(data, feature_key, ret_key, coin_key)
     order = sorted(range(len(data)), key=lambda i: data[i][vol_key])
     size = max(1, len(order) // n_groups)
     labels = ["low", "mid", "high"] if n_groups == 3 else [f"g{i}" for i in range(n_groups)]
@@ -163,8 +194,8 @@ def ic_by_volatility_group(
         idx = order[lo:hi]
         if len(idx) < min_per_group:
             continue
-        f = [data[i][feature_key] for i in idx]
-        y = [data[i][ret_key] for i in idx]
+        f = [f_resid[i] for i in idx]
+        y = [y_resid[i] for i in idx]
         groups[labels[g] if g < len(labels) else f"g{g}"] = spearman_ic(f, y)
     signs = [1 if v > 0 else -1 for v in groups.values() if math.isfinite(v) and v != 0]
     consistent = len(set(signs)) == 1 and len(signs) == len(groups)

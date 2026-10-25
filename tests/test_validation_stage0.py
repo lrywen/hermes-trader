@@ -23,6 +23,7 @@ from hermes_trader.validation import (
     fixed_effect_ic,
     ic_by_volatility_group,
     partial_rank_ic,
+    simulate_size,
     simulate_sizes,
     spearman_ic,
     tradability_verdict,
@@ -109,6 +110,48 @@ def test_ic_by_volatility_group_buckets():
     assert g.consistent is True  # all strongly positive
 
 
+def test_ic_by_volatility_group_rejects_pure_coin_scale_factor():
+    # Iron-law #2 regression guard: a pure per-coin level/membership factor
+    # (feature and return only differ BETWEEN coins, ~zero within-coin) must
+    # NOT be judged "consistent" after within-coin demeaning. The old code
+    # pooled raw values and returned IC ~= +0.7 in every bucket.
+    import random
+    rnd = random.Random(0)
+    levels = {"A": 1.0, "B": 2.0, "C": 3.0, "D": 4.0, "E": 5.0}
+    vols = {"A": 0.5, "B": 1.0, "C": 1.5, "D": 2.0, "E": 2.5}
+    rows = []
+    for coin, lvl in levels.items():
+        for _ in range(90):  # enough per bucket (>=20)
+            rows.append({"coin": coin,
+                         "f": lvl + rnd.gauss(0.0, 1e-9),
+                         "r": lvl + rnd.gauss(0.0, 1e-9),
+                         "v": vols[coin]})
+    g = ic_by_volatility_group(rows, "f", "r", "v", n_groups=3, min_per_group=20)
+    # Within-coin variation is pure noise: no bucket keeps a meaningful IC.
+    assert all(abs(ic) < 0.2 for ic in g.groups.values())
+    assert g.consistent is False
+
+
+def test_ic_by_volatility_group_keeps_genuine_within_coin_edge():
+    # A real within-coin edge (feature up -> forward return up, inside each
+    # coin, regardless of the coin's level) must still pass through.
+    import random
+    rnd = random.Random(1)
+    levels = {"A": 1.0, "B": 4.0, "C": 2.0, "D": 5.0, "E": 3.0}
+    vols = {"A": 0.5, "B": 1.0, "C": 1.5, "D": 2.0, "E": 2.5}
+    rows = []
+    for coin, lvl in levels.items():
+        for _ in range(90):
+            z = rnd.gauss(0.0, 1.0)
+            rows.append({"coin": coin,
+                         "f": lvl + z,
+                         "r": lvl + 0.8 * z + rnd.gauss(0.0, 0.2),
+                         "v": vols[coin]})
+    g = ic_by_volatility_group(rows, "f", "r", "v", n_groups=3, min_per_group=20)
+    assert all(ic > 0.3 for ic in g.groups.values())
+    assert g.consistent is True
+
+
 # ── iron-law 3: cross-sectional portfolio tradability ─────────────────────
 
 def _res(n, gross, net, conc=0.2):
@@ -133,19 +176,55 @@ def test_tradability_passes_agreeing_positive():
 
 
 def test_simulate_sizes_one_signal_per_coin_per_day_and_cost():
+    # Exactly one row per (day, coin); cost is charged round-trip.
     rows = []
     for d in range(20):
         for c in range(6):
             rows.append({"day": d, "coin": f"C{c}",
                          "score": float(c), "ret": 0.002})
-        # duplicate row for same (day, coin) must be ignored
-        rows.append({"day": d, "coin": "C0", "score": 99.0, "ret": 0.9})
     res = simulate_sizes(rows, "score", "ret", sizes=(1, 5),
                          cost_bps=9.47, B=200)
-    # N=1 -> 20 entries (one per day); the spiky C0 duplicate never wins.
+    # N=1 -> 20 entries (one per day); N=5 -> 100.
     assert res[1].n_entries == 20
     assert res[5].n_entries == 100
     assert res[1].net_bps == pytest.approx(0.002 * 1e4 - 9.47)
+
+
+def test_simulate_size_fails_fast_on_duplicate_day_coin():
+    # Iron-law #3 regression guard: a duplicate (day, coin) must raise rather
+    # than silently keep whichever row happened to be first in input order.
+    rows = [
+        {"day": 0, "coin": "C0", "score": 1.0, "ret": 0.001},
+        {"day": 0, "coin": "C1", "score": 0.5, "ret": 0.001},
+    ]
+    # Unique rows are fine.
+    simulate_size(rows, N=2, feature_key="score", ret_key="ret", B=50)
+    # Adding a conflicting row for an existing pair must fail fast.
+    rows.append({"day": 0, "coin": "C0", "score": 9.0, "ret": -0.9})
+    with pytest.raises(ValueError, match="duplicate observation"):
+        simulate_size(rows, N=2, feature_key="score", ret_key="ret", B=50)
+
+
+def test_simulate_size_is_order_independent():
+    # Same data, different row order must give identical results. Build one
+    # unique row per (day, coin) with varied scores/returns, then shuffle.
+    import random
+    rows = []
+    rnd = random.Random(7)
+    for d in range(20):
+        for c in range(6):
+            rows.append({"day": d, "coin": f"C{c}",
+                         "score": rnd.random(), "ret": rnd.gauss(0.0, 0.002)})
+    base = simulate_size(rows, N=3, feature_key="score", ret_key="ret",
+                         cost_bps=9.47, B=500, seed=42)
+    for s in range(5):
+        shuffled = rows[:]
+        random.Random(s).shuffle(shuffled)
+        r = simulate_size(shuffled, N=3, feature_key="score", ret_key="ret",
+                          cost_bps=9.47, B=500, seed=42)
+        assert r.gross_bps == pytest.approx(base.gross_bps)
+        assert r.net_bps == pytest.approx(base.net_bps)
+        assert r.n_entries == base.n_entries
 
 
 # ── trial ledger ───────────────────────────────────────────────────────────

@@ -68,12 +68,15 @@ def simulate_size(
 ) -> PortfolioResult:
     """Pick the top-N coins by feature each day; equal weight; charge cost.
 
-    Only one observation per (day, coin) is allowed (extra rows for the same
-    pair are skipped, mirroring the "one bet per coin per day" rule). Forward
-    returns are fractions (0.001 = 10 bps). When fewer than N coins signal on a
-    day, the available ones are used.
+    Exactly one observation per (day, coin) is REQUIRED. If a duplicate pair is
+    present the call fails fast with ``ValueError``: silently keeping the first
+    row in input order made the result order-dependent (shuffling the same rows
+    could flip the headline sign). The caller must choose an aggregation policy
+    upstream (e.g. last signal of the day, or a mean) and de-duplicate before
+    calling. Forward returns are fractions (0.001 = 10 bps). When fewer than N
+    coins signal on a day, the available ones are used.
     """
-    # Group, enforcing one row per (day, coin).
+    # Group, enforcing exactly one row per (day, coin) with fail-fast.
     by_day: dict[str, dict[str, float]] = {}
     for r in rows:
         f, y = r.get(feature_key), r.get(ret_key)
@@ -83,8 +86,13 @@ def simulate_size(
             continue
         d, c = r[day_key], r[coin_key]
         by_day.setdefault(d, {})
-        if c not in by_day[d]:  # first (and only) signal per coin per day
-            by_day[d][c] = (float(f), float(y))
+        if c in by_day[d]:
+            raise ValueError(
+                f"duplicate observation for ({day_key}={d!r}, {coin_key}={c!r}): "
+                "simulate_size requires exactly one row per (day, coin). "
+                "De-duplicate/aggregate upstream with an explicit policy "
+                "instead of relying on input order.")
+        by_day[d][c] = (float(f), float(y))
 
     entries = []          # (day, gross_bps)
     day_gross: dict[str, list[float]] = {}
