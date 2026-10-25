@@ -13,10 +13,11 @@ def _coerce_float(value: object) -> float:
     Raw exchange/HL JSON can arrive with numeric fields as strings (e.g.
     ``"179.55"``); feeding those straight into arithmetic raises
     ``TypeError: unsupported operand type(s) for -: 'str' and 'str'`` deep
-    inside an indicator. A missing key keeps its historical default of 0;
-    ``None`` or an unparseable value degrades to NaN so the existing
-    is-finite / fail-closed guards reject the bar rather than silently
-    treating garbage as a real price.
+    inside an indicator. A missing key / ``None`` / unparseable value all
+    degrade to NaN so the existing is-finite / fail-closed guards reject the
+    bar rather than silently treating garbage as a real price. Returning 0 for
+    a missing OHLC field was worse: it fabricated a -100% spike on the next
+    return computation (full review 2026-10-25 residual hole).
     """
     if value is None:
         return float("nan")
@@ -26,13 +27,22 @@ def _coerce_float(value: object) -> float:
         return float("nan")
 
 
+_MISSING = object()
+
+
 def candle_val(c: Candle | dict[str, float], key: str) -> float:
-    """Read an OHLCV field from a Candle or a plain dict (always a float)."""
+    """Read an OHLCV field from a Candle or a plain dict (always a float).
+
+    A missing key/attribute returns NaN (fail-closed), never 0.
+    """
     if isinstance(c, dict):
         if key not in c:
-            return 0
+            return float("nan")
         return _coerce_float(c.get(key))
-    return _coerce_float(getattr(c, key, 0))
+    val = getattr(c, key, _MISSING)
+    if val is _MISSING:
+        return float("nan")
+    return _coerce_float(val)
 
 
 def _check_period(period: int) -> None:

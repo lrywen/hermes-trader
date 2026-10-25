@@ -107,7 +107,8 @@ def test_candle_val_dict_and_obj():
     from hermes_trader.indicators.math import candle_val
     assert candle_val(Candle(t=1, o=1, h=2, l=0.5, c=1.5, v=9), "c") == 1.5
     assert candle_val({"c": 7.0}, "c") == 7.0
-    assert candle_val({}, "c") == 0
+    # Missing key fails closed to NaN (never 0, which would fabricate a spike).
+    assert math.isnan(candle_val({}, "c"))
 
 
 def test_ema_sma():

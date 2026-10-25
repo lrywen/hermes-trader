@@ -41,8 +41,11 @@ def test_candle_val_coercing_numeric_strings_subtracts():
     assert imath.candle_val(d, "o") - imath.candle_val(d, "c") == pytest.approx(0.30)
 
 
-def test_candle_val_missing_key_defaults_zero():
-    assert imath.candle_val({"c": 1.0}, "absent") == 0
+def test_candle_val_missing_key_fails_closed_to_nan():
+    # A missing OHLC field must NOT default to 0 (that fabricated a -100%
+    # spike on the next return); it degrades to NaN so guards reject the bar.
+    assert math.isnan(imath.candle_val({"c": 1.0}, "absent"))
+    assert math.isnan(imath.candle_val({"o": 1.0}, "c"))
 
 
 def test_candle_val_none_and_unparseable_fail_closed_to_nan():
