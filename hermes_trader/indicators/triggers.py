@@ -270,8 +270,10 @@ def breakout(
                 "fired": True,
             }
         # Close beyond the edge on weak volume — structural interest but no
-        # institutional confirmation. Keep partial score for composite input
-        # but do NOT fire (the gate won't see it as a trigger).
+        # institutional confirmation. Record the 0.5x score for near-miss /
+        # observability surfaces only; it does NOT enter composite_score, which
+        # filters to fired hits on its first line, so this never raises the
+        # coin's composite. Do NOT fire (the gate won't see it as a trigger).
         return {
             "name": "breakout",
             "score": full_score * 0.5,
@@ -309,8 +311,9 @@ def breakout(
         }
 
     # A single (or not-yet-confirmed) close beyond the edge, or inside range.
-    # Award partial structural score for a lone break bar so composite sees
-    # the developing setup, but don't fire until confirm_bars have held.
+    # Record a partial structural score for a lone break bar (near-miss /
+    # observability only — composite_score skips non-fired hits), but don't
+    # fire until confirm_bars have held.
     if cur_close > prior_high:
         distance = cur_close - prior_high
         return {
@@ -1050,4 +1053,9 @@ def composite_score_aged(
     for h in fired_hits:
         weighted_sum += h["score"] * weights.get(h["name"], 0) * _factor(h["name"])
     raw = (weighted_sum / total_weight) * 10
+    # Match composite_score: a NaN/inf aggregate is fail-OPEN under plain clamp
+    # (min(100, nan) == 100), which would surface a phantom max aged score.
+    # Fail closed to 0 (P2-1 parity with composite_score).
+    if not math.isfinite(raw):
+        return 0.0
     return max(0, min(100, raw))

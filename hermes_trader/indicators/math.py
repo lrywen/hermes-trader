@@ -7,11 +7,32 @@ import math
 from hermes_trader.models.types import Candle
 
 
+def _coerce_float(value: object) -> float:
+    """Normalize an OHLCV cell to float.
+
+    Raw exchange/HL JSON can arrive with numeric fields as strings (e.g.
+    ``"179.55"``); feeding those straight into arithmetic raises
+    ``TypeError: unsupported operand type(s) for -: 'str' and 'str'`` deep
+    inside an indicator. A missing key keeps its historical default of 0;
+    ``None`` or an unparseable value degrades to NaN so the existing
+    is-finite / fail-closed guards reject the bar rather than silently
+    treating garbage as a real price.
+    """
+    if value is None:
+        return float("nan")
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return float("nan")
+
+
 def candle_val(c: Candle | dict[str, float], key: str) -> float:
-    """Read an OHLCV field from a Candle or a plain dict."""
+    """Read an OHLCV field from a Candle or a plain dict (always a float)."""
     if isinstance(c, dict):
-        return c.get(key, 0)
-    return getattr(c, key, 0)
+        if key not in c:
+            return 0
+        return _coerce_float(c.get(key))
+    return _coerce_float(getattr(c, key, 0))
 
 
 def _check_period(period: int) -> None:
