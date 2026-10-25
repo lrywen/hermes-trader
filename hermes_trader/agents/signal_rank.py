@@ -21,12 +21,15 @@ fields available BEFORE research:
   - trigger_quality: number + individual scores of fired triggers
   - whale         : presence of an OI/funding anomaly whale signal
   - cvd           : directional CVD divergence strength
-  - liquidity     : volume-profile read (prefers liquid, well-developed markets)
+  - liquidity     : top-of-book spread_bps (tight book = liquid); neutral 50
+                     when the observation-only spread read is absent/cold
   - class_penalty : HIP-3 markets are scored slightly below the main crypto
                     universe (higher spread / lower depth risk)
 """
 
 from __future__ import annotations
+
+import math
 
 from typing import Any, Mapping, Sequence
 
@@ -45,6 +48,11 @@ DEFAULT_SCORE_WEIGHTS: dict[str, float] = {
 #: HIP-3 markets get up to this many points subtracted from their final score
 #: (``class_penalty`` component). Main crypto universe gets 0.
 HIP3_CLASS_PENALTY = 60.0  # within the 0–100 class_penalty component
+
+#: Top-of-book spread (bps) at which the liquidity component saturates to 0.
+#: 50 bps is a deliberately illiquid ceiling (major crypto trades well inside
+#: ~10 bps); only the observation-only spread_bps field feeds this map.
+SPREAD_FLOOR_BPS = 50.0
 
 #: The seven perception trigger names treated as bullish (mirrors the inline
 #: set in ta_filter.intend_long). Single source of truth for P0-1 ranking and
@@ -147,13 +155,31 @@ def _liquidity_component(perception: dict[str, Any]) -> float:
         # No read: neutral rather than zero so absence of the optional block
         # doesn't systematically demote a coin.
         return 50.0
-    # Prefer an explicit normalised strength/readiness field when present;
-    # otherwise accept a present volume profile as moderately liquid.
+    # Prefer an explicit normalised strength/readiness field when a producer
+    # supplies one.
     for key in ("readiness", "liquidity", "strength"):
-        if key in vp:
-            return 100.0 * _clamp01(vp[key] if float(vp[key]) <= 1.0
-                                    else float(vp[key]) / 100.0)
-    return 55.0
+        if key in vp and vp[key] is not None:
+            try:
+                v = float(vp[key])
+            except (TypeError, ValueError):
+                continue
+            return 100.0 * _clamp01(v if v <= 1.0 else v / 100.0)
+    # Otherwise use the observation-only top-of-book spread (bps) recorded by
+    # launch_capture.spread_observe: a tight book means a liquid market. Map
+    # 0 bps -> 100, saturating to 0 at SPREAD_FLOOR_BPS. None (cold cache /
+    # observer disabled) is NO evidence, hence the same neutral 50.0 as a
+    # missing block — never a constant 55.0 that gives every coin the same
+    # non-neutral contribution (the dormant dead-dimension bug).
+    spread_bps = vp.get("spread_bps")
+    if spread_bps is None:
+        return 50.0
+    try:
+        bps = float(spread_bps)
+    except (TypeError, ValueError):
+        return 50.0
+    if not math.isfinite(bps) or bps < 0.0:
+        return 50.0
+    return 100.0 * _clamp01(1.0 - bps / SPREAD_FLOOR_BPS)
 
 
 def _class_penalty_component(perception: dict[str, Any]) -> float:

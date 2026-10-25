@@ -742,6 +742,16 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "atr_period": _num_leaf(1, 200),
             "atr_multiple": _num_leaf(0.01, 10.0),
         },
+        # Observation-only spread in bps; cache read, never a network fetch.
+        "spread_observe": {
+            "enabled": ("bool",),
+        },
+        # Candidate A record-only shadow arm (merge-plan §5.3); no trading.
+        "candidate_a_shadow": {
+            "enabled": ("bool",),
+            "require_regime_up": ("bool",),
+            "log_path": ("str",),
+        },
         "trades_capture": ("bool",),
     },
     "atr_risk_sizing": _ATR_RISK_SIZING_SPEC,

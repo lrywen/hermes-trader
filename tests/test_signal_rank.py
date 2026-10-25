@@ -182,3 +182,41 @@ def test_garbage_fields_do_not_raise():
     # Must not raise; falls back to safe zero/neutral components.
     s = sr.rank_score(p, None)
     assert 0.0 <= s <= 100.0
+
+
+def test_liquidity_component_neutral_when_no_evidence():
+    # No vp -> 50; vp present but no spread/strength field -> also 50 (the
+    # old code returned a constant 55.0 = dormant dead dimension).
+    assert sr._liquidity_component({}) == 50.0
+    assert sr._liquidity_component({"volume_profile": {}}) == 50.0
+    assert sr._liquidity_component(
+        {"volume_profile": {"poc": 1.0}}) == 50.0
+    # Cold/absent spread observation is no evidence, not a constant boost.
+    assert sr._liquidity_component(
+        {"volume_profile": {"spread_bps": None}}) == 50.0
+
+
+def test_liquidity_component_varies_with_spread():
+    tight = sr._liquidity_component({"volume_profile": {"spread_bps": 0.0}})
+    mid = sr._liquidity_component({"volume_profile": {
+        "spread_bps": sr.SPREAD_FLOOR_BPS / 2}})
+    wide = sr._liquidity_component({"volume_profile": {
+        "spread_bps": sr.SPREAD_FLOOR_BPS}})
+    assert tight > mid > wide
+    assert tight == pytest.approx(100.0)
+    assert mid == pytest.approx(50.0)
+    assert wide == pytest.approx(0.0)
+
+
+def test_liquidity_component_explicit_strength_still_honoured():
+    assert sr._liquidity_component(
+        {"volume_profile": {"readiness": 0.8}}) == pytest.approx(80.0)
+    assert sr._liquidity_component(
+        {"volume_profile": {"liquidity": 30.0}}) == pytest.approx(30.0)
+
+
+def test_liquidity_component_bad_spread_is_neutral():
+    assert sr._liquidity_component(
+        {"volume_profile": {"spread_bps": "x"}}) == 50.0
+    assert sr._liquidity_component(
+        {"volume_profile": {"spread_bps": -5}}) == 50.0

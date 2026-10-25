@@ -173,6 +173,24 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "atr_period": 14,
             "atr_multiple": 0.25,
         },
+        # Observation-only top-of-book spread in bps, attached to the
+        # volume_profile perception payload for research. Disabled by default;
+        # reads the L2 positive-result cache only — never a network fetch — so
+        # a cold cache records spread_bps=None. No scoring/routing consumer.
+        "spread_observe": {
+            "enabled": False,
+        },
+        # Candidate A preregistered shadow arm (merge-plan §5.3): the one
+        # offline-evidenced acceleration path (higherLows1h ∧ pctMoveSpike ∧
+        # volumeSpike under 1h regime=="up", fixed 4h hold, 9.47bp cost), but
+        # FWER p=0.205 so it stays record-only. Appends candidate_a_shadow.jsonl
+        # for the 250-trade forward re-judgement; never routes/orders, never
+        # flips allow_shorts. Disabled by default (strict no-op when off).
+        "candidate_a_shadow": {
+            "enabled": False,
+            "require_regime_up": True,
+            "log_path": "",
+        },
         "trades_capture": False,
     },
     "counter_regime_min_conf": 0.82,

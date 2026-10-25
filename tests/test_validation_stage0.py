@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -122,6 +123,17 @@ def test_ic_by_volatility_group_raises_without_coin_identity():
                 for i in range(30)]
     with pytest.raises(ValueError, match="coin"):
         ic_by_volatility_group(all_none, "f", "r", "v", min_per_group=5)
+    # PARTIAL missing (not all-None) must also raise: those rows pool into a
+    # synthetic coin=None group whose mean is just the pooled mean, re-opening
+    # the scale-factor leak. The guard is per-row, not "all missing".
+    partial = (
+        [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
+         for i in range(30)]
+        + [{"coin": None, "v": float(i), "f": float(i), "r": float(i)}
+           for i in range(30)]
+    )
+    with pytest.raises(ValueError, match="EVERY"):
+        ic_by_volatility_group(partial, "f", "r", "v", min_per_group=5)
     # A single explicitly-named coin is allowed (degenerate but intentional).
     one_coin = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
                 for i in range(30)]
@@ -169,6 +181,27 @@ def test_ic_by_volatility_group_keeps_genuine_within_coin_edge():
     g = ic_by_volatility_group(rows, "f", "r", "v", n_groups=3, min_per_group=20)
     assert all(ic > 0.3 for ic in g.groups.values())
     assert g.consistent is True
+
+
+def test_ic_by_volatility_group_requires_magnitude_not_just_sign(monkeypatch):
+    # Sign agreement alone is uninformative — three buckets share a sign by
+    # chance ~25% under the null, often with |IC|~1e-3. Pin the per-bucket
+    # Spearman to tiny same-sign values and assert the magnitude floor rejects
+    # them at the default 0.10 but accepts them when the gate is loosened.
+    from hermes_trader.validation import incremental as inc
+
+    base_rows = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
+                 for i in range(60)]
+
+    def run(floor):
+        vals = iter([0.0008, 0.0011, 0.0006])
+        monkeypatch.setattr(inc, "spearman_ic", lambda f, y: next(vals))
+        return ic_by_volatility_group(
+            base_rows, "f", "r", "v", n_groups=3, min_per_group=5,
+            min_abs_ic=floor)
+
+    assert run(0.10).consistent is False   # same sign but |IC| ~ 1e-3
+    assert run(0.0).consistent is True     # sign-only gate would pass them
 
 
 # ── iron-law 3: cross-sectional portfolio tradability ─────────────────────
@@ -269,3 +302,69 @@ def test_ledger_append_only_and_family_multiplicity(tmp_path):
     led.append(Trial(hypothesis="H3", caliber="c", n=100, net_bps=1.0,
                      p_raw=0.01, family="depth"))
     assert sum(1 for _ in open(path)) == 4
+
+
+# ── Stage 0 process glue: scripts/stage0_audit.py end-to-end ──────────────
+
+def _write_dataset(path, *, edge: bool, days: int = 30, seed: int = 5):
+    import random
+    rnd = random.Random(seed)
+    with open(path, "w", encoding="utf-8") as fh:
+        for d in range(days):
+            for ci, coin in enumerate("ABCDEFGH"):
+                z = rnd.gauss(0, 1)
+                ret = (0.004 * z if edge else 0.0) + rnd.gauss(0, 0.004)
+                fh.write(json.dumps({
+                    "day": f"2026-09-{d % 28 + 1:02d}", "coin": coin,
+                    "feat": z + ci, "ret": ret + ci * 0.0002,
+                    "vol": 1 + ci * 0.3 + rnd.gauss(0, 0.1)}) + "\n")
+
+
+def test_stage0_audit_cli_edge_clears_null_rejects_and_logs(tmp_path):
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    script = repo / "scripts" / "stage0_audit.py"
+    edge = tmp_path / "edge.jsonl"
+    null = tmp_path / "null.jsonl"
+    ledger = tmp_path / "trials.jsonl"
+    _write_dataset(edge, edge=True)
+    _write_dataset(null, edge=False)
+
+    def run(src, hyp):
+        return subprocess.run(
+            [sys.executable, str(script), "--input", str(src),
+             "--hypothesis", hyp, "--feature", "feat", "--ret", "ret",
+             "--vol", "vol", "--ledger", str(ledger)],
+            capture_output=True, text=True, cwd=str(repo))
+
+    r1 = run(edge, "edge H1")
+    assert r1.returncode == 0, r1.stdout + r1.stderr
+    assert json.loads(r1.stdout)["verdict"] == "reject_h0"
+    r2 = run(null, "null H2")
+    assert r2.returncode == 1, r2.stdout + r2.stderr
+    assert json.loads(r2.stdout)["verdict"] == "fail_reject"
+
+    # The process glue is the first real ledger writer: family m increments.
+    recs = [json.loads(l) for l in open(ledger)]
+    assert [r["trial_id"] for r in recs] == ["T0001", "T0002"]
+    assert [r["family_size_at_test"] for r in recs] == [1, 2]
+
+
+def test_stage0_audit_cli_dry_run_does_not_write(tmp_path):
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    script = repo / "scripts" / "stage0_audit.py"
+    src = tmp_path / "edge.jsonl"
+    ledger = tmp_path / "trials.jsonl"
+    _write_dataset(src, edge=True)
+    r = subprocess.run(
+        [sys.executable, str(script), "--input", str(src), "--hypothesis", "h",
+         "--feature", "feat", "--ret", "ret", "--vol", "vol",
+         "--ledger", str(ledger), "--dry-run"],
+        capture_output=True, text=True, cwd=str(repo))
+    assert r.returncode in (0, 1)
+    assert not ledger.exists()

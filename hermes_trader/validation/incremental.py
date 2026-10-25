@@ -135,7 +135,7 @@ def partial_rank_ic(
 class VolGroupIC:
     n: int
     groups: dict[str, float]   # volatility group label -> within-group IC
-    consistent: bool           # same sign in all populated groups
+    consistent: bool           # same sign AND |IC|>=min_abs_ic in every populated group
 
 
 def _within_coin_demean(
@@ -171,29 +171,43 @@ def ic_by_volatility_group(
     coin_key: str = "coin",
     n_groups: int = 3,
     min_per_group: int = 20,
+    min_abs_ic: float = 0.10,
 ) -> VolGroupIC:
     """Within-coin Spearman IC after bucketing rows by ``vol_key`` quantile.
 
     Both the feature and the forward return are de-meaned by coin FIRST (the
     fixed-effect control of iron-law #2), then rows are ranked globally by
     volatility and split into ``n_groups`` equal buckets (low/mid/high); IC is
-    computed per bucket on the within-coin residuals. ``consistent`` requires
-    the IC sign to agree across every populated bucket. Without the de-meaning
-    a pure scale factor (different coin -> different level) returns IC ~= 1 in
-    every bucket and a false "consistent".
+    computed per bucket on the within-coin residuals.
+
+    ``consistent`` requires BOTH (a) the IC sign to agree across every
+    populated bucket AND (b) every bucket's ``|IC|`` to clear ``min_abs_ic``
+    (default 0.10). Sign agreement alone is uninformative — with three buckets
+    a pure-noise feature lands on the same sign by chance ~25% of the time,
+    often with |IC| ~ 1e-3. Monte Carlo at n~100/bucket shows a fixed 0.10 floor
+    drives the same-sign null pass rate to ~0.5% while still accepting a
+    genuine rho~0.35 within-coin edge ~99% of the time. The floor is an
+    argument, not a hard-coded constant, so larger-sample studies can tighten
+    it. Without the de-meaning a pure scale factor (different coin -> different
+    level) returns IC ~= 1 in every bucket and a false "consistent".
     """
     data = _finite_rows(rows, [feature_key, ret_key, vol_key])
-    # Fail fast if coin identity is missing/None on every row: demeaning would
-    # then collapse every row into one coin=None group and silently degrade to
-    # a pooled IC, which is exactly the scale-factor leak this gate removes.
-    # (A single real coin is a legitimate — if degenerate — explicit input.)
-    coin_vals = [r.get(coin_key) for r in data]
-    if not data or all(c is None for c in coin_vals):
+    # Fail fast if ANY row entering the calc lacks a usable coin identity: that
+    # row would be pooled into a synthetic coin=None group whose "within-coin
+    # mean" is just the pooled mean, re-opening the scale-factor leak this gate
+    # removes. (A single real coin across every row is a legitimate — if
+    # degenerate — explicit input and is allowed.)
+    if not data:
         raise ValueError(
-            f"ic_by_volatility_group requires a usable {coin_key!r} on every "
-            "row for within-coin demeaning; got no coin identity (missing key "
-            "or all None). Pass coin_key= or add the coin field instead of "
-            "silently pooling.")
+            f"ic_by_volatility_group requires finite rows for "
+            f"{feature_key!r}/{ret_key!r}/{vol_key!r}; got none.")
+    missing = [i for i, r in enumerate(data) if r.get(coin_key) is None]
+    if missing:
+        raise ValueError(
+            f"ic_by_volatility_group requires a usable {coin_key!r} on EVERY "
+            f"row for within-coin demeaning; {len(missing)} of {len(data)} rows "
+            "are missing it (key absent or None). Pass coin_key= or add the "
+            "coin field instead of silently pooling those rows.")
     f_resid, y_resid = _within_coin_demean(data, feature_key, ret_key, coin_key)
     order = sorted(range(len(data)), key=lambda i: data[i][vol_key])
     size = max(1, len(order) // n_groups)
@@ -208,6 +222,12 @@ def ic_by_volatility_group(
         f = [f_resid[i] for i in idx]
         y = [y_resid[i] for i in idx]
         groups[labels[g] if g < len(labels) else f"g{g}"] = spearman_ic(f, y)
-    signs = [1 if v > 0 else -1 for v in groups.values() if math.isfinite(v) and v != 0]
-    consistent = len(set(signs)) == 1 and len(signs) == len(groups)
+    finite = [v for v in groups.values() if math.isfinite(v)]
+    signs = {1 if v > 0 else -1 for v in finite}
+    consistent = (
+        len(finite) == len(groups)          # every populated bucket estimable
+        and len(finite) >= 2                # need >=2 buckets to call "robust"
+        and len(signs) == 1                 # all share one sign
+        and all(abs(v) >= min_abs_ic for v in finite)
+    )
     return VolGroupIC(len(data), groups, consistent)

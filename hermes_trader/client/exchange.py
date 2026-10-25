@@ -919,6 +919,41 @@ def entry_size_for_notional(coin: str, notional_usd: float, mid_price: float) ->
     return float(f"{size:.{sz_dec}f}")
 
 
+def get_cached_orderbook_spread(coin: str) -> dict[str, Any]:
+    """Return top-of-book spread from the L2 positive-result cache ONLY.
+
+    Observation-only helper for the hot perception scan: it never performs a
+    network fetch. On a cold/expired cache (or an empty/malformed book) it
+    returns {"ok": False}; callers must treat that as "no observation". It
+    feeds only the shadow-mode signal_ranking liquidity component (a missing
+    read maps to neutral), never a routing/trade decision. The cache is warmed
+    by the pre-trade spread gate / IOC price path via _l2_snapshot_bounded.
+    """
+    try:
+        cached = _L2_CACHE.get(coin)
+        if cached is None or _time.monotonic() - cached[0] >= _L2_CACHE_TTL_S:
+            return {"ok": False, "error": "cold_cache"}
+        levels = (cached[1] or {}).get("levels", [])
+        bids_raw = levels[0] if len(levels) > 0 else []
+        asks_raw = levels[1] if len(levels) > 1 else []
+        if not bids_raw or not asks_raw:
+            return {"ok": False, "error": "empty_orderbook"}
+        best_bid = float(bids_raw[0]["px"])
+        best_ask = float(asks_raw[0]["px"])
+        mid = (best_bid + best_ask) / 2.0
+        spread_pct = (best_ask - best_bid) / mid * 100.0 if mid > 0 else 999.0
+        return {
+            "ok": True,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "mid": mid,
+            "spread_pct": round(spread_pct, 4),
+            "source": "l2_cache",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+
 def get_orderbook_spread(coin: str) -> dict[str, Any]:
     """Fetch L2 order book and return bid/ask spread + depth info.
 

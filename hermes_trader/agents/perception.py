@@ -724,6 +724,27 @@ def _scan_single_market(
                 "distance_from_poc_atr": _vp.distance_from_poc_atr(mid, _atr_last),
                 "chase_risk": _vp.chase_risk(mid, _atr_last),
             }
+            # Observation-only top-of-book spread (audit §spread_bps). Disabled
+            # by default; when enabled it reads the L2 positive-result cache
+            # warmed by the pre-trade gate and NEVER issues a network fetch in
+            # the hot scan, so a cold cache simply yields spread_bps=None.
+            # Recorded for research; the only consumer is the shadow-mode
+            # signal_ranking liquidity component (a missing/None value maps to
+            # neutral, so it can never change a routing/trade decision).
+            _spread_cfg = _lc_capture.get("spread_observe") or {}
+            if bool(_spread_cfg.get("enabled", False)):
+                try:
+                    from hermes_trader.client.exchange import (
+                        get_cached_orderbook_spread,
+                    )
+
+                    _ob = get_cached_orderbook_spread(market["coin"])
+                    _volume_profile_info["spread_bps"] = (
+                        round(float(_ob["spread_pct"]) * 100.0, 3)
+                        if _ob.get("ok") else None
+                    )
+                except Exception:
+                    _volume_profile_info["spread_bps"] = None
         # Daily mover surfacing: the scan already reserves slots for top 24h
         # movers, but the trigger gate can still drop an orderly runner once the
         # fresh spike/breakout bar has passed. Surface large liquid movers to AI
@@ -1019,7 +1040,7 @@ def _scan_single_market(
         # unlike fired_at (scan wall-clock, different every cycle) or id
         # (random per scan). No extra network fetch: the data is in hand.
         # (scored_bar_close_ms is computed before the decay block above.)
-        return (True, {
+        _perception = {
             "id": f"{market['coin']}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:6]}",
             "coin": market["coin"],
             "type": market["type"],
@@ -1036,7 +1057,39 @@ def _scan_single_market(
             "volume_profile": _volume_profile_info,
             "cvd_divergence": _cvd_divergence_info,
             "whale_signal": whale,  # None unless coin is in oi_funding_anomaly hits
-        })
+        }
+        # Candidate A preregistered shadow arm (merge-plan §5.3, FWER p=0.205
+        # ⇒ shadow only, never live). Record-only: detects higherLows1h ∧
+        # pctMoveSpike ∧ volumeSpike under the coin's own 1h regime=="up" and
+        # appends one row per closed bar for the fixed-4h forward-return
+        # study. Reuses the already-fetched candles_1h (zero extra network);
+        # never routes/orders and never flips allow_shorts. Inert unless
+        # launch_capture.candidate_a_shadow.enabled.
+        try:
+            if ((config.get("launch_capture") or {})
+                    .get("candidate_a_shadow") or {}).get("enabled", False):
+                from hermes_trader.agents.candidate_a_shadow import maybe_record
+                from hermes_trader.agents.market_regime import classify_candles
+
+                _ca_regime = (classify_candles(candles_1h)
+                              if candles_1h else None)
+                _ca_fired = [h["name"] for h in hits if h.get("fired")]
+                maybe_record(
+                    coin=market["coin"],
+                    perception={
+                        "bar_close_ms": scored_bar_close_ms,
+                        "mid": mid,
+                        "composite_score": score,
+                        "fired_triggers": _ca_fired,
+                    },
+                    regime=_ca_regime,
+                    config=config,
+                    data_dir=os.environ.get("HERMES_DATA_DIR", "/data"),
+                )
+        except Exception as _ca_e:
+            logger.debug(f"[candidate_a_shadow] eval failed for "
+                         f"{market.get('coin', '?')}: {_ca_e}")
+        return (True, _perception)
     except Exception as e:
         # R12-D1: per-market eval failure used to vanish behind a False return.
         # Caller (scan_once) drops the result, so the operator needs the cause
