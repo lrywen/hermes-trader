@@ -53,6 +53,30 @@ from .methodology_manifest import (
     collect_components,
     methodology_fingerprint,
 )
+# Stage 0 research-validation framework (full-review P0, 2026-10-25)
+from .fixed_effect import (
+    FixedEffectResult,
+    fixed_effect_ic,
+    spearman_ic,
+)
+from .incremental import (
+    PartialICResult,
+    VolGroupIC,
+    ic_by_volatility_group,
+    partial_rank_ic,
+)
+from .portfolio_sim import (
+    PortfolioResult,
+    simulate_size,
+    simulate_sizes,
+    tradability_verdict,
+)
+from .trial_ledger import (
+    LEDGER_VERSION,
+    Trial,
+    TrialLedger,
+    bonferroni,
+)
 
 __all__ = [
     "CPCVResult",
@@ -86,4 +110,20 @@ __all__ = [
     "build_manifest",
     "collect_components",
     "methodology_fingerprint",
+    # Stage 0 research-validation framework (P0, 2026-10-25)
+    "FixedEffectResult",
+    "fixed_effect_ic",
+    "spearman_ic",
+    "PartialICResult",
+    "VolGroupIC",
+    "ic_by_volatility_group",
+    "partial_rank_ic",
+    "PortfolioResult",
+    "simulate_size",
+    "simulate_sizes",
+    "tradability_verdict",
+    "LEDGER_VERSION",
+    "Trial",
+    "TrialLedger",
+    "bonferroni",
 ]
