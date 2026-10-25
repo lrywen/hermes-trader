@@ -26,14 +26,14 @@ from __future__ import annotations
 import logging
 import os
 import time
-from typing import Any, Callable, Optional, Set
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
 # Module-level fingerprint set so the same closed-bar setup is shadow-researched
 # at most once per process even if it keeps surfacing for cycles. Keyed on the
 # same signal_fingerprint the main content-dedup uses (bar_close + triggers).
-_SEEN_FPS: Set[str] = set()
+_SEEN_FPS: set[str] = set()
 _MAX_SEEN = 5_000  # bound memory: once exceeded, clear and re-learn
 
 
