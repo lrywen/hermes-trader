@@ -54,6 +54,15 @@ HIP3_CLASS_PENALTY = 60.0  # within the 0–100 class_penalty component
 #: ~10 bps); only the observation-only spread_bps field feeds this map.
 SPREAD_FLOOR_BPS = 50.0
 
+#: Frozen caliber of the rank-score definition, stamped onto every shadow
+#: signal_ranking row. Bump whenever a component's meaning/mapping changes so
+#: old and new shadow records are never pooled as if comparable. v2 (2026-10-26):
+#: liquidity stopped being the constant +55.0/+50.0 dead dimension and is now
+#: spread_bps-driven (neutral 50 only when the spread observation is absent);
+#: this shifts each VP-bearing coin's total by ~-0.25 vs v1, hence v1/v2 rows
+#: must not be mixed in forward-attribution analysis.
+RANK_CALIBER = "rank_score.v2:comp=.55,trig=.20,whale=.08,cvd=.07,liq=.05(spread_bps,neutral50),pen=.05"
+
 #: The seven perception trigger names treated as bullish (mirrors the inline
 #: set in ta_filter.intend_long). Single source of truth for P0-1 ranking and
 #: the P0-2 conjunction data collection.

@@ -16,11 +16,14 @@ one frozen long-form dataset:
                             day-block bootstrap CI above zero and no N=1/N=5
                             sign opposition.
 
-Every run appends exactly one Trial line to an append-only ledger, stamping the
-running family size m so the Bonferroni correction (m * p_raw) cannot be
-rewritten after the fact. This is the first real caller of TrialLedger and the
-first on-disk research family; it has NO trading side effects and does not read
-or write the live /data state.
+Every successful gate run appends exactly one Trial line to an append-only
+ledger, stamping the running family size m so the Bonferroni correction
+(m * p_raw) cannot be rewritten after the fact. A run that cannot evaluate the
+gates (missing input or a missing coin identity on any row) appends NOTHING and
+exits rc=2/rc=3 — an un-runnable audit must never record a verdict it did not
+compute. This is the first real caller of TrialLedger and the first on-disk
+research family; it has NO trading side effects and does not read or write the
+live /data state.
 
 Input: CSV or JSONL with one row per (day, coin) observation and at least the
 columns: day, coin, <feature>, <ret>. Optional: <vol> for volatility bucketing
@@ -178,7 +181,8 @@ def run_audit(args: argparse.Namespace) -> tuple[str, dict]:
         vg = ic_by_volatility_group(
             rows, args.feature, args.ret, args.vol,
             coin_key=args.coin, n_groups=3,
-            min_per_group=args.min_per_group, min_abs_ic=args.min_abs_ic)
+            min_per_group=args.min_per_group, min_abs_ic=args.min_abs_ic,
+            significance_z=args.significance_z)
         gates["vol_group"] = asdict(vg)
         if not vg.consistent:
             failures.append("vol_group_not_consistent")
@@ -220,7 +224,8 @@ def run_audit(args: argparse.Namespace) -> tuple[str, dict]:
     caliber = (f"feature={args.feature};ret={args.ret};vol={args.vol or '-'};"
                f"controls={'|'.join(args.control) or '-'};"
                f"cost_bps={args.cost_bps};sizes={','.join(map(str, args.sizes))};"
-               f"dedup={args.dedup};min_abs_ic={args.min_abs_ic}")
+               f"dedup={args.dedup};volgroup_floor=max(min_abs_ic={args.min_abs_ic}"
+               f",tanh({args.significance_z}*1.0637/sqrt(n-3)))")
     trial = Trial(
         hypothesis=args.hypothesis,
         caliber=caliber,
@@ -256,6 +261,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--min-rows", type=int, default=120)
     ap.add_argument("--min-per-group", type=int, default=20)
     ap.add_argument("--min-abs-ic", type=float, default=0.10)
+    ap.add_argument("--significance-z", type=float, default=1.96,
+                    help="z s.d. for the sample-size-aware per-bucket Spearman "
+                         "floor; the bucket floor is max(min-abs-ic, "
+                         "tanh(z*1.0637/sqrt(n-3)))")
     ap.add_argument("--ratio-threshold", type=float, default=0.3)
     ap.add_argument("--no-portfolio", action="store_true")
     ap.add_argument("--dry-run", action="store_true",
@@ -272,9 +281,14 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"verdict": "invalid", "error": "input not found"}),
               file=sys.stderr)
         return 2
-    except ValueError as exc:
-        print(json.dumps({"verdict": "invalid", "error": str(exc)}),
-              file=sys.stderr)
+    except (ValueError, KeyError) as exc:
+        # Gate precondition failure (e.g. missing coin identity on some rows).
+        # This is NOT a hypothesis rejection: map to rc=3 so cron/CI never
+        # confuses "bad/incomplete data" with "the gates ran and falsified H0".
+        # No Trial is appended — an un-runnable audit must not pollute the
+        # ledger with a verdict it never actually computed.
+        print(json.dumps({"verdict": "invalid", "error": str(exc)},
+                         ensure_ascii=False), file=sys.stderr)
         return 3
 
     if verdict == "invalid":

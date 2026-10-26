@@ -135,7 +135,25 @@ def partial_rank_ic(
 class VolGroupIC:
     n: int
     groups: dict[str, float]   # volatility group label -> within-group IC
-    consistent: bool           # same sign AND |IC|>=min_abs_ic in every populated group
+    consistent: bool           # same sign AND |IC| clears the per-bucket floor
+    thresholds: dict[str, float]  # per-bucket significance floor actually used
+
+
+def _spearman_min_significant(n: int, z: float) -> float:
+    """Approx two-sided critical |Spearman rs| at z s.d. for sample size n.
+
+    Uses the Fisher-z standard error for Spearman, SE ~= 1.0637 / sqrt(n - 3)
+    (Fieller et al. / textbook approximation, valid for n >= ~10), and
+    converts the critical z to a correlation: tanh(z * SE). Unlike a fixed
+    absolute floor this scales with the noise (~1/sqrt(n)): at n=20 the null
+    |rs| routinely reaches ~0.4 while at n=133 it stays below ~0.15, so a flat
+    0.10 floor either leaks false positives (small buckets) or is looser than
+    needed (large buckets).
+    """
+    if n <= 3:
+        return 1.0  # undefined / unachievable: nothing can clear it
+    se = 1.0637 / math.sqrt(n - 3)
+    return math.tanh(z * se)
 
 
 def _within_coin_demean(
@@ -172,6 +190,7 @@ def ic_by_volatility_group(
     n_groups: int = 3,
     min_per_group: int = 20,
     min_abs_ic: float = 0.10,
+    significance_z: float = 1.96,
 ) -> VolGroupIC:
     """Within-coin Spearman IC after bucketing rows by ``vol_key`` quantile.
 
@@ -180,16 +199,20 @@ def ic_by_volatility_group(
     volatility and split into ``n_groups`` equal buckets (low/mid/high); IC is
     computed per bucket on the within-coin residuals.
 
-    ``consistent`` requires BOTH (a) the IC sign to agree across every
-    populated bucket AND (b) every bucket's ``|IC|`` to clear ``min_abs_ic``
-    (default 0.10). Sign agreement alone is uninformative — with three buckets
-    a pure-noise feature lands on the same sign by chance ~25% of the time,
-    often with |IC| ~ 1e-3. Monte Carlo at n~100/bucket shows a fixed 0.10 floor
-    drives the same-sign null pass rate to ~0.5% while still accepting a
-    genuine rho~0.35 within-coin edge ~99% of the time. The floor is an
-    argument, not a hard-coded constant, so larger-sample studies can tighten
-    it. Without the de-meaning a pure scale factor (different coin -> different
-    level) returns IC ~= 1 in every bucket and a false "consistent".
+    ``consistent`` requires, for EVERY populated bucket, BOTH (a) the IC sign
+    agrees across buckets AND (b) the bucket's ``|IC|`` clears its significance
+    floor ``max(min_abs_ic, tanh(significance_z * 1.0637/sqrt(n-3)))``. The
+    second term is the sample-size-aware Spearman critical value: a flat 0.10
+    floor has ~8% false-positive rate at n=20/bucket (null |rs| noise scales as
+    1/sqrt(n)) even though it is ~0.5% at n~130. Scaling the floor with n keeps
+    the null pass rate near zero at every size; the unavoidable cost is that
+    small buckets also cannot confirm a merely moderate edge (low power) — that
+    is a property of the data, not the threshold, and is the correct verdict
+    ("not enough evidence per bucket"; gather more rows). ``min_abs_ic`` stays a
+    lower bound so very large samples do not certify a trivially small IC.
+    Without the de-meaning a pure scale factor (different coin -> different
+    level) returns IC ~= 1 in every bucket and a false "consistent". The per-
+    bucket floor actually applied is returned in ``thresholds`` for audit.
     """
     data = _finite_rows(rows, [feature_key, ret_key, vol_key])
     # Fail fast if ANY row entering the calc lacks a usable coin identity: that
@@ -213,21 +236,27 @@ def ic_by_volatility_group(
     size = max(1, len(order) // n_groups)
     labels = ["low", "mid", "high"] if n_groups == 3 else [f"g{i}" for i in range(n_groups)]
     groups: dict[str, float] = {}
+    thresholds: dict[str, float] = {}
     for g in range(n_groups):
         lo = g * size
         hi = len(order) if g == n_groups - 1 else (g + 1) * size
         idx = order[lo:hi]
         if len(idx) < min_per_group:
             continue
+        label = labels[g] if g < len(labels) else f"g{g}"
         f = [f_resid[i] for i in idx]
         y = [y_resid[i] for i in idx]
-        groups[labels[g] if g < len(labels) else f"g{g}"] = spearman_ic(f, y)
+        groups[label] = spearman_ic(f, y)
+        thresholds[label] = max(
+            min_abs_ic, _spearman_min_significant(len(idx), significance_z))
     finite = [v for v in groups.values() if math.isfinite(v)]
     signs = {1 if v > 0 else -1 for v in finite}
     consistent = (
         len(finite) == len(groups)          # every populated bucket estimable
         and len(finite) >= 2                # need >=2 buckets to call "robust"
         and len(signs) == 1                 # all share one sign
-        and all(abs(v) >= min_abs_ic for v in finite)
+        and all(abs(ic) >= thresholds[label]
+                for label, ic in groups.items()
+                if math.isfinite(ic))
     )
-    return VolGroupIC(len(data), groups, consistent)
+    return VolGroupIC(len(data), groups, consistent, thresholds)

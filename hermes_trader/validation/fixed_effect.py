@@ -99,6 +99,17 @@ def fixed_effect_ic(
     """
     feats = [float(r[feature_key]) for r in rows]
     rets = [float(r[ret_key]) for r in rows]
+    # Fail fast on a missing coin identity rather than raising a bare KeyError
+    # deep in the list comprehension: the within-coin decomposition is
+    # meaningless without it, and a clean ValueError lets callers (CLI) map the
+    # case to a distinct "invalid precondition" exit code instead of crashing.
+    missing = [i for i, r in enumerate(rows) if r.get(coin_key) is None]
+    if missing:
+        raise ValueError(
+            f"fixed_effect_ic requires a usable {coin_key!r} on EVERY row for "
+            f"the coin fixed-effect decomposition; {len(missing)} of {len(rows)} "
+            "rows are missing it (key absent or None). Pass coin_key= or add the "
+            "coin field instead of silently pooling those rows.")
     coins = [r[coin_key] for r in rows]
     finite = [i for i in range(len(rows))
               if math.isfinite(feats[i]) and math.isfinite(rets[i])]

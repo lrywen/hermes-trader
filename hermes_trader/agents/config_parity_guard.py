@@ -133,6 +133,14 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "regime_risk_overlay.shadow_log_path": ("", "/data/regime_overlay_shadow.jsonl"),
     "trend_filter_200ma.shadow_log_path": ("", "/data/trend_filter_shadow.jsonl"),
     "weight_shadow.shadow_mode": (False, True),
+    # 2026-10-26: record-only observation arms enabled in prod per the frozen
+    # preregistration docs/research/2026-10/observation_arms_candidate_a_spread_prereg_2026-10-26.md.
+    # spread_observe reads the L2 positive-result cache only (never a network
+    # fetch; cold -> null); candidate_a_shadow appends combo rows and never
+    # routes/orders (allow_shorts stays false). Both are strict no-ops off, so
+    # enabling is fail-safe / no capital-protecting semantics are loosened.
+    "launch_capture.spread_observe.enabled": (False, True),
+    "launch_capture.candidate_a_shadow.enabled": (False, True),
     "dsl_exit.stop_confirm_shadow.shadow_mode": (False, True),
     # D2 (2026-10-23): ignite-grace record-only counterfactual arm. Only writes
     # an extra shadow row when an unignited position first crosses the cutoff;

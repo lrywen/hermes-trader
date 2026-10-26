@@ -147,7 +147,7 @@ from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
-from hermes_trader.agents.signal_rank import conjunction_view, rank_jobs, rank_score, select_top_jobs
+from hermes_trader.agents.signal_rank import RANK_CALIBER, conjunction_view, rank_jobs, rank_score, select_top_jobs
 from hermes_trader.agents.ta_filter import analyze_perception, long_only_should_skip
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
@@ -2753,6 +2753,7 @@ while True:
                 append_jsonl(_sr_log, {
                     "ts": now_ms,
                     "mode": _sr_mode,
+                    "rank_caliber": RANK_CALIBER,
                     "n": len(_sr_ranked),
                     "ranking": [
                         {"coin": _j[0], "score": round(_rs, 2),

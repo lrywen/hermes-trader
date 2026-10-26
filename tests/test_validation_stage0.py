@@ -187,21 +187,90 @@ def test_ic_by_volatility_group_requires_magnitude_not_just_sign(monkeypatch):
     # Sign agreement alone is uninformative — three buckets share a sign by
     # chance ~25% under the null, often with |IC|~1e-3. Pin the per-bucket
     # Spearman to tiny same-sign values and assert the magnitude floor rejects
-    # them at the default 0.10 but accepts them when the gate is loosened.
+    # them at the default 0.10 but accepts them when BOTH floors are loosened
+    # (significance_z=0 disables the sample-size-aware term too).
     from hermes_trader.validation import incremental as inc
 
     base_rows = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
                  for i in range(60)]
 
-    def run(floor):
+    def run(floor, z=1.96):
         vals = iter([0.0008, 0.0011, 0.0006])
         monkeypatch.setattr(inc, "spearman_ic", lambda f, y: next(vals))
         return ic_by_volatility_group(
             base_rows, "f", "r", "v", n_groups=3, min_per_group=5,
-            min_abs_ic=floor)
+            min_abs_ic=floor, significance_z=z)
 
     assert run(0.10).consistent is False   # same sign but |IC| ~ 1e-3
-    assert run(0.0).consistent is True     # sign-only gate would pass them
+    assert run(0.0, z=0.0).consistent is True  # sign-only gate would pass them
+
+
+def test_vol_group_floor_scales_with_bucket_size(monkeypatch):
+    # Regression guard for the fixed-0.10 small-bucket leak: a flat absolute
+    # floor passes the null ~8% at n=20/bucket but ~0.5% at n=130 because null
+    # |rs| noise scales as 1/sqrt(n). The per-bucket floor must therefore be
+    # stricter for small buckets and must be reported for audit.
+    from hermes_trader.validation import incremental as inc
+
+    def thresholds_for(n):
+        rows = [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
+                for i in range(3 * n)]
+        g = ic_by_volatility_group(rows, "f", "r", "v", n_groups=3,
+                                   min_per_group=5, min_abs_ic=0.0,
+                                   significance_z=1.96)
+        return g.thresholds
+
+    small = thresholds_for(20)
+    large = thresholds_for(133)
+    assert set(small) == {"low", "mid", "high"}
+    assert small["low"] > large["low"]          # stricter when n is small
+    assert small["low"] == pytest.approx(0.4665, abs=0.01)
+    assert large["low"] == pytest.approx(0.1813, abs=0.01)
+    # min_abs_ic stays a lower bound at large n (large-sample trivial IC).
+    g_large = ic_by_volatility_group(
+        [{"coin": "A", "v": float(i), "f": float(i), "r": float(i)}
+         for i in range(3 * 133)],
+        "f", "r", "v", n_groups=3, min_per_group=5,
+        min_abs_ic=0.25, significance_z=1.96)
+    assert g_large.thresholds["low"] == pytest.approx(0.25, abs=1e-9)
+
+
+def test_vol_group_adaptive_floor_rejects_small_bucket_null(monkeypatch):
+    # A same-sign |IC|~0.30 across buckets would clear a flat 0.10 but is well
+    # inside the null noise at n=20/bucket (~SE 0.25); the adaptive floor must
+    # reject it there. The SAME |IC| at n=133 (SE~0.09) clears that bucket's
+    # floor and is accepted.
+    from hermes_trader.validation import incremental as inc
+
+    def group_with(n, ic):
+        rows = [{"coin": "A", "v": float(i), "f": 0.0, "r": 0.0}
+                for i in range(3 * n)]
+        vals = iter([ic, ic, ic])
+        monkeypatch.setattr(inc, "spearman_ic", lambda f, y: next(vals))
+        return ic_by_volatility_group(rows, "f", "r", "v", n_groups=3,
+                                      min_per_group=5)
+
+    # |IC|=0.30: below the small-bucket adaptive floor (~0.47) -> not
+    # consistent; above the large-bucket floor (~0.18) -> consistent.
+    assert group_with(20, 0.30).consistent is False
+    assert group_with(133, 0.30).consistent is True
+
+
+def test_fixed_effect_ic_raises_on_missing_coin():
+    # 3.1: the fixed-effect gate must fail fast with ValueError (CLI maps this
+    # to rc=3), not a bare KeyError from r[coin_key].
+    good = [{"coin": "A", "f": 1.0, "r": 0.1},
+            {"coin": "B", "f": 2.0, "r": 0.2},
+            {"coin": "A", "f": 1.5, "r": 0.15},
+            {"coin": "B", "f": 2.5, "r": 0.25}]
+    fixed_effect_ic(good, "f", "r")  # does not raise
+    bad = [dict(r, coin=None) if i == 1 else r for i, r in enumerate(good)]
+    with pytest.raises(ValueError, match="EVERY"):
+        fixed_effect_ic(bad, "f", "r")
+    missing_key = [{"f": 1.0, "r": 0.1}, {"f": 2.0, "r": 0.2},
+                   {"f": 1.5, "r": 0.15}, {"f": 2.5, "r": 0.25}]
+    with pytest.raises(ValueError, match="EVERY"):
+        fixed_effect_ic(missing_key, "f", "r")
 
 
 # ── iron-law 3: cross-sectional portfolio tradability ─────────────────────
@@ -367,4 +436,38 @@ def test_stage0_audit_cli_dry_run_does_not_write(tmp_path):
          "--ledger", str(ledger), "--dry-run"],
         capture_output=True, text=True, cwd=str(repo))
     assert r.returncode in (0, 1)
+    assert not ledger.exists()
+
+
+def test_stage0_audit_cli_missing_coin_is_rc3_and_writes_nothing(tmp_path):
+    # 3.1: a dataset lacking coin identity must surface as a distinct
+    # precondition error (rc=3), NOT a bare traceback rc=1, and must never
+    # append a Trial (an un-runnable audit records no verdict).
+    import subprocess
+    import sys
+
+    repo = Path(__file__).resolve().parents[1]
+    script = repo / "scripts" / "stage0_audit.py"
+    src = tmp_path / "nocoin.jsonl"
+    ledger = tmp_path / "trials.jsonl"
+    with open(src, "w", encoding="utf-8") as fh:
+        for d in range(30):
+            for ci in range(8):
+                # Two named coins on most rows, but SOME rows omit the coin.
+                # The >=2-coins prefilter passes, so the per-row gate guard —
+                # not a generic "insufficient data" rc=2 — must fire rc=3.
+                rec = {"day": f"2026-09-{d % 28 + 1:02d}",
+                       "feat": 0.5 + ci * 0.01, "ret": 0.001, "vol": 1.0}
+                if not (d == 0 and ci == 0):
+                    rec["coin"] = "A" if ci % 2 == 0 else "B"
+                fh.write(json.dumps(rec) + "\n")
+    r = subprocess.run(
+        [sys.executable, str(script), "--input", str(src), "--hypothesis", "h",
+         "--feature", "feat", "--ret", "ret", "--vol", "vol",
+         "--ledger", str(ledger)],
+        capture_output=True, text=True, cwd=str(repo))
+    assert r.returncode == 3, r.stdout + r.stderr
+    payload = json.loads(r.stderr.strip().splitlines()[-1])
+    assert payload["verdict"] == "invalid"
+    assert "coin" in payload["error"]
     assert not ledger.exists()
