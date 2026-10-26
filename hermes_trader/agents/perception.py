@@ -57,6 +57,47 @@ def _get_data_gaps() -> int:
     with _data_gap_lock:
         return _data_gap_count
 
+# ── Volume-profile enrichment failure accounting (three-layer audit §4.3) ─────
+# The observation-only volume_profile call is wrapped in try/except so an
+# unexpected indicator bug can never drop a coin from the scan. But a *silent*
+# `except: _vp = None` would also hide a SYSTEMATIC failure — every coin ending
+# up with no vp while the heartbeat still reads "0 errors". Mirror the data-gap
+# accounting: count per-scan failures (thread-safe over the scan pool) and log
+# the FIRST distinct failure type once so the cause is visible in the logs, then
+# surface the per-scan count in the heartbeat. Observability only — no change to
+# what gets traded or scored.
+_vp_fail_lock = threading.Lock()
+_vp_fail_count = 0
+_vp_warned: set[str] = set()
+
+
+def _reset_vp_failures() -> None:
+    global _vp_fail_count
+    with _vp_fail_lock:
+        _vp_fail_count = 0
+
+
+def _note_vp_failure(coin: str, exc: BaseException) -> None:
+    global _vp_fail_count
+    key = f"{type(exc).__name__}"
+    with _vp_fail_lock:
+        _vp_fail_count += 1
+        first = key not in _vp_warned
+        if first:
+            _vp_warned.add(key)
+    if first:
+        logger.warning(
+            f"[scan] volume_profile enrichment failed for {coin} ({key}: {exc}); "
+            "this coin (and any similar) gets vp=None this scan. Logging the first "
+            "occurrence of this error type only; see the vp-fail count in the scan "
+            "summary for the per-cycle total."
+        )
+
+
+def _get_vp_failures() -> int:
+    with _vp_fail_lock:
+        return _vp_fail_count
+
 # ── Setup-age decay (roadmap §2 time-decay factor) ───────────────────────────
 # Composite score is recomputed from the latest CLOSED bar every scan cycle
 # and has no memory. A *formation* trigger (breakout / trend-strength / higher-
@@ -717,17 +758,23 @@ def _scan_single_market(
                 atr_period=int(_vp_cfg.get("atr_period", 14)),
                 atr_multiple=float(_vp_cfg.get("atr_multiple", 0.25)),
             )
-        except Exception:
+        except Exception as _vp_e:
+            _note_vp_failure(market.get("coin", "?"), _vp_e)
             _vp = None
         _volume_profile_info = None
         if _vp is not None:
             # reuse the ATR14 already computed inside volume_profile (w7).
             _atr_last = _vp.atr_last
             _volume_profile_info = {
-                # Bumped 2026-10-26 (three-layer audit S3): value area no longer
-                # expands into zero-volume bins (old up-tie-biased VAH inflated
-                # chase_risk's half-width denominator). Pre/post-S3 VA/chase_risk
-                # rows are not comparable; also folds in S1/S2 non-finite guards.
+                # S3 (three-layer audit 2026-10-26; downgraded by the 12:50
+                # re-audit): value area no longer expands when BOTH frontier bins
+                # are zero-volume. This is a near behaviour-equivalent change
+                # (~0.17-0.27% of real windows differ; on those it narrows the VA
+                # slightly -> marginally conservative chase_risk, NOT a systematic-
+                # bias fix; the production VA-ratio shift was market structure).
+                # The caliber tag also covers the S1/S2 non-finite guards; it marks
+                # provenance but is NOT grounds to refuse cross-period comparison,
+                # since the two calibers are ~99.7% indistinguishable on real data.
                 "vp_caliber": "vp.v3:finite_guards,va_skips_empty_bins",
                 "poc": _vp.poc,
                 "vah": _vp.vah,
@@ -1291,6 +1338,7 @@ def scan_once(
     """
     started = time.time()
     _reset_data_gaps()
+    _reset_vp_failures()
     cfg = config or get_config()
     min_score = cfg["scan"]["minCompositeScore"] if min_score == 20 else min_score
     # Defensive default only; the R13-B9 canonical scan_budget.parallel_workers
@@ -1775,7 +1823,11 @@ def scan_once(
     # ── Step 4: Sort by composite score descending ──────────────────────
     elapsed = (time.time() - started) * 1000
     data_gaps = _get_data_gaps()
-    logger.info(f"[scan] scanned {len(markets)} markets, {len(results)} triggers in {elapsed:.0f}ms ({errors} errors, {data_gaps} data-gaps)")
+    vp_failures = _get_vp_failures()
+    # Only append the vp-fail fragment when non-zero so the common healthy line
+    # stays byte-identical and dashboards/grok patterns are undisturbed.
+    _vp_frag = f", {vp_failures} vp-fail" if vp_failures else ""
+    logger.info(f"[scan] scanned {len(markets)} markets, {len(results)} triggers in {elapsed:.0f}ms ({errors} errors, {data_gaps} data-gaps{_vp_frag})")
     if data_gaps > 0 and len(markets) > 0 and data_gaps / len(markets) > 0.25:
         # >25% of the universe unreadable this scan = a degraded data feed, not a
         # quiet market. Surface loudly so a silent miss-the-move window is visible.

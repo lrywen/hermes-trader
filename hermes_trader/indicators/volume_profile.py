@@ -192,16 +192,20 @@ def volume_profile(
     while volume_inside < target and (above < resolved_bins or below >= 0):
         above_vol = counts[above] if above < resolved_bins else 0.0
         below_vol = counts[below] if below >= 0 else 0.0
-        # S3 (three-layer audit 2026-10-26): never expand the value area into a
-        # ZERO-volume bin. Because volume is allocated by price overlap, the
-        # populated bins are contiguous around the POC, so the first empty bin on
-        # either frontier is the real edge of traded value; walking past it just
-        # paints empty space into the VA. The old ``>=`` tie-break chose UP when
-        # BOTH frontiers were empty (-1 sentinel aside, two real empty bins tied
-        # at 0 and went up), biasing VAH systematically high (34,531 prod windows:
-        # VAH-POC / POC-VAL ratio 1.074, P(up)=0.524) and inflating chase_risk's
-        # half-width denominator. Prefer the heavier populated side; if both are
-        # empty there is no more traded volume to add, so stop.
+        # S3 (three-layer audit 2026-10-26; re-audited 12:50 same day): stop once
+        # BOTH frontiers are zero-volume instead of letting the old ``>=``
+        # tie-break walk an empty bin into the value area. IMPORTANT — the
+        # follow-up re-audit on real data DOWNGRADED this from a systematic-bias
+        # fix to a near behaviour-equivalent refactor: only ~0.17-0.27% of real
+        # 5m windows produce a different (poc/vah/val), and on those the VA gets
+        # NARROWER (median NEW/OLD width ~0.56-0.82), i.e. a slightly SMALLER
+        # chase_risk half-width denominator -> marginally CONSERVATIVE (the
+        # opposite of the original commit's "denominator too large" framing). The
+        # observed production VA-ratio shift was market structure, not this code.
+        # The populated-bins-are-contiguous assumption is NOT guaranteed (a real
+        # empty-price gap collapses VA to a single bin -> position_pct None); that
+        # latent case does not trigger on real data (0/30,842) and is tracked for
+        # a pre-registered coverage guard rather than silently relying on it.
         if above_vol <= 0.0 and below_vol <= 0.0:
             break
         if above_vol >= below_vol and above_vol > 0.0:
