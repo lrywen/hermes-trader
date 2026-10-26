@@ -62,3 +62,55 @@ def test_config_write_audit_nulls_when_backup_disabled(monkeypatch, tmp_path):
     assert row["prev_era_id"] is None
     # 新值 era 仍然可计算（不依赖 prior）。
     assert len(row["era_id"]) == 12
+
+
+def test_deep_merge_does_not_alias_base_nested_objects():
+    # N4 root cause: a shallow dict(base) copy shared nested objects, so an
+    # in-place mutation of a merged CANONICAL_DEFAULTS view wrote back into the
+    # global defaults. A deep merge must never alias a mutable node of base.
+    from hermes_trader.agents.config_store import _deep_merge
+
+    base = {"sec": {"nested": {"m": 0}, "x": 1}}
+    merged = _deep_merge(base, {})
+    merged["sec"]["nested"]["m"] = 99
+    assert base["sec"]["nested"]["m"] == 0
+    # overlay scalars/dicts are also copied (no alias back into overlay).
+    ov = {"sec": {"nested": {"m": 7}}}
+    m2 = _deep_merge(base, ov)
+    m2["sec"]["nested"]["m"] = 700
+    assert ov["sec"]["nested"]["m"] == 7
+
+
+def test_rmw_nested_default_change_is_visible_and_does_not_poison_defaults(
+        monkeypatch, tmp_path):
+    # N4 end-to-end: flipping a nested key that exists ONLY in CANONICAL_DEFAULTS
+    # (absent from the raw file) must (a) appear in changed_keys/old/new and
+    # (b) leave CANONICAL_DEFAULTS untouched. Pre-fix the shallow merge mutated
+    # the module defaults, so the prior-side effective view also read True and
+    # the audit logged changed_keys == [].
+    from hermes_trader.agents.config_defaults import CANONICAL_DEFAULTS
+    from hermes_trader.agents.config_store import update_agent_config
+
+    _isolate_config(monkeypatch, tmp_path)
+    sess_file = tmp_path / "session.jsonl"
+    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(sess_file))
+    # Seed a sparse raw file: launch_capture present but WITHOUT spread_observe,
+    # so the arm default comes purely from CANONICAL_DEFAULTS.
+    write_agent_config({"mode": "SHADOW", "launch_capture": {}},
+                       backup=False, via="seed")
+
+    canon_before = json.loads(json.dumps(
+        CANONICAL_DEFAULTS["launch_capture"]["spread_observe"]))
+    with update_agent_config(backup=True, via="n4_regression") as cfg:
+        cfg["launch_capture"]["spread_observe"]["enabled"] = True
+
+    assert CANONICAL_DEFAULTS["launch_capture"]["spread_observe"] == canon_before
+    assert CANONICAL_DEFAULTS["launch_capture"]["spread_observe"]["enabled"] is False
+
+    writes = [r for r in _read_jsonl(sess_file)
+              if r.get("event") == "config_write" and r.get("via") == "n4_regression"]
+    assert len(writes) == 1
+    ev = writes[0]
+    assert "launch_capture" in ev["changed_keys"]
+    assert ev["old"]["launch_capture"]["spread_observe"] == {"enabled": False}
+    assert ev["new"]["launch_capture"]["spread_observe"] == {"enabled": True}

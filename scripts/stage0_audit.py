@@ -41,6 +41,13 @@ Exit codes (machine-readable for cron/CI):
 The ledger path defaults to $HERMES_STAGE0_LEDGER or
 ~/.hermes-trading/stage0_trials.jsonl on the host; point --ledger at a tmp file
 in tests. Nothing here is imported by the trading runtime.
+
+DEPLOYMENT (N5): this is a HOST-SIDE research CLI. It is intentionally NOT
+copied into the runtime image (only scripts on runtime_whitelist.py are), so
+``/app/scripts/stage0_audit.py`` does not exist in the container. Schedule it
+on the HOST with the host venv (``/home/ldy/hermes-trader/.venv/bin/python
+scripts/stage0_audit.py ...``), never via ``docker exec``/an in-container cron
+(which would fail with "No such file").
 """
 from __future__ import annotations
 
@@ -51,6 +58,7 @@ import math
 import os
 import sys
 from dataclasses import asdict
+from typing import Any
 
 from hermes_trader.validation import (
     Trial,
@@ -205,15 +213,68 @@ def run_audit(args: argparse.Namespace) -> tuple[str, dict]:
         if not ok:
             failures.append(f"not_tradable:{why}")
         tradable = ok
-        headline = sizes[max(sizes)].net_bps
-        ci_lo = sizes[max(sizes)].net_ci_low
-        ci_hi = sizes[max(sizes)].net_ci_high
-        conc = sizes[max(sizes)].top1_concentration
+        headline_size = max(sizes)
+        headline_res = sizes[headline_size]
+        headline = headline_res.net_bps
+        ci_lo = headline_res.net_ci_low
+        ci_hi = headline_res.net_ci_high
+        conc = headline_res.top1_concentration
+        # N1: one-sided day-block bootstrap p for mean net > 0, produced by the
+        # SAME resamples/seed as the CI in portfolio_sim (no method drift).
+        # This is the trial's p_raw; the ledger stamps p_bonferroni = m*p_raw.
+        p_raw = headline_res.p_value
         loc_worst = _leave_one_coin_worst(deduped, args.feature, args.ret,
                                           args.coin)
+        # N2: first/last day actually used (after numeric coercion + dedup), so
+        # the ledger states the data window even when stdout is discarded.
+        days_used = sorted({str(r[args.day]) for r in deduped
+                            if r.get(args.day) is not None})
+        if days_used:
+            day_split = f"{days_used[0]}..{days_used[-1]}"
+        # N3: compact gate detail for the ledger (thresholds + per-bucket IC +
+        # fixed-effect scale flag). Bulky per-day maps are NOT included.
+        gates_summary: dict[str, Any] = {
+            "fixed_effect": {
+                "ic_within": getattr(fe, "ic_within", None),
+                "ic_all": getattr(fe, "ic_all", None),
+                "is_scale_factor": bool(fe.is_scale_factor),
+            },
+        }
+        if args.vol and "vol_group" in gates:
+            vg = gates["vol_group"]
+            gates_summary["vol_group"] = {
+                "ic": vg.get("groups"),
+                "thresholds": vg.get("thresholds"),
+                "consistent": bool(vg.get("consistent")),
+                "n": vg.get("n"),
+            }
+        if args.control and isinstance(gates.get("partial_ic"), dict) \
+                and "error" not in gates["partial_ic"]:
+            pi = gates["partial_ic"]
+            gates_summary["partial_ic"] = {
+                "ic": pi.get("ic"), "estimable": pi.get("estimable"),
+                "absorbed": pi.get("absorbed")}
     else:
+        headline_size = None
         headline = float("nan")
         ci_lo = ci_hi = conc = loc_worst = float("nan")
+        p_raw = float("nan")
+        day_split = ""
+        gates_summary = {
+            "fixed_effect": {
+                "ic_within": getattr(fe, "ic_within", None),
+                "ic_all": getattr(fe, "ic_all", None),
+                "is_scale_factor": bool(fe.is_scale_factor),
+            },
+        }
+        if args.vol and "vol_group" in gates:
+            vg = gates["vol_group"]
+            gates_summary["vol_group"] = {
+                "ic": vg.get("groups"),
+                "thresholds": vg.get("thresholds"),
+                "consistent": bool(vg.get("consistent")),
+                "n": vg.get("n"),
+            }
 
     verdict = "reject_h0" if not failures else "fail_reject"
     # A non-portfolio run only earns a tradable pass when explicitly requested;
@@ -235,8 +296,11 @@ def run_audit(args: argparse.Namespace) -> tuple[str, dict]:
         ci_low_bps=round(ci_lo, 4),
         ci_high_bps=round(ci_hi, 4),
         top1_concentration=round(conc, 4) if math.isfinite(conc) else conc,
+        p_raw=(round(p_raw, 6) if math.isfinite(p_raw) else p_raw),
         family=args.family,
         verdict=verdict,
+        day_split=day_split,
+        gates_summary=gates_summary,
         notes=(";".join(failures) or ("tradable" if tradable else "signal_only")),
     )
     return verdict, {"gates": gates, "trial_preview": asdict(trial)}

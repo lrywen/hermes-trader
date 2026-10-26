@@ -278,7 +278,8 @@ def test_fixed_effect_ic_raises_on_missing_coin():
 def _res(n, gross, net, conc=0.2):
     return PortfolioResult(N=n, n_entries=10, n_days=10, gross_bps=gross,
                            cost_bps=9.47, net_bps=net, net_ci_low=net - 5,
-                           net_ci_high=net + 5, top1_concentration=conc)
+                           net_ci_high=net + 5, p_value=0.01,
+                           top1_concentration=conc)
 
 
 def test_tradability_rejects_opposite_sign_n1_vs_n5():
@@ -294,6 +295,28 @@ def test_tradability_requires_positive_top1_after_cost():
 def test_tradability_passes_agreeing_positive():
     ok, _ = tradability_verdict({1: _res(1, 20.0, 10.5), 5: _res(5, 15.0, 5.5)})
     assert ok is True
+
+
+def test_simulate_size_p_value_discriminates_signal_from_null():
+    # N1: p_value is a one-sided day-block bootstrap p for mean net > 0, from
+    # the SAME resamples as the CI. Strongly positive daily nets -> tiny p
+    # (>= detection floor 1/(B+1)); symmetric zero-mean nets -> large p.
+    from hermes_trader.validation.portfolio_sim import simulate_size
+
+    pos = [{"day": f"d{d:02d}", "coin": f"C{c}", "score": 1.0,
+            "ret": 0.005} for d in range(30) for c in "ABC"]
+    rp = simulate_size(pos, 1, "score", "ret", cost_bps=0.0, B=1000)
+    assert 0.0 < rp.p_value <= 1.0 / 1001 + 1e-12
+    assert rp.p_value < 0.05
+
+    # Deterministically symmetric zero-mean daily nets around 0 -> resampled
+    # mean is 0 -> every replicate counts as <= 0 -> p at/near 1.
+    zero = []
+    for d in range(20):
+        zero.append({"day": f"d{d:02d}", "coin": "A", "score": 1.0,
+                     "ret": 0.001 if d % 2 == 0 else -0.001})
+    rz = simulate_size(zero, 1, "score", "ret", cost_bps=0.0, B=500)
+    assert rz.p_value > 0.5
 
 
 def test_simulate_sizes_one_signal_per_coin_per_day_and_cost():
@@ -419,6 +442,24 @@ def test_stage0_audit_cli_edge_clears_null_rejects_and_logs(tmp_path):
     recs = [json.loads(l) for l in open(ledger)]
     assert [r["trial_id"] for r in recs] == ["T0001", "T0002"]
     assert [r["family_size_at_test"] for r in recs] == [1, 2]
+
+    # N1: the Bonferroni p is wired (no longer the always-NaN placeholder).
+    # The edge trial clears; its raw p and corrected p are finite and in (0,1].
+    edge_rec = recs[0]
+    assert edge_rec["p_raw"] == edge_rec["p_raw"]  # not NaN
+    assert 0.0 < edge_rec["p_raw"] <= 1.0
+    assert edge_rec["p_bonferroni"] == pytest.approx(
+        min(1.0, edge_rec["family_size_at_test"] * edge_rec["p_raw"]))
+    # N2: the data window is recorded (not the empty-string placeholder).
+    assert edge_rec["day_split"].count("..") == 1
+    assert edge_rec["day_split"].split("..")[0] == "2026-09-01"
+    # N3: per-bucket vol-group IC + the thresholds actually applied survive in
+    # the ledger even if stdout is discarded.
+    vg = edge_rec["gates_summary"]["vol_group"]
+    assert set(vg["ic"]) == {"low", "mid", "high"}
+    assert set(vg["thresholds"]) == {"low", "mid", "high"}
+    assert vg["consistent"] is True
+    assert edge_rec["gates_summary"]["fixed_effect"]["is_scale_factor"] is False
 
 
 def test_stage0_audit_cli_dry_run_does_not_write(tmp_path):

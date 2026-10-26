@@ -790,19 +790,30 @@ def _log_validation_warnings(
 
 
 def _deep_merge(base: dict[str, Any], overlay: dict[str, Any]) -> dict[str, Any]:
-    """Recursively merge *overlay* into a copy of *base*.
+    """Recursively merge *overlay* into a DEEP copy of *base*.
 
     A value of ``None`` in *overlay* acts as a deletion marker: the
     corresponding key is removed from the result if present.
+
+    The base must be copied recursively, not just ``dict(base)``: a shallow
+    copy still shares every nested dict object with *base*. When *base* is the
+    module-level CANONICAL_DEFAULTS and the caller mutates the merged result
+    in place (the update_agent_config RMW body), a key present only in the
+    defaults (e.g. launch_capture.spread_observe before it was ever written)
+    would then be mutated ON THE GLOBAL DEFAULTS. That poisoned every later
+    merge in the process — including the prior-side view in the config_write
+    audit — so diffs collapsed to ``changed_keys == []`` even when the file
+    really changed (incident 2026-10-26). copy.deepcopy guarantees the result
+    never aliases any mutable node of *base*.
     """
-    result = dict(base)
+    result = deepcopy(base)
     for k, v in overlay.items():
         if v is None:
             result.pop(k, None)
         elif k in result and isinstance(result[k], dict) and isinstance(v, dict):
             result[k] = _deep_merge(result[k], v)
         else:
-            result[k] = v
+            result[k] = deepcopy(v)
     return result
 
 

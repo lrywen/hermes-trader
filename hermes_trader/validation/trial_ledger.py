@@ -50,6 +50,11 @@ class Trial:
     family_size_at_test: int = 1
     verdict: str = "inconclusive"    # reject_h0 / fail_reject / invalid
     day_split: str = ""              # e.g. "2026-09-28..2026-10-10|..2026-10-25"
+    # Compact, ledger-safe gate detail so a cron run that keeps only the ledger
+    # can still answer "which bucket failed and at what threshold". MUST stay
+    # small (no per-day/per-entry maps): e.g. {"vol_group": {"ic": {...},
+    # "thresholds": {...}, "consistent": bool}, "fixed_effect": {...}}.
+    gates_summary: dict[str, Any] = field(default_factory=dict)
     notes: str = ""
     supersedes: Optional[str] = None
     ts_ms: int = 0

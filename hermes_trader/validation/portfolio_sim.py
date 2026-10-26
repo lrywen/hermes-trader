@@ -30,18 +30,26 @@ class PortfolioResult:
     net_bps: float          # mean per-entry net bps (the headline number)
     net_ci_low: float       # day-block bootstrap 95% CI
     net_ci_high: float
+    p_value: float          # one-sided day-block bootstrap p for mean net > 0
     top1_concentration: float  # share of total gross from the single best entry
     per_day_net: dict[str, float] = field(default_factory=dict)
 
 
-def _day_block_bootstrap_ci(
+def _day_block_bootstrap(
     day_means: list[tuple[str, float]],
     B: int,
     seed: int,
-) -> tuple[float, float]:
-    """95% CI of the pooled mean by resampling whole days (block = 1 day)."""
+) -> tuple[float, float, float]:
+    """Day-block bootstrap of the pooled mean (block = 1 day).
+
+    Returns the 95% CI (2.5/97.5 percentiles) AND a one-sided bootstrap p for
+    H0: mean net <= 0, all from the SAME resamples/seed so the CI and p can
+    never disagree. The p is the share of resampled means that are <= 0, with
+    a +1 pseudocount on both numerator and denominator so a finite-run p is
+    never exactly 0 (it reports the detection limit 1/(B+1)).
+    """
     if not day_means:
-        return (float("nan"), float("nan"))
+        return (float("nan"), float("nan"), float("nan"))
     rng = random.Random(seed)
     n = len(day_means)
     boots = []
@@ -51,7 +59,9 @@ def _day_block_bootstrap_ci(
     boots.sort()
     lo = boots[int(0.025 * (B - 1))]
     hi = boots[int(0.975 * (B - 1))]
-    return lo, hi
+    nonpos = sum(1 for b in boots if b <= 0.0)
+    p_value = (nonpos + 1) / (B + 1)
+    return lo, hi, p_value
 
 
 def simulate_size(
@@ -113,7 +123,7 @@ def simulate_size(
     day_means = []
     for d, gs in day_gross.items():
         day_means.append((d, sum(gs) / len(gs) - cost_bps))
-    lo, hi = _day_block_bootstrap_ci(day_means, B, seed)
+    lo, hi, p_value = _day_block_bootstrap(day_means, B, seed)
 
     best = max((g for _, g in entries), default=0.0)
     tot = sum(g for _, g in entries)
@@ -122,7 +132,7 @@ def simulate_size(
     return PortfolioResult(
         N=N, n_entries=n_entries, n_days=len(day_gross),
         gross_bps=gross, cost_bps=cost_bps, net_bps=net,
-        net_ci_low=lo, net_ci_high=hi,
+        net_ci_low=lo, net_ci_high=hi, p_value=p_value,
         top1_concentration=concentration,
         per_day_net={d: v for d, v in day_means},
     )
