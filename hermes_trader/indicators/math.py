@@ -195,31 +195,58 @@ def atr(candles: list[Candle], period: int = 14) -> list[float]:
 
 
 def _rsi_from_closes(closes: list[float], period: int = 14) -> list[float]:
-    """Wilder RSI series from close prices (first `period` values are NaN)."""
+    """Wilder RSI series from close prices (first `period` values are NaN).
+
+    M2 (three-layer audit 2026-10-26): a non-finite close is a missing bar, not
+    a zero move. The gain/loss accumulators only consume FINITE price
+    differences — an explicit ``isfinite`` check rather than relying on both
+    ``d > 0`` and ``d < 0`` being False for NaN (which silently folded the bad
+    bar in as "no movement" and nudged RSI toward 50). The initial Wilder seed
+    averages over the finite deltas, and one bad bar no longer biases the
+    smoothed level; the series recovers on the next finite close (the Wilder
+    recursion was never permanently NaN-poisoned). All-finite output is
+    bit-identical to the original.
+    """
     _check_period(period)
     out = [float("nan")] * len(closes)
     if len(closes) <= period:
         return out
 
+    def _delta(i: int) -> float:
+        a, b = closes[i], closes[i - 1]
+        d = a - b
+        return d if math.isfinite(d) else float("nan")
+
     g, l = 0.0, 0.0
+    n_seed = 0
     for i in range(1, period + 1):
-        d = closes[i] - closes[i - 1]
+        d = _delta(i)
+        if not math.isfinite(d):
+            continue
+        n_seed += 1
         if d >= 0:
             g += d
         else:
             l -= d
 
-    avg_g = g / period
-    avg_l = l / period
+    # Average over the finite deltas actually present in the seed window.
+    avg_g = g / n_seed if n_seed else 0.0
+    avg_l = l / n_seed if n_seed else 0.0
     # Full-checkup 2026-10-24 (P1-1): ``avg_l == 0`` conflates "no down bars"
     # (genuine RSI 100) with "no movement at all" (avg_g == avg_l == 0), which
     # is mathematically no information, not maximum overbought. A flat tape
     # returning RSI 100 can falsely trip the late_chase 1h-RSI blowoff gate.
     # Flat -> neutral 50; strictly-nonnegative moves with zero losses -> 100.
-    out[period] = 100 if avg_l == 0 and avg_g > 0 else (50 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
+    if n_seed:
+        out[period] = 100 if avg_l == 0 and avg_g > 0 else (50 if avg_l == 0 else 100 - 100 / (1 + avg_g / avg_l))
 
     for i in range(period + 1, len(closes)):
-        d = closes[i] - closes[i - 1]
+        d = _delta(i)
+        if not math.isfinite(d):
+            # Missing bar: hold the previous smoothed level rather than feed a
+            # fabricated zero move (which would pull RSI toward 50).
+            out[i] = out[i - 1] if math.isfinite(out[i - 1]) else float("nan")
+            continue
         # gain = positive move else 0; loss = magnitude of a negative move else 0.
         # The loss term must be a non-negative magnitude — the previous
         # `d if d < 0 else -d` fed negatives in and drove RSI below 0.
@@ -359,15 +386,25 @@ def obv(candles: list[Candle]) -> list[float]:
     """
     out = [0.0] * len(candles)
     running = 0.0
-    prev_close = None
+    prev_close: float | None = None
     for i, c in enumerate(candles):
         close = candle_val(c, "c")
         vol = candle_val(c, "v")
+        # M3 (three-layer audit 2026-10-26): a non-finite volume must NOT poison
+        # the cumulative sum (``running += nan`` stayed NaN forever), and a
+        # non-finite close must not become the comparison baseline (a NaN
+        # prev_close silently dropped the next two bars). Hold the running total
+        # across an unusable bar (volume treated as 0 contribution, the prior
+        # close retained) instead of fabricating a signed NaN move.
+        if not math.isfinite(close):
+            out[i] = running
+            continue
         if prev_close is not None:
+            signed_vol = vol if math.isfinite(vol) else 0.0
             if close > prev_close:
-                running += vol
+                running += signed_vol
             elif close < prev_close:
-                running -= vol
+                running -= signed_vol
         out[i] = running
         prev_close = close
     return out

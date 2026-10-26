@@ -673,8 +673,8 @@ def test_b1_build_hits_order_and_daily_mover_terminal():
     hits, score_weights = T.build_hits(_b1_5m_surge(), th, w)
     # Contractually fixed order: 11 base hits, then the terminal dailyMover.
     assert [h["name"] for h in hits] == _B1_BASE_NAMES + ["dailyMover"]
-    # MC off -> the SAME weights object is returned (no denominator drift).
-    assert score_weights is w
+    # T3: MC off -> no denominator drift (content equal), but a copy not alias.
+    assert score_weights == w and score_weights is not w
     assert hits[-1] == {
         "name": "dailyMover", "score": 0,
         "reason": "not a configured 24h mover", "fired": False,
@@ -685,7 +685,7 @@ def test_b1_build_hits_empty_series_every_hit_flat():
     th, w = _b1_thresholds_weights()
     hits, score_weights = T.build_hits([], th, w)
     assert len(hits) == 12
-    assert score_weights is w
+    assert score_weights == w and score_weights is not w
     assert all(h.get("fired") is False for h in hits)
     # No 1h/15m feeds is equivalent to empty feeds.
     hits_none, _ = T.build_hits(
@@ -715,7 +715,10 @@ def test_b1_build_hits_momentum_continuation_appends_and_adds_weight():
     hits_off, sw_off = T.build_hits(
         _b1_5m_surge(), th, w, candles_1h=c1h,
         momentum_continuation={"enabled": False})
-    assert sw_off is w
+    # T3: even when disabled the returned weights are a COPY (no alias), so a
+    # caller mutating them cannot poison the input `w`; content still matches.
+    assert sw_off is not w
+    assert sw_off == w
     assert all(h["name"] != "momentumContinuation1h" for h in hits_off)
 
 
@@ -726,7 +729,9 @@ def test_b1_build_hits_candlestick_hits_gated():
     assert [h["name"] for h in hits] == (
         _B1_BASE_NAMES + ["bearishReversalCandle", "bullishReversalCandle",
                           "dailyMover"])
-    assert score_weights is w  # candlestick hits never touch the denominator
+    # T3: candlestick hits never add to the denominator, and the returned
+    # weights are a copy (no alias back to the caller's `w`).
+    assert score_weights == w and score_weights is not w
     hits_off, _ = T.build_hits(
         _b1_5m_surge(), th, w, candlestick_patterns={"enabled": False})
     assert "bearishReversalCandle" not in [h["name"] for h in hits_off]
@@ -922,3 +927,54 @@ def test_t1_volume_spike_nan_z_is_json_safe():
     assert hit["fired"] is False
     assert hit["z"] is None or math.isfinite(hit["z"])
     json.dumps(hit)
+
+
+# ----- Yellow batch (2026-10-26 three-layer audit): M2/M3/T2/T3 --------
+
+def test_m2_rsi_missing_close_does_not_bias_to_50_and_recovers():
+    # A NaN close is a missing bar, not a zero move. It must not feed a
+    # fabricated zero gain/loss; the series stays finite and recovers, and
+    # all-finite output is unchanged (covered by the golden-value tests).
+    closes = [100.0 + i * 0.3 for i in range(40)]
+    closes[20] = float("nan")
+    rsi_series = M._rsi_from_closes(closes, 14)
+    # No permanent NaN poisoning; the tail is a finite RSI in range.
+    assert math.isfinite(rsi_series[-1])
+    assert 0.0 <= rsi_series[-1] <= 100.0
+
+
+def test_m3_obv_nan_volume_does_not_poison_cumulative():
+    # One NaN volume used to make every later OBV value NaN (running += nan).
+    candles = []
+    for i in range(40):
+        candles.append(Candle(t=i, o=100 + i, h=101 + i, l=99 + i,
+                              c=100 + i + (1 if i % 2 == 0 else 0), v=10.0))
+    candles[20] = Candle(t=20, o=120, h=121, l=119, c=121, v=float("nan"))
+    obv = M.obv(candles)
+    assert all(math.isfinite(x) for x in obv)
+
+
+def test_t2_momentum_continuation_threshold_scores_five():
+    # A setup exactly at the entry threshold must score 5.0 (same convention as
+    # momentum_burst/volume_buildup/breakout), not the old trend/3 (~1.67-2.67).
+    # Construct a smooth uptrend whose last-12-bar gain clears min_trend_pct and
+    # pullback is ~0 with EMA stacked; assert the score scales from the threshold.
+    candles = []
+    px = 100.0
+    for i in range(40):
+        px *= 1.0055 if i >= 28 else 1.0012
+        candles.append(Candle(t=i, o=px, h=px * 1.0002, l=px * 0.9998,
+                              c=px, v=1000.0))
+    hit = T.momentum_continuation_1h(candles, min_trend_pct=5.0)
+    assert hit["fired"] is True
+    assert hit["score"] == pytest.approx(5.0, rel=0.3)  # ~threshold -> ~5
+    # A non-positive threshold fails closed.
+    assert T.momentum_continuation_1h(candles, min_trend_pct=0)["fired"] is False
+
+
+def test_t3_build_hits_never_aliases_input_weights():
+    th, w = _b1_thresholds_weights()
+    _, returned = T.build_hits(_b1_5m_surge(), th, w)
+    assert returned is not w
+    returned["injected"] = 999.0
+    assert "injected" not in w  # mutating the result never reaches the input

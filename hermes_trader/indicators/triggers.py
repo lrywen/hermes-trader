@@ -813,6 +813,8 @@ def momentum_continuation_1h(
     """
     if len(candles) < 24:
         return {"name": "momentumContinuation1h", "score": 0, "reason": "insufficient_history", "fired": False}
+    if min_trend_pct <= 0:
+        return {"name": "momentumContinuation1h", "score": 0, "reason": "flat", "fired": False}
     closes = [candle_val(c, "c") for c in candles]
     e9 = ema(closes, 9)
     e21 = ema(closes, 21)
@@ -826,7 +828,12 @@ def momentum_continuation_1h(
     pullback_pct = (hi - cur) / hi * 100
     stacked = e9[-1] > e21[-1] and cur > e21[-1]
     fired = stacked and trend_pct >= min_trend_pct and 0 <= pullback_pct <= max_pullback_pct
-    score = min(10, max(0, trend_pct / 3)) if fired else 0
+    # T2 (three-layer audit 2026-10-26): score on the SAME scale as the other
+    # triggers — a setup exactly at the entry threshold must score 5.0 (and
+    # twice the threshold saturates at 10), not the old trend_pct/3 that gave
+    # only 1.67 at min_trend_pct=5 (2.67 at the default 8). min_trend_pct is
+    # guaranteed > 0 by the firing condition (trend_pct >= it and finite).
+    score = min(10.0, trend_pct / min_trend_pct * 5.0) if fired else 0
     return {
         "name": "momentumContinuation1h",
         "score": score,
@@ -950,15 +957,17 @@ def build_hits(
     # movers that print no fresh 5m spike). Gated so it has ZERO scoring effect
     # when off: only when enabled is the hit appended AND its weight added to
     # the denominator.
-    score_weights = weights
+    # T3 (three-layer audit 2026-10-26): always return a fresh weights dict so a
+    # caller that mutates score_weights can never mutate the input `weights`
+    # (previously the mc-disabled branch returned the same object alias).
+    score_weights = dict(weights)
     if mc.get("enabled"):
         hits.append(momentum_continuation_1h(
             candles_1h,
             mc.get("min_trend_pct", 8.0),
             mc.get("max_pullback_pct", 6.0),
         ))
-        score_weights = {**weights,
-                         "momentumContinuation1h": mc.get("weight", 0.4)}
+        score_weights["momentumContinuation1h"] = mc.get("weight", 0.4)
 
     # Candlestick reversal patterns — OFF by default. Shooting-star /
     # bearish-engulfing (top of an advance → SHORT) and hammer /

@@ -99,8 +99,14 @@ def _resolve_bin_size(candles: list[Any], bins: int, lo: float, hi: float,
     if not finite_values:
         return fixed_size, int(bins), atr_last
     dynamic_size = finite_values[-1] * float(atr_multiple)
+    # S5 (three-layer audit 2026-10-26): the previous
+    # ``max(dynamic_size, (hi-lo)/10_000)`` floor was dead code — whenever that
+    # floor bound, dynamic_bins was already >= 10_001 and the caller rejects it
+    # via _MAX_ATR_BINS (returns None), so the floor never produced a usable
+    # profile; it only implied protection that wasn't there. Return the true
+    # ATR-derived bin size and let the bin-count cap be the single guard.
     dynamic_bins = max(1, int(math.ceil((hi - lo) / dynamic_size)))
-    return max(dynamic_size, (hi - lo) / 10_000.0), dynamic_bins, atr_last
+    return dynamic_size, dynamic_bins, atr_last
 
 
 def volume_profile(
