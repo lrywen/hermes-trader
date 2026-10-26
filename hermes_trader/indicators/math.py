@@ -54,17 +54,45 @@ def _check_period(period: int) -> None:
 
 
 def ema(values: list[float], period: int) -> list[float]:
-    """Exponential moving average."""
+    """Exponential moving average.
+
+    A non-finite sample makes the EMA NaN while it is the seed/current value,
+    but — like ``sma`` — the series RECOVERS once a finite sample reappears
+    (M1, three-layer audit 2026-10-26). The previous recursion ``e = x*k +
+    e*(1-k)`` kept e NaN forever after one bad bar, so a single missing close
+    silently wiped 83% of an ema(20) series. Recovery restarts the recursion at
+    the next finite sample using it as the new seed; the gap is not
+    back-filled. On all-finite input the fast path below is the original
+    recursion and stays bit-identical.
+    """
     _check_period(period)
-    k = 2 / (period + 1)
-    out = [float("nan")] * len(values)
+    n = len(values)
+    out = [float("nan")] * n
     if not values:
         return out
+    k = 2 / (period + 1)
 
-    e = values[0]
-    out[0] = e
-    for i in range(1, len(values)):
-        e = values[i] * k + e * (1 - k)
+    if all(isinstance(x, (int, float)) and math.isfinite(x) for x in values):
+        e = values[0]
+        out[0] = e
+        for i in range(1, n):
+            e = values[i] * k + e * (1 - k)
+            out[i] = e
+        return out
+
+    # Dirty path: NaN propagates through the recursion, then re-seeds at the
+    # next finite value so the tail recovers.
+    e = float("nan")
+    for i in range(n):
+        x = values[i]
+        if not isinstance(x, (int, float)) or not math.isfinite(x):
+            out[i] = float("nan")
+            e = float("nan")
+            continue
+        if not math.isfinite(e):
+            e = x           # (re)seed after a gap / at the start
+        else:
+            e = x * k + e * (1 - k)
         out[i] = e
     return out
 
@@ -108,23 +136,61 @@ def sma(values: list[float], period: int) -> list[float]:
     return out
 
 
-def atr(candles: list[Candle], period: int = 14) -> list[float]:
-    """Average true range."""
-    _check_period(period)
-    tr = [0.0] * len(candles)
-    for i in range(1, len(candles)):
-        h, l = candle_val(candles[i], "h"), candle_val(candles[i], "l")
-        pc = candle_val(candles[i - 1], "c")
-        tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+def _true_range(candles: list[Candle], i: int) -> float:
+    """True range at index i (0.0 for i==0); NaN if any input field is bad."""
+    h, l = candle_val(candles[i], "h"), candle_val(candles[i], "l")
+    pc = candle_val(candles[i - 1], "c")
+    tr = max(h - l, abs(h - pc), abs(l - pc))
+    return tr if math.isfinite(tr) else float("nan")
 
-    out = [float("nan")] * len(candles)
-    if len(candles) <= period:
+
+def atr(candles: list[Candle], period: int = 14) -> list[float]:
+    """Average true range (Wilder smoothing).
+
+    NaN no longer poisons the whole series (M1, three-layer audit 2026-10-26):
+    a bar whose h/l/prior-close is non-finite yields a NaN TR for that bar; the
+    smoothed ATR is NaN while fewer than ``period`` consecutive valid TRs
+    follow the gap, then re-seeds from their simple mean and resumes Wilder
+    smoothing — so the tail recovers instead of staying NaN forever (the old
+    ``out[i] = (out[i-1]*(p-1)+tr)/p`` recursion could never un-NaN). The
+    all-finite path is the original computation and bit-identical.
+    """
+    _check_period(period)
+    n = len(candles)
+    out = [float("nan")] * n
+    if n <= period:
         return out
 
-    acc = sum(tr[1:period + 1])
-    out[period] = acc / period
-    for i in range(period + 1, len(candles)):
-        out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+    tr = [float("nan")] * n
+    for i in range(1, n):
+        tr[i] = _true_range(candles, i)
+
+    if all(math.isfinite(x) for x in tr[1:]):
+        acc = sum(tr[1:period + 1])
+        out[period] = acc / period
+        for i in range(period + 1, n):
+            out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+        return out
+
+    # Dirty path: track the trailing run of consecutive valid TRs; once it
+    # reaches `period`, (re)seed from their mean and continue Wilder smoothing
+    # until the next NaN resets the run.
+    run: list[float] = []
+    smoothed = float("nan")
+    for i in range(1, n):
+        x = tr[i]
+        if not math.isfinite(x):
+            run = []
+            smoothed = float("nan")
+            continue
+        if not math.isfinite(smoothed):
+            run.append(x)
+            if len(run) == period:
+                smoothed = sum(run) / period
+                out[i] = smoothed
+        else:
+            smoothed = (smoothed * (period - 1) + x) / period
+            out[i] = smoothed
     return out
 
 
@@ -179,55 +245,107 @@ def rsi_last(closes: list[float], period: int = 14) -> float | None:
 
 
 def adx(candles: list[Candle], period: int = 14) -> list[float]:
-    """Average directional index."""
+    """Average directional index.
+
+    NaN recovery (M1, three-layer audit 2026-10-26): one bar with a bad
+    h/l/c used to make every Wilder-smoothed state (TR/+DM/-DM, then DX, then
+    ADX) NaN forever, wiping ~92% of the series. Each smoothing stage now
+    re-seeds from `period` consecutive valid inputs after a gap, so the tail
+    recovers. The all-finite path is the original recursion and bit-identical.
+    """
     _check_period(period)
     n = len(candles)
     out = [float("nan")] * n
     if n <= period * 2:
         return out
 
-    tr = [0.0] * n
-    p_dm = [0.0] * n
-    m_dm = [0.0] * n
+    tr = [float("nan")] * n
+    p_dm = [float("nan")] * n
+    m_dm = [float("nan")] * n
 
     for i in range(1, n):
         h, l = candle_val(candles[i], "h"), candle_val(candles[i], "l")
         pc = candle_val(candles[i - 1], "c")
         ph, pl = candle_val(candles[i - 1], "h"), candle_val(candles[i - 1], "l")
 
-        tr[i] = max(h - l, abs(h - pc), abs(l - pc))
-
+        trv = max(h - l, abs(h - pc), abs(l - pc))
         up = h - ph
         dn = pl - l
-        p_dm[i] = up if (up > dn and up > 0) else 0
-        m_dm[i] = dn if (dn > up and dn > 0) else 0
+        # All five inputs must be finite; otherwise this bar and the directional
+        # moves that reference it cannot be defined.
+        if not all(math.isfinite(v) for v in (trv, up, dn, h, l, pc, ph, pl)):
+            continue
+        tr[i] = trv
+        p_dm[i] = up if (up > dn and up > 0) else 0.0
+        m_dm[i] = dn if (dn > up and dn > 0) else 0.0
 
-    tr_s, p_s, m_s = 0.0, 0.0, 0.0
-    for i in range(1, period + 1):
-        tr_s += tr[i]
-        p_s += p_dm[i]
-        m_s += m_dm[i]
-
-    def _compute_dx() -> float:
+    def _dx_at(tr_s: float, p_s: float, m_s: float) -> float:
         pdi = 0 if tr_s == 0 else 100 * p_s / tr_s
         mdi = 0 if tr_s == 0 else 100 * m_s / tr_s
         total = pdi + mdi
-        return 0 if total == 0 else 100 * abs(pdi - mdi) / total
+        return 0.0 if total == 0 else 100 * abs(pdi - mdi) / total
 
     dx = [float("nan")] * n
-    dx[period] = _compute_dx()
 
-    for i in range(period + 1, n):
-        tr_s = tr_s - tr_s / period + tr[i]
-        p_s = p_s - p_s / period + p_dm[i]
-        m_s = m_s - m_s / period + m_dm[i]
-        dx[i] = _compute_dx()
+    valid = [i for i in range(1, n) if math.isfinite(tr[i])]
+    if len(valid) == n - 1:
+        # All-finite fast path: original computation, bit-identical.
+        tr_s = sum(tr[1:period + 1])
+        p_s = sum(p_dm[1:period + 1])
+        m_s = sum(m_dm[1:period + 1])
+        dx[period] = _dx_at(tr_s, p_s, m_s)
+        for i in range(period + 1, n):
+            tr_s = tr_s - tr_s / period + tr[i]
+            p_s = p_s - p_s / period + p_dm[i]
+            m_s = m_s - m_s / period + m_dm[i]
+            dx[i] = _dx_at(tr_s, p_s, m_s)
 
-    adx_s = sum(dx[period:period * 2])
-    out[period * 2 - 1] = adx_s / period
+        adx_s = sum(dx[period:period * 2])
+        out[period * 2 - 1] = adx_s / period
+        for i in range(period * 2, n):
+            out[i] = (out[i - 1] * (period - 1) + dx[i]) / period
+        return out
 
-    for i in range(period * 2, n):
-        out[i] = (out[i - 1] * (period - 1) + dx[i]) / period
+    # Dirty path: Wilder-smooth the three components over runs of `period`
+    # consecutive valid bars, re-seeding each run from a simple sum.
+    run_idx: list[int] = []
+    tr_s = p_s = m_s = float("nan")
+    for i in range(1, n):
+        if not math.isfinite(tr[i]):
+            run_idx = []
+            tr_s = p_s = m_s = float("nan")
+            continue
+        run_idx.append(i)
+        if len(run_idx) <= period:
+            # (Re)build the seed window from raw values.
+            w = run_idx[-period:]
+            tr_s = sum(tr[j] for j in w)
+            p_s = sum(p_dm[j] for j in w)
+            m_s = sum(m_dm[j] for j in w)
+            if len(run_idx) >= period:
+                dx[i] = _dx_at(tr_s, p_s, m_s)
+        else:
+            tr_s = tr_s - tr_s / period + tr[i]
+            p_s = p_s - p_s / period + p_dm[i]
+            m_s = m_s - m_s / period + m_dm[i]
+            dx[i] = _dx_at(tr_s, p_s, m_s)
+
+    # Smooth DX into ADX, re-seeding from `period` consecutive valid DX.
+    dx_run: list[float] = []
+    adx_prev = float("nan")
+    for i in range(period, n):
+        if not math.isfinite(dx[i]):
+            dx_run = []
+            adx_prev = float("nan")
+            continue
+        dx_run.append(dx[i])
+        if not math.isfinite(adx_prev):
+            if len(dx_run) == period:
+                adx_prev = sum(dx_run) / period
+                out[i] = adx_prev
+        else:
+            adx_prev = (adx_prev * (period - 1) + dx[i]) / period
+            out[i] = adx_prev
 
     return out
 

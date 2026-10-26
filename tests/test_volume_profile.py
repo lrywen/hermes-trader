@@ -100,3 +100,65 @@ def test_volume_profile_atr_bins_and_chase_risk():
     assert vp.chase_risk(vp.poc + half) == pytest.approx(1.0)
     assert 0.0 < vp.chase_risk(vp.poc + half / 2.0) < 1.0
     assert 0.0 <= vp.chase_risk(vp.poc + half * 10.0) <= 1.0
+
+
+def _trend_candles(n=80):
+    out = []
+    for i in range(n):
+        base = 100.0 + i * 0.1
+        out.append({"h": base + 0.05, "l": base - 0.05,
+                    "c": base, "v": 1000.0})
+    return out
+
+
+def test_s1_missing_or_nan_bounds_fail_closed_not_raise():
+    """S1: a missing h/l (candle_val -> NaN) used to make min()/max() NaN, bypass
+    the ``hi <= lo`` guard, and raise ValueError at int(NaN), dropping the whole
+    coin at the unguarded perception call. Must return None instead."""
+    all_nan = [{"h": float("nan"), "l": float("nan"), "c": float("nan"),
+                "v": 1.0} for _ in range(80)]
+    assert volume_profile(all_nan) is None
+
+    # One bad bar in otherwise-clean data does not crash; the remaining finite
+    # bars still define the range (graceful degradation), and the result is sane.
+    one_missing = _trend_candles()
+    one_missing[40].pop("h")
+    vp = volume_profile(one_missing, atr_bins=False)
+    assert vp is not None
+    assert vp.val <= vp.poc <= vp.vah
+
+
+def test_s2_nan_volume_bar_dropped_not_degenerate_profile():
+    """S2: ``volume <= 0`` is False for NaN, so one NaN volume poisoned total and
+    returned a degenerate poc=vah=val profile. The bad bar is dropped; the other
+    finite bars still produce a real (non-degenerate) profile."""
+    cs = _trend_candles()
+    cs[50]["v"] = float("nan")
+    vp = volume_profile(cs, atr_bins=False)
+    assert vp is not None
+    assert vp.vah > vp.val  # not the single-bin garbage collapse
+
+    # All-NaN volume -> no usable volume -> None.
+    all_nan_v = _trend_candles()
+    for c in all_nan_v:
+        c["v"] = float("nan")
+    assert volume_profile(all_nan_v, atr_bins=False) is None
+
+
+def test_s3_value_area_does_not_expand_into_empty_bins():
+    """S3: the old >= tie-break expanded UP into two empty (zero-volume) bins,
+    biasing VAH high. A symmetric configuration with populated bins only around
+    the POC must not extend the VA into empty space on either side."""
+    candles = []
+    for price, vol in ((100.0, 600.0), (90.0, 400.0), (110.0, 400.0)):
+        for _ in range(10):
+            candles.append({"h": price + 0.01, "l": price - 0.01,
+                            "c": price, "v": vol / 10.0})
+    vp = volume_profile(candles, bins=50, value_area_pct=70.0, atr_bins=False)
+    assert vp is not None
+    up = vp.vah - vp.poc
+    dn = vp.poc - vp.val
+    # No systematic one-sided reach into empty bins: the two extensions must be
+    # comparable (pre-fix up-ext was ~10.2 while dn-ext was 0.0).
+    assert up == pytest.approx(dn, rel=0.0, abs=0.5)
+

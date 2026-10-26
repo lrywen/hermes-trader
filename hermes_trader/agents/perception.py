@@ -703,18 +703,32 @@ def _scan_single_market(
             _cvd_divergence_info = None
 
         _vp_cfg = _lc_capture.get("volume_profile") or {}
-        _vp = volume_profile(
-            candles,
-            bins=int(_vp_cfg.get("bins", 50)),
-            atr_bins=bool(_vp_cfg.get("atr_bins", True)),
-            atr_period=int(_vp_cfg.get("atr_period", 14)),
-            atr_multiple=float(_vp_cfg.get("atr_multiple", 0.25)),
-        )
+        # Defense in depth (S1, three-layer audit 2026-10-26): volume_profile
+        # now fail-closes to None on non-finite OHLC, but never let an
+        # unexpected error from this observation-only enrichment bubble up and
+        # drop the whole coin for the scan cycle (the previous unguarded call
+        # did exactly that via _scan_single_market's outer except). Mirrors the
+        # try/except on the CVD block directly above.
+        try:
+            _vp = volume_profile(
+                candles,
+                bins=int(_vp_cfg.get("bins", 50)),
+                atr_bins=bool(_vp_cfg.get("atr_bins", True)),
+                atr_period=int(_vp_cfg.get("atr_period", 14)),
+                atr_multiple=float(_vp_cfg.get("atr_multiple", 0.25)),
+            )
+        except Exception:
+            _vp = None
         _volume_profile_info = None
         if _vp is not None:
             # reuse the ATR14 already computed inside volume_profile (w7).
             _atr_last = _vp.atr_last
             _volume_profile_info = {
+                # Bumped 2026-10-26 (three-layer audit S3): value area no longer
+                # expands into zero-volume bins (old up-tie-biased VAH inflated
+                # chase_risk's half-width denominator). Pre/post-S3 VA/chase_risk
+                # rows are not comparable; also folds in S1/S2 non-finite guards.
+                "vp_caliber": "vp.v3:finite_guards,va_skips_empty_bins",
                 "poc": _vp.poc,
                 "vah": _vp.vah,
                 "val": _vp.val,

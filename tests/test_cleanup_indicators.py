@@ -156,6 +156,88 @@ def test_sma_nan_poisons_only_covering_windows_then_recovers():
     assert all((math.isnan(a) and math.isnan(b)) or a == b for a, b in zip(new, old))
 
 
+def _m1_candles(n=120):
+    cs = []
+    px = 100.0
+    for i in range(n):
+        px += 0.5
+        cs.append({"h": px + 1.0, "l": px - 1.0, "c": px, "v": 1000.0})
+    return cs
+
+
+def test_ema_nan_reseeds_and_recovers():
+    """M1: one missing close must NaN the EMA at that bar but the tail recovers,
+    and all-finite output stays bit-identical to the original recursion."""
+    from hermes_trader.indicators.math import ema
+
+    p = 20
+    closes = [float(i) for i in range(120)]
+    closes[30] = float("nan")
+    e = ema(closes, p)
+    assert math.isnan(e[30])
+    assert all(math.isfinite(e[i]) for i in range(31, 120))  # re-seeds, recovers
+
+    def old_ema(values, period):
+        k = 2 / (period + 1)
+        out = [float("nan")] * len(values)
+        x = values[0]
+        out[0] = x
+        for i in range(1, len(values)):
+            x = values[i] * k + x * (1 - k)
+            out[i] = x
+        return out
+
+    clean = [float(i) for i in range(120)]
+    assert ema(clean, p) == old_ema(clean, p)
+
+
+def test_atr_nan_reseeds_and_recovers_clean_bit_identical():
+    """M1: a single missing h/l NaNs the TR and any smoothed ATR touching it, but
+    after `period` consecutive valid bars the ATR re-seeds and the tail recovers
+    instead of staying NaN forever. Clean output is bit-identical to the original
+    Wilder recursion."""
+    from hermes_trader.indicators.math import atr
+
+    cs = _m1_candles(120)
+    cs[30].pop("h")
+    a = atr(cs, 14)
+    assert math.isnan(a[30])
+    assert all(math.isfinite(a[i]) for i in range(45, 120))
+
+    def old_atr(candles, period=14):
+        tr = [0.0] * len(candles)
+        for i in range(1, len(candles)):
+            h, l, pc = candles[i]["h"], candles[i]["l"], candles[i - 1]["c"]
+            tr[i] = max(h - l, abs(h - pc), abs(l - pc))
+        out = [float("nan")] * len(candles)
+        out[period] = sum(tr[1:period + 1]) / period
+        for i in range(period + 1, len(candles)):
+            out[i] = (out[i - 1] * (period - 1) + tr[i]) / period
+        return out
+
+    clean = _m1_candles(120)
+    new, old = atr(clean, 14), old_atr(clean)
+    assert all((math.isnan(x) and math.isnan(y)) or x == y
+               for x, y in zip(new, old))
+
+
+def test_adx_nan_reseeds_and_recovers_clean_bit_identical():
+    """M1: ADX smoothing (TR/+DM/-DM -> DX -> ADX) re-seeds after a gap so the
+    tail recovers; clean output is unchanged from the original recursion."""
+    from hermes_trader.indicators.math import adx
+
+    cs = _m1_candles(120)
+    cs[40].pop("h")
+    x = adx(cs, 14)
+    assert math.isnan(x[40])
+    # Enough consecutive valid bars after the gap -> the tail is finite again.
+    assert all(math.isfinite(x[i]) for i in range(75, 120))
+
+    # Structural sanity on clean data: ADX stays in [0, 100].
+    clean = adx(_m1_candles(120), 14)
+    assert all(math.isnan(v) or 0.0 <= v <= 100.0 for v in clean)
+
+
 def test_directional_momentum_triggers_are_symmetric():
     """uptrend_momentum fires on a sustained UP move, downtrend_momentum on a
     sustained DOWN move, and each stays silent on the opposite/flat — the

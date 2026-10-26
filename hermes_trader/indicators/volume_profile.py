@@ -130,9 +130,16 @@ def volume_profile(
 
     lows = [_candle_value(c, "l") for c in candles]
     highs = [_candle_value(c, "h") for c in candles]
+    # S1 (three-layer audit 2026-10-26): a single missing/non-finite high or low
+    # makes min()/max() NaN; ``hi <= lo`` is False for NaN so the degenerate
+    # guard below was bypassed and ``int((c_lo-lo)/bin_size)`` then raised
+    # ValueError ("cannot convert float NaN to integer"), which at the unguarded
+    # perception call site silently dropped the whole coin for the scan cycle.
+    # candle_val deliberately degrades a bad bar to NaN so the is-finite guard
+    # here can reject it; honor that contract and fail closed to None.
     lo = min(lows)
     hi = max(highs)
-    if hi <= lo:
+    if not (math.isfinite(lo) and math.isfinite(hi)) or hi <= lo:
         return None
 
     bin_size, resolved_bins, atr_last = _resolve_bin_size(
@@ -147,6 +154,14 @@ def volume_profile(
         c_lo = _candle_value(candle, "l")
         c_hi = _candle_value(candle, "h")
         volume = _candle_value(candle, "v")
+        # S2 (three-layer audit 2026-10-26): a non-finite volume must be dropped.
+        # ``volume <= 0`` is False for NaN, so the old guard let counts[i]+=NaN
+        # through, poisoning total to NaN (``total <= 0`` also False) and
+        # returning a degenerate single-bin profile (poc=vah=val) instead of
+        # None. Non-finite bounds cannot be allocated to bins either, so skip.
+        if not (math.isfinite(c_lo) and math.isfinite(c_hi)
+                and math.isfinite(volume)):
+            continue
         c_rng = c_hi - c_lo
         if c_hi <= c_lo or volume <= 0:
             continue
@@ -169,9 +184,21 @@ def volume_profile(
     below = poc_i - 1
 
     while volume_inside < target and (above < resolved_bins or below >= 0):
-        above_vol = counts[above] if above < resolved_bins else -1.0
-        below_vol = counts[below] if below >= 0 else -1.0
-        if above_vol >= below_vol:
+        above_vol = counts[above] if above < resolved_bins else 0.0
+        below_vol = counts[below] if below >= 0 else 0.0
+        # S3 (three-layer audit 2026-10-26): never expand the value area into a
+        # ZERO-volume bin. Because volume is allocated by price overlap, the
+        # populated bins are contiguous around the POC, so the first empty bin on
+        # either frontier is the real edge of traded value; walking past it just
+        # paints empty space into the VA. The old ``>=`` tie-break chose UP when
+        # BOTH frontiers were empty (-1 sentinel aside, two real empty bins tied
+        # at 0 and went up), biasing VAH systematically high (34,531 prod windows:
+        # VAH-POC / POC-VAL ratio 1.074, P(up)=0.524) and inflating chase_risk's
+        # half-width denominator. Prefer the heavier populated side; if both are
+        # empty there is no more traded volume to add, so stop.
+        if above_vol <= 0.0 and below_vol <= 0.0:
+            break
+        if above_vol >= below_vol and above_vol > 0.0:
             included.add(above)
             volume_inside += above_vol
             above += 1

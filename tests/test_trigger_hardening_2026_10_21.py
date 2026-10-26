@@ -886,3 +886,39 @@ def test_b1_evaluate_window_single_feed_matches_build_hits():
     # Backtest never opts into momentum continuation, so the hit is absent.
     assert all(h["name"] != "momentumContinuation1h" for h in hits)
 
+
+
+# ---------- T1 (2026-10-26 three-layer audit): NaN z / direction --------
+
+def test_t1_pct_move_spike_nan_close_is_json_safe_flat():
+    import json
+    # all-NaN candles: z must not be NaN (invalid JSON) and direction must not
+    # be "down" for a no-data bar.
+    all_nan = [Candle(t=i, o=float("nan"), h=float("nan"), l=float("nan"),
+                      c=float("nan"), v=1.0) for i in range(100)]
+    hit = T.pct_move_spike(all_nan)
+    assert hit["fired"] is False
+    assert hit["z"] is None or math.isfinite(hit["z"])
+    assert hit["direction"] == "flat"
+    json.dumps(hit)  # strict: non-finite NaN would raise only with allow_nan=False
+
+    # missing CURRENT close specifically -> flat, finite z, not "down".
+    good = [Candle(t=i, o=100 + i * 0.01, h=100 + i * 0.01 + 0.02,
+                   l=100 + i * 0.01 - 0.02, c=100 + i * 0.01, v=1000.0)
+            for i in range(100)]
+    good[-1] = Candle(t=99, o=float("nan"), h=float("nan"), l=float("nan"),
+                      c=float("nan"), v=1000.0)
+    h2 = T.pct_move_spike(good)
+    assert h2["fired"] is False
+    assert h2["z"] is None or math.isfinite(h2["z"])
+    assert h2["direction"] == "flat"
+
+
+def test_t1_volume_spike_nan_z_is_json_safe():
+    import json
+    all_nan = [Candle(t=i, o=float("nan"), h=float("nan"), l=float("nan"),
+                      c=float("nan"), v=float("nan")) for i in range(100)]
+    hit = T.volume_spike(all_nan)
+    assert hit["fired"] is False
+    assert hit["z"] is None or math.isfinite(hit["z"])
+    json.dumps(hit)

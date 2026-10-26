@@ -33,7 +33,15 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
     # the current pair explicitly up front.
     _flat = {"name": "pctMoveSpike", "score": 0, "reason": "flat", "fired": False,
              "z": 0.0, "direction": "flat"}
-    if candle_val(candles[-2], "c") <= 0:
+    # T1 (three-layer audit 2026-10-26): the current close and the prior close
+    # must both be finite. A NaN comparison is always False, so a missing current
+    # close slipped past the prior-close guard, produced a NaN z (which makes
+    # json.dumps emit invalid non-finite JSON) and — worse — labelled the bar
+    # direction "down" (NaN > 0 is False), tagging a no-data bar as a drop.
+    _cur_close = candle_val(candles[-1], "c")
+    _prev_close = candle_val(candles[-2], "c")
+    if not (math.isfinite(_cur_close) and math.isfinite(_prev_close)) \
+            or _prev_close <= 0:
         return _flat
 
     returns = []
@@ -67,6 +75,11 @@ def pct_move_spike(candles: list[Candle], sigma_threshold: float = 3) -> Trigger
                 "z": 0.0, "direction": "flat"}
 
     z_score = abs(current_return - mean) / std
+    # Defensive: a NaN anywhere in the trailing returns makes mean/std/z NaN.
+    # Never emit a non-finite z (invalid JSON) or call a no-data bar "down".
+    if not math.isfinite(z_score) or not math.isfinite(current_return):
+        return {"name": "pctMoveSpike", "score": 0, "reason": "flat",
+                "fired": False, "z": None, "direction": "flat"}
     fired = z_score >= sigma_threshold
     score = min(10, max(0, z_score))
     # B3 (2026-10-22): direction is the bar's actual up/down move, not the
@@ -123,6 +136,11 @@ def volume_spike(candles: list[Candle], sigma_threshold: float = 3) -> TriggerHi
                 "z": 0.0}
 
     z_score = abs(current_vol - mean) / std
+    # T1 (three-layer audit 2026-10-26): a NaN anywhere in the baseline poisons
+    # mean/std and therefore z. Emit JSON-safe None instead of non-finite NaN.
+    if not math.isfinite(z_score):
+        return {"name": "volumeSpike", "score": 0, "reason": "flat",
+                "fired": False, "z": None}
     fired = z_score >= sigma_threshold
     score = min(10, max(0, z_score))
 
