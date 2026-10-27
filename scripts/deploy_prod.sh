@@ -13,6 +13,8 @@
 #          却忘了 build，容器仍跑旧镜像）
 #        - postdeploy_smoke.py 冒烟
 #        - 近期容器日志无 Traceback
+#        - postdeploy_shadow_checks.py：panic gate 落盘 + maker v2 零成交守卫
+#          （只读；MISSING=预热不阻断，FAIL 默认告警、STRICT_SHADOW_CHECKS=1 阻断）
 #   4. 打印 git 回滚锚点与回滚命令（本流程无镜像 tag，回滚走 git）
 #
 # 用法：
@@ -24,6 +26,8 @@
 #   SRC_DIR    源码目录（默认 /home/ldy/hermes-trader）
 #   DEPLOY_DIR 部署目录（默认 /home/ldy/hermes-deploy）
 #   SERVICE    容器/服务名（默认 hermes-trader）
+#   STRICT_SHADOW_CHECKS=1  影子核验 FAIL(exit2) 时阻断发布（默认仅告警）
+#   EXPECT_MAKER_V2=on      声明本次已启用 maker v2，强制其账本出现并健康
 # ────────────────────────────────────────────────────────────────────
 set -euo pipefail
 
@@ -146,6 +150,34 @@ else
     warn "近 3 分钟日志出现 ${RECENT_TRACEBACKS} 处 Traceback，请用 'docker logs ${SERVICE}' 复核"
     docker logs --since 3m "${SERVICE}" 2>&1 | grep -A3 "Traceback" | tail -20 || true
 fi
+
+# 3d. 影子健康核验（panic gate 落盘 + maker v2 零成交守卫）。只读、不下单。
+#     全新部署时账本/影子 jsonl 尚不存在，脚本返回 3(MISSING) 属正常预热，不阻断。
+#     默认 auto：仅在容器内运行并打印，FAIL 给告警；要让 FAIL 阻断发布，设
+#     STRICT_SHADOW_CHECKS=1；显式启用了 maker v2 时加 EXPECT_MAKER_V2=on。
+#       STRICT_SHADOW_CHECKS=1 EXPECT_MAKER_V2=on bash scripts/deploy_prod.sh
+log "运行容器内 postdeploy_shadow_checks.py（panic gate + maker v2，只读）..."
+SHADOW_ARGS=()
+if [[ "${EXPECT_MAKER_V2:-auto}" == "on" ]]; then
+    SHADOW_ARGS+=(--expect-v2 on)
+fi
+set +e
+docker exec "${SERVICE}" python /app/scripts/postdeploy_shadow_checks.py "${SHADOW_ARGS[@]}"
+SHADOW_RC=$?
+set -e
+case "${SHADOW_RC}" in
+    0) ok "影子健康核验通过（OK/预热 WARN）" ;;
+    3) warn "影子账本/落盘尚不存在（MISSING，预热中）；跑过若干扫描周期后重跑核验" ;;
+    2)
+        warn "影子健康核验 FAIL（panic gate 或 maker v2 接线异常，见上方输出）"
+        if [[ "${STRICT_SHADOW_CHECKS:-0}" == "1" ]]; then
+            err "STRICT_SHADOW_CHECKS=1：发布后影子核验失败，阻断。"
+            exit 1
+        fi
+        warn "默认不阻断；确认缺陷后可带 STRICT_SHADOW_CHECKS=1 重新发布以强制阻断。"
+        ;;
+    *) warn "影子核验返回未知退出码 ${SHADOW_RC}，请人工复核" ;;
+esac
 
 # ── 4. 完成 + 回滚锚点 ────────────────────────────────────────────────
 log "== 4/4 部署完成 =="

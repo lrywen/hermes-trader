@@ -94,6 +94,94 @@ flyctl deploy     # builds image + rolls both processes
 For zero-downtime deploys, Fly does the web rolling restart for free. The loop
 process briefly drops; the next scan tick (~60s later) resumes.
 
+## Post-deploy verification
+
+`scripts/deploy_prod.sh` already runs `scripts/postdeploy_smoke.py` inside the
+image and fails the deploy on a Traceback in the first ~3 minutes. The scripts
+below are the **shadow-evidence** checks added for the 2026-10-27 maker-v2 /
+panic-gate / dual-gate work. They are all read-only and open no orders; run them
+inside the container (`cd /app`) after enough scan cycles have elapsed. They
+write nothing and exit non-zero only where noted.
+
+### 0. One-command shadow health (panic gate + maker v2)
+
+```bash
+python scripts/postdeploy_shadow_checks.py            # auto-detects v2 from the book
+# after explicitly enabling maker v2, force the expectation:
+python scripts/postdeploy_shadow_checks.py --expect-v2 on --min-v2-decided 20
+echo $?   # 0 OK (incl. pre-warm WARN), 2 FAIL (wiring defect), 3 MISSING
+```
+
+It reads the real `ShadowBook` (`adverse_selection.v2`) and
+`xs_reversal_shadow.jsonl` and catches the two "enabled-but-silent" failures:
+- maker v2 returns `FAIL` if the book shows >=20 touched cancels with 0 fills
+  (`zero_fill_warning`) or a sub-1% fill rate after an adequate sample;
+- panic gate returns `FAIL` if trigger rows exist but none carry `panic_gate_*`
+  fields (deployed image predates the record-only gate). When the arm hasn't
+  triggered yet it falls back to the xs heartbeat (`/data/.xs-reversal.state`)
+  for liveness. Use `--json` for machine output. The detailed checks below give
+  the underlying counters.
+
+### 1. maker v2 fill model (only if `shadow_book.maker_fill_model="v2"`)
+
+The v2 deterministic wiring must NOT produce a silent empty ledger (the 2026-10-27
+defect: the old `p>=1` rule never filled at base=0.30). After the shadow book has
+decided >=20 maker orders, inspect the maker shadow summary (`adverse_selection.v2`):
+
+- `zero_fill_warning` must be `false`. `true` means >=20 orders were touched but
+  0 filled — the probability wiring regressed; do not trust v2 evidence.
+- `fill_rate_pct` should sit near the calibrated ~9–30% band (1m real-data
+  offline replay ~9%; long-run deterministic expectation tracks base 0.30), never
+  0. v1 (default) is unchanged and does not emit a v2 block.
+
+### 2. WF-C scan coverage
+
+Evidence comes from the already-enabled `coin_selection` shadow log
+(`mode=shadow, top_k=55`); no extra instrumentation is needed.
+
+```bash
+# static structure from a universe snapshot (works immediately, no waiting):
+python scripts/wfc_scan_coverage_counterfactual.py \
+  --meta ~/.hermes/universe_cache/meta.json
+# measured multi-cycle coverage once /data/coin_selection.jsonl has >=30 cycles:
+python scripts/wfc_scan_coverage_from_log.py --file /data/coin_selection.jsonl
+```
+
+Decision criteria (measured, not assumed):
+- `union_coverage_pct` should approach ~100% of the **sweep ring** (markets with
+  24h notional >= `scan_budget.movers_vol_floor_usd`, 101 of 234 in the 2026-10-20
+  snapshot; the other 133 are intentionally-excluded pico-caps). Static expectation
+  is full ring coverage within ~7 cycles.
+- Sub-$300k markets being absent is by design; do not widen `max_markets` on the
+  basis of single-cycle coverage (the 60-cap already covers ~98.6% of notional).
+- Act only if `score_only_coins_never_bucket_scanned` repeatedly contains
+  **liquid ($1–4M) oversold** coins with positive forward returns in the
+  `selection_attribution` output — then consider a dedicated oversold entry
+  channel, not a blanket cap increase (HL ~1200 weight/min budget).
+
+### 3. WF-C min_composite 40/45 dual gate (record-only)
+
+Every runner-gate verdict now logs `passes40`/`passes45` to
+`runner_gate_shadow.jsonl`. The live gate is unchanged.
+
+```bash
+python scripts/wfc_dual_gate_counts.py --file /data/runner_gate_shadow.jsonl --days 14
+```
+
+Do NOT change `min_composite` from 45 unless the `[40,45)` band, over enough
+verdicts, stays **positive end-to-end** in an AI-gated A/B. The counters only
+start accumulating after the deploy that includes this field.
+
+### 4. Error-rate alerting
+
+```bash
+python scripts/wfc_error_rate_alert.py --file /data/session-log.jsonl --warn 100 --days 1
+echo $?   # 0 OK, 2 threshold breached, 3 log missing
+```
+
+Investigate any day whose ERROR count breaches `--warn` (the 2026-10-23 spike was
+~958: max-retries / funding timeout / 429 backoff). Suitable for a cron watch.
+
 ## SSH into the running machine
 
 ```bash
