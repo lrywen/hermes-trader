@@ -1,0 +1,110 @@
+{
+  "history": {
+    "85.0": {
+      "none": {
+        "vol_leg": "none",
+        "n_episodes": 137,
+        "n_signal_days": 108,
+        "mean_net_bp": 246.1,
+        "win_pct": 62.8,
+        "day_t": 3.1,
+        "day_ci95_bp": [
+          84.7,
+          353.9
+        ],
+        "leave_one_month_out_worst_bp": 219.5,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 40.8,
+        "gate_preliminary_pass": true
+      },
+      "fixed1.0": {
+        "vol_leg": "fixed1.0",
+        "n_episodes": 120,
+        "n_signal_days": 95,
+        "mean_net_bp": 276.3,
+        "win_pct": 64.2,
+        "day_t": 2.98,
+        "day_ci95_bp": [
+          79.0,
+          392.6
+        ],
+        "leave_one_month_out_worst_bp": 247.3,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 36.7,
+        "gate_preliminary_pass": true
+      },
+      "pctile0.6": {
+        "vol_leg": "pctile0.6",
+        "n_episodes": 98,
+        "n_signal_days": 79,
+        "mean_net_bp": 296.8,
+        "win_pct": 68.4,
+        "day_t": 2.83,
+        "day_ci95_bp": [
+          65.3,
+          374.8
+        ],
+        "leave_one_month_out_worst_bp": 251.1,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 32.9,
+        "gate_preliminary_pass": true
+      }
+    },
+    "90.0": {
+      "none": {
+        "vol_leg": "none",
+        "n_episodes": 131,
+        "n_signal_days": 101,
+        "mean_net_bp": 158.5,
+        "win_pct": 58.0,
+        "day_t": 2.02,
+        "day_ci95_bp": [
+          7.5,
+          287.6
+        ],
+        "leave_one_month_out_worst_bp": 120.6,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 56.9,
+        "gate_preliminary_pass": true
+      },
+      "fixed1.0": {
+        "vol_leg": "fixed1.0",
+        "n_episodes": 116,
+        "n_signal_days": 93,
+        "mean_net_bp": 198.5,
+        "win_pct": 59.5,
+        "day_t": 2.25,
+        "day_ci95_bp": [
+          21.7,
+          324.1
+        ],
+        "leave_one_month_out_worst_bp": 157.6,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 45.3,
+        "gate_preliminary_pass": true
+      },
+      "pctile0.6": {
+        "vol_leg": "pctile0.6",
+        "n_episodes": 107,
+        "n_signal_days": 80,
+        "mean_net_bp": 226.9,
+        "win_pct": 63.6,
+        "day_t": 2.59,
+        "day_ci95_bp": [
+          48.5,
+          368.9
+        ],
+        "leave_one_month_out_worst_bp": 184.1,
+        "coin_breadth_pos_pct": 100.0,
+        "n_coins": 3,
+        "top5pct_profit_share": 41.7,
+        "gate_preliminary_pass": true
+      }
+    }
+  }
+}

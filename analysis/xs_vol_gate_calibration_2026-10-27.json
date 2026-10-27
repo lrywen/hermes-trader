@@ -1,0 +1,308 @@
+{
+  "params": {
+    "ext_max": -8.0,
+    "rsi_min": 20.0,
+    "atr_pctile_win": 2160
+  },
+  "deep_n": 137,
+  "variants": {
+    "fixed_atr>=0.8%": {
+      "stats": {
+        "n": 133,
+        "days": 104,
+        "mean_bp": 255.1,
+        "wr_pct": 63.2,
+        "day_t": 3.14,
+        "day_ci_bp": [
+          87.1,
+          370.2
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 6.0,
+        "ETHUSDT": 32.3,
+        "SOLUSDT": 61.7
+      },
+      "yearly": {
+        "2023": {
+          "n": 7,
+          "mean_bp": 325.2,
+          "wr_pct": 57.1
+        },
+        "2024": {
+          "n": 47,
+          "mean_bp": 239.3,
+          "wr_pct": 61.7
+        },
+        "2025": {
+          "n": 56,
+          "mean_bp": 271.2,
+          "wr_pct": 64.3
+        },
+        "2026": {
+          "n": 23,
+          "mean_bp": 226.6,
+          "wr_pct": 65.2
+        }
+      },
+      "y2026_n": 23,
+      "y2026_mean_bp": 226.6
+    },
+    "fixed_atr>=1.0%": {
+      "stats": {
+        "n": 120,
+        "days": 95,
+        "mean_bp": 276.3,
+        "wr_pct": 64.2,
+        "day_t": 2.98,
+        "day_ci_bp": [
+          79.0,
+          392.6
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 5.0,
+        "ETHUSDT": 30.8,
+        "SOLUSDT": 64.2
+      },
+      "yearly": {
+        "2023": {
+          "n": 7,
+          "mean_bp": 325.2,
+          "wr_pct": 57.1
+        },
+        "2024": {
+          "n": 40,
+          "mean_bp": 292.7,
+          "wr_pct": 67.5
+        },
+        "2025": {
+          "n": 52,
+          "mean_bp": 275.3,
+          "wr_pct": 63.5
+        },
+        "2026": {
+          "n": 21,
+          "mean_bp": 231.5,
+          "wr_pct": 61.9
+        }
+      },
+      "y2026_n": 21,
+      "y2026_mean_bp": 231.5
+    },
+    "fixed_atr>=1.2%": {
+      "stats": {
+        "n": 88,
+        "days": 72,
+        "mean_bp": 275.0,
+        "wr_pct": 65.9,
+        "day_t": 2.71,
+        "day_ci_bp": [
+          70.2,
+          425.2
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 4.5,
+        "ETHUSDT": 28.4,
+        "SOLUSDT": 67.0
+      },
+      "yearly": {
+        "2023": {
+          "n": 6,
+          "mean_bp": 481.9,
+          "wr_pct": 66.7
+        },
+        "2024": {
+          "n": 34,
+          "mean_bp": 221.7,
+          "wr_pct": 61.8
+        },
+        "2025": {
+          "n": 33,
+          "mean_bp": 292.5,
+          "wr_pct": 69.7
+        },
+        "2026": {
+          "n": 15,
+          "mean_bp": 274.6,
+          "wr_pct": 66.7
+        }
+      },
+      "y2026_n": 15,
+      "y2026_mean_bp": 274.6
+    },
+    "atr_pctile>=0.5": {
+      "stats": {
+        "n": 109,
+        "days": 85,
+        "mean_bp": 261.7,
+        "wr_pct": 66.1,
+        "day_t": 2.67,
+        "day_ci_bp": [
+          50.8,
+          363.7
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 7.3,
+        "ETHUSDT": 35.8,
+        "SOLUSDT": 56.9
+      },
+      "yearly": {
+        "2023": {
+          "n": 6,
+          "mean_bp": 481.9,
+          "wr_pct": 66.7
+        },
+        "2024": {
+          "n": 40,
+          "mean_bp": 237.0,
+          "wr_pct": 65.0
+        },
+        "2025": {
+          "n": 42,
+          "mean_bp": 268.3,
+          "wr_pct": 66.7
+        },
+        "2026": {
+          "n": 21,
+          "mean_bp": 232.7,
+          "wr_pct": 66.7
+        }
+      },
+      "y2026_n": 21,
+      "y2026_mean_bp": 232.7
+    },
+    "atr_pctile>=0.6": {
+      "stats": {
+        "n": 98,
+        "days": 79,
+        "mean_bp": 296.8,
+        "wr_pct": 68.4,
+        "day_t": 2.83,
+        "day_ci_bp": [
+          65.3,
+          374.8
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 8.2,
+        "ETHUSDT": 38.8,
+        "SOLUSDT": 53.1
+      },
+      "yearly": {
+        "2023": {
+          "n": 5,
+          "mean_bp": 238.6,
+          "wr_pct": 60.0
+        },
+        "2024": {
+          "n": 34,
+          "mean_bp": 312.9,
+          "wr_pct": 67.6
+        },
+        "2025": {
+          "n": 39,
+          "mean_bp": 318.2,
+          "wr_pct": 71.8
+        },
+        "2026": {
+          "n": 20,
+          "mean_bp": 241.9,
+          "wr_pct": 65.0
+        }
+      },
+      "y2026_n": 20,
+      "y2026_mean_bp": 241.9
+    },
+    "atr_pctile>=0.7": {
+      "stats": {
+        "n": 84,
+        "days": 66,
+        "mean_bp": 328.5,
+        "wr_pct": 71.4,
+        "day_t": 2.92,
+        "day_ci_bp": [
+          85.0,
+          423.3
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 9.5,
+        "ETHUSDT": 40.5,
+        "SOLUSDT": 50.0
+      },
+      "yearly": {
+        "2023": {
+          "n": 4,
+          "mean_bp": 471.8,
+          "wr_pct": 75.0
+        },
+        "2024": {
+          "n": 26,
+          "mean_bp": 292.2,
+          "wr_pct": 69.2
+        },
+        "2025": {
+          "n": 35,
+          "mean_bp": 386.2,
+          "wr_pct": 77.1
+        },
+        "2026": {
+          "n": 19,
+          "mean_bp": 242.0,
+          "wr_pct": 63.2
+        }
+      },
+      "y2026_n": 19,
+      "y2026_mean_bp": 242.0
+    },
+    "__no_vol_leg__": {
+      "stats": {
+        "n": 137,
+        "days": 108,
+        "mean_bp": 246.1,
+        "wr_pct": 62.8,
+        "day_t": 3.1,
+        "day_ci_bp": [
+          84.7,
+          353.9
+        ]
+      },
+      "coin_share_pct": {
+        "BTCUSDT": 6.6,
+        "ETHUSDT": 31.4,
+        "SOLUSDT": 62.0
+      },
+      "yearly": {
+        "2023": {
+          "n": 8,
+          "mean_bp": 239.5,
+          "wr_pct": 50.0
+        },
+        "2024": {
+          "n": 48,
+          "mean_bp": 238.8,
+          "wr_pct": 62.5
+        },
+        "2025": {
+          "n": 56,
+          "mean_bp": 271.2,
+          "wr_pct": 64.3
+        },
+        "2026": {
+          "n": 25,
+          "mean_bp": 206.2,
+          "wr_pct": 64.0
+        }
+      },
+      "y2026_n": 25,
+      "y2026_mean_bp": 206.2
+    }
+  },
+  "coin_share_spread": {
+    "fixed_atr>=1.0%": 59.2,
+    "atr_pctile>=0.6": 44.9
+  }
+}

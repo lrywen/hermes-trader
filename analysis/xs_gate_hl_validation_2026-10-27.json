@@ -1,0 +1,257 @@
+{
+  "test": "xs combined gate external validation on Hyperliquid",
+  "gate": {
+    "ext_pct<=": -8.0,
+    "atr24_pct>=": 1.0,
+    "rsi>=": 20.0,
+    "frozen_from": "binance_discovery"
+  },
+  "hl_span": [
+    "2026-05-28",
+    "2026-09-02"
+  ],
+  "top_pct": 85.0,
+  "cost_bps": 9.26,
+  "hl": {
+    "span": [
+      "2026-05-28",
+      "2026-09-02"
+    ],
+    "n_rows": 23,
+    "all_candidates": {
+      "n_ep": 23,
+      "n_days": 14,
+      "mean_bp": 13.5,
+      "wr_pct": 69.6,
+      "day_t": 0.74,
+      "day_ci_bp": [
+        -197.5,
+        372.1
+      ],
+      "y2026_n": 23,
+      "y2026_mean_bp": 13.5
+    },
+    "gated": {
+      "n_ep": 5,
+      "n_days": 3,
+      "mean_bp": 743.9,
+      "wr_pct": 100.0,
+      "day_t": 7.44,
+      "day_ci_bp": [
+        620.5,
+        1001.6
+      ],
+      "y2026_n": 5,
+      "y2026_mean_bp": 743.9
+    },
+    "per_coin": {
+      "BTC": {
+        "all": {
+          "n_ep": 8,
+          "n_days": 8,
+          "mean_bp": 30.1,
+          "wr_pct": 75.0,
+          "day_t": 0.15,
+          "day_ci_bp": [
+            -392.8,
+            346.8
+          ],
+          "y2026_n": 8,
+          "y2026_mean_bp": 30.1
+        },
+        "gated": {
+          "n_ep": 1,
+          "n_days": 1,
+          "mean_bp": 525.0,
+          "wr_pct": 100.0,
+          "day_t": null,
+          "day_ci_bp": null,
+          "y2026_n": 1,
+          "y2026_mean_bp": 525.0
+        }
+      },
+      "ETH": {
+        "all": {
+          "n_ep": 8,
+          "n_days": 8,
+          "mean_bp": -88.7,
+          "wr_pct": 62.5,
+          "day_t": -0.36,
+          "day_ci_bp": [
+            -603.9,
+            306.7
+          ],
+          "y2026_n": 8,
+          "y2026_mean_bp": -88.7
+        },
+        "gated": {
+          "n_ep": 1,
+          "n_days": 1,
+          "mean_bp": 617.7,
+          "wr_pct": 100.0,
+          "day_t": null,
+          "day_ci_bp": null,
+          "y2026_n": 1,
+          "y2026_mean_bp": 617.7
+        }
+      },
+      "SOL": {
+        "all": {
+          "n_ep": 7,
+          "n_days": 7,
+          "mean_bp": 111.1,
+          "wr_pct": 71.4,
+          "day_t": 0.32,
+          "day_ci_bp": [
+            -595.5,
+            686.6
+          ],
+          "y2026_n": 7,
+          "y2026_mean_bp": 111.1
+        },
+        "gated": {
+          "n_ep": 3,
+          "n_days": 3,
+          "mean_bp": 859.0,
+          "wr_pct": 100.0,
+          "day_t": 10.52,
+          "day_ci_bp": [
+            718.8,
+            1001.6
+          ],
+          "y2026_n": 3,
+          "y2026_mean_bp": 859.0
+        }
+      }
+    },
+    "neighbor_grid": {
+      "ext<=-7.0|atr>=0.8": {
+        "n": 9,
+        "mean_bp": 239.0,
+        "t": 0.15,
+        "ci_bp": [
+          -729.4,
+          656.5
+        ]
+      },
+      "ext<=-7.0|atr>=1.0": {
+        "n": 5,
+        "mean_bp": 743.9,
+        "t": 7.44,
+        "ci_bp": [
+          620.5,
+          1001.6
+        ]
+      },
+      "ext<=-7.0|atr>=1.2": {
+        "n": 5,
+        "mean_bp": 743.9,
+        "t": 7.44,
+        "ci_bp": [
+          620.5,
+          1001.6
+        ]
+      },
+      "ext<=-8.0|atr>=0.8": {
+        "n": 5,
+        "mean_bp": 743.9,
+        "t": 7.44,
+        "ci_bp": [
+          620.5,
+          1001.6
+        ]
+      },
+      "ext<=-8.0|atr>=1.0": {
+        "n": 5,
+        "mean_bp": 743.9,
+        "t": 7.44,
+        "ci_bp": [
+          620.5,
+          1001.6
+        ]
+      },
+      "ext<=-8.0|atr>=1.2": {
+        "n": 5,
+        "mean_bp": 743.9,
+        "t": 7.44,
+        "ci_bp": [
+          620.5,
+          1001.6
+        ]
+      },
+      "ext<=-9.0|atr>=0.8": {
+        "n": 4,
+        "mean_bp": 679.5,
+        "t": 6.26,
+        "ci_bp": [
+          620.5,
+          856.6
+        ]
+      },
+      "ext<=-9.0|atr>=1.0": {
+        "n": 4,
+        "mean_bp": 679.5,
+        "t": 6.26,
+        "ci_bp": [
+          620.5,
+          856.6
+        ]
+      },
+      "ext<=-9.0|atr>=1.2": {
+        "n": 4,
+        "mean_bp": 679.5,
+        "t": 6.26,
+        "ci_bp": [
+          620.5,
+          856.6
+        ]
+      }
+    }
+  },
+  "binance_same_window": {
+    "span": [
+      "2026-05-28",
+      "2026-09-02"
+    ],
+    "n_rows": 22,
+    "all_candidates": {
+      "n_ep": 22,
+      "n_days": 15,
+      "mean_bp": 34.4,
+      "wr_pct": 68.2,
+      "day_t": 0.13,
+      "day_ci_bp": [
+        -316.5,
+        324.4
+      ],
+      "y2026_n": 22,
+      "y2026_mean_bp": 34.4
+    },
+    "gated": {
+      "n_ep": 6,
+      "n_days": 4,
+      "mean_bp": 613.2,
+      "wr_pct": 83.3,
+      "day_t": 2.68,
+      "day_ci_bp": [
+        190.3,
+        926.6
+      ],
+      "y2026_n": 6,
+      "y2026_mean_bp": 613.2
+    }
+  },
+  "verdict": {
+    "hl_gated_n_episodes": 5,
+    "hl_gated_n_signal_days": 3,
+    "hl_gated_t_ge_2": true,
+    "hl_gated_ci_lo_gt_0": true,
+    "hl_gated_mean_pos": true,
+    "binance_same_window_mean_pos": true,
+    "binance_same_window_ci_lo_gt_0": true,
+    "min_independent_days_for_confirm": 20,
+    "direction_replicated": true,
+    "statistically_confirmed": false,
+    "external_validation_pass": false
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "source": "logs/binance_klines_cache/BTCUSDT_5m.json",
+  "granularity_warning": "interval=5m > 1m; intrabar touch/queue unobservable, results are a COARSE lower/upper bound, not 1m-precision",
+  "interval_min": 5.0,
+  "ttl_bars": 6,
+  "offset_bps": 5.0,
+  "runaway_bp": 8.0,
+  "n_windows": 51770,
+  "touch": {
+    "n": 39665,
+    "rate": 0.7662,
+    "rate_wilson95": [
+      0.7625,
+      0.7698
+    ],
+    "no_touch": 12105,
+    "first_touch_bars_p50": 1,
+    "first_touch_bars_p90": 4
+  },
+  "conditional_on_touch": {
+    "runaway_n": 26976,
+    "runaway_rate": 0.6801,
+    "runaway_rate_boot95": [
+      0.6743,
+      0.6855
+    ],
+    "reclaimed_n": 19276,
+    "benign_n": 10204,
+    "base_fill_prob_point": 0.2573,
+    "base_fill_prob_wilson95": [
+      0.253,
+      0.2616
+    ]
+  },
+  "unconditional_fill": {
+    "v1_touch_fill_rate": 0.7662,
+    "benign_fill_rate": 0.1971,
+    "benign_fill_wilson95": [
+      0.1937,
+      0.2006
+    ]
+  },
+  "adverse_drift_bps": {
+    "median_all": 0.818,
+    "median_positive": 6.459,
+    "p25": -5.114,
+    "p75": 7.219,
+    "p90": 16.448,
+    "median_positive_boot95": [
+      6.3072,
+      6.6028
+    ],
+    "advise_kappa": 1.0
+  },
+  "defaults": {
+    "v2_default_base": 0.7,
+    "v2_default_kappa": 1.0
+  },
+  "recommendation": {
+    "base_fill_prob_conservative": 0.2616,
+    "adv_drift_kappa": 1.0,
+    "note": "coarse 5m estimate; queue unobservable; rerun on 1m before live shadow v2 promote; use interval bounds not point estimates"
+  }
+}

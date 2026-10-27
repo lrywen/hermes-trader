@@ -1,0 +1,61 @@
+{
+  "top_pct": 85.0,
+  "cost_bps": 9.26,
+  "n_xs_independent_episodes": 333,
+  "btc_down_bar_baseline_pct": 30.2,
+  "xs_in_down_pct": 90.4,
+  "down_enrichment_x_vs_baseline": 2.99,
+  "p1c_threshold_pct": 20.0,
+  "same_phenomenon_if_ge_pct": 20.0,
+  "regime_distribution": {
+    "chop": {
+      "n": 14,
+      "share_pct": 4.2,
+      "n_days": 13,
+      "mean72_net_bp": 122.7,
+      "median72_net_bp": 79.3,
+      "win_pct": 57.1
+    },
+    "down": {
+      "n": 301,
+      "share_pct": 90.4,
+      "n_days": 173,
+      "mean72_net_bp": 77.5,
+      "median72_net_bp": 45.7,
+      "win_pct": 55.8
+    },
+    "neutral": {
+      "n": 12,
+      "share_pct": 3.6,
+      "n_days": 10,
+      "mean72_net_bp": 207.7,
+      "median72_net_bp": 383.4,
+      "win_pct": 58.3
+    },
+    "up": {
+      "n": 6,
+      "share_pct": 1.8,
+      "n_days": 6,
+      "mean72_net_bp": 264.0,
+      "median72_net_bp": 263.0,
+      "win_pct": 83.3
+    }
+  },
+  "down_group": {
+    "n": 301,
+    "share_pct": 90.4,
+    "n_days": 173,
+    "mean72_net_bp": 77.5,
+    "median72_net_bp": 45.7,
+    "win_pct": 55.8
+  },
+  "non_down_group": {
+    "n": 32,
+    "share_pct": 9.6,
+    "n_days": 28,
+    "mean72_net_bp": 181.1,
+    "median72_net_bp": 175.5,
+    "win_pct": 62.5
+  },
+  "needs_independent_thesis": false
+}

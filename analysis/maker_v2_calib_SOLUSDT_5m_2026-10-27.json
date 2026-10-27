@@ -1,0 +1,64 @@
+{
+  "source": "logs/binance_klines_cache/SOLUSDT_5m.json",
+  "granularity_warning": "interval=5m > 1m; intrabar touch/queue unobservable, results are a COARSE lower/upper bound, not 1m-precision",
+  "interval_min": 5.0,
+  "ttl_bars": 6,
+  "offset_bps": 5.0,
+  "runaway_bp": 8.0,
+  "n_windows": 51770,
+  "touch": {
+    "n": 45826,
+    "rate": 0.8852,
+    "rate_wilson95": [
+      0.8824,
+      0.8879
+    ],
+    "no_touch": 5944,
+    "first_touch_bars_p50": 1,
+    "first_touch_bars_p90": 2
+  },
+  "conditional_on_touch": {
+    "runaway_n": 38597,
+    "runaway_rate": 0.8423,
+    "runaway_rate_boot95": [
+      0.8386,
+      0.8462
+    ],
+    "reclaimed_n": 22575,
+    "benign_n": 6791,
+    "base_fill_prob_point": 0.1482,
+    "base_fill_prob_wilson95": [
+      0.145,
+      0.1515
+    ]
+  },
+  "unconditional_fill": {
+    "v1_touch_fill_rate": 0.8852,
+    "benign_fill_rate": 0.1312,
+    "benign_fill_wilson95": [
+      0.1283,
+      0.1341
+    ]
+  },
+  "adverse_drift_bps": {
+    "median_all": 0.94,
+    "median_positive": 13.256,
+    "p25": -11.278,
+    "p75": 14.0,
+    "p90": 30.852,
+    "median_positive_boot95": [
+      13.0199,
+      13.5183
+    ],
+    "advise_kappa": 1.0
+  },
+  "defaults": {
+    "v2_default_base": 0.7,
+    "v2_default_kappa": 1.0
+  },
+  "recommendation": {
+    "base_fill_prob_conservative": 0.1515,
+    "adv_drift_kappa": 1.0,
+    "note": "coarse 5m estimate; queue unobservable; rerun on 1m before live shadow v2 promote; use interval bounds not point estimates"
+  }
+}

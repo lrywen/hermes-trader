@@ -1,0 +1,136 @@
+{
+  "data": {
+    "source": "logs/hl_klines_cache",
+    "coins_with_gated_hit": 81,
+    "window": "2026-02-24..2026-09-21",
+    "gate": {
+      "top_pct": 85.0,
+      "ext_max": -8.0,
+      "rsi_min": 20.0,
+      "atr_pctile_min": 0.6,
+      "cost_bps": 9.26
+    }
+  },
+  "breadth": {
+    "independent_days": 80,
+    "episodes": 449,
+    "coins_per_day_median": 2.0,
+    "coins_per_day_max": 38,
+    "single_coin_days": 30,
+    "multi3_days": 37
+  },
+  "effective_sample_views": {
+    "A_naive_per_episode_iid": {
+      "n": 449,
+      "mean_bp": -1.8,
+      "wr_pct": 47.7,
+      "t": -0.03,
+      "ci_bp": [
+        -107.1,
+        112.7
+      ]
+    },
+    "B_day_equal_weight": {
+      "n": 80,
+      "mean_bp": 173.3,
+      "wr_pct": 56.2,
+      "t": 1.27,
+      "ci_bp": [
+        -72.4,
+        464.0
+      ]
+    },
+    "C_panic_event_gap1d": {
+      "n": 17,
+      "mean_bp": 316.5,
+      "wr_pct": 47.1,
+      "t": 1.2,
+      "ci_bp": [
+        -118.4,
+        869.7
+      ]
+    },
+    "C_panic_event_gap2d": {
+      "n": 9,
+      "mean_bp": 553.2,
+      "wr_pct": 44.4,
+      "t": 1.2,
+      "ci_bp": [
+        -160.3,
+        1549.7
+      ]
+    },
+    "C_panic_event_gap3d": {
+      "n": 3,
+      "mean_bp": 520.6,
+      "wr_pct": 100.0,
+      "t": 1.17,
+      "ci_bp": [
+        19.9,
+        1404.9
+      ]
+    },
+    "C_panic_event_gap5d": {
+      "n": 2,
+      "mean_bp": 231.4,
+      "wr_pct": 100.0,
+      "t": 1.09,
+      "ci_bp": [
+        19.9,
+        443.0
+      ]
+    }
+  },
+  "monthly_day_equal_weight": {
+    "2026-05": {
+      "n": 3,
+      "mean_bp": -267.0,
+      "wr_pct": 33.3,
+      "t": -0.88,
+      "ci_bp": [
+        -832.0,
+        212.4
+      ]
+    },
+    "2026-06": {
+      "n": 25,
+      "mean_bp": -150.9,
+      "wr_pct": 52.0,
+      "t": -0.86,
+      "ci_bp": [
+        -489.3,
+        185.2
+      ]
+    },
+    "2026-07": {
+      "n": 21,
+      "mean_bp": 330.5,
+      "wr_pct": 71.4,
+      "t": 1.48,
+      "ci_bp": [
+        -79.6,
+        771.7
+      ]
+    },
+    "2026-08": {
+      "n": 19,
+      "mean_bp": 500.6,
+      "wr_pct": 57.9,
+      "t": 1.16,
+      "ci_bp": [
+        -169.4,
+        1430.8
+      ]
+    },
+    "2026-09": {
+      "n": 12,
+      "mean_bp": 165.4,
+      "wr_pct": 41.7,
+      "t": 0.64,
+      "ci_bp": [
+        -291.6,
+        663.8
+      ]
+    }
+  }
+}

@@ -1,0 +1,64 @@
+{
+  "source": "logs/binance_klines_cache/ETHUSDT_5m.json",
+  "granularity_warning": "interval=5m > 1m; intrabar touch/queue unobservable, results are a COARSE lower/upper bound, not 1m-precision",
+  "interval_min": 5.0,
+  "ttl_bars": 6,
+  "offset_bps": 5.0,
+  "runaway_bp": 8.0,
+  "n_windows": 51770,
+  "touch": {
+    "n": 42533,
+    "rate": 0.8216,
+    "rate_wilson95": [
+      0.8183,
+      0.8249
+    ],
+    "no_touch": 9237,
+    "first_touch_bars_p50": 1,
+    "first_touch_bars_p90": 3
+  },
+  "conditional_on_touch": {
+    "runaway_n": 32113,
+    "runaway_rate": 0.755,
+    "runaway_rate_boot95": [
+      0.7499,
+      0.7598
+    ],
+    "reclaimed_n": 20900,
+    "benign_n": 9076,
+    "base_fill_prob_point": 0.2134,
+    "base_fill_prob_wilson95": [
+      0.2095,
+      0.2173
+    ]
+  },
+  "unconditional_fill": {
+    "v1_touch_fill_rate": 0.8216,
+    "benign_fill_rate": 0.1753,
+    "benign_fill_wilson95": [
+      0.1721,
+      0.1786
+    ]
+  },
+  "adverse_drift_bps": {
+    "median_all": 0.729,
+    "median_positive": 8.602,
+    "p25": -7.202,
+    "p75": 9.317,
+    "p90": 21.701,
+    "median_positive_boot95": [
+      8.3804,
+      8.8024
+    ],
+    "advise_kappa": 1.0
+  },
+  "defaults": {
+    "v2_default_base": 0.7,
+    "v2_default_kappa": 1.0
+  },
+  "recommendation": {
+    "base_fill_prob_conservative": 0.2173,
+    "adv_drift_kappa": 1.0,
+    "note": "coarse 5m estimate; queue unobservable; rerun on 1m before live shadow v2 promote; use interval bounds not point estimates"
+  }
+}

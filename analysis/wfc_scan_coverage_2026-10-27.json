@@ -1,0 +1,125 @@
+{
+  "snapshot": "/home/ldy/.hermes/universe_cache/meta.json",
+  "eligible_crypto_perps": 234,
+  "budget": {
+    "max_markets": 60,
+    "movers": 10,
+    "sweep": 8
+  },
+  "cycle_1": {
+    "scanned": 60,
+    "by_volume": 42,
+    "sweep_examples": [
+      "ATOM",
+      "BCH"
+    ]
+  },
+  "steady_state": {
+    "scanned_per_cycle": [
+      60
+    ],
+    "single_cycle_coverage_pct": 25.6,
+    "sweep_ring_size": 101,
+    "below_floor_never_swept": 133,
+    "cycles_to_cover_ring": 7,
+    "expected_ring_pass_cycles": 13
+  },
+  "notional_coverage_cycle1_pct": 98.6,
+  "oi_coverage_cycle1_pct": 67.0,
+  "tail_excluded_cycle1": 174,
+  "tail_with_vol_ge_1m": 28,
+  "tail_ge_1m_examples": [
+    {
+      "coin": "PENDLE",
+      "dayNtlVlm_usd": 3879554,
+      "pct24h": 2.98
+    },
+    {
+      "coin": "ETHFI",
+      "dayNtlVlm_usd": 3718349,
+      "pct24h": 4.37
+    },
+    {
+      "coin": "CHIP",
+      "dayNtlVlm_usd": 3483573,
+      "pct24h": 5.59
+    },
+    {
+      "coin": "MON",
+      "dayNtlVlm_usd": 3445265,
+      "pct24h": 5.52
+    },
+    {
+      "coin": "DOT",
+      "dayNtlVlm_usd": 3167958,
+      "pct24h": 1.2
+    },
+    {
+      "coin": "PURR",
+      "dayNtlVlm_usd": 2909024,
+      "pct24h": 0.39
+    },
+    {
+      "coin": "PAXG",
+      "dayNtlVlm_usd": 2901503,
+      "pct24h": 0.32
+    },
+    {
+      "coin": "TRUMP",
+      "dayNtlVlm_usd": 2814151,
+      "pct24h": 4.19
+    },
+    {
+      "coin": "MORPHO",
+      "dayNtlVlm_usd": 2495113,
+      "pct24h": 3.23
+    },
+    {
+      "coin": "FIL",
+      "dayNtlVlm_usd": 2365867,
+      "pct24h": 1.01
+    }
+  ],
+  "worst_sweep_gap_cycles_top10": [
+    [
+      6,
+      "kSHIB"
+    ],
+    [
+      6,
+      "kBONK"
+    ],
+    [
+      6,
+      "ZK"
+    ],
+    [
+      6,
+      "XLM"
+    ],
+    [
+      6,
+      "WLFI"
+    ],
+    [
+      6,
+      "WIF"
+    ],
+    [
+      6,
+      "W"
+    ],
+    [
+      6,
+      "VIRTUAL"
+    ],
+    [
+      6,
+      "TRX"
+    ],
+    [
+      6,
+      "TRUMP"
+    ]
+  ]
+}

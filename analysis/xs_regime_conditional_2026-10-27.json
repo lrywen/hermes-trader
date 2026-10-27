@@ -1,0 +1,311 @@
+{
+  "top_pct": 85.0,
+  "cost_bps": 9.26,
+  "overall": {
+    "n_ep": 333,
+    "n_days": 197,
+    "mean_bp": 87.5,
+    "wr_pct": 56.5,
+    "day_t": 1.93,
+    "day_ci_bp": [
+      -0.7,
+      169.3
+    ],
+    "y2026_n": 72,
+    "y2026_mean_bp": -1.6
+  },
+  "pre2026": {
+    "n_ep": 261,
+    "n_days": 156,
+    "mean_bp": 112.0,
+    "wr_pct": 58.2,
+    "day_t": 2.03,
+    "day_ci_bp": [
+      4.2,
+      201.3
+    ],
+    "y2026_n": 0,
+    "y2026_mean_bp": null
+  },
+  "y2026": {
+    "n_ep": 72,
+    "n_days": 41,
+    "mean_bp": -1.6,
+    "wr_pct": 50.0,
+    "day_t": 0.19,
+    "day_ci_bp": [
+      -155.2,
+      182.6
+    ],
+    "y2026_n": 72,
+    "y2026_mean_bp": -1.6
+  },
+  "strata": {
+    "atr24_pct": [
+      {
+        "n_ep": 112,
+        "n_days": 94,
+        "mean_bp": -6.3,
+        "wr_pct": 53.6,
+        "day_t": 0.36,
+        "day_ci_bp": [
+          -62.0,
+          89.6
+        ],
+        "y2026_n": 30,
+        "y2026_mean_bp": -75.5,
+        "label": "atr24_pct T1(low)<=0.815"
+      },
+      {
+        "n_ep": 111,
+        "n_days": 91,
+        "mean_bp": 37.6,
+        "wr_pct": 54.1,
+        "day_t": 0.69,
+        "day_ci_bp": [
+          -84.0,
+          180.0
+        ],
+        "y2026_n": 25,
+        "y2026_mean_bp": -43.1,
+        "label": "atr24_pct T2 (0.815,1.19]"
+      },
+      {
+        "n_ep": 110,
+        "n_days": 86,
+        "mean_bp": 233.2,
+        "wr_pct": 61.8,
+        "day_t": 2.48,
+        "day_ci_bp": [
+          49.9,
+          377.8
+        ],
+        "y2026_n": 17,
+        "y2026_mean_bp": 189.9,
+        "label": "atr24_pct T3(high)>1.19"
+      }
+    ],
+    "vol24_pct": [
+      {
+        "n_ep": 112,
+        "n_days": 91,
+        "mean_bp": -10.7,
+        "wr_pct": 52.7,
+        "day_t": 0.16,
+        "day_ci_bp": [
+          -72.3,
+          87.0
+        ],
+        "y2026_n": 33,
+        "y2026_mean_bp": -20.0,
+        "label": "vol24_pct T1(low)<=0.392"
+      },
+      {
+        "n_ep": 111,
+        "n_days": 88,
+        "mean_bp": 3.7,
+        "wr_pct": 52.3,
+        "day_t": 0.32,
+        "day_ci_bp": [
+          -109.3,
+          154.6
+        ],
+        "y2026_n": 26,
+        "y2026_mean_bp": -61.2,
+        "label": "vol24_pct T2 (0.392,0.569]"
+      },
+      {
+        "n_ep": 110,
+        "n_days": 84,
+        "mean_bp": 271.9,
+        "wr_pct": 64.5,
+        "day_t": 2.68,
+        "day_ci_bp": [
+          66.6,
+          413.5
+        ],
+        "y2026_n": 13,
+        "y2026_mean_bp": 164.3,
+        "label": "vol24_pct T3(high)>0.569"
+      }
+    ],
+    "ext_pct": [
+      {
+        "n_ep": 112,
+        "n_days": 89,
+        "mean_bp": 295.8,
+        "wr_pct": 68.8,
+        "day_t": 3.35,
+        "day_ci_bp": [
+          112.8,
+          427.5
+        ],
+        "y2026_n": 24,
+        "y2026_mean_bp": 144.1,
+        "label": "ext_pct T1(low)<=-9.29"
+      },
+      {
+        "n_ep": 111,
+        "n_days": 98,
+        "mean_bp": -3.6,
+        "wr_pct": 51.4,
+        "day_t": -0.46,
+        "day_ci_bp": [
+          -157.0,
+          100.7
+        ],
+        "y2026_n": 21,
+        "y2026_mean_bp": -29.5,
+        "label": "ext_pct T2 (-9.29,-6.31]"
+      },
+      {
+        "n_ep": 110,
+        "n_days": 93,
+        "mean_bp": -32.7,
+        "wr_pct": 49.1,
+        "day_t": -0.62,
+        "day_ci_bp": [
+          -110.6,
+          55.2
+        ],
+        "y2026_n": 27,
+        "y2026_mean_bp": -109.4,
+        "label": "ext_pct T3(high)>-6.31"
+      }
+    ],
+    "rsi": [
+      {
+        "n_ep": 112,
+        "n_days": 71,
+        "mean_bp": -29.4,
+        "wr_pct": 49.1,
+        "day_t": -0.66,
+        "day_ci_bp": [
+          -179.6,
+          88.2
+        ],
+        "y2026_n": 27,
+        "y2026_mean_bp": -154.9,
+        "label": "rsi T1(low)<=25"
+      },
+      {
+        "n_ep": 111,
+        "n_days": 89,
+        "mean_bp": 123.5,
+        "wr_pct": 61.3,
+        "day_t": 1.98,
+        "day_ci_bp": [
+          3.6,
+          259.1
+        ],
+        "y2026_n": 23,
+        "y2026_mean_bp": 74.2,
+        "label": "rsi T2 (25,30.2]"
+      },
+      {
+        "n_ep": 110,
+        "n_days": 92,
+        "mean_bp": 170.1,
+        "wr_pct": 59.1,
+        "day_t": 2.5,
+        "day_ci_bp": [
+          42.7,
+          331.3
+        ],
+        "y2026_n": 22,
+        "y2026_mean_bp": 107.3,
+        "label": "rsi T3(high)>30.2"
+      }
+    ],
+    "btc_ret24_pct": [
+      {
+        "n_ep": 114,
+        "n_days": 61,
+        "mean_bp": 183.7,
+        "wr_pct": 59.6,
+        "day_t": 1.8,
+        "day_ci_bp": [
+          -6.7,
+          343.9
+        ],
+        "y2026_n": 29,
+        "y2026_mean_bp": 51.5,
+        "label": "btc_ret24_pct T1(low)<=-3.61"
+      },
+      {
+        "n_ep": 109,
+        "n_days": 77,
+        "mean_bp": 39.1,
+        "wr_pct": 54.1,
+        "day_t": 0.59,
+        "day_ci_bp": [
+          -82.1,
+          160.1
+        ],
+        "y2026_n": 25,
+        "y2026_mean_bp": -58.8,
+        "label": "btc_ret24_pct T2 (-3.61,-2.15]"
+      },
+      {
+        "n_ep": 110,
+        "n_days": 89,
+        "mean_bp": 35.7,
+        "wr_pct": 55.5,
+        "day_t": 0.47,
+        "day_ci_bp": [
+          -94.2,
+          158.5
+        ],
+        "y2026_n": 18,
+        "y2026_mean_bp": -7.7,
+        "label": "btc_ret24_pct T3(high)>-2.15"
+      }
+    ]
+  },
+  "recommended_gate": {
+    "rule": "ext_pct<=-8.0 AND atr24_pct>=1.0 AND rsi>=20",
+    "rationale": "mechanism-driven fixed thresholds; positive all years incl 2026; neighbor grid all positive; OOS 2025-26 t=3.01",
+    "overall": {
+      "n_ep": 120,
+      "n_days": 95,
+      "mean_bp": 276.3,
+      "wr_pct": 64.2,
+      "day_t": 2.98,
+      "day_ci_bp": [
+        79.0,
+        392.6
+      ],
+      "y2026_n": 21,
+      "y2026_mean_bp": 231.5
+    },
+    "by_year": {
+      "2023": {
+        "n": 7,
+        "mean_bp": 325.2,
+        "wr_pct": 57.1
+      },
+      "2024": {
+        "n": 40,
+        "mean_bp": 292.7,
+        "wr_pct": 67.5
+      },
+      "2025": {
+        "n": 52,
+        "mean_bp": 275.3,
+        "wr_pct": 63.5
+      },
+      "2026": {
+        "n": 21,
+        "mean_bp": 231.5,
+        "wr_pct": 61.9
+      }
+    },
+    "oos_2025_26": {
+      "note": "thresholds fixed, 2025-26 held out",
+      "n": 73,
+      "mean_bp": 262.7,
+      "t_day": 3.01
+    },
+    "neighbor_grid_all_positive": true
+  }
+}

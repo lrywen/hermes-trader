@@ -1,0 +1,985 @@
+{
+  "cost_bps_rt": 9.26,
+  "symbols": [
+    {
+      "coin": "BTCUSDT",
+      "bars": 30360,
+      "span": [
+        1683241200000,
+        1792533600000
+      ],
+      "variants": {
+        "85.0": {
+          "n_overlapping_triggers": 1159,
+          "n_independent_episodes": 113,
+          "n_independent_signal_days": 113,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 1159,
+                "n_signal_days": 221,
+                "mean_pct": 0.1889,
+                "median_pct": 0.2523,
+                "win_rate_pct": 55.74,
+                "t_iid": 2.012,
+                "day_block_ci95": [
+                  0.4818,
+                  1.2685
+                ],
+                "mean_bps": 18.89
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": -0.0699,
+                "median_pct": 0.1639,
+                "win_rate_pct": 52.21,
+                "t_iid": -0.248,
+                "day_block_ci95": [
+                  -0.6244,
+                  0.492
+                ],
+                "mean_bps": -6.99
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.0227,
+                "median_pct": 0.2565,
+                "win_rate_pct": 52.21,
+                "t_iid": 0.08,
+                "day_block_ci95": [
+                  -0.5318,
+                  0.5846
+                ],
+                "mean_bps": 2.27
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 1159,
+                "n_signal_days": 221,
+                "mean_pct": 0.4729,
+                "median_pct": 0.5709,
+                "win_rate_pct": 58.07,
+                "t_iid": 3.416,
+                "day_block_ci95": [
+                  0.4706,
+                  1.6425
+                ],
+                "mean_bps": 47.29
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.5336,
+                "median_pct": 0.4487,
+                "win_rate_pct": 56.64,
+                "t_iid": 1.259,
+                "day_block_ci95": [
+                  -0.2924,
+                  1.3799
+                ],
+                "mean_bps": 53.36
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.6262,
+                "median_pct": 0.5413,
+                "win_rate_pct": 56.64,
+                "t_iid": 1.478,
+                "day_block_ci95": [
+                  -0.1998,
+                  1.4725
+                ],
+                "mean_bps": 62.62
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 1159,
+                "n_signal_days": 221,
+                "mean_pct": -0.1017,
+                "median_pct": 0.1976,
+                "win_rate_pct": 51.34,
+                "t_iid": -0.499,
+                "day_block_ci95": [
+                  0.0458,
+                  1.8821
+                ],
+                "mean_bps": -10.17
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.3504,
+                "median_pct": 0.2771,
+                "win_rate_pct": 53.1,
+                "t_iid": 0.565,
+                "day_block_ci95": [
+                  -0.901,
+                  1.5797
+                ],
+                "mean_bps": 35.04
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.443,
+                "median_pct": 0.3697,
+                "win_rate_pct": 53.1,
+                "t_iid": 0.714,
+                "day_block_ci95": [
+                  -0.8084,
+                  1.6723
+                ],
+                "mean_bps": 44.3
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": false,
+            "day_boot_lo_gt_0": false,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 113,
+            "gap_to_60_days": 0
+          }
+        },
+        "90.0": {
+          "n_overlapping_triggers": 915,
+          "n_independent_episodes": 89,
+          "n_independent_signal_days": 89,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 915,
+                "n_signal_days": 168,
+                "mean_pct": 0.3285,
+                "median_pct": 0.3258,
+                "win_rate_pct": 55.85,
+                "t_iid": 3.006,
+                "day_block_ci95": [
+                  0.6136,
+                  1.5444
+                ],
+                "mean_bps": 32.85
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.1034,
+                "median_pct": 0.4512,
+                "win_rate_pct": 52.81,
+                "t_iid": 0.297,
+                "day_block_ci95": [
+                  -0.5681,
+                  0.7901
+                ],
+                "mean_bps": 10.34
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.196,
+                "median_pct": 0.5438,
+                "win_rate_pct": 52.81,
+                "t_iid": 0.563,
+                "day_block_ci95": [
+                  -0.4755,
+                  0.8827
+                ],
+                "mean_bps": 19.6
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 915,
+                "n_signal_days": 168,
+                "mean_pct": 0.5954,
+                "median_pct": 0.7121,
+                "win_rate_pct": 59.67,
+                "t_iid": 3.7,
+                "day_block_ci95": [
+                  0.6251,
+                  2.0026
+                ],
+                "mean_bps": 59.54
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.917,
+                "median_pct": 1.1638,
+                "win_rate_pct": 66.29,
+                "t_iid": 1.72,
+                "day_block_ci95": [
+                  -0.117,
+                  1.9397
+                ],
+                "mean_bps": 91.7
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 1.0096,
+                "median_pct": 1.2564,
+                "win_rate_pct": 67.42,
+                "t_iid": 1.893,
+                "day_block_ci95": [
+                  -0.0244,
+                  2.0323
+                ],
+                "mean_bps": 100.96
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 915,
+                "n_signal_days": 168,
+                "mean_pct": -0.2519,
+                "median_pct": 0.1308,
+                "win_rate_pct": 50.6,
+                "t_iid": -1.096,
+                "day_block_ci95": [
+                  -0.0257,
+                  2.0054
+                ],
+                "mean_bps": -25.19
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.4609,
+                "median_pct": 0.8522,
+                "win_rate_pct": 56.18,
+                "t_iid": 0.659,
+                "day_block_ci95": [
+                  -0.9256,
+                  1.807
+                ],
+                "mean_bps": 46.09
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.5535,
+                "median_pct": 0.9448,
+                "win_rate_pct": 56.18,
+                "t_iid": 0.792,
+                "day_block_ci95": [
+                  -0.833,
+                  1.8996
+                ],
+                "mean_bps": 55.35
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": false,
+            "day_boot_lo_gt_0": false,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 89,
+            "gap_to_60_days": 0
+          }
+        }
+      }
+    },
+    {
+      "coin": "ETHUSDT",
+      "bars": 30250,
+      "span": [
+        1683637200000,
+        1792533600000
+      ],
+      "variants": {
+        "85.0": {
+          "n_overlapping_triggers": 1181,
+          "n_independent_episodes": 113,
+          "n_independent_signal_days": 113,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 1181,
+                "n_signal_days": 212,
+                "mean_pct": 0.2349,
+                "median_pct": 0.3709,
+                "win_rate_pct": 54.53,
+                "t_iid": 1.723,
+                "day_block_ci95": [
+                  0.5114,
+                  1.6289
+                ],
+                "mean_bps": 23.49
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": -0.0504,
+                "median_pct": -0.0185,
+                "win_rate_pct": 47.79,
+                "t_iid": -0.125,
+                "day_block_ci95": [
+                  -0.8167,
+                  0.7476
+                ],
+                "mean_bps": -5.04
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.0422,
+                "median_pct": 0.0741,
+                "win_rate_pct": 51.33,
+                "t_iid": 0.105,
+                "day_block_ci95": [
+                  -0.7241,
+                  0.8402
+                ],
+                "mean_bps": 4.22
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 1181,
+                "n_signal_days": 212,
+                "mean_pct": 0.2121,
+                "median_pct": 0.9697,
+                "win_rate_pct": 56.39,
+                "t_iid": 1.084,
+                "day_block_ci95": [
+                  0.1333,
+                  1.7996
+                ],
+                "mean_bps": 21.21
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.2207,
+                "median_pct": 0.875,
+                "win_rate_pct": 57.52,
+                "t_iid": 0.386,
+                "day_block_ci95": [
+                  -0.8963,
+                  1.3414
+                ],
+                "mean_bps": 22.07
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.3133,
+                "median_pct": 0.9676,
+                "win_rate_pct": 58.41,
+                "t_iid": 0.548,
+                "day_block_ci95": [
+                  -0.8037,
+                  1.434
+                ],
+                "mean_bps": 31.33
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 1181,
+                "n_signal_days": 212,
+                "mean_pct": 0.2734,
+                "median_pct": 0.5135,
+                "win_rate_pct": 52.58,
+                "t_iid": 1.061,
+                "day_block_ci95": [
+                  0.008,
+                  2.2554
+                ],
+                "mean_bps": 27.34
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.189,
+                "median_pct": 1.0261,
+                "win_rate_pct": 53.1,
+                "t_iid": 0.239,
+                "day_block_ci95": [
+                  -1.3951,
+                  1.7188
+                ],
+                "mean_bps": 18.9
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 113,
+                "n_signal_days": 113,
+                "mean_pct": 0.2816,
+                "median_pct": 1.1187,
+                "win_rate_pct": 53.98,
+                "t_iid": 0.356,
+                "day_block_ci95": [
+                  -1.3025,
+                  1.8114
+                ],
+                "mean_bps": 28.16
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": false,
+            "day_boot_lo_gt_0": false,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 113,
+            "gap_to_60_days": 0
+          }
+        },
+        "90.0": {
+          "n_overlapping_triggers": 906,
+          "n_independent_episodes": 89,
+          "n_independent_signal_days": 89,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 906,
+                "n_signal_days": 173,
+                "mean_pct": 0.3807,
+                "median_pct": 0.5807,
+                "win_rate_pct": 56.29,
+                "t_iid": 2.316,
+                "day_block_ci95": [
+                  0.3969,
+                  1.6864
+                ],
+                "mean_bps": 38.07
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.2214,
+                "median_pct": 0.7805,
+                "win_rate_pct": 53.93,
+                "t_iid": 0.486,
+                "day_block_ci95": [
+                  -0.665,
+                  1.1257
+                ],
+                "mean_bps": 22.14
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.314,
+                "median_pct": 0.8731,
+                "win_rate_pct": 56.18,
+                "t_iid": 0.69,
+                "day_block_ci95": [
+                  -0.5724,
+                  1.2183
+                ],
+                "mean_bps": 31.4
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 906,
+                "n_signal_days": 173,
+                "mean_pct": 0.4614,
+                "median_pct": 1.2994,
+                "win_rate_pct": 58.17,
+                "t_iid": 2.019,
+                "day_block_ci95": [
+                  0.3241,
+                  2.2381
+                ],
+                "mean_bps": 46.14
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.2993,
+                "median_pct": 0.4349,
+                "win_rate_pct": 55.06,
+                "t_iid": 0.429,
+                "day_block_ci95": [
+                  -1.0725,
+                  1.6709
+                ],
+                "mean_bps": 29.93
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.3919,
+                "median_pct": 0.5275,
+                "win_rate_pct": 55.06,
+                "t_iid": 0.562,
+                "day_block_ci95": [
+                  -0.9799,
+                  1.7635
+                ],
+                "mean_bps": 39.19
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 906,
+                "n_signal_days": 173,
+                "mean_pct": 0.1596,
+                "median_pct": 0.3247,
+                "win_rate_pct": 51.55,
+                "t_iid": 0.557,
+                "day_block_ci95": [
+                  -0.1012,
+                  2.4213
+                ],
+                "mean_bps": 15.96
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.0311,
+                "median_pct": -0.142,
+                "win_rate_pct": 49.44,
+                "t_iid": 0.034,
+                "day_block_ci95": [
+                  -1.7687,
+                  1.8021
+                ],
+                "mean_bps": 3.11
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 89,
+                "n_signal_days": 89,
+                "mean_pct": 0.1237,
+                "median_pct": -0.0494,
+                "win_rate_pct": 49.44,
+                "t_iid": 0.135,
+                "day_block_ci95": [
+                  -1.6761,
+                  1.8947
+                ],
+                "mean_bps": 12.37
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": false,
+            "day_boot_lo_gt_0": false,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 89,
+            "gap_to_60_days": 0
+          }
+        }
+      }
+    },
+    {
+      "coin": "SOLUSDT",
+      "bars": 30250,
+      "span": [
+        1683637200000,
+        1792533600000
+      ],
+      "variants": {
+        "85.0": {
+          "n_overlapping_triggers": 1034,
+          "n_independent_episodes": 107,
+          "n_independent_signal_days": 107,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 1034,
+                "n_signal_days": 202,
+                "mean_pct": 0.5587,
+                "median_pct": 0.1913,
+                "win_rate_pct": 52.13,
+                "t_iid": 3.238,
+                "day_block_ci95": [
+                  0.9837,
+                  2.2921
+                ],
+                "mean_bps": 55.87
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": -0.0545,
+                "median_pct": -0.071,
+                "win_rate_pct": 49.53,
+                "t_iid": -0.112,
+                "day_block_ci95": [
+                  -1.0058,
+                  0.8947
+                ],
+                "mean_bps": -5.45
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": 0.0381,
+                "median_pct": 0.0216,
+                "win_rate_pct": 50.47,
+                "t_iid": 0.078,
+                "day_block_ci95": [
+                  -0.9132,
+                  0.9873
+                ],
+                "mean_bps": 3.81
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 1034,
+                "n_signal_days": 202,
+                "mean_pct": 1.4165,
+                "median_pct": 0.8528,
+                "win_rate_pct": 54.74,
+                "t_iid": 5.294,
+                "day_block_ci95": [
+                  1.7181,
+                  3.9295
+                ],
+                "mean_bps": 141.65
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": 1.9253,
+                "median_pct": 1.3769,
+                "win_rate_pct": 55.14,
+                "t_iid": 2.309,
+                "day_block_ci95": [
+                  0.3388,
+                  3.5518
+                ],
+                "mean_bps": 192.53
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": 2.0179,
+                "median_pct": 1.4695,
+                "win_rate_pct": 55.14,
+                "t_iid": 2.42,
+                "day_block_ci95": [
+                  0.4314,
+                  3.6444
+                ],
+                "mean_bps": 201.79
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 1034,
+                "n_signal_days": 202,
+                "mean_pct": 1.4149,
+                "median_pct": 0.5855,
+                "win_rate_pct": 52.9,
+                "t_iid": 3.937,
+                "day_block_ci95": [
+                  1.4606,
+                  4.8872
+                ],
+                "mean_bps": 141.49
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": 2.6854,
+                "median_pct": 0.7842,
+                "win_rate_pct": 55.14,
+                "t_iid": 2.179,
+                "day_block_ci95": [
+                  0.3432,
+                  5.135
+                ],
+                "mean_bps": 268.54
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 107,
+                "n_signal_days": 107,
+                "mean_pct": 2.778,
+                "median_pct": 0.8768,
+                "win_rate_pct": 57.01,
+                "t_iid": 2.254,
+                "day_block_ci95": [
+                  0.4358,
+                  5.2276
+                ],
+                "mean_bps": 277.8
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": true,
+            "day_boot_lo_gt_0": true,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 107,
+            "gap_to_60_days": 0
+          }
+        },
+        "90.0": {
+          "n_overlapping_triggers": 793,
+          "n_independent_episodes": 82,
+          "n_independent_signal_days": 82,
+          "fwd": {
+            "24": {
+              "overlap_gross": {
+                "label": "fwd24 overlap gross",
+                "n_episodes": 793,
+                "n_signal_days": 150,
+                "mean_pct": 0.9538,
+                "median_pct": 0.619,
+                "win_rate_pct": 55.49,
+                "t_iid": 4.744,
+                "day_block_ci95": [
+                  1.0775,
+                  2.6545
+                ],
+                "mean_bps": 95.38
+              },
+              "indep_net": {
+                "label": "fwd24 indep net",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": -0.202,
+                "median_pct": 0.1481,
+                "win_rate_pct": 52.44,
+                "t_iid": -0.354,
+                "day_block_ci95": [
+                  -1.2998,
+                  0.9472
+                ],
+                "mean_bps": -20.2
+              },
+              "indep_gross": {
+                "label": "fwd24 indep gross",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": -0.1094,
+                "median_pct": 0.2407,
+                "win_rate_pct": 54.88,
+                "t_iid": -0.192,
+                "day_block_ci95": [
+                  -1.2072,
+                  1.0398
+                ],
+                "mean_bps": -10.94
+              }
+            },
+            "72": {
+              "overlap_gross": {
+                "label": "fwd72 overlap gross",
+                "n_episodes": 793,
+                "n_signal_days": 150,
+                "mean_pct": 1.6312,
+                "median_pct": 1.3454,
+                "win_rate_pct": 57.76,
+                "t_iid": 5.255,
+                "day_block_ci95": [
+                  1.5492,
+                  4.0646
+                ],
+                "mean_bps": 163.12
+              },
+              "indep_net": {
+                "label": "fwd72 indep net",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": 1.6299,
+                "median_pct": 1.2401,
+                "win_rate_pct": 54.88,
+                "t_iid": 1.885,
+                "day_block_ci95": [
+                  -0.0709,
+                  3.3289
+                ],
+                "mean_bps": 162.99
+              },
+              "indep_gross": {
+                "label": "fwd72 indep gross",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": 1.7225,
+                "median_pct": 1.3327,
+                "win_rate_pct": 54.88,
+                "t_iid": 1.992,
+                "day_block_ci95": [
+                  0.0217,
+                  3.4215
+                ],
+                "mean_bps": 172.25
+              }
+            },
+            "168": {
+              "overlap_gross": {
+                "label": "fwd168 overlap gross",
+                "n_episodes": 793,
+                "n_signal_days": 150,
+                "mean_pct": 1.2615,
+                "median_pct": 0.2977,
+                "win_rate_pct": 51.7,
+                "t_iid": 3.13,
+                "day_block_ci95": [
+                  0.7484,
+                  4.6439
+                ],
+                "mean_bps": 126.15
+              },
+              "indep_net": {
+                "label": "fwd168 indep net",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": 1.2096,
+                "median_pct": 0.1844,
+                "win_rate_pct": 52.44,
+                "t_iid": 0.898,
+                "day_block_ci95": [
+                  -1.4109,
+                  3.9653
+                ],
+                "mean_bps": 120.96
+              },
+              "indep_gross": {
+                "label": "fwd168 indep gross",
+                "n_episodes": 82,
+                "n_signal_days": 82,
+                "mean_pct": 1.3022,
+                "median_pct": 0.277,
+                "win_rate_pct": 52.44,
+                "t_iid": 0.967,
+                "day_block_ci95": [
+                  -1.3183,
+                  4.0579
+                ],
+                "mean_bps": 130.22
+              }
+            }
+          },
+          "s2_gate_72h": {
+            "indep_t_iid_ge_2": false,
+            "day_boot_lo_gt_0": false,
+            "net_mean_ge_3bp": true,
+            "indep_signal_days": 82,
+            "gap_to_60_days": 0
+          }
+        }
+      }
+    }
+  ],
+  "pooled_panels": [
+    {
+      "top_pct": 85.0,
+      "symbols": 3,
+      "n_independent_episodes": 333,
+      "n_independent_signal_days": 197,
+      "day_mean_net_pct": 0.8468,
+      "day_mean_bps": 84.68,
+      "day_t_iid": 1.929,
+      "day_block_ci95": [
+        -0.0072,
+        1.6926
+      ],
+      "by_year": {
+        "2023": {
+          "n_episodes": 39,
+          "mean_net_pct": 1.1288,
+          "win_rate_pct": 61.5
+        },
+        "2024": {
+          "n_episodes": 107,
+          "mean_net_pct": 1.1734,
+          "win_rate_pct": 57.9
+        },
+        "2025": {
+          "n_episodes": 115,
+          "mean_net_pct": 1.0679,
+          "win_rate_pct": 57.4
+        },
+        "2026": {
+          "n_episodes": 72,
+          "mean_net_pct": -0.016,
+          "win_rate_pct": 50.0
+        }
+      },
+      "gate_pass": false
+    },
+    {
+      "top_pct": 90.0,
+      "symbols": 3,
+      "n_independent_episodes": 260,
+      "n_independent_signal_days": 165,
+      "day_mean_net_pct": 0.8661,
+      "day_mean_bps": 86.61,
+      "day_t_iid": 1.81,
+      "day_block_ci95": [
+        -0.0703,
+        1.7984
+      ],
+      "by_year": {
+        "2023": {
+          "n_episodes": 33,
+          "mean_net_pct": 2.1083,
+          "win_rate_pct": 72.7
+        },
+        "2024": {
+          "n_episodes": 80,
+          "mean_net_pct": 0.9807,
+          "win_rate_pct": 56.2
+        },
+        "2025": {
+          "n_episodes": 94,
+          "mean_net_pct": 0.9783,
+          "win_rate_pct": 57.4
+        },
+        "2026": {
+          "n_episodes": 53,
+          "mean_net_pct": 0.036,
+          "win_rate_pct": 56.6
+        }
+      },
+      "gate_pass": false
+    }
+  ]
+}

@@ -1,0 +1,64 @@
+{
+  "source": "logs/binance_klines_cache/BTCUSDT_1m.json",
+  "granularity_warning": "interval=1m",
+  "interval_min": 1.0,
+  "ttl_bars": 30,
+  "offset_bps": 5.0,
+  "runaway_bp": 8.0,
+  "n_windows": 1393,
+  "touch": {
+    "n": 991,
+    "rate": 0.7114,
+    "rate_wilson95": [
+      0.6871,
+      0.7346
+    ],
+    "no_touch": 402,
+    "first_touch_bars_p50": 5,
+    "first_touch_bars_p90": 19
+  },
+  "conditional_on_touch": {
+    "runaway_n": 600,
+    "runaway_rate": 0.6054,
+    "runaway_rate_boot95": [
+      0.554,
+      0.6509
+    ],
+    "reclaimed_n": 464,
+    "benign_n": 295,
+    "base_fill_prob_point": 0.2977,
+    "base_fill_prob_wilson95": [
+      0.27,
+      0.3269
+    ]
+  },
+  "unconditional_fill": {
+    "v1_touch_fill_rate": 0.7114,
+    "benign_fill_rate": 0.2118,
+    "benign_fill_wilson95": [
+      0.1911,
+      0.234
+    ]
+  },
+  "adverse_drift_bps": {
+    "median_all": 1.041,
+    "median_positive": 2.494,
+    "p25": -0.925,
+    "p75": 3.365,
+    "p90": 6.783,
+    "median_positive_boot95": [
+      2.1194,
+      2.7747
+    ],
+    "advise_kappa": 1.0
+  },
+  "defaults": {
+    "v2_default_base": 0.3,
+    "v2_default_kappa": 1.0
+  },
+  "recommendation": {
+    "base_fill_prob_conservative": 0.3,
+    "adv_drift_kappa": 1.0,
+    "note": "use Wilson/bootstrap interval bounds, not point estimates; queue penetration is unobservable from OHLC and needs real fill reports"
+  }
+}
