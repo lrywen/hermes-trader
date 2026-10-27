@@ -5536,14 +5536,23 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
         else:
             admitted = (decision == "")
             rule = "" if admitted else str(decision)
+        score_v = feats.get("score")
         rec = {
             "ts": int(time.time() * 1000),
             "coin": analysis.get("coin") or "",
             "side": (analysis.get("side") or "").lower(),
             "admitted": admitted,
             "rule": rule,
-            "composite_score": feats.get("score"),
+            "composite_score": score_v,
             "min_composite": feats.get("min_score"),
+            # WF-C (2026-10-27): record-only 40-vs-45 dual threshold counters.
+            # ch_weight_calibration showed min_composite=45 may be an
+            # over-raised gate after the ADR-0009 weight change (~40 rescues
+            # higher-median-WR triggers). We do NOT change the live gate; both
+            # booleans are logged on every verdict so an AI-gated A/B can decide
+            # whether a 40-vs-45 ADR is warranted. None when score unavailable.
+            "passes40": (float(score_v) >= 40.0) if score_v is not None else None,
+            "passes45": (float(score_v) >= 45.0) if score_v is not None else None,
             "candidate_floor": feats.get("candidate_floor"),
             "would_clear_candidate_score": feats.get(
                 "would_clear_candidate_score"),

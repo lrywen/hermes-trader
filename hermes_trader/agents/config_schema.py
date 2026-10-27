@@ -1020,6 +1020,15 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "awake_min_frac": _num_leaf(0.0, 1.0),
         "rsi_long": _num_leaf(0.0, 100.0),
         "rsi_floor": _num_leaf(0.0, 100.0),
+        # S2 2026-10-27 record-only "panic gate". Annotates the shadow record
+        # (panic_gate_pass/reasons/atr24_pct); never gates is_candidate or an
+        # order. Default disabled; thresholds frozen on Binance discovery.
+        "panic_gate_enabled": ("bool",),
+        "panic_vol_mode": ("enum", ("fixed", "pctile")),
+        "panic_ext_max_pct": _num_leaf(-100.0, 0.0),
+        "panic_atr24_min_pct": _num_leaf(0.0, 100.0),
+        "panic_atr_pctile_min": _num_leaf(0.0, 1.0),
+        "panic_rsi_min": _num_leaf(0.0, 100.0),
         "shadow_log_path": ("str",),
     },
     # P1-4 Phase 3: volatility/score de-leverage arm (executor.py

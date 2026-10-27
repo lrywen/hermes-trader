@@ -213,6 +213,29 @@ def _awake_frac(candles: list, vols: list[float], i: int,
     return active / awake_bars
 
 
+def _atr_pct(candles: list, i: int, period: int = 24) -> float:
+    """Mean True Range over the last `period` (default 24) 1h bars as a percent
+    of the bar-i close. This is the volatility leg of the record-only "panic
+    gate" (see evaluate_xs_reversal). Simple mean of TR/close — deliberately
+    parity with the offline discovery/validation scripts
+    (scripts/xs_regime_conditional.py), not Wilder ATR. NaN when uncomputable."""
+    lo = i - period + 1
+    if lo <= 0:
+        return float("nan")
+    trs = []
+    for j in range(lo, i + 1):
+        c = candles[j]
+        prev_c = candles[j - 1].c
+        tr = max(c.h - c.l,
+                 abs(c.h - prev_c),
+                 abs(c.l - prev_c))
+        if c.c > 0:
+            trs.append(tr / c.c * 100.0)
+    if len(trs) < period:
+        return float("nan")
+    return sum(trs) / len(trs)
+
+
 def _regime_label(score: float) -> str:
     """Threshold labels byte-for-byte with backtest_ab_compare._regime_score
     (which delegates to the same canonical scorer)."""
@@ -245,6 +268,42 @@ def evaluate_xs_reversal(candles: list, *, config: Optional[dict[str, Any]] = No
                                    config=config))
     rsi_long = float(cfg_get("xs_reversal.rsi_long", 35.0, config=config))
     rsi_floor = float(cfg_get("xs_reversal.rsi_floor", 15.0, config=config))
+
+    # Record-only "panic gate" (S2 2026-10-27). The un-gated xs candidate has a
+    # t≈1.93 / CI-crosses-zero edge that is driven by LOW-volatility noise in the
+    # 2026 regime; conditioning on genuine panic (deep drawdown + elevated vol +
+    # not a free-falling knife) restores a cross-year, OOS-significant edge
+    # (Binance 3.4y: 120 episodes / +276bp / day-t 2.98; Hyperliquid same-window
+    # direction-replicated). This gate ONLY annotates the shadow record
+    # (panic_gate_pass/reasons); it never changes is_candidate and never touches
+    # an order. Disabled by default so existing consumers see no behavioral
+    # change; thresholds were FROZEN on Binance and only validated (never
+    # re-tuned) on Hyperliquid.
+    panic_gate_enabled = bool(
+        cfg_get("xs_reversal.panic_gate_enabled", False, config=config))
+    panic_ext_max = float(
+        cfg_get("xs_reversal.panic_ext_max_pct", -8.0, config=config))
+    panic_atr_min = float(
+        cfg_get("xs_reversal.panic_atr24_min_pct", 1.0, config=config))
+    panic_rsi_min = float(
+        cfg_get("xs_reversal.panic_rsi_min", 20.0, config=config))
+    # Volatility-leg MODE (S2 2026-10-27 calibration):
+    #   "fixed"   -> atr24_pct >= panic_atr24_min_pct (cross-coin biased toward
+    #                high-vol alts; ETH day-block CI crossed zero in backtests)
+    #   "pctile"  -> atr24 in the top (1-q) of the coin's OWN trailing 90d ATR
+    #                distribution (self-normalizing, zero look-ahead; chosen
+    #                because it turns every coin's CI lower bound positive and
+    #                cuts the BTC/ETH/SOL share skew from 59pp to 45pp).
+    # Default stays "fixed" purely so an unset config reproduces the prior
+    # record; enabling the gate is opt-in regardless. Threshold q is
+    # panic_atr_pctile_min (0.6 = top 40%).
+    panic_vol_mode = str(
+        cfg_get("xs_reversal.panic_vol_mode", "fixed", config=config)
+    ).strip().lower()
+    if panic_vol_mode not in ("fixed", "pctile"):
+        panic_vol_mode = "fixed"
+    panic_atr_pctile_min = float(
+        cfg_get("xs_reversal.panic_atr_pctile_min", 0.6, config=config))
 
     # lookback_d only re-derives the lookback window when changed from the
     # default 3; the canonical fixed LOOKBACK_BARS (72) is the 3d geometry.
@@ -292,6 +351,40 @@ def evaluate_xs_reversal(candles: list, *, config: Optional[dict[str, Any]] = No
     rsi_ok = rsi_floor <= rsi_v < rsi_long
     is_candidate = bool(downtrend and rsi_ok)
 
+    # Record-only panic gate features (see config note above). ATR% and its
+    # within-coin percentile are computed for EVERY trigger so the shadow record
+    # carries both continuous features even when the gate is disabled; the
+    # boolean only becomes meaningful when panic_gate_enabled=True. The
+    # volatility leg can use either a fixed ATR% cutoff or the coin's own
+    # trailing-90d ATR percentile (self-normalizing). Snapshot-only failures
+    # must never gate anything.
+    atr24_pct = _atr_pct(candles, i, 24)
+    atr_pctile = float("nan")
+    try:
+        # Recompute the trailing ATR series only over the percentile window
+        # (plus the 24-bar ATR warm-up), ranked against bars UP TO i (PIT).
+        plo = max(24, i - PCTILE_WIN + 1)
+        atr_win = [_atr_pct(candles, j, 24) for j in range(plo, i + 1)]
+        atr_win = [v for v in atr_win if math.isfinite(v)]
+        if atr_win and math.isfinite(atr24_pct):
+            atr_pctile = bisect.bisect_right(
+                sorted(atr_win), atr24_pct) / len(atr_win)
+    except Exception as e:  # pragma: no cover - snapshot only, never gates
+        logger.debug(f"[xs_reversal] atr percentile failed: {e}")
+
+    panic_reasons = []
+    if ext[i] > panic_ext_max:
+        panic_reasons.append("ext_too_shallow")
+    if panic_vol_mode == "pctile":
+        if not math.isfinite(atr_pctile) or atr_pctile < panic_atr_pctile_min:
+            panic_reasons.append("atr_pctile_too_low")
+    else:
+        if not math.isfinite(atr24_pct) or atr24_pct < panic_atr_min:
+            panic_reasons.append("atr24_too_low")
+    if rsi_v < panic_rsi_min:
+        panic_reasons.append("rsi_below_floor")
+    panic_gate_pass = bool(panic_gate_enabled and not panic_reasons)
+
     # Regime snapshot label (canonical direction-agnostic scorer over the
     # trailing REGIME_WIN bars). Recorded for M4 grouping; NEVER a hard gate.
     regime_score = 0.0
@@ -320,6 +413,17 @@ def evaluate_xs_reversal(candles: list, *, config: Optional[dict[str, Any]] = No
         "rsi_floor": rsi_floor,
         "top_pct": top_pct,
         "is_candidate": is_candidate,
+        # Record-only panic gate (S2 2026-10-27). Never feeds is_candidate or
+        # order placement; used by M4/forward-reconcile to accumulate gated
+        # independent signal-days before any promote decision.
+        "atr24_pct": round(float(atr24_pct), 4)
+        if math.isfinite(atr24_pct) else None,
+        "atr_pctile": round(float(atr_pctile), 6)
+        if math.isfinite(atr_pctile) else None,
+        "panic_vol_mode": panic_vol_mode,
+        "panic_gate_enabled": bool(panic_gate_enabled),
+        "panic_gate_pass": panic_gate_pass,
+        "panic_gate_reasons": panic_reasons,
         # outcome fields are backfilled by M4 reconcile; null for now.
         "outcome": None,
         "exit_px": None,

@@ -269,6 +269,78 @@ def test_evaluate_candidate_downtrend_oversold(monkeypatch, tmp_path):
     assert rec["outcome"] is None and rec["exit_px"] is None and rec["pnl_usd"] is None
 
 
+def test_panic_gate_disabled_by_default_but_records_features(monkeypatch, tmp_path):
+    candles = _series(xs.MIN_BARS + 2)
+    cfg = _cfg(tmp_path)
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    assert rec is not None
+    # 默认关闭：布尔恒 False，但连续特征仍落盘供 M4 离线分组。
+    assert rec["panic_gate_enabled"] is False
+    assert rec["panic_gate_pass"] is False
+    assert rec["panic_gate_reasons"] == []
+    assert rec["atr24_pct"] is not None and rec["atr24_pct"] > 0
+    # 不改变 M1 候选语义。
+    assert rec["is_candidate"] is True
+
+
+def test_panic_gate_passes_for_deep_active_panic(monkeypatch, tmp_path):
+    # 合成序列：ext~-22%（深回撤）、放量暴跌（ATR 高）、RSI~22（>=20 非接刀）。
+    candles = _series(xs.MIN_BARS + 2)
+    cfg = _cfg(tmp_path)
+    cfg["xs_reversal"]["panic_gate_enabled"] = True
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    assert rec is not None and rec["is_candidate"] is True
+    assert rec["panic_gate_enabled"] is True
+    assert rec["ext_pct"] <= -8.0
+    assert rec["atr24_pct"] >= 1.0
+    assert rec["rsi14"] >= 20.0
+    assert rec["panic_gate_pass"] is True
+    assert rec["panic_gate_reasons"] == []
+
+
+def test_panic_gate_rejects_low_vol_shallow_signal(monkeypatch, tmp_path):
+    # 平缓阴跌（crash_vol_mult=1、单步极小）：xs 候选可能成立，但不属"恐慌"，
+    # ATR/ext 腿应把门判为不通过且给出原因；仍不得影响 is_candidate/下单。
+    candles = _series(xs.MIN_BARS + 2, d=0.0006, crash_len=120,
+                      crash_vol_mult=1.0, rng_frac=0.0008)
+    cfg = _cfg(tmp_path)
+    cfg["xs_reversal"]["panic_gate_enabled"] = True
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    if rec is not None and rec["is_candidate"]:
+        assert rec["panic_gate_pass"] is False
+        assert rec["panic_gate_reasons"]  # 至少一个拒绝原因
+        assert ("atr24_too_low" in rec["panic_gate_reasons"]
+                or "ext_too_shallow" in rec["panic_gate_reasons"])
+        # 门只注解，不回写候选标志。
+        assert rec["is_candidate"] is True
+
+
+def test_panic_gate_pctile_mode_uses_within_coin_percentile(monkeypatch, tmp_path):
+    # pctile 模式波动腿用币内 ATR 分位（恐慌暴跌使当前 ATR 处于自身高位）。
+    candles = _series(xs.MIN_BARS + 2)
+    cfg = _cfg(tmp_path)
+    cfg["xs_reversal"]["panic_gate_enabled"] = True
+    cfg["xs_reversal"]["panic_vol_mode"] = "pctile"
+    cfg["xs_reversal"]["panic_atr_pctile_min"] = 0.6
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    assert rec is not None and rec["is_candidate"] is True
+    assert rec["panic_vol_mode"] == "pctile"
+    assert rec["atr_pctile"] is not None
+    assert rec["atr_pctile"] >= 0.6
+    assert rec["panic_gate_pass"] is True
+    assert "atr_pctile_too_low" not in rec["panic_gate_reasons"]
+
+
+def test_panic_gate_bad_vol_mode_falls_back_to_fixed(monkeypatch, tmp_path):
+    candles = _series(xs.MIN_BARS + 2)
+    cfg = _cfg(tmp_path)
+    cfg["xs_reversal"]["panic_gate_enabled"] = True
+    cfg["xs_reversal"]["panic_vol_mode"] = "bogus"
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    assert rec is not None
+    assert rec["panic_vol_mode"] == "fixed"
+
+
 def test_evaluate_uptrend_not_candidate_but_snapshot_recorded(monkeypatch, tmp_path):
     candles = _series(xs.MIN_BARS + 2, downtrend=False, rsi_oversold=False)
     cfg = _cfg(tmp_path)
