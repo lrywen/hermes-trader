@@ -186,6 +186,42 @@ def _maker_ttl_bars() -> int:
         return 30
 
 
+def _maker_fill_model() -> str:
+    """Which maker fill simulator the live shadow book uses.
+
+    Default ``v1`` preserves the audited touch-fill behaviour byte-for-byte;
+    ``v2`` selects the conditional-fill + adverse-selection-priced model
+    (maker_shadow.simulate_shadow_order_v2, deterministic conservative path).
+    Any unrecognised value fails closed to ``v1`` so a typo never silently
+    changes booking. v2 remains a SHADOW/replay-only model — never live.
+    """
+    raw = str(_shadow_cfg().get("maker_fill_model", "v1") or "v1").strip().lower()
+    return "v2" if raw in ("v2", "maker_shadow_v2", "conditional") else "v1"
+
+
+def _maker_v2_params() -> dict[str, float]:
+    """v2 conditional-fill parameters (conservative priors; config-overridable
+    for offline sweep). Values are clamped to [0,1] by the simulator itself."""
+    c = _shadow_cfg()
+
+    def _f(key: str, default: float) -> float:
+        try:
+            return float(c[key]) if c.get(key) is not None else default
+        except (TypeError, ValueError):
+            return default
+
+    from hermes_trader.execution.maker_shadow import (
+        V2_DEFAULT_ADV_DRIFT_KAPPA,
+        V2_DEFAULT_BASE_FILL_PROB,
+        V2_DEFAULT_FILL_PROB_DECAY,
+    )
+    return {
+        "base_fill_prob": _f("maker_v2_base_fill_prob", V2_DEFAULT_BASE_FILL_PROB),
+        "fill_prob_decay": _f("maker_v2_fill_prob_decay", V2_DEFAULT_FILL_PROB_DECAY),
+        "adv_drift_kappa": _f("maker_v2_adv_drift_kappa", V2_DEFAULT_ADV_DRIFT_KAPPA),
+    }
+
+
 # Upper bound on 1m candles fetched to resolve one resting maker order. Guards
 # against unbounded fetch for pathologically stale orders; anything older than
 # this is handled by the TTL-age cancel fallback in _resolve_pending_maker_orders.
@@ -940,6 +976,10 @@ class ShadowBook:
             "analysis_id": analysis_id or "",
             "signal_meta": signal_meta or {},
             "posted_at": _now_ms(),
+            # 标记该挂单将由哪个成交模型裁决，撤单审计与之一致。
+            "fill_model": (
+                "maker_shadow_v2" if _maker_fill_model() == "v2"
+                else "maker_shadow"),
         })
 
     def _fill_maker_order(self, order: dict[str, Any], fill_px: float,
@@ -990,12 +1030,20 @@ class ShadowBook:
             "position_id": pid, "ts": filled_at,
             "coin": coin, "side": side, "qty": float(size_coin),
             "price": float(fill_px), "notional_usd": float(size_usd),
-            "leverage": lev, "fee_usd": 0.0, "fill_model": "maker_shadow",
+            "leverage": lev, "fee_usd": 0.0,
+            # v1 账本沿用 "maker_shadow"；v2 条件成交模型标记 maker_shadow_v2。
+            "fill_model": selection.get("fill_model") or "maker_shadow",
             "analysis_id": order.get("analysis_id", ""),
             # maker fill-quality / adverse-selection metrics (may be None)
             "resting_bars": selection.get("resting_bars"),
             "maker_edge_bps": selection.get("maker_edge_bps"),
             "post_fill_mid_drift_bps": selection.get("post_fill_mid_drift_bps"),
+            # v2-only conditional-fill audit (None/0 on v1 opens)
+            "fill_prob": selection.get("fill_prob"),
+            "raw_drift_bps": selection.get("raw_drift_bps"),
+            "adv_drift_charge_bps": selection.get("adv_drift_charge_bps"),
+            "residual_drift_bps": selection.get("residual_drift_bps"),
+            "reject_count": int(selection.get("reject_count") or 0),
             **sig_meta,
         }
         acc["fills"].append(fill)
@@ -1022,15 +1070,21 @@ class ShadowBook:
             f"notional=${size_usd:.2f} lev={lev}x (paper)")
         return fill
 
-    def _cancel_maker_order(self, order: dict[str, Any], at_ms: int) -> None:
+    def _cancel_maker_order(self, order: dict[str, Any], at_ms: int,
+                            *, reject_count: int = 0,
+                            touched: bool = False) -> None:
         """Drop a TTL-expired maker order and append an audit cancel fill."""
         acc = self._account("maker_shadow")
         acc["fills"].append({
             "type": "cancel", "id": uuid.uuid4().hex[:12],
             "ts": at_ms, "coin": order["coin"], "side": order["side"],
             "limit_px": float(order["limit_px"]),
-            "fill_model": "maker_shadow",
+            "fill_model": order.get("fill_model", "maker_shadow"),
             "analysis_id": order.get("analysis_id", ""),
+            # v2 取证：区分"从未触及"与"触及但被队列概率拒绝"，配合零成交告警
+            # 防止 v2 接线退化成静默空账本。
+            "touched": bool(touched),
+            "reject_count": int(reject_count or 0),
         })
 
     def _resolve_pending_maker_orders(self, mids: dict[str, float]) -> None:
@@ -1043,7 +1097,15 @@ class ShadowBook:
         the fetched window; the window is sized to cover the resting TTL.
         """
         from hermes_trader.client.hl_client import fetch_hl_candles
-        from hermes_trader.execution.maker_shadow import ShadowMakerOrder, locate_posted_bar_idx, simulate_shadow_order
+        from hermes_trader.execution.maker_shadow import (
+            ShadowMakerOrder,
+            deterministic_shadow_order_v2,
+            locate_posted_bar_idx,
+            simulate_shadow_order,
+        )
+
+        use_v2 = _maker_fill_model() == "v2"
+        v2_params = _maker_v2_params() if use_v2 else {}
 
         acc = self._account("maker_shadow")
         if not acc["pending_orders"]:
@@ -1097,7 +1159,12 @@ class ShadowBook:
                 post_mid_px=float(order["post_mid_px"]),
                 ttl_bars=min(ttl, len(bars) - 1 - posted_idx),
             )
-            verdict = simulate_shadow_order(sim, bars)
+            if use_v2:
+                # 实时影子账本走等概率确定性判定（稳定 hash 抽样，重放可复现，
+                # 长期成交率≈base）；带种子蒙特卡洛期望口径仅离线回放使用。
+                verdict = deterministic_shadow_order_v2(sim, bars, **v2_params)
+            else:
+                verdict = simulate_shadow_order(sim, bars)
             if verdict.filled:
                 filled_at = int(verdict.fill_ms or _now_ms())
                 acc["pending_orders"] = [
@@ -1109,6 +1176,16 @@ class ShadowBook:
                         "maker_edge_bps": verdict.maker_edge_bps,
                         "post_fill_mid_drift_bps": verdict.post_fill_mid_drift_bps,
                         "fill_bar_t": verdict.fill_ms,
+                        # v2 审计（v1 路径这些键缺省为 None/0，不影响既有聚合）
+                        "fill_model": getattr(verdict, "fill_model", "maker_shadow"),
+                        "fill_prob": getattr(verdict, "fill_prob", None),
+                        "fill_draw": getattr(verdict, "fill_draw", None),
+                        "raw_drift_bps": getattr(verdict, "raw_drift_bps", None),
+                        "adv_drift_charge_bps": getattr(
+                            verdict, "adv_drift_charge_bps", None),
+                        "residual_drift_bps": getattr(
+                            verdict, "residual_drift_bps", None),
+                        "reject_count": getattr(verdict, "reject_count", 0),
                     })
             elif verdict.canceled:
                 # TTL of resting time elapsed without a touch.
@@ -1116,7 +1193,10 @@ class ShadowBook:
                 if age_min >= ttl:
                     acc["pending_orders"] = [
                         o for o in acc["pending_orders"] if o["id"] != order["id"]]
-                    self._cancel_maker_order(order, _now_ms())
+                    self._cancel_maker_order(
+                        order, _now_ms(),
+                        reject_count=getattr(verdict, "reject_count", 0),
+                        touched=getattr(verdict, "touch_bar_idx", None) is not None)
 
     def _resolve_pending_drift(self) -> None:
         """Backfill post-fill mid drift for maker opens that filled before the
@@ -1577,7 +1657,11 @@ class ShadowBook:
 
         Pins the maker go/no-go evidence: fill rate (fills vs fills+cuts),
         resting time, captured maker edge, and post-fill adverse drift.
-        Edge/drift values of None (no forward bar) are excluded from means."""
+        Edge/drift values of None (no forward bar) are excluded from means.
+        v2 opens (fill_model=maker_shadow_v2) additionally report mean queue
+        penetration probability and touch-reject count, plus a per-model split
+        so v1/v2 can be compared on the same book without cross-contamination.
+        """
         opens = [f for f in acc["fills"] if f.get("type") == "open"]
         cancels = [f for f in acc["fills"] if f.get("type") == "cancel"]
         n_fill = len(opens)
@@ -1589,13 +1673,52 @@ class ShadowBook:
         rests = [float(f["resting_bars"]) for f in opens
                  if f.get("resting_bars") is not None]
         decided = n_fill + n_cancel
+
+        def _mean(xs: list[float]) -> Optional[float]:
+            return round(sum(xs) / len(xs), 3) if xs else None
+
+        v2_opens = [f for f in opens if f.get("fill_model") == "maker_shadow_v2"]
+        v2_cancels = [f for f in cancels
+                      if f.get("fill_model") == "maker_shadow_v2"]
+        v2_probs = [float(f["fill_prob"]) for f in v2_opens
+                    if f.get("fill_prob") is not None]
+        v2_resid = [float(f["residual_drift_bps"]) for f in v2_opens
+                    if f.get("residual_drift_bps") is not None]
+        v2_rejects = [int(f.get("reject_count") or 0) for f in v2_opens]
+        v2_touched_cancels = sum(
+            1 for f in v2_cancels if f.get("touched")
+            or int(f.get("reject_count") or 0) > 0)
+        v2_decided = len(v2_opens) + len(v2_cancels)
+        v2 = None
+        if v2_decided:
+            # Fail-loud：v2 已裁决足够多订单、且确有挂单被价格触及，却 0 成交，
+            # 说明确定性接线退化（历史缺陷：p 恒<1 导致永不成交）。>=20 笔后
+            # 置告警，避免冷启动小样本误报。
+            zero_fill_with_touches = (
+                len(v2_opens) == 0 and v2_touched_cancels >= 20)
+            v2 = {
+                "fills": len(v2_opens),
+                "cancels": len(v2_cancels),
+                "touched_cancels": v2_touched_cancels,
+                "fill_rate_pct": round(100.0 * len(v2_opens) / v2_decided, 2),
+                "zero_fill_warning": zero_fill_with_touches,
+                "avg_fill_prob": _mean(v2_probs),
+                # 已计入价格后残留的逆选择；kappa=1 时应≈0（S1 Go 判据）。
+                "avg_residual_drift_bps": _mean(v2_resid),
+                "avg_reject_count": _mean([float(x) for x in v2_rejects]),
+                # 被概率拒绝后仍成交的笔数占比（逆选择存活证据）
+                "fills_after_reject_pct": round(
+                    100.0 * sum(1 for r in v2_rejects if r > 0)
+                    / len(v2_opens), 2) if v2_opens else 0.0,
+            }
         return {
             "fills": n_fill,
             "cancels": n_cancel,
             "fill_rate_pct": round(100.0 * n_fill / decided, 2) if decided else 0.0,
-            "avg_maker_edge_bps": round(sum(edges) / len(edges), 3) if edges else None,
-            "avg_post_fill_drift_bps": round(sum(drifts) / len(drifts), 3) if drifts else None,
-            "avg_resting_bars": round(sum(rests) / len(rests), 2) if rests else None,
+            "avg_maker_edge_bps": _mean(edges),
+            "avg_post_fill_drift_bps": _mean(drifts),
+            "avg_resting_bars": _mean(rests),
+            "v2": v2,
         }
 
     def would_execute_dropped(self) -> int:
