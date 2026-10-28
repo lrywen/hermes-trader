@@ -222,6 +222,45 @@ def _maker_v2_params() -> dict[str, float]:
     }
 
 
+def _norm_coin(coin: object) -> str:
+    """Normalize a coin symbol for allow-list matching (upper, strip USDT)."""
+    return str(coin or "").upper().removesuffix("USDT").strip()
+
+
+def _maker_v2_coins() -> Optional[set[str]]:
+    """Optional coin allow-list for the v2 conditional-fill maker model.
+
+    Returns None when unset/empty => v2 applies to every coin (prior semantics).
+    When set (e.g. ["BTC"]), returns the symbol set and only those coins book via
+    v2; every other coin keeps the audited v1 touch-fill model. A present but
+    malformed/empty-after-normalize allow-list returns an empty set (not None),
+    i.e. fail closed to v1 on every coin rather than silently applying v2 to all.
+    """
+    if "maker_v2_coins" not in _shadow_cfg():
+        return None
+    raw = _shadow_cfg().get("maker_v2_coins")
+    if raw is None:
+        return None
+    if not isinstance(raw, (list, tuple, set)):
+        return set()  # malformed type: restrict to nothing (v1 everywhere)
+    if len(raw) == 0:
+        return None  # explicit empty allow-list == all coins (canonical default)
+    coins = {_norm_coin(c) for c in raw if str(c or "").strip()}
+    # present, non-empty list that parses to zero valid symbols -> fail closed
+    return coins if coins else set()
+
+
+def _maker_uses_v2(coin: str) -> bool:
+    """Coin-scoped model selection: global model must be v2 AND, when an allow
+    list is configured, the coin must appear in it. Fails closed to v1."""
+    if _maker_fill_model() != "v2":
+        return False
+    allow = _maker_v2_coins()
+    if allow is None:
+        return True
+    return _norm_coin(coin) in allow
+
+
 # Upper bound on 1m candles fetched to resolve one resting maker order. Guards
 # against unbounded fetch for pathologically stale orders; anything older than
 # this is handled by the TTL-age cancel fallback in _resolve_pending_maker_orders.
@@ -976,9 +1015,9 @@ class ShadowBook:
             "analysis_id": analysis_id or "",
             "signal_meta": signal_meta or {},
             "posted_at": _now_ms(),
-            # 标记该挂单将由哪个成交模型裁决，撤单审计与之一致。
+            # 标记该挂单将由哪个成交模型裁决，撤单审计与之一致（按币 v2 白名单）。
             "fill_model": (
-                "maker_shadow_v2" if _maker_fill_model() == "v2"
+                "maker_shadow_v2" if _maker_uses_v2(coin)
                 else "maker_shadow"),
         })
 
@@ -1104,8 +1143,8 @@ class ShadowBook:
             simulate_shadow_order,
         )
 
-        use_v2 = _maker_fill_model() == "v2"
-        v2_params = _maker_v2_params() if use_v2 else {}
+        global_v2 = _maker_fill_model() == "v2"
+        v2_params = _maker_v2_params() if global_v2 else {}
 
         acc = self._account("maker_shadow")
         if not acc["pending_orders"]:
@@ -1159,6 +1198,7 @@ class ShadowBook:
                 post_mid_px=float(order["post_mid_px"]),
                 ttl_bars=min(ttl, len(bars) - 1 - posted_idx),
             )
+            use_v2 = global_v2 and _maker_uses_v2(coin)
             if use_v2:
                 # 实时影子账本走等概率确定性判定（稳定 hash 抽样，重放可复现，
                 # 长期成交率≈base）；带种子蒙特卡洛期望口径仅离线回放使用。

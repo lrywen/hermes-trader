@@ -223,6 +223,15 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     # (None, live) 使「新增未被登记的 live-only 叶」或「这些叶值被改」都会变红。
     "coin_overrides.HYPE.dsl_exit.atr_stop.ceiling_pct": (None, 3),
     "coin_overrides.HYPE.dsl_exit.atr_stop.floor_pct": (None, 1.5),
+    # 2026-10-29: maker_shadow v2 BTC-only deep-offset SHADOW validation (no
+    # capital: the model is paper-only and mode=SHADOW cannot place orders).
+    # Selects the conditional-fill model on BTC at 12bp with kappa=1 (the
+    # conservative adverse-selection pricing); every other coin keeps audited
+    # v1. base/decay/kappa stay at canonical, so they are not divergences.
+    # Value-bound: changing the model/offset/coin set without re-review goes red.
+    "shadow_book.maker_fill_model": ("v1", "v2"),
+    "shadow_book.maker_limit_offset_bps": (5.0, 12.0),
+    "shadow_book.maker_v2_coins": ([], ["BTC"]),
 }
 
 

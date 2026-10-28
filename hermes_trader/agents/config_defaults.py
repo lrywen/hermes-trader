@@ -1925,6 +1925,23 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "maker_fee_pct": 0.015,
         # Number of fills per round trip (entry + exit = 2).
         "round_trip_fills": 2,
+        # maker_shadow counterfactual fill model. "v1" = audited touch-fill;
+        # "v2" = conditional queue-penetration fill + adverse-selection-priced
+        # (shadow/replay only, never live). Canonical stays v1; enabling v2 is
+        # an operator-only production divergence that must be registered in
+        # config_parity_guard._REVIEWED_SAFE_DIVERGENCES.
+        "maker_fill_model": "v1",
+        # Resting post-only limit offset behind decision mid (bps). Mirrors the
+        # module default; 12 selects the deep-offset niche for shadow testing.
+        "maker_limit_offset_bps": 5.0,
+        # v2 conditional-fill priors (maker_shadow.V2_DEFAULT_*); shadow-only.
+        "maker_v2_base_fill_prob": 0.30,
+        "maker_v2_fill_prob_decay": 0.5,
+        "maker_v2_adv_drift_kappa": 1.0,
+        # Optional coin allow-list for v2 (bare symbols; USDT suffix stripped).
+        # Empty => v2 applies to every coin. Set ["BTC"] to shadow the historical
+        # deep-offset niche on BTC only while every other coin keeps audited v1.
+        "maker_v2_coins": [],
         # Cap on concurrent virtual positions. SHADOW/LIVE PARITY: the paper
         # book MUST admit exactly the same number of concurrent positions a
         # live book would — a higher cap would let SHADOW book entries the
