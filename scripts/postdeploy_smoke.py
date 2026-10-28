@@ -211,7 +211,11 @@ def check_backfill_source() -> bool:
             ok = False
 
         # 3. executor record_close failure must alert loudly (not silent warn).
-        esrc = inspect.getsource(executor.close_position_market)
+        # C-M6 (2026-08-28) wrapped close_position_market in a per-coin lock; it
+        # is now a thin delegator to _close_position_market_locked, where the
+        # record_close chokepoint and its Feishu alert live. Inspect the real
+        # implementation, not the wrapper.
+        esrc = inspect.getsource(executor._close_position_market_locked)
         if "notify.send_text" in esrc and "record_close 失败" in esrc:
             _ok("executor record_close failure triggers Feishu alert")
         else:
@@ -232,23 +236,46 @@ def check_backfill_source() -> bool:
         else:
             _info(f"reconcile_fills.py not at {rf_path} (skipped)")
 
-        # 5. risk_gates: verify fail_closed_shorts + alert_on_fail_open are
-        #    present (the HTA circuit-breaker hardening shipped).
+        # 5. fail-open visibility + fail-closed shorts hardening.
+        #    The HTA hardening shipped under its current names:
+        #      * a memory-gate read failure is alerted on TWO independent
+        #        channels — a Feishu danger card (_alert_memory_gate_blind) and
+        #        an operator SSE/audit "risk_gate_blind" event (H-P3: losing the
+        #        only alert must not leave a blind gate silent);
+        #      * shorting has a single authoritative fail-closed switch
+        #        (ADR-0008: runner_entry_gate.allow_shorts), enforced in the
+        #        executor before any short order. The early-idea names
+        #        hta_risk_gate.fail_closed_shorts / _notify_fail_open were never
+        #        the landed identifiers — assert the real ones instead.
         rg_path = os.path.join(
             os.path.dirname(__file__), "..",
             "hermes_trader", "agents", "risk_gates.py")
         if os.path.isfile(rg_path):
             with open(rg_path) as fh:
                 rgsrc = fh.read()
-            if ("fail_closed_shorts" in rgsrc
-                    and "_notify_fail_open" in rgsrc
-                    and 'timeout_s", 12.0' in rgsrc):
-                _ok("risk_gates fail_closed_shorts + fail-open alerts present")
+            if ("_alert_memory_gate_blind" in rgsrc
+                    and '"risk_gate_blind"' in rgsrc
+                    and "fail-open" in rgsrc):
+                _ok("risk_gates blind-gate dual-channel fail-open alerts present")
             else:
-                _fail("risk_gates missing fail_closed_shorts/alert hardening")
+                _fail("risk_gates missing blind-gate fail-open alert hardening")
                 ok = False
         else:
             _info(f"risk_gates.py not at {rg_path} (skipped)")
+
+        ex_path = os.path.join(
+            os.path.dirname(__file__), "..",
+            "hermes_trader", "agents", "executor.py")
+        if os.path.isfile(ex_path):
+            with open(ex_path) as fh:
+                exsrc = fh.read()
+            if "runner_gate_blocked (shorts disabled)" in exsrc:
+                _ok("executor fail-closed short block (runner_entry_gate) present")
+            else:
+                _fail("executor missing fail-closed shorts enforcement")
+                ok = False
+        else:
+            _info(f"executor.py not at {ex_path} (skipped)")
 
     except Exception as e:
         _fail(f"backfill source check: {e}")
