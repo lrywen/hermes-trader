@@ -1,0 +1,87 @@
+{
+  "source": "history_1h",
+  "symbols": [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT"
+  ],
+  "cost_bps_rt": 9.26,
+  "tail_cut_85": 0.15,
+  "tail_cut_90": 0.1,
+  "gated_filter": {
+    "ext_pct_max": -8.0,
+    "rsi_min": 20.0,
+    "atr_pctile_min": 0.6
+  },
+  "gated": {
+    "all85_triggers": {
+      "n": 98,
+      "days": 79,
+      "mean_net_bp": 296.8,
+      "win_pct": 68.4,
+      "day_t": 2.83,
+      "day_ci95_bp": [
+        72.9,
+        379.0
+      ]
+    },
+    "top90_subset": {
+      "n": 59,
+      "days": 46,
+      "mean_net_bp": 297.7,
+      "win_pct": 67.8,
+      "day_t": 2.07,
+      "day_ci95_bp": [
+        9.9,
+        459.2
+      ]
+    },
+    "band_85_only": {
+      "n": 39,
+      "days": 35,
+      "mean_net_bp": 295.4,
+      "win_pct": 69.2,
+      "day_t": 2.26,
+      "day_ci95_bp": [
+        48.9,
+        517.2
+      ]
+    }
+  },
+  "note": "90 is a strict subset of 85 on the SAME de-overlapped stream; band_85_only is the counterfactual kept by 85 but dropped by 90. Freeze 85 if that band stays positive; tighten to 90 only if it is negative and drags the mean below the 90 subset.",
+  "all_candidates": {
+    "all85_triggers": {
+      "n": 333,
+      "days": 197,
+      "mean_net_bp": 87.5,
+      "win_pct": 56.5,
+      "day_t": 1.93,
+      "day_ci95_bp": [
+        -0.9,
+        171.1
+      ]
+    },
+    "top90_subset": {
+      "n": 132,
+      "days": 95,
+      "mean_net_bp": 141.9,
+      "win_pct": 63.6,
+      "day_t": 2.13,
+      "day_ci95_bp": [
+        14.4,
+        257.9
+      ]
+    },
+    "band_85_only": {
+      "n": 201,
+      "days": 133,
+      "mean_net_bp": 51.7,
+      "win_pct": 51.7,
+      "day_t": 0.78,
+      "day_ci95_bp": [
+        -64.3,
+        154.5
+      ]
+    }
+  }
+}
