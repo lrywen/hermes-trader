@@ -72,8 +72,10 @@ def day_block(rows, key, boot, seed):
         nd = len(days)
         sims = sorted(statistics.fmean(days[rng.randrange(nd)] for _ in range(nd))
                       for _ in range(boot))
-        ci = [round(sims[int(boot * 0.025)] * 100, 1),
-              round(sims[int(boot * 0.975)] * 100, 1)]
+        # day net 是分数（simulate_exit 返回 (px/entry-1) - cost/1e4），
+        # 分数→bp 必须 ×1e4；此前 ×100 得到的是百分数却误标成 bp（低估 100 倍）。
+        ci = [round(sims[int(boot * 0.025)] * 1e4, 1),
+              round(sims[int(boot * 0.975)] * 1e4, 1)]
     return t, ci, len(days)
 
 
@@ -152,7 +154,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         t, ci, ndays = day_block(sims, "net", args.boot, args.seed)
         row = {
             "n": len(sims), "days": ndays,
-            "mean_net_bp": round(statistics.fmean(vals) * 100, 1),
+            # net 为分数（见 simulate_exit），×1e4 才是 bp。
+            "mean_net_bp": round(statistics.fmean(vals) * 1e4, 1),
             "wr_pct": round(100 * sum(v > 0 for v in vals) / len(vals), 1),
             "day_t": t, "day_ci_bp": ci,
             "stop_hit_pct": round(100 * stop_hits / len(sims), 1),
