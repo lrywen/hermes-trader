@@ -47,8 +47,13 @@ def _boom(*_a, **_k):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_lkg():
+def _isolate_lkg(tmp_path, monkeypatch):
     from hermes_trader.agents import risk_gates
+    # Pin the durable mirror to a per-test tmp file so persistence is exercised
+    # deterministically and tests never read a real /data mirror on a host that
+    # happens to have one.
+    monkeypatch.setenv(risk_gates._BREAKER_LKG_FILE_ENV,
+                       str(tmp_path / "breaker-lkg.json"))
     risk_gates.reset_breaker_lkg()
     yield
     risk_gates.reset_breaker_lkg()
@@ -190,7 +195,8 @@ def test_per_coin_daily_loss_holds_armed_block(monkeypatch, tmp_path):
 # ── drawdown ──────────────────────────────────────────────────────────────
 
 def test_drawdown_holds_armed_block_when_blinded(monkeypatch, tmp_path):
-    from hermes_trader.agents import memory as memory_mod, risk_gates
+    from hermes_trader.agents import memory as memory_mod
+    from hermes_trader.agents import risk_gates
     from hermes_trader.agents.risk_gates import drawdown_gate
     m = _isolated_memory(monkeypatch, tmp_path)
     # Seed a rolling trail directly (same-second track_daily_pnl ticks collapse
@@ -236,7 +242,7 @@ def test_drawdown_no_baseline_pass_not_cached(monkeypatch, tmp_path):
 def test_expired_lkg_degrades_to_fail_open(monkeypatch, tmp_path):
     """An outage longer than the LKG TTL must not wedge the book closed on a
     stale armed verdict forever — it falls back to the alerted fail-open."""
-    from hermes_trader.agents import memory as memory_mod, risk_gates
+    from hermes_trader.agents import risk_gates
     _isolated_memory(monkeypatch, tmp_path)
     monkeypatch.setattr(risk_gates, "_BREAKER_LKG_TTL_S", 0.0)  # always stale
     future_key = risk_gates._lkg_key("global_halt", _ctx())
@@ -246,6 +252,63 @@ def test_expired_lkg_degrades_to_fail_open(monkeypatch, tmp_path):
     # With TTL=0 the entry is immediately expired → no replay.
     assert risk_gates._breaker_lkg_result("global_halt", _ctx()) is None
     assert future_key in risk_gates._breaker_lkg  # entry still present, just stale
+
+
+# ── durable mirror across a (simulated) process restart (audit P1, 2026-10-28) ─
+
+def test_durable_lkg_replays_armed_block_after_simulated_restart(monkeypatch, tmp_path):
+    """An armed verdict is mirrored to disk; after the in-process cache is wiped
+    (as a container restart would), a blinded read must HOLD the block within
+    TTL instead of cold-failing open."""
+    from hermes_trader.agents import memory as memory_mod
+    from hermes_trader.agents import risk_gates
+    from hermes_trader.agents.risk_gates import global_halt_gate
+    lkg_file = str(tmp_path / "lkg.json")
+    monkeypatch.setenv(risk_gates._BREAKER_LKG_FILE_ENV, lkg_file)
+    risk_gates.reset_breaker_lkg()
+    _isolated_memory(monkeypatch, tmp_path)
+    # armed tick → BLOCK is persisted
+    monkeypatch.setattr(memory_mod.memory, "global_halt_remaining_min", lambda: 120.0)
+    assert global_halt_gate(_ctx())["pass"] is False
+    import json as _json
+    assert _json.loads(__import__("pathlib").Path(lkg_file).read_text())
+
+    # Simulate restart: wipe in-process state and force the disk-load guard to
+    # re-run, but KEEP the durable file. A fresh blinded read now holds BLOCK.
+    risk_gates._breaker_lkg.clear()
+    risk_gates._lkg_disk_loaded = False
+    monkeypatch.setattr(memory_mod.memory, "global_halt_remaining_min", _boom)
+    held = global_halt_gate(_ctx())
+    assert held["pass"] is False and held.get("via") == "lkg_fallback"
+    assert "LKG" in held["reason"]
+
+
+def test_durable_lkg_expired_after_restart_fails_open(monkeypatch, tmp_path):
+    """A mirror older than TTL must not resurrect an ancient armed block."""
+    from hermes_trader.agents import risk_gates
+    lkg_file = str(tmp_path / "lkg.json")
+    monkeypatch.setenv(risk_gates._BREAKER_LKG_FILE_ENV, lkg_file)
+    risk_gates.reset_breaker_lkg()
+    import json as _json
+    import time as _time
+    stale_ts = _time.time() - risk_gates._BREAKER_LKG_TTL_S - 60
+    __import__("pathlib").Path(lkg_file).write_text(_json.dumps({
+        "global_halt:-": [stale_ts, True, "old halt"]}))
+    risk_gates._breaker_lkg.clear()
+    risk_gates._lkg_disk_loaded = False
+    assert risk_gates._breaker_lkg_result("global_halt", _ctx()) is None
+
+
+def test_durable_lkg_corrupt_file_is_ignored(monkeypatch, tmp_path):
+    from hermes_trader.agents import risk_gates
+    lkg_file = str(tmp_path / "lkg.json")
+    monkeypatch.setenv(risk_gates._BREAKER_LKG_FILE_ENV, lkg_file)
+    risk_gates.reset_breaker_lkg()
+    __import__("pathlib").Path(lkg_file).write_text("{not valid json")
+    risk_gates._breaker_lkg.clear()
+    risk_gates._lkg_disk_loaded = False
+    # Must not raise; cold-start semantics → no replay.
+    assert risk_gates._breaker_lkg_result("global_halt", _ctx()) is None
 
 
 # ── reentry_cap (6th breaker; LKG only in ENFORCE, shadow stays probe) ──────

@@ -635,6 +635,105 @@ _BREAKER_LKG_TTL_S = float(os.environ.get("HERMES_BREAKER_LKG_TTL_S", "3600"))
 # key -> (monotonic-ish wall s, blocked bool, reason)
 _breaker_lkg: dict[str, tuple[float, bool, str]] = {}
 
+# ── Durable LKG mirror (2026-10-28, audit P1) ───────────────────────────────
+# The in-process cache above is wiped on every container/process restart, so a
+# "restart + memory read failure" window cold-failed OPEN for all five
+# memory-backed breakers. We mirror the latest verdict to a small best-effort
+# file on the persisted /data volume and replay it (still TTL-bounded) after a
+# restart. Hard guarantees / posture (unchanged):
+#   * TTL still bounds staleness — an outage longer than TTL degrades to the
+#     loud, alerted fail-open exactly as before;
+#   * disk is best-effort only: any IO/parse error is swallowed and the gate
+#     behaves exactly as the prior in-process-only implementation;
+#   * only verdicts computed from a GOOD memory read are persisted (the record
+#     path is never reached from an except branch);
+#   * default location is only used when it exists and is writable, so
+#     dev/CI boxes without /data are unaffected (set HERMES_BREAKER_LKG_FILE
+#     explicitly to opt in elsewhere).
+_BREAKER_LKG_FILE_ENV = "HERMES_BREAKER_LKG_FILE"
+_DEFAULT_LKG_PATH = "/data/.breaker-lkg.json"
+_lkg_path_resolved: Optional[str] = None
+_lkg_path_resolved_done = False
+_lkg_disk_loaded = False
+
+
+def _lkg_store_path() -> Optional[str]:
+    """Resolve the durable LKG file path, or None to disable persistence."""
+    global _lkg_path_resolved, _lkg_path_resolved_done
+    if not _lkg_path_resolved_done:
+        _lkg_path_resolved_done = True
+        explicit = os.environ.get(_BREAKER_LKG_FILE_ENV)
+        candidate = explicit if explicit else _DEFAULT_LKG_PATH
+        try:
+            parent = os.path.dirname(os.path.abspath(candidate)) or "."
+            if not os.path.isdir(parent):
+                candidate = None
+            else:
+                # Probe writability without creating noise: a missing file in a
+                # writable dir is fine; an existing file must be readable.
+                if os.path.exists(candidate) and not os.access(candidate, os.R_OK | os.W_OK):
+                    candidate = None
+                elif not os.path.exists(candidate) and not os.access(parent, os.W_OK):
+                    candidate = None
+        except OSError:
+            candidate = None
+        _lkg_path_resolved = candidate
+    return _lkg_path_resolved
+
+
+def _lkg_disk_load() -> None:
+    """Merge the durable LKG mirror into the in-process cache (once/process)."""
+    global _lkg_disk_loaded
+    if _lkg_disk_loaded:
+        return
+    _lkg_disk_loaded = True
+    path = _lkg_store_path()
+    if not path:
+        return
+    try:
+        import json
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh)
+        now = time.time()
+        if isinstance(raw, dict):
+            for key, entry in raw.items():
+                try:
+                    ts, blocked, reason = entry
+                    ts = float(ts)
+                except (TypeError, ValueError):
+                    continue
+                # Honour the same TTL on replay so a long-stopped process can
+                # never resurrect an ancient armed verdict.
+                if isinstance(key, str) and (now - ts) <= _BREAKER_LKG_TTL_S:
+                    _breaker_lkg[key] = (ts, bool(blocked), str(reason))
+    except (OSError, ValueError):
+        # Missing/corrupt mirror → cold-start behaviour, nothing to replay.
+        return
+
+
+def _lkg_disk_persist() -> None:
+    """Best-effort flush of the in-process LKG cache to the durable mirror."""
+    path = _lkg_store_path()
+    if not path:
+        return
+    try:
+        import json
+        import tempfile
+        parent = os.path.dirname(os.path.abspath(path)) or "."
+        fd, tmp = tempfile.mkstemp(dir=parent, prefix=".breaker-lkg.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(_breaker_lkg, fh)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+    except OSError:
+        return
+
 
 def _lkg_key(gate: str, ctx: "GateContext | None") -> str:
     coin = getattr(ctx, "coin", "-") if ctx is not None else "-"
@@ -642,8 +741,24 @@ def _lkg_key(gate: str, ctx: "GateContext | None") -> str:
 
 
 def reset_breaker_lkg() -> None:
-    """Clear all cached breaker verdicts (tests / forced re-arm baseline)."""
+    """Clear all cached breaker verdicts (tests / forced re-arm baseline).
+
+    Also drops the durable mirror and re-arms path resolution + disk-load
+    guards so tests that point HERMES_BREAKER_LKG_FILE at a fresh tmp path get
+    a clean slate and never inherit another test's persisted verdict.
+    """
+    global _lkg_path_resolved, _lkg_path_resolved_done, _lkg_disk_loaded
     _breaker_lkg.clear()
+    path = _lkg_store_path()
+    if path:
+        try:
+            if os.path.exists(path):
+                os.remove(path)
+        except OSError:
+            pass
+    _lkg_path_resolved = None
+    _lkg_path_resolved_done = False
+    _lkg_disk_loaded = False
 
 
 def _breaker_record_lkg(gate: str, ctx: "GateContext | None", result: GateResult) -> None:
@@ -651,6 +766,8 @@ def _breaker_record_lkg(gate: str, ctx: "GateContext | None", result: GateResult
 
     Only PASS/BLOCK verdicts computed from a *good* memory read are recorded
     (callers invoke this on the success path, never from the except branch).
+    Mirrors to the durable /data file so a process restart keeps enforcing the
+    last armed/clear verdict within the TTL instead of cold-failing open.
     """
     try:
         _breaker_lkg[_lkg_key(gate, ctx)] = (
@@ -658,6 +775,7 @@ def _breaker_record_lkg(gate: str, ctx: "GateContext | None", result: GateResult
             bool(result.get("pass")) is False,
             str(result.get("reason", "")),
         )
+        _lkg_disk_persist()
     except Exception:  # pragma: no cover - a cache write must never affect the gate
         pass
 
@@ -669,9 +787,11 @@ def _breaker_lkg_result(
 
     A BLOCK is replayed verbatim (tagged via ``lkg_fallback``); a PASS is
     replayed as a plain pass. Expired / absent entries yield None so the caller
-    falls through to the documented fail-open path.
+    falls through to the documented fail-open path. On first use per process,
+    the durable mirror is merged in (TTL-filtered) to survive restarts.
     """
     try:
+        _lkg_disk_load()
         entry = _breaker_lkg.get(_lkg_key(gate, ctx))
     except Exception:
         return None

@@ -1,3 +1,28 @@
+# Deploy hermes-trader
+
+> ## ⚠️ 当前生产部署方式：自建主机 Docker Compose（2026-10 起）
+>
+> 生产环境**不再使用 Fly.io**。下文 Fly 章节仅作历史参考，值班/回滚请以本节为准。
+>
+> - 部署目录：`/home/ldy/hermes-deploy`（`docker-compose.yml` + 绑定挂载的
+>   `.agent-config.json` / `.secrets.json` / `.env.local`）。
+> - 镜像：`hermes-deploy-hermes-trader`；容器/服务名：`hermes-trader`；
+>   命名卷 `hermes_data:/data`；仅 `expose 8000`（经内网 nginx，不直接发布）。
+> - 一键发布（源码仓库内）：`bash scripts/deploy_prod.sh`
+>   （预检 → 同步 → `compose build` → `up -d --force-recreate`（保留 /data 卷）
+>   → 健康轮询 → `postdeploy_smoke` → `postdeploy_shadow_checks`）。
+> - 健康检查：compose healthcheck 调容器内 `/healthcheck.sh`
+>   （HTTP `/api/health` + trading_loop 进程存活 + 心跳 ≤300s）。
+> - 运行模式安全默认：`mode` 不进 prod_override 快照（重建回 canonical OFF）；
+>   生产运行配置当前为 **SHADOW**、`allow_shorts=false`、maker 执行关闭。
+>   LIVE 需 env `HERMES_ENABLE_LIVE` + B-13 HMAC 限时准入记录双闸同时满足。
+> - 回滚锚点：见每次 `deploy_prod.sh` 结束时打印的 git commit 与回滚步骤；
+>   镜像/容器由 compose 管理，可用旧镜像 tag 重建。
+>
+> ---
+>
+> # （历史）Fly.io 部署
+
 # Deploy hermes-trader to Fly.io
 
 Single-machine Fly deployment running the dashboard (public) + trading loop (private)
