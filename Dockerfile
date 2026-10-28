@@ -81,6 +81,9 @@ COPY scripts/reconcile_weight_shadow.py scripts/reconcile_weight_shadow.py
 # volume, so the one-shot 2026-10-28 evaluation runs via `docker exec`.
 COPY scripts/m1_ofi_eval.py scripts/m1_ofi_eval.py
 COPY scripts/postdeploy_smoke.py scripts/postdeploy_smoke.py
+# Read-only post-deploy shadow health check (panic-gate fields + maker v2
+# zero-fill guard); invoked in-container by scripts/deploy_prod.sh step 3d.
+COPY scripts/postdeploy_shadow_checks.py scripts/postdeploy_shadow_checks.py
 # Privilege-drop entrypoint (consumed by the `cp` in the RUN step below).
 COPY scripts/docker-entrypoint.sh scripts/docker-entrypoint.sh
 COPY conftest.py ./

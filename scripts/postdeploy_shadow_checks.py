@@ -138,8 +138,15 @@ def check_maker_v2(book_path: str, expect_v2: Optional[bool],
 
 
 def check_panic_gate(xs_path: str, state_path: str,
-                     min_rows: int, staleness_s: int) -> dict[str, Any]:
-    """核验 xs panic gate 影子字段落盘与心跳活性。只读。"""
+                     min_rows: int, staleness_s: int,
+                     deployed_after_ms: int = 0) -> dict[str, Any]:
+    """核验 xs panic gate 影子字段落盘与心跳活性。只读。
+
+    deployed_after_ms：部署/容器重建时刻（epoch ms，可留几秒 grace）。早于它
+    的 jsonl 行是上一个镜像写的历史记录，不含 panic_gate_* 属正常，必须排除
+    在"接线断裂"判据之外——否则 append-only 文件在每次刚部署、新代码尚未产生
+    触发时都会被旧行误判为 FAIL。
+    """
     res: dict[str, Any] = {"check": "panic_gate", "path": xs_path}
     if not os.path.exists(xs_path):
         res.update(status="MISSING",
@@ -156,8 +163,9 @@ def check_panic_gate(xs_path: str, state_path: str,
         return res
 
     total = 0
+    legacy = 0          # 部署前旧镜像写的行（无 panic 字段但时间早于 cutoff）
     enabled_rows = 0
-    field_missing = 0
+    field_missing = 0   # 仅统计部署后、应由新代码写出却缺字段的行
     pass_n = 0
     reasons: dict[str, int] = {}
     have_pctile = 0
@@ -173,8 +181,13 @@ def check_panic_gate(xs_path: str, state_path: str,
             except json.JSONDecodeError:
                 continue
             total += 1
-            last_ts = max(last_ts, int(r.get("timestamp") or 0))
-            if any(k not in r for k in required):
+            ts = int(r.get("timestamp") or 0)
+            last_ts = max(last_ts, ts)
+            has_fields = all(k in r for k in required)
+            if not has_fields and deployed_after_ms and ts < deployed_after_ms:
+                legacy += 1
+                continue
+            if not has_fields:
                 field_missing += 1
                 continue
             if r.get("panic_gate_enabled"):
@@ -186,24 +199,43 @@ def check_panic_gate(xs_path: str, state_path: str,
                 for why in (r.get("panic_gate_reasons") or []):
                     reasons[why] = reasons.get(why, 0) + 1
 
-    res.update(rows=total, enabled_rows=enabled_rows, gate_pass=pass_n,
+    # 部署后由新代码实际写出的行数（含字段行 + 缺字段行；旧行不计入）。
+    new_rows = total - legacy
+    res.update(rows=total, new_rows=new_rows, legacy_rows=legacy,
+               enabled_rows=enabled_rows, gate_pass=pass_n,
                rows_with_atr_pctile=have_pctile,
-               rows_missing_panic_fields=field_missing,
+               new_rows_missing_panic_fields=field_missing,
                block_reasons=reasons,
                last_trigger_age_s=(int(time.time()) - last_ts // 1000)
                if last_ts else None)
 
-    # 接线断裂判据：有行但全部缺 panic 字段 → 跑的是旧码（未部署新字段）。
-    if total > 0 and field_missing == total:
+    # 真正的接线断裂：部署后新代码写出的行里出现缺字段。
+    if field_missing > 0:
         res.update(status="FAIL",
-                   detail=f"{total} rows but NONE carry panic_gate_* fields — "
-                          "deployed image predates the record-only gate")
+                   detail=f"{field_missing} post-deploy rows missing panic_gate_* "
+                          "fields — running image predates the record-only gate")
         res["exit"] = EXIT_FAIL
         return res
-    if total < min_rows:
+    # 部署后尚无任何新触发行：无法从 jsonl 判断，回退心跳，给 WARN 而非 FAIL。
+    if new_rows == 0:
+        hb = _read_json(state_path)
+        hb_sum = _heartbeat_summary(hb, staleness_s) if hb else None
+        res["heartbeat_fallback"] = hb_sum
+        if hb_sum and hb_sum["alive"]:
+            res.update(status="WARN",
+                       detail=f"all {total} rows predate deploy (legacy, no panic "
+                              "fields); no post-deploy trigger yet but heartbeat alive")
+            res["exit"] = EXIT_OK
+        else:
+            res.update(status="FAIL",
+                       detail="no post-deploy trigger rows and heartbeat stale/"
+                              "missing — arm may not be running the new image")
+            res["exit"] = EXIT_FAIL
+        return res
+    if new_rows < min_rows:
         res.update(status="WARN",
-                   detail=f"only {total} trigger rows (<{min_rows}); gate field "
-                          "schema present, awaiting samples")
+                   detail=f"only {new_rows} post-deploy trigger rows (<{min_rows}); "
+                          "gate field schema present, awaiting samples")
         res["exit"] = EXIT_OK
         return res
     # 字段在、且开启行的 atr_pctile 覆盖率健康即可；pass 少属正常（门本来就严）。
@@ -214,8 +246,8 @@ def check_panic_gate(xs_path: str, state_path: str,
         res["exit"] = EXIT_OK
         return res
     res.update(status="OK",
-               detail=f"panic gate schema healthy: {enabled_rows}/{total} rows "
-                      f"enabled, {pass_n} passed gate")
+               detail=f"panic gate schema healthy: {enabled_rows}/{new_rows} "
+                      f"post-deploy rows enabled, {pass_n} passed gate")
     res["exit"] = EXIT_OK
     return res
 
@@ -241,6 +273,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--min-v2-decided", type=int, default=20)
     ap.add_argument("--min-xs-rows", type=int, default=1)
     ap.add_argument("--heartbeat-staleness-s", type=int, default=6 * 3600)
+    ap.add_argument("--deployed-after-ms", type=int, default=0,
+                    help="epoch ms 部署时刻；早于它的 jsonl 行视为旧镜像 legacy，"
+                         "不计入 panic 字段缺失判据（默认 0=不区分）")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args(argv)
 
@@ -248,7 +283,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     checks = [
         check_maker_v2(args.book, expect, args.min_v2_decided),
         check_panic_gate(args.xs, args.xs_state, args.min_xs_rows,
-                         args.heartbeat_staleness_s),
+                         args.heartbeat_staleness_s,
+                         deployed_after_ms=args.deployed_after_ms),
     ]
     # FAIL 优先于 MISSING 优先于 OK（WARN 用 OK 退出码）。
     worst = EXIT_OK

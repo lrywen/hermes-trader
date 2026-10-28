@@ -108,6 +108,8 @@ fi
 
 # ── 2. 调用既有部署脚本（build + force-recreate + 健康轮询）──────────
 log "== 2/4 调用 ${DEPLOY_SH} 构建并重建容器 =="
+# 记录重建前时刻（epoch ms），供 3d 区分 jsonl 里的旧镜像 legacy 行。
+DEPLOY_SINCE_MS="$(date +%s%3N)"
 bash "${DEPLOY_SH}"
 
 # ── 3. 发布后验证 ─────────────────────────────────────────────────────
@@ -117,8 +119,11 @@ log "== 3/4 发布后验证 =="
 log "校验 checkpoint 代码已打包进运行中的容器 ..."
 assert_in_container() {
     # $1 = 容器内文件, $2 = grep 模式, $3 = 最少命中数
+    # 注意：grep -c 在 0 命中时退出码为 1，不能用 `... || echo 0`，否则
+    # 会得到 "0\n0" 使算术比较报错；用 `|| true` 保留单一计数即可。
     local file="$1" pat="$2" min="${3:-1}" cnt
-    cnt="$(docker exec "${SERVICE}" grep -c "${pat}" "${file}" 2>/dev/null || echo 0)"
+    cnt="$(docker exec "${SERVICE}" grep -c "${pat}" "${file}" 2>/dev/null || true)"
+    cnt="${cnt:-0}"
     if [[ "${cnt}" -ge "${min}" ]]; then
         ok "  ${file} 含 '${pat}'（${cnt} 处）"
     else
@@ -128,7 +133,7 @@ assert_in_container() {
     fi
 }
 assert_in_container "/app/scripts/trading_loop.py" "def _exit_checkpoint(" 1
-assert_in_container "/app/scripts/trading_loop.py" '_exit_checkpoint(mids, tag=f"research:{coin}")' 1
+assert_in_container "/app/scripts/trading_loop.py" '_exit_checkpoint(mids, tag=f"research:{_r_coin}")' 1
 assert_in_container "/app/scripts/trading_loop.py" "on_batch_complete=lambda" 1
 assert_in_container "/app/hermes_trader/agents/perception.py" "on_batch_complete(completed, total)" 1
 
@@ -161,6 +166,8 @@ SHADOW_ARGS=()
 if [[ "${EXPECT_MAKER_V2:-auto}" == "on" ]]; then
     SHADOW_ARGS+=(--expect-v2 on)
 fi
+# 把重建前时刻传入，使 jsonl 中旧镜像写的 legacy 行不被误判为接线断裂。
+SHADOW_ARGS+=(--deployed-after-ms "${DEPLOY_SINCE_MS}")
 set +e
 docker exec "${SERVICE}" python /app/scripts/postdeploy_shadow_checks.py "${SHADOW_ARGS[@]}"
 SHADOW_RC=$?
