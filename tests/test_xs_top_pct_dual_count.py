@@ -41,9 +41,9 @@ def _write_jsonl(path, rows):
 def test_jsonl_dual_counts_and_pending_outcomes(tmp_path):
     p = os.path.join(tmp_path, "xs.jsonl")
     _write_jsonl(p, [
-        # 过 90、是候选、已回填 outcome +1%（net_pct=100 -> 1.0% -> 100bp）
+        # 过 90、是候选、已回填 outcome +1%（net_pct=1.0 百分数 -> 100bp）
         {"timestamp": HOUR, "ext_percentile": 0.05, "is_candidate": True,
-         "outcome": {"fwd72_net_pct": 100.0}},
+         "outcome": {"fwd72_net_pct": 1.0}},
         # 85-only、是候选、outcome 缺失 -> pending
         {"timestamp": 2 * HOUR, "ext_percentile": 0.12, "is_candidate": True,
          "outcome": None},

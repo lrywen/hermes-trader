@@ -274,13 +274,29 @@ def test_panic_gate_disabled_by_default_but_records_features(monkeypatch, tmp_pa
     cfg = _cfg(tmp_path)
     rec = xs.evaluate_xs_reversal(candles, config=cfg)
     assert rec is not None
-    # 默认关闭：布尔恒 False，但连续特征仍落盘供 M4 离线分组。
+    # 默认关闭：开关字段 False，但纯条件判定 panic_gate_pass 仍照常计算，
+    # 使影子流在开关关闭时也能累积"门内条件长什么样"的证据（audit 2026-10-28）。
     assert rec["panic_gate_enabled"] is False
-    assert rec["panic_gate_pass"] is False
+    assert rec["panic_gate_active"] is False
+    # 合成序列是深回撤+高波+RSI 达标：条件满足 -> pass True，尽管开关关着。
+    assert rec["panic_gate_pass"] is True
     assert rec["panic_gate_reasons"] == []
     assert rec["atr24_pct"] is not None and rec["atr24_pct"] > 0
     # 不改变 M1 候选语义。
     assert rec["is_candidate"] is True
+
+
+def test_panic_gate_pass_is_conditional_even_when_disabled(monkeypatch, tmp_path):
+    # 关闭状态下遇到"非恐慌"特征（浅回撤/低波），pass 必须为 False 并带原因，
+    # 证明 pass 是纯条件量、与开关解耦。
+    candles = _series(xs.MIN_BARS + 2, d=0.0006, crash_len=120,
+                      crash_vol_mult=1.0, rng_frac=0.0008)
+    cfg = _cfg(tmp_path)  # 默认 enabled=False
+    rec = xs.evaluate_xs_reversal(candles, config=cfg)
+    if rec is not None and rec["is_candidate"]:
+        assert rec["panic_gate_active"] is False
+        assert rec["panic_gate_pass"] is False
+        assert rec["panic_gate_reasons"]
 
 
 def test_panic_gate_passes_for_deep_active_panic(monkeypatch, tmp_path):
@@ -428,6 +444,24 @@ def test_shadow_writes_jsonl_and_never_orders(monkeypatch, tmp_path):
     assert rec["coin"] == "BTC" and rec["side"] == "long"
     assert rec["is_candidate"] is True
     assert rec["entry_px"] > 0
+
+
+def test_repeated_gather_same_closed_bar_writes_once(monkeypatch, tmp_path):
+    # Audit 2026-10-28 (#3.1): the same closed trigger bar is re-evaluated on
+    # every ~8s scan until the next 1h bar prints. De-dup on (ts, coin) must
+    # collapse those into a single shadow record (also keeps WR unweighted and
+    # the rotating log small), including across the in-process call boundary.
+    candles = _series(xs.MIN_BARS + 2)
+    _patch_fetch(monkeypatch, candles)
+    cfg = _cfg(tmp_path, mode="shadow")
+    for _ in range(3):
+        xs.run_xs_reversal_async("BTC", "long", config=cfg)
+    _wait_threads()
+    recs = _read_jsonl(cfg["xs_reversal"]["shadow_log_path"])
+    assert len(recs) == 1
+    # Retention override is pinned for the resolved xs shadow path.
+    from hermes_trader import shadow_log
+    assert shadow_log._retention_for(cfg["xs_reversal"]["shadow_log_path"]) == 90
 
 
 def test_enforce_is_record_only_same_as_shadow(monkeypatch, tmp_path):

@@ -131,6 +131,35 @@ def test_daily_rotation_same_day_keeps_single_file(tmp_path, monkeypatch):
     assert os.path.exists(path)
 
 
+# ── per-path retention override (audit 2026-10-28, xs 90-day evidence) ──────
+
+def test_per_path_retention_keeps_more_siblings(tmp_path, monkeypatch):
+    """set_retention raises only the named path's sibling cap; the global
+    BACKUP_COUNT still governs every other stream."""
+    monkeypatch.setattr(shadow_log, "MAX_BYTES", 100)
+    monkeypatch.setattr(shadow_log, "BACKUP_COUNT", 2)
+    monkeypatch.setattr(shadow_log, "_rotation_enabled", True)
+    shadow_log._BACKUP_COUNT_OVERRIDES.clear()
+    long_path = str(tmp_path / "xs.jsonl")
+    short_path = str(tmp_path / "other.jsonl")
+    shadow_log.set_retention(long_path, 5)
+
+    # Five size rotations on the long-retention path keeps .1.. .5.
+    for n in range(5):
+        shadow_log.append_jsonl(long_path, {"pad": "x" * 120}, stream="xs")
+        shadow_log.append_jsonl(long_path, {"n": n}, stream="xs")
+    assert os.path.exists(f"{long_path}.5")
+    assert not os.path.exists(f"{long_path}.6")
+
+    # Three rotations on a normal path still caps at global BACKUP_COUNT=2.
+    for n in range(3):
+        shadow_log.append_jsonl(short_path, {"pad": "y" * 120}, stream="o")
+        shadow_log.append_jsonl(short_path, {"n": n}, stream="o")
+    assert os.path.exists(f"{short_path}.2")
+    assert not os.path.exists(f"{short_path}.3")
+    shadow_log._BACKUP_COUNT_OVERRIDES.clear()
+
+
 # ── failure paths: never raise, return False ────────────────────────────────
 
 @pytest.mark.parametrize(

@@ -77,4 +77,6 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "m1_ofi_eval.py",
     # Deploy smoke path.
     "postdeploy_smoke.py",
+    # Deploy step 3d: in-container post-deploy shadow health check.
+    "postdeploy_shadow_checks.py",
 )

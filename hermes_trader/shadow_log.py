@@ -46,6 +46,23 @@ MAX_BYTES = 10 * 1024 * 1024
 # Keep at most this many rotated siblings (file.1 .. file.BACKUP_COUNT).
 BACKUP_COUNT = 5
 
+# Per-path retention override (absolute path -> number of rotated siblings).
+# Most audit streams are happy with the global BACKUP_COUNT=5, but long-horizon
+# evidence arms must keep far more history to stay statistically usable: the
+# xs_reversal shadow arm needs ~90 daily siblings so its independent signal-days
+# are not aged out before the promote gate can accrue them (audit 2026-10-28).
+_BACKUP_COUNT_OVERRIDES: dict[str, int] = {}
+
+
+def set_retention(path: str, backup_count: int) -> None:
+    """Pin a per-path rotated-sibling retention. Call once at arm setup."""
+    if backup_count is not None and int(backup_count) >= 0:
+        _BACKUP_COUNT_OVERRIDES[os.path.abspath(path)] = int(backup_count)
+
+
+def _retention_for(path: str) -> int:
+    return _BACKUP_COUNT_OVERRIDES.get(os.path.abspath(path), BACKUP_COUNT)
+
 # Process-local serialization for rotation+append on the same path. Shadow
 # writers are low-frequency (a few records per scan), so a single global lock
 # is ample and keeps the rotation chain race-free within this process.
@@ -75,12 +92,12 @@ def _local_day(now: Optional[float] = None) -> str:
     return time.strftime("%Y-%m-%d", time.localtime(now if now is not None else time.time()))
 
 
-def _rotate_locked(path: str) -> None:
+def _rotate_locked(path: str, backup_count: int = BACKUP_COUNT) -> None:
     """Rename chain path.(N-1) -> path.N, path -> path.1. Caller holds lock."""
-    oldest = f"{path}.{BACKUP_COUNT}"
+    oldest = f"{path}.{backup_count}"
     if os.path.exists(oldest):
         os.remove(oldest)
-    for i in range(BACKUP_COUNT - 1, 0, -1):
+    for i in range(backup_count - 1, 0, -1):
         src = f"{path}.{i}"
         dst = f"{path}.{i + 1}"
         if os.path.exists(src):
@@ -124,11 +141,11 @@ def append_jsonl(path: str, record: dict[str, Any], *, stream: str = "shadow") -
                     if file_day is None and os.path.exists(path):
                         file_day = _local_day(os.path.getmtime(path))
                     if file_day is not None and file_day < today:
-                        _rotate_locked(path)
+                        _rotate_locked(path, _retention_for(path))
                         _active_day.pop(key, None)
                         file_day = None
                     if os.path.exists(path) and os.path.getsize(path) >= MAX_BYTES:
-                        _rotate_locked(path)
+                        _rotate_locked(path, _retention_for(path))
                         _active_day.pop(key, None)
                         file_day = None
                 except OSError as e:

@@ -167,10 +167,12 @@ def check_panic_gate(xs_path: str, state_path: str,
     enabled_rows = 0
     field_missing = 0   # 仅统计部署后、应由新代码写出却缺字段的行
     pass_n = 0
+    cond_pass_n = 0     # 纯条件判定通过的行（与开关无关，影子证据累积量）
     reasons: dict[str, int] = {}
     have_pctile = 0
     last_ts = 0
-    required = ("panic_gate_enabled", "panic_gate_pass", "panic_gate_reasons")
+    required = ("panic_gate_enabled", "panic_gate_active",
+                "panic_gate_pass", "panic_gate_reasons")
     with open(xs_path) as fh:
         for line in fh:
             line = line.strip()
@@ -190,6 +192,11 @@ def check_panic_gate(xs_path: str, state_path: str,
             if not has_fields:
                 field_missing += 1
                 continue
+            # panic_gate_pass is now the PURE conditional verdict (computed even
+            # while the switch is off), so it accrues evidence regardless of
+            # enabled state; gate-active rows additionally require the switch.
+            if r.get("panic_gate_pass"):
+                cond_pass_n += 1
             if r.get("panic_gate_enabled"):
                 enabled_rows += 1
                 if r.get("panic_gate_pass"):
@@ -203,6 +210,7 @@ def check_panic_gate(xs_path: str, state_path: str,
     new_rows = total - legacy
     res.update(rows=total, new_rows=new_rows, legacy_rows=legacy,
                enabled_rows=enabled_rows, gate_pass=pass_n,
+               conditional_pass=cond_pass_n,
                rows_with_atr_pctile=have_pctile,
                new_rows_missing_panic_fields=field_missing,
                block_reasons=reasons,
@@ -247,7 +255,9 @@ def check_panic_gate(xs_path: str, state_path: str,
         return res
     res.update(status="OK",
                detail=f"panic gate schema healthy: {enabled_rows}/{new_rows} "
-                      f"post-deploy rows enabled, {pass_n} passed gate")
+                      f"post-deploy rows enabled, {pass_n} active-passed, "
+                      f"{cond_pass_n}/{new_rows} conditionally pass (shadow "
+                      f"evidence accrues even while switch is off)")
     res["exit"] = EXIT_OK
     return res
 

@@ -242,3 +242,42 @@ def test_net_outcome_none_for_immature(monkeypatch):
     r = _rec()
     assert mod.grade(r) == "immature"
     assert "net_outcome" not in r
+
+
+# --- durable append-only ledger (audit 2026-10-28, survives log rotation) ---
+
+def _run_main_argv(monkeypatch, argv):
+    monkeypatch.setattr(sys, "argv", ["x"] + argv)
+    return mod.main()
+
+
+def test_ledger_appends_mature_rows_and_is_idempotent(tmp_path, monkeypatch):
+    # Legacy mature rows are folded into the summary without re-grading, and
+    # must still be persisted to the durable ledger.
+    p = _legacy_file(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    # grade() booby-trap: no live grading should happen for these legacy rows.
+    monkeypatch.setattr(mod, "grade", lambda *a, **k: pytest.fail("no regrade"))
+    argv = ["--file", str(p), "--ledger", str(ledger)]
+    assert _run_main_argv(monkeypatch, argv) == 0
+    rows = [json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+    assert len(rows) == 2                      # AAA winner + BBB loser
+    assert {r["coin"] for r in rows} == {"AAA", "BBB"}
+    assert {r["outcome"] for r in rows} == {"win", "loss"}
+    # Compact durable row carries the identity + key features.
+    aaa = next(r for r in rows if r["coin"] == "AAA")
+    assert aaa["pnl_pct"] == 5.0 and aaa["timestamp"] and "graded_at" in aaa
+
+    # Second run must be idempotent: same (ts,coin) keys are not re-appended.
+    assert _run_main_argv(monkeypatch, argv) == 0
+    rows2 = [json.loads(l) for l in ledger.read_text().splitlines() if l.strip()]
+    assert len(rows2) == 2
+
+
+def test_no_ledger_writes_nothing(tmp_path, monkeypatch):
+    p = _legacy_file(tmp_path)
+    ledger = tmp_path / "ledger.jsonl"
+    monkeypatch.setattr(mod, "grade", lambda *a, **k: pytest.fail("no regrade"))
+    argv = ["--file", str(p), "--ledger", str(ledger), "--no-ledger"]
+    assert _run_main_argv(monkeypatch, argv) == 0
+    assert not ledger.exists()

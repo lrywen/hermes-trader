@@ -40,6 +40,13 @@ from hermes_trader.client.hl_client import _http_post
 
 DEFAULT_FILE = "/data/xs_reversal_shadow.jsonl"
 FILE = os.environ.get("HERMES_XS_REVERSAL_SHADOW_FILE", DEFAULT_FILE)
+# Append-only, de-duplicated mature-outcome ledger (audit 2026-10-28). The raw
+# shadow JSONL is size/day-rotated, so writing graded outcomes back only into
+# those files lets evidence age out (the 60 signal-day gate became structurally
+# unreachable). This ledger is NEVER rotated and keeps one compact row per
+# (bar_ts, coin); reconcile is idempotent against it. It is the durable source
+# for forward-evidence panels regardless of raw-log retention.
+DEFAULT_LEDGER = "/data/xs_reversal_outcomes.ledger.jsonl"
 FWD_HOURS = (24, 72, 168)
 MIN_BARS_AFTER = 200          # require a little warm/headroom beyond 168h
 
@@ -159,6 +166,64 @@ def _iter_files(primary: str) -> list[str]:
     return out
 
 
+def _ledger_key(rec: dict[str, Any]) -> Optional[tuple[Any, Any]]:
+    """Stable (bar_ts_ms, coin) identity for the append-only ledger."""
+    t0 = _signal_ms(rec)
+    coin = rec.get("coin")
+    if not t0 or not coin:
+        return None
+    return (t0, coin)
+
+
+def _load_ledger_keys(path: str) -> set[tuple[Any, Any]]:
+    keys: set[tuple[Any, Any]] = set()
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                k = _ledger_key(r)
+                if k is not None:
+                    keys.add(k)
+    except FileNotFoundError:
+        return set()
+    return keys
+
+
+def _ledger_row(rec: dict[str, Any]) -> dict[str, Any]:
+    """Compact durable row: identity + candidate/panic features + outcome."""
+    net = rec.get("net_outcome") or {}
+    # Normalize legacy vocabulary even on a dry run (the in-memory rec is only
+    # rewritten to win/loss under --write, but the ledger always stores canonical
+    # outcomes so future readers don't inherit winner/loser).
+    outcome = rec.get("outcome")
+    outcome = _LEGACY_OUTCOME.get(outcome, outcome)
+    return {
+        "timestamp": _signal_ms(rec),
+        "coin": rec.get("coin"),
+        "is_candidate": bool(rec.get("is_candidate")),
+        "ext_pct": rec.get("ext_pct"),
+        "ext_percentile": rec.get("ext_percentile"),
+        "rsi14": rec.get("rsi14"),
+        "macro_regime": rec.get("macro_regime"),
+        "atr24_pct": rec.get("atr24_pct"),
+        "atr_pctile": rec.get("atr_pctile"),
+        "panic_gate_active": rec.get("panic_gate_active",
+                                     rec.get("panic_gate_enabled")),
+        "panic_gate_pass": rec.get("panic_gate_pass"),
+        "panic_gate_reasons": rec.get("panic_gate_reasons"),
+        "outcome": outcome,
+        "pnl_pct": rec.get("pnl_pct"),
+        "net_outcome": net,
+        "graded_at": int(time.time() * 1000),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--file", default=FILE)
@@ -170,12 +235,34 @@ def main() -> int:
                     help="only grade signals younger than N hours")
     ap.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS,
                     help="round-trip cost in bp for net_outcome (default %(default)s)")
+    ap.add_argument("--ledger", default=DEFAULT_LEDGER,
+                    help="append-only, de-duplicated mature-outcome ledger path")
+    ap.add_argument("--no-ledger", action="store_true",
+                    help="do not read/write the durable ledger")
     args = ap.parse_args()
 
     files = _iter_files(args.file)
     if not files:
         print(f"no shadow files for {args.file}")
         return 1
+
+    # The durable ledger is written on EVERY run (not gated by --write): it is
+    # the long-term evidence store that survives raw-log rotation. --write only
+    # controls stamping outcomes back into the rotating raw JSONL files.
+    ledger_path = None if args.no_ledger else args.ledger
+    ledger_keys: set[tuple[Any, Any]] = set()
+    if ledger_path:
+        ledger_keys = _load_ledger_keys(ledger_path)
+    ledger_new: list[dict[str, Any]] = []
+
+    def _note_ledger(rec: dict[str, Any]) -> None:
+        if not ledger_path:
+            return
+        k = _ledger_key(rec)
+        if k is None or k in ledger_keys:
+            return
+        ledger_keys.add(k)
+        ledger_new.append(_ledger_row(rec))
 
     total = graded = winners = 0
     by_candidate = {True: [0, 0], False: [0, 0]}   # [n, wins]
@@ -208,6 +295,7 @@ def main() -> int:
                         winners += v > 0
                         graded += 1
                         _tally(by_candidate, by_macro, r, v > 0)
+                        _note_ledger(r)
                     recs.append(r)
                     continue
                 t0 = _signal_ms(r)
@@ -222,6 +310,7 @@ def main() -> int:
                     win = outcome == "win"
                     winners += win
                     _tally(by_candidate, by_macro, r, win)
+                    _note_ledger(r)
                 recs.append(r)
         if args.write and changed:
             with open(path, "w", encoding="utf-8") as f:
@@ -229,6 +318,21 @@ def main() -> int:
                     f.write(json.dumps(r, ensure_ascii=False) + "\n")
         print(f"  {path}: total={len(recs)} newly_graded={changed}"
               f"{' [WRITTEN]' if args.write and changed else ''}")
+
+    # Flush the durable append-only ledger (survives raw-log rotation). Follows
+    # the same best-effort contract: a ledger write failure must not fail the
+    # read-only reconciliation report.
+    if ledger_path and ledger_new:
+        try:
+            os.makedirs(os.path.dirname(os.path.abspath(ledger_path)),
+                        exist_ok=True)
+            with open(ledger_path, "a", encoding="utf-8") as f:
+                for row in ledger_new:
+                    f.write(json.dumps(row, ensure_ascii=False,
+                                       allow_nan=False) + "\n")
+            print(f"durable ledger: +{len(ledger_new)} rows -> {ledger_path}")
+        except OSError as e:
+            print(f"durable ledger: WRITE FAILED ({e})")
 
     print("\n=== xs_reversal shadow reconciliation ===")
     print(f"records scanned: {total}   mature+graded: {graded}")

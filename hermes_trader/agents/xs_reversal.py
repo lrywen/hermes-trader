@@ -71,6 +71,12 @@ _DEFAULT_LOG_NAME = "xs_reversal_shadow.jsonl"
 # which can be weeks apart.
 _DEFAULT_STATE_PATH = "/data/.xs-reversal.state"
 _STREAM = "xs_reversal"
+# Long-horizon evidence arm: keep ~90 daily rotated siblings (vs the global
+# default of 5) so independent signal-days are not aged out before the promote
+# gate can accrue them. Audit 2026-10-28 (5-day retention made the 60
+# signal-day gate structurally unreachable). Applied once per resolved path.
+_RETENTION_DAYS = 90
+_RETENTION_PATHS: set[str] = set()
 
 # Fixed geometry of the signal (byte-for-byte the M1 backtest windows).
 LOOKBACK_BARS = 72          # 3d rolling highest-high window (lookback_d=3)
@@ -103,6 +109,53 @@ def _resolve_path(config: Optional[dict[str, Any]]) -> str:
         _PATH_ENV,
         os.path.expanduser(f"~/.hermes-trading/{_DEFAULT_LOG_NAME}"),
     )
+
+
+def _bar_key(rec: dict[str, Any]) -> Optional[tuple[Any, Any]]:
+    """Stable (bar_timestamp_ms, coin) identity for de-duping repeated writes.
+
+    A closed trigger bar keeps satisfying the trigger on every ~8s scan until
+    the next 1h bar prints, so without this guard the same record is appended
+    many times (audit 2026-10-28: identical ts appeared 3x), which both bloats
+    the rotating log and double-weights the record in reconciliation."""
+    ts = rec.get("timestamp")
+    coin = rec.get("coin")
+    if ts is None or not coin:
+        return None
+    if isinstance(ts, str):
+        return (ts, coin)
+    try:
+        v = int(ts)
+    except (TypeError, ValueError):
+        return None
+    return (v if v > 10_000_000_000 else v * 1000, coin)
+
+
+def _already_logged(path: str, key: tuple[Any, Any]) -> bool:
+    """True if (ts, coin) already exists in the ACTIVE shadow file.
+
+    Scans only the current (today's) file — daily rotation means it stays small
+    — so the check is O(lines/day) and naturally resets each day. Cross-process
+    safe: relies on on-disk content rather than in-process state, so a worker
+    restart does not re-emit the same closed bar."""
+    try:
+        import json as _json
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    r = _json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if _bar_key(r) == key:
+                    return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    return False
 
 
 def _resolve_state_path(config: Optional[dict[str, Any]]) -> str:
@@ -383,7 +436,12 @@ def evaluate_xs_reversal(candles: list, *, config: Optional[dict[str, Any]] = No
             panic_reasons.append("atr24_too_low")
     if rsi_v < panic_rsi_min:
         panic_reasons.append("rsi_below_floor")
-    panic_gate_pass = bool(panic_gate_enabled and not panic_reasons)
+    # panic_gate_pass is the PURE conditional verdict (would the gate pass on
+    # today's features?) and is computed whether or not the gate is enabled, so
+    # the shadow stream keeps accruing evidence even while the switch is off.
+    # panic_gate_active separately records the switch state. The AND of the two
+    # (active AND pass) is what an enforced gate would actually act on.
+    panic_gate_pass = bool(not panic_reasons)
 
     # Regime snapshot label (canonical direction-agnostic scorer over the
     # trailing REGIME_WIN bars). Recorded for M4 grouping; NEVER a hard gate.
@@ -422,6 +480,7 @@ def evaluate_xs_reversal(candles: list, *, config: Optional[dict[str, Any]] = No
         if math.isfinite(atr_pctile) else None,
         "panic_vol_mode": panic_vol_mode,
         "panic_gate_enabled": bool(panic_gate_enabled),
+        "panic_gate_active": bool(panic_gate_enabled),
         "panic_gate_pass": panic_gate_pass,
         "panic_gate_reasons": panic_reasons,
         # outcome fields are backfilled by M4 reconcile; null for now.
@@ -473,8 +532,19 @@ def gather_xs_reversal(coin: str, side: str = "long", *,
             return None
         rec["coin"] = coin
         path = _resolve_path(config)
+        # De-dupe repeated emissions of the same closed bar across ~8s scans
+        # (and worker restarts): one shadow record per (bar_ts, coin).
+        key = _bar_key(rec)
+        if key is not None and _already_logged(path, key):
+            _write_heartbeat(config, coin, data_ok=True, triggered=True,
+                             pctile=rec.get("ext_percentile"),
+                             ext_pct=rec.get("ext_pct"))
+            return rec
         try:
-            from hermes_trader.shadow_log import append_jsonl
+            from hermes_trader.shadow_log import append_jsonl, set_retention
+            if path not in _RETENTION_PATHS:
+                set_retention(path, _RETENTION_DAYS)
+                _RETENTION_PATHS.add(path)
             append_jsonl(path, rec, stream=_STREAM)
         except Exception as e:  # pragma: no cover - writer never raises
             logger.debug(f"[xs_reversal] shadow write failed ({coin}): {e}")
