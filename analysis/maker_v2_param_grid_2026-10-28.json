@@ -1,0 +1,2183 @@
+{
+  "grid": {
+    "offsets": [
+      3.0,
+      5.0,
+      8.0,
+      12.0
+    ],
+    "kappas": [
+      0.0,
+      0.5,
+      1.0
+    ],
+    "gates": [
+      "none",
+      "high"
+    ],
+    "mc": 20,
+    "rest_minutes": 30
+  },
+  "results": [
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": 0.992,
+      "t": 4.17,
+      "ci": [
+        0.518,
+        1.459
+      ],
+      "fill_rate_pct": 15.56,
+      "n_fills": 4335
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -2.122,
+      "t": -4.81,
+      "ci": [
+        -3.011,
+        -1.261
+      ],
+      "fill_rate_pct": 15.56,
+      "n_fills": 4335
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -5.235,
+      "t": -8.04,
+      "ci": [
+        -6.541,
+        -3.954
+      ],
+      "fill_rate_pct": 15.56,
+      "n_fills": 4335
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": 1.058,
+      "t": 2.47,
+      "ci": [
+        0.249,
+        1.905
+      ],
+      "fill_rate_pct": 21.14,
+      "n_fills": 2359
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -2.369,
+      "t": -3.18,
+      "ci": [
+        -3.805,
+        -0.919
+      ],
+      "fill_rate_pct": 21.14,
+      "n_fills": 2359
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -5.794,
+      "t": -5.39,
+      "ci": [
+        -7.885,
+        -3.711
+      ],
+      "fill_rate_pct": 21.14,
+      "n_fills": 2359
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": 2.695,
+      "t": 7.26,
+      "ci": [
+        1.987,
+        3.415
+      ],
+      "fill_rate_pct": 9.11,
+      "n_fills": 2538
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -0.683,
+      "t": -1.08,
+      "ci": [
+        -1.902,
+        0.537
+      ],
+      "fill_rate_pct": 9.11,
+      "n_fills": 2538
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 31,
+      "mean_bp": -4.059,
+      "t": -4.47,
+      "ci": [
+        -5.803,
+        -2.332
+      ],
+      "fill_rate_pct": 9.11,
+      "n_fills": 2538
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": 2.746,
+      "t": 5.31,
+      "ci": [
+        1.743,
+        3.754
+      ],
+      "fill_rate_pct": 13.24,
+      "n_fills": 1478
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": -1.053,
+      "t": -1.23,
+      "ci": [
+        -2.71,
+        0.633
+      ],
+      "fill_rate_pct": 13.24,
+      "n_fills": 1478
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": -4.849,
+      "t": -3.99,
+      "ci": [
+        -7.193,
+        -2.471
+      ],
+      "fill_rate_pct": 13.24,
+      "n_fills": 1478
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": 5.731,
+      "t": 11.63,
+      "ci": [
+        4.742,
+        6.664
+      ],
+      "fill_rate_pct": 4.68,
+      "n_fills": 1304
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": 2.118,
+      "t": 2.52,
+      "ci": [
+        0.431,
+        3.71
+      ],
+      "fill_rate_pct": 4.68,
+      "n_fills": 1304
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 29,
+      "mean_bp": -1.493,
+      "t": -1.24,
+      "ci": [
+        -3.908,
+        0.75
+      ],
+      "fill_rate_pct": 4.68,
+      "n_fills": 1304
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 27,
+      "mean_bp": 5.954,
+      "t": 7.99,
+      "ci": [
+        4.465,
+        7.434
+      ],
+      "fill_rate_pct": 7.73,
+      "n_fills": 863
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 27,
+      "mean_bp": 1.936,
+      "t": 1.6,
+      "ci": [
+        -0.495,
+        4.324
+      ],
+      "fill_rate_pct": 7.73,
+      "n_fills": 863
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 27,
+      "mean_bp": -2.079,
+      "t": -1.23,
+      "ci": [
+        -5.501,
+        1.209
+      ],
+      "fill_rate_pct": 7.73,
+      "n_fills": 863
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 28,
+      "mean_bp": 10.126,
+      "t": 13.48,
+      "ci": [
+        8.653,
+        11.598
+      ],
+      "fill_rate_pct": 2.19,
+      "n_fills": 611
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 28,
+      "mean_bp": 6.204,
+      "t": 5.15,
+      "ci": [
+        3.839,
+        8.556
+      ],
+      "fill_rate_pct": 2.19,
+      "n_fills": 611
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 28,
+      "mean_bp": 2.284,
+      "t": 1.37,
+      "ci": [
+        -1.01,
+        5.56
+      ],
+      "fill_rate_pct": 2.19,
+      "n_fills": 611
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 24,
+      "mean_bp": 10.499,
+      "t": 13.21,
+      "ci": [
+        8.988,
+        12.137
+      ],
+      "fill_rate_pct": 3.92,
+      "n_fills": 438
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 24,
+      "mean_bp": 6.55,
+      "t": 5.72,
+      "ci": [
+        4.311,
+        8.878
+      ],
+      "fill_rate_pct": 3.92,
+      "n_fills": 438
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 1.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 24,
+      "mean_bp": 2.603,
+      "t": 1.71,
+      "ci": [
+        -0.391,
+        5.704
+      ],
+      "fill_rate_pct": 3.92,
+      "n_fills": 438
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1117,
+      "mean_bp": 1.084,
+      "t": 2.78,
+      "ci": [
+        0.32,
+        1.868
+      ],
+      "fill_rate_pct": 30.46,
+      "n_fills": 12186
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1117,
+      "mean_bp": -5.174,
+      "t": -8.25,
+      "ci": [
+        -6.408,
+        -3.936
+      ],
+      "fill_rate_pct": 30.46,
+      "n_fills": 12186
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1117,
+      "mean_bp": -11.424,
+      "t": -13.0,
+      "ci": [
+        -13.157,
+        -9.701
+      ],
+      "fill_rate_pct": 30.46,
+      "n_fills": 12186
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 574,
+      "mean_bp": 1.238,
+      "t": 1.66,
+      "ci": [
+        -0.267,
+        2.683
+      ],
+      "fill_rate_pct": 34.73,
+      "n_fills": 5557
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 574,
+      "mean_bp": -6.797,
+      "t": -5.76,
+      "ci": [
+        -9.172,
+        -4.544
+      ],
+      "fill_rate_pct": 34.73,
+      "n_fills": 5557
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 574,
+      "mean_bp": -14.819,
+      "t": -9.02,
+      "ci": [
+        -18.154,
+        -11.69
+      ],
+      "fill_rate_pct": 34.73,
+      "n_fills": 5557
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": 3.288,
+      "t": 7.73,
+      "ci": [
+        2.445,
+        4.131
+      ],
+      "fill_rate_pct": 25.82,
+      "n_fills": 10328
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": -2.997,
+      "t": -4.42,
+      "ci": [
+        -4.358,
+        -1.677
+      ],
+      "fill_rate_pct": 25.82,
+      "n_fills": 10328
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": -9.273,
+      "t": -9.81,
+      "ci": [
+        -11.161,
+        -7.415
+      ],
+      "fill_rate_pct": 25.82,
+      "n_fills": 10328
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 549,
+      "mean_bp": 4.433,
+      "t": 5.82,
+      "ci": [
+        2.951,
+        5.912
+      ],
+      "fill_rate_pct": 31.25,
+      "n_fills": 5000
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 549,
+      "mean_bp": -2.971,
+      "t": -2.54,
+      "ci": [
+        -5.217,
+        -0.805
+      ],
+      "fill_rate_pct": 31.25,
+      "n_fills": 5000
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 549,
+      "mean_bp": -10.363,
+      "t": -6.45,
+      "ci": [
+        -13.481,
+        -7.398
+      ],
+      "fill_rate_pct": 31.25,
+      "n_fills": 5000
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 910,
+      "mean_bp": 6.598,
+      "t": 13.37,
+      "ci": [
+        5.625,
+        7.562
+      ],
+      "fill_rate_pct": 19.8,
+      "n_fills": 7919
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 910,
+      "mean_bp": 0.152,
+      "t": 0.19,
+      "ci": [
+        -1.424,
+        1.67
+      ],
+      "fill_rate_pct": 19.8,
+      "n_fills": 7919
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 910,
+      "mean_bp": -6.285,
+      "t": -5.6,
+      "ci": [
+        -8.505,
+        -4.145
+      ],
+      "fill_rate_pct": 19.8,
+      "n_fills": 7919
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 513,
+      "mean_bp": 8.211,
+      "t": 10.25,
+      "ci": [
+        6.682,
+        9.851
+      ],
+      "fill_rate_pct": 26.51,
+      "n_fills": 4242
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 513,
+      "mean_bp": 1.107,
+      "t": 0.9,
+      "ci": [
+        -1.286,
+        3.567
+      ],
+      "fill_rate_pct": 26.51,
+      "n_fills": 4242
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 513,
+      "mean_bp": -5.986,
+      "t": -3.56,
+      "ci": [
+        -9.263,
+        -2.644
+      ],
+      "fill_rate_pct": 26.51,
+      "n_fills": 4242
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 777,
+      "mean_bp": 10.998,
+      "t": 19.94,
+      "ci": [
+        9.94,
+        12.073
+      ],
+      "fill_rate_pct": 14.02,
+      "n_fills": 5609
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 777,
+      "mean_bp": 4.487,
+      "t": 5.13,
+      "ci": [
+        2.801,
+        6.185
+      ],
+      "fill_rate_pct": 14.02,
+      "n_fills": 5609
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 777,
+      "mean_bp": -2.015,
+      "t": -1.66,
+      "ci": [
+        -4.421,
+        0.368
+      ],
+      "fill_rate_pct": 14.02,
+      "n_fills": 5609
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 444,
+      "mean_bp": 12.238,
+      "t": 14.06,
+      "ci": [
+        10.492,
+        13.928
+      ],
+      "fill_rate_pct": 20.14,
+      "n_fills": 3222
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 444,
+      "mean_bp": 4.956,
+      "t": 3.63,
+      "ci": [
+        2.165,
+        7.576
+      ],
+      "fill_rate_pct": 20.14,
+      "n_fills": 3222
+    },
+    {
+      "coin": "BTC",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 444,
+      "mean_bp": -2.313,
+      "t": -1.23,
+      "ci": [
+        -6.168,
+        1.303
+      ],
+      "fill_rate_pct": 20.14,
+      "n_fills": 3222
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1173,
+      "mean_bp": 0.856,
+      "t": 1.51,
+      "ci": [
+        -0.236,
+        1.987
+      ],
+      "fill_rate_pct": 34.03,
+      "n_fills": 13613
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1173,
+      "mean_bp": -7.689,
+      "t": -8.46,
+      "ci": [
+        -9.473,
+        -5.917
+      ],
+      "fill_rate_pct": 34.03,
+      "n_fills": 13613
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1173,
+      "mean_bp": -16.217,
+      "t": -12.72,
+      "ci": [
+        -18.745,
+        -13.763
+      ],
+      "fill_rate_pct": 34.03,
+      "n_fills": 13613
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 588,
+      "mean_bp": 1.972,
+      "t": 1.77,
+      "ci": [
+        -0.281,
+        4.195
+      ],
+      "fill_rate_pct": 36.17,
+      "n_fills": 5788
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 588,
+      "mean_bp": -8.708,
+      "t": -4.88,
+      "ci": [
+        -12.275,
+        -5.177
+      ],
+      "fill_rate_pct": 36.17,
+      "n_fills": 5788
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 588,
+      "mean_bp": -19.362,
+      "t": -7.77,
+      "ci": [
+        -24.303,
+        -14.513
+      ],
+      "fill_rate_pct": 36.17,
+      "n_fills": 5788
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1112,
+      "mean_bp": 2.853,
+      "t": 4.76,
+      "ci": [
+        1.671,
+        4.019
+      ],
+      "fill_rate_pct": 29.64,
+      "n_fills": 11855
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1112,
+      "mean_bp": -5.683,
+      "t": -5.81,
+      "ci": [
+        -7.63,
+        -3.82
+      ],
+      "fill_rate_pct": 29.64,
+      "n_fills": 11855
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1112,
+      "mean_bp": -14.199,
+      "t": -10.3,
+      "ci": [
+        -16.956,
+        -11.591
+      ],
+      "fill_rate_pct": 29.64,
+      "n_fills": 11855
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 569,
+      "mean_bp": 3.962,
+      "t": 3.56,
+      "ci": [
+        1.755,
+        6.151
+      ],
+      "fill_rate_pct": 33.93,
+      "n_fills": 5429
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 569,
+      "mean_bp": -6.537,
+      "t": -3.64,
+      "ci": [
+        -10.182,
+        -3.119
+      ],
+      "fill_rate_pct": 33.93,
+      "n_fills": 5429
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 569,
+      "mean_bp": -17.01,
+      "t": -6.76,
+      "ci": [
+        -22.109,
+        -12.243
+      ],
+      "fill_rate_pct": 33.93,
+      "n_fills": 5429
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": 5.943,
+      "t": 9.27,
+      "ci": [
+        4.611,
+        7.197
+      ],
+      "fill_rate_pct": 24.55,
+      "n_fills": 9820
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": -2.734,
+      "t": -2.53,
+      "ci": [
+        -4.956,
+        -0.671
+      ],
+      "fill_rate_pct": 24.55,
+      "n_fills": 9820
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1038,
+      "mean_bp": -11.392,
+      "t": -7.41,
+      "ci": [
+        -14.553,
+        -8.498
+      ],
+      "fill_rate_pct": 24.55,
+      "n_fills": 9820
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": 6.87,
+      "t": 6.05,
+      "ci": [
+        4.569,
+        9.155
+      ],
+      "fill_rate_pct": 30.23,
+      "n_fills": 4836
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": -3.551,
+      "t": -1.87,
+      "ci": [
+        -7.447,
+        0.087
+      ],
+      "fill_rate_pct": 30.23,
+      "n_fills": 4836
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": -13.942,
+      "t": -5.19,
+      "ci": [
+        -19.462,
+        -8.781
+      ],
+      "fill_rate_pct": 30.23,
+      "n_fills": 4836
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 915,
+      "mean_bp": 10.127,
+      "t": 13.81,
+      "ci": [
+        8.692,
+        11.583
+      ],
+      "fill_rate_pct": 18.9,
+      "n_fills": 7560
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 915,
+      "mean_bp": 1.333,
+      "t": 1.08,
+      "ci": [
+        -1.126,
+        3.702
+      ],
+      "fill_rate_pct": 18.9,
+      "n_fills": 7560
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 915,
+      "mean_bp": -7.44,
+      "t": -4.22,
+      "ci": [
+        -10.941,
+        -4.062
+      ],
+      "fill_rate_pct": 18.9,
+      "n_fills": 7560
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 490,
+      "mean_bp": 11.578,
+      "t": 9.56,
+      "ci": [
+        9.218,
+        13.91
+      ],
+      "fill_rate_pct": 25.12,
+      "n_fills": 4020
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 490,
+      "mean_bp": 1.286,
+      "t": 0.65,
+      "ci": [
+        -2.704,
+        5.115
+      ],
+      "fill_rate_pct": 25.12,
+      "n_fills": 4020
+    },
+    {
+      "coin": "ETH",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 490,
+      "mean_bp": -8.978,
+      "t": -3.2,
+      "ci": [
+        -14.665,
+        -3.664
+      ],
+      "fill_rate_pct": 25.12,
+      "n_fills": 4020
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1208,
+      "mean_bp": 0.683,
+      "t": 0.9,
+      "ci": [
+        -0.809,
+        2.161
+      ],
+      "fill_rate_pct": 37.63,
+      "n_fills": 15053
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1208,
+      "mean_bp": -11.412,
+      "t": -9.64,
+      "ci": [
+        -13.733,
+        -9.13
+      ],
+      "fill_rate_pct": 37.63,
+      "n_fills": 15053
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1208,
+      "mean_bp": -23.477,
+      "t": -14.33,
+      "ci": [
+        -26.724,
+        -20.326
+      ],
+      "fill_rate_pct": 37.63,
+      "n_fills": 15053
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 612,
+      "mean_bp": 3.038,
+      "t": 2.15,
+      "ci": [
+        0.264,
+        5.774
+      ],
+      "fill_rate_pct": 38.54,
+      "n_fills": 6167
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 612,
+      "mean_bp": -11.509,
+      "t": -5.47,
+      "ci": [
+        -15.724,
+        -7.433
+      ],
+      "fill_rate_pct": 38.54,
+      "n_fills": 6167
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 612,
+      "mean_bp": -26.017,
+      "t": -9.14,
+      "ci": [
+        -31.709,
+        -20.542
+      ],
+      "fill_rate_pct": 38.54,
+      "n_fills": 6167
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1179,
+      "mean_bp": 3.174,
+      "t": 4.08,
+      "ci": [
+        1.67,
+        4.678
+      ],
+      "fill_rate_pct": 34.48,
+      "n_fills": 13793
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1179,
+      "mean_bp": -8.662,
+      "t": -7.24,
+      "ci": [
+        -10.997,
+        -6.408
+      ],
+      "fill_rate_pct": 34.48,
+      "n_fills": 13793
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1179,
+      "mean_bp": -20.468,
+      "t": -12.45,
+      "ci": [
+        -23.717,
+        -17.387
+      ],
+      "fill_rate_pct": 34.48,
+      "n_fills": 13793
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 592,
+      "mean_bp": 4.324,
+      "t": 2.98,
+      "ci": [
+        1.432,
+        7.139
+      ],
+      "fill_rate_pct": 36.27,
+      "n_fills": 5804
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 592,
+      "mean_bp": -10.361,
+      "t": -4.74,
+      "ci": [
+        -14.837,
+        -6.114
+      ],
+      "fill_rate_pct": 36.27,
+      "n_fills": 5804
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 592,
+      "mean_bp": -25.006,
+      "t": -8.43,
+      "ci": [
+        -31.072,
+        -19.333
+      ],
+      "fill_rate_pct": 36.27,
+      "n_fills": 5804
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1127,
+      "mean_bp": 6.038,
+      "t": 7.23,
+      "ci": [
+        4.379,
+        7.683
+      ],
+      "fill_rate_pct": 30.19,
+      "n_fills": 12076
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1127,
+      "mean_bp": -5.733,
+      "t": -4.54,
+      "ci": [
+        -8.309,
+        -3.293
+      ],
+      "fill_rate_pct": 30.19,
+      "n_fills": 12076
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1127,
+      "mean_bp": -17.476,
+      "t": -10.12,
+      "ci": [
+        -20.988,
+        -14.171
+      ],
+      "fill_rate_pct": 30.19,
+      "n_fills": 12076
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 577,
+      "mean_bp": 8.394,
+      "t": 5.65,
+      "ci": [
+        5.525,
+        11.316
+      ],
+      "fill_rate_pct": 33.54,
+      "n_fills": 5366
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 577,
+      "mean_bp": -5.524,
+      "t": -2.57,
+      "ci": [
+        -9.678,
+        -1.311
+      ],
+      "fill_rate_pct": 33.54,
+      "n_fills": 5366
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 577,
+      "mean_bp": -19.406,
+      "t": -6.75,
+      "ci": [
+        -25.034,
+        -13.814
+      ],
+      "fill_rate_pct": 33.54,
+      "n_fills": 5366
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1049,
+      "mean_bp": 10.725,
+      "t": 12.06,
+      "ci": [
+        8.982,
+        12.484
+      ],
+      "fill_rate_pct": 25.23,
+      "n_fills": 10090
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1049,
+      "mean_bp": -0.849,
+      "t": -0.64,
+      "ci": [
+        -3.446,
+        1.733
+      ],
+      "fill_rate_pct": 25.23,
+      "n_fills": 10090
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1049,
+      "mean_bp": -12.394,
+      "t": -6.94,
+      "ci": [
+        -15.956,
+        -8.867
+      ],
+      "fill_rate_pct": 25.23,
+      "n_fills": 10090
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": 12.246,
+      "t": 7.45,
+      "ci": [
+        8.97,
+        15.594
+      ],
+      "fill_rate_pct": 29.66,
+      "n_fills": 4745
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": -2.029,
+      "t": -0.86,
+      "ci": [
+        -6.825,
+        2.691
+      ],
+      "fill_rate_pct": 29.66,
+      "n_fills": 4745
+    },
+    {
+      "coin": "SOL",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 534,
+      "mean_bp": -16.264,
+      "t": -5.14,
+      "ci": [
+        -22.758,
+        -10.064
+      ],
+      "fill_rate_pct": 29.66,
+      "n_fills": 4745
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1175,
+      "mean_bp": 1.74,
+      "t": 3.1,
+      "ci": [
+        0.632,
+        2.829
+      ],
+      "fill_rate_pct": 34.17,
+      "n_fills": 13668
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1175,
+      "mean_bp": -5.658,
+      "t": -6.49,
+      "ci": [
+        -7.422,
+        -3.974
+      ],
+      "fill_rate_pct": 34.17,
+      "n_fills": 13668
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1175,
+      "mean_bp": -13.042,
+      "t": -10.78,
+      "ci": [
+        -15.522,
+        -10.706
+      ],
+      "fill_rate_pct": 34.17,
+      "n_fills": 13668
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 595,
+      "mean_bp": 2.442,
+      "t": 2.22,
+      "ci": [
+        0.278,
+        4.571
+      ],
+      "fill_rate_pct": 36.39,
+      "n_fills": 5822
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 595,
+      "mean_bp": -7.294,
+      "t": -4.34,
+      "ci": [
+        -10.661,
+        -4.09
+      ],
+      "fill_rate_pct": 36.39,
+      "n_fills": 5822
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 3.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 595,
+      "mean_bp": -17.007,
+      "t": -7.36,
+      "ci": [
+        -21.657,
+        -12.658
+      ],
+      "fill_rate_pct": 36.39,
+      "n_fills": 5822
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1086,
+      "mean_bp": 3.632,
+      "t": 6.02,
+      "ci": [
+        2.482,
+        4.837
+      ],
+      "fill_rate_pct": 27.91,
+      "n_fills": 11165
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1086,
+      "mean_bp": -3.865,
+      "t": -4.23,
+      "ci": [
+        -5.709,
+        -2.079
+      ],
+      "fill_rate_pct": 27.91,
+      "n_fills": 11165
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 1086,
+      "mean_bp": -11.349,
+      "t": -9.07,
+      "ci": [
+        -13.879,
+        -8.917
+      ],
+      "fill_rate_pct": 27.91,
+      "n_fills": 11165
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 552,
+      "mean_bp": 3.709,
+      "t": 3.3,
+      "ci": [
+        1.564,
+        5.969
+      ],
+      "fill_rate_pct": 33.26,
+      "n_fills": 5322
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 552,
+      "mean_bp": -6.22,
+      "t": -3.64,
+      "ci": [
+        -9.597,
+        -2.88
+      ],
+      "fill_rate_pct": 33.26,
+      "n_fills": 5322
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 5.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 552,
+      "mean_bp": -16.126,
+      "t": -6.88,
+      "ci": [
+        -20.808,
+        -11.665
+      ],
+      "fill_rate_pct": 33.26,
+      "n_fills": 5322
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 995,
+      "mean_bp": 6.903,
+      "t": 10.54,
+      "ci": [
+        5.646,
+        8.192
+      ],
+      "fill_rate_pct": 22.87,
+      "n_fills": 9148
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 995,
+      "mean_bp": -0.611,
+      "t": -0.62,
+      "ci": [
+        -2.538,
+        1.319
+      ],
+      "fill_rate_pct": 22.87,
+      "n_fills": 9148
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 995,
+      "mean_bp": -8.111,
+      "t": -5.95,
+      "ci": [
+        -10.774,
+        -5.464
+      ],
+      "fill_rate_pct": 22.87,
+      "n_fills": 9148
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 515,
+      "mean_bp": 6.928,
+      "t": 5.79,
+      "ci": [
+        4.603,
+        9.335
+      ],
+      "fill_rate_pct": 28.43,
+      "n_fills": 4549
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 515,
+      "mean_bp": -3.081,
+      "t": -1.7,
+      "ci": [
+        -6.724,
+        0.419
+      ],
+      "fill_rate_pct": 28.43,
+      "n_fills": 4549
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 8.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 515,
+      "mean_bp": -13.066,
+      "t": -5.27,
+      "ci": [
+        -18.155,
+        -8.353
+      ],
+      "fill_rate_pct": 28.43,
+      "n_fills": 4549
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 862,
+      "mean_bp": 10.21,
+      "t": 14.32,
+      "ci": [
+        8.802,
+        11.577
+      ],
+      "fill_rate_pct": 16.7,
+      "n_fills": 6680
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 862,
+      "mean_bp": 2.185,
+      "t": 1.93,
+      "ci": [
+        -0.103,
+        4.342
+      ],
+      "fill_rate_pct": 16.7,
+      "n_fills": 6680
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "none",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 862,
+      "mean_bp": -5.824,
+      "t": -3.68,
+      "ci": [
+        -9.069,
+        -2.858
+      ],
+      "fill_rate_pct": 16.7,
+      "n_fills": 6680
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 452,
+      "mean_bp": 11.225,
+      "t": 9.14,
+      "ci": [
+        8.884,
+        13.582
+      ],
+      "fill_rate_pct": 22.99,
+      "n_fills": 3678
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 0.5,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 452,
+      "mean_bp": 1.447,
+      "t": 0.76,
+      "ci": [
+        -2.279,
+        5.096
+      ],
+      "fill_rate_pct": 22.99,
+      "n_fills": 3678
+    },
+    {
+      "coin": "BNB",
+      "interval_min": 5.0,
+      "offset_bps": 12.0,
+      "kappa": 1.0,
+      "gate": "high",
+      "base": 0.3,
+      "decay": 0.5,
+      "days": 452,
+      "mean_bp": -8.308,
+      "t": -3.14,
+      "ci": [
+        -13.578,
+        -3.302
+      ],
+      "fill_rate_pct": 22.99,
+      "n_fills": 3678
+    }
+  ]
+}
