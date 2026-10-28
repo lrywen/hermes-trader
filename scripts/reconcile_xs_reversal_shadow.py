@@ -43,6 +43,14 @@ FILE = os.environ.get("HERMES_XS_REVERSAL_SHADOW_FILE", DEFAULT_FILE)
 FWD_HOURS = (24, 72, 168)
 MIN_BARS_AFTER = 200          # require a little warm/headroom beyond 168h
 
+# Round-trip cost in basis points used to turn the GROSS forward grid into the
+# NET percent outcome the S2 dashboard / top_pct dual-count consume. Mirrors the
+# research convention (9.26bp rt); overridable via --cost-bps. The net figure is
+# stored on a SEPARATE top-level key (net_outcome) because "outcome" must stay a
+# win/loss string for shadow_grade._window_stats (a dict there would break the
+# grader and the already-graded skip logic).
+DEFAULT_COST_BPS = 9.26
+
 # Mature terminal outcomes the grader counts. Legacy aliases from before the
 # vocabulary alignment ("winner"/"loser") are accepted as already-graded and
 # normalized to "win"/"loss" on --write so historical rows don't stay invisible.
@@ -77,8 +85,13 @@ def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[dict[int, 
     return {int(c["t"]): float(c["c"]) for c in raw}
 
 
-def grade(rec: dict[str, Any]) -> str:
-    """Return outcome bucket; mutate rec with forward grid on success."""
+def grade(rec: dict[str, Any], cost_bps: float = DEFAULT_COST_BPS) -> str:
+    """Return outcome bucket; mutate rec with forward grid on success.
+
+    Also stamps a numeric NET outcome on rec["net_outcome"] (percent, net of
+    cost_bps round-trip) so read-only S2 evidence tools can consume it without
+    re-fetching candles. "outcome" stays the win/loss string.
+    """
     coin = rec.get("coin")
     entry = rec.get("entry_px")
     t0 = _signal_ms(rec)
@@ -119,6 +132,14 @@ def grade(rec: dict[str, Any]) -> str:
         # API returned bars but the 72h bar has not printed yet — too young.
         return "immature"
     rec["pnl_pct"] = v72
+    # Numeric net-of-cost outcome (PERCENT) for S2 dashboard / dual-count live
+    # readers. Kept separate from the win/loss string under "outcome".
+    net_grid: dict[str, Any] = {"cost_bps_rt": cost_bps}
+    for h in FWD_HOURS:
+        g = grid.get(f"fwd{h}h_pct")
+        net_grid[f"fwd{h}_net_pct"] = (
+            round(g - cost_bps / 100.0, 4) if g is not None else None)
+    rec["net_outcome"] = net_grid
     # Vocabulary aligned with the other reconcile arms (pullback/change/tuning)
     # and the grader shadow_grade._window_stats, which only counts outcomes in
     # ("win", "loss"). The legacy "winner"/"loser" values were invisible to the
@@ -147,6 +168,8 @@ def main() -> int:
                     help="re-grade records that already have outcomes")
     ap.add_argument("--max-age-hours", type=float, default=None,
                     help="only grade signals younger than N hours")
+    ap.add_argument("--cost-bps", type=float, default=DEFAULT_COST_BPS,
+                    help="round-trip cost in bp for net_outcome (default %(default)s)")
     args = ap.parse_args()
 
     files = _iter_files(args.file)
@@ -191,7 +214,7 @@ def main() -> int:
                 if cutoff and t0 and t0/1000 < cutoff:
                     recs.append(r)
                     continue
-                outcome = grade(r)
+                outcome = grade(r, args.cost_bps)
                 r["outcome"] = outcome
                 if outcome in MATURE_OUTCOMES:
                     changed += 1

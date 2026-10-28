@@ -41,6 +41,27 @@ VOL_LEGS = {
     "pctile0.6": lambda r: r["atr_pctile"] >= 0.6,
 }
 
+# Live-shadow rows carry their matured forward return under several schemas that
+# have evolved over time. Read the 72h NET return in PERCENT (the unit replay_coin
+# feeds the historical panel, which dashboard() then *100 scales to bp). Priority:
+#   1. net_outcome.fwd72_net_pct  (current reconciler; already net, percent)
+#   2. outcome.fwd72_net_pct      (older dict-outcome contract; net, percent)
+#   3. forward.fwd72h_pct - cost  (gross percent grid; subtract round-trip cost)
+LIVE_COST_BPS = 9.26
+
+
+def live_fwd72_net_pct(rec: dict, cost_bps: float = LIVE_COST_BPS):
+    no = rec.get("net_outcome")
+    if isinstance(no, dict) and no.get("fwd72_net_pct") is not None:
+        return float(no["fwd72_net_pct"])
+    out = rec.get("outcome")
+    if isinstance(out, dict) and out.get("fwd72_net_pct") is not None:
+        return float(out["fwd72_net_pct"])
+    fwd = rec.get("forward")
+    if isinstance(fwd, dict) and fwd.get("fwd72h_pct") is not None:
+        return float(fwd["fwd72h_pct"]) - cost_bps / 100.0
+    return None
+
 
 def leave_one_month_out_worst(rows: list[dict]) -> Optional[float]:
     """留一剔月：每次剔除一个自然月后其余 72h 净均值（bp），返回最差值。
@@ -202,18 +223,19 @@ def run_jsonl(path, boot, seed) -> dict:
             total += 1
             if not rec.get("is_candidate"):
                 continue
-            net = (((rec.get("outcome") or {}).get("fwd72_net_pct"))
-                   if isinstance(rec.get("outcome"), dict) else None)
+            net = live_fwd72_net_pct(rec)
             if net is None:
                 pending += 1
                 continue
             ts = int(rec.get("timestamp") or 0)
+            # fwd72_net stays in PERCENT; dashboard() scales percent*100 -> bp,
+            # exactly as for the historical replay_coin feed (no /100 here).
             rows.append({"ts": ts, "coin": rec.get("coin", "?"),
                          "ext_pct": rec.get("ext_pct", 0),
                          "rsi": rec.get("rsi14", 0),
                          "atr24_pct": rec.get("atr24_pct") or float("nan"),
                          "atr_pctile": rec.get("atr_pctile") or float("nan"),
-                         "fwd72_net": float(net) / 100.0})
+                         "fwd72_net": float(net)})
     dash = {"none": dashboard(rows, "none", boot, seed)}
     return {"meta": {"jsonl": path, "total_lines": total,
                      "candidate_outcome_pending": pending},

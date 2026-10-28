@@ -45,6 +45,24 @@ COST_BPS_DEFAULT = 9.26
 GATED_EXT_MAX, GATED_RSI_MIN, GATED_ATR_Q = -8.0, 20.0, 0.6
 
 
+def _live_fwd72_net_pct(rec: dict, cost_bps: float = COST_BPS_DEFAULT):
+    """实时影子行的 72h 净收益（百分数）。兼容三种演进过的落盘 schema：
+      1. net_outcome.fwd72_net_pct（现行回填器，已扣费、百分数，优先）
+      2. outcome.fwd72_net_pct    （旧 dict-outcome 契约）
+      3. forward.fwd72h_pct - cost（毛收益百分数网格，扣往返成本）
+    """
+    no = rec.get("net_outcome")
+    if isinstance(no, dict) and no.get("fwd72_net_pct") is not None:
+        return float(no["fwd72_net_pct"])
+    out = rec.get("outcome")
+    if isinstance(out, dict) and out.get("fwd72_net_pct") is not None:
+        return float(out["fwd72_net_pct"])
+    fwd = rec.get("forward")
+    if isinstance(fwd, dict) and fwd.get("fwd72h_pct") is not None:
+        return float(fwd["fwd72h_pct"]) - cost_bps / 100.0
+    return None
+
+
 def _summarize(rows: list[dict], net_key: str, boot: int, seed: int) -> dict:
     """对一批 episode 给出去重叠后的计数与日块统计。net 为百分数 → bp ×100。"""
     if not rows:
@@ -163,15 +181,15 @@ def jsonl_dual(path: str, boot: int, seed: int, days: Optional[float]) -> dict:
                 counts["cand90"] += 1
             if in85 and not in90:
                 counts["cand85only"] += 1
-            out = rec.get("outcome")
-            net = out.get("fwd72_net_pct") if isinstance(out, dict) else None
+            net = _live_fwd72_net_pct(rec)
             band = "90" if in90 else ("85only" if in85 else None)
             if band is None:
                 continue
             if net is None:
                 pending["p90" if band == "90" else "p85only"] += 1
                 continue
-            row = {"ts": ts, "fwd72_net": float(net) / 100.0}
+            # fwd72_net 保持百分数（与历史 replay_coin 同单位），_summarize ×100 得 bp。
+            row = {"ts": ts, "fwd72_net": float(net)}
             (rows90 if band == "90" else rows85only).append(row)
     return {
         "source": "live_shadow_jsonl",

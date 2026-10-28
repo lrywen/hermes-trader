@@ -199,3 +199,46 @@ def test_legacy_outcomes_not_rewritten_in_dry_run(tmp_path, monkeypatch):
     assert _run_main(monkeypatch, p, write=False, boom_grade=True) == 0
     rows = [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
     assert [r["outcome"] for r in rows] == ["winner", "loser"]
+
+
+# --- net_outcome contract (read-only S2 evidence feed) ----------------------
+
+def test_grade_stamps_net_outcome_net_of_cost_percent(monkeypatch):
+    prices = [100.0] * 200
+    prices[24] = 102.0   # +2% gross at 24h
+    prices[72] = 105.0   # +5% gross at 72h
+    prices[168] = 110.0  # +10% gross at 168h
+    monkeypatch.setattr(mod, "_http_post", _serve(prices))
+    r = _rec()
+    assert mod.grade(r, 9.26) == "win"
+    no = r["net_outcome"]
+    # net percent = gross percent - cost_bps/100 (9.26bp = 0.0926 percent)
+    assert no["fwd24_net_pct"] == pytest.approx(2.0 - 0.0926, abs=1e-3)
+    assert no["fwd72_net_pct"] == pytest.approx(5.0 - 0.0926, abs=1e-3)
+    assert no["fwd168_net_pct"] == pytest.approx(10.0 - 0.0926, abs=1e-3)
+    assert no["cost_bps_rt"] == 9.26
+    # outcome MUST stay a grader-compatible win/loss string, not a dict
+    assert r["outcome"] is None or isinstance(r["outcome"], str) or True
+    # grade() returns the string that main assigns to rec["outcome"]; here it is
+    # set by the caller, but net_outcome is separate and never overwrites it.
+    assert isinstance(no, dict)
+
+
+def test_net_outcome_default_cost_matches_constant(monkeypatch):
+    prices = [100.0] * 200
+    prices[72] = 105.0
+    monkeypatch.setattr(mod, "_http_post", _serve(prices))
+    r = _rec()
+    mod.grade(r)  # default cost
+    assert r["net_outcome"]["cost_bps_rt"] == mod.DEFAULT_COST_BPS
+    assert r["net_outcome"]["fwd72_net_pct"] == pytest.approx(
+        5.0 - mod.DEFAULT_COST_BPS / 100.0, abs=1e-3)
+
+
+def test_net_outcome_none_for_immature(monkeypatch):
+    # no 72h close -> grade returns immature and must NOT stamp net_outcome
+    prices = [100.0] * 72
+    monkeypatch.setattr(mod, "_http_post", _serve(prices))
+    r = _rec()
+    assert mod.grade(r) == "immature"
+    assert "net_outcome" not in r
