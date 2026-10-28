@@ -29,3 +29,4 @@
 | [0007](0007-keep-hip3-disabled-restart-gate.md) | HIP-3（DEX 永续）维持关停，登记注资重启前置条件（不改代码/配置） | Accepted |
 | [0008](0008-allow-shorts-single-source-runner-gate.md) | 做空单一真源 = runner_entry_gate.allow_shorts；chop 对齐回 False（只决策，改值另走变更） | Accepted（对齐改值待执行） |
 | [0009](0009-trigger-weights-promote-gap.md) | trigger_weights canonical→生产 promote 遗漏（trend_strength 0.55 vs 0.30） | Accepted（修复待用户确认） |
+| [0010](0010-xs-exit-72h-time-stop-freeze-top-pct-85.md) | xs 臂退出冻结（仅 72h 时间止损，拒 1.5% 硬止损）+ top_pct 定格 85 | Proposed（待风控签字） |
