@@ -129,6 +129,19 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "signal_age_decay.shadow_log_path": ("", "/data/signal_age_decay_shadow.jsonl"),
     "xs_reversal.mode": ("off", "shadow"),
     "xs_reversal.shadow_log_path": ("", "/data/xs_reversal_shadow.jsonl"),
+    # 2026-10-28: xs_reversal panic-gate record-only shadow markers. The arm is
+    # mode=shadow and physically cannot place orders (xs_reversal.enforce is a
+    # no-op; the module never imports executor/exchange). Enabling the gate only
+    # changes the recorded panic_gate_active/pass/reasons features — it never
+    # alters is_candidate and never routes an order. pctile = coin-relative
+    # trailing-90d ATR percentile (q0.6), chosen over the cross-coin-biased
+    # fixed cutoff. All five are live-only leaves (canonical omits them → None);
+    # value-binding means any later change to these live values re-reviews red.
+    "xs_reversal.panic_gate_enabled": (None, True),
+    "xs_reversal.panic_vol_mode": (None, "pctile"),
+    "xs_reversal.panic_ext_max_pct": (None, -8.0),
+    "xs_reversal.panic_atr_pctile_min": (None, 0.6),
+    "xs_reversal.panic_rsi_min": (None, 20.0),
     "market_circuit.mode": ("shadow", "enforce"),
     "regime_risk_overlay.shadow_log_path": ("", "/data/regime_overlay_shadow.jsonl"),
     "trend_filter_200ma.shadow_log_path": ("", "/data/trend_filter_shadow.jsonl"),
