@@ -3358,6 +3358,7 @@ def register_routes(app: FastAPI) -> None:
     from hermes_trader.dashboard_routes.secrets import register_secrets_routes
     from hermes_trader.dashboard_routes.shadow import register_shadow_routes
     from hermes_trader.dashboard_routes.shadow_arms import register_shadow_arms_routes
+    from hermes_trader.dashboard_routes.shadow_evidence import register_shadow_evidence_routes
 
     register_config_routes(app)
     register_operator_routes(app)
@@ -3372,6 +3373,7 @@ def register_routes(app: FastAPI) -> None:
     # reports over read-only endpoints + operator-gated refresh. Same
     # before-public ordering so /api/dashboard/shadow-arms/* is not swallowed.
     register_shadow_arms_routes(app)
+    register_shadow_evidence_routes(app)
     # Audit 2026-09-07 (M4): hash-chain verification + reconcile status read
     # endpoints. Read-only/anonymous-safe at the trader boundary; the portal
     # BFF tightens RBAC. Same before-public ordering as the other API groups.
