@@ -33,7 +33,9 @@ _DATA_DIR = os.environ.get("HERMES_DATA_DIR", "/data")
 class CandleSource:
     """5m close series resolver: local cache first, optional network fallback."""
 
-    def __init__(self, cache_path: str = "", use_network: bool = True):
+    def __init__(self, cache_path: str = "", use_network: bool = True,
+                 source: str = "hyperliquid"):
+        self.source = source
         self.cache: dict[str, Any] = {}
         self._series_cache: dict[str, Optional[tuple[list[int], list[float]]]] = {}
         self.use_network = use_network
@@ -65,10 +67,27 @@ class CandleSource:
                         cs.append(math.nan)
                 rows = (ts, cs)
                 break
-        if rows is None and self.use_network:
+        if rows is None and self.source == "binance":
+            rows = self._binance_series(coin)
+        elif rows is None and self.use_network:
             rows = self._network_series(coin)
         self._series_cache[coin] = rows
         return rows
+
+    def _binance_series(self, coin: str):
+        try:
+            from hermes_trader.data import binance_candles as B
+            if B.to_binance_symbol(coin) is None:
+                return None
+            cdls = B.fetch_candle_range(coin, "5m",
+                                        self._bn_start, self._bn_end,
+                                        use_cache=True)
+            cdls = [c for c in cdls if c.t + BAR_MS <= self._bn_end]
+            if not cdls:
+                return None
+            return ([c.t for c in cdls], [float(c.c) for c in cdls])
+        except Exception:
+            return None
 
     def _network_series(self, coin: str, span_bars: int = 18000) -> Optional[tuple[list[int], list[float]]]:
         # Wide history window so rows older than the last ~3 days still resolve.
@@ -251,13 +270,16 @@ def main() -> int:
     ap.add_argument("--no-network", action="store_true")
     ap.add_argument("--max-rows", type=int, default=0)
     ap.add_argument("--horizon", default="1h", choices=list(HORIZONS))
+    ap.add_argument("--source", choices=["hyperliquid", "binance"],
+                    default="hyperliquid")
     args = ap.parse_args()
 
     rows = load_rows(args.pattern)
     rows.sort(key=lambda r: r.get("ts", 0))
     if args.max_rows:
         rows = rows[-args.max_rows:]
-    src = CandleSource(args.cache, use_network=not args.no_network)
+    src = CandleSource(args.cache, use_network=not args.no_network,
+                       source=args.source)
     bench_coins = sorted({k[:-3] for k in getattr(src, "cache", {}) if k.endswith("|5m")})
     enriched = enrich(rows, src, bench_coins)
     out_dir = os.path.dirname(args.out)

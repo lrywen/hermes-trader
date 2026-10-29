@@ -74,19 +74,29 @@ def to_binance_symbol(coin: str) -> Optional[str]:
     return coin.upper() + "USDT"
 
 
-def _http_get_json(url: str, timeout: int = 20) -> list:
+def _http_get_json(url: str, timeout: int = 20,
+                     retries: int = 3, backoff_s: float = 1.5) -> list:
     last = None
-    for host in BASE_HOSTS:
-        full = host + url
-        try:
-            req = urllib.request.Request(
-                full, headers={"User-Agent": "hermes-offline-replay/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read())
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError,
-                json.JSONDecodeError) as e:
-            last = e
-            continue
+    for attempt in range(max(1, retries)):
+        for host in BASE_HOSTS:
+            full = host + url
+            try:
+                req = urllib.request.Request(
+                    full, headers={"User-Agent": "hermes-offline-replay/1.0"})
+                with urllib.request.urlopen(req, timeout=timeout) as r:
+                    return json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                last = e
+                # 429/418 weight ban -> back off before retrying any host
+                if e.code in (418, 429):
+                    time.sleep(backoff_s * (attempt + 1))
+                continue
+            except (urllib.error.URLError, TimeoutError,
+                    json.JSONDecodeError) as e:
+                last = e
+                continue
+        if attempt + 1 < retries:
+            time.sleep(backoff_s * (attempt + 1))
     raise RuntimeError(f"binance klines fetch failed: {last}")
 
 
@@ -207,8 +217,8 @@ def fetch_candle_range(coin: str, interval: str,
             if nxt <= cursor or newest >= g1:
                 break
             cursor = nxt
-            if sleep_s:
-                time.sleep(sleep_s)
+            # gentle default pacing to stay under Binance IP weight limits
+            time.sleep(sleep_s or 0.05)
         return [bk[t] for t in sorted(bk) if g0 <= t <= g1]
 
 
