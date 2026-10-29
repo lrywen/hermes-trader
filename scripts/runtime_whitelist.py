@@ -80,6 +80,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "replay_gate.py",
     "reconcile_binance_stream.py",
     "arm_edge_eval.py",
+    "promotion_gate.py",
     # M-1 OFI evaluator (research tool, not in the trading runtime path);
     # runs one-shot via `docker exec` against the /data volume.
     "m1_ofi_eval.py",

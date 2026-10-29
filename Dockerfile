@@ -81,6 +81,7 @@ COPY scripts/reconcile_decision_shadow.py scripts/reconcile_decision_shadow.py
 COPY scripts/replay_gate.py scripts/replay_gate.py
 COPY scripts/reconcile_binance_stream.py scripts/reconcile_binance_stream.py
 COPY scripts/arm_edge_eval.py scripts/arm_edge_eval.py
+COPY scripts/promotion_gate.py scripts/promotion_gate.py
 # U1 (2026-10-23): M-1 OFI evaluator. Research tool, NOT in the trading
 # runtime path; shipped only because the host cannot read the /data docker
 # volume, so the one-shot 2026-10-28 evaluation runs via `docker exec`.
