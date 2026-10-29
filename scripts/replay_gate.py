@@ -40,6 +40,16 @@ from hermes_trader.indicators import triggers as T
 from hermes_trader.indicators import math as M
 
 BAR5 = 5 * 60_000
+
+# Liquid Hermes-universe coins that also trade on Binance USDT spot (offline
+# Binance deep-history replay only). HIP-3/k-prefix/exclusive/delisted names
+# omitted: no 1:1 Binance symbol.
+_DEFAULT_BASKET = [
+    "AAVE","ADA","AERO","ASTER","AVAX","BTC","CHIP","CRV","ENA","ETH",
+    "ETHFI","GRAM","HEMI","HYPE","INIT","INJ","JTO","JUP","LINK","LTC",
+    "NEAR","ONDO","PENGU","PUMP","PYTH","REZ","SOL","SUI","TAO","TRUMP",
+    "UNI","WLD","XPL","ZEC","ZRO","ALT","ANIME","BABY","BIGTIME","BLUR",
+    "COMP","DASH","GMX","MEGA","NIL","SOPH","TIA","WCT"]
 _DATA_DIR = os.environ.get("HERMES_DATA_DIR", "/data")
 _SLOW_BURN = {"volumeBuildup1h", "trendFlip1h", "higherLows1h"}
 
@@ -60,37 +70,68 @@ def _candles(rows: list[tuple[int, list[float]]]):
 
 
 class Data:
-    def __init__(self, cache_path: str = "", use_network: bool = True):
+    def __init__(self, cache_path: str = "", use_network: bool = True,
+                 source: str = "hyperliquid"):
+        self.source = source
         self.cache: dict[str, Any] = {}
-        if cache_path and os.path.exists(cache_path):
+        if cache_path and source == "hyperliquid" and os.path.exists(cache_path):
             try:
                 self.cache = json.load(open(cache_path))
             except Exception:
                 self.cache = {}
         self.use_network = use_network
-        self._mem: dict[str, Optional[list[dict]]] = {}
+        self._mem: dict[str, Optional[list]] = {}
 
     def candles(self, coin: str, interval: str,
-                start_ms: int, end_ms: int) -> Optional[list[dict]]:
+                start_ms: int, end_ms: int):
         key = f"{coin}|{interval}"
         if key not in self._mem:
             series = None
-            d = self.cache.get(key)
-            if d:
-                series = _candles(sorted((int(t), v) for t, v in d.items()))
-            elif self.use_network:
-                try:
-                    from hermes_trader.data.historical_candles import fetch_candle_range
-                    cdls = fetch_candle_range(
-                        coin, interval, start_ms, end_ms, use_cache=True)
-                    series = list(cdls)  # already Candle models
-                except Exception:
-                    series = None
+            if self.source == "binance":
+                if self.use_network:
+                    try:
+                        from hermes_trader.data import binance_candles as B
+                        if B.to_binance_symbol(coin) is None:
+                            series = None  # HIP-3 / no 1:1 symbol
+                        else:
+                            series = list(B.fetch_candle_range(
+                                coin, interval, start_ms, end_ms,
+                                use_cache=True))
+                    except Exception:
+                        series = None
+            else:
+                d = self.cache.get(key)
+                if d:
+                    series = _candles(sorted((int(t), v) for t, v in d.items()))
+                elif self.use_network:
+                    try:
+                        from hermes_trader.data.historical_candles import fetch_candle_range
+                        series = list(fetch_candle_range(
+                            coin, interval, start_ms, end_ms, use_cache=True))
+                    except Exception:
+                        series = None
             self._mem[key] = series
         s = self._mem[key]
         if not s:
             return None
         return [c for c in s if start_ms <= c.t <= end_ms]
+
+    def quote_volume_24h(self, coin: str, t5_ms: int) -> Optional[float]:
+        """Trailing-24h USDT notional ending at t5_ms (binance only)."""
+        if self.source != "binance":
+            return None
+        try:
+            from hermes_trader.data import binance_candles as B
+            tot = 0.0
+            found = False
+            for k in range(288):
+                qv = B.quote_volume(coin, "5m", t5_ms - k * BAR5)
+                if qv is not None:
+                    tot += qv
+                    found = True
+            return tot if found else None
+        except Exception:
+            return None
 
 
 def _resample_4h(c5) -> list:
@@ -119,8 +160,8 @@ def _resample_4h(c5) -> list:
             for g in sorted(buckets)]
 
 
-def build_analysis(data: Data, coin: str, i5: int, c5: list[dict],
-                   c15: list[dict], c1h: list[dict],
+def build_analysis(data: Data, coin: str, i5: int, c5: list,
+                   c15: list, c1h: list,
                    thresholds: dict, weights: dict,
                    mover_cfg: dict) -> Optional[dict]:
     """Reconstruct the runner-gate analysis dict at closed 5m bar index i5."""
@@ -167,7 +208,9 @@ def build_analysis(data: Data, coin: str, i5: int, c5: list[dict],
     if i5 - 288 >= 0 and mover_cfg.get("enabled", False):
         prev = c5[i5 - 288].c
         cur = c5[i5].c
-        vol24 = sum(c.v * c.c for c in c5[i5 - 288:i5 + 1])
+        qv24 = data.quote_volume_24h(coin, c5[i5].t)
+        vol24 = (qv24 if qv24 is not None
+                 else sum(c.v * c.c for c in c5[i5 - 288:i5 + 1]))
         move = (cur - prev) / prev * 100 if prev > 0 else 0.0
         if (abs(move) >= float(mover_cfg.get("min_crypto_24h_pct", 10.0))
                 and vol24 >= float(mover_cfg.get("min_volume_usd", 5e6))):
@@ -244,6 +287,7 @@ def replay_coin(data: Data, coin: str, start_ms: int, end_ms: int,
             "mid_price": an["mid"],
             "fired_names": an["_fired_names"],
             "replay": True,
+            "data_source": getattr(data, "source", "hyperliquid"),
             "replay_note": ("structural gate from candles; AI confidence "
                             "neutralized; whale/news/account absent"),
         })
@@ -259,6 +303,8 @@ def main() -> int:
     ap.add_argument("--step-bars", type=int, default=10)
     ap.add_argument("--conf", type=float, default=0.9)
     ap.add_argument("--no-network", action="store_true")
+    ap.add_argument("--source", choices=["hyperliquid", "binance"],
+                    default="hyperliquid")
     ap.add_argument("--out", default=os.path.join(_DATA_DIR, "decision_shadow_replay.jsonl"))
     ap.add_argument("--max-coins", type=int, default=0)
     args = ap.parse_args()
@@ -268,16 +314,25 @@ def main() -> int:
     weights = trigger_weights_params(config=config)
     end_ms = int(time.time() * 1000)
     start_ms = end_ms - args.days * 86_400_000
-    data = Data(args.cache, use_network=not args.no_network)
+    data = Data(args.cache, use_network=not args.no_network,
+                source=args.source)
 
     if args.coins:
         coins = [c.strip() for c in args.coins.split(",") if c.strip()]
+    elif args.source == "binance":
+        # Binance has no local cache seed; default to the liquid shared basket.
+        coins = _DEFAULT_BASKET
     else:
         coins = sorted({k[:-3] for k in data.cache if k.endswith("|5m")})
     if args.max_coins:
         coins = coins[:args.max_coins]
 
     n = 0
+    if args.source == "binance":
+        try:
+            from hermes_trader.data import binance_candles as _B
+        except Exception:
+            _B = None
     tmp_out = args.out + ".tmp"
     with open(tmp_out, "w") as f:
         for ci, coin in enumerate(coins):
@@ -287,6 +342,8 @@ def main() -> int:
                 f.write(json.dumps(r, ensure_ascii=False) + chr(10))
             n += len(rows)
             print(f"[{ci+1}/{len(coins)}] {coin}: {len(rows)}", flush=True)
+    if args.source == "binance" and _B is not None:
+        _B.flush_disk()
     os.replace(tmp_out, args.out)
     adm = 0
     all_ts = []
@@ -298,16 +355,21 @@ def main() -> int:
     span = None
     if all_ts:
         span_days = (max(all_ts) - min(all_ts)) / 86_400_000
+        _notes = {
+            "hyperliquid": ("HL serves 5m candles only back ~17d (hard "
+                            "exchange retention)."),
+            "binance": ("Binance public spot klines (offline-only source; "
+                        "never used by live trading). Symbols without a 1:1 "
+                        "USDT spot listing (HIP-3/k-prefix/delisted) omitted."),
+        }
         span = {"requested_days": args.days,
                 "actual_first_utc": time.strftime(
                     "%Y-%m-%d", time.gmtime(min(all_ts) / 1000)),
                 "actual_last_utc": time.strftime(
                     "%Y-%m-%d", time.gmtime(max(all_ts) / 1000)),
                 "actual_span_days": round(span_days, 1),
-                "base_interval": "5m",
-                "note": ("HL serves 5m candles only back ~17d (hard exchange "
-                         "retention); deeper history requires 15m/1h which are "
-                         "a differently-tuned gate and are NOT emitted here.")}
+                "base_interval": "5m", "data_source": args.source,
+                "note": _notes.get(args.source, "")}
         meta_out = args.out.replace(".jsonl", "_meta.json")
         json.dump({"rows": n, "coins": len(coins), "admitted": adm,
                    "span": span}, open(meta_out, "w"), indent=2)
