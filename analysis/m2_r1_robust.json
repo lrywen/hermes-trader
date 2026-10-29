@@ -1,0 +1,129 @@
+{
+ "n_mover": 325,
+ "n_kept": 816,
+ "horizons": {
+  "1h": {
+   "gross": {
+    "blocked_mean": -0.437,
+    "blocked_ci": [
+     -1.671,
+     -0.277
+    ],
+    "kept_mean": 0.074,
+    "kept_ci": [
+     -0.121,
+     0.279
+    ],
+    "blocked_minus_kept": -0.511
+   },
+   "maker9": {
+    "blocked_mean": -0.53,
+    "blocked_ci": [
+     -1.764,
+     -0.37
+    ],
+    "kept_mean": -0.019,
+    "kept_ci": [
+     -0.213,
+     0.187
+    ],
+    "blocked_minus_kept": -0.511
+   },
+   "taker19": {
+    "blocked_mean": -0.627,
+    "blocked_ci": [
+     -1.861,
+     -0.467
+    ],
+    "kept_mean": -0.116,
+    "kept_ci": [
+     -0.311,
+     0.089
+    ],
+    "blocked_minus_kept": -0.511
+   }
+  },
+  "4h": {
+   "gross": {
+    "blocked_mean": -0.95,
+    "blocked_ci": [
+     -2.452,
+     -0.46
+    ],
+    "kept_mean": 0.327,
+    "kept_ci": [
+     -0.091,
+     0.76
+    ],
+    "blocked_minus_kept": -1.277
+   },
+   "maker9": {
+    "blocked_mean": -1.043,
+    "blocked_ci": [
+     -2.545,
+     -0.553
+    ],
+    "kept_mean": 0.235,
+    "kept_ci": [
+     -0.183,
+     0.667
+    ],
+    "blocked_minus_kept": -1.278
+   },
+   "taker19": {
+    "blocked_mean": -1.14,
+    "blocked_ci": [
+     -2.642,
+     -0.65
+    ],
+    "kept_mean": 0.137,
+    "kept_ci": [
+     -0.281,
+     0.57
+    ],
+    "blocked_minus_kept": -1.277
+   }
+  },
+  "24h": {
+   "gross": {
+    "blocked_mean": -0.862,
+    "blocked_ci": [
+     -4.923,
+     0.502
+    ],
+    "kept_mean": 0.8,
+    "kept_ci": [
+     -0.333,
+     1.301
+    ],
+    "blocked_minus_kept": -1.662
+   },
+   "maker9": {
+    "blocked_mean": -0.954,
+    "blocked_ci": [
+     -5.016,
+     0.409
+    ],
+    "kept_mean": 0.708,
+    "kept_ci": [
+     -0.426,
+     1.208
+    ],
+    "blocked_minus_kept": -1.662
+   },
+   "taker19": {
+    "blocked_mean": -1.052,
+    "blocked_ci": [
+     -5.113,
+     0.312
+    ],
+    "kept_mean": 0.61,
+    "kept_ci": [
+     -0.523,
+     1.111
+    ],
+    "blocked_minus_kept": -1.662
+   }
+  }
+ }
+}
