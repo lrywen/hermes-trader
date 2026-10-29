@@ -76,6 +76,8 @@ COPY scripts/reconcile_daily_extension_cap_shadow.py scripts/reconcile_daily_ext
 COPY scripts/reconcile_risk_tuning_shadow.py scripts/reconcile_risk_tuning_shadow.py
 COPY scripts/reconcile_stop_confirm_shadow.py scripts/reconcile_stop_confirm_shadow.py
 COPY scripts/reconcile_weight_shadow.py scripts/reconcile_weight_shadow.py
+COPY scripts/audit_effective_config.py scripts/audit_effective_config.py
+COPY scripts/reconcile_decision_shadow.py scripts/reconcile_decision_shadow.py
 # U1 (2026-10-23): M-1 OFI evaluator. Research tool, NOT in the trading
 # runtime path; shipped only because the host cannot read the /data docker
 # volume, so the one-shot 2026-10-28 evaluation runs via `docker exec`.

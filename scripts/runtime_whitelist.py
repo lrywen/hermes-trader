@@ -72,6 +72,11 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # Audit 2026-10-11 shadow A/B arms.
     "reconcile_stop_confirm_shadow.py",
     "reconcile_weight_shadow.py",
+    # M0 (2026-10-29): effective trigger-config canonical<->live drift audit.
+    "audit_effective_config.py",
+    # M1 (2026-10-29): universe-wide decision-shadow forward-return reconcile
+    # (cron_reconcile.sh -> docker exec; read-only).
+    "reconcile_decision_shadow.py",
     # M-1 OFI evaluator (research tool, not in the trading runtime path);
     # runs one-shot via `docker exec` against the /data volume.
     "m1_ofi_eval.py",
