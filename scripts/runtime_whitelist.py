@@ -78,6 +78,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # (cron_reconcile.sh -> docker exec; read-only).
     "reconcile_decision_shadow.py",
     "replay_gate.py",
+    "reconcile_binance_stream.py",
     # M-1 OFI evaluator (research tool, not in the trading runtime path);
     # runs one-shot via `docker exec` against the /data volume.
     "m1_ofi_eval.py",
