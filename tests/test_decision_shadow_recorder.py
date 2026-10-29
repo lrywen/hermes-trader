@@ -1,0 +1,44 @@
+"""M1 (plan G1): decision-shadow recorder enrichment.
+
+Hermetic unit tests for the additive observational fields appended to
+runner_gate_shadow rows: fired_names mapping, volume tiering, safe float.
+These fields are never read by the gate, so the tests assert pure transforms.
+"""
+from __future__ import annotations
+
+from hermes_trader.agents import executor as e
+
+
+def test_fired_names_maps_booleans_and_slowburn():
+    feats = {"vol": True, "brk": False, "burst": True, "dMover": False,
+             "up": True, "down": False, "slow_count": 2}
+    assert e._runner_gate_fired_names(feats) == [
+        "volumeSpike", "momentumBurst", "uptrendMomentum", "slowBurn"]
+
+
+def test_fired_names_empty_and_no_slow_when_zero():
+    assert e._runner_gate_fired_names({}) == []
+    assert e._runner_gate_fired_names({"slow_count": 0}) == []
+    assert e._runner_gate_fired_names({"brk": True}) == ["breakout"]
+    assert e._runner_gate_fired_names({"down": True, "slow_count": 1}) == [
+        "downtrendMomentum", "slowBurn"]
+    # defensive: non-dict / garbage must not raise
+    assert e._runner_gate_fired_names(None) == []  # type: ignore[arg-type]
+
+
+def test_volume_tier_boundaries():
+    assert e._runner_gate_volume_tier(None) is None
+    assert e._runner_gate_volume_tier(0) == "micro"
+    assert e._runner_gate_volume_tier(9_999_999) == "micro"
+    assert e._runner_gate_volume_tier(10_000_000) == "mid"
+    assert e._runner_gate_volume_tier(99_999_999) == "mid"
+    assert e._runner_gate_volume_tier(100_000_000) == "mega"
+
+
+def test_safe_float():
+    assert e._safe_float("3.5") == 3.5
+    assert e._safe_float(2) == 2.0
+    assert e._safe_float(None) is None
+    assert e._safe_float("x") is None
+    assert e._safe_float(float("nan")) is None
+    assert e._safe_float(float("inf")) is None

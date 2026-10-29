@@ -564,11 +564,16 @@ def uptrend_momentum(candles: list[Candle], lookback: int = 72, pct_threshold: f
     """Sustained UPward move over `lookback` bars (default ~6h on 5m).
 
     Surfaces a coin in a steady uptrend that the fast spike triggers (which need
-    a sharp 5m/2-bar move) miss. The symmetric counterpart to downtrend_momentum;
-    together they remove the long-bias in surfacing — both directions get a
-    sustained-trend signal so the AI sees up-movers (LONG) and down-movers (SHORT)
-    alike. Used as a surfacing BYPASS (weight 0), so it never reaches the
-    composite gate's denominator."""
+    a sharp 5m/2-bar move) miss. The symmetric counterpart to downtrend_momentum.
+
+    Weight/denominator note (M0 doc-fix 2026-10-29): unlike downtrend_momentum
+    (a true weight-0 surfacing bypass), the PRODUCTION trigger_weights set
+    uptrend_momentum = 0.20, so this trigger DOES enter the composite
+    denominator (~11.1% of the 1.80 sum) and adds a long-only term. This is an
+    asymmetric long bias (the down mirror stays weight 0). The asymmetry is
+    currently on the M2 edge-rebuild list; until then treat the weight as a
+    reviewed fact, not as "weight 0". (Effective weight always resolves via
+    trigger_weights_params() — see scripts/audit_effective_config.py.)"""
     move = _sustained_move_pct(candles, lookback)
     if move is None:
         return {"name": "uptrendMomentum", "score": 0, "reason": "insufficient_history", "fired": False}
@@ -933,13 +938,13 @@ def build_hits(
                           interval_minutes=60),
         trend_flip_1h(candles_1h, thresholds.get("trendFlipBars", 3)),
         higher_lows_1h(candles_1h, thresholds.get("higherLowsRequired", 4)),
-        # Symmetric directional surfacing (weight 0 → no composite-denominator
-        # impact). uptrend/downtrend momentum surface a coin in a sustained
-        # intraday trend for research REGARDLESS of the bullish-biased composite
-        # gate — the down side is what lets us short selloffs (the weighted
-        # triggers are all long-structured, so down-movers scored ~0 and never
-        # reached the AI). Acts as a bypass below; the AI + aligned-conf bar +
-        # short floor + counter-regime gate adjudicate direction/execution.
+        # Directional sustained-trend surfacing. NOTE (M0 2026-10-29): only
+        # downtrendMomentum is a weight-0 bypass. uptrendMomentum carries a
+        # production weight of 0.20 and DOES enter the composite denominator
+        # (long-only term, ~11.1% of the 1.80 sum). Resolve effective weights via
+        # trigger_weights_params(); see scripts/audit_effective_config.py. The
+        # down side still surfaces for SHORT research; the AI + aligned-conf bar
+        # + short floor + counter-regime gate adjudicate direction/execution.
         uptrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),
                          thresholds.get("trendMomentumPct", 5.0)),
         downtrend_momentum(candles, thresholds.get("trendMomentumLookback", 72),

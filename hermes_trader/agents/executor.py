@@ -5520,6 +5520,63 @@ def _default_runner_gate_shadow_file() -> str:
 _RUNNER_GATE_SHADOW_FILE = _default_runner_gate_shadow_file()
 
 
+def _safe_float(v: Any) -> Optional[float]:
+    """Best-effort finite float for observational logging; None on any failure."""
+    try:
+        fv = float(v)  # type: ignore[arg-type]
+        return fv if math.isfinite(fv) else None
+    except (TypeError, ValueError):
+        return None
+
+
+# M1 (2026-10-29): map the recorder feats booleans to canonical trigger names.
+# Pure function of the feats dict so it is unit-testable and reads no live state.
+def _runner_gate_fired_names(feats: dict[str, Any]) -> list[str]:
+    if not isinstance(feats, dict):
+        return []
+    pairs = (
+        ("vol", "volumeSpike"), ("brk", "breakout"), ("burst", "momentumBurst"),
+        ("dMover", "dailyMover"), ("up", "uptrendMomentum"),
+        ("down", "downtrendMomentum"),
+    )
+    names = [nm for key, nm in pairs if bool(feats.get(key))]
+    # slow-burn re-fire is structural, not a base trigger; surface it distinctly.
+    if int(feats.get("slow_count") or 0) >= 1:
+        names.append("slowBurn")
+    return names
+
+
+# M1: 24h quote-volume tiering for universe stratification. Thresholds mirror
+# the reform-plan mega/mid/micro layers; resolved best-effort and cached lightly
+# per coin for one process so the recorder does not hammer the market cache.
+_RG_VOL24_CACHE: dict[str, Optional[float]] = {}
+
+
+def _runner_gate_volume_24h(coin: str) -> Optional[float]:
+    if not coin:
+        return None
+    if coin in _RG_VOL24_CACHE:
+        return _RG_VOL24_CACHE[coin]
+    val: Optional[float] = None
+    try:
+        v = _get_market_volume_24h(coin)
+        val = float(v) if v is not None and math.isfinite(float(v)) else None
+    except Exception:
+        val = None
+    _RG_VOL24_CACHE[coin] = val
+    return val
+
+
+def _runner_gate_volume_tier(vol_usd: Optional[float]) -> Optional[str]:
+    if vol_usd is None:
+        return None
+    if vol_usd >= 100_000_000:
+        return "mega"
+    if vol_usd >= 10_000_000:
+        return "mid"
+    return "micro"
+
+
 def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None:
     """Append one structured runner-gate verdict. Best-effort, never raises.
 
@@ -5571,6 +5628,14 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
             "whale": feats.get("whale"),
             "forced": feats.get("forced"),
             "is_hip3": ":" in str(analysis.get("coin") or ""),
+            # M1 (2026-10-29): additive decision-shadow fields for universe-wide
+            # forward-return reconciliation (scripts/reconcile_decision_shadow.py).
+            # Observational only; never consumed by the gate. Best-effort None.
+            "mid_price": feats.get("mid"),
+            "fired_names": _runner_gate_fired_names(feats),
+            "volume_24h_usd": _runner_gate_volume_24h(analysis.get("coin") or ""),
+            "volume_tier": _runner_gate_volume_tier(
+                _runner_gate_volume_24h(analysis.get("coin") or "")),
         }
         from hermes_trader.shadow_log import append_jsonl
         append_jsonl(_RUNNER_GATE_SHADOW_FILE, rec, stream="runner_gate")
@@ -5934,6 +5999,10 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
             "downtrend": bool(downtrend),
             "whale": bool(whale),
             "forced": bool(forced),
+            # M1 (2026-10-29): PIT price for decision-shadow forward-return
+            # reconciliation. Additive/observational only — never read by the
+            # admit/block decision. Best-effort (None when unavailable).
+            "mid": _safe_float(analysis.get("mid")),
         }
     except Exception:
         _runner_gate_ctx.feats = None

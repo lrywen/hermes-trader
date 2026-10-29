@@ -128,6 +128,17 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
     --window-hours "${HERMES_STOP_CONFIRM_WINDOW:-168}"
   echo "$(ts) stop_confirm shadow reconcile exit=$?"
 
+  # M1 (2026-10-29 plan G1): universe-wide decision-shadow forward-return
+  # reconciliation. Reads runner_gate_shadow.jsonl* (EVERY evaluated candidate,
+  # admitted or blocked, incl. microcaps), aligns PIT 5m entry bars, attaches
+  # 1h/4h/24h/72h net returns at 9.26bp and 19bp plus equal-weight market
+  # excess, and buckets by path A/B/C, fired trigger and volume tier with
+  # day-block bootstrap CI. Network candle fallback enabled. Read-only: never
+  # mutates the source and never places orders. Best-effort like the arms above.
+  echo "$(ts) decision_shadow reconcile start"
+  docker exec "$CONTAINER" python /app/scripts/reconcile_decision_shadow.py     --pattern /data/runner_gate_shadow.jsonl*     --cache /data/ch_hist_candles.json     --out /data/decision_shadow_outcomes.jsonl     --summary-out /data/decision_shadow_summary.json
+  echo "$(ts) decision_shadow reconcile exit=$?"
+
   echo
   exit "$rc"
 } >> "$LOG_FILE" 2>&1
