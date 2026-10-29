@@ -1,0 +1,189 @@
+{
+  "coins": 48,
+  "1h": {
+    "cont": {
+      "n": 1134,
+      "excess_maker9_mean": -0.176,
+      "excess9_ci": [
+        [
+          -0.425,
+          -0.05
+        ],
+        88
+      ],
+      "excess_taker19_mean": -0.273,
+      "excess19_ci": [
+        [
+          -0.523,
+          -0.147
+        ],
+        88
+      ],
+      "gross_mean": -0.072
+    },
+    "pull": {
+      "n": 3525,
+      "excess_maker9_mean": -0.096,
+      "excess9_ci": [
+        [
+          -0.114,
+          0.008
+        ],
+        84
+      ],
+      "excess_taker19_mean": -0.193,
+      "excess19_ci": [
+        [
+          -0.212,
+          -0.09
+        ],
+        84
+      ],
+      "gross_mean": 0.003
+    },
+    "dip": {
+      "n": 7253,
+      "excess_maker9_mean": -0.072,
+      "excess9_ci": [
+        [
+          -0.106,
+          0.007
+        ],
+        69
+      ],
+      "excess_taker19_mean": -0.169,
+      "excess19_ci": [
+        [
+          -0.203,
+          -0.091
+        ],
+        69
+      ],
+      "gross_mean": 0.041
+    }
+  },
+  "4h": {
+    "cont": {
+      "n": 1134,
+      "excess_maker9_mean": -0.186,
+      "excess9_ci": [
+        [
+          -0.641,
+          -0.09
+        ],
+        88
+      ],
+      "excess_taker19_mean": -0.283,
+      "excess19_ci": [
+        [
+          -0.738,
+          -0.187
+        ],
+        88
+      ],
+      "gross_mean": -0.043
+    },
+    "pull": {
+      "n": 3525,
+      "excess_maker9_mean": -0.128,
+      "excess9_ci": [
+        [
+          -0.2,
+          0.201
+        ],
+        84
+      ],
+      "excess_taker19_mean": -0.225,
+      "excess19_ci": [
+        [
+          -0.298,
+          0.103
+        ],
+        84
+      ],
+      "gross_mean": -0.032
+    },
+    "dip": {
+      "n": 7253,
+      "excess_maker9_mean": 0.002,
+      "excess9_ci": [
+        [
+          -0.155,
+          0.207
+        ],
+        69
+      ],
+      "excess_taker19_mean": -0.096,
+      "excess19_ci": [
+        [
+          -0.252,
+          0.109
+        ],
+        69
+      ],
+      "gross_mean": 0.159
+    }
+  },
+  "24h": {
+    "cont": {
+      "n": 1134,
+      "excess_maker9_mean": -0.092,
+      "excess9_ci": [
+        [
+          -1.512,
+          0.407
+        ],
+        88
+      ],
+      "excess_taker19_mean": -0.189,
+      "excess19_ci": [
+        [
+          -1.609,
+          0.31
+        ],
+        88
+      ],
+      "gross_mean": 0.335
+    },
+    "pull": {
+      "n": 3525,
+      "excess_maker9_mean": 0.163,
+      "excess9_ci": [
+        [
+          -0.583,
+          0.926
+        ],
+        84
+      ],
+      "excess_taker19_mean": 0.066,
+      "excess19_ci": [
+        [
+          -0.68,
+          0.828
+        ],
+        84
+      ],
+      "gross_mean": 0.415
+    },
+    "dip": {
+      "n": 7253,
+      "excess_maker9_mean": 0.243,
+      "excess9_ci": [
+        [
+          -0.692,
+          0.728
+        ],
+        69
+      ],
+      "excess_taker19_mean": 0.145,
+      "excess19_ci": [
+        [
+          -0.789,
+          0.63
+        ],
+        69
+      ],
+      "gross_mean": 0.633
+    }
+  }
+}
