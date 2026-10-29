@@ -82,6 +82,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "arm_edge_eval.py",
     "promotion_gate.py",
     "real_verdict_eval.py",
+    "assemble_veto_evidence.py",
     # M-1 OFI evaluator (research tool, not in the trading runtime path);
     # runs one-shot via `docker exec` against the /data volume.
     "m1_ofi_eval.py",

@@ -83,6 +83,7 @@ COPY scripts/reconcile_binance_stream.py scripts/reconcile_binance_stream.py
 COPY scripts/arm_edge_eval.py scripts/arm_edge_eval.py
 COPY scripts/promotion_gate.py scripts/promotion_gate.py
 COPY scripts/real_verdict_eval.py scripts/real_verdict_eval.py
+COPY scripts/assemble_veto_evidence.py scripts/assemble_veto_evidence.py
 # U1 (2026-10-23): M-1 OFI evaluator. Research tool, NOT in the trading
 # runtime path; shipped only because the host cannot read the /data docker
 # volume, so the one-shot 2026-10-28 evaluation runs via `docker exec`.

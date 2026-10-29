@@ -1,0 +1,17 @@
+{
+  "arm": "R1_remove_daily_mover",
+  "kind": "veto",
+  "blocked": {
+    "n": 325,
+    "days": 88,
+    "mean_pct": -1.14,
+    "ci95_pct": [
+      -2.642,
+      -0.65
+    ]
+  },
+  "blocked_gross_pct": -0.95,
+  "kept_minus_blocked_pct": 1.277,
+  "max_coin_share_pct": 12,
+  "max_day_share_pct": 8
+}
