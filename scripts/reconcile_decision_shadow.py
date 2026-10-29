@@ -70,7 +70,11 @@ class CandleSource:
         self._series_cache[coin] = rows
         return rows
 
-    def _network_series(self, coin: str, span_bars: int = 900) -> Optional[tuple[list[int], list[float]]]:
+    def _network_series(self, coin: str, span_bars: int = 18000) -> Optional[tuple[list[int], list[float]]]:
+        # Wide history window so rows older than the last ~3 days still resolve.
+        # 18000 x 5m ~= 62 days, under the fetch guard (20000 bars/request);
+        # fetch_candle_range merges its disk cache, so mature bars are not
+        # re-requested. Only fully-closed bars are returned.
         try:
             from hermes_trader.data.historical_candles import fetch_candle_range
             end = int(time.time() * 1000)
@@ -98,6 +102,21 @@ def load_rows(pattern: str) -> list[dict[str, Any]]:
             continue
     return list(rows.values())
 
+
+
+def legacy_fired_names(r: dict[str, Any]) -> list[str]:
+    """Reconstruct fired names from pre-M1 boolean columns when fired_names absent."""
+    if r.get("fired_names"):
+        return list(r["fired_names"])
+    names = []
+    if r.get("vol"): names.append("volumeSpike")
+    if r.get("brk"): names.append("breakout")
+    if r.get("burst"): names.append("momentumBurst")
+    if r.get("dMover"): names.append("dailyMover")
+    if r.get("up"): names.append("uptrendMomentum")
+    if r.get("down"): names.append("downtrendMomentum")
+    if int(r.get("slow_burn_count") or 0) >= 1: names.append("slowBurn")
+    return names
 
 def classify_path(r: dict[str, Any]) -> str:
     fresh = bool(r.get("fresh_impulse"))
@@ -127,6 +146,7 @@ def enrich(rows: list[dict[str, Any]], src: CandleSource, bench_coins: list[str]
         s = src.series(coin)
         rec = dict(r)
         rec["path"] = classify_path(r)
+        rec["fired_names"] = legacy_fired_names(r)
         if not s:
             rec["covered"] = False
             out.append(rec)

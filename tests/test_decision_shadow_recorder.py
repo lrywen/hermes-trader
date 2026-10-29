@@ -42,3 +42,34 @@ def test_safe_float():
     assert e._safe_float("x") is None
     assert e._safe_float(float("nan")) is None
     assert e._safe_float(float("inf")) is None
+
+
+def test_legacy_fired_names_reconstructs_old_schema():
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        "rds", os.path.join(os.path.dirname(__file__), "..",
+                            "scripts", "reconcile_decision_shadow.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    old = {"vol": True, "brk": False, "burst": True, "dMover": False,
+           "up": False, "down": True, "slow_burn_count": 1}
+    assert mod.legacy_fired_names(old) == [
+        "volumeSpike", "momentumBurst", "downtrendMomentum", "slowBurn"]
+    assert mod.legacy_fired_names({"fired_names": ["breakout"]}) == ["breakout"]
+    assert mod.legacy_fired_names({}) == []
+
+
+def test_classify_path_abc():
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        "rds2", os.path.join(os.path.dirname(__file__), "..",
+                             "scripts", "reconcile_decision_shadow.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.classify_path({"fresh_impulse": True, "slow_burn_count": 1}) == "A_fresh_slow"
+    assert mod.classify_path({"fresh_impulse": True, "slow_burn_count": 0,
+                              "composite_score": 50}) == "B_fresh_score"
+    assert mod.classify_path({"fresh_impulse": False, "dMover": True,
+                              "admitted": True}) == "C_daily_mover"
+    assert mod.classify_path({"fresh_impulse": False, "dMover": False,
+                              "admitted": False}) == "Z_blocked"

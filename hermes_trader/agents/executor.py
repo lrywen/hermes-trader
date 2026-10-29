@@ -5518,6 +5518,18 @@ def _default_runner_gate_shadow_file() -> str:
 
 
 _RUNNER_GATE_SHADOW_FILE = _default_runner_gate_shadow_file()
+# M1 (2026-10-29): the decision-shadow evidence stream must survive long enough
+# for forward-return reconciliation (1h..72h) and >=40-60 independent trading
+# days of promotion-gate stats. The default rotates to only 5 daily siblings
+# (~5 days, 1,263 rows), aging decisions out before they can be studied. Pin a
+# 90-sibling retention exactly like the xs_reversal long-horizon arm. Observational
+# only: changes how many rotated JSONL files are kept, never any trade decision.
+_RUNNER_GATE_SHADOW_RETENTION = 90
+try:
+    from hermes_trader.shadow_log import set_retention as _set_rg_retention
+    _set_rg_retention(_RUNNER_GATE_SHADOW_FILE, _RUNNER_GATE_SHADOW_RETENTION)
+except Exception:  # never let logging setup affect the trade path
+    pass
 
 
 def _safe_float(v: Any) -> Optional[float]:
