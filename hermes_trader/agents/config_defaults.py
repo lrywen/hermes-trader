@@ -529,6 +529,16 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "mover_bypass_veto": {
             "shadow_mode": False,
         },
+        # M2 / R3 (2026-10-29): over-extension chase veto. Offline 88-day
+        # run-up bucketing: fresh longs entered after a >3% pre-entry 1h
+        # run-up (most stretched 4h ATR extension) carried the only clearly
+        # negative fresh bucket. Default shadow_mode=false = no-op; true only
+        # records a would-block (rule=overextension_veto). Enforce is a
+        # separate, explicitly-approved promotion.
+        "overextension_veto": {
+            "shadow_mode": False,
+            "max_extension_atr": 3.0,
+        },
         # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
         # _reason used before these were schema-configurable).
         "rsi_overbought": 75.0,

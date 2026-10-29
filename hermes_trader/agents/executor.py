@@ -6617,6 +6617,39 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
         logger.warning(f"[runner_gate] M2 mover_bypass_veto shadow failed "
                        f"(non-fatal): {_mb_e}")
 
+    # ── M2 / R3 (2026-10-29): over-extension (chase) veto SHADOW ─────────
+    # Offline run-up bucketing of the 88-day Binance admits: fresh-impulse
+    # longs entered after a >3% pre-entry 1h run-up (the most stretched) were
+    # the only fresh bucket with a clearly negative 1h forward return
+    # (-0.354%, n=149); moderate run-up (1-2%) was flat-to-slightly-positive.
+    # This arm RECORDS a would-block for admitted longs whose 4h close is far
+    # past EMA21 in ATR units (a snapshot measure already computed above), so
+    # real forward outcomes accrue; it never changes live admission (default
+    # shadow_mode off = no-op). enforce is a separate approved promotion.
+    try:
+        _oc_cfg = gate.get("overextension_veto") or {}
+        if bool(_oc_cfg.get("shadow_mode", False)) and side == "long"                 and extension_4h is not None:
+            _oc_max = float(_oc_cfg.get("max_extension_atr", 3.0) or 0.0)
+            if _oc_max > 0 and extension_4h >= _oc_max:
+                _record_risk_tuning_shadow(
+                    rule="overextension_veto", coin=coin, side=side,
+                    would="block",
+                    detail={
+                        "extension_4h_atr": round(float(extension_4h), 4),
+                        "max_extension_atr": _oc_max,
+                        "composite_score": round(float(score), 4),
+                        "slow_burn_count": int(slow_count),
+                        "fresh_impulse": bool(fresh_impulse),
+                        "daily_mover": bool(daily_mover),
+                        "rsi4h": _f(rsi4h),
+                        "entry_px": float(analysis.get("mid") or analysis.get("price") or 0.0),
+                    },
+                    trace_id=str(analysis.get("id") or ""),
+                )
+    except Exception as _oc_e:
+        logger.warning(f"[runner_gate] M2 overextension_veto shadow failed "
+                       f"(non-fatal): {_oc_e}")
+
     logger.info(
         f"[runner_gate] {coin} long ADMITTED: score={score:.0f}, slow={slow_count}, "
         f"fresh={int(fresh_impulse)}, dMover={int(structured_daily_mover)}, "

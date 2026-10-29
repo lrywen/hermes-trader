@@ -1,13 +1,9 @@
-"""M2 / R1 (2026-10-29): daily-mover bypass veto is a record-only shadow arm.
+"""M2 entry-selection construction fixes (2026-10-29): record-only shadow arms.
 
-88-day Binance + real-verdict reconciliation proved the daily-mover-only
-bypass (structured_daily_mover WITHOUT a fresh impulse) loses gross: it buys a
-+1.71% pre-entry run-up and mean-reverts. The arm must:
-
-  * be a strict no-op (never fire) when shadow_mode is absent/false;
-  * when shadow_mode=true, RECORD a would-block (rule=mover_bypass_veto) but
-    still ADMIT (return "") — live admission never changes;
-  * never fire for a fresh-impulse admit (structured_runner carrier).
+R1 mover_bypass_veto and R3 overextension_veto are SHADOW arms. They must be a
+strict no-op when shadow_mode is absent/false; when enabled they only RECORD a
+would-block via the risk_tuning_shadow feed while live admission is unchanged
+(return ""). Live enforcement is a separate, explicitly-approved promotion.
 """
 from __future__ import annotations
 
@@ -29,19 +25,32 @@ def _gate(**kw):
         "mover_min_confidence": 0.72,
         "mover_min_composite": 30.0,
         "mover_bypass_veto": {"shadow_mode": False},
+        "overextension_veto": {"shadow_mode": False, "max_extension_atr": 3.0},
     }
     base.update(kw)
     return {"runner_entry_gate": base}
 
 
 def _mover_analysis(**kw):
-    # daily_mover long with slow-burn backing, NO fresh impulse -> the C path.
     base = {"coin": "TST", "side": "long", "confidence": 0.80,
             "ai_confidence_raw": 0.80, "composite_score": 34.0,
             "daily_mover_fired": True, "slow_burn_count": 2,
             "momentum_burst_fired": False, "breakout_fired": False,
             "volume_spike_fired": False, "uptrend_momentum_fired": True,
             "whale_signal": False, "mid_price": 100.0}
+    base.update(kw)
+    return base
+
+
+def _fresh_analysis(**kw):
+    base = {"coin": "TST", "side": "long", "confidence": 0.80,
+            "ai_confidence_raw": 0.80, "composite_score": 48.0,
+            "daily_mover_fired": False, "slow_burn_count": 2,
+            "momentum_burst_fired": False, "breakout_fired": True,
+            "volume_spike_fired": False, "uptrend_momentum_fired": True,
+            "whale_signal": False, "mid_price": 100.0,
+            "rsi4h": 70.0, "adx4h": 40.0, "ema8_4h": 101.0,
+            "ema21_4h": 100.0, "atr4h": 1.0, "close4h": 103.2}
     base.update(kw)
     return base
 
@@ -58,28 +67,27 @@ def isolated(monkeypatch):
     return monkeypatch
 
 
-def _mover_admits(analysis, config):
-    """A C-path daily-mover long clears every other gate (confidence passes,
-    mover thresholds pass, no overbought snapshot) and reaches final admit."""
-    reason = executor._runner_entry_block_reason_impl(analysis, config)
-    return reason
-
-
-def test_arm_disabled_is_strict_noop(isolated, monkeypatch):
+def _spy(monkeypatch):
     calls = []
     monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
                         lambda *a, **k: calls.append(k))
-    cfg = _gate()  # shadow_mode False
-    assert _mover_admits(_mover_analysis(), cfg) == ""   # live admit unchanged
-    assert calls == []                                   # arm never recorded
+    return calls
 
 
-def test_arm_shadow_records_but_still_admits(isolated, monkeypatch):
-    calls = []
-    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
-                        lambda *a, **k: calls.append(k))
+# ── R1 daily-mover bypass veto ──────────────────────────────────────────────
+
+def test_r1_disabled_is_strict_noop(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    assert executor._runner_entry_block_reason_impl(
+        _mover_analysis(), _gate()) == ""
+    assert calls == []
+
+
+def test_r1_shadow_records_but_still_admits(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
     cfg = _gate(mover_bypass_veto={"shadow_mode": True})
-    assert _mover_admits(_mover_analysis(), cfg) == ""   # STILL admitted
+    assert executor._runner_entry_block_reason_impl(
+        _mover_analysis(), cfg) == ""
     assert len(calls) == 1
     assert calls[0]["rule"] == "mover_bypass_veto"
     assert calls[0]["would"] == "block"
@@ -87,13 +95,41 @@ def test_arm_shadow_records_but_still_admits(isolated, monkeypatch):
     assert calls[0]["detail"]["fresh_impulse"] is False
 
 
-def test_arm_skips_fresh_impulse_admit(isolated, monkeypatch):
-    calls = []
-    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
-                        lambda *a, **k: calls.append(k))
+def test_r1_skips_fresh_impulse_admit(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
     cfg = _gate(mover_bypass_veto={"shadow_mode": True})
-    # fresh impulse (breakout) + slow -> structured_runner carrier, not C
-    a = _mover_analysis(daily_mover_fired=False, breakout_fired=True,
-                        slow_burn_count=2, composite_score=46.0)
-    assert _mover_admits(a, cfg) == ""
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), cfg) == ""
+    assert [c for c in calls if c.get("rule") == "mover_bypass_veto"] == []
+
+
+# ── R3 over-extension chase veto ────────────────────────────────────────────
+
+def test_r3_disabled_is_noop(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(overextension_veto={"shadow_mode": False,
+                                    "max_extension_atr": 3.0})
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), cfg) == ""
     assert calls == []
+
+
+def test_r3_shadow_flags_extended_but_still_admits(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(overextension_veto={"shadow_mode": True,
+                                    "max_extension_atr": 3.0})
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), cfg) == ""
+    flagged = [c for c in calls if c.get("rule") == "overextension_veto"]
+    assert len(flagged) == 1
+    assert flagged[0]["would"] == "block"
+    assert flagged[0]["detail"]["extension_4h_atr"] == 3.2
+
+
+def test_r3_skips_low_extension(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(overextension_veto={"shadow_mode": True,
+                                    "max_extension_atr": 3.0})
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(close4h=101.0), cfg) == ""
+    assert [c for c in calls if c.get("rule") == "overextension_veto"] == []
