@@ -289,11 +289,34 @@ def main() -> int:
             print(f"[{ci+1}/{len(coins)}] {coin}: {len(rows)}", flush=True)
     os.replace(tmp_out, args.out)
     adm = 0
+    all_ts = []
     for line in open(args.out):
-        if json.loads(line).get("admitted"):
+        r = json.loads(line)
+        if r.get("admitted"):
             adm += 1
-    print(f"replay rows={n} admitted={adm} "
-          f"({100*adm/n:.2f}%) coins={len(coins)} -> {args.out}")
+        all_ts.append(r["ts"])
+    span = None
+    if all_ts:
+        span_days = (max(all_ts) - min(all_ts)) / 86_400_000
+        span = {"requested_days": args.days,
+                "actual_first_utc": time.strftime(
+                    "%Y-%m-%d", time.gmtime(min(all_ts) / 1000)),
+                "actual_last_utc": time.strftime(
+                    "%Y-%m-%d", time.gmtime(max(all_ts) / 1000)),
+                "actual_span_days": round(span_days, 1),
+                "base_interval": "5m",
+                "note": ("HL serves 5m candles only back ~17d (hard exchange "
+                         "retention); deeper history requires 15m/1h which are "
+                         "a differently-tuned gate and are NOT emitted here.")}
+        meta_out = args.out.replace(".jsonl", "_meta.json")
+        json.dump({"rows": n, "coins": len(coins), "admitted": adm,
+                   "span": span}, open(meta_out, "w"), indent=2)
+    if n:
+        print(f"replay rows={n} admitted={adm} ({100*adm/n:.2f}%) "
+              f"coins={len(coins)} span={span['actual_span_days']}d "
+              f"-> {args.out}")
+    else:
+        print("replay rows=0")
     return 0
 
 

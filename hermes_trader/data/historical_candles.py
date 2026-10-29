@@ -180,6 +180,56 @@ def _request_range(coin: str, interval: str,
     return _parse_rows(raw)
 
 
+# HL caps a single candleSnapshot response at ~5,011 bars (newest-first window),
+# so a request for a wider [start,end] silently truncates to the newest ~17 days
+# of 5m. Page backward in pages safely under that cap to reach deep history.
+PAGE_BARS = 4_800
+# Overall safety ceiling for one logical fetch (all pages summed). ~208 days of
+# 5m; beyond this callers should narrow the range rather than spin many pages.
+MAX_TOTAL_BARS = 60_000
+
+
+def _request_range_paged(coin: str, interval: str,
+                         start_ms: int, end_ms: int,
+                         *, sleep_s: float = 0.0) -> list[Candle]:
+    """Fetch the full [start_ms, end_ms] window, paging backward past HL's
+    per-response ~5,011-bar cap. Ascending, de-duped; tolerates empty pages."""
+    step = _interval_ms(interval)
+    g0 = start_ms - (start_ms % step)
+    g1 = end_ms - (end_ms % step)
+    total_bars = (g1 - g0) // step + 1
+    if total_bars > MAX_TOTAL_BARS:
+        raise ValueError(
+            f"refusing paged fetch of {total_bars} bars (> {MAX_TOTAL_BARS}); "
+            f"narrow the range")
+    merged: dict[int, Candle] = {}
+    page_end = g1
+    while page_end >= g0:
+        page_start = max(g0, page_end - (PAGE_BARS - 1) * step)
+        rows = _request_range(coin, interval, page_start, page_end + step - 1)
+        if rows:
+            for c in rows:
+                if g0 <= c.t <= g1:
+                    merged[c.t] = c
+            oldest = rows[0].t
+            # If the exchange returned nothing as old as this page's start,
+            # stop (no deeper history) to avoid a hot loop on thin symbols.
+            if oldest <= page_start + step and page_start <= g0 + step:
+                break
+            # Next page ends at the oldest bar just fetched (inclusive); the
+            # overlap is de-duped via merged and keeps coverage down to g0.
+            if oldest >= page_end:  # no backward progress -> bail
+                break
+            page_end = oldest
+        else:
+            break
+        if page_start <= g0:
+            break
+        if sleep_s:
+            time.sleep(sleep_s)
+    return [merged[t] for t in sorted(merged)]
+
+
 def fetch_candle_range(coin: str, interval: str,
                        start_ms: int, end_ms: int, *,
                        use_cache: bool = True) -> list[Candle]:
@@ -196,11 +246,11 @@ def fetch_candle_range(coin: str, interval: str,
     # Guard against pathological spans (e.g. a far-future as_of) that would
     # otherwise spin a huge grid under the cache lock. The outcome windows we
     # replay never exceed ~10k bars per request.
-    max_bars = 20_000
+    max_bars = MAX_TOTAL_BARS
     if (end_ms - (start_ms - start_ms % step)) // step > max_bars:
         raise ValueError(
-            f"refusing single fetch over {(end_ms-start_ms)//step} bars "
-            f"(>{max_bars}); chunk the replay or shrink as_of")
+            f"refusing paged fetch over {(end_ms-start_ms)//step} bars "
+            f"(>{max_bars}); narrow the range")
     global _DISK_DIRTY
     if use_cache:
         _load_disk_cache()
@@ -219,8 +269,13 @@ def fetch_candle_range(coin: str, interval: str,
             # Request the full span covering the missing grid points in one
             # call; HL returns the forming bar too (open t == current grid),
             # which callers filter via closed_bars_as_of.
-            fetched = _request_range(coin, interval, missing[0],
-                                     missing[-1] + step)
+            # M1.6 (2026-10-29): page backward over the missing span. One call is
+            # capped by HL at ~5,011 bars (~17d of 5m) and silently truncates
+            # to the newest window; paging reaches deep history. HL also returns
+            # the forming bar (open t == current grid), filtered by
+            # closed_bars_as_of.
+            fetched = _request_range_paged(coin, interval, missing[0],
+                                           missing[-1] + step)
             if use_cache:
                 added = 0
                 for cdl in fetched:

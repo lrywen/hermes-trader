@@ -125,3 +125,56 @@ def test_warm_cache_merges_per_coin(monkeypatch):
 def test_bad_interval_rejected():
     with pytest.raises(ValueError):
         hc.fetch_candle_range("AAA", "7h", 0, 10 * STEP)
+
+
+# --- M1.6 (2026-10-29): backward pagination past HL's ~5,011-bar per-call cap ---
+
+def test_paged_fetch_walks_backward_through_cap(monkeypatch):
+    step = hc.INTERVAL_MS["5m"]
+    g0 = 0
+    g1 = (hc.PAGE_BARS * 3) * step  # 3 full pages deep
+    all_t = list(range(g0, g1 + step, step))
+
+    def fake_request(coin, interval, start, end):
+        # emulate exchange: return at most 5,011 NEWEST bars within the window
+        win = [t for t in all_t if start - (start % step) <= t <= end]
+        win = win[-5011:]
+        return [hc.Candle(t=t, o=1, h=1, l=1, c=1, v=1) for t in win]
+
+    monkeypatch.setattr(hc, "_request_range", fake_request)
+    rows = hc._request_range_paged("X", "5m", g0, g1)
+    ts = [b.t for b in rows]
+    assert ts == sorted(set(ts))           # ascending, de-duped
+    assert ts[0] == g0 and ts[-1] == g1    # full deep range recovered
+    assert len(ts) > hc.PAGE_BARS          # required multiple pages
+
+
+def test_paged_fetch_stops_when_no_deeper_history(monkeypatch):
+    # Exchange has only the newest ~17d; older pages return empty/overlap.
+    step = hc.INTERVAL_MS["5m"]
+    newest = 1_000_000 * step
+    have = list(range(newest - 5011 * step, newest + step, step))
+
+    def fake_request(coin, interval, start, end):
+        win = [t for t in have if start <= t <= end][-5011:]
+        return [hc.Candle(t=t, o=1, h=1, l=1, c=1, v=1) for t in win]
+
+    calls = []
+    def counting(coin, interval, start, end):
+        calls.append((start, end))
+        return fake_request(coin, interval, start, end)
+
+    monkeypatch.setattr(hc, "_request_range", counting)
+    g0 = newest - 30_000 * step
+    rows = hc._request_range_paged("X", "5m", g0, newest)
+    # returns only real history (newest 5011 bars), does not hot-loop
+    assert len(rows) == len(have)
+    assert len(calls) < 12
+    assert rows[0].t == have[0]
+
+
+def test_paged_fetch_refuses_over_ceiling():
+    step = hc.INTERVAL_MS["5m"]
+    with pytest.raises(ValueError):
+        hc._request_range_paged("X", "5m", 0,
+                                (hc.MAX_TOTAL_BARS + 10) * step)
