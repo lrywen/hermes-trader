@@ -6585,6 +6585,38 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                   f"score={score:.0f}, slow={slow_count}")
         return (f"runner_gate_blocked ({_block})")
 
+    # ── M2 / R1 (2026-10-29): daily-mover bypass veto SHADOW ──────────────
+    # 88-day Binance + real-verdict reconciliation proved the daily-mover-only
+    # bypass (structured_daily_mover with NO fresh impulse) is structurally
+    # value-destroying: gross -0.50% at 1h (loses even at zero fee), it buys
+    # after a +1.71% pre-entry run-up and mean-reverts (-0.95% by 4h). Removing
+    # it lifts the kept long portfolio from -0.26% to -0.12% (1h) / +0.13% to
+    # +0.61% (24h) and flips kept-minus-blocked positive. This arm RECORDS the
+    # counter-factual veto for every such admit so real forward outcomes accrue
+    # under the existing risk_tuning_shadow reconciliation; it does NOT change
+    # the live admit/block decision (default shadow_mode off = no-op).
+    try:
+        _mb_cfg = gate.get("mover_bypass_veto") or {}
+        if bool(_mb_cfg.get("shadow_mode", False)) and side == "long"                 and structured_daily_mover and not fresh_impulse:
+            _record_risk_tuning_shadow(
+                rule="mover_bypass_veto", coin=coin, side=side, would="block",
+                detail={
+                    "composite_score": round(float(score), 4),
+                    "confidence": round(float(gate_conf), 4),
+                    "slow_burn_count": int(slow_count),
+                    "fresh_impulse": bool(fresh_impulse),
+                    "daily_mover": bool(daily_mover),
+                    "breakout": bool(breakout),
+                    "burst": bool(burst),
+                    "volume": bool(volume),
+                    "entry_px": float(analysis.get("mid") or analysis.get("price") or 0.0),
+                },
+                trace_id=str(analysis.get("id") or ""),
+            )
+    except Exception as _mb_e:
+        logger.warning(f"[runner_gate] M2 mover_bypass_veto shadow failed "
+                       f"(non-fatal): {_mb_e}")
+
     logger.info(
         f"[runner_gate] {coin} long ADMITTED: score={score:.0f}, slow={slow_count}, "
         f"fresh={int(fresh_impulse)}, dMover={int(structured_daily_mover)}, "

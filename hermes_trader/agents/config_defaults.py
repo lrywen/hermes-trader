@@ -520,6 +520,15 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "min_short_composite": 45.0,
         "mover_min_confidence": 0.72,
         "mover_min_composite": 30.0,
+        # M2 / R1 (2026-10-29): daily-mover-only bypass veto. 88-day Binance +
+        # real-verdict reconciliation proved this bypass loses gross (chases a
+        # +1.71% run-up, mean-reverts -0.95% by 4h). Default shadow_mode=false
+        # = pure no-op; when true the gate only RECORDS a would-block
+        # (rule= mover_bypass_veto) for real-outcome reconciliation. Live
+        # enforcement is a separate, explicitly-approved flip after promotion.
+        "mover_bypass_veto": {
+            "shadow_mode": False,
+        },
         # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
         # _reason used before these were schema-configurable).
         "rsi_overbought": 75.0,
