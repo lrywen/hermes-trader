@@ -769,6 +769,16 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "min_short_composite": _num_leaf(0.0, 100.0),
         "mover_min_confidence": _num_leaf(0.0, 1.0),
         "mover_min_composite": _num_leaf(0.0, 100.0),
+        # M2 record-only counter-factual arms (default shadow_mode=false => no-op).
+        # mover_bypass_veto would-block the daily-mover-only admission; the
+        # overextension_veto would-block stretched fresh-impulse longs.
+        "mover_bypass_veto": {
+            "shadow_mode": ("bool",),
+        },
+        "overextension_veto": {
+            "shadow_mode": ("bool",),
+            "max_extension_atr": _num_leaf(0.0, 50.0),
+        },
         # 4h late-entry veto thresholds (consumed in _runner_entry_block_reason).
         # Previously read via .get() with hard-coded defaults but absent from the
         # schema, so they could not be tuned; added here with the code defaults.

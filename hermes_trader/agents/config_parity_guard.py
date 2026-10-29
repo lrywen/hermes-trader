@@ -169,6 +169,10 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "runner_entry_gate.breakout_score_floor.shadow_mode": (False, True),
     "runner_entry_gate.per_coin_cooldown.shadow_mode": (True, False),
     "runner_entry_gate.pullback_long.shadow_mode": (False, True),
+    # M2 record-only counter-factual arms (0e7ca4b): shadow=true only
+    # appends would-block rows; admission/orders unchanged. fail-closed defaults.
+    "runner_entry_gate.mover_bypass_veto.shadow_mode": (False, True),
+    "runner_entry_gate.overextension_veto.shadow_mode": (False, True),
     # 生产功能开关（live 开启，canonical 关闭；开启更激进，但非保护放宽）
     "candlestick_patterns.enabled": (False, True),
     "debate_research.enabled": (False, True),
