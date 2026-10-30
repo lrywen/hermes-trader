@@ -27,6 +27,7 @@ import json
 import math
 import os
 import sys
+import time
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -62,6 +63,7 @@ from hermes_trader.backtest import stats as kstats
 from hermes_trader.backtest.types import Trade
 from hermes_trader.client.hl_client import fetch_hl_candles
 from hermes_trader.client.universe import get_universe
+from hermes_trader.data.universe_snapshot import snapshot_as_of
 from hermes_trader.models.types import Candle
 
 # Interval → candle duration in ms (mirrors hl_client._MS_PER_CANDLE).
@@ -257,6 +259,10 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--days", type=int, default=14)
     ap.add_argument("--coins", type=int, default=20)
+    ap.add_argument("--universe", default="current", choices=["current", "pit"],
+                    help="M1B: 'current' = today's universe+volume (survivorship/look-ahead "
+                         "biased, legacy behavior); 'pit' = point-in-time universe from "
+                         "universe-snapshots as of the backtest start (no future info)")
     ap.add_argument("--interval", default="1h", choices=["5m", "15m", "1h", "4h", "1d"])
     ap.add_argument("--equity", type=float, default=100.0)
     ap.add_argument("--equity-fraction", type=float, default=0.0,
@@ -384,7 +390,24 @@ def main() -> int:
     # Trigger config is only used for the header line; the kernel's
     # default_heuristic_config() reads the same source.
     cfg = get_config()
-    universe = get_universe()
+    universe_bias = "current"
+    if args.universe == "pit":
+        # Point-in-time: the coin pool visible at the backtest START (now - days),
+        # selected by that snapshot's dayNtlVlm only. Prevents both survivorship
+        # (delisted coins absent from today's universe) and look-ahead (ranking by
+        # today's volume). Requires universe-snapshots captured by the live scan.
+        start_ms = time.time() * 1000.0 - args.days * 86_400_000.0
+        snap = snapshot_as_of(start_ms)
+        if snap is None:
+            print("ERROR: --universe pit but no point-in-time universe snapshot found "
+                  f"on/within 10 days before {start_ms:.0f}. Run the live scanner "
+                  "(record_universe_snapshot) to accumulate snapshots, or use "
+                  "--universe current (results are survivor/look-ahead biased).")
+            return 2
+        universe = snap.get("markets", [])
+        universe_bias = f"pit@{snap.get('ts')}"
+    else:
+        universe = get_universe()
     perps = [m for m in universe if m["type"] == "perp" and not m["coin"].startswith("@")]
     coins = sorted(perps, key=lambda m: m.get("dayNtlVlm", 0), reverse=True)[: args.coins]
 
@@ -403,7 +426,7 @@ def main() -> int:
     )
 
     print("=== hermes-trader backtest ===")
-    print(f"period: {args.days} days   interval: {args.interval}   universe: top-{args.coins} by 24h volume")
+    print(f"period: {args.days} days   interval: {args.interval}   universe: top-{args.coins} by 24h volume ({universe_bias})")
     print(f"equity: ${args.equity:.0f}   fraction: {equity_fraction:.0%}   leverage ceiling: {leverage_ceiling}x")
     print(f"DSL: max_loss={max_loss}%  protect={protect}%  retrace={retrace}  atr_mult={atr_mult}")
     print(f"triggers config: sigma={cfg['thresholds']['sigmaThreshold']}  "

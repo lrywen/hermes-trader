@@ -23,6 +23,7 @@ from hermes_trader.agents.config_store import cfg_get, report_legacy_mode_drift
 from hermes_trader.client.cache import _Cache
 from hermes_trader.client.hl_client import _get_ws_mids_instance, fetch_all_mids, fetch_hl_candles
 from hermes_trader.client.universe import get_universe
+from hermes_trader.data.universe_snapshot import record_universe_snapshot
 from hermes_trader.indicators import triggers as trigger_mod
 from hermes_trader.indicators.volume_profile import volume_profile
 from hermes_trader.models.types import Candle
@@ -363,6 +364,7 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
         if live_pass == alt_pass:
             return
         from datetime import datetime, timezone
+
         from hermes_trader.shadow_log import append_jsonl
         append_jsonl(_weight_shadow_path(), {
             "ts": int(now_ms),
@@ -1426,6 +1428,10 @@ def scan_once(
         # rationale as the mids prefetch above.
         with _scan_stage("universe"):
             universe = get_universe(include_hip3=include_hip3)
+        # M1B: point-in-time universe capture for survivorship/look-ahead-free
+        # backtests. Best-effort append-only snapshot; never feeds this scan or
+        # any live decision (record_universe_snapshot swallows all errors).
+        record_universe_snapshot(universe)
 
     # Filter: must have valid mid, exclude spot (@ or type=spot), then apply
     # asset-class gates + budget split.
