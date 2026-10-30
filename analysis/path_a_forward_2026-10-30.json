@@ -1,0 +1,114 @@
+{
+  "question": "enforce-block path A (fresh & slow>=1)?",
+  "primary_metric": "excess19_pct",
+  "primary_horizon": "24h",
+  "horizons": {
+    "1h": {
+      "n_pathA": 793,
+      "net19": {
+        "n": 793,
+        "days": 88,
+        "mean_pct": -0.0852,
+        "median_pct": -0.153,
+        "ci95_pct": [
+          -0.2556,
+          0.0758
+        ],
+        "win_rate_pct": 42.6
+      },
+      "excess19": {
+        "n": 793,
+        "days": 88,
+        "mean_pct": -0.1152,
+        "median_pct": -0.19,
+        "ci95_pct": [
+          -0.2569,
+          0.0464
+        ],
+        "win_rate_pct": 40.2
+      },
+      "excess19_split_half": {
+        "first_half_mean": -0.0357,
+        "second_half_mean": -0.1944,
+        "same_sign": true
+      },
+      "gap3d_independent_events": 504,
+      "gap3d_excess19": {
+        "n": 504,
+        "days": 87,
+        "mean_pct": -0.1177,
+        "median_pct": -0.19,
+        "ci95_pct": [
+          -0.2839,
+          0.0741
+        ],
+        "win_rate_pct": 39.7
+      },
+      "last20d_excess19": {
+        "n": 150,
+        "days": 21,
+        "mean_pct": -0.1602,
+        "median_pct": -0.1316,
+        "ci95_pct": [
+          -0.4528,
+          0.2908
+        ],
+        "win_rate_pct": 39.3
+      }
+    },
+    "24h": {
+      "n_pathA": 793,
+      "net19": {
+        "n": 793,
+        "days": 88,
+        "mean_pct": 0.5086,
+        "median_pct": 0.0432,
+        "ci95_pct": [
+          -0.6172,
+          0.948
+        ],
+        "win_rate_pct": 50.3
+      },
+      "excess19": {
+        "n": 793,
+        "days": 88,
+        "mean_pct": 0.1103,
+        "median_pct": -0.4606,
+        "ci95_pct": [
+          -0.675,
+          0.6553
+        ],
+        "win_rate_pct": 43.4
+      },
+      "excess19_split_half": {
+        "first_half_mean": 0.1529,
+        "second_half_mean": 0.0679,
+        "same_sign": true
+      },
+      "gap3d_independent_events": 504,
+      "gap3d_excess19": {
+        "n": 504,
+        "days": 87,
+        "mean_pct": 0.1794,
+        "median_pct": -0.4063,
+        "ci95_pct": [
+          -0.6137,
+          0.9125
+        ],
+        "win_rate_pct": 43.7
+      },
+      "last20d_excess19": {
+        "n": 150,
+        "days": 21,
+        "mean_pct": -0.5808,
+        "median_pct": -0.4783,
+        "ci95_pct": [
+          -1.4486,
+          2.4811
+        ],
+        "win_rate_pct": 43.3
+      }
+    }
+  },
+  "verdict": "INSUFFICIENT / CI spans 0 — keep path A, keep observing; do NOT enforce"
+}
