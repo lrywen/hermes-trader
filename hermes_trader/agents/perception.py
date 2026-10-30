@@ -1428,10 +1428,13 @@ def scan_once(
         # rationale as the mids prefetch above.
         with _scan_stage("universe"):
             universe = get_universe(include_hip3=include_hip3)
-        # M1B: point-in-time universe capture for survivorship/look-ahead-free
-        # backtests. Best-effort append-only snapshot; never feeds this scan or
-        # any live decision (record_universe_snapshot swallows all errors).
-        record_universe_snapshot(universe)
+    # M1B: point-in-time universe capture for survivorship/look-ahead-free
+    # backtests. Best-effort append-only snapshot; never feeds this scan or
+    # any live decision (record_universe_snapshot swallows all errors).
+    # NOTE: recorded OUTSIDE the `universe is None` branch — the live loop
+    # always passes a pre-fetched universe (trading_loop scan_once(universe=...)),
+    # so a hook inside the branch would never fire in production.
+    record_universe_snapshot(universe)
 
     # Filter: must have valid mid, exclude spot (@ or type=spot), then apply
     # asset-class gates + budget split.

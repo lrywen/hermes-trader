@@ -57,18 +57,38 @@ def test_record_swallows_errors(tmp_path, monkeypatch):
 
 
 def test_scan_hook_records_snapshot(tmp_path, monkeypatch):
-    """perception.scan must call record_universe_snapshot after get_universe."""
+    """scan_once must snapshot the universe on BOTH resolution paths.
+
+    Regression: the live loop always passes a pre-fetched universe
+    (trading_loop: scan_once(universe=universe)), so a hook placed only inside
+    the `universe is None` branch never fired in production and no PIT snapshot
+    was ever written. Drive scan_once itself with a pre-fetched universe.
+    """
     from hermes_trader.agents import perception
+    monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
     calls = []
     monkeypatch.setattr(perception, "record_universe_snapshot",
                         lambda markets, **kw: calls.append(len(markets)))
-    monkeypatch.setattr(perception, "get_universe", lambda **kw: [_market("BTC", 1e9)])
-    # Drive just the universe step: scan() is heavy, so assert the hook is wired
-    # by checking the symbol is the one we patched and get_universe is stubbed.
-    assert perception.record_universe_snapshot is not None
-    # Simulate the call site contract.
-    perception.record_universe_snapshot(perception.get_universe())
-    assert calls == [1]
+    # No mids / no candle fetches: the scan returns early on an empty market
+    # list, so this stays offline and only exercises the universe step.
+    monkeypatch.setattr(perception, "fetch_all_mids", lambda **kw: {})
+    monkeypatch.setattr(perception, "get_universe",
+                        lambda **kw: [_market("BTC", 1e9), _market("ETH", 5e8)])
+
+    # Path A: caller supplies the universe (production path).
+    perception.scan_once(universe=[_market("BTC", 1e9), _market("ETH", 5e8)],
+                        min_score=0)
+    assert calls == [2]
+
+    # Path B: no universe supplied → resolved via get_universe.
+    perception.scan_once(min_score=0)
+    assert calls == [2, 2]
+
+    # The production call site really does pass a pre-fetched universe.
+    from pathlib import Path
+    loop_src = (Path(__file__).resolve().parents[1] / "scripts" /
+                "trading_loop.py").read_text(encoding="utf-8")
+    assert "universe=universe, min_score=min_score" in loop_src
 
 
 def test_backtest_pit_universe_selection(tmp_path, monkeypatch):
