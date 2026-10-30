@@ -1,0 +1,724 @@
+{
+  "question": "which part of the path-A brk leg has/leaks edge?",
+  "limitation": "replay reconstructs only same-bar breakout (brk); recent_brk (44% of live path A) and burst_score have NO offline samples — judge them from live shadow only.",
+  "slices": {
+    "brk_vol_yes": {
+      "1h": {
+        "n": 165,
+        "net19": {
+          "n": 165,
+          "days": 68,
+          "mean_pct": -0.3589,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -1.0718,
+            -0.0072
+          ],
+          "win_rate_pct": 41.2
+        },
+        "excess19": {
+          "n": 165,
+          "days": 68,
+          "mean_pct": -0.3799,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -1.0208,
+            0.0
+          ],
+          "win_rate_pct": 38.8
+        },
+        "gap3d_n": 146,
+        "gap3d_excess19": {
+          "n": 146,
+          "days": 64,
+          "mean_pct": -0.3065,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.673,
+            0.08
+          ],
+          "win_rate_pct": 38.4
+        }
+      },
+      "24h": {
+        "n": 165,
+        "net19": {
+          "n": 165,
+          "days": 68,
+          "mean_pct": 0.412,
+          "median_pct": -0.0646,
+          "ci95_pct": [
+            -1.3128,
+            1.3508
+          ],
+          "win_rate_pct": 48.5
+        },
+        "excess19": {
+          "n": 165,
+          "days": 68,
+          "mean_pct": 0.1098,
+          "median_pct": -0.4383,
+          "ci95_pct": [
+            -1.4768,
+            1.0651
+          ],
+          "win_rate_pct": 45.5
+        },
+        "gap3d_n": 146,
+        "gap3d_excess19": {
+          "n": 146,
+          "days": 64,
+          "mean_pct": 0.0425,
+          "median_pct": -0.2097,
+          "ci95_pct": [
+            -1.8534,
+            1.1511
+          ],
+          "win_rate_pct": 45.9
+        }
+      }
+    },
+    "brk_vol_no": {
+      "1h": {
+        "n": 624,
+        "net19": {
+          "n": 624,
+          "days": 87,
+          "mean_pct": -0.0248,
+          "median_pct": -0.153,
+          "ci95_pct": [
+            -0.2001,
+            0.1282
+          ],
+          "win_rate_pct": 42.8
+        },
+        "excess19": {
+          "n": 624,
+          "days": 87,
+          "mean_pct": -0.0556,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.2134,
+            0.0879
+          ],
+          "win_rate_pct": 40.5
+        },
+        "gap3d_n": 426,
+        "gap3d_excess19": {
+          "n": 426,
+          "days": 85,
+          "mean_pct": -0.0667,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.2509,
+            0.0704
+          ],
+          "win_rate_pct": 39.7
+        }
+      },
+      "24h": {
+        "n": 624,
+        "net19": {
+          "n": 624,
+          "days": 87,
+          "mean_pct": 0.5658,
+          "median_pct": 0.0982,
+          "ci95_pct": [
+            -0.5861,
+            0.9541
+          ],
+          "win_rate_pct": 51.0
+        },
+        "excess19": {
+          "n": 624,
+          "days": 87,
+          "mean_pct": 0.1465,
+          "median_pct": -0.4554,
+          "ci95_pct": [
+            -0.6626,
+            0.5696
+          ],
+          "win_rate_pct": 42.9
+        },
+        "gap3d_n": 426,
+        "gap3d_excess19": {
+          "n": 426,
+          "days": 85,
+          "mean_pct": 0.3071,
+          "median_pct": -0.4063,
+          "ci95_pct": [
+            -0.5933,
+            0.7947
+          ],
+          "win_rate_pct": 43.0
+        }
+      }
+    },
+    "slow1": {
+      "1h": {
+        "n": 654,
+        "net19": {
+          "n": 654,
+          "days": 87,
+          "mean_pct": -0.0491,
+          "median_pct": -0.1339,
+          "ci95_pct": [
+            -0.2572,
+            0.0758
+          ],
+          "win_rate_pct": 43.3
+        },
+        "excess19": {
+          "n": 654,
+          "days": 87,
+          "mean_pct": -0.0752,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.2591,
+            0.0468
+          ],
+          "win_rate_pct": 41.0
+        },
+        "gap3d_n": 436,
+        "gap3d_excess19": {
+          "n": 436,
+          "days": 86,
+          "mean_pct": -0.0738,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.2684,
+            0.0891
+          ],
+          "win_rate_pct": 40.8
+        }
+      },
+      "24h": {
+        "n": 654,
+        "net19": {
+          "n": 654,
+          "days": 87,
+          "mean_pct": 0.6519,
+          "median_pct": 0.1144,
+          "ci95_pct": [
+            -0.4405,
+            1.2248
+          ],
+          "win_rate_pct": 51.2
+        },
+        "excess19": {
+          "n": 654,
+          "days": 87,
+          "mean_pct": 0.3184,
+          "median_pct": -0.3093,
+          "ci95_pct": [
+            -0.4874,
+            0.9483
+          ],
+          "win_rate_pct": 44.3
+        },
+        "gap3d_n": 436,
+        "gap3d_excess19": {
+          "n": 436,
+          "days": 86,
+          "mean_pct": 0.4125,
+          "median_pct": -0.2724,
+          "ci95_pct": [
+            -0.5967,
+            1.1918
+          ],
+          "win_rate_pct": 44.7
+        }
+      }
+    },
+    "slow_ge2": {
+      "1h": {
+        "n": 135,
+        "net19": {
+          "n": 135,
+          "days": 63,
+          "mean_pct": -0.3155,
+          "median_pct": -0.2263,
+          "ci95_pct": [
+            -0.9869,
+            -0.1087
+          ],
+          "win_rate_pct": 38.5
+        },
+        "excess19": {
+          "n": 135,
+          "days": 63,
+          "mean_pct": -0.357,
+          "median_pct": -0.2303,
+          "ci95_pct": [
+            -0.9873,
+            -0.1455
+          ],
+          "win_rate_pct": 36.3
+        },
+        "gap3d_n": 125,
+        "gap3d_excess19": {
+          "n": 125,
+          "days": 61,
+          "mean_pct": -0.3622,
+          "median_pct": -0.2301,
+          "ci95_pct": [
+            -1.0215,
+            -0.1519
+          ],
+          "win_rate_pct": 36.0
+        }
+      },
+      "24h": {
+        "n": 135,
+        "net19": {
+          "n": 135,
+          "days": 63,
+          "mean_pct": -0.0391,
+          "median_pct": -0.5547,
+          "ci95_pct": [
+            -1.8545,
+            0.536
+          ],
+          "win_rate_pct": 46.7
+        },
+        "excess19": {
+          "n": 135,
+          "days": 63,
+          "mean_pct": -0.7306,
+          "median_pct": -0.9643,
+          "ci95_pct": [
+            -2.1951,
+            0.0774
+          ],
+          "win_rate_pct": 39.3
+        },
+        "gap3d_n": 125,
+        "gap3d_excess19": {
+          "n": 125,
+          "days": 61,
+          "mean_pct": -0.9758,
+          "median_pct": -1.0317,
+          "ci95_pct": [
+            -2.4775,
+            -0.1417
+          ],
+          "win_rate_pct": 37.6
+        }
+      }
+    },
+    "score_lt20": {
+      "1h": {
+        "n": 503,
+        "net19": {
+          "n": 503,
+          "days": 87,
+          "mean_pct": -0.0091,
+          "median_pct": -0.1314,
+          "ci95_pct": [
+            -0.1142,
+            0.1549
+          ],
+          "win_rate_pct": 43.1
+        },
+        "excess19": {
+          "n": 503,
+          "days": 87,
+          "mean_pct": -0.0358,
+          "median_pct": -0.1676,
+          "ci95_pct": [
+            -0.1551,
+            0.08
+          ],
+          "win_rate_pct": 40.4
+        },
+        "gap3d_n": 356,
+        "gap3d_excess19": {
+          "n": 356,
+          "days": 84,
+          "mean_pct": -0.0476,
+          "median_pct": -0.1765,
+          "ci95_pct": [
+            -0.1945,
+            0.0653
+          ],
+          "win_rate_pct": 39.6
+        }
+      },
+      "24h": {
+        "n": 503,
+        "net19": {
+          "n": 503,
+          "days": 87,
+          "mean_pct": 0.67,
+          "median_pct": -0.0058,
+          "ci95_pct": [
+            -0.2974,
+            1.3738
+          ],
+          "win_rate_pct": 49.7
+        },
+        "excess19": {
+          "n": 503,
+          "days": 87,
+          "mean_pct": 0.3943,
+          "median_pct": -0.3658,
+          "ci95_pct": [
+            -0.4267,
+            0.9921
+          ],
+          "win_rate_pct": 43.9
+        },
+        "gap3d_n": 356,
+        "gap3d_excess19": {
+          "n": 356,
+          "days": 84,
+          "mean_pct": 0.4778,
+          "median_pct": -0.2964,
+          "ci95_pct": [
+            -0.3017,
+            1.214
+          ],
+          "win_rate_pct": 44.1
+        }
+      }
+    },
+    "score_20_30": {
+      "1h": {
+        "n": 181,
+        "net19": {
+          "n": 181,
+          "days": 65,
+          "mean_pct": -0.1705,
+          "median_pct": -0.2643,
+          "ci95_pct": [
+            -0.6069,
+            0.0506
+          ],
+          "win_rate_pct": 39.2
+        },
+        "excess19": {
+          "n": 181,
+          "days": 65,
+          "mean_pct": -0.2113,
+          "median_pct": -0.2667,
+          "ci95_pct": [
+            -0.5989,
+            0.0367
+          ],
+          "win_rate_pct": 39.2
+        },
+        "gap3d_n": 156,
+        "gap3d_excess19": {
+          "n": 156,
+          "days": 63,
+          "mean_pct": -0.1565,
+          "median_pct": -0.2884,
+          "ci95_pct": [
+            -0.4685,
+            0.1638
+          ],
+          "win_rate_pct": 38.5
+        }
+      },
+      "24h": {
+        "n": 181,
+        "net19": {
+          "n": 181,
+          "days": 65,
+          "mean_pct": -0.1655,
+          "median_pct": -0.0988,
+          "ci95_pct": [
+            -1.8628,
+            0.2666
+          ],
+          "win_rate_pct": 48.1
+        },
+        "excess19": {
+          "n": 181,
+          "days": 65,
+          "mean_pct": -0.6813,
+          "median_pct": -0.7544,
+          "ci95_pct": [
+            -1.9382,
+            -0.1585
+          ],
+          "win_rate_pct": 40.9
+        },
+        "gap3d_n": 156,
+        "gap3d_excess19": {
+          "n": 156,
+          "days": 63,
+          "mean_pct": -0.6878,
+          "median_pct": -0.5943,
+          "ci95_pct": [
+            -1.9087,
+            -0.0361
+          ],
+          "win_rate_pct": 41.7
+        }
+      }
+    },
+    "score_ge30": {
+      "1h": {
+        "n": 105,
+        "net19": {
+          "n": 105,
+          "days": 56,
+          "mean_pct": -0.3741,
+          "median_pct": -0.261,
+          "ci95_pct": [
+            -1.3012,
+            0.1922
+          ],
+          "win_rate_pct": 44.8
+        },
+        "excess19": {
+          "n": 105,
+          "days": 56,
+          "mean_pct": -0.3915,
+          "median_pct": -0.315,
+          "ci95_pct": [
+            -1.2018,
+            0.1955
+          ],
+          "win_rate_pct": 41.0
+        },
+        "gap3d_n": 97,
+        "gap3d_excess19": {
+          "n": 97,
+          "days": 53,
+          "mean_pct": -0.2954,
+          "median_pct": -0.2813,
+          "ci95_pct": [
+            -1.056,
+            0.4485
+          ],
+          "win_rate_pct": 41.2
+        }
+      },
+      "24h": {
+        "n": 105,
+        "net19": {
+          "n": 105,
+          "days": 56,
+          "mean_pct": 1.0854,
+          "median_pct": 0.7477,
+          "ci95_pct": [
+            -1.5557,
+            1.6573
+          ],
+          "win_rate_pct": 58.1
+        },
+        "excess19": {
+          "n": 105,
+          "days": 56,
+          "mean_pct": 0.3289,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -1.6723,
+            1.216
+          ],
+          "win_rate_pct": 45.7
+        },
+        "gap3d_n": 97,
+        "gap3d_excess19": {
+          "n": 97,
+          "days": 53,
+          "mean_pct": 0.7039,
+          "median_pct": -0.1658,
+          "ci95_pct": [
+            -1.2441,
+            1.7313
+          ],
+          "win_rate_pct": 47.4
+        }
+      }
+    },
+    "conf1": {
+      "1h": {
+        "n": 0,
+        "net19": {
+          "n": 0,
+          "note": "no samples"
+        },
+        "excess19": {
+          "n": 0,
+          "note": "no samples"
+        },
+        "gap3d_n": 0,
+        "gap3d_excess19": {
+          "n": 0,
+          "note": "no samples"
+        }
+      },
+      "24h": {
+        "n": 0,
+        "net19": {
+          "n": 0,
+          "note": "no samples"
+        },
+        "excess19": {
+          "n": 0,
+          "note": "no samples"
+        },
+        "gap3d_n": 0,
+        "gap3d_excess19": {
+          "n": 0,
+          "note": "no samples"
+        }
+      }
+    },
+    "conf2": {
+      "1h": {
+        "n": 189,
+        "net19": {
+          "n": 189,
+          "days": 73,
+          "mean_pct": -0.1109,
+          "median_pct": -0.2036,
+          "ci95_pct": [
+            -0.3173,
+            0.0894
+          ],
+          "win_rate_pct": 37.6
+        },
+        "excess19": {
+          "n": 189,
+          "days": 73,
+          "mean_pct": -0.0978,
+          "median_pct": -0.1933,
+          "ci95_pct": [
+            -0.2854,
+            0.0589
+          ],
+          "win_rate_pct": 37.6
+        },
+        "gap3d_n": 159,
+        "gap3d_excess19": {
+          "n": 159,
+          "days": 71,
+          "mean_pct": -0.1022,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.3359,
+            0.0224
+          ],
+          "win_rate_pct": 37.7
+        }
+      },
+      "24h": {
+        "n": 189,
+        "net19": {
+          "n": 189,
+          "days": 73,
+          "mean_pct": 0.3138,
+          "median_pct": 0.045,
+          "ci95_pct": [
+            -0.7033,
+            1.542
+          ],
+          "win_rate_pct": 50.3
+        },
+        "excess19": {
+          "n": 189,
+          "days": 73,
+          "mean_pct": 0.0273,
+          "median_pct": -0.4554,
+          "ci95_pct": [
+            -0.9723,
+            1.0787
+          ],
+          "win_rate_pct": 42.3
+        },
+        "gap3d_n": 159,
+        "gap3d_excess19": {
+          "n": 159,
+          "days": 71,
+          "mean_pct": 0.0345,
+          "median_pct": -0.5232,
+          "ci95_pct": [
+            -0.9762,
+            1.1008
+          ],
+          "win_rate_pct": 42.8
+        }
+      }
+    },
+    "conf_ge3": {
+      "1h": {
+        "n": 600,
+        "net19": {
+          "n": 600,
+          "days": 86,
+          "mean_pct": -0.0896,
+          "median_pct": -0.1313,
+          "ci95_pct": [
+            -0.3361,
+            0.0439
+          ],
+          "win_rate_pct": 44.0
+        },
+        "excess19": {
+          "n": 600,
+          "days": 86,
+          "mean_pct": -0.1315,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.342,
+            0.0129
+          ],
+          "win_rate_pct": 41.0
+        },
+        "gap3d_n": 416,
+        "gap3d_excess19": {
+          "n": 416,
+          "days": 85,
+          "mean_pct": -0.1227,
+          "median_pct": -0.19,
+          "ci95_pct": [
+            -0.3243,
+            0.0624
+          ],
+          "win_rate_pct": 40.1
+        }
+      },
+      "24h": {
+        "n": 600,
+        "net19": {
+          "n": 600,
+          "days": 86,
+          "mean_pct": 0.6029,
+          "median_pct": 0.0574,
+          "ci95_pct": [
+            -0.7729,
+            0.9239
+          ],
+          "win_rate_pct": 50.5
+        },
+        "excess19": {
+          "n": 600,
+          "days": 86,
+          "mean_pct": 0.174,
+          "median_pct": -0.4417,
+          "ci95_pct": [
+            -0.811,
+            0.6549
+          ],
+          "win_rate_pct": 43.8
+        },
+        "gap3d_n": 416,
+        "gap3d_excess19": {
+          "n": 416,
+          "days": 85,
+          "mean_pct": 0.2137,
+          "median_pct": -0.4075,
+          "ci95_pct": [
+            -0.8546,
+            0.8562
+          ],
+          "win_rate_pct": 43.8
+        }
+      }
+    }
+  }
+}
