@@ -1,5 +1,11 @@
 FROM python:3.11-slim AS base
 
+# Build-time source commit provenance. deploy.sh passes `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`
+# so the running image always records which source commit it was built from (read via
+# `docker inspect` LABEL or `cat /app/.git-commit`). Defaults to unknown for ad-hoc builds.
+ARG GIT_COMMIT=unknown
+ENV GIT_COMMIT=${GIT_COMMIT}
+
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -97,6 +103,10 @@ COPY scripts/docker-entrypoint.sh scripts/docker-entrypoint.sh
 COPY conftest.py ./
 # Ops docs (e.g. DSL/SL manual) so they ship inside the image.
 COPY docs/ docs/
+
+# Record the source commit this image was built from (provenance for deploy audits).
+LABEL org.opencontainers.image.revision=${GIT_COMMIT}
+RUN printf '%s\n' "${GIT_COMMIT}" > /app/.git-commit
 
 # Editable-install the project itself now that all source is present.
 RUN uv sync --frozen --no-dev
