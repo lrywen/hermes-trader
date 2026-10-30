@@ -306,8 +306,16 @@ def check_outcome_store() -> bool:
                     f"{c.get('side')} exit={c.get('exit_px')} "
                     f"pnl=${c.get('realized_pnl_usd')}")
         else:
-            _fail("no close_source=reconcile_backfill rows found")
-            ok = False
+            # R1 (2026-10-30): this was a hard _fail on a ONE-TIME historical
+            # backfill (2026-08-22 ETH orphan close). events.jsonl has since
+            # rotated that row out, so the assertion failed on EVERY deploy
+            # (6/7) without indicating any live defect. The record_close
+            # chokepoint itself is covered by the source checks in group 5;
+            # the presence of this specific historical row is informational
+            # only, not a deploy gate. Downgrade to INFO.
+            _info("no close_source=reconcile_backfill rows found "
+                  "(historical 2026-08-22 row rotated out of events.jsonl; "
+                  "not a live defect)")
 
         # Also verify rehydrated opens were recorded.
         trades = memory.get_all_trades() if hasattr(memory, "get_all_trades") else []

@@ -5857,6 +5857,22 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     coin = analysis.get("coin") or ""
     is_hip3 = ":" in coin
     side = (analysis.get("side") or "").lower()
+    # R1 (2026-10-30): short-circuit shorts BEFORE the long-only computation
+    # below (fresh-impulse resolution, weak-trend chase, mover veto, GEX, ...).
+    # With scan_long_only=true / allow_shorts=false, ~92% of evaluated
+    # candidates are shorts that can never be admitted — running them through
+    # the full long gate chain is pure CPU/log-IO waste. The verdict string is
+    # identical to the original block (kept for the shadow recorder), only the
+    # evaluation order changes: short-disabled is decided from config/overlay
+    # alone, which needs none of the long-side fields.
+    if side == "short" and not _ov_allow_shorts:
+        if bool(gate.get("allow_shorts", False)):
+            # Base config allows shorts but the overlay turned them off.
+            logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
+                        f"(E1 choppy-market de-risk overlay)")
+        else:
+            logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
+        return "runner_gate_blocked (shorts disabled)"
     conf = float(analysis.get("confidence", 0) or 0)
     # A structural override rewrites confidence up to min_ai_confidence, which
     # is — by the confidence_guard single-source rule (P0-1) — the SAME value as
@@ -6164,16 +6180,10 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                 pass
 
     if side == "short":
-        # E1 (Audit 2026-09-06): allow_shorts may be force-disabled by the
-        # choppy-market overlay in enforce+de-risk posture (shadow never does).
-        if not _ov_allow_shorts:
-            if bool(gate.get("allow_shorts", False)):
-                # Base config allows shorts but the overlay turned them off.
-                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
-                            f"(E1 choppy-market de-risk overlay)")
-            else:
-                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
-            return "runner_gate_blocked (shorts disabled)"
+        # Reaching here implies _ov_allow_shorts is True — short-disabled is
+        # short-circuited at function entry (R1 2026-10-30) before any long
+        # computation. The per-side score/confidence/structure bars below are
+        # still applied when shorts are enabled.
         short_min_score = float(gate.get("min_short_composite", min_score))
         short_min_conf = float(gate.get("min_short_confidence", min_conf))
         if conf < short_min_conf:

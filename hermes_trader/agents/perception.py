@@ -1121,37 +1121,6 @@ def _scan_single_market(
             "cvd_divergence": _cvd_divergence_info,
             "whale_signal": whale,  # None unless coin is in oi_funding_anomaly hits
         }
-        # Candidate A preregistered shadow arm (merge-plan §5.3, FWER p=0.205
-        # ⇒ shadow only, never live). Record-only: detects higherLows1h ∧
-        # pctMoveSpike ∧ volumeSpike under the coin's own 1h regime=="up" and
-        # appends one row per closed bar for the fixed-4h forward-return
-        # study. Reuses the already-fetched candles_1h (zero extra network);
-        # never routes/orders and never flips allow_shorts. Inert unless
-        # launch_capture.candidate_a_shadow.enabled.
-        try:
-            if ((config.get("launch_capture") or {})
-                    .get("candidate_a_shadow") or {}).get("enabled", False):
-                from hermes_trader.agents.candidate_a_shadow import maybe_record
-                from hermes_trader.agents.market_regime import classify_candles
-
-                _ca_regime = (classify_candles(candles_1h)
-                              if candles_1h else None)
-                _ca_fired = [h["name"] for h in hits if h.get("fired")]
-                maybe_record(
-                    coin=market["coin"],
-                    perception={
-                        "bar_close_ms": scored_bar_close_ms,
-                        "mid": mid,
-                        "composite_score": score,
-                        "fired_triggers": _ca_fired,
-                    },
-                    regime=_ca_regime,
-                    config=config,
-                    data_dir=os.environ.get("HERMES_DATA_DIR", "/data"),
-                )
-        except Exception as _ca_e:
-            logger.debug(f"[candidate_a_shadow] eval failed for "
-                         f"{market.get('coin', '?')}: {_ca_e}")
         return (True, _perception)
     except Exception as e:
         # R12-D1: per-market eval failure used to vanish behind a False return.
