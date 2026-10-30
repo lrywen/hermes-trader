@@ -6595,11 +6595,19 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     # counter-factual veto for every such admit so real forward outcomes accrue
     # under the existing risk_tuning_shadow reconciliation; it does NOT change
     # the live admit/block decision (default shadow_mode off = no-op).
+    # M2 / R1 ENFORCE (gray, 2026-10-30): when ``enforce`` is explicitly true
+    # (default false/fail-closed, hot-reloaded), mover-only bypass admits are
+    # blocked for real in addition to being recorded. Enabling enforce does NOT
+    # change paper/SHADOW vs real-money mode; it only removes this value-
+    # destroying admit path. shadow_mode (or enforce) keeps the audit record.
     try:
         _mb_cfg = gate.get("mover_bypass_veto") or {}
-        if bool(_mb_cfg.get("shadow_mode", False)) and side == "long"                 and structured_daily_mover and not fresh_impulse:
+        _mb_enforce = bool(_mb_cfg.get("enforce", False))
+        _mb_record = bool(_mb_cfg.get("shadow_mode", False)) or _mb_enforce
+        if _mb_record and side == "long" and structured_daily_mover and not fresh_impulse:
             _record_risk_tuning_shadow(
-                rule="mover_bypass_veto", coin=coin, side=side, would="block",
+                rule="mover_bypass_veto", coin=coin, side=side,
+                would=("block_enforced" if _mb_enforce else "block"),
                 detail={
                     "composite_score": round(float(score), 4),
                     "confidence": round(float(gate_conf), 4),
@@ -6609,12 +6617,19 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                     "breakout": bool(breakout),
                     "burst": bool(burst),
                     "volume": bool(volume),
+                    "enforced": bool(_mb_enforce),
                     "entry_px": float(analysis.get("mid") or analysis.get("price") or 0.0),
                 },
                 trace_id=str(analysis.get("id") or ""),
             )
+            if _mb_enforce:
+                logger.info(
+                    f"[runner_gate] {coin} BLOCKED (M2 mover_bypass_veto ENFORCE): "
+                    f"score={score:.0f}, slow={slow_count}, conf={gate_conf:.2f}")
+                return (f"runner_gate_blocked (M2 mover_bypass_veto ENFORCE; "
+                        f"mover-only bypass removed; score={score:.0f}, slow={slow_count})")
     except Exception as _mb_e:
-        logger.warning(f"[runner_gate] M2 mover_bypass_veto shadow failed "
+        logger.warning(f"[runner_gate] M2 mover_bypass_veto failed "
                        f"(non-fatal): {_mb_e}")
 
     # ── M2 / R3 (2026-10-29): over-extension (chase) veto SHADOW ─────────

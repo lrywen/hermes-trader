@@ -528,6 +528,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # enforcement is a separate, explicitly-approved flip after promotion.
         "mover_bypass_veto": {
             "shadow_mode": False,
+            # M2 gray (2026-10-30): explicit real-block kill-switch. Default
+            # false = fail-closed no-op; hot-reloaded, rollback = set false.
+            "enforce": False,
         },
         # M2 / R3 (2026-10-29): over-extension chase veto. Offline 88-day
         # run-up bucketing: fresh longs entered after a >3% pre-entry 1h

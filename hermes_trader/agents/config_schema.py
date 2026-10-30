@@ -774,6 +774,7 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         # overextension_veto would-block stretched fresh-impulse longs.
         "mover_bypass_veto": {
             "shadow_mode": ("bool",),
+            "enforce": ("bool",),  # M2 gray: real block (default false/fail-closed)
         },
         "overextension_veto": {
             "shadow_mode": ("bool",),
