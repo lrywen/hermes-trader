@@ -6675,6 +6675,48 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
         logger.warning(f"[runner_gate] M2 overextension_veto shadow failed "
                        f"(non-fatal): {_oc_e}")
 
+    # ── Stage-4 (2026-10-30): deep slow-burn veto SHADOW ─────────────────
+    # Gate ablation over the 88-day Binance admits (gate_ablation.py): blocking
+    # admits with slow_burn_count>=2 removes a negative-excess cluster on BOTH
+    # horizons (1h excess -0.53%, day-block p=0.0037; 24h -1.88%, p=0.028),
+    # but neither passes the Bonferroni gate (alpha*=0.05/22=0.0023). Per the
+    # pre-registered rule we do NOT enforce; we record a would-block so real
+    # forward outcomes accrue under risk_tuning_shadow reconciliation. This
+    # arm never changes live admission (default shadow_mode off = no-op);
+    # enforce is a separate approved promotion gated on live shadow evidence.
+    try:
+        _ds_cfg = gate.get("deep_slow_burn_veto") or {}
+        _ds_enforce = bool(_ds_cfg.get("enforce", False))
+        _ds_record = bool(_ds_cfg.get("shadow_mode", False)) or _ds_enforce
+        _ds_min = int(_ds_cfg.get("min_slow_burn", 2) or 2)
+        if (_ds_record and side == "long" and fresh_impulse
+                and int(slow_count) >= _ds_min):
+            _record_risk_tuning_shadow(
+                rule="deep_slow_burn_veto", coin=coin, side=side,
+                would=("block_enforced" if _ds_enforce else "block"),
+                detail={
+                    "composite_score": round(float(score), 4),
+                    "confidence": round(float(gate_conf), 4),
+                    "slow_burn_count": int(slow_count),
+                    "min_slow_burn": _ds_min,
+                    "fresh_impulse": bool(fresh_impulse),
+                    "daily_mover": bool(daily_mover),
+                    "breakout": bool(breakout),
+                    "enforced": bool(_ds_enforce),
+                    "entry_px": float(analysis.get("mid") or analysis.get("price") or 0.0),
+                },
+                trace_id=str(analysis.get("id") or ""),
+            )
+            if _ds_enforce:
+                logger.info(
+                    f"[runner_gate] {coin} BLOCKED (deep_slow_burn_veto ENFORCE): "
+                    f"score={score:.0f}, slow={slow_count}")
+                return (f"runner_gate_blocked (deep_slow_burn_veto ENFORCE; "
+                        f"slow_burn_count>={_ds_min}; score={score:.0f})")
+    except Exception as _ds_e:
+        logger.warning(f"[runner_gate] deep_slow_burn_veto shadow failed "
+                       f"(non-fatal): {_ds_e}")
+
     logger.info(
         f"[runner_gate] {coin} long ADMITTED: score={score:.0f}, slow={slow_count}, "
         f"fresh={int(fresh_impulse)}, dMover={int(structured_daily_mover)}, "

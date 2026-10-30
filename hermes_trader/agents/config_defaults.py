@@ -531,6 +531,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "shadow_mode": False,
             "max_extension_atr": 3.0,
         },
+        # Stage-4 (2026-10-30): deep slow-burn veto. Gate ablation
+        # (gate_ablation.py) showed slow_burn_count>=2 admits carry negative
+        # excess on both horizons (nominal p, not Bonferroni-pass), so this is
+        # shipped SHADOW-ONLY: true only records a would-block
+        # (rule=deep_slow_burn_veto) for real-outcome reconciliation. Default
+        # shadow_mode=false = no-op; enforce is a separate approved promotion
+        # after live shadow evidence (fail-closed default false).
+        "deep_slow_burn_veto": {
+            "shadow_mode": False,
+            "enforce": False,
+            "min_slow_burn": 2,
+        },
         # 4h late-entry veto (mirrors the code defaults that _runner_entry_block
         # _reason used before these were schema-configurable).
         "rsi_overbought": 75.0,

@@ -774,6 +774,12 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
             "shadow_mode": ("bool",),
             "max_extension_atr": _num_leaf(0.0, 50.0),
         },
+        # Stage-4: deep slow-burn veto (shipped shadow-only, see config_defaults).
+        "deep_slow_burn_veto": {
+            "shadow_mode": ("bool",),
+            "enforce": ("bool",),
+            "min_slow_burn": _num_leaf(0.0, 20.0),
+        },
         # 4h late-entry veto thresholds (consumed in _runner_entry_block_reason).
         # Previously read via .get() with hard-coded defaults but absent from the
         # schema, so they could not be tuned; added here with the code defaults.

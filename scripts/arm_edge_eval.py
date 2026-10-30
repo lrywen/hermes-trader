@@ -16,7 +16,11 @@ happens if we apply the arm:
 The decision metric is net P&L of the resulting portfolio and edge vs the
 blocked baseline, with day-block bootstrap 95% CI. Arms do NOT touch live code.
 """
-import argparse, bisect, datetime, json, math, random
+import argparse
+import datetime
+import json
+import math
+import random
 from collections import defaultdict
 
 COST19 = 0.0019
@@ -64,12 +68,52 @@ def arm_score_floor40(f):
 def arm_score_floor50(f):
     return float(f.get("composite_score") or 0) < 50.0
 
+
+# ── Stage-4 (2026-10-30): extend to the slow / conf / score-band dimensions ──
+# The original 5 arms all live on the path axis (fresh/dMover). The three-way
+# review converged on two real axes (A: fresh+brk+slow, C: dMover+not-brk), so
+# brk is NOT re-tested (it is the path axis). These arms probe the remaining
+# un-sliced dimensions: slow_burn_count depth, confidence band, score band.
+def arm_slow_ge2(f):
+    """Block deep slow-burn (slow_burn_count>=2) — stage-3 lead, needs CI."""
+    return int(f.get("slow_burn_count") or 0) >= 2
+
+def arm_slow_eq1(f):
+    """Block shallow slow-burn (slow_burn_count==1) — keep only deep structure."""
+    return int(f.get("slow_burn_count") or 0) == 1
+
+def arm_score_mid_20_30(f):
+    """Block the mid-score band 20-30 (stage-3 negative sub-cluster)."""
+    s = float(f.get("composite_score") or 0)
+    return 20 <= s < 30
+
+def arm_score_lt20(f):
+    """Block low-score (<20) — keep only scored entries."""
+    return float(f.get("composite_score") or 0) < 20
+
+def arm_conf_lt70(f):
+    """Block low-confidence (<0.70) — note: replay conf is neutralized to 0.9,
+    so this arm is a no-op on replay data and only meaningful on live verdicts."""
+    return float(f.get("confidence") or 0) < 0.70
+
+def arm_no_vol(f):
+    """Block entries without a 2-sigma volumeSpike (vol=False)."""
+    return not bool(f.get("vol"))
+
+
 ARMS = {
     "R1_remove_daily_mover": arm_remove_daily_mover,
     "R1b_require_fresh_impulse": arm_require_fresh,
     "R1c_fresh_or_slow>=3": arm_fresh_or_strong_slow,
     "Rscore_floor40": arm_score_floor40,
     "Rscore_floor50": arm_score_floor50,
+    # new dimensions
+    "S_slow_ge2": arm_slow_ge2,
+    "S_slow_eq1": arm_slow_eq1,
+    "S_score_mid20_30": arm_score_mid_20_30,
+    "S_score_lt20": arm_score_lt20,
+    "S_conf_lt70": arm_conf_lt70,
+    "S_no_vol": arm_no_vol,
 }
 
 

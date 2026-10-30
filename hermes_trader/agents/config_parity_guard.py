@@ -174,6 +174,9 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "runner_entry_gate.mover_bypass_veto.shadow_mode": (False, True),
     "runner_entry_gate.mover_bypass_veto.enforce": (False, True),
     "runner_entry_gate.overextension_veto.shadow_mode": (False, True),
+    # Stage-4 deep slow-burn veto: production records would-blocks for real
+    # forward reconciliation; admission/orders unchanged. enforce stays false.
+    "runner_entry_gate.deep_slow_burn_veto.shadow_mode": (False, True),
     # 生产功能开关（live 开启，canonical 关闭；开启更激进，但非保护放宽）
     "candlestick_patterns.enabled": (False, True),
     "debate_research.enabled": (False, True),

@@ -133,3 +133,46 @@ def test_r3_skips_low_extension(isolated, monkeypatch):
     assert executor._runner_entry_block_reason_impl(
         _fresh_analysis(close4h=101.0), cfg) == ""
     assert [c for c in calls if c.get("rule") == "overextension_veto"] == []
+
+
+# ── Stage-4 deep slow-burn veto (shipped shadow-only) ──────────────────────
+
+def test_ds_disabled_is_strict_noop(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), _gate()) == ""
+    assert [c for c in calls if c.get("rule") == "deep_slow_burn_veto"] == []
+
+
+def test_ds_shadow_records_but_still_admits(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(deep_slow_burn_veto={"shadow_mode": True,
+                                     "enforce": False, "min_slow_burn": 2})
+    # slow_burn_count=2, fresh=True -> would-block recorded, still admitted
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), cfg) == ""
+    flagged = [c for c in calls if c.get("rule") == "deep_slow_burn_veto"]
+    assert len(flagged) == 1
+    assert flagged[0]["would"] == "block"
+    assert flagged[0]["detail"]["slow_burn_count"] == 2
+    assert flagged[0]["detail"]["fresh_impulse"] is True
+
+
+def test_ds_skips_shallow_slow_burn(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(deep_slow_burn_veto={"shadow_mode": True, "min_slow_burn": 2})
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(slow_burn_count=1), cfg) == ""
+    assert [c for c in calls if c.get("rule") == "deep_slow_burn_veto"] == []
+
+
+def test_ds_enforce_blocks(isolated, monkeypatch):
+    calls = _spy(monkeypatch)
+    cfg = _gate(deep_slow_burn_veto={"shadow_mode": False,
+                                     "enforce": True, "min_slow_burn": 2})
+    reason = executor._runner_entry_block_reason_impl(
+        _fresh_analysis(), cfg)
+    assert "deep_slow_burn_veto ENFORCE" in reason
+    flagged = [c for c in calls if c.get("rule") == "deep_slow_burn_veto"]
+    assert len(flagged) == 1
+    assert flagged[0]["would"] == "block_enforced"

@@ -80,6 +80,9 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "replay_gate.py",
     "reconcile_binance_stream.py",
     "arm_edge_eval.py",
+    # Stage-4 one-shot counter-factual gate ablation over bn90d replay; runs
+    # via `docker exec` against /data (same class as m1_ofi_eval.py).
+    "gate_ablation.py",
     "promotion_gate.py",
     "real_verdict_eval.py",
     "assemble_veto_evidence.py",
