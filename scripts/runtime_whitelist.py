@@ -83,6 +83,9 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # Stage-4 one-shot counter-factual gate ablation over bn90d replay; runs
     # via `docker exec` against /data (same class as m1_ofi_eval.py).
     "gate_ablation.py",
+    # Stage-4 deep slow-burn veto multi-source promotion review (one-shot,
+    # docker exec against /data; same class as gate_ablation.py).
+    "deep_slow_burn_review.py",
     "promotion_gate.py",
     "real_verdict_eval.py",
     "assemble_veto_evidence.py",
