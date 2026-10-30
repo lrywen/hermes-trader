@@ -1,0 +1,32 @@
+{
+  "generated_utc": "2026-10-30T01:21:56Z",
+  "horizon": "4h",
+  "cost_pct": 0.19,
+  "min_real_n": 50,
+  "arms": [
+    {
+      "rule": "mover_bypass_veto",
+      "horizon_bars": 48,
+      "would_block_records": 325,
+      "real_verdict": {
+        "n": 325,
+        "mean_pct": -1.1402,
+        "agree": true,
+        "same_direction": true,
+        "sufficient": true
+      }
+    },
+    {
+      "rule": "overextension_veto",
+      "horizon_bars": 48,
+      "would_block_records": 0,
+      "real_verdict": {
+        "n": 0,
+        "mean_pct": null,
+        "agree": false,
+        "same_direction": false,
+        "sufficient": false
+      }
+    }
+  ]
+}

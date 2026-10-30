@@ -50,10 +50,14 @@ def forward_returns(recs, horizon_bars):
     for coin, rs in by_coin.items():
         if B.to_binance_symbol(coin) is None:
             continue
-        ts0 = min(_parse_ts(r["timestamp"]) for r in rs)
+        _ts = [_parse_ts(r["timestamp"]) for r in rs]
+        ts0, ts1 = min(_ts), max(_ts)
         try:
+            # span min..max+horizon so records spread across a long backfill
+            # window each align correctly (a single short window from the
+            # earliest ts misaligns/drops later records).
             cd = B.fetch_candle_range(coin, "5m", ts0 - 1000,
-                                      min(now_ms, ts0 + (horizon_bars + 5) * 300000))
+                                      min(now_ms, ts1 + (horizon_bars + 5) * 300000))
         except Exception:
             continue
         cts = [c.t for c in cd]; cs = [c.c for c in cd]
