@@ -1461,6 +1461,19 @@ _TRADES_DROP_GRACE_CYCLES = 3
 _trades_absent_cycles: dict = {}
 
 
+# P3 崩溃恢复：主循环启动前一次性扫描意图 WAL 中的未决订单并对账。
+# 确认成交的仓位由后续首个 tick 的 rehydrate_from_exchange 补登 tracker；
+# 此处只负责把 WAL 里的意图状态推进到终态（FILLED/FAILED）或保持 UNKNOWN。
+# best-effort：任何失败只记日志，绝不阻断启动。
+try:
+    from hermes_trader.execution.recover import recover_pending_orders
+    _rc_summary = recover_pending_orders()
+    if _rc_summary.get("scanned"):
+        logger.warning(f"[startup] P3 订单意图崩溃恢复: {_rc_summary}")
+except Exception as _rc_e:
+    logger.error(f"[startup] P3 崩溃恢复异常（不阻断启动）: {_rc_e!r}")
+
+
 while True:
     try:
         # ── Integrity: flag any config write that bypassed config_store ───

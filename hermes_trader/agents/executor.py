@@ -2296,7 +2296,8 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
                                     mid_price: float, cloid: Any,
                                     config: dict[str, Any], user: str,
                                     mode: str, aid: str,
-                                    gate_results: Any) -> dict[str, Any] | None:
+                                    gate_results: Any,
+                                    intent: Any = None) -> dict[str, Any] | None:
     """Handle a failed order placement. A DEFINITE failure (HL envelope
     rejection, slippage cap, local validation) clears the in-flight marker and
     returns an order_failed result. error_code="response_unknown" (408 / read
@@ -2307,8 +2308,10 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
     breaker on the latter) and returns a rejection result dict."""
     if order_res.get("ok"):
         return None
+    from hermes_trader.execution import lifecycle as _lc
     if order_res.get("error_code") != "response_unknown" or cloid is None:
         # Definite rejection / envelope error — no order on the exchange.
+        _lc.mark_failed(intent, reason=f"order_failed: {order_res.get('error', 'unknown')}")
         _reset_resp_unknown_streak()
         with _EXEC_LOCK:
             _IN_FLIGHT_ANALYSES.discard(aid)
@@ -2318,6 +2321,8 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
             "reason": f"order_failed: {order_res.get('error', 'unknown')}",
             "gate_results": gate_results,
         }
+    # response_unknown：回执丢失，进入待对账状态。
+    _lc.mark_unknown(intent, reason="response_unknown")
     try:
         from hermes_trader.client.exchange import reconcile_order_fill
         _rc = reconcile_order_fill(
@@ -2358,10 +2363,13 @@ def _reconcile_unknown_order_result(order_res: dict[str, Any], *, coin: str,
             "filled_at_ms": _rc.get("filled_at_ms"),
             "reconciled_after_response_unknown": True,
         })
+        # FILLED 统一在 _register_filled_position 之后标记（正常成功路径），
+        # 此处不重复标，避免终态二次迁移。
         return None
     if _rc.get("status") == "not_filled":
         # Exchange answered cleanly and has no fill → the order truly did not
         # execute. Safe to clear + retry later.
+        _lc.mark_failed(intent, reason="response_unknown_not_filled")
         _reset_resp_unknown_streak()
         logger.info(f"[executor] H6 reconcile {coin}: confirmed NOT filled "
                     f"after response loss ({_rc.get('reason')}); safe to retry.")
@@ -4914,6 +4922,13 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "gate_results": gate_output["results"],
         }
 
+    # P3 意图 WAL：下单前记录意图（含完整上下文），崩溃后可重建并对账。
+    # best-effort：WAL 失败不阻断下单（资金安全靠 cloid 幂等 + reconcile）。
+    from hermes_trader.execution import lifecycle as _lc
+    _intent = _lc.begin_order(
+        cloid=_cloid, coin=coin, side=trade_side, is_buy=is_buy,
+        size_in_coin=size_in_coin, mid_px=mid_price, mode=mode,
+        analysis_id=_aid)
     if _maker_on:
         from hermes_trader.execution.maker import place_hl_maker_order
 
@@ -4926,11 +4941,14 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             coin=coin, cloid=_cloid, max_notional=_mk_max)
     else:
         order_res = place_hl_order(is_buy, size_in_coin, mid_price, coin, cloid=_cloid)
+    # P3：订单已离手（无论回执），推进到 SUBMITTED。
+    _lc.mark_submitted(_intent)
 
     _order_fail = _reconcile_unknown_order_result(
         order_res, coin=coin, is_buy=is_buy, size_in_coin=size_in_coin,
         mid_price=mid_price, cloid=_cloid, config=config, user=user,
-        mode=mode, aid=_aid, gate_results=gate_output["results"])
+        mode=mode, aid=_aid, gate_results=gate_output["results"],
+        intent=_intent)
     if _order_fail is not None:
         # G-P1-3: a definite rejection / confirmed-not-filled / unresolved
         # lookup means no success-path register will run — release the flock.
@@ -4962,6 +4980,11 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
         trade_side=trade_side, mid_price=mid_price, size_in_coin=size_in_coin,
         atr=atr, leverage=leverage, user=user,
         override_composite=override_composite, enf=_enf, aid=_aid)
+    # P3：正常成功路径（含 ok=True 早退与 reconcile 补登）在此统一确认成交。
+    # reconcile 分支已标过 FILLED 时此为幂等 no-op（终态不可再迁移，被
+    # lifecycle._transition 的异常守卫吞掉并记日志，不影响主流程）。
+    if order_res.get("ok"):
+        _lc.mark_filled(_intent, order_res)
     entry_px = _fill["entry_px"]
     position_notional = _fill["position_notional"]
     size_in_coin = _fill["size_in_coin"]
