@@ -80,6 +80,10 @@ def run(
         if pending is not None:
             entry_side = pending.side
             entry_ref = bar.o
+            # P2 数据同源：raw fill 模型需要成交时刻（bar open ms）做 PIT 查询；
+            # 普通 CostModel 无 set_time，hasattr 守卫保持接口兼容。
+            if hasattr(cost, "set_time"):
+                cost.set_time(bar.t)
             entry_fill = cost.fill_entry(bar.o, entry_side)
             entry_bar = i
             # A signal carrying its own decision-time context (replay) wins;
@@ -120,6 +124,10 @@ def run(
                 # The adapter indexes bars relative to the entry bar; the
                 # position closes on the bar currently being processed.
                 exit_bar = i
+                # P2 数据同源：exit fill 时刻 = 当前 bar 的 open ms（与 entry 同
+                # 语义，PIT 只向后看）。stop/floor 的 ref_px 已是 gap-filled 参考。
+                if hasattr(cost, "set_time"):
+                    cost.set_time(bar.t)
                 exit_fill = cost.fill_exit(exit_event.ref_px, entry_side,
                                            exit_event.reason)
                 gross, net = cost.pnl_usd(entry_side, entry_fill, exit_fill,
