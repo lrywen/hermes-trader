@@ -235,12 +235,14 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "shadow_book.maker_fill_model": ("v1", "v2"),
     "shadow_book.maker_limit_offset_bps": (5.0, 12.0),
     "shadow_book.maker_v2_coins": ([], ["BTC"]),
-    # 2026-10-31: live raised the v2 conditional base fill prob 0.30→0.87 from
-    # the empirical 5m calibration (scripts/maker_v2_calibrate_real.py). This is
-    # a paper-only SHADOW fill model parameter — mode=SHADOW cannot place
-    # orders, so a more optimistic fill assumption only changes shadow ledger
-    # accounting, never real capital. Value-bound: any further change re-reviews.
-    "shadow_book.maker_v2_base_fill_prob": (0.30, 0.87),
+    # 2026-10-31: v2 conditional base fill prob re-calibrated on REAL 5m
+    # candles at the LIVE 12bp offset (scripts/maker_v2_calibrate_real.py):
+    # BTC recommend 0.2652, ETH 0.2223 → live set to the more conservative
+    # 0.22 (was an empirical 5bp 0.87, judged too optimistic). Paper-only
+    # SHADOW parameter — mode=SHADOW cannot place orders, so this only
+    # affects shadow ledger accounting, never real capital. Value-bound:
+    # any further change re-reviews.
+    "shadow_book.maker_v2_base_fill_prob": (0.30, 0.22),
 }
 
 
