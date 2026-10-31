@@ -79,7 +79,7 @@ def test_config_halflife_parsing(monkeypatch):
     monkeypatch.delenv(_ENV_MODE, raising=False)
     assert executor._confidence_decay_config(
         {"confidence_decay": {"halflife_s": 300}})["halflife_s"] == 300.0
-    # Garbage halflife → default; negatives clamp to 0 (decay_factor → 1.0).
+    # Garbage halflife → default; negatives clamp to 0 (no decay).
     assert executor._confidence_decay_config(
         {"confidence_decay": {"halflife_s": "x"}})["halflife_s"] == \
         executor._CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S

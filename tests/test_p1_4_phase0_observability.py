@@ -2,16 +2,13 @@
 
 Read-only behavioral surface: no trading semantics change, no env removed.
 
-P0-1  the 4th gray-release mode (HERMES_SIGNAL_AGE_DECAY_MODE, read by
-      perception._age_decay_config) is registered in config_store's legacy env
-      list, so it appears in the startup snapshot like the other three modes.
 P0-2  the sizing_v2 one-time env-vs-config drift alarm is generalized to all
-      four gray-release modes: when a valid env mode actively overrides the
+      gray-release modes: when a valid env mode actively overrides the
       persisted file value (file absent/off counts too), a warning fires once
       per process and a config_env_drift session event is appended. Aligned or
       absent env stays silent.
 P0-3  the snapshot gains an ``accessor_effective`` view resolving loop_runtime
-      knobs and the four gray modes through their REAL module accessors — the
+      knobs and the gray modes through their REAL module accessors — the
       canonical provenance walk cannot see legacy env overrides there.
 P0-4  three dedicated kill/observability switches that bypass HERMES_CFG_
       (HERMES_HL_RATE_STATS, HERMES_PRICE_CROSSCHECK_ENABLED,
@@ -26,27 +23,19 @@ import logging
 import pytest
 
 from hermes_trader import loop_runtime, session_log
-from hermes_trader.agents import config_store, executor, perception
+from hermes_trader.agents import config_store, executor
 
-# ── P0-1: 4th gray-release mode registered ─────────────────────────────────
+# ── P0-1: gray-release modes registered ────────────────────────────────────
 
-def test_p01_signal_age_mode_visible_in_legacy_env_overrides(monkeypatch):
-    monkeypatch.setenv("HERMES_SIGNAL_AGE_DECAY_MODE", "shadow")
-    snap = config_store.build_effective_config_snapshot()
-    assert (snap["legacy_env_overrides"]["HERMES_SIGNAL_AGE_DECAY_MODE"]
-            == "shadow")
-
-
-def test_p01_all_four_gray_modes_registered():
+def test_p01_all_gray_modes_registered():
     assert set(config_store._GRAY_MODE_ENV_KEYS) == {
         "HERMES_CONFIDENCE_DECAY_MODE",
         "HERMES_ATR_REGIME_CALIB_MODE",
         "HERMES_SIZING_V2_MODE",
-        "HERMES_SIGNAL_AGE_DECAY_MODE",
     }
 
 
-# ── P0-2: drift alarm generalized to all four modes ────────────────────────
+# ── P0-2: drift alarm generalized ──────────────────────────────────────────
 
 @pytest.fixture
 def drift_events(monkeypatch):
@@ -74,10 +63,6 @@ _DRIFT_CASES = (
                               "sizing_v2_enabled": False}},
          "atr_risk_sizing.sizing_v2_mode",
          lambda c: executor._sizing_v2_config(c)["mode"]),
-        ("HERMES_SIGNAL_AGE_DECAY_MODE",
-         {"signal_age_decay": {"mode": "off"}},
-         "signal_age_decay.mode",
-         lambda c: perception._age_decay_config(c)["mode"]),
     ],
 )
 
@@ -172,20 +157,16 @@ def test_p03_accessor_view_closes_loop_runtime_blind_spot(
     assert set(rt) == set(loop_runtime.LOOP_RUNTIME_DEFAULTS)
 
 
-def test_p03_accessor_view_exposes_all_four_gray_modes(monkeypatch):
-    monkeypatch.setenv("HERMES_SIGNAL_AGE_DECAY_MODE", "shadow")
+def test_p03_accessor_view_exposes_all_gray_modes(monkeypatch):
+    monkeypatch.setenv("HERMES_CONFIDENCE_DECAY_MODE", "shadow")
     snap = config_store.build_effective_config_snapshot()
     modes = snap["accessor_effective"]["gray_modes"]
     assert set(modes) == {
         "atr_regime_calibration.mode",
         "confidence_decay.mode",
         "atr_risk_sizing.sizing_v2_mode",
-        "signal_age_decay.mode",
     }
-    assert modes["signal_age_decay.mode"] == "shadow"
-    # The canonical leaf still shows the file/default value — the exact blind
-    # spot this view exists to close.
-    assert snap["keys"]["signal_age_decay.mode"]["value"] in ("off", None)
+    assert modes["confidence_decay.mode"] == "shadow"
 
 
 # ── P0-4: dedicated kill/observability switches registered ────────────────

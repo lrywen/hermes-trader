@@ -2233,26 +2233,6 @@ class AgentMemory:
         with self._lock:
             return list(self._trades)
 
-    def count_openings_since(self, coin: str, since_ms: int) -> int:
-        # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: count this
-        # coin's OPENING fills (record_trade only ever records entries; closes
-        # live in _closes) executed at/after ``since_ms``. Backs the per-coin
-        # rolling reentry cap; a pure scan over the trade log so it shares the
-        # existing retention/sweep and needs no extra state to rebuild.
-        with self._lock:
-            trades = list(self._trades)
-        n = 0
-        for t in trades:
-            if t.get("coin") != coin:
-                continue
-            try:
-                ts = int(t.get("executed_at") or 0)
-            except (TypeError, ValueError):
-                continue
-            if ts >= since_ms:
-                n += 1
-        return n
-
     def get_all_analyses(self) -> list[dict[str, Any]]:
         with self._lock:
             return list(self._analyses)

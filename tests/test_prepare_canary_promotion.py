@@ -33,7 +33,7 @@ def _grade(**over):
 
 def test_gather_evidence_handles_windows_list():
     ev = pcp.gather_evidence(
-        "signal_age_decay", {"signal_age_decay": _grade()},
+        "trend_filter_200ma", {"trend_filter_200ma": _grade()},
         killswitch_tested=False, orderable=False)
     assert ev["mature_outcomes"] == 0
     # missing r5/independent/realistic fields stay None (fail closed)
@@ -51,19 +51,19 @@ def test_gather_evidence_falls_back_to_widest_window():
 
 def test_main_dry_run_does_not_crash(tmp_path, monkeypatch):
     hist = tmp_path / "shadow_grade_history.jsonl"
-    hist.write_text(json.dumps({"arms": [_grade(arm="signal_age_decay")]})
+    hist.write_text(json.dumps({"arms": [_grade(arm="trend_filter_200ma")]})
                     + "\n")
     monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
-    rc = pcp.main(["--arms", "signal_age_decay"])
+    rc = pcp.main(["--arms", "trend_filter_200ma"])
     assert rc == 0
 
 
 def test_main_no_pending_file_when_unqualified(tmp_path, monkeypatch):
     hist = tmp_path / "shadow_grade_history.jsonl"
-    hist.write_text(json.dumps({"arms": [_grade(arm="signal_age_decay")]})
+    hist.write_text(json.dumps({"arms": [_grade(arm="trend_filter_200ma")]})
                     + "\n")
     monkeypatch.setenv("HERMES_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("HERMES_CANARY_PIPELINE_FILE",
                        str(tmp_path / "pending.jsonl"))
-    pcp.main(["--write", "--arms", "signal_age_decay"])
+    pcp.main(["--write", "--arms", "trend_filter_200ma"])
     assert not (tmp_path / "pending.jsonl").exists()

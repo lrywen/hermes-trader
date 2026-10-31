@@ -10,8 +10,7 @@ survived into replay/audit scripts:
   an indicator subtracted them. This was the only defect that actually crashed
   a replay script.
 * ``composite_score`` guarded a NaN/inf aggregate (plain ``min(100, nan)``
-  returns 100 — a phantom max score), but the ``composite_score_aged`` twin
-  had no such guard.
+  returns 100 — a phantom max score).
 
 These tests pin hand-computed values for the core indicators (no numpy/pandas
 in the runtime image, so the oracle is arithmetic, not a second library) and
@@ -119,19 +118,3 @@ def test_composite_score_nan_aggregate_fails_closed():
     assert triggers.composite_score([_hit("a", float("nan"))], _W) == 0.0
     assert triggers.composite_score([_hit("a", float("inf"))], _W) == 0.0
 
-
-def test_composite_score_aged_nan_aggregate_fails_closed():
-    # Same NaN hit through the aged twin must NOT surface the 100 ceiling.
-    hits = [_hit("a", float("nan"))]
-    aged = triggers.composite_score_aged(
-        hits, _W, current_bar_ms=1000, onset_ms={}, halflife_ms={})
-    assert aged == 0.0
-
-
-def test_composite_score_aged_normal_finite_matches_expected():
-    # New trigger (no onset -> factor 1.0): single fired hit weight 0.4 over
-    # total weight 0.7, score 10 -> (10*0.4/0.7)*10 = 57.142...
-    hits = [_hit("a", 10.0), _hit("b", 0.0)]
-    aged = triggers.composite_score_aged(
-        hits, _W, current_bar_ms=1000, onset_ms={}, halflife_ms={})
-    assert aged == pytest.approx((10.0 * 0.4 / 0.7) * 10)

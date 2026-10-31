@@ -600,12 +600,6 @@
     "mode": "enforce",
     "sample_rate": 1
   },
-  "reentry_cap": {
-    "max_per_coin": 2,
-    "mode": "shadow",
-    "shadow_log_path": "/data/reentry_cap_shadow.jsonl",
-    "window_hours": 24
-  },
   "reflection": {
     "enabled": true,
     "inject_limit": 3,
@@ -795,23 +789,6 @@
     "pct_sigma_min": 3,
     "shadow_mode": true,
     "vol_sigma_min": 5
-  },
-  "signal_age_decay": {
-    "halflife_s": {
-      "breakout": 900,
-      "higherLows1h": 7200,
-      "momentumBurst": 0,
-      "momentumContinuation1h": 7200,
-      "pctMoveSpike": 0,
-      "rangeCompression": 0,
-      "trendFlip1h": 7200,
-      "trendStrength": 1800,
-      "volumeBuildup1h": 7200,
-      "volumeSpike": 0
-    },
-    "mode": "shadow",
-    "onset_ttl_s": 21600,
-    "shadow_log_path": "/data/signal_age_decay_shadow.jsonl"
   },
   "signal_enforcement": {
     "boost": false,

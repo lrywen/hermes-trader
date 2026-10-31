@@ -1772,15 +1772,13 @@ def _resolve_provenance(dotted_key: str) -> tuple[Any, str]:
 
 # Gray-release MODE switches that bypass the generic HERMES_CFG_ scheme
 # (each is read by its own module accessor: executor._atr_calib_config /
-# _sizing_v2_config / _confidence_decay_config and perception._age_decay_config).
+# _sizing_v2_config / _confidence_decay_config).
 # Included in the startup effective-config snapshot so non-canonical overrides
-# are visible too. P1-4 Phase 0: the 4th mode (signal_age_decay) was previously
-# missing and silently invisible.
+# are visible too.
 _GRAY_MODE_ENV_KEYS: tuple[str, ...] = (
     "HERMES_CONFIDENCE_DECAY_MODE",
     "HERMES_ATR_REGIME_CALIB_MODE",
     "HERMES_SIZING_V2_MODE",
-    "HERMES_SIGNAL_AGE_DECAY_MODE",
 )
 
 # Dedicated kill/observability switches read directly by runtime modules,
@@ -1999,7 +1997,7 @@ def _accessor_effective_view() -> dict[str, Any]:
     except Exception as e:
         view["loop_runtime"] = {"error": f"{type(e).__name__}: {e}"}
     try:
-        from hermes_trader.agents import executor, perception
+        from hermes_trader.agents import executor
 
         cfg = read_agent_config()
         view["gray_modes"] = {
@@ -2009,8 +2007,6 @@ def _accessor_effective_view() -> dict[str, Any]:
                 executor._confidence_decay_config(cfg)["mode"],
             "atr_risk_sizing.sizing_v2_mode":
                 executor._sizing_v2_config(cfg)["mode"],
-            "signal_age_decay.mode":
-                perception._age_decay_config(cfg)["mode"],
         }
     except Exception as e:
         view["gray_modes"] = {"error": f"{type(e).__name__}: {e}"}
@@ -2256,11 +2252,10 @@ def build_effective_config_snapshot() -> dict[str, Any]:
     mutates state and never raises (returns an {"error": ...} leaf instead).
 
     P1-4 Phase 0 additions:
-      * legacy_env_overrides now covers all FOUR gray-release MODE env vars
-        (signal_age_decay was previously missing);
+      * legacy_env_overrides now covers all THREE gray-release MODE env vars;
       * env_switches lists the dedicated kill/observability switches even
         when unset, alongside their default-when-unset (two default ON);
-      * accessor_effective resolves loop_runtime knobs and the four gray
+      * accessor_effective resolves loop_runtime knobs and the three gray
         modes through their real module accessors — the only place legacy
         env overrides of those paths are visible.
     """

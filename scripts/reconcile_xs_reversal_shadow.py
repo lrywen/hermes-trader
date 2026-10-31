@@ -15,6 +15,15 @@ already graded (unless --force), and by default is a dry run; --write stamps
 Pure paper reconciliation: never places an order, never touches a live
 decision. Read-only on the market (1h candleSnapshot).
 
+P2 RSI bucket observation (2026-10-31) — read-only, rsi_long is NOT touched:
+  * bucket edges are FROZEN before looking at results: [15,20) [20,25)
+    [25,30) [30,35), plus the two non-candidate tails (<15 / >=35);
+  * a bucket is only allowed to raise a parameter hypothesis when it has
+    n >= RSI_BUCKET_MIN_N graded records AND its mean 72h net move differs
+    from the [25,30) reference bucket by >= RSI_BUCKET_MIN_DELTA_PP;
+  * even then this script only prints an observation — changing rsi_floor /
+    rsi_long requires a separate promote decision via config_store.
+
 Usage:
     python3 scripts/reconcile_xs_reversal_shadow.py
     python3 scripts/reconcile_xs_reversal_shadow.py --write
@@ -25,6 +34,7 @@ from __future__ import annotations
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
@@ -64,6 +74,21 @@ DEFAULT_COST_BPS = 9.26
 MATURE_OUTCOMES = ("win", "loss")
 _LEGACY_OUTCOME = {"winner": "win", "loser": "loss"}
 
+# ── P2 RSI bucket observation (pre-registered 2026-10-31) ─────────────────────
+# Frozen bucket edges (the canonical xs_reversal geometry: rsi_floor=15,
+# rsi_long=35). They are deliberately hard-coded, not read from live config,
+# so a moved threshold can never silently re-cut the buckets and make the
+# observation self-fulfilling.
+RSI_BUCKET_FLOOR = 15.0
+RSI_BUCKET_LONG = 35.0
+RSI_BUCKET_EDGES = (20.0, 25.0, 30.0)
+RSI_BUCKET_ORDER = ("[15,20)", "[20,25)", "[25,30)", "[30,35)", "<15", ">=35", "?")
+RSI_BUCKET_REF = "[25,30)"
+# Pre-registered evidence bar: a bucket may raise a hypothesis only with this
+# many graded records AND a mean 72h net move this far from the reference.
+RSI_BUCKET_MIN_N = 30
+RSI_BUCKET_MIN_DELTA_PP = 2.0
+
 
 def _signal_ms(rec: dict[str, Any]) -> Optional[int]:
     # xs_reversal stores an int millisecond epoch under "timestamp".
@@ -78,6 +103,84 @@ def _signal_ms(rec: dict[str, Any]) -> Optional[int]:
         except ValueError:
             return None
     return None
+
+
+def _rsi_bucket(rsi: Any) -> str:
+    """Frozen P2 bucket label for one signal's RSI (see module docstring)."""
+    try:
+        v = float(rsi)
+    except (TypeError, ValueError):
+        return "?"
+    if not math.isfinite(v):
+        return "?"
+    if v < RSI_BUCKET_FLOOR:
+        return "<15"
+    if v >= RSI_BUCKET_LONG:
+        return ">=35"
+    lo = RSI_BUCKET_FLOOR
+    for edge in RSI_BUCKET_EDGES:
+        if v < edge:
+            return f"[{lo:g},{edge:g})"
+        lo = edge
+    return f"[{lo:g},{RSI_BUCKET_LONG:g})"
+
+
+def _tally_rsi(by_rsi: dict[str, dict[str, Any]], r: dict[str, Any],
+               win: bool) -> None:
+    """Fold one graded record into the P2 RSI bucket panel (read-only)."""
+    label = _rsi_bucket(r.get("rsi14"))
+    b = by_rsi.setdefault(label, {"n": 0, "wins": 0, "sum_pnl": 0.0,
+                                 "pnl_n": 0, "days": set()})
+    b["n"] += 1
+    b["wins"] += int(win)
+    p = r.get("pnl_pct")
+    if isinstance(p, (int, float)) and math.isfinite(p):
+        b["sum_pnl"] += float(p)
+        b["pnl_n"] += 1
+    ts = _signal_ms(r)
+    if ts:
+        b["days"].add(ts // 86_400_000)
+
+
+def _rsi_bucket_report(by_rsi: dict[str, dict[str, Any]]) -> list[str]:
+    """Render the pre-registered P2 panel + its (non-actionable) verdict."""
+    if not by_rsi:
+        return []
+    lines = ["by RSI bucket (P2 observation; rsi_long stays 35 — read-only):"]
+    means: dict[str, float] = {}
+    for label in RSI_BUCKET_ORDER:
+        b = by_rsi.get(label)
+        if not b or not b["n"]:
+            continue
+        wr = 100.0 * b["wins"] / b["n"]
+        mean = (b["sum_pnl"] / b["pnl_n"]) if b["pnl_n"] else float("nan")
+        if math.isfinite(mean):
+            means[label] = mean
+            mean_txt = f"{mean:+6.2f}%"
+        else:
+            mean_txt = "   n/a"
+        lines.append(f"  {label:9s} n={b['n']:4d} days={len(b['days']):3d} "
+                     f"72h WR={wr:5.1f}%  mean={mean_txt}")
+    ref = means.get(RSI_BUCKET_REF)
+    eligible = {k: v for k, v in means.items()
+                if k != RSI_BUCKET_REF
+                and by_rsi[k]["n"] >= RSI_BUCKET_MIN_N
+                and by_rsi[k]["days"] and ref is not None}
+    if ref is None or not eligible:
+        lines.append(f"  判读：各桶样本未达 n>={RSI_BUCKET_MIN_N}"
+                     f"（或参考桶 {RSI_BUCKET_REF} 无数据）→ 仅观测，"
+                     f"不作任何阈值调整。")
+        return lines
+    hits = {k: v - ref for k, v in eligible.items()
+            if abs(v - ref) >= RSI_BUCKET_MIN_DELTA_PP}
+    if hits:
+        detail = "，".join(f"{k} 均值差 {d:+.2f}pp" for k, d in sorted(hits.items()))
+        lines.append(f"  判读：{detail}（vs {RSI_BUCKET_REF}）→ 达到预注册差异门槛，"
+                     f"可另立假设评估 rsi_floor/rsi_long；本次不改配置。")
+    else:
+        lines.append(f"  判读：无桶达到 {RSI_BUCKET_MIN_DELTA_PP:g}pp 差异门槛 → "
+                     f"维持 rsi_long=35/rsi_floor=15 不变。")
+    return lines
 
 
 def _forward_closes(coin: str, start_ms: int, hours: int) -> Optional[dict[int, float]]:
@@ -267,6 +370,7 @@ def main() -> int:
     total = graded = winners = 0
     by_candidate = {True: [0, 0], False: [0, 0]}   # [n, wins]
     by_macro: dict[str, list[int]] = {}
+    by_rsi: dict[str, dict[str, Any]] = {}         # P2 observation (read-only)
     cutoff = (time.time() - args.max_age_hours * 3600) if args.max_age_hours else None
 
     for path in files:
@@ -295,6 +399,7 @@ def main() -> int:
                         winners += v > 0
                         graded += 1
                         _tally(by_candidate, by_macro, r, v > 0)
+                        _tally_rsi(by_rsi, r, v > 0)
                         _note_ledger(r)
                     recs.append(r)
                     continue
@@ -310,6 +415,7 @@ def main() -> int:
                     win = outcome == "win"
                     winners += win
                     _tally(by_candidate, by_macro, r, win)
+                    _tally_rsi(by_rsi, r, win)
                     _note_ledger(r)
                 recs.append(r)
         if args.write and changed:
@@ -349,6 +455,8 @@ def main() -> int:
         for k in sorted(by_macro):
             n, w = by_macro[k]
             print(f"  {k:14s} n={n:3d}  72h WR={100*w/n:5.1f}%")
+    for line in _rsi_bucket_report(by_rsi):
+        print(line)
     if not args.write:
         print("\n(dry-run; pass --write to persist outcomes into the JSONL)")
     return 0

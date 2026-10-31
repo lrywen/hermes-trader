@@ -32,7 +32,6 @@ from hermes_trader.agents import live_gate
 # Arms eligible to be prepared for a canary promotion. Kept explicit: only
 # arms whose counterfactual evidence is actually collected/graded are listed.
 CANDIDATE_ARMS = (
-    "signal_age_decay",
     "trend_filter_200ma",
     "pullback",
     "ta_late_entry",

@@ -70,11 +70,11 @@ def test_build_pending_record_raises_when_unqualified():
 
 
 def test_pending_record_is_inert():
-    rec = cp.build_pending_record("signal_age_decay", _full_evidence(),
+    rec = cp.build_pending_record("trend_filter_200ma", _full_evidence(),
                                   now_ms=NOW_MS)
     assert rec["state"] == cp.PENDING
     assert rec["operator"] is None and rec["decided_ms"] is None
-    assert rec["arm"] == "signal_age_decay"
+    assert rec["arm"] == "trend_filter_200ma"
 
 
 # ── P2 evidence-discipline gates ────────────────────────────────────────────
@@ -133,7 +133,7 @@ def test_borderline_ci_marker_is_non_fatal():
 
 def test_pending_record_carries_borderline_marker():
     rec = cp.build_pending_record(
-        "signal_age_decay", _full_evidence(bb_ci_lo_bps=1.0), now_ms=NOW_MS)
+        "trend_filter_200ma", _full_evidence(bb_ci_lo_bps=1.0), now_ms=NOW_MS)
     assert rec["state"] == cp.PENDING
     assert rec["borderline"][0]["dimension"] == "bootstrap_ci"
 

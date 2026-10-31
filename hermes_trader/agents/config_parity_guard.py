@@ -65,8 +65,7 @@ LEAF_DANGER_KIND: dict[str, str] = {
     # market_circuit / daily_extension_cap 有意 canonical=shadow（新部署惰性），
     # 生产 /data 切 enforce；其丢键保护由 config_store._production_enforce_arm_errors
     # 在权威源上 fail-closed，故不纳入此「canonical 必须不弱于 live」断言。
-    # （signal_age_decay / reentry_cap / xs_reversal 为观测流，关闭观测不构成
-    #   放宽资金保护，同样不在此表。）
+    # （xs_reversal 为观测流，关闭观测不构成放宽资金保护，同样不在此表。）
 }
 
 # 对 mode 三态叶子，按「保护强度」排序：canonical 严格弱于 live 即危险方向。
@@ -123,10 +122,6 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     # shadow 观测流路径与模式开关（关闭/路径变更不构成放宽资金保护）
     "daily_extension_cap.mode": ("shadow", "enforce"),
     "daily_extension_cap.shadow_log_path": ("", "/data/daily_extension_cap_shadow.jsonl"),
-    "reentry_cap.mode": ("off", "shadow"),
-    "reentry_cap.shadow_log_path": ("", "/data/reentry_cap_shadow.jsonl"),
-    "signal_age_decay.mode": ("off", "shadow"),
-    "signal_age_decay.shadow_log_path": ("", "/data/signal_age_decay_shadow.jsonl"),
     "xs_reversal.mode": ("off", "shadow"),
     "xs_reversal.shadow_log_path": ("", "/data/xs_reversal_shadow.jsonl"),
     # 2026-10-28: xs_reversal panic-gate record-only shadow markers. The arm is
@@ -240,6 +235,12 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "shadow_book.maker_fill_model": ("v1", "v2"),
     "shadow_book.maker_limit_offset_bps": (5.0, 12.0),
     "shadow_book.maker_v2_coins": ([], ["BTC"]),
+    # 2026-10-31: live raised the v2 conditional base fill prob 0.30→0.87 from
+    # the empirical 5m calibration (scripts/maker_v2_calibrate_real.py). This is
+    # a paper-only SHADOW fill model parameter — mode=SHADOW cannot place
+    # orders, so a more optimistic fill assumption only changes shadow ledger
+    # accounting, never real capital. Value-bound: any further change re-reviews.
+    "shadow_book.maker_v2_base_fill_prob": (0.30, 0.87),
 }
 
 

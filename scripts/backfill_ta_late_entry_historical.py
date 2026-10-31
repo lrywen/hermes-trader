@@ -82,6 +82,38 @@ def signal_ms(rec: dict[str, Any]) -> Optional[int]:
     return None
 
 
+def _signal_bar_ms(rec: dict[str, Any]) -> Optional[int]:
+    """4h bar OPEN time of the bar the signal fired in (geometry anchor)."""
+    t0 = signal_ms(rec)
+    return None if not t0 else t0 - (t0 % BAR_MS)
+
+
+def dedupe_by_signal_bar(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Collapse scan-level rows that share one (coin, side, 4h bar) geometry.
+
+    The grader's exit is fixed by the signal bar (exit_idx == b1_idx, i.e.
+    B1.close) and prefilter entries fall back to B0.close, so every scan that
+    lands inside the same 4h bar produces an IDENTICAL entry/exit/pnl row.
+    Those are pseudo-replicates, not independent observations: counting them
+    repeatedly narrows any win-rate / confidence interval artificially.
+    Keep the earliest scan per geometry and record how many scans it stands
+    for; all scan-level context (extension, rsi4h, reason) stays on the kept
+    row as the representative.
+    """
+    kept: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for r in rows:
+        bar = _signal_bar_ms(r)
+        key = (r.get("coin"), r.get("side") or "long", bar)
+        cur = kept.get(key)
+        if cur is None:
+            r["signal_bar_ms"] = bar
+            r["scan_count"] = 1
+            kept[key] = r
+        else:
+            cur["scan_count"] = int(cur.get("scan_count", 1)) + 1
+    return list(kept.values())
+
+
 def _iter_input_files(primary: str) -> list[str]:
     """Live primary plus size rotations, newest rotation first, primary last."""
     files = sorted(glob.glob(primary + ".*"), reverse=True)
@@ -193,6 +225,7 @@ def grade_record(rec: dict[str, Any], *, hold_bars: int = HOLD_BARS,
 
 def run(*, file: str = FILE, out: str = DEFAULT_OUT,
         write: bool = False, force: bool = False, hold_bars: int = HOLD_BARS,
+        dedupe_bar: bool = True,
         as_of_ms: Optional[int] = None, max_age_hours: Optional[float] = None,
         use_cache: bool = True, sleep_s: float = 0.0,
         cache_file: Optional[str] = None) -> dict[str, Any]:
@@ -245,9 +278,19 @@ def run(*, file: str = FILE, out: str = DEFAULT_OUT,
         if sleep_s and produced:
             time.sleep(sleep_s)
 
-    if write and produced:
-        # Isolated append product. Merge with any prior backfill output,
-        # de-duping on (coin, ts, entry); re-runs replace stale replays.
+    # One row per independent (coin, side, 4h bar) geometry — see
+    # dedupe_by_signal_bar. Scan-level duplicates would otherwise inflate n
+    # ~200x and fake tight confidence intervals downstream.
+    emitted = dedupe_by_signal_bar(produced) if dedupe_bar else produced
+    counts["rows_graded"] = len(produced)
+    counts["independent_geometries"] = len(emitted)
+
+    if write and emitted:
+        # Isolated product. A prior file written BEFORE dedupe existed holds
+        # scan-level pseudo-replicates (no ``signal_bar_ms``); merging those
+        # back in would re-inflate n, so a legacy file is replaced wholesale.
+        # A dedupe-aware file is merged on (coin, side, signal_bar_ms) with the
+        # fresh rows winning.
         existing: dict[tuple[Any, ...], dict[str, Any]] = {}
         if os.path.exists(out):
             with open(out, encoding="utf-8") as f:
@@ -259,11 +302,14 @@ def run(*, file: str = FILE, out: str = DEFAULT_OUT,
                         old = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    existing[(old.get("coin"), old.get("timestamp"),
-                              old.get("entry_px"))] = old
-        for r in produced:
-            existing[(r.get("coin"), r.get("timestamp"),
-                      r.get("entry_px"))] = r
+                    if "signal_bar_ms" not in old:
+                        existing = {}
+                        break
+                    existing[(old.get("coin"), old.get("side") or "long",
+                              old.get("signal_bar_ms"))] = old
+        for r in emitted:
+            existing[(r.get("coin"), r.get("side") or "long",
+                      r.get("signal_bar_ms"))] = r
         tmp = out + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
             for r in sorted(existing.values(),
@@ -273,7 +319,8 @@ def run(*, file: str = FILE, out: str = DEFAULT_OUT,
         hc.flush_disk_cache()
 
     counts["produced"] = len(produced)
-    counts["written"] = len(produced) if write else 0
+    # written counts genuine rows (deduped), not scan-level duplicates.
+    counts["written"] = len(emitted) if write else 0
     counts["out_path"] = out if write else None
     return counts
 
@@ -290,6 +337,10 @@ def main() -> int:
                     help="re-grade records that already have outcomes")
     ap.add_argument("--hold-bars", type=int, default=HOLD_BARS,
                     help="4h bars to hold the counterfactual trade (default 2)")
+    ap.add_argument("--no-dedupe-bar", dest="no_dedupe_bar", action="store_true",
+                    help="keep scan-level duplicates (default: collapse to one "
+                         "row per coin/side/4h signal bar, since the geometry "
+                         "is identical within a bar)")
     ap.add_argument("--max-age-hours", type=float, default=None)
     ap.add_argument("--as-of", type=int, default=None,
                     help="PIT cutoff in epoch ms (testing/replay determinism)")
@@ -304,6 +355,7 @@ def main() -> int:
 
     stats = run(file=args.file, out=args.out, write=args.write,
                 force=args.force, hold_bars=args.hold_bars,
+                dedupe_bar=not args.no_dedupe_bar,
                 as_of_ms=args.as_of, max_age_hours=args.max_age_hours,
                 cache_file=args.cache_file, sleep_s=args.sleep)
     graded = stats["win"] + stats["loss"]
@@ -316,6 +368,11 @@ def main() -> int:
           f"(win {stats['win']} / loss {stats['loss']})  "
           f"no_future_bars {stats['no_future_bars']}  "
           f"errors {stats['error']}")
+    if stats.get("independent_geometries") is not None:
+        ind = stats["independent_geometries"]
+        dup = graded / ind if ind else 0.0
+        print(f"independent geometries: {ind}  "
+              f"(scan-level duplicates: {dup:.1f}x per geometry)")
     if graded:
         print(f"net win-rate ({args.hold_bars}x4h hold): "
               f"{100*stats['win']/graded:.1f}%")

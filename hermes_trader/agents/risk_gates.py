@@ -2449,115 +2449,6 @@ def daily_extension_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateRe
             "daily_change_pct": ext, "cap_pct": cap}
 
 
-def reentry_cap_gate(ctx: GateContext, config: dict[str, Any]) -> GateResult:
-    """D3 (ported from Pathia reentry_cap): per-coin rolling-window OPENING
-    cap. Blocks a new entry for a coin that already has ``max_per_coin``
-    opening fills within the last ``window_hours`` (both longs and shorts —
-    reentry pacing is side-agnostic). max_per_coin<=0 disables.
-
-    Counts openings from the memory trade log (record_trade only records
-    entries), via memory.count_openings_since. A memory read failure FAILS
-    OPEN in SHADOW (probe mode — no protection exists yet). In ENFORCE the
-    gate is protective, so like the five sibling breakers it holds its
-    last-known-good verdict while memory is unreadable (armed BLOCK stays
-    blocking; clear PASS stays passing) and only degrades to the alerted
-    fail-open on a cold/no-LKG read (shared circuit-breaker convention: a
-    transient state-read hiccup must not become a total trading DoS). SHADOW
-    first: mode off/shadow/enforce (env HERMES_REENTRY_CAP_MODE)."""
-    blk = config.get("reentry_cap")
-    if not isinstance(blk, dict):
-        return {"pass": True, "via": "reentry_cap_disabled"}
-    mode = _gate_mode(blk, "HERMES_REENTRY_CAP_MODE")
-    if mode == "off":
-        return {"pass": True, "via": "reentry_cap_off"}
-    try:
-        max_per_coin = int(blk.get("max_per_coin", 2) or 0)
-        window_hours = float(blk.get("window_hours", 24.0) or 0.0)
-    except (TypeError, ValueError):
-        max_per_coin, window_hours = 2, 24.0
-    if max_per_coin <= 0 or window_hours <= 0:
-        return {"pass": True, "via": "reentry_cap_disabled"}
-
-    side = ctx.trade_side if ctx.trade_side in ("long", "short") else "long"
-    ts_now = int(time.time() * 1000)
-    since_ms = ts_now - int(window_hours * 3600.0 * 1000.0)
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    path = _gate_shadow_path(blk, "HERMES_REENTRY_CAP_SHADOW_FILE",
-                             "reentry_cap_shadow.jsonl")
-    try:
-        # Data source depends on mode: in SHADOW the actual openings live in
-        # the shadow book (shadow_open never writes the live memory trade log),
-        # so counting memory would always return 0 and the gate could never
-        # fire. Count the shadow population in shadow mode; the live memory
-        # log in enforce mode.
-        if mode == "shadow":
-            from hermes_trader.agents import shadow_book
-            openings = int(
-                shadow_book.get_book().count_openings_since(ctx.coin, since_ms))
-            source = "shadow_book"
-        else:
-            from hermes_trader.agents.memory import memory
-            openings = int(memory.count_openings_since(ctx.coin, since_ms))
-            source = "memory"
-    except Exception as e:
-        rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
-               "max_per_coin": max_per_coin, "window_hours": window_hours,
-               "state": "data_missing", "openings": None,
-               "reentry_would_block": None}
-        _record_gate_shadow(rec, path, "reentry_cap")
-        if mode == "enforce":
-            # P1-4 parity (2026-10-19): the gate is protective in enforce.
-            # _breaker_blind_or_lkg emits the loudness triplet itself and holds
-            # the last-known-good verdict (armed stays blocked); cold/no-LKG
-            # degrades to the alerted fail-open below.
-            lkg = _breaker_blind_or_lkg("reentry_cap", ctx, e)
-            if lkg.get("via") == "lkg_fallback":
-                return {**lkg, "via": "reentry_cap_lkg_block"}
-            # clear-LKG replay or cold fail-open: keep the gate's native via.
-            return {"pass": True, "via": "reentry_cap_data_missing",
-                    "reason": f"reentry cap unavailable ({type(e).__name__})"}
-        # shadow/off: probe mode has no protection to preserve. Emit the
-        # loudness triplet, then fail open.
-        logger.error("[risk][gates] reentry_cap state read failed for %s "
-                     "(mode=%s) — cap BLIND, failing open: %s", ctx.coin, mode, e)
-        try:
-            from hermes_trader import metrics
-            metrics.MEMORY_GATE_READ_ERRORS.labels(gate="reentry_cap").inc()
-        except Exception as metric_e:
-            logger.error("[risk] MEMORY_GATE_READ_ERRORS metric failed for "
-                         "reentry_cap: %r", metric_e)
-        _alert_memory_gate_blind("reentry_cap", ctx, e)
-        return {"pass": True, "via": "reentry_cap_data_missing",
-                "reason": f"reentry cap unavailable ({type(e).__name__})"}
-
-    over = openings >= max_per_coin
-    rec = {"timestamp": ts, "coin": ctx.coin, "side": side, "mode": mode,
-           "max_per_coin": max_per_coin, "window_hours": window_hours,
-           "state": "ok", "openings": openings, "source": source,
-           "reentry_would_block": bool(over)}
-    _record_gate_shadow(rec, path, "reentry_cap")
-    if not over:
-        clear_res = {"pass": True, "via": "reentry_cap_ok",
-                     "openings": openings, "max_per_coin": max_per_coin}
-        if mode == "enforce":
-            _breaker_record_lkg("reentry_cap", ctx, clear_res)
-        return clear_res
-    reason = (f"{openings} openings on {ctx.coin} within {window_hours:.0f}h "
-              f"(>= cap {max_per_coin})")
-    if mode == "shadow":
-        logger.info(
-            "[risk][gates] reentry_cap SHADOW would-block %s: %s",
-            ctx.coin, reason)
-        return {"pass": True, "via": "reentry_cap_shadow_block",
-                "reason": f"SHADOW: {reason}", "openings": openings}
-    logger.info(
-        "[risk][gates] reentry_cap BLOCK %s: %s", ctx.coin, reason)
-    block_res = {"pass": False, "via": "reentry_cap_block",
-                 "reason": f"reentry cap: {reason}", "openings": openings}
-    _breaker_record_lkg("reentry_cap", ctx, block_res)
-    return block_res
-
-
 # Load cross-component shared config (~/.hermes-trading/config.yaml).
 # Canonical implementation lives in hermes_trader.shared_config.
 _load_shared_config = load_shared_config
@@ -2739,12 +2630,11 @@ def eval_all_gates(
     # ta_filter pre-filter and the backtest. Mode-independent: once active it
     # enforces identically in SHADOW and LIVE (mode off/enforce only).
     results["ta_late_entry"] = ta_late_entry_gate(ctx, config)
-    # Wave D (Audit 2026-09-06), ported from Pathia. All three ship as SHADOW
+    # Wave D (Audit 2026-09-06), ported from Pathia. Both ship as SHADOW
     # probes first (mode off/shadow/enforce; shadow records would-block but
     # passes the order, so adding them here is non-blocking by default).
     results["trend_filter_200ma"] = trend_filter_200ma_gate(ctx, config)
     results["daily_extension_cap"] = daily_extension_cap_gate(ctx, config)
-    results["reentry_cap"] = reentry_cap_gate(ctx, config)
 
     block_reasons = []
     blocked = False
@@ -2761,7 +2651,7 @@ def eval_all_gates(
         "correlation", "equity_risk", "market_regime", "news", "debate",
         "ta_late_entry",
         # Wave D (Audit 2026-09-06): Pathia-ported gates.
-        "trend_filter_200ma", "daily_extension_cap", "reentry_cap",
+        "trend_filter_200ma", "daily_extension_cap",
     }
     for key, result in results.items():
         if not result.get("pass"):

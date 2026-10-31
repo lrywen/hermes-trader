@@ -1262,37 +1262,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
     },
-    # signal_age_decay (roadmap §2, 2026-09-04): setup-age decay for the
-    # perception composite score. Formation triggers keep firing at high
-    # score on every bar after the breakout matures (the FARTCOIN top-tick
-    # late-chase); each trigger's FIRST-fire bar per coin is tracked across
-    # cycles and its weight decayed by exp(-onset_age/halflife). Pulse
-    # triggers self-extinguish as velocity normalizes, so their halflife is
-    # 0 = never decay (an extra age factor would double-penalize them).
-    # halflife_s maps camelCase trigger names → seconds; onset_ttl_s prunes
-    # stale onset state (6h). mode off|shadow|enforce, default off.
-    "signal_age_decay": {
-        "mode": "off",
-        "halflife_s": {
-            # 5m formation triggers: edge is the breakout bar itself.
-            "breakout": 900.0,
-            "trendStrength": 1800.0,
-            "rangeCompression": 0.0,        # only feeds breakout coupling
-            "trendFlip1h": 7200.0,          # 1h formation setups
-            "higherLows1h": 7200.0,
-            "volumeBuildup1h": 7200.0,
-            "momentumContinuation1h": 7200.0,
-            # Pulse triggers self-extinguish — never decay.
-            "pctMoveSpike": 0.0,
-            "volumeSpike": 0.0,
-            "momentumBurst": 0.0,
-        },
-        # Stale-onset prune window, seconds (a setup quiet past this age
-        # restarts its clock on the next fire).
-        "onset_ttl_s": 21600.0,
-        # --- shadow verdict log (JSONL); empty = container default path ---
-        "shadow_log_path": "",
-    },
     # atr_regime_calibration (roadmap §1, 2026-09-04): continuous ATR-volatility
     # regime factor for stop WIDTH sizing (sizing.atr_regime_calibration).
     # When current ATR% is far below its recent mean (compressed vol, ratio <
@@ -1360,22 +1329,6 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "mode": "shadow",
         # Audit 2026-09-21 (#4): on a daily-change data miss, fail CLOSED.
         "fail_closed": True,
-        # --- shadow verdict log (JSONL); empty = container default path ---
-        "shadow_log_path": "",
-    },
-    # reentry_cap (Wave D, 2026-09-06, ported from Pathia): per-coin rolling
-    # ENTRY counter. Blocks a new entry on a coin that has already had
-    # `max_per_coin` entries (opens) within the last `window_hours`. This caps
-    # stop-out-and-rebuy churn on a single name (the coin_circuit breaker only
-    # arms on a large realized loss; this caps raw frequency regardless of PnL).
-    # Counts OPENINGS only (record_trade), both sides. A memory read failure
-    # FAILS OPEN (shared breaker convention). max_per_coin <= 0 disables.
-    # mode off|shadow|enforce, default off (gray-release; shadow via
-    # HERMES_REENTRY_CAP_MODE).
-    "reentry_cap": {
-        "mode": "off",
-        "max_per_coin": 2,
-        "window_hours": 24.0,
         # --- shadow verdict log (JSONL); empty = container default path ---
         "shadow_log_path": "",
     },

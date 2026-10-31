@@ -69,7 +69,7 @@ def test_wfa_raises_on_short_series():
 def test_grade_arm_attaches_r5_stats():
     recs = _records(24, 0.1)
     out = sg.grade_arm(
-        "signal_age_decay", "shadow", "/nonexistent.jsonl",
+        "trend_filter_200ma", "shadow", "/nonexistent.jsonl",
         windows=(24, 72), records=recs)
     assert "r5_stats" in out
     assert out["independent_days"] == 24

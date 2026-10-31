@@ -57,7 +57,7 @@ TRADING_LOOP_SRC = (REPO_ROOT / "scripts" / "trading_loop.py").read_text(encodin
 
 @pytest.fixture(autouse=True)
 def _isolate_breaker_lkg():
-    """P1-4 parity: the reentry_cap enforce leg caches an LKG verdict in the
+    """P1-4 parity: memory-backed breaker gates cache an LKG verdict in the
     module-global breaker cache; clear it around every test so an armed verdict
     from another case/file can't turn this file's cold-fail-open read into a
     held block."""
@@ -1058,70 +1058,6 @@ def test_per_coin_cooldown_enforce_failclosed_is_recorded(monkeypatch):
     written.clear()
     assert executor._runner_entry_block_reason(a, shadow_cfg) == ""
     assert [e for e in written if e["event"] == "error"] == []
-
-
-def test_reentry_cap_read_failure_is_loud_but_fails_open(monkeypatch, tmp_path):
-    """reentry_cap is the one memory-backed gate whose data-missing branch was
-    still a bare debug log (its sibling gates — coin_circuit/global_halt/... —
-    log at error, bump MEMORY_GATE_READ_ERRORS and fire _alert_memory_gate_blind).
-    A persistently blind reentry cap therefore emits neither Feishu card,
-    metric, nor the risk_gate_blind SSE event. The fail-open return must NOT
-    change (pass=True/via=reentry_cap_data_missing); only the loudness triplet
-    is added (risk_gates.py ~:2021-2031)."""
-    import hermes_trader.agents.memory as memory_mod
-    from hermes_trader import metrics, notify, session_log
-    from hermes_trader.agents import risk_gates
-
-    class _BoomMem:
-        def count_openings_since(self, coin, since_ms):
-            raise RuntimeError("memory down")
-
-    monkeypatch.setattr(memory_mod, "memory", _BoomMem())
-
-    # Feishu card channel: must be attempted, outcome irrelevant to the gate.
-    cards = []
-    monkeypatch.setattr(notify, "send_card",
-                        lambda *a, **kw: cards.append((a, kw)))
-    # SSE mirror capture.
-    feed = []
-    monkeypatch.setattr(session_log, "append", lambda ev: feed.append(ev))
-    # Metric counter capture.
-    incs = []
-
-    class _FakeCounter:
-        def inc(self):
-            incs.append("reentry_cap")
-
-    def _labels(**kw):
-        assert kw.get("gate") == "reentry_cap"
-        return _FakeCounter()
-
-    monkeypatch.setattr(metrics.MEMORY_GATE_READ_ERRORS, "labels", _labels)
-
-    ctx = risk_gates.GateContext(
-        confidence=0.9, current_positions=[], trade_notional_usd=50,
-        daily_pnl=0, market_volume_24h_usd=1e8, coin="ETH",
-        trade_side="long", has_binary_news_risk=False, equity=1000.0,
-        total_open_notional=0)
-    cfg = {"reentry_cap": {
-        "mode": "enforce", "max_per_coin": 2, "window_hours": 24,
-        "shadow_log_path": str(tmp_path / "reentry.jsonl")}}
-
-    r = risk_gates.reentry_cap_gate(ctx, cfg)
-
-    # Fail-open contract unchanged.
-    assert r["pass"] is True
-    assert r["via"] == "reentry_cap_data_missing"
-    # LOUD triplet: metric + Feishu card + SSE blind-gate event.
-    assert incs == ["reentry_cap"]
-    assert cards and cards[0][1]["dedup_key"] == "mem_gate_blind:reentry_cap"
-    assert len(feed) == 1
-    ev = feed[0]
-    assert ev["event"] == "risk_gate_blind"
-    assert ev["gate"] == "reentry_cap"
-    assert ev["coin"] == "ETH"
-    assert ev["posture"] == "fail-open"
-    assert "memory down" in ev["error"]
 
 
 def test_gex_veto_check_failure_is_recorded(monkeypatch):

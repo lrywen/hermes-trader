@@ -8,8 +8,7 @@
      涨幅未知不旁路；shadow 记录反事实但放行，enforce 才 block。
   D2 daily_extension_cap —— 仅多头；24h 涨幅超 cap(30%) 不追多；涨幅未知
      fail-OPEN；cap<=0 禁用；无 mode 块时默认 shadow（env 可切）。
-  D3 reentry_cap —— 多空均计开仓；窗口内开仓 >= max_per_coin 才拦；
-     memory 读失败 fail-OPEN；max_per_coin<=0 禁用；shadow 放行 enforce 拦。
+D3 reentry_cap 已于 2026-10-31 作为孤儿影子臂删除（live 0 次命中）。
 另锁配置层（CANONICAL_DEFAULTS 两块 + 两标量、schema 三态/越界/未知叶）。
 """
 
@@ -25,9 +24,8 @@ from hermes_trader.agents.config_store import CANONICAL_DEFAULTS, cfg_get
 
 @pytest.fixture(autouse=True)
 def _isolate_breaker_lkg():
-    """P1-4 parity: the reentry_cap enforce leg now caches an LKG verdict in
-    the module-global breaker cache; clear it around every test so an armed
-    verdict from one case can't leak into another case's blind-read result."""
+    """Clear the module-global breaker LKG cache around every test so a
+    verdict armed in one case cannot leak into another case's blind read."""
     rg.reset_breaker_lkg()
     yield
     rg.reset_breaker_lkg()
@@ -115,7 +113,7 @@ def _read_shadow(path):
 # ══════════════════════════════════════════════════════════════════════════
 def test_d_config_defaults_registered():
     assert "trend_filter_200ma" in CANONICAL_DEFAULTS
-    assert "reentry_cap" in CANONICAL_DEFAULTS
+    assert "reentry_cap" not in CANONICAL_DEFAULTS
     t = CANONICAL_DEFAULTS["trend_filter_200ma"]
     assert t["mode"] == "enforce"          # 生产已生效；canonical 对齐，丢键不再关闭保护
     assert t["period"] == 200
@@ -128,17 +126,13 @@ def test_d_config_defaults_registered():
     d2 = CANONICAL_DEFAULTS["daily_extension_cap"]
     assert d2["mode"] == "shadow"
     assert "shadow_log_path" in d2
-    r = CANONICAL_DEFAULTS["reentry_cap"]
-    assert r["mode"] == "off"
-    assert r["max_per_coin"] == 2
-    assert r["window_hours"] == 24.0
     # D1/D2 root scalars
     assert cfg_get("min_history_bars", config={}) == 200
     assert cfg_get("override_max_daily_extension_pct", config={}) == 30.0
 
 
 def test_d_schema_accepts_three_modes_and_rejects_bad():
-    for blk_name in ("trend_filter_200ma", "daily_extension_cap", "reentry_cap"):
+    for blk_name in ("trend_filter_200ma", "daily_extension_cap"):
         for mode in ("off", "shadow", "enforce"):
             errors = validate_config_updates({blk_name: {"mode": mode}},
                                              strict_keys=True)
@@ -154,9 +148,6 @@ def test_d_schema_accepts_three_modes_and_rejects_bad():
 def test_d_schema_rejects_out_of_range():
     errors = validate_config_updates(
         {"trend_filter_200ma": {"period": 5}}, strict_keys=True)  # < 20
-    assert errors, errors
-    errors = validate_config_updates(
-        {"reentry_cap": {"max_per_coin": 999}}, strict_keys=True)  # > 100
     assert errors, errors
 
 
@@ -349,97 +340,4 @@ def test_d2_defaults_to_shadow_without_mode_block(monkeypatch):
     assert r["pass"] and r["via"] == "daily_ext_cap_shadow_block"
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# D3 reentry_cap
-# ══════════════════════════════════════════════════════════════════════════
-class _FakeMemory:
-    def __init__(self, count=0, raises=False):
-        self._count = count
-        self._raises = raises
 
-    def count_openings_since(self, coin, since_ms):
-        if self._raises:
-            raise RuntimeError("memory down")
-        return self._count
-
-
-def _patch_memory(monkeypatch, fake):
-    # The gate does `from hermes_trader.agents.memory import memory` inside the
-    # function, so patch the singleton instance attribute on the source module.
-    import hermes_trader.agents.memory as memory_mod
-    monkeypatch.setattr(memory_mod, "memory", fake)
-
-
-def _r_cfg(tmp_path, mode="shadow", **over):
-    blk = {"mode": mode, "max_per_coin": 2, "window_hours": 24.0,
-           "shadow_log_path": str(tmp_path / "reentry.jsonl")}
-    blk.update(over)
-    return {"reentry_cap": blk}
-
-
-def test_d3_off_passes_without_memory(monkeypatch, tmp_path):
-    _patch_memory(monkeypatch, _FakeMemory(raises=True))
-    r = rg.reentry_cap_gate(_ctx(), _r_cfg(tmp_path, mode="off"))
-    assert r["pass"] and r["via"] == "reentry_cap_off"
-
-
-def test_d3_under_cap_passes(monkeypatch, tmp_path):
-    _patch_memory(monkeypatch, _FakeMemory(count=1))
-    r = rg.reentry_cap_gate(_ctx(), _r_cfg(tmp_path, mode="enforce"))
-    assert r["pass"] and r["via"] == "reentry_cap_ok"
-
-
-def test_d3_over_cap_shadow_passes_enforce_blocks(monkeypatch, tmp_path):
-    # Shadow mode counts the SHADOW BOOK (shadow_open does not write the live
-    # memory log); enforce counts memory. Patch each source accordingly.
-    class _FakeBook:
-        def count_openings_since(self, coin, since_ms):
-            return 2  # >= cap
-
-    import hermes_trader.agents.shadow_book as sb_mod
-    monkeypatch.setattr(sb_mod, "get_book", lambda: _FakeBook())
-    _patch_memory(monkeypatch, _FakeMemory(count=2))  # for the enforce leg
-    cfg = _r_cfg(tmp_path, mode="shadow")
-    rs = rg.reentry_cap_gate(_ctx(), cfg)
-    assert rs["pass"] and rs["via"] == "reentry_cap_shadow_block"
-    recs = _read_shadow(cfg["reentry_cap"]["shadow_log_path"])
-    assert recs and recs[-1]["reentry_would_block"] is True
-    re = rg.reentry_cap_gate(_ctx(), _r_cfg(tmp_path, mode="enforce"))
-    assert not re["pass"] and re["via"] == "reentry_cap_block"
-
-
-def test_d3_counts_both_sides(monkeypatch, tmp_path):
-    # side-agnostic: a short is also gated when the coin hit its opening cap.
-    _patch_memory(monkeypatch, _FakeMemory(count=2))
-    r = rg.reentry_cap_gate(_ctx(side="short"), _r_cfg(tmp_path, mode="enforce"))
-    assert not r["pass"] and r["via"] == "reentry_cap_block"
-
-
-def test_d3_memory_failure_fail_open(monkeypatch, tmp_path):
-    _patch_memory(monkeypatch, _FakeMemory(raises=True))
-    r = rg.reentry_cap_gate(_ctx(), _r_cfg(tmp_path, mode="enforce"))
-    assert r["pass"] and r["via"] == "reentry_cap_data_missing"
-
-
-def test_d3_zero_cap_disables(monkeypatch, tmp_path):
-    _patch_memory(monkeypatch, _FakeMemory(count=99))
-    r = rg.reentry_cap_gate(_ctx(), _r_cfg(tmp_path, mode="enforce", max_per_coin=0))
-    assert r["pass"] and r["via"] == "reentry_cap_disabled"
-
-
-def test_d3_memory_count_openings_since_filters_coin_and_time():
-    from hermes_trader.agents.memory import AgentMemory
-    mem = AgentMemory.__new__(AgentMemory)  # bypass singleton/__init__ side effects
-    import threading
-    mem._lock = threading.RLock()
-    now = 1_000_000
-    # 2 BTC openings in-window, 1 BTC stale, 1 ETH in-window
-    mem._trades = [
-        {"coin": "BTC", "executed_at": now - 1000},
-        {"coin": "BTC", "executed_at": now - 2000},
-        {"coin": "BTC", "executed_at": now - 100_000_000},  # stale
-        {"coin": "ETH", "executed_at": now - 1000},
-    ]
-    assert mem.count_openings_since("BTC", now - 10_000) == 2
-    assert mem.count_openings_since("ETH", now - 10_000) == 1
-    assert mem.count_openings_since("SOL", now - 10_000) == 0

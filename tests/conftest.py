@@ -92,10 +92,8 @@ for _arm_env, _arm_file in (
     ("HERMES_ATR_REGIME_CALIB_SHADOW_FILE", "atr_regime_calib_shadow.jsonl"),
     ("HERMES_SIZING_V2_SHADOW_FILE", "sizing_v2_shadow.jsonl"),
     ("HERMES_CONFIDENCE_DECAY_SHADOW_FILE", "confidence_decay_shadow.jsonl"),
-    ("HERMES_SIGNAL_AGE_DECAY_SHADOW_FILE", "signal_age_decay_shadow.jsonl"),
     ("HERMES_TREND_FILTER_SHADOW_FILE", "trend_filter_shadow.jsonl"),
     ("HERMES_DAILY_EXTENSION_CAP_SHADOW_FILE", "daily_extension_cap_shadow.jsonl"),
-    ("HERMES_REENTRY_CAP_SHADOW_FILE", "reentry_cap_shadow.jsonl"),
     ("HERMES_XS_REVERSAL_SHADOW_FILE", "xs_reversal_shadow.jsonl"),
     ("HERMES_REGIME_OVERLAY_SHADOW_FILE", "regime_overlay_shadow.jsonl"),
     # 2026-10-23: risk_tuning was added after this list and was missed, so

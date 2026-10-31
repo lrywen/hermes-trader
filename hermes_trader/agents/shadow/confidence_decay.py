@@ -3,9 +3,8 @@
 Moved verbatim (behavior-preserving) from ``agents/executor.py`` in the
 P1-1 executor decomposition. Exponentially decays AI confidence by the age
 of the verdict CONTENT (first time this exact verdict/side/confidence was
-seen for the coin): factor = 2 ** (-age/hl). The technical-trigger half lives
-in perception (composite_score_aged); this covers the AI conviction driving
-the confidence gate / conviction sizing.
+seen for the coin): factor = 2 ** (-age/hl). This covers the AI conviction
+driving the confidence gate / conviction sizing.
 
 Modes:
   off     — confidence never touched; byte-identical behaviour.

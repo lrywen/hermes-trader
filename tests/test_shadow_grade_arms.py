@@ -117,7 +117,7 @@ def test_off_arm_with_no_records_is_reported_off_not_data_gap(sg):
     # reported as OFF (not a blind-gate DATA_GAP, and not a misleading
     # "still collecting"). Only shadow/enforce arms are held to DATA_GAP.
     now = 1_700_000_000_000.0
-    out = sg.grade_arm("reentry_cap", "off", "/nonexistent.jsonl",
+    out = sg.grade_arm("trend_filter_200ma", "off", "/nonexistent.jsonl",
                        [24, 72, 168], now_ms=now, records=[])
     assert out["verdict"] == sg.OFF
 
@@ -215,10 +215,10 @@ def test_inert_when_samples_enough_but_no_mature_outcomes(sg):
 def test_zero_hit_gate_is_inert_not_collecting(sg):
     """0.3 §5 缺陷 2：168h 内一次都没触发的闸门不产生任何信息，
     判 INERT，而不是「继续采数」——采集预算不该养空转臂。
-    实测 reentry_cap 83 次决策 / 0 命中，旧逻辑给 COLLECTING。"""
+    实测 trend_filter_200ma 83 次决策 / 0 命中，旧逻辑给 COLLECTING。"""
     now = 1_700_000_000_000.0
     recs = [_rec(now, would_block=False) for _ in range(83)]
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.INERT
     assert out["windows"][-1]["hits"] == 0
@@ -400,8 +400,8 @@ def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
     # mostly "win" (arm-HARMFUL: the change foregoes profit) must be REVIEW,
     # even when it never writes pnl_usd. Before the fix the `kind == "block"`
     # guard skipped the high-harm-rate branch for change arms and such an arm
-    # was mislabelled PROMOTE_CANDIDATE. (Vehicle: the surviving change arm
-    # signal_age_decay; confidence_decay/atr_regime_calib were retired 2026-09.)
+    # was mislabelled PROMOTE_CANDIDATE. (Vehicle: the change arm sizing_v2;
+    # confidence_decay/atr_regime_calib were retired 2026-09.)
     now = 1_700_000_000_000.0
     recs = []
     # 20 harmful (outcome=win, no pnl_usd at all) + 5 beneficial (outcome=loss),
@@ -413,7 +413,7 @@ def test_harmful_change_arm_without_pnl_usd_is_review_not_promote(sg):
         recs.append(_rec(now, would_change=True, outcome="loss"))
     for i in range(40):
         recs.append(_rec(now, would_change=(i < 4)))
-    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["kind"] == "change"
     assert out["verdict"] == sg.REVIEW
@@ -936,7 +936,7 @@ def test_enforce_healthy_arm_maintains(sg):
         recs.append(_rec(now, would_block=True, outcome="loss"))
     for _ in range(45):
         recs.append(_rec(now, would_block=False))
-    out = sg.grade_arm("reentry_cap", "enforce", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "enforce", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.MAINTAIN
     assert "维持" in out["reason"]
@@ -947,7 +947,7 @@ def test_enforce_healthy_arm_maintains(sg):
 def test_shadow_too_wide_with_no_outcomes_is_review(sg):
     now = 1_700_000_000_000.0
     recs = [_rec(now - H, would_block=True) for _ in range(60)]
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [24, 168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [24, 168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.REVIEW
     assert "太宽" in out["reason"]
@@ -960,7 +960,7 @@ def test_shadow_wide_but_healthy_outcomes_still_review(sg):
     recs = [_rec(now, would_change=True, outcome="win") for _ in range(5)]
     recs += [_rec(now, would_change=True, outcome="loss") for _ in range(45)]
     recs += [_rec(now, would_change=False, outcome="loss") for _ in range(10)]
-    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.REVIEW
     assert out["windows"][-1]["decisions"] == 60
@@ -970,7 +970,7 @@ def test_shadow_wide_but_healthy_outcomes_still_review(sg):
 
 def test_promote_grey_zone_45pct_harm_is_collecting(sg):
     # 45.1% harm rate change-arm profile, healthy backfill. (Vehicle: the
-    # surviving change arm signal_age_decay.)
+    # change arm sizing_v2.)
     now = 1_700_000_000_000.0
     recs = []
     # 45% harm rate (45 wins / 100 mature) on hit records. All 400 records are
@@ -982,7 +982,7 @@ def test_promote_grey_zone_45pct_harm_is_collecting(sg):
         recs.append(_rec(now, would_change=True, outcome="loss"))
     for _ in range(300):
         recs.append(_rec(now, would_change=False, outcome="loss"))
-    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.COLLECTING
     assert "安全余量" in out["reason"]
@@ -993,7 +993,7 @@ def test_promote_at_40pct_or_below_harm_passes(sg):
     recs = [_rec(now, would_block=True, outcome="win") for _ in range(8)]
     recs += [_rec(now, would_block=True, outcome="loss") for _ in range(17)]
     recs += [_rec(now, would_block=False, outcome="loss") for _ in range(40)]
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.PROMOTE
 
@@ -1026,7 +1026,7 @@ def test_low_backfill_healthy_arm_collecting_not_promote(sg):
     # promote branch. To exercise the mature≥20 low-confidence path instead:
     recs = [_rec(now, would_block=True, outcome="loss") for _ in range(20)]
     recs += [_rec(now, would_block=False) for _ in range(180)]  # 10% backfill
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["verdict"] == sg.COLLECTING
     assert any("回填率" in w for w in out["warnings"])
@@ -1108,7 +1108,7 @@ def test_zero_backfill_with_volume_warns(sg):
     # block arm: 70 fired records, zero outcomes → promotion-pending, but the
     # reconcile coverage warning must still be attached.
     recs = [_rec(now - 2 * H, would_block=True) for _ in range(70)]
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert any("回填为 0" in w for w in out["warnings"])
 
@@ -1430,7 +1430,7 @@ def test_harm_rate_uses_hit_set_denominator(sg):
     # A change arm with many mature records overall but only the
     # would_change=True rows are the arm's decisions. 90/754 = 12% on all
     # records; on the hit set it is 45%. Non-hit outcomes must not dilute the
-    # rate. (Vehicle: the surviving change arm signal_age_decay.)
+    # rate. (Vehicle: the change arm sizing_v2.)
     now = 1_700_000_000_000.0
     recs = []
     # Hit set: 200 mature, 45% harmful (90 win / 110 loss).
@@ -1444,7 +1444,7 @@ def test_harm_rate_uses_hit_set_denominator(sg):
         recs.append(_rec(now, would_change=False, outcome="loss"))
     for _ in range(3109):
         recs.append(_rec(now, would_change=False))
-    out = sg.grade_arm("signal_age_decay", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("sizing_v2", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     # All-records win rate would be 90/754 = 12%; hit-set rate is 45%.
     assert out["hit_set_harmful_rate"] == sg.pytest.approx(0.45, abs=0.001) \
@@ -1460,7 +1460,7 @@ def test_hit_set_below_min_falls_back_with_warning(sg):
     now = 1_700_000_000_000.0
     recs = [_rec(now, would_block=True, outcome="win") for _ in range(5)]
     recs += [_rec(now, would_block=False, outcome="loss") for _ in range(55)]
-    out = sg.grade_arm("reentry_cap", "shadow", "p.jsonl", [168],
+    out = sg.grade_arm("trend_filter_200ma", "shadow", "p.jsonl", [168],
                        now_ms=now, records=recs)
     assert out["harmful_rate_basis"] == "all_records"
     assert any("命中集成熟样本仅 5" in w

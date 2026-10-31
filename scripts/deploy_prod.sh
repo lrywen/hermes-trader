@@ -20,6 +20,7 @@
 # 用法：
 #   bash scripts/deploy_prod.sh                # 预检 + 发布 + 发布后验证
 #   bash scripts/deploy_prod.sh --with-retest  # 额外跑只读 WS 复测
+#   bash scripts/deploy_prod.sh --with-pytest  # 额外跑 pytest 门禁（失败即阻断）
 #   bash scripts/deploy_prod.sh --preflight-only  # 只预检，不发布
 #
 # 可选环境变量（与 deploy.sh 一致）：
@@ -38,10 +39,12 @@ COMPOSE_FILE="${DEPLOY_DIR}/docker-compose.yml"
 DEPLOY_SH="${DEPLOY_DIR}/deploy.sh"
 
 WITH_RETEST=0
+WITH_PYTEST=0
 PREFLIGHT_ONLY=0
 for arg in "$@"; do
     case "$arg" in
         --with-retest)    WITH_RETEST=1 ;;
+        --with-pytest)    WITH_PYTEST=1 ;;
         --preflight-only) PREFLIGHT_ONLY=1 ;;
         -h|--help)
             grep -E '^#( |$)' "$0" | sed 's/^# \{0,1\}//'
@@ -99,6 +102,23 @@ if [[ "${WITH_RETEST}" == "1" ]]; then
     ok "复测通过"
 else
     log "跳过 WS 复测（加 --with-retest 可启用；只读不下单）"
+fi
+
+# P3 (2026-10-31): 可选 pytest 门禁。默认跳过（全量 ~15min，不拖慢每次发布）；
+# 发布前用 --with-pytest 显式启用，跑配置/影子臂/风控等快速契约测试子集，
+# 任一失败即阻断发布（exit 1），防止把红测试带进镜像。
+if [[ "${WITH_PYTEST}" == "1" ]]; then
+    log "== 1c/4 pytest 门禁（配置/影子臂/风控契约子集）=="
+    ( cd "${SRC_DIR}" && PYTHONPATH="${SRC_DIR}" "${PY}" -m pytest -q \
+        tests/test_config_parity_guard.py \
+        tests/test_shadow_arms_api.py \
+        tests/test_shadow_grade_arms.py \
+        tests/test_risk_wiring_contract.py \
+        tests/test_reconcile_gate_outcomes.py \
+        tests/test_reconcile_xs_reversal_shadow.py )
+    ok "pytest 门禁通过"
+else
+    log "跳过 pytest 门禁（加 --with-pytest 可启用；失败即阻断发布）"
 fi
 
 if [[ "${PREFLIGHT_ONLY}" == "1" ]]; then

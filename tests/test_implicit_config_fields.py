@@ -305,23 +305,19 @@ def test_r12_c1_nested_blocks_accepted_as_objects():
 
 
 # ── roadmap §1/§2 (2026-09-04, #12): gray-release decay / regime blocks ─────
-# confidence_decay / signal_age_decay / atr_regime_calibration shipped as
-# env-gated shadow features with hardcoded defaults at the call sites. #12
-# registers the three blocks in CANONICAL_DEFAULTS + config_schema so they are
-# tunable via config/env, visible in dashboard dumps, and covered by the R7
-# drift sentinel. Defaults MUST equal the module constants byte-for-byte and
-# mode defaults to "off" (production flips to shadow via HERMES_*_MODE env).
+# confidence_decay / atr_regime_calibration shipped as env-gated shadow
+# features with hardcoded defaults at the call sites. #12 registers the
+# blocks in CANONICAL_DEFAULTS + config_schema so they are tunable via
+# config/env, visible in dashboard dumps, and covered by the R7 drift
+# sentinel. Defaults MUST equal the module constants byte-for-byte and mode
+# defaults to "off" (production flips to shadow via HERMES_*_MODE env).
 
 def test_r12_decay_blocks_registered_with_hardcoded_defaults():
-    """Canonical defaults equal the executor/perception/sizing literals."""
+    """Canonical defaults equal the executor/sizing literals."""
     from hermes_trader.agents.executor import (
         _ATR_CALIB_MODES,
         _CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S,
         _CONFIDENCE_DECAY_MODES,
-    )
-    from hermes_trader.agents.perception import (
-        _AGE_DECAY_DEFAULT_HALFLIFE_S,
-        _AGE_DECAY_MODES,
     )
     from hermes_trader.agents.sizing import ATR_REGIME_DEFAULTS
 
@@ -330,16 +326,6 @@ def test_r12_decay_blocks_registered_with_hardcoded_defaults():
     assert cd["halflife_s"] == _CONFIDENCE_DECAY_DEFAULT_HALFLIFE_S == 900.0
     assert cd["shadow_log_path"] == ""
     assert set(_CONFIDENCE_DECAY_MODES) == {"off", "shadow", "enforce"}
-
-    sd = CANONICAL_DEFAULTS["signal_age_decay"]
-    assert sd["mode"] == "off"
-    assert sd["halflife_s"] == dict(_AGE_DECAY_DEFAULT_HALFLIFE_S)
-    assert sd["halflife_s"]["breakout"] == 900.0
-    assert sd["halflife_s"]["momentumBurst"] == 0.0
-    # onset_ttl_s mirrors the perception.py call-site literal (6h).
-    assert sd["onset_ttl_s"] == 21600.0
-    assert sd["shadow_log_path"] == ""
-    assert set(_AGE_DECAY_MODES) == {"off", "shadow", "enforce"}
 
     ac = CANONICAL_DEFAULTS["atr_regime_calibration"]
     assert ac["mode"] == "off"
@@ -362,13 +348,6 @@ def test_r12_decay_blocks_registered_with_hardcoded_defaults():
     ("confidence_decay.mode", "off"),
     ("confidence_decay.halflife_s", 900.0),
     ("confidence_decay.shadow_log_path", ""),
-    ("signal_age_decay.mode", "off"),
-    ("signal_age_decay.halflife_s.breakout", 900.0),
-    ("signal_age_decay.halflife_s.trendStrength", 1800.0),
-    ("signal_age_decay.halflife_s.trendFlip1h", 7200.0),
-    ("signal_age_decay.halflife_s.pctMoveSpike", 0.0),
-    ("signal_age_decay.onset_ttl_s", 21600.0),
-    ("signal_age_decay.shadow_log_path", ""),
     ("atr_regime_calibration.mode", "off"),
     ("atr_regime_calibration.low_ratio", 0.6),
     ("atr_regime_calibration.high_ratio", 1.6),
@@ -386,15 +365,9 @@ def test_r12_decay_env_override_mode_and_scalar_leaves(monkeypatch):
     """HERMES_CFG_<BLOCK>__<LEAF> overrides land (double-underscore nesting)."""
     monkeypatch.setenv("HERMES_CFG_CONFIDENCE_DECAY__MODE", "shadow")
     monkeypatch.setenv("HERMES_CFG_CONFIDENCE_DECAY__HALFLIFE_S", "1200")
-    monkeypatch.setenv("HERMES_CFG_SIGNAL_AGE_DECAY__ONSET_TTL_S", "3600")
-    monkeypatch.setenv(
-        "HERMES_CFG_SIGNAL_AGE_DECAY__HALFLIFE_S__BREAKOUT", "600")
     monkeypatch.setenv("HERMES_CFG_ATR_REGIME_CALIBRATION__LOW_RATIO", "0.75")
     assert cfg_get("confidence_decay.mode", config={}) == "shadow"
     assert cfg_get("confidence_decay.halflife_s", config={}) == 1200.0
-    assert cfg_get("signal_age_decay.onset_ttl_s", config={}) == 3600.0
-    assert cfg_get(
-        "signal_age_decay.halflife_s.breakout", config={}) == 600.0
     assert cfg_get("atr_regime_calibration.low_ratio", config={}) == 0.75
 
 
@@ -412,11 +385,9 @@ def test_r12_decay_config_dict_override_partial():
 
 
 def test_r12_decay_blocks_exposed_in_full_config_view():
-    """read_agent_config() pure-canonical view exposes all three blocks."""
+    """read_agent_config() pure-canonical view exposes both blocks."""
     cfg = read_agent_config()
     assert cfg["confidence_decay"]["mode"] == "off"
-    assert cfg["signal_age_decay"]["halflife_s"]["momentumBurst"] == 0.0
-    assert cfg["signal_age_decay"]["onset_ttl_s"] == 21600.0
     assert cfg["atr_regime_calibration"]["max_mult"] == 1.35
 
 
@@ -425,19 +396,16 @@ def test_r12_decay_blocks_deep_merge_partial_overlay(tmp_path, monkeypatch):
     import json
     cfg_file = tmp_path / ".agent-config.json"
     cfg_file.write_text(json.dumps({
-        "signal_age_decay": {"halflife_s": {"breakout": 120.0}},
         "atr_regime_calibration": {"mode": "shadow"},
     }))
     monkeypatch.setattr(config_store, "CONFIG_PATH", str(cfg_file))
     monkeypatch.setattr(config_store, "_CONFIG_LOCK_PATH", str(cfg_file) + ".lock")
 
     cfg = read_agent_config()
-    assert cfg["signal_age_decay"]["halflife_s"]["breakout"] == 120.0
-    # Overridden leaf's siblings survive from canonical.
-    assert cfg["signal_age_decay"]["halflife_s"]["trendStrength"] == 1800.0
-    assert cfg["signal_age_decay"]["mode"] == "off"
     assert cfg["atr_regime_calibration"]["mode"] == "shadow"
+    # Overridden leaf's siblings survive from canonical.
     assert cfg["atr_regime_calibration"]["low_ratio"] == 0.6
+    assert cfg["confidence_decay"]["mode"] == "off"
 
 
 def test_r12_decay_blocks_known_to_schema_strict_keys():
@@ -445,11 +413,6 @@ def test_r12_decay_blocks_known_to_schema_strict_keys():
     from hermes_trader.agents.config_schema import validate_config_updates
     errors = validate_config_updates({
         "confidence_decay": {"mode": "shadow", "halflife_s": 600.0},
-        "signal_age_decay": {
-            "mode": "enforce",
-            "halflife_s": {"breakout": 300.0, "momentumBurst": 0.0},
-            "onset_ttl_s": 7200.0,
-        },
         "atr_regime_calibration": {
             "mode": "shadow", "low_ratio": 0.5, "max_mult": 1.5,
         },
@@ -462,13 +425,11 @@ def test_r12_decay_schema_rejects_unknown_and_bad_leaves():
     from hermes_trader.agents.config_schema import validate_config_updates
     errors = validate_config_updates({
         "confidence_decay": {"mode": "bogus", "bogus_leaf": 1},
-        "signal_age_decay": {"halflife_s": {"not_a_trigger": 100.0}},
         "atr_regime_calibration": {"low_ratio": "not-a-number"},
     }, strict_keys=True)
     joined = " | ".join(errors)
     assert "confidence_decay.mode" in joined
     assert "confidence_decay.bogus_leaf: unknown key" in joined
-    assert "signal_age_decay.halflife_s.not_a_trigger: unknown key" in joined
     assert "atr_regime_calibration.low_ratio" in joined
 
 
@@ -478,7 +439,6 @@ def test_r12_decay_runtime_readers_pick_up_config_block():
         _atr_calib_config,
         _confidence_decay_config,
     )
-    from hermes_trader.agents.perception import _age_decay_config, _age_decay_halflives_ms
 
     cd = _confidence_decay_config({"confidence_decay": {"mode": "shadow", "halflife_s": 300.0}})
     assert cd["mode"] == "shadow"
@@ -488,11 +448,3 @@ def test_r12_decay_runtime_readers_pick_up_config_block():
     assert ac["mode"] == "enforce"
     # An invalid mode in the block safely falls back to off.
     assert _atr_calib_config({"atr_regime_calibration": {"mode": "bogus"}})["mode"] == "off"
-
-    sd = _age_decay_config({"signal_age_decay": {"mode": "shadow"}})
-    assert sd["mode"] == "shadow"
-    hl = _age_decay_halflives_ms(sd["block"])
-    assert hl["breakout"] == 900.0 * 1000.0      # canonical default
-    sd2 = _age_decay_config({"signal_age_decay": {"halflife_s": {"breakout": 60.0}}})
-    hl2 = _age_decay_halflives_ms(sd2["block"])
-    assert hl2["breakout"] == 60.0 * 1000.0      # overlay leaf

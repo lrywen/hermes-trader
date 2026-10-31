@@ -137,11 +137,9 @@ _BACKFILL_FILES: tuple[tuple[str, str], ...] = (
     ("unstucking", "unstucking.jsonl"),
     # P1-2 continuous coin selection: evidence is the counterfactual ranking log.
     ("coin_selection", "coin_selection.jsonl"),
-    # Audit 2026-09-27 (P0): 无离线回放脚本的臂，证据即主日志本身。补齐这4臂
+    # Audit 2026-09-27 (P0): 无离线回放脚本的臂，证据即主日志本身。补齐这2臂
     # 以保证「评级器能看见的臂，证据面也能看见」。
     ("market_circuit", "market_circuit_shadow.jsonl"),
-    ("reentry_cap", "reentry_cap_shadow.jsonl"),
-    ("signal_age_decay", "signal_age_decay_shadow.jsonl"),
     ("regime_overlay", "regime_overlay_shadow.jsonl"),
 )
 

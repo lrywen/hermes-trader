@@ -139,13 +139,13 @@ ts() { date -u +"%Y-%m-%dT%H:%M:%SZ"; }
   docker exec "$CONTAINER" python /app/scripts/reconcile_decision_shadow.py     --pattern /data/runner_gate_shadow.jsonl*     --cache /data/ch_hist_candles.json     --out /data/decision_shadow_outcomes.jsonl     --summary-out /data/decision_shadow_summary.json
   echo "$(ts) decision_shadow reconcile exit=$?"
 
-  # R1 (2026-10-30): signal_age_decay / trend_filter_200ma outcome backfill.
-  # The script shipped in the image but was NEVER scheduled, so both arms'
+  # R1 (2026-10-30): shadow veto-gate outcome backfill (6 arms).
+  # The script shipped in the image but was NEVER scheduled, so the arms'
   # records stayed outcome-less (backfill=0) forever. It resolves /data via
-  # HERMES_DATA_DIR inside the container and grades both arms' live JSONL +
+  # HERMES_DATA_DIR inside the container and grades each arm's live JSONL +
   # rotated siblings (72h forward, cost-aware). Pure paper, best-effort: never
   # masks the fills reconcile exit code above.
-  echo "$(ts) gate_outcomes shadow backfill start (signal_age_decay + trend_filter)"
+  echo "$(ts) gate_outcomes shadow backfill start"
   docker exec "$CONTAINER" python /app/scripts/reconcile_gate_outcomes.py --write
   echo "$(ts) gate_outcomes shadow backfill exit=$?"
 

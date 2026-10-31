@@ -432,12 +432,6 @@ CONFIDENCE_DECAY_OBSERVATIONS = Counter(
     "mode and bounded outcome (applied/no_change/would_block).",
     ["mode", "outcome"],
 )
-SIGNAL_AGE_DECAY_OBSERVATIONS = Counter(
-    "hermes_signal_age_decay_observations_total",
-    "Perception setup-age decay evaluations (perception.py), labelled by "
-    "mode and bounded outcome (applied/no_change/would_block).",
-    ["mode", "outcome"],
-)
 ATR_REGIME_CALIB_OBSERVATIONS = Counter(
     "hermes_atr_regime_calib_observations_total",
     "ATR volatility-regime stop-width factor evaluations (sizing.py via "

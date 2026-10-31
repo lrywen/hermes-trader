@@ -327,22 +327,19 @@ class _ConfigPatch(BaseModel):
     # Legacy HERMES_* env vars remain the top-priority channel.
     loop_runtime: dict[str, Any] = Field(default_factory=lambda: _dict_default("loop_runtime"))
     # roadmap §1/§2 (2026-09-04): gray-release blocks. confidence_decay ages
-    # the AI verdict confidence; signal_age_decay ages the perception
-    # composite per trigger (nested halflife_s map); atr_regime_calibration
-    # scales stop width by the ATR volatility regime. Each carries the
-    # off|shadow|enforce mode switch and a shadow_log_path leaf.
+    # the AI verdict confidence; atr_regime_calibration scales stop width by
+    # the ATR volatility regime. Each carries the off|shadow|enforce mode
+    # switch and a shadow_log_path leaf.
     confidence_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("confidence_decay"))
-    signal_age_decay: dict[str, Any] = Field(default_factory=lambda: _dict_default("signal_age_decay"))
     atr_regime_calibration: dict[str, Any] = Field(default_factory=lambda: _dict_default("atr_regime_calibration"))
-    # Audit 2026-09-06 (D1/D2/D3), ported from Pathia: the daily-200SMA long
-    # trend filter, the 24h long-extension ceiling and the per-coin rolling
-    # reentry cap. Each carries the off|shadow|enforce mode switch and a
-    # shadow_log_path leaf (D2 defaults to shadow, D1/D3 default off).
+    # Audit 2026-09-06 (D1/D2), ported from Pathia: the daily-200SMA long
+    # trend filter and the 24h long-extension ceiling. Each carries the
+    # off|shadow|enforce mode switch and a shadow_log_path leaf (D2 defaults
+    # to shadow, D1 defaults off).
     trend_filter_200ma: dict[str, Any] = Field(default_factory=lambda: _dict_default("trend_filter_200ma"))
     daily_extension_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("daily_extension_cap"))
     # Audit 2026-09-21 (#3): live post-only maker execution scaffold.
     maker_execution: dict[str, Any] = Field(default_factory=lambda: _dict_default("maker_execution"))
-    reentry_cap: dict[str, Any] = Field(default_factory=lambda: _dict_default("reentry_cap"))
     # Late-chase gate (2026-09-22): move-state freshness + terminal 1h-RSI
     # blowoff. Enabled by default (hard block, SHADOW/LIVE parity).
     late_chase: dict[str, Any] = Field(default_factory=lambda: _dict_default("late_chase"))
@@ -942,26 +939,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "halflife_s": _num_leaf(1.0, 86_400.0),
         "shadow_log_path": ("str",),
     },
-    # roadmap §2 (2026-09-04): perception setup-age decay (perception.py).
-    # halflife_s is a nested trigger-name → seconds map (0 = never decay);
-    # onset_ttl_s prunes stale onset state.
-    "signal_age_decay": {
-        "mode": ("enum", ("off", "shadow", "enforce")),
-        "halflife_s": {
-            "breakout": _num_leaf(0.0, 86_400.0),
-            "trendStrength": _num_leaf(0.0, 86_400.0),
-            "rangeCompression": _num_leaf(0.0, 86_400.0),
-            "trendFlip1h": _num_leaf(0.0, 86_400.0),
-            "higherLows1h": _num_leaf(0.0, 86_400.0),
-            "volumeBuildup1h": _num_leaf(0.0, 86_400.0),
-            "momentumContinuation1h": _num_leaf(0.0, 86_400.0),
-            "pctMoveSpike": _num_leaf(0.0, 86_400.0),
-            "volumeSpike": _num_leaf(0.0, 86_400.0),
-            "momentumBurst": _num_leaf(0.0, 86_400.0),
-        },
-        "onset_ttl_s": _num_leaf(60.0, 7 * 86_400.0),
-        "shadow_log_path": ("str",),
-    },
     # roadmap §1 (2026-09-04): ATR volatility-regime stop-width factor
     # (sizing.atr_regime_calibration, called from executor.py).
     "atr_regime_calibration": {
@@ -1008,16 +985,6 @@ _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
         "resting_lifecycle_ready": ("bool",),
         "offset_bps": _num_leaf(0.0, 1000.0),
         "max_notional_usd": _num_leaf(0.0, 1_000_000.0),
-    },
-    # Audit 2026-09-06 (D3), ported from Pathia reentry_cap: per-coin rolling
-    # window OPENING count. max_per_coin openings (fills, not signals) within
-    # window_hours block further entries for that coin. max_per_coin<=0
-    # disables. Memory read failure fails OPEN (shared-breaker convention).
-    "reentry_cap": {
-        "mode": ("enum", ("off", "shadow", "enforce")),
-        "max_per_coin": ("int", 0, 100),
-        "window_hours": _num_leaf(0.0, 24.0 * 30.0),
-        "shadow_log_path": ("str",),
     },
     # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm.
     # xs percentile trigger (top_pct), awake activity filter, downtrend +

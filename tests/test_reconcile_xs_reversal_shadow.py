@@ -274,6 +274,51 @@ def test_ledger_appends_mature_rows_and_is_idempotent(tmp_path, monkeypatch):
     assert len(rows2) == 2
 
 
+# --- P2 RSI bucket observation (read-only; pre-registered edges) ------------
+
+def test_rsi_bucket_uses_frozen_edges():
+    # Edges are frozen constants, independent of live config: a moved
+    # rsi_long can never re-cut the panel.
+    assert mod._rsi_bucket(15.0) == "[15,20)"
+    assert mod._rsi_bucket(19.99) == "[15,20)"
+    assert mod._rsi_bucket(20.0) == "[20,25)"
+    assert mod._rsi_bucket(30.0) == "[30,35)"
+    assert mod._rsi_bucket(14.9) == "<15"
+    assert mod._rsi_bucket(35.0) == ">=35"
+    assert mod._rsi_bucket(None) == "?"
+    assert mod._rsi_bucket(float("nan")) == "?"
+
+
+def test_rsi_bucket_report_requires_preregistered_evidence():
+    # Below the pre-registered n bar: observation only, never a threshold call.
+    small = {}
+    mod._tally_rsi(small, {"rsi14": 22.0, "pnl_pct": -5.0,
+                           "timestamp": 1_700_000_000_000}, False)
+    out = "\n".join(mod._rsi_bucket_report(small))
+    assert "仅观测" in out
+    assert "另立假设" not in out
+    # Enough records but a delta under the 2pp bar: keep rsi_long=35.
+    flat = {}
+    for i in range(mod.RSI_BUCKET_MIN_N):
+        mod._tally_rsi(flat, {"rsi14": 22.0, "pnl_pct": 1.0,
+                              "timestamp": 1_700_000_000_000 + i * 3600_000}, True)
+        mod._tally_rsi(flat, {"rsi14": 27.0, "pnl_pct": 1.5,
+                              "timestamp": 1_700_000_000_000 + i * 3600_000}, True)
+    out = "\n".join(mod._rsi_bucket_report(flat))
+    assert "维持 rsi_long=35" in out
+    # A >2pp gap against the reference bucket raises a hypothesis — but the
+    # report must still say the config is untouched.
+    big = {}
+    for i in range(mod.RSI_BUCKET_MIN_N):
+        mod._tally_rsi(big, {"rsi14": 17.0, "pnl_pct": -6.0,
+                             "timestamp": 1_700_000_000_000 + i * 3600_000}, False)
+        mod._tally_rsi(big, {"rsi14": 27.0, "pnl_pct": 1.0,
+                             "timestamp": 1_700_000_000_000 + i * 3600_000}, True)
+    out = "\n".join(mod._rsi_bucket_report(big))
+    assert "另立假设" in out
+    assert "本次不改配置" in out
+
+
 def test_no_ledger_writes_nothing(tmp_path, monkeypatch):
     p = _legacy_file(tmp_path)
     ledger = tmp_path / "ledger.jsonl"

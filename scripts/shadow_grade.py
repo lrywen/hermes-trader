@@ -34,14 +34,18 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import sys
 import time
 from datetime import datetime, timezone
+from typing import Optional
 
 # 复用同目录 shadow_progress 的臂表与解析逻辑（路径已在 Audit 2026-09-07 修正）。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shadow_progress as sp
+
+logger = logging.getLogger(__name__)
 
 # ── 评级阈值（保守；只决定"建议"，不自动执行任何动作）───────────────────────
 MIN_SAMPLES_PROMOTE = 60     # 168h 窗口内至少这么多条记录才谈晋升
@@ -174,9 +178,7 @@ ARM_KIND = {
     "ta_late_entry": "block",
     "sizing_v2": "change",
     "market_circuit": "signal",
-    "signal_age_decay": "change",
     "daily_extension_cap": "block",
-    "reentry_cap": "block",
     "trend_filter_200ma": "block",
     "xs_reversal": "signal",
     "regime_overlay": "signal",
@@ -1406,8 +1408,7 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
     if s["decisions"] > 0 and rate < MIN_BLOCK_RATE and kind in ("block", "change"):
         # D-6 附（0.3 §5 缺陷 2）：真正零触发的闸门不该判 COLLECTING。
         # 「继续采数」对一条 168h 内一次都没动作的臂没有意义 —— 它不产生
-        # 任何正反证据，只是在消耗采集预算。实测 reentry_cap 83 次决策 /
-        # 0 次命中，旧逻辑给「先继续观察」，属误导。零触发 = INERT。
+        # 任何正反证据，只是在消耗采集预算。零触发 = INERT。
         # 仅当确有极少量命中（hits>0）时才保留「继续观察」语义。
         if s["hits"] == 0:
             return INERT, (
