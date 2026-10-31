@@ -470,3 +470,34 @@ def test_timeout_cooldown_off_by_default(isolated_gate, monkeypatch):
     monkeypatch.setattr(sb, "get_book", lambda: _FakeShadowBook(close))
     a = _analysis(confidence=0.9, composite_score=50.0, breakout_fired=True)
     assert _block(a, cfg) == ""
+
+
+# ── 7. fresh_src provenance pin (P1) ───────────────────────────────────────
+
+def test_fresh_src_pinned_breakout(isolated_gate):
+    """The wrapper pins WHICH fresh leg admitted the trade onto the analysis so
+    the SHADOW open fill can be sliced by provenance (brk / recent_brk /
+    vol_burst / burst_score)."""
+    a = _analysis(confidence=0.9, composite_score=35.0, breakout_fired=True)
+    assert _block(a, _gate()) == ""
+    assert a["_runner_fresh_src"] == "brk"
+
+
+def test_fresh_src_pinned_volume_burst(isolated_gate):
+    a = _analysis(confidence=0.9, composite_score=35.0,
+                  volume_spike_fired=True, momentum_burst_fired=True,
+                  slow_burn_count=1)
+    assert _block(a, _gate()) == ""
+    assert a["_runner_fresh_src"] == "vol_burst"
+
+
+def test_fresh_src_blank_and_never_stale(isolated_gate):
+    """A gate that never runs (disabled) must pin "", not the previous
+    evaluation's value: the wrapper clears the thread-local per call."""
+    a1 = _analysis(coin="AAA", confidence=0.9, composite_score=35.0,
+                   breakout_fired=True)
+    assert _block(a1, _gate()) == ""
+    assert a1["_runner_fresh_src"] == "brk"
+    a2 = _analysis(coin="BBB", confidence=0.9)
+    assert _block(a2, {"runner_entry_gate": {"enabled": False}}) == ""
+    assert a2["_runner_fresh_src"] == ""

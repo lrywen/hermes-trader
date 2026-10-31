@@ -43,7 +43,7 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 10
+    assert len(SCHEDULED_JOBS) == 11
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
@@ -73,6 +73,13 @@ def test_daily_job_table_matches_compose_windows() -> None:
             30,
             ("scripts/reconcile_ta_late_entry_shadow.py", "--window-hours", "8", "--write"),
             "ta-late-reconcile.log",
+            {},
+        ),
+        "reconcile_fills": (
+            35,
+            ("scripts/reconcile_fills.py", "--window-hours", "26",
+             "--alert-on-orphan"),
+            "reconcile-fills.log",
             {},
         ),
         "reconcile_xs_reversal_shadow": (
@@ -169,7 +176,7 @@ def test_hourly_job_dedup_per_hour_but_fires_each_hour() -> None:
 
 def test_hourly_and_daily_jobs_never_share_a_window() -> None:
     # The compose schedule relies on the 05-07 hourly window never
-    # overlapping any daily window (10/20/30/40/55-57).
+    # overlapping any daily window (10/15/20/25/30/35/40/50/55-57).
     for minute in range(60):
         names = {j.name for j in SCHEDULED_JOBS if is_within_window(j, _utc(h=0, m=minute))}
         assert len(names) <= 1, (minute, names)

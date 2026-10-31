@@ -1,0 +1,80 @@
+{
+  "created_at": "2026-10-31T22:18:29.667535+00:00",
+  "era": {
+    "era_id": "ea9351fa8ef4",
+    "tracked_keys": [
+      "daily_extension_cap",
+      "dsl_exit",
+      "equity_fraction_per_trade",
+      "leverage",
+      "market_circuit",
+      "max_daily_loss_usd",
+      "max_signal_price_deviation_pct",
+      "min_ai_confidence",
+      "runner_entry_gate",
+      "scan.minCompositeScore",
+      "score_invariant_enabled",
+      "ta_late_entry",
+      "trend_filter_200ma",
+      "xs_reversal"
+    ]
+  },
+  "files": {
+    "config_effective": "config.effective.json",
+    "config_tracked": "config.tracked.json",
+    "data_inventory": "data_inventory.json",
+    "ledger": "ledger.json"
+  },
+  "git": {
+    "branch": "",
+    "commit": "",
+    "dirty": false
+  },
+  "paths": {
+    "config_file": "/data/.agent-config.json",
+    "data_dir": "/data",
+    "shadow_book": "/data/.shadow-book.json"
+  },
+  "runtime": {
+    "atr_risk_sizing": {
+      "coin_overrides": {
+        "BOME": {
+          "sl_floor_pct": 1.2
+        },
+        "HYPE": {
+          "sl_floor_pct": 1.5
+        },
+        "PURR": {
+          "sl_floor_pct": 1.2
+        }
+      },
+      "enabled": true,
+      "risk_per_trade_pct": 0.02,
+      "sizing_basis": "primary_stop",
+      "sizing_v2_cap_pct": 1,
+      "sizing_v2_mode": "enforce"
+    },
+    "max_total_notional_pct": 2,
+    "max_trade_notional_usd": 30,
+    "mode": "SHADOW",
+    "regime_risk_overlay": {
+      "chop": {
+        "allow_shorts": false,
+        "equity_fraction_mult": 0.5,
+        "max_concurrent": 1,
+        "pullback_long_enabled": false
+      },
+      "enabled": true,
+      "hysteresis_bars": 3,
+      "sample_interval_s": 300,
+      "shadow_log_path": "/data/regime_overlay_shadow.jsonl",
+      "shadow_mode": true,
+      "trend": {
+        "allow_shorts": true,
+        "equity_fraction_mult": 1,
+        "max_concurrent": 4
+      }
+    }
+  },
+  "schema": 1
+}

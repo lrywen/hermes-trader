@@ -1,0 +1,1804 @@
+{
+  "data": {
+    "entries": [
+      {
+        "bytes": 24115,
+        "kind": "file",
+        "mtime": "2026-10-31T22:08:41.144201+00:00",
+        "name": ".agent-config.json"
+      },
+      {
+        "bytes": 24115,
+        "kind": "file",
+        "mtime": "2026-10-31T10:53:08.926845+00:00",
+        "name": ".agent-config.json.bak"
+      },
+      {
+        "bytes": 21461,
+        "kind": "file",
+        "mtime": "2026-09-24T21:43:08.311909+00:00",
+        "name": ".agent-config.json.bak-20260924214308"
+      },
+      {
+        "bytes": 22051,
+        "kind": "file",
+        "mtime": "2026-09-30T03:30:32.345813+00:00",
+        "name": ".agent-config.json.bak-20260928"
+      },
+      {
+        "bytes": 24551,
+        "kind": "file",
+        "mtime": "2026-10-30T02:00:51.992222+00:00",
+        "name": ".agent-config.json.bak-enforce-20261030T020051Z"
+      },
+      {
+        "bytes": 21767,
+        "kind": "file",
+        "mtime": "2026-10-10T23:58:18.698987+00:00",
+        "name": ".agent-config.json.bak-feefix-1791676698"
+      },
+      {
+        "bytes": 21992,
+        "kind": "file",
+        "mtime": "2026-09-30T03:30:32.707847+00:00",
+        "name": ".agent-config.json.bak-intraday-20260930"
+      },
+      {
+        "bytes": 23369,
+        "kind": "file",
+        "mtime": "2026-10-16T03:58:30.867762+00:00",
+        "name": ".agent-config.json.bak-minconf-20261016-064734"
+      },
+      {
+        "bytes": 22465,
+        "kind": "file",
+        "mtime": "2026-10-15T10:01:45.915879+00:00",
+        "name": ".agent-config.json.bak-noshort-20261015-100145"
+      },
+      {
+        "bytes": 20081,
+        "kind": "file",
+        "mtime": "2026-09-15T09:30:04.028396+00:00",
+        "name": ".agent-config.json.bak-owngap-20260915"
+      },
+      {
+        "bytes": 21523,
+        "kind": "file",
+        "mtime": "2026-09-26T18:23:37.814401+00:00",
+        "name": ".agent-config.json.bak-pre-gatefix"
+      },
+      {
+        "bytes": 24398,
+        "kind": "file",
+        "mtime": "2026-10-28T22:09:29.099480+00:00",
+        "name": ".agent-config.json.bak-r1r3-20261029T203845Z"
+      },
+      {
+        "bytes": 24398,
+        "kind": "file",
+        "mtime": "2026-10-28T22:09:29.099480+00:00",
+        "name": ".agent-config.json.bak-r1r3-20261029T203858Z"
+      },
+      {
+        "bytes": 24398,
+        "kind": "file",
+        "mtime": "2026-10-28T22:09:29.099480+00:00",
+        "name": ".agent-config.json.bak-r1r3-20261029T203911Z"
+      },
+      {
+        "bytes": 22520,
+        "kind": "file",
+        "mtime": "2026-10-11T09:06:45.205420+00:00",
+        "name": ".agent-config.json.bak-realign-20261012-103016"
+      },
+      {
+        "bytes": 21988,
+        "kind": "file",
+        "mtime": "2026-09-30T11:40:11.616949+00:00",
+        "name": ".agent-config.json.bak-revert-20260930"
+      },
+      {
+        "bytes": 21764,
+        "kind": "file",
+        "mtime": "2026-10-10T23:58:18.700988+00:00",
+        "name": ".agent-config.json.bak-wt25-20261011-042926"
+      },
+      {
+        "bytes": 4612,
+        "kind": "file",
+        "mtime": "2026-08-21T03:46:23.048609+00:00",
+        "name": ".agent-config.json.bak.p0.1787327772"
+      },
+      {
+        "bytes": 13,
+        "kind": "file",
+        "mtime": "2026-10-31T22:09:20.875888+00:00",
+        "name": ".agent-config.json.integrity"
+      },
+      {
+        "bytes": 13,
+        "kind": "file",
+        "mtime": "2026-10-31T10:53:10.017947+00:00",
+        "name": ".agent-config.json.lastwrite"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-08-22T11:27:55.601255+00:00",
+        "name": ".agent-config.json.lock"
+      },
+      {
+        "bytes": 24633,
+        "kind": "file",
+        "mtime": "2026-10-30T14:19:07.821554+00:00",
+        "name": ".agent-config.json.pre-maker-v2-calib-20261031T003645Z"
+      },
+      {
+        "bytes": 5749,
+        "kind": "file",
+        "mtime": "2026-08-24T22:44:11.325692+00:00",
+        "name": ".agent-config.json.snap.1787611451.json"
+      },
+      {
+        "bytes": 5749,
+        "kind": "file",
+        "mtime": "2026-08-24T22:51:19.545338+00:00",
+        "name": ".agent-config.json.snap.1787611879.json"
+      },
+      {
+        "bytes": 24551,
+        "kind": "file",
+        "mtime": "2026-10-29T20:38:58.456607+00:00",
+        "name": ".agent-config.json.tmp"
+      },
+      {
+        "bytes": 2091279,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:34.908681+00:00",
+        "name": ".agent-memory.json"
+      },
+      {
+        "bytes": 2091246,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:51.417112+00:00",
+        "name": ".agent-memory.json.bak"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-08-17T06:49:37.161758+00:00",
+        "name": ".agent-memory.json.lock"
+      },
+      {
+        "bytes": 7081052,
+        "kind": "file",
+        "mtime": "2026-10-29T05:47:20.228283+00:00",
+        "name": ".binance-candles.json"
+      },
+      {
+        "bytes": 1760,
+        "kind": "file",
+        "mtime": "2026-10-31T13:23:26.700310+00:00",
+        "name": ".blowoff-latch.json"
+      },
+      {
+        "bytes": 276,
+        "kind": "file",
+        "mtime": "2026-10-31T13:23:26.717311+00:00",
+        "name": ".breaker-lkg.json"
+      },
+      {
+        "bytes": 58,
+        "kind": "file",
+        "mtime": "2026-10-30T02:57:47.095855+00:00",
+        "name": ".dsl-state.json"
+      },
+      {
+        "bytes": 58,
+        "kind": "file",
+        "mtime": "2026-10-30T02:57:47.017848+00:00",
+        "name": ".dsl-state.json.bak"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-08-22T11:28:24.457895+00:00",
+        "name": ".dsl-state.json.lock"
+      },
+      {
+        "bytes": 7889684,
+        "kind": "file",
+        "mtime": "2026-10-31T00:43:45.186360+00:00",
+        "name": ".historical-candles.json"
+      },
+      {
+        "bytes": 231,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.530923+00:00",
+        "name": ".loop-observability.state"
+      },
+      {
+        "bytes": 60,
+        "kind": "file",
+        "mtime": "2026-10-31T22:05:24.299924+00:00",
+        "name": ".macro-regime-watch.json"
+      },
+      {
+        "bytes": 221,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.529923+00:00",
+        "name": ".market-circuit.state"
+      },
+      {
+        "bytes": 19121,
+        "kind": "file",
+        "mtime": "2026-10-31T22:18:25.287339+00:00",
+        "name": ".move-state.json"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-10-21T07:48:22.871477+00:00",
+        "name": ".pc_tmp"
+      },
+      {
+        "bytes": 26,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.778946+00:00",
+        "name": ".pending-sl-retries.json"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.778946+00:00",
+        "name": ".pending-sl-retries.json.lock"
+      },
+      {
+        "bytes": 64,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:35.229711+00:00",
+        "name": ".positions-snapshot.json"
+      },
+      {
+        "bytes": 210,
+        "kind": "file",
+        "mtime": "2026-10-31T19:15:03.315486+00:00",
+        "name": ".pullback-gate.state"
+      },
+      {
+        "bytes": 164,
+        "kind": "file",
+        "mtime": "2026-10-31T22:12:38.917271+00:00",
+        "name": ".regime-overlay.state"
+      },
+      {
+        "bytes": 1716,
+        "kind": "file",
+        "mtime": "2026-10-24T03:30:04.704562+00:00",
+        "name": ".secrets.json"
+      },
+      {
+        "bytes": 916779,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.685938+00:00",
+        "name": ".shadow-book.json"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-09-03T02:41:17.967176+00:00",
+        "name": ".shadow-book.json.lock"
+      },
+      {
+        "bytes": 1767,
+        "kind": "file",
+        "mtime": "2026-10-31T22:18:25.266337+00:00",
+        "name": ".surge-detector-state.json"
+      },
+      {
+        "bytes": 26,
+        "kind": "file",
+        "mtime": "2026-09-26T23:35:22.049993+00:00",
+        "name": ".ws-user-fills-seen.json"
+      },
+      {
+        "bytes": 149,
+        "kind": "file",
+        "mtime": "2026-10-31T19:15:03.596513+00:00",
+        "name": ".xs-reversal.state"
+      },
+      {
+        "bytes": 0,
+        "files": 0,
+        "kind": "dir",
+        "mtime": "2026-10-31T22:18:28.821666+00:00",
+        "name": "baselines"
+      },
+      {
+        "bytes": 1190,
+        "kind": "file",
+        "mtime": "2026-10-29T10:15:13.633325+00:00",
+        "name": "bn90_sum_1h.json"
+      },
+      {
+        "bytes": 1177,
+        "kind": "file",
+        "mtime": "2026-10-29T10:15:13.663328+00:00",
+        "name": "bn90_sum_24h.json"
+      },
+      {
+        "bytes": 33761,
+        "kind": "file",
+        "mtime": "2026-10-29T06:55:32.693307+00:00",
+        "name": "bn90d_summary.json"
+      },
+      {
+        "bytes": 20202,
+        "kind": "file",
+        "mtime": "2026-10-09T10:15:35.019417+00:00",
+        "name": "book-continuity.log"
+      },
+      {
+        "bytes": 2108879714,
+        "files": 786,
+        "kind": "dir",
+        "mtime": "2026-10-31T00:00:00.564176+00:00",
+        "name": "book-raw"
+      },
+      {
+        "bytes": 35078119,
+        "kind": "file",
+        "mtime": "2026-10-21T09:09:36.132633+00:00",
+        "name": "ch_deep_candles.json"
+      },
+      {
+        "bytes": 23732441,
+        "kind": "file",
+        "mtime": "2026-10-24T06:24:20.444840+00:00",
+        "name": "ch_hist_candles.json"
+      },
+      {
+        "bytes": 23278,
+        "kind": "file",
+        "mtime": "2026-10-24T06:44:32.059188+00:00",
+        "name": "ch_weight_calib.jsonl"
+      },
+      {
+        "bytes": 237,
+        "kind": "file",
+        "mtime": "2026-10-24T06:44:33.331307+00:00",
+        "name": "ch_weight_calib.jsonl.meta.json"
+      },
+      {
+        "bytes": 3180,
+        "kind": "file",
+        "mtime": "2026-10-24T06:24:21.024894+00:00",
+        "name": "ch_wt_fetch.log"
+      },
+      {
+        "bytes": 1234,
+        "kind": "file",
+        "mtime": "2026-10-24T06:44:33.345308+00:00",
+        "name": "ch_wt_run.log"
+      },
+      {
+        "bytes": 2455,
+        "kind": "file",
+        "mtime": "2026-10-24T06:24:21.024894+00:00",
+        "name": "ch_wt_summary.json"
+      },
+      {
+        "bytes": 103956,
+        "kind": "file",
+        "mtime": "2026-10-31T00:00:37.290592+00:00",
+        "name": "clean-trades-raw.log"
+      },
+      {
+        "bytes": 1073488,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:37.894957+00:00",
+        "name": "coin_selection.jsonl"
+      },
+      {
+        "bytes": 718308,
+        "kind": "file",
+        "mtime": "2026-10-30T23:59:53.887555+00:00",
+        "name": "coin_selection.jsonl.1"
+      },
+      {
+        "bytes": 712604,
+        "kind": "file",
+        "mtime": "2026-10-29T23:54:19.827332+00:00",
+        "name": "coin_selection.jsonl.2"
+      },
+      {
+        "bytes": 811497,
+        "kind": "file",
+        "mtime": "2026-10-28T23:58:31.958194+00:00",
+        "name": "coin_selection.jsonl.3"
+      },
+      {
+        "bytes": 1331092,
+        "kind": "file",
+        "mtime": "2026-10-27T23:58:39.469784+00:00",
+        "name": "coin_selection.jsonl.4"
+      },
+      {
+        "bytes": 1813165,
+        "kind": "file",
+        "mtime": "2026-10-26T23:59:37.625872+00:00",
+        "name": "coin_selection.jsonl.5"
+      },
+      {
+        "bytes": 388624,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:39.658025+00:00",
+        "name": "completion_cap_shadow.jsonl"
+      },
+      {
+        "bytes": 866240,
+        "kind": "file",
+        "mtime": "2026-10-30T23:57:56.314620+00:00",
+        "name": "completion_cap_shadow.jsonl.1"
+      },
+      {
+        "bytes": 692868,
+        "kind": "file",
+        "mtime": "2026-10-29T23:59:58.964941+00:00",
+        "name": "completion_cap_shadow.jsonl.2"
+      },
+      {
+        "bytes": 537269,
+        "kind": "file",
+        "mtime": "2026-10-28T23:58:17.342831+00:00",
+        "name": "completion_cap_shadow.jsonl.3"
+      },
+      {
+        "bytes": 424930,
+        "kind": "file",
+        "mtime": "2026-10-27T23:56:10.987116+00:00",
+        "name": "completion_cap_shadow.jsonl.4"
+      },
+      {
+        "bytes": 275841,
+        "kind": "file",
+        "mtime": "2026-10-26T23:59:22.370435+00:00",
+        "name": "completion_cap_shadow.jsonl.5"
+      },
+      {
+        "bytes": 100698,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.192710+00:00",
+        "name": "confidence_decay_shadow.jsonl"
+      },
+      {
+        "bytes": 269744,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.184709+00:00",
+        "name": "confidence_decay_shadow.jsonl.1"
+      },
+      {
+        "bytes": 130337,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.163707+00:00",
+        "name": "confidence_decay_shadow.jsonl.2"
+      },
+      {
+        "bytes": 130371,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.150706+00:00",
+        "name": "confidence_decay_shadow.jsonl.3"
+      },
+      {
+        "bytes": 169063,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.139705+00:00",
+        "name": "confidence_decay_shadow.jsonl.4"
+      },
+      {
+        "bytes": 105012,
+        "kind": "file",
+        "mtime": "2026-09-23T00:16:46.122703+00:00",
+        "name": "confidence_decay_shadow.jsonl.5"
+      },
+      {
+        "bytes": 45639,
+        "kind": "file",
+        "mtime": "2026-10-31T22:14:35.761116+00:00",
+        "name": "conjunction_probe.jsonl"
+      },
+      {
+        "bytes": 171024,
+        "kind": "file",
+        "mtime": "2026-10-30T23:56:52.811716+00:00",
+        "name": "conjunction_probe.jsonl.1"
+      },
+      {
+        "bytes": 125109,
+        "kind": "file",
+        "mtime": "2026-10-29T23:58:34.727090+00:00",
+        "name": "conjunction_probe.jsonl.2"
+      },
+      {
+        "bytes": 64007,
+        "kind": "file",
+        "mtime": "2026-10-28T23:55:40.680164+00:00",
+        "name": "conjunction_probe.jsonl.3"
+      },
+      {
+        "bytes": 49452,
+        "kind": "file",
+        "mtime": "2026-10-27T23:55:00.808641+00:00",
+        "name": "conjunction_probe.jsonl.4"
+      },
+      {
+        "bytes": 32528,
+        "kind": "file",
+        "mtime": "2026-10-26T23:58:17.495322+00:00",
+        "name": "conjunction_probe.jsonl.5"
+      },
+      {
+        "bytes": 90437,
+        "kind": "file",
+        "mtime": "2026-10-31T00:10:42.219865+00:00",
+        "name": "daily-report.log"
+      },
+      {
+        "bytes": 744,
+        "kind": "file",
+        "mtime": "2026-10-31T13:23:27.838416+00:00",
+        "name": "daily_extension_cap_shadow.jsonl"
+      },
+      {
+        "bytes": 934,
+        "kind": "file",
+        "mtime": "2026-10-30T18:49:00.936299+00:00",
+        "name": "daily_extension_cap_shadow.jsonl.1"
+      },
+      {
+        "bytes": 2049,
+        "kind": "file",
+        "mtime": "2026-10-29T20:20:09.644456+00:00",
+        "name": "daily_extension_cap_shadow.jsonl.2"
+      },
+      {
+        "bytes": 8624,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:50.272506+00:00",
+        "name": "daily_extension_cap_shadow.jsonl.3"
+      },
+      {
+        "bytes": 2979,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:45.588070+00:00",
+        "name": "daily_extension_cap_shadow.jsonl.4"
+      },
+      {
+        "bytes": 746,
+        "kind": "file",
+        "mtime": "2026-10-30T00:16:20.838464+00:00",
+        "name": "daily_extension_cap_shadow.jsonl.5"
+      },
+      {
+        "bytes": 66120012,
+        "files": 18,
+        "kind": "dir",
+        "mtime": "2026-10-31T00:00:58.802593+00:00",
+        "name": "decision-snapshots"
+      },
+      {
+        "bytes": 1790916,
+        "kind": "file",
+        "mtime": "2026-10-31T00:18:57.152885+00:00",
+        "name": "decision_shadow_outcomes.jsonl"
+      },
+      {
+        "bytes": 361,
+        "kind": "file",
+        "mtime": "2026-10-29T06:52:08.517167+00:00",
+        "name": "decision_shadow_replay_bn90d_meta.json"
+      },
+      {
+        "bytes": 397,
+        "kind": "file",
+        "mtime": "2026-10-29T05:03:59.178246+00:00",
+        "name": "decision_shadow_replay_full_meta.json"
+      },
+      {
+        "bytes": 6411,
+        "kind": "file",
+        "mtime": "2026-10-31T00:18:57.504918+00:00",
+        "name": "decision_shadow_summary.json"
+      },
+      {
+        "bytes": 9324538,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:41.154163+00:00",
+        "name": "events.jsonl"
+      },
+      {
+        "bytes": 10485784,
+        "kind": "file",
+        "mtime": "2026-10-19T00:40:36.907161+00:00",
+        "name": "events.jsonl.1"
+      },
+      {
+        "bytes": 10485845,
+        "kind": "file",
+        "mtime": "2026-10-02T07:30:48.779463+00:00",
+        "name": "events.jsonl.2"
+      },
+      {
+        "bytes": 10485899,
+        "kind": "file",
+        "mtime": "2026-09-15T15:21:21.191674+00:00",
+        "name": "events.jsonl.3"
+      },
+      {
+        "bytes": 90,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:41.194166+00:00",
+        "name": "events.jsonl.chain"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-09-02T23:12:01.263116+00:00",
+        "name": "events.jsonl.lock"
+      },
+      {
+        "bytes": 9097310,
+        "files": 50,
+        "kind": "dir",
+        "mtime": "2026-10-07T11:13:15.779079+00:00",
+        "name": "funding"
+      },
+      {
+        "bytes": 256,
+        "kind": "file",
+        "mtime": "2026-10-09T10:25:47.712831+00:00",
+        "name": "funding-carry-forward.json"
+      },
+      {
+        "bytes": 9723,
+        "kind": "file",
+        "mtime": "2026-10-09T10:25:48.421898+00:00",
+        "name": "funding-carry-forward.log"
+      },
+      {
+        "bytes": 17373,
+        "kind": "file",
+        "mtime": "2026-10-31T00:26:49.747849+00:00",
+        "name": "gate-outcomes-reconcile.log"
+      },
+      {
+        "bytes": 27301,
+        "kind": "file",
+        "mtime": "2026-10-29T23:45:06.174726+00:00",
+        "name": "hist_wouldblock_30d.jsonl"
+      },
+      {
+        "bytes": 106836,
+        "kind": "file",
+        "mtime": "2026-10-30T01:10:22.393752+00:00",
+        "name": "hist_wouldblock_stored.jsonl"
+      },
+      {
+        "bytes": 138,
+        "kind": "file",
+        "mtime": "2026-10-31T22:14:55.713961+00:00",
+        "name": "ip_drift_state.json"
+      },
+      {
+        "bytes": 2414,
+        "kind": "file",
+        "mtime": "2026-10-28T22:45:29+00:00",
+        "name": "m1_eval_20261028.log"
+      },
+      {
+        "bytes": 827,
+        "kind": "file",
+        "mtime": "2026-10-29T20:58:02.097162+00:00",
+        "name": "m2_backfill_verdict.json"
+      },
+      {
+        "bytes": 2882,
+        "kind": "file",
+        "mtime": "2026-10-30T03:17:25.475011+00:00",
+        "name": "m2_entry_tailbuy.py"
+      },
+      {
+        "bytes": 2701,
+        "kind": "file",
+        "mtime": "2026-10-30T03:17:25.472011+00:00",
+        "name": "m2_exit_giveback.py"
+      },
+      {
+        "bytes": 657,
+        "kind": "file",
+        "mtime": "2026-10-29T23:52:42.584268+00:00",
+        "name": "m2_hist_real_verdict.json"
+      },
+      {
+        "bytes": 656,
+        "kind": "file",
+        "mtime": "2026-10-30T01:26:10.012308+00:00",
+        "name": "m2_hist_verdict_fixed.json"
+      },
+      {
+        "bytes": 657,
+        "kind": "file",
+        "mtime": "2026-10-30T01:10:50.750396+00:00",
+        "name": "m2_hist_verdict_stored.json"
+      },
+      {
+        "bytes": 1981,
+        "kind": "file",
+        "mtime": "2026-10-29T18:02:06.875566+00:00",
+        "name": "m2_promotion_verdict.json"
+      },
+      {
+        "bytes": 403,
+        "kind": "file",
+        "mtime": "2026-10-29T23:30:54.283365+00:00",
+        "name": "m2_r1_evidence.json"
+      },
+      {
+        "bytes": 406,
+        "kind": "file",
+        "mtime": "2026-10-30T01:27:16.985622+00:00",
+        "name": "m2_r1_hist_evidence.json"
+      },
+      {
+        "bytes": 403,
+        "kind": "file",
+        "mtime": "2026-10-30T01:27:43.467119+00:00",
+        "name": "m2_r1_live_evidence.json"
+      },
+      {
+        "bytes": 156,
+        "kind": "file",
+        "mtime": "2026-10-29T22:06:47.344950+00:00",
+        "name": "m2_r1_revalidation.txt"
+      },
+      {
+        "bytes": 1938,
+        "kind": "file",
+        "mtime": "2026-10-29T22:19:28.408897+00:00",
+        "name": "m2_r1_robust.json"
+      },
+      {
+        "bytes": 325,
+        "kind": "file",
+        "mtime": "2026-10-29T22:54:41.231817+00:00",
+        "name": "m2_r1_temporal.json"
+      },
+      {
+        "bytes": 296,
+        "kind": "file",
+        "mtime": "2026-10-29T22:38:12+00:00",
+        "name": "m2_r1_veto_offline.json"
+      },
+      {
+        "bytes": 1454,
+        "kind": "file",
+        "mtime": "2026-10-29T21:47:58.314693+00:00",
+        "name": "m2_r3_cap_sweep.json"
+      },
+      {
+        "bytes": 526,
+        "kind": "file",
+        "mtime": "2026-10-29T21:28:32.290962+00:00",
+        "name": "m2_r3_semantics.json"
+      },
+      {
+        "bytes": 3041,
+        "kind": "file",
+        "mtime": "2026-10-29T17:26:11.818955+00:00",
+        "name": "m2_r5_excess.json"
+      },
+      {
+        "bytes": 388,
+        "kind": "file",
+        "mtime": "2026-10-29T17:05:24.352555+00:00",
+        "name": "m2_r5_meanrev_88d.txt"
+      },
+      {
+        "bytes": 218,
+        "kind": "file",
+        "mtime": "2026-10-29T18:00:52.454638+00:00",
+        "name": "m2_r5_regime_88d.txt"
+      },
+      {
+        "bytes": 652,
+        "kind": "file",
+        "mtime": "2026-10-30T01:27:43.226096+00:00",
+        "name": "m2_real_verdict.json"
+      },
+      {
+        "bytes": 652,
+        "kind": "file",
+        "mtime": "2026-10-29T22:37:31.450798+00:00",
+        "name": "m2_real_verdict_now.json"
+      },
+      {
+        "bytes": 832,
+        "kind": "file",
+        "mtime": "2026-10-29T18:29:21.010941+00:00",
+        "name": "m2_splithalf_88d.json"
+      },
+      {
+        "bytes": 724979,
+        "kind": "file",
+        "mtime": "2026-10-31T22:05:24.387933+00:00",
+        "name": "macro-regime-watch.log"
+      },
+      {
+        "bytes": 430,
+        "kind": "file",
+        "mtime": "2026-10-29T20:47:23.842678+00:00",
+        "name": "market_circuit_shadow.jsonl"
+      },
+      {
+        "bytes": 430,
+        "kind": "file",
+        "mtime": "2026-10-24T15:22:43.616968+00:00",
+        "name": "market_circuit_shadow.jsonl.1"
+      },
+      {
+        "bytes": 430,
+        "kind": "file",
+        "mtime": "2026-10-17T21:44:14.936388+00:00",
+        "name": "market_circuit_shadow.jsonl.2"
+      },
+      {
+        "bytes": 861,
+        "kind": "file",
+        "mtime": "2026-10-15T02:33:25.236832+00:00",
+        "name": "market_circuit_shadow.jsonl.3"
+      },
+      {
+        "bytes": 861,
+        "kind": "file",
+        "mtime": "2026-10-07T02:14:24.955642+00:00",
+        "name": "market_circuit_shadow.jsonl.4"
+      },
+      {
+        "bytes": 430,
+        "kind": "file",
+        "mtime": "2026-09-23T14:24:55.901881+00:00",
+        "name": "market_circuit_shadow.jsonl.5"
+      },
+      {
+        "bytes": 385,
+        "kind": "file",
+        "mtime": "2026-10-30T04:07:27.104544+00:00",
+        "name": "p1_explore.json"
+      },
+      {
+        "bytes": 1075123,
+        "kind": "file",
+        "mtime": "2026-10-30T05:17:58.120616+00:00",
+        "name": "p1_records.json"
+      },
+      {
+        "bytes": 1080,
+        "kind": "file",
+        "mtime": "2026-10-30T04:49:42.869665+00:00",
+        "name": "p1_sweep.json"
+      },
+      {
+        "bytes": 2480,
+        "kind": "file",
+        "mtime": "2026-10-30T11:21:30.311731+00:00",
+        "name": "path_a_forward_2026-10-30.json"
+      },
+      {
+        "bytes": 15612,
+        "kind": "file",
+        "mtime": "2026-10-30T12:38:45.190233+00:00",
+        "name": "path_a_leg_2026-10-30.json"
+      },
+      {
+        "bytes": 66391,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:40.862136+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl"
+      },
+      {
+        "bytes": 138500,
+        "kind": "file",
+        "mtime": "2026-10-30T23:55:37.380703+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl.1"
+      },
+      {
+        "bytes": 95033,
+        "kind": "file",
+        "mtime": "2026-10-29T23:54:04.286883+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl.2"
+      },
+      {
+        "bytes": 84044,
+        "kind": "file",
+        "mtime": "2026-10-28T23:58:18.650953+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl.3"
+      },
+      {
+        "bytes": 75490,
+        "kind": "file",
+        "mtime": "2026-10-27T23:56:13.259326+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl.4"
+      },
+      {
+        "bytes": 50773,
+        "kind": "file",
+        "mtime": "2026-10-26T23:59:23.903579+00:00",
+        "name": "per_coin_cooldown_shadow.jsonl.5"
+      },
+      {
+        "bytes": 6992327,
+        "files": 1933,
+        "kind": "dir",
+        "mtime": "2026-10-31T18:22:46.986214+00:00",
+        "name": "postmortems"
+      },
+      {
+        "bytes": 21678,
+        "kind": "file",
+        "mtime": "2026-10-31T00:55:20.134028+00:00",
+        "name": "prepare-canary-promotion.log"
+      },
+      {
+        "bytes": 78668,
+        "kind": "file",
+        "mtime": "2026-10-31T00:20:51.058479+00:00",
+        "name": "pullback-shadow-report.log"
+      },
+      {
+        "bytes": 1019,
+        "kind": "file",
+        "mtime": "2026-09-15T03:05:59.576502+00:00",
+        "name": "pullback_shadow.backfill.jsonl"
+      },
+      {
+        "bytes": 10842,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:08.316605+00:00",
+        "name": "pullback_shadow.jsonl"
+      },
+      {
+        "bytes": 8590,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:08.317605+00:00",
+        "name": "pullback_shadow.jsonl.1"
+      },
+      {
+        "bytes": 38803,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:08.320606+00:00",
+        "name": "pullback_shadow.jsonl.2"
+      },
+      {
+        "bytes": 32766,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:08.323606+00:00",
+        "name": "pullback_shadow.jsonl.3"
+      },
+      {
+        "bytes": 305858,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:39.663025+00:00",
+        "name": "reasoning_effort_rollout.jsonl"
+      },
+      {
+        "bytes": 681590,
+        "kind": "file",
+        "mtime": "2026-10-30T23:57:56.321621+00:00",
+        "name": "reasoning_effort_rollout.jsonl.1"
+      },
+      {
+        "bytes": 545226,
+        "kind": "file",
+        "mtime": "2026-10-29T23:59:58.969942+00:00",
+        "name": "reasoning_effort_rollout.jsonl.2"
+      },
+      {
+        "bytes": 422897,
+        "kind": "file",
+        "mtime": "2026-10-28T23:58:17.350832+00:00",
+        "name": "reasoning_effort_rollout.jsonl.3"
+      },
+      {
+        "bytes": 334453,
+        "kind": "file",
+        "mtime": "2026-10-27T23:56:10.994117+00:00",
+        "name": "reasoning_effort_rollout.jsonl.4"
+      },
+      {
+        "bytes": 217128,
+        "kind": "file",
+        "mtime": "2026-10-26T23:59:22.375435+00:00",
+        "name": "reasoning_effort_rollout.jsonl.5"
+      },
+      {
+        "bytes": 441,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:03.736179+00:00",
+        "name": "reconcile_status.json"
+      },
+      {
+        "bytes": 441,
+        "kind": "file",
+        "mtime": "2026-10-18T00:15:03.408298+00:00",
+        "name": "reconcile_status.json.tmp"
+      },
+      {
+        "bytes": 150863,
+        "kind": "file",
+        "mtime": "2026-09-15T08:38:08.835560+00:00",
+        "name": "regen_param_sweep_report.json"
+      },
+      {
+        "bytes": 33426,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:40.838134+00:00",
+        "name": "regime_direction_shadow.jsonl"
+      },
+      {
+        "bytes": 88072,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:16.573423+00:00",
+        "name": "regime_direction_shadow.jsonl.1"
+      },
+      {
+        "bytes": 59950,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:16.588425+00:00",
+        "name": "regime_direction_shadow.jsonl.2"
+      },
+      {
+        "bytes": 53447,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:28.168502+00:00",
+        "name": "regime_direction_shadow.jsonl.3"
+      },
+      {
+        "bytes": 52511,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:27.727461+00:00",
+        "name": "regime_direction_shadow.jsonl.4"
+      },
+      {
+        "bytes": 36084,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:25.809283+00:00",
+        "name": "regime_direction_shadow.jsonl.5"
+      },
+      {
+        "bytes": 642,
+        "kind": "file",
+        "mtime": "2026-10-31T08:35:24.971752+00:00",
+        "name": "regime_overlay_shadow.jsonl"
+      },
+      {
+        "bytes": 2537,
+        "kind": "file",
+        "mtime": "2026-10-29T23:21:39.584659+00:00",
+        "name": "regime_overlay_shadow.jsonl.1"
+      },
+      {
+        "bytes": 957,
+        "kind": "file",
+        "mtime": "2026-10-28T22:52:56.002129+00:00",
+        "name": "regime_overlay_shadow.jsonl.2"
+      },
+      {
+        "bytes": 949,
+        "kind": "file",
+        "mtime": "2026-10-27T17:22:52.505179+00:00",
+        "name": "regime_overlay_shadow.jsonl.3"
+      },
+      {
+        "bytes": 1602,
+        "kind": "file",
+        "mtime": "2026-10-26T19:47:45.920345+00:00",
+        "name": "regime_overlay_shadow.jsonl.4"
+      },
+      {
+        "bytes": 1917,
+        "kind": "file",
+        "mtime": "2026-10-25T23:47:34.788187+00:00",
+        "name": "regime_overlay_shadow.jsonl.5"
+      },
+      {
+        "bytes": 72150,
+        "kind": "file",
+        "mtime": "2026-10-31T00:50:19.564068+00:00",
+        "name": "relax-tier-reconcile.log"
+      },
+      {
+        "bytes": 38260,
+        "kind": "file",
+        "mtime": "2026-10-29T04:22:47.093266+00:00",
+        "name": "replay_60d_summary.json"
+      },
+      {
+        "bytes": 16110,
+        "kind": "file",
+        "mtime": "2026-10-31T22:14:33.287888+00:00",
+        "name": "research_cooldown_adaptive.jsonl"
+      },
+      {
+        "bytes": 8739,
+        "kind": "file",
+        "mtime": "2026-10-30T22:40:18.187109+00:00",
+        "name": "research_cooldown_adaptive.jsonl.1"
+      },
+      {
+        "bytes": 8975,
+        "kind": "file",
+        "mtime": "2026-10-29T23:08:18.284965+00:00",
+        "name": "research_cooldown_adaptive.jsonl.2"
+      },
+      {
+        "bytes": 8305,
+        "kind": "file",
+        "mtime": "2026-10-28T23:14:01.858549+00:00",
+        "name": "research_cooldown_adaptive.jsonl.3"
+      },
+      {
+        "bytes": 11992,
+        "kind": "file",
+        "mtime": "2026-10-27T21:45:39.267000+00:00",
+        "name": "research_cooldown_adaptive.jsonl.4"
+      },
+      {
+        "bytes": 6324,
+        "kind": "file",
+        "mtime": "2026-10-26T23:10:00.702137+00:00",
+        "name": "research_cooldown_adaptive.jsonl.5"
+      },
+      {
+        "bytes": 1760466,
+        "kind": "file",
+        "mtime": "2026-10-31T12:53:54.334201+00:00",
+        "name": "risk_tuning_shadow.jsonl"
+      },
+      {
+        "bytes": 2617,
+        "kind": "file",
+        "mtime": "2026-10-24T22:16:00.963681+00:00",
+        "name": "risk_tuning_shadow.jsonl.1"
+      },
+      {
+        "bytes": 43770,
+        "kind": "file",
+        "mtime": "2026-10-21T21:57:52.487055+00:00",
+        "name": "risk_tuning_shadow.jsonl.2"
+      },
+      {
+        "bytes": 5617,
+        "kind": "file",
+        "mtime": "2026-10-21T07:44:05.589276+00:00",
+        "name": "risk_tuning_shadow.jsonl.3"
+      },
+      {
+        "bytes": 14027,
+        "kind": "file",
+        "mtime": "2026-10-21T07:44:05.487266+00:00",
+        "name": "risk_tuning_shadow.jsonl.4"
+      },
+      {
+        "bytes": 61603,
+        "kind": "file",
+        "mtime": "2026-10-21T07:44:05.337252+00:00",
+        "name": "risk_tuning_shadow.jsonl.5"
+      },
+      {
+        "bytes": 118994,
+        "kind": "file",
+        "mtime": "2026-10-31T22:15:40.888138+00:00",
+        "name": "runner_gate_shadow.jsonl"
+      },
+      {
+        "bytes": 324913,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:16.643430+00:00",
+        "name": "runner_gate_shadow.jsonl.1"
+      },
+      {
+        "bytes": 216228,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:16.659431+00:00",
+        "name": "runner_gate_shadow.jsonl.2"
+      },
+      {
+        "bytes": 166752,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:54.670967+00:00",
+        "name": "runner_gate_shadow.jsonl.3"
+      },
+      {
+        "bytes": 161868,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:50.710599+00:00",
+        "name": "runner_gate_shadow.jsonl.4"
+      },
+      {
+        "bytes": 107654,
+        "kind": "file",
+        "mtime": "2026-10-31T01:11:05.930015+00:00",
+        "name": "runner_gate_shadow.jsonl.5"
+      },
+      {
+        "bytes": 153889,
+        "kind": "file",
+        "mtime": "2026-10-31T01:11:14.697830+00:00",
+        "name": "runner_gate_shadow.jsonl.6"
+      },
+      {
+        "bytes": 116660,
+        "kind": "file",
+        "mtime": "2026-10-31T01:10:30.938760+00:00",
+        "name": "runner_gate_shadow.jsonl.7"
+      },
+      {
+        "bytes": 72022,
+        "kind": "file",
+        "mtime": "2026-10-31T08:23:02.502055+00:00",
+        "name": "runtime_config.effective.json"
+      },
+      {
+        "bytes": 941,
+        "kind": "file",
+        "mtime": "2026-10-31T22:18:24.397257+00:00",
+        "name": "scheduler_state.json"
+      },
+      {
+        "bytes": 121,
+        "kind": "file",
+        "mtime": "2026-10-18T02:15:49.944744+00:00",
+        "name": "scheduler_state.json.tmp"
+      },
+      {
+        "bytes": 14000,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:48.975385+00:00",
+        "name": "selection-attribution-verdict.log"
+      },
+      {
+        "bytes": 3438443,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:38.376001+00:00",
+        "name": "selection_attribution.json"
+      },
+      {
+        "bytes": 11214892,
+        "kind": "file",
+        "mtime": "2026-10-18T22:48:06.082340+00:00",
+        "name": "selection_attribution.json.bak-1792363708"
+      },
+      {
+        "bytes": 1399536,
+        "kind": "file",
+        "mtime": "2026-10-18T23:12:25.804115+00:00",
+        "name": "selection_attribution.json.bak-1792365262"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-10-16T02:14:13.062784+00:00",
+        "name": "selection_attribution.json.lock"
+      },
+      {
+        "bytes": 14085,
+        "kind": "file",
+        "mtime": "2026-10-31T00:15:48.890377+00:00",
+        "name": "selection_attribution_verdicts.jsonl"
+      },
+      {
+        "bytes": 6122194,
+        "kind": "file",
+        "mtime": "2026-10-31T22:18:25.212332+00:00",
+        "name": "session-log.jsonl"
+      },
+      {
+        "bytes": 1374507,
+        "kind": "file",
+        "mtime": "2026-09-22T23:48:57.111830+00:00",
+        "name": "session-log.jsonl.1790120936.gz"
+      },
+      {
+        "bytes": 1979386,
+        "kind": "file",
+        "mtime": "2026-09-28T12:52:42.196020+00:00",
+        "name": "session-log.jsonl.1790599961.gz"
+      },
+      {
+        "bytes": 2100436,
+        "kind": "file",
+        "mtime": "2026-10-07T20:53:00.621869+00:00",
+        "name": "session-log.jsonl.1791406379.gz"
+      },
+      {
+        "bytes": 2075159,
+        "kind": "file",
+        "mtime": "2026-10-17T20:11:10.320904+00:00",
+        "name": "session-log.jsonl.1792267869.gz"
+      },
+      {
+        "bytes": 1982022,
+        "kind": "file",
+        "mtime": "2026-10-28T10:40:43.919822+00:00",
+        "name": "session-log.jsonl.1793184043.gz"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-08-28T12:38:00.375435+00:00",
+        "name": "session-log.jsonl.lock"
+      },
+      {
+        "bytes": 1015151,
+        "kind": "file",
+        "mtime": "2026-10-31T00:45:20.492233+00:00",
+        "name": "shadow_grade_history.jsonl"
+      },
+      {
+        "bytes": 6389,
+        "kind": "file",
+        "mtime": "2026-09-21T00:55:23.159348+00:00",
+        "name": "short-only-reconcile.log"
+      },
+      {
+        "bytes": 59358,
+        "kind": "file",
+        "mtime": "2026-10-31T22:14:38.776395+00:00",
+        "name": "signal_ranking.jsonl"
+      },
+      {
+        "bytes": 122051,
+        "kind": "file",
+        "mtime": "2026-10-30T23:56:52.883723+00:00",
+        "name": "signal_ranking.jsonl.1"
+      },
+      {
+        "bytes": 94003,
+        "kind": "file",
+        "mtime": "2026-10-29T23:58:34.728090+00:00",
+        "name": "signal_ranking.jsonl.2"
+      },
+      {
+        "bytes": 78553,
+        "kind": "file",
+        "mtime": "2026-10-28T23:55:40.680164+00:00",
+        "name": "signal_ranking.jsonl.3"
+      },
+      {
+        "bytes": 68773,
+        "kind": "file",
+        "mtime": "2026-10-27T23:55:03.822919+00:00",
+        "name": "signal_ranking.jsonl.4"
+      },
+      {
+        "bytes": 47511,
+        "kind": "file",
+        "mtime": "2026-10-26T23:58:17.495322+00:00",
+        "name": "signal_ranking.jsonl.5"
+      },
+      {
+        "bytes": 43578,
+        "kind": "file",
+        "mtime": "2026-09-23T00:15:11.786818+00:00",
+        "name": "sizing_v2_shadow.jsonl"
+      },
+      {
+        "bytes": 52507,
+        "kind": "file",
+        "mtime": "2026-09-23T00:15:11.784818+00:00",
+        "name": "sizing_v2_shadow.jsonl.1"
+      },
+      {
+        "bytes": 93351,
+        "kind": "file",
+        "mtime": "2026-09-23T00:15:11.781818+00:00",
+        "name": "sizing_v2_shadow.jsonl.2"
+      },
+      {
+        "bytes": 291284,
+        "kind": "file",
+        "mtime": "2026-09-23T00:15:11.777817+00:00",
+        "name": "sizing_v2_shadow.jsonl.3"
+      },
+      {
+        "bytes": 2145345,
+        "kind": "file",
+        "mtime": "2026-10-31T00:37:31.484570+00:00",
+        "name": "ta-late-reconcile.log"
+      },
+      {
+        "bytes": 38148,
+        "kind": "file",
+        "mtime": "2026-10-31T00:44:26.418199+00:00",
+        "name": "ta_late_entry_shadow.backfill.jsonl"
+      },
+      {
+        "bytes": 364075,
+        "kind": "file",
+        "mtime": "2026-10-31T21:20:42.161427+00:00",
+        "name": "ta_late_entry_shadow.jsonl"
+      },
+      {
+        "bytes": 364661,
+        "kind": "file",
+        "mtime": "2026-10-29T23:56:54.958791+00:00",
+        "name": "ta_late_entry_shadow.jsonl.1"
+      },
+      {
+        "bytes": 337090,
+        "kind": "file",
+        "mtime": "2026-10-31T00:16:12.676589+00:00",
+        "name": "ta_late_entry_shadow.jsonl.2"
+      },
+      {
+        "bytes": 189483,
+        "kind": "file",
+        "mtime": "2026-10-30T00:16:39.819235+00:00",
+        "name": "ta_late_entry_shadow.jsonl.3"
+      },
+      {
+        "bytes": 64217,
+        "kind": "file",
+        "mtime": "2026-10-29T00:15:51.787861+00:00",
+        "name": "ta_late_entry_shadow.jsonl.4"
+      },
+      {
+        "bytes": 572202,
+        "kind": "file",
+        "mtime": "2026-10-28T00:15:25.958517+00:00",
+        "name": "ta_late_entry_shadow.jsonl.5"
+      },
+      {
+        "bytes": 7962786609,
+        "files": 44,
+        "kind": "dir",
+        "mtime": "2026-10-31T00:00:02.205328+00:00",
+        "name": "tape-raw"
+      },
+      {
+        "bytes": 237682,
+        "kind": "file",
+        "mtime": "2026-10-01T20:49:15.673419+00:00",
+        "name": "tmp281cg13q.tmp"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-10-01T20:02:34.858844+00:00",
+        "name": "tmp3qpgapb_.tmp"
+      },
+      {
+        "bytes": 131192,
+        "kind": "file",
+        "mtime": "2026-10-23T13:45:14.302943+00:00",
+        "name": "tmp50x1526c.tmp"
+      },
+      {
+        "bytes": 8196,
+        "kind": "file",
+        "mtime": "2026-10-01T17:49:24.153646+00:00",
+        "name": "tmp8sqsf8gt.tmp"
+      },
+      {
+        "bytes": 631265,
+        "kind": "file",
+        "mtime": "2026-09-10T11:09:21.724040+00:00",
+        "name": "tmpf5fb9jka.tmp"
+      },
+      {
+        "bytes": 958949,
+        "kind": "file",
+        "mtime": "2026-10-24T13:27:29.932443+00:00",
+        "name": "tmphy57trnc.tmp"
+      },
+      {
+        "bytes": 11821847,
+        "kind": "file",
+        "mtime": "2026-10-18T01:03:06.210790+00:00",
+        "name": "tmpiivlzaak.tmp"
+      },
+      {
+        "bytes": 409834,
+        "kind": "file",
+        "mtime": "2026-10-01T17:02:47.459107+00:00",
+        "name": "tmpnfzby14s.tmp"
+      },
+      {
+        "bytes": 90157,
+        "kind": "file",
+        "mtime": "2026-10-07T04:04:06.658173+00:00",
+        "name": "tmpokxqybfc.tmp"
+      },
+      {
+        "bytes": 0,
+        "kind": "file",
+        "mtime": "2026-10-01T16:11:41.330354+00:00",
+        "name": "tmprura11we.tmp"
+      },
+      {
+        "bytes": 21170,
+        "kind": "file",
+        "mtime": "2026-09-23T21:39:01.918941+00:00",
+        "name": "tmpu9rngtr3"
+      },
+      {
+        "bytes": 7822917642,
+        "files": 273,
+        "kind": "dir",
+        "mtime": "2026-10-31T00:00:08.849946+00:00",
+        "name": "trades-raw"
+      },
+      {
+        "bytes": 8507628,
+        "kind": "file",
+        "mtime": "2026-10-31T22:18:25.212332+00:00",
+        "name": "trading-loop.log"
+      },
+      {
+        "bytes": 52428791,
+        "kind": "file",
+        "mtime": "2026-10-30T23:07:55.340300+00:00",
+        "name": "trading-loop.log.1"
+      },
+      {
+        "bytes": 52428789,
+        "kind": "file",
+        "mtime": "2026-10-25T16:47:30.619431+00:00",
+        "name": "trading-loop.log.2"
+      },
+      {
+        "bytes": 52428699,
+        "kind": "file",
+        "mtime": "2026-10-20T14:28:46.380474+00:00",
+        "name": "trading-loop.log.3"
+      },
+      {
+        "bytes": 52428784,
+        "kind": "file",
+        "mtime": "2026-10-16T00:15:26.525585+00:00",
+        "name": "trading-loop.log.4"
+      },
+      {
+        "bytes": 52428774,
+        "kind": "file",
+        "mtime": "2026-10-10T19:35:44.138969+00:00",
+        "name": "trading-loop.log.5"
+      },
+      {
+        "bytes": 1372,
+        "kind": "file",
+        "mtime": "2026-10-31T13:23:27.830415+00:00",
+        "name": "trend_filter_shadow.jsonl"
+      },
+      {
+        "bytes": 1934,
+        "kind": "file",
+        "mtime": "2026-10-30T18:49:00.925298+00:00",
+        "name": "trend_filter_shadow.jsonl.1"
+      },
+      {
+        "bytes": 4054,
+        "kind": "file",
+        "mtime": "2026-10-29T20:20:09.633455+00:00",
+        "name": "trend_filter_shadow.jsonl.2"
+      },
+      {
+        "bytes": 8712,
+        "kind": "file",
+        "mtime": "2026-10-28T23:39:04.637220+00:00",
+        "name": "trend_filter_shadow.jsonl.3"
+      },
+      {
+        "bytes": 3021,
+        "kind": "file",
+        "mtime": "2026-10-31T00:19:09.176003+00:00",
+        "name": "trend_filter_shadow.jsonl.4"
+      },
+      {
+        "bytes": 693,
+        "kind": "file",
+        "mtime": "2026-10-26T14:43:47.016912+00:00",
+        "name": "trend_filter_shadow.jsonl.5"
+      },
+      {
+        "bytes": 133184937,
+        "files": 2,
+        "kind": "dir",
+        "mtime": "2026-10-31T00:03:03.434187+00:00",
+        "name": "universe-snapshots"
+      },
+      {
+        "bytes": 117208,
+        "kind": "file",
+        "mtime": "2026-10-31T22:17:35.316719+00:00",
+        "name": "unstucking.jsonl"
+      },
+      {
+        "bytes": 75670,
+        "kind": "file",
+        "mtime": "2026-10-30T23:59:50.713259+00:00",
+        "name": "unstucking.jsonl.1"
+      },
+      {
+        "bytes": 77763,
+        "kind": "file",
+        "mtime": "2026-10-29T23:54:16.044980+00:00",
+        "name": "unstucking.jsonl.2"
+      },
+      {
+        "bytes": 88896,
+        "kind": "file",
+        "mtime": "2026-10-28T23:58:29.064924+00:00",
+        "name": "unstucking.jsonl.3"
+      },
+      {
+        "bytes": 144900,
+        "kind": "file",
+        "mtime": "2026-10-27T23:58:36.601521+00:00",
+        "name": "unstucking.jsonl.4"
+      },
+      {
+        "bytes": 197386,
+        "kind": "file",
+        "mtime": "2026-10-26T23:59:34.796606+00:00",
+        "name": "unstucking.jsonl.5"
+      },
+      {
+        "bytes": 17366,
+        "kind": "file",
+        "mtime": "2026-09-21T12:22:53.286763+00:00",
+        "name": "userfills-backfill.jsonl"
+      },
+      {
+        "bytes": 3546,
+        "kind": "file",
+        "mtime": "2026-10-31T13:09:42.555544+00:00",
+        "name": "weight_shadow.jsonl"
+      },
+      {
+        "bytes": 4890,
+        "kind": "file",
+        "mtime": "2026-10-30T18:49:58.220637+00:00",
+        "name": "weight_shadow.jsonl.1"
+      },
+      {
+        "bytes": 7725,
+        "kind": "file",
+        "mtime": "2026-10-29T20:48:53.723054+00:00",
+        "name": "weight_shadow.jsonl.2"
+      },
+      {
+        "bytes": 3522,
+        "kind": "file",
+        "mtime": "2026-10-28T22:03:12.406597+00:00",
+        "name": "weight_shadow.jsonl.3"
+      },
+      {
+        "bytes": 683,
+        "kind": "file",
+        "mtime": "2026-10-27T08:41:28.298555+00:00",
+        "name": "weight_shadow.jsonl.4"
+      },
+      {
+        "bytes": 2786,
+        "kind": "file",
+        "mtime": "2026-10-25T18:11:34.318772+00:00",
+        "name": "weight_shadow.jsonl.5"
+      },
+      {
+        "bytes": 40726,
+        "kind": "file",
+        "mtime": "2026-10-31T00:41:03.758331+00:00",
+        "name": "xs-reversal-reconcile.log"
+      },
+      {
+        "bytes": 10278,
+        "kind": "file",
+        "mtime": "2026-10-31T07:40:25.026930+00:00",
+        "name": "xs_reversal_outcomes.ledger.jsonl"
+      },
+      {
+        "bytes": 35661,
+        "kind": "file",
+        "mtime": "2026-09-15T01:41:11.933484+00:00",
+        "name": "xs_reversal_shadow.backfill.jsonl"
+      },
+      {
+        "bytes": 2367,
+        "kind": "file",
+        "mtime": "2026-10-31T18:25:11.304662+00:00",
+        "name": "xs_reversal_shadow.jsonl"
+      },
+      {
+        "bytes": 6516,
+        "kind": "file",
+        "mtime": "2026-10-30T23:00:11.624154+00:00",
+        "name": "xs_reversal_shadow.jsonl.1"
+      },
+      {
+        "bytes": 13718,
+        "kind": "file",
+        "mtime": "2026-10-29T23:29:37.046166+00:00",
+        "name": "xs_reversal_shadow.jsonl.2"
+      },
+      {
+        "bytes": 11481,
+        "kind": "file",
+        "mtime": "2026-10-28T23:09:32.431551+00:00",
+        "name": "xs_reversal_shadow.jsonl.3"
+      },
+      {
+        "bytes": 15642,
+        "kind": "file",
+        "mtime": "2026-10-30T22:49:24.316916+00:00",
+        "name": "xs_reversal_shadow.jsonl.4"
+      },
+      {
+        "bytes": 677,
+        "kind": "file",
+        "mtime": "2026-10-30T22:49:15.942137+00:00",
+        "name": "xs_reversal_shadow.jsonl.5"
+      },
+      {
+        "bytes": 5340,
+        "kind": "file",
+        "mtime": "2026-10-30T22:49:15.773121+00:00",
+        "name": "xs_reversal_shadow.jsonl.6"
+      },
+      {
+        "bytes": 2673,
+        "kind": "file",
+        "mtime": "2026-10-30T22:49:14.202975+00:00",
+        "name": "xs_reversal_shadow.jsonl.7"
+      },
+      {
+        "bytes": 4276,
+        "kind": "file",
+        "mtime": "2026-10-30T22:49:13.520911+00:00",
+        "name": "xs_reversal_shadow.jsonl.8"
+      }
+    ],
+    "exists": true,
+    "path": "/data"
+  },
+  "key_files": {
+    ".agent-memory.json": {
+      "bytes": 2091279,
+      "mtime": "2026-10-31T22:17:34.908681+00:00"
+    },
+    ".dsl-state.json": {
+      "bytes": 58,
+      "mtime": "2026-10-30T02:57:47.095855+00:00"
+    },
+    ".historical-candles.json": {
+      "bytes": 7889684,
+      "mtime": "2026-10-31T00:43:45.186360+00:00"
+    },
+    ".pending-sl-retries.json": {
+      "bytes": 26,
+      "mtime": "2026-10-31T22:17:37.778946+00:00"
+    },
+    ".positions-snapshot.json": {
+      "bytes": 64,
+      "mtime": "2026-10-31T22:17:35.229711+00:00"
+    },
+    "reconcile_status.json": {
+      "bytes": 441,
+      "mtime": "2026-10-31T00:15:03.736179+00:00"
+    },
+    "scheduler_state.json": {
+      "bytes": 941,
+      "mtime": "2026-10-31T22:18:24.397257+00:00"
+    }
+  }
+}

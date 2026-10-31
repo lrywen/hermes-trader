@@ -101,3 +101,30 @@ def test_shadow_result_swallows_regime_failure(monkeypatch):
     # Regime failure degrades to "" but the fill is still paper-booked.
     assert captured["entry_regime"] == ""
     assert captured["coin"] == "BTC"
+
+
+# ── P1: runner-gate fresh-impulse provenance rides signal_meta ─────────────
+
+def test_shadow_result_pins_runner_fresh_src(monkeypatch):
+    captured = {}
+    _patch_shadow_book(monkeypatch, captured)
+    shadow_result(
+        mode="SHADOW", analysis_id="a13", coin="ETH", trade_side="long",
+        mid_price=100.0, atr=2.0, trade_notional=500.0, leverage=2.0,
+        gate_results={},
+        analysis={"coin": "ETH", "_runner_fresh_src": "vol_burst",
+                  "composite_score": 55.0, "confidence": 0.8,
+                  "trigger_score": 60.0})
+    assert captured["signal_meta"]["fresh_src"] == "vol_burst"
+
+
+def test_shadow_result_blank_fresh_src_without_analysis(monkeypatch):
+    """No pinned provenance (gate bypassed / pre-P1 caller) must book "" — the
+    ledger sanitizer then drops the key instead of persisting a stale value."""
+    captured = {}
+    _patch_shadow_book(monkeypatch, captured)
+    shadow_result(
+        mode="SHADOW", analysis_id="a14", coin="ETH", trade_side="short",
+        mid_price=100.0, atr=2.0, trade_notional=500.0, leverage=2.0,
+        gate_results={})
+    assert captured["signal_meta"]["fresh_src"] == ""

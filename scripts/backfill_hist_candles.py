@@ -10,6 +10,7 @@ for reproducibility).
 
 Usage (inside the container):
     python3 scripts/backfill_hist_candles.py --days 90 --intervals 1h 4h
+    python3 scripts/backfill_hist_candles.py --days 400 --intervals 1d
     python3 scripts/backfill_hist_candles.py --verify-only
 """
 from __future__ import annotations
@@ -21,6 +22,7 @@ import sys
 import time
 
 from hermes_trader.data.historical_candles import (
+    INTERVAL_MS,
     cached_span,
     fetch_candle_range,
     flush_disk_cache,
@@ -42,12 +44,14 @@ def _universe() -> list[str]:
 
 def backfill(coins: list[str], intervals: list[str], days: int) -> dict:
     now_ms = int(time.time() * 1000)
-    # Align end to the last fully-closed 1h bar to avoid an in-progress candle.
-    end_ms = now_ms - (now_ms % 3_600_000) - 1
     start_ms = now_ms - days * 86_400_000
     set_cache_file(PROD_CACHE)
     stats = {}
     for iv in intervals:
+        # Align end to the last fully-closed bar *of this interval* so a forming
+        # candle (e.g. today's 1d) never enters the immutable-history cache.
+        step = INTERVAL_MS.get(iv, 3_600_000)
+        end_ms = now_ms - (now_ms % step) - 1
         for coin in coins:
             span = cached_span(coin, iv)
             before = span[1] if span else None
@@ -78,7 +82,11 @@ def _fmt(ms):
 
 
 def verify(coins: list[str], intervals: list[str]) -> dict:
-    """Report per-interval coverage: series count, newest bar, staleness."""
+    """Report per-interval coverage: series count, newest bar, staleness.
+
+    Staleness is interval-aware: a series is stale once its newest bar is more
+    than two *bars* old (a 1d series is not stale after 2 hours).
+    """
     set_cache_file(PROD_CACHE)
     now_ms = int(time.time() * 1000)
     out = {}
@@ -87,6 +95,7 @@ def verify(coins: list[str], intervals: list[str]) -> dict:
         oldest_all = None
         n = 0
         stale = []
+        max_age_ms = 2 * INTERVAL_MS.get(iv, 3_600_000)
         for coin in coins:
             span = cached_span(coin, iv)
             if not span:
@@ -94,7 +103,7 @@ def verify(coins: list[str], intervals: list[str]) -> dict:
             n += 1
             newest_all = max(newest_all, span[1])
             oldest_all = span[0] if oldest_all is None else min(oldest_all, span[0])
-            if now_ms - span[1] > 2 * 3_600_000:
+            if now_ms - span[1] > max_age_ms:
                 stale.append(coin)
         out[iv] = {
             "series": n,
@@ -108,7 +117,7 @@ def verify(coins: list[str], intervals: list[str]) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=90)
-    ap.add_argument("--intervals", nargs="+", default=["1h", "4h"])
+    ap.add_argument("--intervals", nargs="+", default=["1h", "4h", "1d"])
     ap.add_argument("--coins", nargs="*", default=None)
     ap.add_argument("--verify-only", action="store_true")
     args = ap.parse_args()

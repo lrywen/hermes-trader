@@ -443,6 +443,13 @@ def _reflection_row(acct: str, fill: dict[str, Any]) -> dict[str, Any]:
 # Kept tiny (a list of names + a few floats); anything malformed is dropped so
 # a bad upstream payload can never break bookkeeping.
 _SIGNAL_META_NUM_KEYS = ("composite_score", "ai_confidence", "trigger_score")
+# P1 (2026-11-01): the runner gate's fresh-impulse provenance (brk /
+# recent_brk / vol_burst / burst_score / "") rides the open fill so realized
+# exits can be sliced by WHICH fresh leg admitted the trade. Short free-form
+# string: length-capped rather than whitelisted so a new gate leg does not
+# silently vanish from the ledger.
+_SIGNAL_META_STR_KEYS = ("fresh_src",)
+_SIGNAL_META_STR_MAX = 32
 
 
 def _sanitize_signal_meta(meta: Any) -> dict[str, Any]:
@@ -467,6 +474,10 @@ def _sanitize_signal_meta(meta: Any) -> dict[str, Any]:
             fv = None
         if fv is not None and fv == fv and fv not in (float("inf"), float("-inf")):
             out[k] = fv
+    for k in _SIGNAL_META_STR_KEYS:
+        v = meta.get(k)
+        if isinstance(v, str) and v.strip():
+            out[k] = v.strip()[:_SIGNAL_META_STR_MAX]
     return out
 
 
@@ -944,6 +955,14 @@ class ShadowBook:
             "coin": coin, "side": side, "qty": float(size_coin),
             "price": float(fill_px), "mid_px": float(entry_px),
             "slippage_pct": round(slip, 5),
+            # P1 cost observability: per-fill cost in bps of notional so realized
+            # cost is queryable instead of re-derived from config. The taker fee
+            # is charged on the CLOSE fill (round-trip model), so the entry leg
+            # legitimately carries fee_bps=0 and only its own slippage. Summing
+            # open + close cost_bps over a position gives the round-trip cost.
+            "fee_bps": 0.0,
+            "slippage_bps": round(slip * 100.0, 4),
+            "cost_bps": round(slip * 100.0, 4),
             "notional_usd": float(size_usd),
             "leverage": lev, "fee_usd": 0.0, "fill_model": "taker",
             "analysis_id": analysis_id or "",
@@ -1044,6 +1063,11 @@ class ShadowBook:
             "coin": coin, "side": side, "qty": float(size_coin),
             "price": float(fill_px), "notional_usd": float(size_usd),
             "leverage": lev, "fee_usd": 0.0,
+            # Passive fill: no taker slippage and the maker fee is booked at
+            # close, so both legs of the cost are 0 here (see taker open).
+            "fee_bps": 0.0,
+            "slippage_bps": 0.0,
+            "cost_bps": 0.0,
             # v1 账本沿用 "maker_shadow"；v2 条件成交模型标记 maker_shadow_v2。
             "fill_model": selection.get("fill_model") or "maker_shadow",
             "analysis_id": order.get("analysis_id", ""),
@@ -1293,6 +1317,13 @@ class ShadowBook:
         fee_usd = notional * fee_pct / 100.0 * _round_trip_fills()
         net_pnl = gross_pnl - fee_usd
         roe_pct = spot_pct * lev - fee_pct * _round_trip_fills() * lev
+        # P1 cost observability (bps of notional): fee_bps is derived FROM the
+        # booked fee_usd so the two can never drift, and equals
+        # fee_pct * round_trip_fills * 100 (9bp taker / 3bp maker at defaults).
+        # cost_bps = fee_bps + slippage_bps holds for this fill only; the
+        # round-trip total is this row's cost_bps plus the entry leg's.
+        fee_bps = fee_usd / notional * 1e4 if notional > 0 else 0.0
+        slippage_bps = close_slip * 100.0
 
         closed_at = _now_ms()
         close_fill = {
@@ -1302,6 +1333,12 @@ class ShadowBook:
             "qty": float(pos["size_coin"]), "entry_px": entry_px,
             "price": float(fill_exit_px), "mid_px": float(exit_px),
             "slippage_pct": round(close_slip, 5),
+            # P1 cost observability (bps of notional). cost_bps = fee_bps +
+            # slippage_bps. The fee row carries the whole round-trip fee
+            # (round_trip_fills legs), the slippage row only the exit leg.
+            "fee_bps": round(fee_bps, 4),
+            "slippage_bps": round(slippage_bps, 4),
+            "cost_bps": round(fee_bps + slippage_bps, 4),
             # Audit 2026-10-16: real gap-through overshoot on max_loss exits.
             # gap_spot_pct>0 means the confirming mark gapped past the exchange
             # backup-SL trigger and the paper fill was capped there; the overshoot

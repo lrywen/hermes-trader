@@ -1,0 +1,39 @@
+{
+  "accounts": {
+    "maker_shadow": {
+      "close_fills_retained": 77,
+      "closed_count": 77,
+      "fills_retained": 159,
+      "last_equity_point": {
+        "equity": 86.8744,
+        "ts": 1793207972971
+      },
+      "open_fills_retained": 77,
+      "open_positions": 0,
+      "pending_orders": 0,
+      "sum_fee_usd": 0.432711,
+      "sum_gross_pnl_usd": -2.692901,
+      "sum_net_pnl_usd": -3.125613,
+      "wallet_balance": 86.874386,
+      "wallet_minus_sum_net": 89.999999
+    },
+    "taker": {
+      "close_fills_retained": 158,
+      "closed_count": 158,
+      "fills_retained": 316,
+      "last_equity_point": {
+        "equity": 100.2418,
+        "ts": 1793207972717
+      },
+      "open_fills_retained": 158,
+      "open_positions": 0,
+      "pending_orders": 0,
+      "sum_fee_usd": 2.121497,
+      "sum_gross_pnl_usd": 2.363334,
+      "sum_net_pnl_usd": 0.241838,
+      "wallet_balance": 100.241832,
+      "wallet_minus_sum_net": 99.999994
+    }
+  },
+  "version": 2
+}

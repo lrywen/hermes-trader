@@ -3159,16 +3159,20 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
             # P0-A instrumentation: pin point-in-time trigger labels onto the
             # open fill so real shadow fills can later be sliced by fired
             # trigger -> realized ROE (fired names are NOT on older fills).
-            _sig_meta: dict[str, Any] = {}
+            # P1: ``fresh_src`` rides the same snapshot (blank when the runner
+            # gate did not run); the sanitizer drops the blank value.
+            _a = analysis or {}
+            _sig_meta: dict[str, Any] = {
+                "fresh_src": str(_a.get("_runner_fresh_src") or ""),
+            }
             try:
                 from hermes_trader.agents.perception import extract_fired_triggers
-                a = analysis or {}
-                _sig_meta = {
-                    "fired_names": extract_fired_triggers(a),
-                    "composite_score": a.get("composite_score"),
-                    "ai_confidence": a.get("confidence"),
-                    "trigger_score": a.get("trigger_score"),
-                }
+                _sig_meta.update({
+                    "fired_names": extract_fired_triggers(_a),
+                    "composite_score": _a.get("composite_score"),
+                    "ai_confidence": _a.get("confidence"),
+                    "trigger_score": _a.get("trigger_score"),
+                })
             except Exception as _sig_e:
                 logger.warning(f"[shadow_book] signal_meta build failed (non-fatal): {_sig_e}")
             shadow_book.shadow_open(
@@ -5814,6 +5818,15 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         # candidate (before any early block), independent of the decision.
         _record_per_coin_cooldown_shadow(analysis, config)
         decision = _runner_entry_block_reason_impl(analysis, config)
+        # P1 (2026-11-01): pin THIS analysis' fresh-impulse provenance before the
+        # thread-local is reused, so the SHADOW open fill can be sliced by which
+        # fresh leg admitted the trade. Pinned per-analysis rather than read from
+        # the thread-local downstream: on the sidestep-bypass path the gate never
+        # runs, and a thread-local read there would borrow a previous coin's value.
+        _feats = getattr(_runner_gate_ctx, "feats", None)
+        analysis["_runner_fresh_src"] = (
+            str((_feats or {}).get("fresh_src") or "")
+            if isinstance(_feats, dict) else "")
         _record_runner_gate_verdict(analysis, decision)
         return decision
     return _wrapped(analysis, config)

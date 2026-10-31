@@ -2,15 +2,24 @@
 """P0-3 — single home for the nightly/hourly job schedule.
 
 Replaces the inlined ``while true`` bash window block in docker-compose
-with testable data + pure functions. The schedule (UTC, mirrors the
-compose block exactly):
+with testable data + pure functions. The schedule (UTC):
 
+  00:00  clean_trades_raw
   00:10  daily_report --push
+  00:15  reconcile_selection_attribution --write
   00:20  pullback_shadow_daily --window-hours 24 --push
+  00:25  reconcile_gate_outcomes --write
   00:30  reconcile_ta_late_entry_shadow --window-hours 8 --write
+  00:35  reconcile_fills --window-hours 26 --alert-on-orphan
   00:40  reconcile_xs_reversal_shadow --write
   00:50  reconcile_relax_tier_shadow --write
+  00:55  prepare_canary_promotion --write
   HH:05  macro_regime_watch --push (every hour)
+
+P1 (2026-11-01): reconcile_fills joins the daily table at 00:35. The script
+existed but was never scheduled, so local↔exchange fill drift (the "measurement
+debt" in the fusion doc) was never measured. Window 26h covers a UTC day plus
+boundary slack; exit code 2 (orphan) surfaces as a scheduler error log line.
 
 Each job is eligible for a 2-minute window; the runner dedups by slot id
 (UTC day for daily jobs, UTC hour for the hourly one), so a 60s poll
@@ -107,6 +116,14 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         "reconcile_ta_late_entry_shadow", 0, 30,
         ("scripts/reconcile_ta_late_entry_shadow.py", "--window-hours", "8", "--write"),
         "ta-late-reconcile.log",
+    ),
+    _daily(
+        "reconcile_fills", 0, 35,
+        ("scripts/reconcile_fills.py", "--window-hours", "26", "--alert-on-orphan"),
+        "reconcile-fills.log",
+        # 26h look-back over the whole day's fills can exceed the 5-min gap to
+        # the 00:40 job on a large backlog; 300s keeps it inside its slot.
+        timeout_s=300,
     ),
     _daily(
         "reconcile_xs_reversal_shadow", 0, 40,

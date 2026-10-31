@@ -48,6 +48,26 @@ def test_sanitize_drops_garbage():
     assert "trigger_score" not in out
 
 
+# ------------------------------------------------------- sanitize: fresh_src
+
+def test_sanitize_keeps_fresh_src():
+    # P1: runner-gate fresh-impulse provenance rides the open fill.
+    for src in ("brk", "recent_brk", "vol_burst", "burst_score"):
+        assert sb._sanitize_signal_meta({"fresh_src": src}) \
+            == {"fresh_src": src}
+
+
+def test_sanitize_drops_blank_or_nonstring_fresh_src():
+    # A blank / non-str value must vanish rather than persist an empty key.
+    for raw in ("", "   ", None, 7, ["brk"], {"x": 1}):
+        assert "fresh_src" not in sb._sanitize_signal_meta({"fresh_src": raw})
+
+
+def test_sanitize_caps_fresh_src_length():
+    out = sb._sanitize_signal_meta({"fresh_src": "x" * 80})
+    assert len(out["fresh_src"]) == sb._SIGNAL_META_STR_MAX
+
+
 # ----------------------------------------------------------------- taker fill
 
 def test_taker_open_carries_signal_meta(tmp_path, monkeypatch):
@@ -57,13 +77,15 @@ def test_taker_open_carries_signal_meta(tmp_path, monkeypatch):
         coin="BTC", side="long", entry_px=100.0, size_usd=1000.0, leverage=1,
         analysis_id="a1",
         signal_meta={"fired_names": ["breakout"], "composite_score": 58.0,
-                     "ai_confidence": 0.7})
+                     "ai_confidence": 0.7, "fresh_src": "brk"})
     assert fill["fired_names"] == ["breakout"]
     assert fill["composite_score"] == 58.0
     assert fill["ai_confidence"] == 0.7
+    assert fill["fresh_src"] == "brk"
     # persisted onto the open position too
     pos = book.state["accounts"]["taker"]["positions"][0]
     assert pos["fired_names"] == ["breakout"]
+    assert pos["fresh_src"] == "brk"
 
 
 def test_taker_open_without_meta_back_compat(tmp_path, monkeypatch):
@@ -84,18 +106,22 @@ def test_maker_resting_order_and_fill_carry_meta(tmp_path, monkeypatch):
         coin="ETH", side="long", entry_px=200.0, size_usd=1000.0, leverage=1,
         analysis_id="a9",
         signal_meta={"fired_names": ["momentumBurst", "uptrendMomentum"],
-                     "composite_score": 61.0, "ai_confidence": 0.72})
+                     "composite_score": 61.0, "ai_confidence": 0.72,
+                     "fresh_src": "burst_score"})
     order = book.state["accounts"]["maker_shadow"]["pending_orders"][0]
     # meta rides the resting order so the async fill inherits it
     assert order["signal_meta"]["fired_names"] == \
         ["momentumBurst", "uptrendMomentum"]
+    assert order["signal_meta"]["fresh_src"] == "burst_score"
     fill = book._fill_maker_order(order, fill_px=199.9, filled_at=_T0)
     assert fill["fired_names"] == ["momentumBurst", "uptrendMomentum"]
     assert fill["composite_score"] == 61.0
     assert fill["ai_confidence"] == 0.72
+    assert fill["fresh_src"] == "burst_score"
     assert fill["fill_model"] == "maker_shadow"
     pos = book.state["accounts"]["maker_shadow"]["positions"][0]
     assert pos["fired_names"] == ["momentumBurst", "uptrendMomentum"]
+    assert pos["fresh_src"] == "burst_score"
 
 
 def test_meta_persists_across_reload(tmp_path, monkeypatch):
