@@ -51,9 +51,11 @@ def test_drift_tier_constants():
 def test_drift_register_block_halts_on_critical(monkeypatch):
     """The post-fill drift block must call memory.set_global_halt when dev
     exceeds the critical tier (source-level contract; the block is deep in the
-    fill-registration path)."""
+    fill-registration path). P4: implementation moved to
+    execution.order_lifecycle; assert against the real implementation there."""
     import inspect
-    src = inspect.getsource(executor._register_filled_position)
+    from hermes_trader.execution import order_lifecycle as _ol
+    src = inspect.getsource(_ol._register_filled_position)
     assert "_STOP_DRIFT_CRITICAL_PCT" in src
     assert "set_global_halt" in src
     assert "STOP DRIFT CRITICAL" in src
