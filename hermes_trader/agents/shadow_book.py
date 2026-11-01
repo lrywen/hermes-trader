@@ -1686,6 +1686,15 @@ class ShadowBook:
             maker = self.state["accounts"]["maker_shadow"]
             return {
                 "starting_balance": float(self.state["starting_balance"]),
+                # Per-arm baselines (wallet - Σclose realized, carry included) so
+                # the chart can draw each arm's own reference line. The arms can
+                # have different effective baselines (a manual per-account wallet
+                # edit diverged maker to 90 vs the global 100); a single global
+                # markLine made the maker curve look permanently $10 underwater.
+                "taker_baseline": round(
+                    float(taker["wallet_balance"]) - _realized_with_carry(taker), 4),
+                "maker_baseline": round(
+                    float(maker["wallet_balance"]) - _realized_with_carry(maker), 4),
                 "points": list(taker["equity_curve"]),
                 "maker_points": list(maker["equity_curve"]),
             }
