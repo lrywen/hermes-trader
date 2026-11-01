@@ -746,6 +746,10 @@ class ShadowBook:
                     "fills": raw.get("fills") if isinstance(raw.get("fills"), list) else [],
                     "equity_curve": raw.get("equity_curve") if isinstance(raw.get("equity_curve"), list) else [],
                     "closed_count": int(raw.get("closed_count", 0) or 0),
+                    # Persist the trim carry: without this, realized PnL folded
+                    # in by _trim_fills survives only in-process and is lost on
+                    # every restart (this container reloads the book often).
+                    "realized_carry": float(raw.get("realized_carry", 0.0) or 0.0),
                 }
             self.state = {
                 "version": _STATE_VERSION,
@@ -1706,7 +1710,18 @@ class ShadowBook:
         total_fee = sum(float(c.get("fee_usd", 0.0) or 0.0) for c in closes)
         # Include realized_carry so a _MAX_FILLS trim cannot drop early realized
         # PnL from either total_realized_pnl_usd or the total_return_pct baseline.
+        carry = float(acc.get("realized_carry", 0.0) or 0.0)
         total_pnl = _realized_with_carry(acc)
+        # Fold the carry into gross_win/gross_loss by sign so that
+        # gross_profit + gross_loss == total_realized_pnl_usd stays self-consistent
+        # after a trim (otherwise the trimmed early PnL vanishes from the gross
+        # split while remaining in the total). Per-trade counts (wins/losses/
+        # closed_trades) and single-trade extremes (best/worst) intentionally
+        # describe only the retained fills — the carry has no per-trade detail.
+        if carry > 0:
+            gross_win += carry
+        elif carry < 0:
+            gross_loss += carry
         holds = [float(c.get("hold_minutes", 0.0) or 0.0) for c in closes]
         best = max((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
         worst = min((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)

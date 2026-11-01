@@ -112,3 +112,51 @@ def test_realized_survives_max_fills_trim(tmp_path, monkeypatch):
     assert acc["realized_carry"] == -6.0
     after = book._account_metrics("taker")["realized_pnl_usd"]
     assert after == -10.0  # conserved despite the trim
+
+
+def test_realized_carry_survives_save_and_reload(tmp_path, monkeypatch):
+    """realized_carry must persist across a save/load cycle. _load() rebuilds
+    each account dict by hand; omitting the field would silently drop the carry
+    on every restart (this container reloads the book often), losing trimmed
+    realized PnL. Reproduces the 8cf4f14 follow-up bug."""
+    _patch_cfg(monkeypatch)
+    path = str(tmp_path / "s.json")
+    book = sb.ShadowBook(path=path)
+    acc = book._account("taker")
+    acc["fills"] = [{"type": "close", "realized_pnl_usd": 1.0, "fee_usd": 0.0}
+                    for _ in range(5)]
+    acc["wallet_balance"] = 100.0 + 5.0
+    book.state["starting_balance"] = 100.0
+    monkeypatch.setattr(sb, "_MAX_FILLS", 2)
+    sb._trim_fills(acc)                       # folds +3.0 into carry
+    assert acc["realized_carry"] == 3.0
+    book._save(force=True)
+
+    # Fresh instance -> _load() from disk.
+    reloaded = sb.ShadowBook(path=path)
+    racc = reloaded._account("taker")
+    assert racc["realized_carry"] == 3.0      # was None before the fix
+    assert reloaded._account_metrics("taker")["realized_pnl_usd"] == 5.0
+
+
+def test_gross_split_stays_consistent_after_trim(tmp_path, monkeypatch):
+    """gross_profit + gross_loss must equal total_realized_pnl_usd even after a
+    trim folds early PnL into the carry (carry is merged into the gross split by
+    sign). Per-trade counts/extremes still describe only the retained fills."""
+    _patch_cfg(monkeypatch)
+    book = sb.ShadowBook(path=str(tmp_path / "s.json"))
+    acc = book._account("taker")
+    # Mix of wins and losses; net = 3 - 7 = -4.0 across 6 fills.
+    pnls = [3.0, -2.0, 1.0, -3.0, 2.0, -5.0]   # wins sum=6, losses sum=-10
+    acc["fills"] = [{"type": "close", "realized_pnl_usd": p, "fee_usd": 0.0}
+                    for p in pnls]
+    acc["wallet_balance"] = 100.0 + sum(pnls)
+    book.state["starting_balance"] = 100.0
+    monkeypatch.setattr(sb, "_MAX_FILLS", 2)   # keep last 2 (2.0, -5.0)
+    sb._trim_fills(acc)
+    # Dropped: 3,-2,1,-3 -> net -1.0 carry; wins 3+1=4 dropped, losses -2-3=-5 dropped.
+    stats = book._account_stats("taker")
+    assert stats["total_realized_pnl_usd"] == round(sum(pnls), 4)   # -4.0
+    # gross split must still sum to the total.
+    assert round(stats["gross_profit_usd"] + stats["gross_loss_usd"], 4) == \
+        stats["total_realized_pnl_usd"]
