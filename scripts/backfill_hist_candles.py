@@ -43,9 +43,9 @@ def _universe() -> list[str]:
     return [m["coin"] for m in perps[:44]]
 
 
-def backfill(coins: list[str], intervals: list[str], days: int) -> dict:
+def backfill(coins: list[str], intervals: list[str], days: int,
+             days_map: dict[str, int] | None = None) -> dict:
     now_ms = int(time.time() * 1000)
-    start_ms = now_ms - days * 86_400_000
     set_cache_file(PROD_CACHE)
     # set_cache_file only pins the path and clears _DISK_LOADED; it does NOT
     # load. cached_span reads the in-memory _BAR_CACHE, so without an explicit
@@ -54,6 +54,11 @@ def backfill(coins: list[str], intervals: list[str], days: int) -> dict:
     _load_disk_cache()
     stats = {}
     for iv in intervals:
+        # Per-interval lookback: 1d needs the full 400-day history, but 1h/4h
+        # only need a short recent window to stay fresh — a 400-day 1h window
+        # would backfill ~7400 bars/coin of unwanted pre-cache history.
+        iv_days = (days_map or {}).get(iv, days)
+        start_ms = now_ms - iv_days * 86_400_000
         # Align end to the last fully-closed bar *of this interval* so a forming
         # candle (e.g. today's 1d) never enters the immutable-history cache.
         step = INTERVAL_MS.get(iv, 3_600_000)
@@ -127,16 +132,23 @@ def verify(coins: list[str], intervals: list[str]) -> dict:
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=90)
+    ap.add_argument("--days-map", nargs="*", default=None,
+                    help="per-interval lookback override, e.g. 1d:400 4h:14 1h:14; "
+                         "intervals not listed fall back to --days")
     ap.add_argument("--intervals", nargs="+", default=["1h", "4h", "1d"])
     ap.add_argument("--coins", nargs="*", default=None)
     ap.add_argument("--verify-only", action="store_true")
     args = ap.parse_args()
+    days_map = {}
+    for tok in (args.days_map or []):
+        k, _, v = tok.partition(":")
+        days_map[k.strip()] = int(v)
     coins = args.coins or _universe()
     print(f"universe: {len(coins)} coins -> {coins[:6]}...")
     if args.verify_only:
         print(json.dumps(verify(coins, args.intervals), indent=2))
         return
-    backfill(coins, args.intervals, args.days)
+    backfill(coins, args.intervals, args.days, days_map=days_map)
     print("\n=== post-backfill coverage ===")
     print(json.dumps(verify(coins, args.intervals), indent=2))
 

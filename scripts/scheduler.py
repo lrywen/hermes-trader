@@ -151,15 +151,22 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
     ),
     # P1 (2026-11-01): weekly refresh of the production 1d candle cache so the
     # 400-day history every gate reconcile depends on never goes stale again.
-    # Sunday 01:10 UTC — clear of the 00:xx daily batch. 1d bars only; the
-    # intraday intervals are maintained by their own paths.
+    # Sunday 01:10 UTC — clear of the 00:xx daily batch.
+    # Intervals 1d 4h 1h: the "intraday maintained by their own paths" comment
+    # was wrong — grep shows flush_disk_cache is only called by research/backfill
+    # scripts, and collect_candles.py is in NO scheduler/cron. Without this job
+    # the 1h/4h cache sat stale at 10-30 22:00 (40/40), forcing every 4h ATR call
+    # to lazy-backfill ~48 bars over the network (a rate-limit there would size
+    # stops off a 2-day-old ATR). One job covers all three intervals.
     ScheduledJob(
         name="backfill_hist_candles",
-        argv=("scripts/backfill_hist_candles.py", "--days", "400", "--intervals", "1d"),
+        argv=("scripts/backfill_hist_candles.py",
+              "--intervals", "1d", "4h", "1h",
+              "--days-map", "1d:400", "4h:14", "1h:14"),
         log_name="backfill-hist-candles.log",
         minute_of_day=1 * 60 + 10,
         weekday=6,  # Sunday (UTC)
-        timeout_s=1800,  # full-universe 1d paging can exceed the 900s default
+        timeout_s=1800,  # 44 coins x 3 intervals, incremental; ~5-8 min typical
     ),
 )
 
