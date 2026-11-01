@@ -43,7 +43,7 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 11
+    assert len(SCHEDULED_JOBS) == 12
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
@@ -136,9 +136,38 @@ def test_daily_window_boundaries() -> None:
 def test_each_daily_job_only_open_at_its_own_minute() -> None:
     daily = [j for j in SCHEDULED_JOBS if j.minute_of_day is not None]
     for job in daily:
+        # Weekly-gated jobs (weekday set) only open on their weekday; the
+        # default _utc() date (2026-09-17, Thursday) is not their firing day,
+        # so the "window open at own minute" assertion does not apply. Their
+        # weekday gating is covered by test_weekly_job_* below.
+        if job.weekday is not None:
+            continue
         h, m = divmod(job.minute_of_day, 60)
         assert is_within_window(job, _utc(h=h, m=m)) is True
         assert is_within_window(job, _utc(h=h, m=m + 2)) is False
+
+
+def test_weekly_job_only_opens_on_its_weekday() -> None:
+    job = _job("backfill_hist_candles")  # Sunday 01:10 UTC
+    assert job.weekday == 6
+    # 2026-11-01 is a Sunday.
+    assert is_within_window(job, _utc(y=2026, mo=11, d=1, h=1, m=10)) is True
+    assert is_within_window(job, _utc(y=2026, mo=11, d=1, h=1, m=11)) is True
+    assert is_within_window(job, _utc(y=2026, mo=11, d=1, h=1, m=12)) is False
+    # Same wall-clock minute on Monday 2026-11-02 must NOT open.
+    assert is_within_window(job, _utc(y=2026, mo=11, d=2, h=1, m=10)) is False
+
+
+def test_weekly_job_slot_dedupes_per_iso_week() -> None:
+    job = _job("backfill_hist_candles")
+    sun = _utc(y=2026, mo=11, d=1, h=1, m=10)
+    # 2026-11-01 (Sunday) is the LAST day of ISO week 44.
+    assert slot_id(job, sun) == "2026-W44"
+    # Next Sunday 2026-11-08 rolls to ISO week 45.
+    assert slot_id(job, _utc(y=2026, mo=11, d=8, h=1, m=10)) == "2026-W45"
+    # Dedup: a Sunday firing and a same-weekday re-check share one slot key,
+    # so the job fires at most once per ISO week.
+    assert slot_id(job, sun) == slot_id(job, _utc(y=2026, mo=11, d=1, h=1, m=11))
 
 
 def test_hourly_window_reopens_every_hour() -> None:

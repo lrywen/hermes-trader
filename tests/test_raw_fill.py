@@ -140,3 +140,56 @@ def test_fee_and_pnl_match_cost_model(tmp_path):
     assert m.fee_usd(10000.0) == cm.fee_usd(10000.0)
     assert m.pnl_usd("long", 100.0, 110.0, 10000.0) == \
         cm.pnl_usd("long", 100.0, 110.0, 10000.0)
+
+
+# ── driver 端到端：证明 set_time → tape fill 链路真实走通 ───────────
+# 这是复核指出的缺口：RawFillModel 此前只在单测里直接调 fill_entry，
+# 没有任何一笔真实交易经过 driver.run。这里构造合成 bar + signal + tape，
+# 强制一笔 long 在 bar1 open 入场、bar2 end_of_data 平仓，断言两个 fill
+# 价都来自 tape VWAP 而非 CostModel 固定滑点。
+def test_driver_run_uses_tape_fill_end_to_end(tmp_path):
+    from hermes_trader.agents.dsl_exit import ExitPolicy
+    from hermes_trader.backtest import driver
+    from hermes_trader.backtest.types import Signal
+    from hermes_trader.models.types import Candle
+
+    BAR_MS = 3_600_000  # 1h bars
+    # bar0 = decision bar（signal），bar1 open = entry，bar2 close = exit。
+    bars = [
+        Candle(t=T0,              o=100.0, h=101.0, l=99.0, c=100.0, v=1.0),
+        Candle(t=T0 + BAR_MS,     o=100.0, h=101.0, l=99.0, c=100.0, v=1.0),
+        Candle(t=T0 + 2 * BAR_MS, o=100.0, h=101.0, l=99.0, c=105.0, v=1.0),
+    ]
+    # tape 在 entry 时刻（T0+BAR_MS）：真实成交 ~110（与 bar open 100 明显
+    # 偏离，固定滑点不可能产生这个价）；exit 时刻 ~112。
+    entry_t = T0 + BAR_MS
+    exit_t = T0 + 2 * BAR_MS
+    _write_tape(tmp_path / "tape", "BTC", [
+        _tape_row(entry_t - 1000, 110.0, 1.0, spread_bps=0.0),
+        _tape_row(exit_t - 1000, 112.0, 1.0, spread_bps=0.0),
+    ])
+    model = RawFillModel("BTC",
+                         fallback=CostModel(round_trip_fee_bps=0.0,
+                                            entry_slip_bps=5.0,
+                                            exit_slip_bps=15.0,
+                                            stop_delay_slip_bps=10.0),
+                         tape_root=tmp_path / "tape",
+                         book_root=tmp_path / "book")
+    policy = ExitPolicy(
+        max_loss_pct=50.0, max_loss_roe_pct=1e9, protect_pct=50.0,
+        retrace_threshold=0.30, hard_timeout_minutes=1e9,
+        breakeven_trigger_pct=0.0, breakeven_lock_pct=0.0,
+        stale_flat_timeout_minutes=0.0,
+        hard_stop_confirm_sec=0.0, breach_confirm_sec=0.0,
+    )
+    trades = driver.run(bars, [Signal(0, "long")], policy,
+                        coin="BTC", notional_usd=10_000.0,
+                        cost=model, bar_ms=BAR_MS)
+    assert len(trades) == 1, "synthetic run must produce exactly one trade"
+    t = trades[0]
+    # 固定滑点入场价会是 100.05；tape 路径必须是 110（spread_bps=0）。
+    assert t.entry_fill_px == pytest.approx(110.0, abs=1e-9)
+    # end_of_data exit 在 bar2 close=105，但 tape 覆盖为 112。
+    assert t.exit_fill_px == pytest.approx(112.0, abs=1e-9)
+    # 两笔 fill 都命中 tape，零次兜底——证明 set_time 被 driver 真实调用。
+    assert model.stats == {"tape": 2, "book": 0, "fallback": 0}
