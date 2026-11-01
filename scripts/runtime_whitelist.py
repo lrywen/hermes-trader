@@ -96,4 +96,14 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "postdeploy_smoke.py",
     # Deploy step 3d: in-container post-deploy shadow health check.
     "postdeploy_shadow_checks.py",
+    # P0/P1.5 (2026-10-31): baseline freeze + measurement/validation tooling.
+    # freeze_baseline / gate_coverage / wfa_main_strategy run via `docker exec`
+    # against /data (same class as m1_ofi_eval.py). backfill_hist_candles is a
+    # PRODUCTION data-maintenance job (refreshes /data/.historical-candles.json,
+    # the cache every gate reconcile depends on) — NOT a research backtest; it
+    # is registered in scheduler.SCHEDULED_JOBS as a weekly job.
+    "freeze_baseline.py",
+    "gate_coverage.py",
+    "wfa_main_strategy.py",
+    "backfill_hist_candles.py",
 )

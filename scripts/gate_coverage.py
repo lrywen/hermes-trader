@@ -39,21 +39,41 @@ def _utc_day(ts_ms: float) -> str:
 
 
 def load_rows(path: str) -> Optional[list[dict[str, Any]]]:
-    """Parse a decision JSONL; ``None`` when the file does not exist."""
-    if not os.path.exists(path):
+    """Parse a decision JSONL **including its rotated generations**.
+
+    ``runner_gate_shadow.jsonl`` rotates daily: the current file holds only
+    today's rows, older days live in ``<path>.1``, ``<path>.2``, … Reading just
+    the main file systematically under-counts coverage (and drops to ~0 right
+    after rotation). We therefore read the main file plus every existing
+    ``<path>.N`` generation (N ascending = oldest→newest within rotations).
+    Returns ``None`` only when neither the main file nor any generation exists.
+    """
+    candidates: list[str] = []
+    if os.path.exists(path):
+        candidates.append(path)
+    # Rotated generations: .1 is the most recent rotation, .N the oldest.
+    n = 1
+    while True:
+        gen = f"{path}.{n}"
+        if not os.path.exists(gen):
+            break
+        candidates.append(gen)
+        n += 1
+    if not candidates:
         return None
     rows: list[dict[str, Any]] = []
-    with open(path, encoding="utf-8") as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if isinstance(obj, dict):
-                rows.append(obj)
+    for p in candidates:
+        with open(p, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(obj, dict):
+                    rows.append(obj)
     return rows
 
 

@@ -53,6 +53,9 @@ class ScheduledJob:
     # Exactly one of the two schedules is set.
     minute_of_day: Optional[int] = None  # daily job, 0..1439 UTC
     minute_of_hour: Optional[int] = None  # hourly job, 0..59
+    # Optional weekly gate: when set (0=Mon .. 6=Sun, UTC), a minute_of_day job
+    # only fires on that weekday. None = every day (unchanged default).
+    weekday: Optional[int] = None
     extra_env: tuple[tuple[str, str], ...] = ()
     window_minutes: int = 2
     # P0-7 (recheck 2026-10-18): 单 job 硬超时。此前 _run_job 的 subprocess.run
@@ -146,6 +149,18 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         log_name="macro-regime-watch.log",
         minute_of_hour=5,
     ),
+    # P1 (2026-11-01): weekly refresh of the production 1d candle cache so the
+    # 400-day history every gate reconcile depends on never goes stale again.
+    # Sunday 01:10 UTC — clear of the 00:xx daily batch. 1d bars only; the
+    # intraday intervals are maintained by their own paths.
+    ScheduledJob(
+        name="backfill_hist_candles",
+        argv=("scripts/backfill_hist_candles.py", "--days", "400", "--intervals", "1d"),
+        log_name="backfill-hist-candles.log",
+        minute_of_day=1 * 60 + 10,
+        weekday=6,  # Sunday (UTC)
+        timeout_s=1800,  # full-universe 1d paging can exceed the 900s default
+    ),
 )
 
 
@@ -155,15 +170,23 @@ def is_within_window(job: ScheduledJob, now: datetime) -> bool:
         start = job.minute_of_hour
         return start <= now.minute < start + job.window_minutes
     if job.minute_of_day is not None:
+        if job.weekday is not None and now.weekday() != job.weekday:
+            return False
         elapsed = now.hour * 60 + now.minute - job.minute_of_day
         return 0 <= elapsed < job.window_minutes
     return False
 
 
 def slot_id(job: ScheduledJob, now: datetime) -> str:
-    """Dedup key: UTC day for daily jobs, UTC hour for hourly jobs."""
+    """Dedup key: UTC day for daily jobs, UTC hour for hourly jobs.
+
+    Weekly jobs key on the ISO week so the single weekly firing is deduped
+    across the whole week (not re-armed each day)."""
     if job.minute_of_hour is not None:
         return now.strftime("%Y-%m-%dT%H")
+    if job.weekday is not None:
+        iso = now.isocalendar()
+        return f"{iso[0]}-W{iso[1]:02d}"
     return now.strftime("%Y-%m-%d")
 
 

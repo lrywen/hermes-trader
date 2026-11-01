@@ -39,12 +39,18 @@ def test_whitelist_has_no_duplicates():
 
 
 def test_no_research_or_backtest_scripts_whitelisted():
+    # backfill_hist_candles.py is a PRODUCTION data-maintenance job (refreshes
+    # /data/.historical-candles.json that every gate reconcile reads), not a
+    # research backfill — it is whitelisted deliberately and runs weekly via
+    # scheduler.SCHEDULED_JOBS. Exempt it from the research-prefix ban.
+    production_data_jobs = {"backfill_hist_candles.py"}
     forbidden = [
         name
         for name in RUNTIME_SCRIPTS
-        if name.startswith("backtest_")
-        or name.startswith("backfill_")
-        or name in {"calibrate_regime_thresholds.py"}
+        if name not in production_data_jobs
+        and (name.startswith("backtest_")
+             or name.startswith("backfill_")
+             or name in {"calibrate_regime_thresholds.py"})
     ]
     assert not forbidden, (
         f"research/backtest/calibration scripts must not ship in the runtime "

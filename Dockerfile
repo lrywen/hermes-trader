@@ -98,6 +98,17 @@ COPY scripts/postdeploy_smoke.py scripts/postdeploy_smoke.py
 # Read-only post-deploy shadow health check (panic-gate fields + maker v2
 # zero-fill guard); invoked in-container by scripts/deploy_prod.sh step 3d.
 COPY scripts/postdeploy_shadow_checks.py scripts/postdeploy_shadow_checks.py
+# P0/P1.5 (2026-10-31): baseline freeze + measurement/validation tooling
+# (docker exec against /data) + production 1d candle-cache backfill (weekly
+# scheduler job refreshing /data/.historical-candles.json).
+COPY scripts/freeze_baseline.py scripts/freeze_baseline.py
+COPY scripts/gate_coverage.py scripts/gate_coverage.py
+COPY scripts/wfa_main_strategy.py scripts/wfa_main_strategy.py
+COPY scripts/backfill_hist_candles.py scripts/backfill_hist_candles.py
+# Stage-4 one-shot research runners (whitelisted but their COPY lines were
+# missing); docker exec against /data, same class as m1_ofi_eval.py.
+COPY scripts/gate_ablation.py scripts/gate_ablation.py
+COPY scripts/deep_slow_burn_review.py scripts/deep_slow_burn_review.py
 # Privilege-drop entrypoint (consumed by the `cp` in the RUN step below).
 COPY scripts/docker-entrypoint.sh scripts/docker-entrypoint.sh
 COPY conftest.py ./

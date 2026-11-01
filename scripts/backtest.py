@@ -311,6 +311,9 @@ def main() -> int:
                          "configured min samples)")
     ap.add_argument("--no-slippage", action="store_true",
                     help="zero all slippage/penalty (fee-only, pre-H-7 behavior)")
+    ap.add_argument("--raw-fill", action="store_true",
+                    help="P2 数据同源：用 tape-raw/book-raw 真实成交替代固定滑点 "
+                         "(RawFillModel；BTC/ETH 走 tape VWAP，其余币回退 book/固定)")
     ap.add_argument("--oos-frac", type=float, default=0.0,
                     help="O-7: fraction of the tradeable window held out as "
                          "out-of-sample for walk-forward validation (e.g. 0.3 = "
@@ -580,6 +583,11 @@ def main() -> int:
                 exit_slip_bps=coin_exit_slip,
                 stop_delay_slip_bps=stop_delay_slip_bps,
             )
+            if args.raw_fill:
+                # P2 数据同源：以 CostModel 为 fee/pnl/兜底，fill 价改走
+                # tape-raw VWAP → book-raw 最优档 → 固定滑点 三级回退。
+                from hermes_trader.backtest.raw_fill import RawFillModel
+                cost = RawFillModel(coin, fallback=cost)
             trades = kdriver.run(
                 candles, kept, base_policy, coin=coin, leverage=lev,
                 notional_usd=notional, cost=cost, bar_ms=sim_ms,
