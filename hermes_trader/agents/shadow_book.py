@@ -59,6 +59,33 @@ _EQUITY_MIN_INTERVAL_S = 60.0   # throttle between-curve points while a position
 _SAVE_MIN_INTERVAL_S = 5.0      # throttle mark-time persistence (open/close force-save)
 
 
+def _trim_fills(acc: dict[str, Any]) -> None:
+    """Cap acc["fills"] at _MAX_FILLS, preserving realized PnL across the trim.
+
+    realized_pnl_usd / total_return_pct are now computed as Σ(close-fill
+    realized). Trimming from the head would silently drop the oldest close
+    fills and skew those sums upward (early losses forgotten). Fold the
+    realized of every close fill about to be dropped into acc["realized_carry"]
+    so the running total is conserved no matter how many trims occur.
+    """
+    overflow = len(acc["fills"]) - _MAX_FILLS
+    if overflow <= 0:
+        return
+    dropped = acc["fills"][:overflow]
+    carry = sum(float(f.get("realized_pnl_usd") or 0.0)
+                for f in dropped if f.get("type") == "close")
+    if carry:
+        acc["realized_carry"] = float(acc.get("realized_carry", 0.0) or 0.0) + carry
+    del acc["fills"][:overflow]
+
+
+def _realized_with_carry(acc: dict[str, Any]) -> float:
+    """Σ(close-fill realized) plus any realized folded in by _trim_fills."""
+    return float(acc.get("realized_carry", 0.0) or 0.0) + sum(
+        float(f.get("realized_pnl_usd") or 0.0)
+        for f in acc["fills"] if f.get("type") == "close")
+
+
 # ---------------------------------------------------------------------------
 # config helpers
 # ---------------------------------------------------------------------------
@@ -851,10 +878,9 @@ class ShadowBook:
             # only), so subtracting the single global baseline mis-reported
             # maker_shadow by exactly that drift (-13.13% shown vs -3.13% real).
             # Summing close fills is correct per-account by construction and is
-            # also immune to future deposit()/reset() baseline shifts.
-            "realized_pnl_usd": round(sum(float(f.get("realized_pnl_usd") or 0.0)
-                                          for f in acc["fills"]
-                                          if f.get("type") == "close"), 4),
+            # also immune to future deposit()/reset() baseline shifts. Includes
+            # realized_carry so _MAX_FILLS trims never drop early realized PnL.
+            "realized_pnl_usd": round(_realized_with_carry(acc), 4),
             "total_fees_usd": round(sum(float(f.get("fee_usd", 0.0) or 0.0)
                                         for f in acc["fills"]
                                         if f.get("type") == "close"), 4),
@@ -979,8 +1005,7 @@ class ShadowBook:
             **(signal_meta or {}),
         }
         acc["fills"].append(fill)
-        if len(acc["fills"]) > _MAX_FILLS:
-            del acc["fills"][: len(acc["fills"]) - _MAX_FILLS]
+        _trim_fills(acc)
 
         snap = self._account_metrics("taker")
         self._append_equity("taker", opened_at, snap, force=True)
@@ -1377,8 +1402,7 @@ class ShadowBook:
             "opened_at": pos.get("opened_at"),
         }
         acc["fills"].append(close_fill)
-        if len(acc["fills"]) > _MAX_FILLS:
-            del acc["fills"][: len(acc["fills"]) - _MAX_FILLS]
+        _trim_fills(acc)
 
         acc["wallet_balance"] = float(acc["wallet_balance"]) + net_pnl
         acc["closed_count"] = int(acc["closed_count"]) + 1
@@ -1680,11 +1704,19 @@ class ShadowBook:
         gross_win = sum(float(c.get("realized_pnl_usd", 0.0)) for c in wins)
         gross_loss = sum(float(c.get("realized_pnl_usd", 0.0)) for c in losses)
         total_fee = sum(float(c.get("fee_usd", 0.0) or 0.0) for c in closes)
-        total_pnl = sum(float(c.get("realized_pnl_usd", 0.0)) for c in closes)
+        # Include realized_carry so a _MAX_FILLS trim cannot drop early realized
+        # PnL from either total_realized_pnl_usd or the total_return_pct baseline.
+        total_pnl = _realized_with_carry(acc)
         holds = [float(c.get("hold_minutes", 0.0) or 0.0) for c in closes]
         best = max((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
         worst = min((float(c.get("realized_pnl_usd", 0.0)) for c in closes), default=0.0)
-        start = float(self.state["starting_balance"])
+        # Per-account baseline = wallet - Σclose realized, NOT the global
+        # starting_balance. The two arms can have different effective baselines
+        # (a manual per-account wallet edit diverged maker_shadow to 90 vs the
+        # global 100), so the global value mis-stated maker total_return_pct as
+        # -13.13% when the true figure is -3.47%. This matches the realized_pnl
+        # fix in _account_metrics: derive the baseline from the account itself.
+        start = float(acc["wallet_balance"]) - total_pnl
         equity = float(acc["wallet_balance"]) + sum(
             float(p.get("unrealized_pnl_usd", 0.0) or 0.0)
             for p in acc["positions"])
