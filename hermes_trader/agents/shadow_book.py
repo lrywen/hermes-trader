@@ -844,7 +844,17 @@ class ShadowBook:
             "used_margin": round(used_margin, 4),
             "unrealized_pnl_usd": round(unrealized, 4),
             "open_notional_usd": round(open_notional, 4),
-            "realized_pnl_usd": round(wallet - self.state["starting_balance"], 4),
+            # Realized PnL = sum of close-fill realized, NOT wallet minus the
+            # GLOBAL starting_balance. The two shadow arms can have different
+            # effective baselines (e.g. a manual per-account wallet edit that
+            # bypassed deposit()/reset() on 2026-10-09 added +70 to maker_shadow
+            # only), so subtracting the single global baseline mis-reported
+            # maker_shadow by exactly that drift (-13.13% shown vs -3.13% real).
+            # Summing close fills is correct per-account by construction and is
+            # also immune to future deposit()/reset() baseline shifts.
+            "realized_pnl_usd": round(sum(float(f.get("realized_pnl_usd") or 0.0)
+                                          for f in acc["fills"]
+                                          if f.get("type") == "close"), 4),
             "total_fees_usd": round(sum(float(f.get("fee_usd", 0.0) or 0.0)
                                         for f in acc["fills"]
                                         if f.get("type") == "close"), 4),
