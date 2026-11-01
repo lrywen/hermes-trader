@@ -23,6 +23,7 @@ import time
 
 from hermes_trader.data.historical_candles import (
     INTERVAL_MS,
+    _load_disk_cache,
     cached_span,
     fetch_candle_range,
     flush_disk_cache,
@@ -46,6 +47,11 @@ def backfill(coins: list[str], intervals: list[str], days: int) -> dict:
     now_ms = int(time.time() * 1000)
     start_ms = now_ms - days * 86_400_000
     set_cache_file(PROD_CACHE)
+    # set_cache_file only pins the path and clears _DISK_LOADED; it does NOT
+    # load. cached_span reads the in-memory _BAR_CACHE, so without an explicit
+    # load the before_newest span is always None. fetch_candle_range would load
+    # lazily, but we need the span BEFORE the first fetch.
+    _load_disk_cache()
     stats = {}
     for iv in intervals:
         # Align end to the last fully-closed bar *of this interval* so a forming
@@ -88,6 +94,10 @@ def verify(coins: list[str], intervals: list[str]) -> dict:
     than two *bars* old (a 1d series is not stale after 2 hours).
     """
     set_cache_file(PROD_CACHE)
+    # Must load explicitly: set_cache_file does not read the file, and
+    # cached_span only inspects in-memory _BAR_CACHE. Without this load
+    # --verify-only always reports 0 series despite a healthy on-disk cache.
+    _load_disk_cache()
     now_ms = int(time.time() * 1000)
     out = {}
     for iv in intervals:
