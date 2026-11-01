@@ -2248,6 +2248,16 @@ async def _tail_log_sse(public_only: bool = False) -> AsyncIterator[str]:
 _AUTH_MAX_FAILURES = int(os.environ.get("HERMES_AUTH_MAX_FAILURES", "5"))
 _AUTH_COOLDOWN_SEC = int(os.environ.get("HERMES_AUTH_COOLDOWN_SEC", str(5 * 60)))
 _AUTH_TRUST_PROXY = os.environ.get("HERMES_TRUST_PROXY", "") == "1"
+# P0-2: behind the BFF every portal request shares ONE socket peer (the nginx
+# bridge IP), so a purely per-IP lockout collapses into a single global bucket —
+# 5 bad tokens from any LAN host 429'd the whole operator surface for 300s. Fix
+# by keying the lockout on the BFF-authenticated X-Portal-User when present
+# (each portal user gets its own bucket), while ALWAYS also counting the socket
+# IP as a brute-force backstop. The socket-IP bucket uses a much higher ceiling
+# for requests that arrive via a trusted RFC1918 proxy hop (the BFF aggregate),
+# so legitimate per-user lockouts never trip the shared-IP ceiling, but a direct
+# (non-RFC1918) attacker cannot raise its own IP ceiling by forging X-Portal-User.
+_AUTH_PROXY_MAX_FAILURES = int(os.environ.get("HERMES_AUTH_PROXY_MAX_FAILURES", "100"))
 _auth_failures: dict[str, dict[str, float]] = {}
 _auth_lock = threading.Lock()
 
@@ -2295,6 +2305,69 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+def _is_rfc1918(ip: str) -> bool:
+    """True only for genuine private/loopback/link-local addresses (the trusted
+    proxy / LAN boundary). Uses explicit ranges rather than ipaddress.is_private,
+    which also matches documentation/reserved blocks (e.g. 203.0.113.x TEST-NET-3)
+    that are NOT a trusted internal proxy."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    if a.is_loopback or a.is_link_local:
+        return True
+    private_nets = (
+        ipaddress.ip_network("10.0.0.0/8"),
+        ipaddress.ip_network("172.16.0.0/12"),
+        ipaddress.ip_network("192.168.0.0/16"),
+    )
+    return any(a in net for net in private_nets)
+
+
+def _auth_bucket_keys(request: Request) -> tuple[str, str, int]:
+    """Return (user_bucket, ip_bucket, ip_ceiling) for the auth-failure lockout.
+
+    - user_bucket: "user:<portal_user>" when the BFF injected a valid
+      X-Portal-User, else "" (no per-user bucket for direct connections).
+    - ip_bucket: "ip:<socket_ip>" always — the brute-force backstop that a
+      forged X-Portal-User cannot rotate away from.
+    - ip_ceiling: the failure threshold for the IP bucket. It is the strict
+      _AUTH_MAX_FAILURES for direct/public clients, but the much higher
+      _AUTH_PROXY_MAX_FAILURES when the request arrived via a trusted RFC1918
+      proxy (the BFF aggregate) so per-user lockouts never 429 the whole site.
+    """
+    ip = _client_ip(request)
+    portal_user = operator_portal_user(request)
+    user_bucket = f"user:{portal_user}" if portal_user else ""
+    # Only a trusted internal proxy hop earns the relaxed IP ceiling; a direct
+    # public client forging X-Portal-User still faces the strict IP ceiling.
+    ip_ceiling = _AUTH_PROXY_MAX_FAILURES if _is_rfc1918(ip) else _AUTH_MAX_FAILURES
+    return user_bucket, f"ip:{ip}", ip_ceiling
+
+
+def _auth_bucket_locked(bucket: str, now: float) -> float:
+    """Return remaining lock seconds for ``bucket`` (0 if not locked)."""
+    rec = _auth_failures.get(bucket)
+    if rec and now < rec.get("locked_until", 0.0):
+        return rec["locked_until"] - now
+    return 0.0
+
+
+def _auth_record_failure(bucket: str, ceiling: int, now: float) -> float:
+    """Increment the failure counter for ``bucket``; return lock seconds if this
+    failure trips the ceiling (0 otherwise). A success path clears the bucket."""
+    rec = _auth_failures.get(bucket) or {"fails": 0, "locked_until": 0.0}
+    rec["fails"] = int(rec.get("fails", 0)) + 1
+    locked = 0.0
+    if rec["fails"] >= ceiling:
+        locked = _AUTH_COOLDOWN_SEC
+        rec["locked_until"] = now + _AUTH_COOLDOWN_SEC
+        rec["fails"] = 0
+    _auth_failures[bucket] = rec
+    return locked
+
+
 def _extract_bearer(request: Request) -> str:
     """Return the bearer token from ``Authorization: Bearer <token>`` or ``''``."""
     auth = request.headers.get("Authorization") or request.headers.get("authorization", "")
@@ -2322,16 +2395,22 @@ def _require_operator(request: Request, write: bool = False) -> None:
         raise HTTPException(status_code=503, detail="operator surface disabled (set HERMES_OPERATOR_TOKEN)")
 
     ip = _client_ip(request)
+    user_bucket, ip_bucket, ip_ceiling = _auth_bucket_keys(request)
     now = time.time()
     with _auth_lock:
-        rec = _auth_failures.get(ip)
-        if rec and now < rec.get("locked_until", 0.0):
-            retry = int(rec["locked_until"] - now) + 1
-            raise HTTPException(
-                status_code=429,
-                detail="too many failed operator auth attempts — try again later",
-                headers={"Retry-After": str(retry)},
-            )
+        # Locked if EITHER the per-user bucket (BFF) or the socket-IP backstop
+        # is cooling down. Per-user isolation means one portal user's failures
+        # never lock out another; the IP backstop still stops direct brute force.
+        for bucket in (user_bucket, ip_bucket):
+            if not bucket:
+                continue
+            remaining = _auth_bucket_locked(bucket, now)
+            if remaining > 0:
+                raise HTTPException(
+                    status_code=429,
+                    detail="too many failed operator auth attempts — try again later",
+                    headers={"Retry-After": str(int(remaining) + 1)},
+                )
 
     provided = (
         _extract_bearer(request)
@@ -2340,19 +2419,17 @@ def _require_operator(request: Request, write: bool = False) -> None:
     # P1-12: constant-time comparison; never accept a ?token= query param.
     if not hmac.compare_digest(provided or "", expected):
         with _auth_lock:
-            rec = _auth_failures.get(ip) or {"fails": 0, "locked_until": 0.0}
-            rec["fails"] = int(rec.get("fails", 0)) + 1
-            locked_until = 0.0
-            if rec["fails"] >= _AUTH_MAX_FAILURES:
-                locked_until = now + _AUTH_COOLDOWN_SEC
-                rec["locked_until"] = locked_until
-                rec["fails"] = 0
-            _auth_failures[ip] = rec
+            # Count the failure on the per-user bucket (strict ceiling) AND on
+            # the socket-IP backstop (relaxed ceiling only via a trusted proxy).
+            locked = 0.0
+            if user_bucket:
+                locked = max(locked, _auth_record_failure(user_bucket, _AUTH_MAX_FAILURES, now))
+            locked = max(locked, _auth_record_failure(ip_bucket, ip_ceiling, now))
         logger.warning(
-            "[operator] auth failed from %s (consecutive failures, cooldown active: %s)",
-            ip, bool(locked_until),
+            "[operator] auth failed from %s (portal_user=%s, cooldown active: %s)",
+            ip, user_bucket or "-", bool(locked),
         )
-        if locked_until:
+        if locked:
             raise HTTPException(
                 status_code=429,
                 detail="too many failed operator auth attempts — try again later",
@@ -2366,9 +2443,11 @@ def _require_operator(request: Request, write: bool = False) -> None:
             headers={"WWW-Authenticate": 'Bearer realm="hermes-trader"'},
         )
 
-    # Success — clear the failure counter for this IP.
+    # Success — clear the failure counters for both buckets.
     with _auth_lock:
-        _auth_failures.pop(ip, None)
+        if user_bucket:
+            _auth_failures.pop(user_bucket, None)
+        _auth_failures.pop(ip_bucket, None)
     # F11: state-changing requests are additionally rate-limited per IP even
     # with a valid token (a leaked token / runaway script must not be able to
     # fire unlimited close/mode/config writes).
