@@ -106,4 +106,9 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "gate_coverage.py",
     "wfa_main_strategy.py",
     "backfill_hist_candles.py",
+    # P0-2 (2026-11-02): realized entry-slippage measurement from signal close
+    # to next-bar open over runner-gate candidates. Read-only research tool run
+    # via `docker exec` against /data (ch_hist_candles.json cache + book-raw);
+    # same class as m1_ofi_eval.py / gate_ablation.py.
+    "measure_realized_slippage.py",
 )

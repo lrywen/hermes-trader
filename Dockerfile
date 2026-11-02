@@ -105,6 +105,9 @@ COPY scripts/freeze_baseline.py scripts/freeze_baseline.py
 COPY scripts/gate_coverage.py scripts/gate_coverage.py
 COPY scripts/wfa_main_strategy.py scripts/wfa_main_strategy.py
 COPY scripts/backfill_hist_candles.py scripts/backfill_hist_candles.py
+# P0-2 (2026-11-02): realized entry-slippage measurement (docker exec against
+# /data; same class as m1_ofi_eval.py).
+COPY scripts/measure_realized_slippage.py scripts/measure_realized_slippage.py
 # Stage-4 one-shot research runners (whitelisted but their COPY lines were
 # missing); docker exec against /data, same class as m1_ofi_eval.py.
 COPY scripts/gate_ablation.py scripts/gate_ablation.py
