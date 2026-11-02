@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import datetime as _dt
 import glob
 import json
 import os
@@ -52,12 +53,18 @@ _DATA_DIR = os.environ.get("HERMES_DATA_DIR", "/data")
 _BINANCE_BASE = "https://data-api.binance.vision"
 
 # Volume tiers keyed on the candidate's own recorded 24h notional.
+# "unknown" is a real bucket, not micro: ~52% of runner-gate candidates have
+# no recorded volume_24h_usd, and folding them into micro_lt5M (the old
+# behaviour) made the thinnest tier ~70% missing-data and every "all sample"
+# statement wrong (review D2, 2026-11-02).
+UNKNOWN_TIER = "unknown_volume"
 TIERS = [
     ("micro_lt5M", 0.0, 5e6),
     ("small_5M_50M", 5e6, 5e7),
     ("medium_50M_200M", 5e7, 2e8),
     ("large_ge200M", 2e8, float("inf")),
 ]
+TIER_NAMES = [name for name, _, _ in TIERS] + [UNKNOWN_TIER]
 
 
 def load_candidates(pattern: str) -> list[dict[str, Any]]:
@@ -170,17 +177,98 @@ def _series(coin: str, start_ms: int, end_ms: int, use_network: bool):
     return [r[0] for r in rows], [r[4] for r in rows], [r[1] for r in rows]
 
 
+# ── HyperLiquid perp series (review D1): same venue as the candidates, read
+# from the local candle cache (COIN|5m -> {ts_str: [o,h,l,c,v]}). No cross-venue
+# basis. Coverage is smaller than Binance spot; prefer fidelity over n.
+_HL_CACHE: dict[str, dict] = {}
+_HL_CACHE_LOADED = False
+
+
+def hl_cache_load(path: str) -> None:
+    global _HL_CACHE_LOADED
+    try:
+        _HL_CACHE.clear()
+        _HL_CACHE.update(json.loads(Path(path).read_text()))
+    except Exception:
+        _HL_CACHE.clear()
+    _HL_CACHE_LOADED = True
+
+
+def _series_hl(coin: str, start_ms: int, end_ms: int, use_network: bool = True):
+    """Return (ts, close, open) for the HyperLiquid perp, same venue as the
+    candidates (review D1). Local cache first; if it does not cover the window
+    and networking is allowed, fetch via the production HL candleSnapshot path
+    (paged, bar-cached). Returns None if neither yields >=2 bars.
+    """
+    node = _HL_CACHE.get(f"{coin}|5m")
+    local: list[tuple] = []
+    if isinstance(node, dict):
+        for ts_str, k in node.items():
+            try:
+                t = int(ts_str)
+                if start_ms <= t <= end_ms:
+                    # HL candle vector is [o, h, l, c, v]
+                    local.append((t, float(k[3]), float(k[0])))
+            except Exception:
+                continue
+    local.sort(key=lambda r: r[0])
+
+    covers = bool(local) and local[0][0] <= start_ms + BAR_MS and local[-1][0] >= end_ms - BAR_MS
+    if covers or not use_network:
+        rows = local
+    else:
+        try:
+            from hermes_trader.data import historical_candles as hc
+            candles = hc.fetch_candle_range(coin, "5m", start_ms, end_ms)
+            rows = [(c.t, c.c, c.o) for c in candles if start_ms <= c.t <= end_ms]
+        except Exception:
+            rows = local
+    if len(rows) < 2:
+        return None
+    return [r[0] for r in rows], [r[1] for r in rows], [r[2] for r in rows]
+
+
 def _tier(vol_usd: Optional[float]) -> str:
-    v = vol_usd or 0.0
+    # Missing/non-positive volume is reported separately, never silently
+    # treated as the thinnest real-liquidity bucket (review D2).
+    if vol_usd is None or vol_usd <= 0:
+        return UNKNOWN_TIER
+    v = float(vol_usd)
     for name, lo, hi in TIERS:
         if lo <= v < hi:
             return name
-    return "unknown"
+    return UNKNOWN_TIER
+
+
+def _pair_bar(ts: int, bars_t: list[int], bars_c: list[float],
+              bars_o: list[float]) -> Optional[tuple[int, float, float]]:
+    """Locate the signal bar containing ``ts`` and return (bar_ts, signal
+    close, NEXT-bar open). Strict anti-look-ahead: the fill price always comes
+    from the bar AFTER the one whose close is the decision price.
+
+    Returns None if:
+      * ts falls before the first bar,
+      * there is no bar after the signal bar,
+      * ts is not within one BAR_MS of a bar open (misaligned / gap),
+      * either price is non-positive.
+    """
+    j = bisect.bisect_right(bars_t, ts - 1) - 1
+    if j < 0 or j + 1 >= len(bars_t) or abs(bars_t[j] - ts) > BAR_MS:
+        return None
+    decision = bars_c[j]
+    fill = bars_o[j + 1]
+    if not (decision > 0 and fill > 0):
+        return None
+    return bars_t[j], decision, fill
 
 
 def measure(cands: list[dict[str, Any]], use_network: bool,
-            progress: bool = False) -> list[dict[str, Any]]:
-    """Pair each candidate's signal-bar close with the next-bar open."""
+            progress: bool = False, source: str = "binance") -> list[dict[str, Any]]:
+    """Pair each candidate's signal-bar close with the next-bar open.
+
+    source="binance": Binance spot 5m (broad coverage, cross-venue basis).
+    source="hl":      local HyperLiquid perp 5m cache (same venue, no basis).
+    """
     # group by coin so one fetch covers all that coin's candidates
     by_coin: dict[str, list[dict]] = {}
     for c in cands:
@@ -193,7 +281,12 @@ def measure(cands: list[dict[str, Any]], use_network: bool,
         start_ms = ts_list[0] - 2 * BAR_MS
         end_ms = ts_list[-1] + 2 * BAR_MS
         ser = None
-        if use_network:
+        if source == "hl":
+            try:
+                ser = _series_hl(coin, start_ms, end_ms, use_network=use_network)
+            except Exception:
+                ser = None
+        elif use_network:
             try:
                 ser = _series(coin, start_ms, end_ms, True)
             except Exception:
@@ -205,22 +298,17 @@ def measure(cands: list[dict[str, Any]], use_network: bool,
             continue
         bars_t, bars_c, bars_o = ser
         for c in cs:
-            ts = int(c["ts"])
-            j = bisect.bisect_right(bars_t, ts - 1) - 1
-            # signal bar must contain ts and the next bar must exist
-            if j < 0 or j + 1 >= len(bars_t) or abs(bars_t[j] - ts) > BAR_MS:
+            paired = _pair_bar(int(c["ts"]), bars_t, bars_c, bars_o)
+            if paired is None:
                 continue
-            decision = bars_c[j]
-            fill = bars_o[j + 1]
-            if not (decision > 0 and fill > 0):
-                continue
+            bar_ts, decision, fill = paired
             raw_bp = (fill - decision) / decision * 1e4
             side = c.get("side")
             # adverse-when-positive: long buys the open (higher=worse), short
             # sells the open (lower=worse).
             dir_bp = raw_bp if side == "long" else (-raw_bp if side == "short" else raw_bp)
             out.append({
-                "coin": coin, "side": side, "ts": bars_t[j],
+                "coin": coin, "side": side, "ts": bar_ts, "source": source,
                 "tier": _tier(c.get("volume_24h_usd")),
                 "volume_24h_usd": c.get("volume_24h_usd"),
                 "decision_close": decision, "fill_open": fill,
@@ -251,6 +339,41 @@ def _boot_mean_ci(xs: list[float], B: int = 2000, seed: int = 7) -> tuple[float,
     return means[int(.025 * B)], means[int(.975 * B)]
 
 
+def _day_key(ts_ms: int) -> str:
+    return _dt.datetime.utcfromtimestamp(ts_ms / 1000).strftime("%Y-%m-%d")
+
+
+def _boot_day_ci(pairs: list[dict[str, Any]], B: int = 4000,
+                 seed: int = 7) -> dict[str, Any]:
+    """UTC day-block bootstrap (review D3).
+
+    Candidates cluster heavily in time/coins, so an iid resample understates
+    uncertainty. Average adverse_bp WITHIN each UTC day first, then resample
+    the daily means (B=4000, fixed seed). Returns the day count and CI of the
+    cross-day mean. Fewer than 2 distinct days -> NaN interval.
+    """
+    import random
+    by_day: dict[str, list[float]] = {}
+    for p in pairs:
+        by_day.setdefault(_day_key(p["ts"]), []).append(p["adverse_bp"])
+    daily = [st.mean(v) for v in by_day.values()]
+    if len(daily) < 2:
+        return {"days": len(daily), "day_mean_bp": (round(st.mean(daily), 3)
+                if daily else None), "day_ci95_bp": [float("nan"), float("nan")]}
+    rnd = random.Random(seed)
+    n = len(daily)
+    means = []
+    for _ in range(B):
+        means.append(sum(daily[rnd.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    return {
+        "days": n,
+        "day_mean_bp": round(st.mean(daily), 3),
+        "day_ci95_bp": [round(means[int(.025 * B)], 3),
+                        round(means[int(.975 * B)], 3)],
+    }
+
+
 def report(pairs: list[dict[str, Any]]) -> dict[str, Any]:
     def block(xs: list[dict]) -> dict[str, Any]:
         adv = [p["adverse_bp"] for p in xs]
@@ -261,33 +384,40 @@ def report(pairs: list[dict[str, Any]]) -> dict[str, Any]:
             "n": len(adv),
             "mean_adverse_bp": round(st.mean(adv), 3),
             "ci95_bp": [round(lo, 3), round(hi, 3)],
+            # UTC day-block bootstrap (preferred inference; iid CI is secondary)
+            **_boot_day_ci(xs),
             "median_bp": round(_quant(adv, .5), 3),
             "p90_adverse_bp": round(_quant(adv, .9), 3),
             "frac_adverse_pct": round(100 * sum(1 for x in adv if x > 0) / len(adv), 1),
         }
 
-    by_tier = {name: [] for name, _, _ in TIERS}
+    by_tier: dict[str, list] = {name: [] for name in TIER_NAMES}
     for p in pairs:
         by_tier.setdefault(p["tier"], []).append(p)
 
     res = {
         "total_pairs": len(pairs),
         "overall": block(pairs),
-        "by_tier": {t: block(by_tier.get(t, [])) for t, _, _ in TIERS},
+        "by_tier": {t: block(by_tier.get(t, [])) for t in TIER_NAMES},
         "by_side": {},
         "small_vs_large": {},
     }
     for side in ("long", "short"):
         res["by_side"][side] = block([p for p in pairs if p["side"] == side])
 
-    # pivotal contrast for the 50M floor: small(5-50M) vs medium+large(>=50M)
+    # Pivotal contrast for the 50M floor: small(5-50M) vs medium+large(>=50M).
+    # Both sides have REAL recorded volume; unknown_volume is excluded from
+    # this contrast (it is reported separately in by_tier).
     small = [p for p in pairs if p["tier"] == "small_5M_50M"]
     big = [p for p in pairs if p["tier"] in ("medium_50M_200M", "large_ge200M")]
     res["small_vs_large"] = {
         "small_5_50M": block(small),
         "medium_or_large_ge50M": block(big),
-        "note": "if mean_adverse_bp CIs overlap and are within ~taker cost, "
-                "the 10x short floor lacks slippage support",
+        "note": "This measures ONE-BAR DELAY COST (signal close -> next 5m "
+                "open), not order-book slippage. It answers 'does waiting one "
+                "bar cost more in thin-volume coins?', not the 50M floor's "
+                "depth-risk rationale. Compare via day_ci95_bp (independent "
+                "UTC days), not iid ci95_bp; d>=30 required for a decision.",
     }
     return res
 
@@ -296,6 +426,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--pattern", default=os.path.join(_DATA_DIR, "runner_gate_shadow.jsonl*"))
     ap.add_argument("--cache", default=os.path.join(_DATA_DIR, "ch_slippage_candles.json"))
+    ap.add_argument("--hl-cache", default=os.path.join(_DATA_DIR, "ch_hist_candles.json"),
+                    help="local HyperLiquid perp candle cache for --source hl")
+    ap.add_argument("--source", choices=("binance", "hl"), default="binance",
+                    help="price source; hl = same-venue perp, no cross-venue basis")
     ap.add_argument("--out", default="")
     ap.add_argument("--no-network", action="store_true")
     ap.add_argument("--max-rows", type=int, default=0)
@@ -305,14 +439,21 @@ def main() -> int:
     cands.sort(key=lambda c: c.get("ts", 0))
     if args.max_rows:
         cands = cands[-args.max_rows:]
-    print(f"candidates: {len(cands)}", file=sys.stderr)
+    print(f"candidates: {len(cands)} source={args.source}", file=sys.stderr)
 
-    cache_load(args.cache)
-    pairs = measure(cands, use_network=not args.no_network, progress=True)
-    cache_flush()
+    if args.source == "hl":
+        hl_cache_load(args.hl_cache)
+        pairs = measure(cands, use_network=not args.no_network, progress=True,
+                        source="hl")
+    else:
+        cache_load(args.cache)
+        pairs = measure(cands, use_network=not args.no_network, progress=True,
+                        source="binance")
+        cache_flush()
     print(f"paired: {len(pairs)}", file=sys.stderr)
 
     res = report(pairs)
+    res["source"] = args.source
     txt = json.dumps(res, ensure_ascii=False, indent=2)
     print(txt)
     if args.out:

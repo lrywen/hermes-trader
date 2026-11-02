@@ -8,6 +8,33 @@
   证据 [evidence-slippage-2026-11-02.json](./evidence-slippage-2026-11-02.json)、
   脚本 [measure_realized_slippage.py](../../scripts/measure_realized_slippage.py)
 
+## 0. 复核修订（2026-11-02 终版，覆盖以下相应旧结论）
+
+《P0-2 滑点测量复核融合终版》逐条实测后，本 ADR 三处结论撤回/修正：
+
+1. **测得的不是滑点，是一 bar 延迟成本。** `(next_open − signal_close)/signal_close`
+   含决策到成交的时间延迟与该时段自然移动，**不含盘口深度冲击与成交价−同时刻 mid 价差**。
+   0.47–0.57bp 的正确名称是「一 bar 延迟成本」，回答「等一根 5m 柱贵不贵」，不能替代滑点假设。
+2. **「系统未持久化 book 快照，需新增采集」错误，撤回。** `/data/book-raw/date=*/COIN.jsonl.gz`
+   已持续采集 36 天（2026-09-28 起，1.79GB，1s 采样，10 档买卖盘）。但该采集按 dayNtlVlm
+   取前 N 名，**结构上覆盖不到 5–50M 档**（小成交额币进不了 top-N），因此即使扩容也服务不了
+   地板决策所需标的——故终版决定**不追加盘口深度工程**（二阶项、且只优化成本墙的 5–6%）。
+3. **地板保留理由修正**：不是「证据不足」，而是「放松地板对盈利性无效」——滑点/延迟不是约束项
+   （毛 edge <3bp、taker 往返 9bp，延迟成本仅占成本墙 5–6%）；其唯一正当用途是**研究吞吐**
+   （增加候选供给以突破 d≥30 样本门槛），见 P2 shadow 观察。
+
+脚本缺陷修复（已实现）：**D1** 新增 `--source hl`（同所 HyperLiquid 永续，本地蜡烛缓存 +
+HL candleSnapshot 网络补数，消除跨所基差；Binance 现货口径保留为默认宽覆盖对照）；
+**D2** 缺失 volume 归入独立 `unknown_volume` 档（实测 51.6% 候选无 volume，旧版误并入 micro，
+污染「全样本」表述；small vs ge50M 决策对比两侧均有真实成交额，不受影响）；
+**D3** 新增 UTC 日块 bootstrap（先组内按日均值、再跨日重抽 4000 次 seed=7，写入 day_ci95_bp/days，
+iid CI 仅作次参考）；**D5** 反前视配对提取为 `_pair_bar` 并补单测。**D6** 管道延迟：单次辩论调用
+p50 34.8s、一次决策 ≥3 次，回放假设最长 300s 成交，0.47bp 是延迟成本下界。
+
+> 口径提醒（终版 §4.1/§4.2）：已观测的成交后中价不利漂移 median +40.63bp 仅存在于
+> **maker_shadow** fills（n=48）；**taker 侧该字段完全未采集**，不能据此推断 taker 真实成本。
+> elapsed_ms 是**单次** LLM 调用耗时，端到端决策耗时从未被记录（P1 补）。
+
 ## 1. 目的
 
 空头流动性地板 `runner_entry_gate.min_short_volume_usd = 50_000_000`（是多头 5M 地板的 10×）。
