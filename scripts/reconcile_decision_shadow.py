@@ -21,6 +21,7 @@ import math
 import os
 import random
 import statistics as st
+import sys
 import time
 from typing import Any, Optional
 
@@ -120,6 +121,33 @@ def load_rows(pattern: str) -> list[dict[str, Any]]:
         except Exception:
             continue
     return list(rows.values())
+
+
+def count_source_lines(pattern: str) -> int:
+    """Count non-blank, parseable source lines across the glob.
+
+    Used as the truncation baseline instead of ``len(load_rows())``: a
+    rotation race (a file mid-rename / partially written at cron time) makes
+    load_rows read a short snapshot, so a guard compared only against its own
+    de-duplicated count would see src==out and miss the loss. The physical
+    line count of whatever the glob currently resolves is the floor the
+    output must not materially fall below.
+    """
+    n = 0
+    for fp in sorted(glob.glob(pattern)):
+        try:
+            for line in open(fp, errors="ignore"):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    json.loads(line)
+                except Exception:
+                    continue
+                n += 1
+        except Exception:
+            continue
+    return n
 
 
 
@@ -278,16 +306,42 @@ def main() -> int:
     rows.sort(key=lambda r: r.get("ts", 0))
     if args.max_rows:
         rows = rows[-args.max_rows:]
+    # Physical parseable source lines across the glob — the truncation floor.
+    # Distinct from len(rows): under a rotation race load_rows itself can read
+    # a short snapshot, so guarding only against its own count would miss loss.
+    src_phys_n = 0 if args.max_rows else count_source_lines(args.pattern)
     src = CandleSource(args.cache, use_network=not args.no_network,
                        source=args.source)
     bench_coins = sorted({k[:-3] for k in getattr(src, "cache", {}) if k.endswith("|5m")})
     enriched = enrich(rows, src, bench_coins)
+
+    # ADR-0012 / v2 §4.4 truncation guard: this job rewrites the whole derived
+    # file and races log rotation (~00:15-00:19 UTC). On 2026-11-01 a rotation
+    # race made load_rows see a partial source snapshot; silently rewriting the
+    # output then permanently dropped 75 rows (37 more on 11-02). Refuse to
+    # publish an output materially below the physical source line count.
+    # Checked BEFORE writing so a bad run never overwrites the previous good
+    # output. max_rows intentionally truncates and bypasses the guard.
+    out_n = len(enriched)
+    if src_phys_n and out_n < src_phys_n * 0.98:
+        print(f"[FATAL] truncated: source_lines={src_phys_n} out={out_n} "
+              f"(< 98% of source; likely a rotation race — output NOT written)",
+              file=sys.stderr)
+        return 2
+
     out_dir = os.path.dirname(args.out)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
-    with open(args.out, "w") as f:
+    # Atomic publish: write a temp file in the same directory, fsync, then
+    # os.replace (atomic on POSIX) so a concurrent reader / the next rotation
+    # can never observe a half-written outcomes file.
+    tmp_out = args.out + ".tmp"
+    with open(tmp_out, "w") as f:
         for r in enriched:
             f.write(json.dumps(r, ensure_ascii=False) + chr(10))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp_out, args.out)
     summary = summarize(enriched, hz=args.horizon)
     txt = json.dumps(summary, ensure_ascii=False, indent=2)
     print(txt)
