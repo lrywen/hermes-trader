@@ -1109,6 +1109,7 @@ def _call_openrouter(
     max_tokens: Optional[int] = None,
     model: Optional[str] = None,
     path: str = "call_ai",
+    force_reasoning_effort: Optional[str] = None,
 ) -> str:
     """Call the LLM API via OpenAI-compatible endpoint (synchronous httpx).
 
@@ -1178,6 +1179,12 @@ def _call_openrouter(
         _ro_mode == "enforce"
         and random.random() <= float(_ro.get("sample_rate", 1.0))
     )
+    # P-latency (2026-11-02): a non-empty caller force (bull/bear analyst legs)
+    # unconditionally pins reasoning_effort, independent of the stochastic
+    # canary above. Track it separately so the rollout telemetry records what
+    # was actually sent rather than only the canary's random decision.
+    _forced_effort = str(force_reasoning_effort or "").strip().lower() or None
+    _effort_sent = _forced_effort or (_ro_effort if _apply_low else None)
 
     payload: dict[str, Any] = {
         "model": model,
@@ -1205,10 +1212,11 @@ def _call_openrouter(
         body = dict(payload)
         body["messages"] = msgs
         body["max_tokens"] = max_toks
-        if _apply_low:
-            # Canary: shrink the (unseen) chain-of-thought budget. Proven −39%
-            # reasoning tokens / −48% wall time in controlled testing.
-            body["reasoning_effort"] = _ro_effort
+        if _effort_sent is not None:
+            # reasoning_effort shrinks the (unseen) chain-of-thought budget.
+            # Canary path: proven −39% reasoning tokens / −48% wall time in
+            # controlled testing; forced path: bull/bear latency cap.
+            body["reasoning_effort"] = _effort_sent
         # Give the read (response body) phase the full timeout; connect/pool
         # phases are fast but LLM inference can take several seconds, so a
         # blanket timeout kills otherwise-successful slow reads.
@@ -1395,9 +1403,9 @@ def _call_openrouter(
             elapsed_ms=int((time.time() - _t_started) * 1000),
             finish_reason=finish_reason,
             path=path,
-            applied=_apply_low,
-            mode=_ro_mode,
-            effort=_ro_effort,
+            applied=(_effort_sent is not None),
+            mode=("forced" if _forced_effort else _ro_mode),
+            effort=(_effort_sent or _ro_effort),
         )
         return content
     except Exception as e:
@@ -1851,6 +1859,11 @@ def _debate_cfg() -> dict[str, Any]:
         # arbiter_model covers the synth call. All stay on the shared provider.
         "analyst_model": str(d.get("analyst_model", "") or ""),
         "arbiter_model": str(d.get("arbiter_model", "") or ""),
+        # P-latency (2026-11-02): reasoning_effort forced on bull/bear legs.
+        # "" disables. Default "low" (config_defaults) to pull p75 leg latency
+        # under the 38.5s per-call budget; synth is deliberately unaffected.
+        "analyst_reasoning_effort": str(
+            d.get("analyst_reasoning_effort", "low") or "").strip(),
     }
 
 
@@ -2037,11 +2050,17 @@ def _debate_direct(
     per_call_timeout = timeout if timeout is not None else _debate_per_call_timeout()
     role = _debate_role(system_prompt)
     role_model = _debate_role_model(role)
+    # P-latency (2026-11-02): force reasoning_effort=low on the analyst
+    # (bull/bear) legs only. The synth/arbiter leg keeps its full reasoning
+    # budget — it runs once after bull/bear and is the verdict-quality leg.
+    _force_effort: Optional[str] = None
+    if role in ("bull", "bear"):
+        _force_effort = _debate_cfg().get("analyst_reasoning_effort") or None
     t0 = time.time()
     logger.info(
         f"[debate] call START | role={role} structured={structured} "
         f"timeout_s={per_call_timeout:.1f} prompt_chars={len(user_message)} "
-        f"model={role_model or '<default>'}"
+        f"model={role_model or '<default>'} effort={_force_effort or 'default'}"
     )
     try:
         out = _call_openrouter(
@@ -2052,6 +2071,7 @@ def _debate_direct(
             max_tokens=debate_tokens,
             model=role_model or None,
             path="debate_direct",
+            force_reasoning_effort=_force_effort,
         )
     except Exception as e:
         logger.warning(

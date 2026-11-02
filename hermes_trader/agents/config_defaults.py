@@ -771,6 +771,13 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # the synth call (strong-reasoning tier). Provider/base_url stay shared.
         "analyst_model": "",
         "arbiter_model": "",
+        # P-latency (2026-11-02): force reasoning_effort on the bull/bear
+        # (analyst) legs only. Production logs showed 42% of analyst legs took
+        # >38.5s (p75 51.8s / p90 64.5s on Ark deepseek), tripping the outer
+        # 42.5s debate deadline → bull_bear_failed → a full single-LLM fallback
+        # (end-to-end up to 95s, double token burn). "" disables; synth/arbiter
+        # is intentionally NOT covered (it runs once, after bull/bear).
+        "analyst_reasoning_effort": "low",
         # Shadow A/B (absorbed from TradingAgents). When enabled, run the
         # bull/bear/arbiter debate in the BACKGROUND for eligible candidates
         # purely as a comparison signal — it NEVER replaces the single-LLM

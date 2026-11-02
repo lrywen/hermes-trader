@@ -316,3 +316,63 @@ def test_debate_default_model_when_overrides_empty(monkeypatch, _enable_debate):
         "ETH", "ctx", _perception(mid=100.0), atr_abs=1.0)
     assert fields is not None
     assert seen_models == [None, None, None]
+
+
+# ── P-latency (2026-11-02): forced reasoning_effort on analyst legs ────────
+
+def test_debate_forces_low_reasoning_on_analyst_legs_not_synth(monkeypatch):
+    """bull/bear carry force_reasoning_effort='low'; synth stays unforced."""
+    monkeypatch.setattr(
+        R, "_debate_cfg",
+        lambda: {
+            "enabled": True, "max_latency_s": 10.0, "cache_ttl_s": 300.0,
+            "parallel": True, "use_structured_output": True,
+            "bull_timeout_s": None, "synth_timeout_s": None,
+            "analyst_model": "", "arbiter_model": "",
+            "analyst_reasoning_effort": "low",
+        },
+    )
+    monkeypatch.setattr(R, "cfg_get", lambda key, *a, **k: 1.5)
+    seen: list = []
+
+    def fake(system_prompt, user_message, **kwargs):
+        seen.append(kwargs.get("force_reasoning_effort"))
+        if "arbiter" in system_prompt:
+            return _synth_json(verdict="LONG", confidence=0.6, stop_pct=0.03)
+        return "bull" if "LONG specialist" in system_prompt else "bear"
+
+    monkeypatch.setattr(R, "_call_openrouter", fake)
+
+    fields = R._debate_research(
+        "ETH", "ctx", _perception(mid=100.0), atr_abs=1.0)
+    assert fields is not None
+    # bull + bear forced low; synth (last call) not forced.
+    assert seen == ["low", "low", None]
+
+
+def test_debate_analyst_effort_disabled_when_config_empty(monkeypatch):
+    """analyst_reasoning_effort='' → no force on any leg."""
+    monkeypatch.setattr(
+        R, "_debate_cfg",
+        lambda: {
+            "enabled": True, "max_latency_s": 10.0, "cache_ttl_s": 300.0,
+            "parallel": True, "use_structured_output": True,
+            "bull_timeout_s": None, "synth_timeout_s": None,
+            "analyst_model": "", "arbiter_model": "",
+            "analyst_reasoning_effort": "",
+        },
+    )
+    monkeypatch.setattr(R, "cfg_get", lambda key, *a, **k: 1.5)
+    seen: list = []
+
+    def fake(system_prompt, user_message, **kwargs):
+        seen.append(kwargs.get("force_reasoning_effort"))
+        if "arbiter" in system_prompt:
+            return _synth_json(verdict="PASS", confidence=0.2, conviction="low")
+        return "b"
+
+    monkeypatch.setattr(R, "_call_openrouter", fake)
+    fields = R._debate_research(
+        "ETH", "ctx", _perception(mid=100.0), atr_abs=1.0)
+    assert fields is not None
+    assert seen == [None, None, None]
