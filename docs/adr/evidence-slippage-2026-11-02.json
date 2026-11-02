@@ -1,109 +1,219 @@
 {
-  "total_pairs": 1717,
+  "_meta": {
+    "generated_at_utc": "2026-11-02T14:57:01Z",
+    "generated_on": "acer3830 / 192.168.124.65 (container hermes-trader)",
+    "command": "python3 scripts/measure_realized_slippage.py --source hl --out /tmp/slip_hl_v2",
+    "source": "hl (HyperLiquid perp 5m, same venue as the candidates)",
+    "supersedes": "the 2026-11-02 09:18 Binance-spot/iid version of this file",
+    "why_regenerated": "D8 fix: load_rows/load_candidates used a per-file try, so one torn line at runner_gate_shadow.jsonl.1:84 discarded the 75 rows after it; the P0-2 refresh therefore used 2,381 candidates instead of 2,464.",
+    "candidates": 2454,
+    "pairs": 2464,
+    "pairs_by_source": {
+      "hl": 2464
+    },
+    "independent_utc_days": 10,
+    "pairs_by_day": {
+      "2026-10-24": 200,
+      "2026-10-25": 259,
+      "2026-10-26": 181,
+      "2026-10-27": 269,
+      "2026-10-28": 299,
+      "2026-10-29": 337,
+      "2026-10-30": 493,
+      "2026-10-31": 198,
+      "2026-11-01": 158,
+      "2026-11-02": 70
+    },
+    "metric": "ONE-BAR DELAY COST (signal close -> next 5m open), not order-book slippage",
+    "decision_statistic": "small_vs_large.diff_small_minus_ge50M (day-block CI, common UTC days)",
+    "threshold": "d>=30 independent days required before any floor change",
+    "measured_day_pairs": 5
+  },
+  "total_pairs": 2464,
   "overall": {
-    "n": 1717,
-    "mean_adverse_bp": 0.365,
+    "n": 2464,
+    "mean_adverse_bp": -0.27,
     "ci95_bp": [
-      -0.112,
-      0.853
+      -0.959,
+      0.45
     ],
-    "median_bp": 0.0,
-    "p90_adverse_bp": 9.932,
-    "frac_adverse_pct": 36.4
+    "days": 10,
+    "day_mean_bp": -0.427,
+    "day_ci95_bp": [
+      -0.995,
+      0.129
+    ],
+    "median_bp": -0.0,
+    "p90_adverse_bp": 13.737,
+    "frac_adverse_pct": 45.9
   },
   "by_tier": {
     "micro_lt5M": {
-      "n": 1296,
-      "mean_adverse_bp": 0.313,
+      "n": 561,
+      "mean_adverse_bp": 0.155,
       "ci95_bp": [
-        -0.307,
-        0.95
+        -1.893,
+        2.68
       ],
-      "median_bp": -0.0,
-      "p90_adverse_bp": 10.811,
-      "frac_adverse_pct": 36.8
+      "days": 5,
+      "day_mean_bp": 0.022,
+      "day_ci95_bp": [
+        -1.448,
+        1.483
+      ],
+      "median_bp": 0.0,
+      "p90_adverse_bp": 22.211,
+      "frac_adverse_pct": 44.0
     },
     "small_5M_50M": {
-      "n": 278,
-      "mean_adverse_bp": 0.47,
+      "n": 468,
+      "mean_adverse_bp": 0.579,
       "ci95_bp": [
-        -0.151,
-        1.091
+        -0.174,
+        1.323
+      ],
+      "days": 5,
+      "day_mean_bp": 0.66,
+      "day_ci95_bp": [
+        0.31,
+        0.988
       ],
       "median_bp": -0.0,
-      "p90_adverse_bp": 6.56,
-      "frac_adverse_pct": 36.3
+      "p90_adverse_bp": 9.988,
+      "frac_adverse_pct": 49.6
     },
     "medium_50M_200M": {
-      "n": 74,
-      "mean_adverse_bp": 0.108,
+      "n": 105,
+      "mean_adverse_bp": -0.444,
       "ci95_bp": [
-        -1.034,
-        1.142
+        -1.416,
+        0.509
+      ],
+      "days": 5,
+      "day_mean_bp": -0.241,
+      "day_ci95_bp": [
+        -1.365,
+        1.096
       ],
       "median_bp": -0.0,
-      "p90_adverse_bp": 4.677,
-      "frac_adverse_pct": 32.4
+      "p90_adverse_bp": 5.273,
+      "frac_adverse_pct": 41.9
     },
     "large_ge200M": {
       "n": 69,
-      "mean_adverse_bp": 1.192,
+      "mean_adverse_bp": -0.153,
       "ci95_bp": [
-        -0.905,
-        3.253
+        -1.192,
+        0.844
+      ],
+      "days": 3,
+      "day_mean_bp": -1.231,
+      "day_ci95_bp": [
+        -3.931,
+        0.423
       ],
       "median_bp": 0.0,
-      "p90_adverse_bp": 19.194,
-      "frac_adverse_pct": 33.3
+      "p90_adverse_bp": 3.849,
+      "frac_adverse_pct": 40.6
+    },
+    "unknown_volume": {
+      "n": 1261,
+      "mean_adverse_bp": -0.765,
+      "ci95_bp": [
+        -1.587,
+        0.05
+      ],
+      "days": 6,
+      "day_mean_bp": -0.268,
+      "day_ci95_bp": [
+        -1.236,
+        1.082
+      ],
+      "median_bp": 0.0,
+      "p90_adverse_bp": 13.889,
+      "frac_adverse_pct": 46.0
     }
   },
   "by_side": {
     "long": {
-      "n": 733,
-      "mean_adverse_bp": 0.088,
+      "n": 948,
+      "mean_adverse_bp": -1.498,
       "ci95_bp": [
-        -0.59,
-        0.758
+        -2.7,
+        -0.05
       ],
-      "median_bp": 0.0,
-      "p90_adverse_bp": 10.764,
-      "frac_adverse_pct": 39.0
+      "days": 10,
+      "day_mean_bp": -2.284,
+      "day_ci95_bp": [
+        -3.833,
+        -0.873
+      ],
+      "median_bp": -0.148,
+      "p90_adverse_bp": 14.871,
+      "frac_adverse_pct": 43.1
     },
     "short": {
-      "n": 984,
-      "mean_adverse_bp": 0.572,
+      "n": 1516,
+      "mean_adverse_bp": 0.498,
       "ci95_bp": [
-        -0.091,
-        1.26
+        -0.234,
+        1.215
+      ],
+      "days": 10,
+      "day_mean_bp": 0.343,
+      "day_ci95_bp": [
+        -0.212,
+        0.857
       ],
       "median_bp": -0.0,
-      "p90_adverse_bp": 8.576,
-      "frac_adverse_pct": 34.5
+      "p90_adverse_bp": 13.305,
+      "frac_adverse_pct": 47.6
     }
   },
   "small_vs_large": {
     "small_5_50M": {
-      "n": 278,
-      "mean_adverse_bp": 0.47,
+      "n": 468,
+      "mean_adverse_bp": 0.579,
       "ci95_bp": [
-        -0.151,
-        1.091
+        -0.174,
+        1.323
+      ],
+      "days": 5,
+      "day_mean_bp": 0.66,
+      "day_ci95_bp": [
+        0.31,
+        0.988
       ],
       "median_bp": -0.0,
-      "p90_adverse_bp": 6.56,
-      "frac_adverse_pct": 36.3
+      "p90_adverse_bp": 9.988,
+      "frac_adverse_pct": 49.6
     },
     "medium_or_large_ge50M": {
-      "n": 143,
-      "mean_adverse_bp": 0.631,
+      "n": 174,
+      "mean_adverse_bp": -0.329,
       "ci95_bp": [
-        -0.511,
-        1.863
+        -1.016,
+        0.392
       ],
-      "median_bp": -0.0,
-      "p90_adverse_bp": 5.233,
-      "frac_adverse_pct": 32.9
+      "days": 5,
+      "day_mean_bp": -0.385,
+      "day_ci95_bp": [
+        -1.582,
+        0.963
+      ],
+      "median_bp": 0.0,
+      "p90_adverse_bp": 5.273,
+      "frac_adverse_pct": 41.4
     },
-    "note": "if mean_adverse_bp CIs overlap and are within ~taker cost, the 10x short floor lacks slippage support"
-  }
+    "diff_small_minus_ge50M": {
+      "days": 5,
+      "diff_mean_bp": 1.045,
+      "diff_day_ci95_bp": [
+        -0.037,
+        2.205
+      ]
+    },
+    "note": "This measures ONE-BAR DELAY COST (signal close -> next 5m open), not order-book slippage. It answers 'does waiting one bar cost more in thin-volume coins?', not the 50M floor's depth-risk rationale. The decision statistic is diff_small_minus_ge50M (day-block CI on common UTC days); d>=30 required before any conclusion."
+  },
+  "source": "hl"
 }

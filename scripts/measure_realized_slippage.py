@@ -385,6 +385,42 @@ def _boot_day_ci(pairs: list[dict[str, Any]], B: int = 4000,
     }
 
 
+def _boot_day_diff(a: list[dict[str, Any]], b: list[dict[str, Any]],
+                   B: int = 4000, seed: int = 7) -> dict[str, Any]:
+    """Day-block bootstrap of the BETWEEN-GROUP difference (a - b).
+
+    The decision statistic for the 50M floor is not either tier's level but
+    the small(5-50M) minus medium+large(>=50M) contrast. Resampling days (not
+    pairs) keeps the within-day clustering intact. Restricted to days present
+    in BOTH groups so the pairing is like-for-like. Positive = small coins are
+    more adverse (i.e. the floor is doing something).
+    """
+    import random
+    def daily(xs: list[dict[str, Any]]) -> dict[str, float]:
+        acc: dict[str, list[float]] = {}
+        for p in xs:
+            acc.setdefault(_day_key(p["ts"]), []).append(p["adverse_bp"])
+        return {k: st.mean(v) for k, v in acc.items()}
+    da, db = daily(a), daily(b)
+    common = sorted(set(da) & set(db))
+    diffs = [da[d] - db[d] for d in common]
+    if len(diffs) < 2:
+        return {"days": len(diffs), "diff_mean_bp": (round(st.mean(diffs), 3)
+                if diffs else None), "diff_day_ci95_bp": [float("nan"), float("nan")]}
+    rnd = random.Random(seed)
+    n = len(diffs)
+    means = []
+    for _ in range(B):
+        means.append(sum(diffs[rnd.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    return {
+        "days": n,
+        "diff_mean_bp": round(st.mean(diffs), 3),
+        "diff_day_ci95_bp": [round(means[int(.025 * B)], 3),
+                             round(means[int(.975 * B)], 3)],
+    }
+
+
 def report(pairs: list[dict[str, Any]]) -> dict[str, Any]:
     def block(xs: list[dict]) -> dict[str, Any]:
         adv = [p["adverse_bp"] for p in xs]
@@ -424,11 +460,13 @@ def report(pairs: list[dict[str, Any]]) -> dict[str, Any]:
     res["small_vs_large"] = {
         "small_5_50M": block(small),
         "medium_or_large_ge50M": block(big),
+        "diff_small_minus_ge50M": _boot_day_diff(small, big),
         "note": "This measures ONE-BAR DELAY COST (signal close -> next 5m "
                 "open), not order-book slippage. It answers 'does waiting one "
                 "bar cost more in thin-volume coins?', not the 50M floor's "
-                "depth-risk rationale. Compare via day_ci95_bp (independent "
-                "UTC days), not iid ci95_bp; d>=30 required for a decision.",
+                "depth-risk rationale. The decision statistic is "
+                "diff_small_minus_ge50M (day-block CI on common UTC days); "
+                "d>=30 required before any conclusion.",
     }
     return res
 

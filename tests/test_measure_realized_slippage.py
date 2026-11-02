@@ -183,3 +183,36 @@ def test_load_candidates_skips_corrupt_line_only(tmp_path):
 
     got = mrs.load_candidates(str(p))
     assert len(got) == 30
+
+
+def test_boot_day_diff_uses_common_days_and_sign():
+    """Decision statistic: small minus >=50M, day-blocked, common days only."""
+    def mk(side_bp, day):
+        return {"coin": "X", "side": "long", "tier": "small_5M_50M",
+                "ts": day * 86_400_000 + 3_600_000, "adverse_bp": side_bp}
+
+    small = [mk(2.0, 19000), mk(2.0, 19001), mk(2.0, 19002)]
+    big = [mk(0.0, 19000), mk(0.0, 19001)]          # day 19002 missing in big
+    out = mrs._boot_day_diff(small, big, B=200)
+    assert out["days"] == 2                         # common days only
+    assert out["diff_mean_bp"] == 2.0               # small is more adverse
+    lo, hi = out["diff_day_ci95_bp"]
+    assert lo == 2.0 and hi == 2.0                  # constant per-day diff
+
+
+def test_boot_day_diff_degenerate_single_day():
+    def mk(v, day):
+        return {"coin": "X", "side": "long", "tier": "small_5M_50M",
+                "ts": day * 86_400_000, "adverse_bp": v}
+    out = mrs._boot_day_diff([mk(1.0, 19000)], [mk(0.5, 19000)], B=100)
+    assert out["days"] == 1
+    assert out["diff_day_ci95_bp"][0] != out["diff_day_ci95_bp"][0]  # NaN
+
+
+def test_report_emits_diff_field():
+    pairs = [{"coin": "X", "side": "long", "tier": "small_5M_50M",
+              "ts": 19000 * 86_400_000, "adverse_bp": 1.0},
+             {"coin": "Y", "side": "long", "tier": "large_ge200M",
+              "ts": 19000 * 86_400_000, "adverse_bp": 0.0}]
+    rep = mrs.report(pairs)
+    assert "diff_small_minus_ge50M" in rep["small_vs_large"]
