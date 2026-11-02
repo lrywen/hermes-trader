@@ -5101,7 +5101,34 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
             "volume_24h_usd": _runner_gate_volume_24h(analysis.get("coin") or ""),
             "volume_tier": _runner_gate_volume_tier(
                 _runner_gate_volume_24h(analysis.get("coin") or "")),
+            # P1 AI observability: end-to-end decision latency, raw model
+            # confidence at research exit, number of LLM calls, debate state.
+            # Previously only per-call elapsed_ms existed in logs (p50 34.8s);
+            # the research entry -> verdict latency was never recorded.
+            "ai_decision_elapsed_ms": analysis.get("ai_decision_elapsed_ms"),
+            "ai_confidence_raw": analysis.get("ai_confidence_raw"),
+            "ai_debate_calls": analysis.get("ai_debate_calls"),
+            "ai_debate_state": analysis.get("ai_debate_state") or "",
+            "ai_debate_fallback_reason": analysis.get("ai_debate_fallback_reason") or "",
         }
+        # P2 shadow observation (zero exposure): for SHORT candidates, flag
+        # whether the 50M short liquidity floor (risk_gates.short_liquidity_floor)
+        # alone would block them. Purely observational — it never changes
+        # admission (allow_shorts stays false). Lets us answer offline "how
+        # many extra shorts, and at what forward return, would enter if the
+        # floor were relaxed" so the floor can be decided once at d>=30.
+        try:
+            _side_v = rec["side"]
+            _vol_v = rec.get("volume_24h_usd")
+            _floor_v = float(cfg_get("min_short_volume_usd") or 0)
+            rec["short_floor_usd"] = _floor_v if _side_v == "short" else None
+            rec["short_floor_would_block"] = (
+                bool(_side_v == "short" and _floor_v > 0 and _vol_v is not None
+                     and float(_vol_v) < _floor_v)
+                if _side_v == "short" else None)
+        except Exception:
+            rec["short_floor_usd"] = None
+            rec["short_floor_would_block"] = None
         from hermes_trader.shadow_log import append_jsonl
         append_jsonl(_RUNNER_GATE_SHADOW_FILE, rec, stream="runner_gate")
     except Exception as _rg_rec_e:  # never break the trade path

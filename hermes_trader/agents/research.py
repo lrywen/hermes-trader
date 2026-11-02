@@ -2727,6 +2727,10 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
             N duplicate HTTP POSTs per cycle. When None, fetches its own.
     """
     as_of_date = _compute_as_of_date()
+    # P1 observability: wall-clock start of the full AI decision. The runner
+    # gate shadow record reports ai_decision_elapsed_ms (research entry ->
+    # verdict), which was previously never recorded (only per-call elapsed_ms).
+    _decision_t0 = time.monotonic()
     # Parallel pre-LLM data gather (3 candle TFs + funding + news + signals),
     # extracted to _parallel_prefetch (P2-1).
     # Audit 2026-09-06 (C13): tag prefetch failures with the specific source so
@@ -2928,6 +2932,30 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         debate_state=debate_state,
         debate_fallback_reason=debate_fallback_reason,
     )
+
+    # P1 observability: pin the end-to-end AI decision telemetry onto analysis
+    # so the runner-gate shadow record can surface it. ai_confidence_raw is the
+    # model confidence at the research exit, before confidence_decay /
+    # force-override rewrite analysis["confidence"] downstream (executor.py).
+    analysis["ai_confidence_raw"] = float(analysis.get("confidence", 0) or 0)
+    analysis["ai_decision_elapsed_ms"] = int(max(0, time.monotonic() - _decision_t0) * 1000)
+    analysis["ai_debate_state"] = str(analysis.get("debate_state") or "")
+    analysis["ai_debate_fallback_reason"] = str(
+        analysis.get("fallback_reason") or analysis.get("debate_fallback") or "")
+    # Total LLM requests actually issued for this decision:
+    #   succeeded debate = bull+bear+synth = 3 (no single-LLM fallback)
+    #   bull/bear failed -> 2 debate calls + 1 single-LLM fallback = 3
+    #   synth failed/empty -> 3 debate calls + 1 single-LLM fallback = 4
+    #   debate disabled / parsed directly -> 1 single-LLM call
+    if analysis.get("debate_used") and analysis.get("debate_state") == "succeeded":
+        _ai_calls = 3
+    elif debate_fallback_reason == "bull_bear_failed":
+        _ai_calls = 3
+    elif str(analysis.get("debate_state") or "") == "fallback":
+        _ai_calls = 4
+    else:
+        _ai_calls = 1
+    analysis["ai_debate_calls"] = _ai_calls
 
     memory.record_analysis(analysis)
     return analysis

@@ -114,6 +114,89 @@ def test_hip3_flag(monkeypatch, tmp_path):
     assert rec["is_hip3"] is True
 
 
+def test_p1_ai_telemetry_passthrough(monkeypatch, tmp_path):
+    # P1: research-exit AI telemetry must land on the runner-gate record.
+    _isolate(monkeypatch)
+    out = tmp_path / "rg_ai.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    a = _analysis(
+        breakout_fired=True, volumeSpike=True,
+        composite_score=50.0, confidence=0.9,
+        ai_decision_elapsed_ms=101234,
+        ai_confidence_raw=0.87,
+        ai_debate_calls=3,
+        ai_debate_state="succeeded",
+        ai_debate_fallback_reason="",
+    )
+    executor._runner_entry_block_reason(a, _gate())
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["ai_decision_elapsed_ms"] == 101234
+    assert rec["ai_confidence_raw"] == 0.87
+    assert rec["ai_debate_calls"] == 3
+    assert rec["ai_debate_state"] == "succeeded"
+    assert rec["ai_debate_fallback_reason"] == ""
+
+
+def test_p1_ai_telemetry_absent_defaults_safe(monkeypatch, tmp_path):
+    # Older analysis objects without the new keys must not break the recorder;
+    # fields default to None / "" rather than raising.
+    _isolate(monkeypatch)
+    out = tmp_path / "rg_ai_old.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    a = _analysis(composite_score=20.0, confidence=0.2)
+    executor._runner_entry_block_reason(a, _gate())
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["ai_decision_elapsed_ms"] is None
+    assert rec["ai_confidence_raw"] is None
+    assert rec["ai_debate_calls"] is None
+    assert rec["ai_debate_state"] == ""
+    assert rec["ai_debate_fallback_reason"] == ""
+
+
+def _isolate_p2(monkeypatch, volume_usd):
+    _isolate(monkeypatch)
+    monkeypatch.setattr(executor, "cfg_get",
+                        lambda key, *a, **k: 50_000_000 if key == "min_short_volume_usd" else None)
+    monkeypatch.setattr(executor, "_runner_gate_volume_24h", lambda coin: volume_usd)
+    monkeypatch.setattr(executor, "_runner_gate_volume_tier", lambda v: "small")
+
+
+def test_p2_short_floor_would_block_flag(monkeypatch, tmp_path):
+    # Zero-exposure observation: a thin-volume SHORT is flagged as blocked by
+    # the 50M floor even though the flag never changes admission.
+    out = tmp_path / "rg_p2.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    _isolate_p2(monkeypatch, 10_000_000)
+    a = _analysis(side="short", composite_score=20.0, confidence=0.2)
+    executor._runner_entry_block_reason(a, _gate())
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["short_floor_usd"] == 50_000_000
+    assert rec["short_floor_would_block"] is True
+
+
+def test_p2_short_high_volume_not_flagged(monkeypatch, tmp_path):
+    out = tmp_path / "rg_p2b.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    _isolate_p2(monkeypatch, 300_000_000)
+    a = _analysis(side="short", composite_score=20.0, confidence=0.2)
+    executor._runner_entry_block_reason(a, _gate())
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["short_floor_usd"] == 50_000_000
+    assert rec["short_floor_would_block"] is False
+
+
+def test_p2_floor_fields_none_for_long(monkeypatch, tmp_path):
+    # The floor observation applies to shorts only; long records carry None.
+    out = tmp_path / "rg_p2c.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    _isolate_p2(monkeypatch, 10_000_000)
+    a = _analysis(side="long", composite_score=20.0, confidence=0.2)
+    executor._runner_entry_block_reason(a, _gate())
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["short_floor_usd"] is None
+    assert rec["short_floor_would_block"] is None
+
+
 def test_record_failure_never_breaks_gate(monkeypatch, tmp_path):
     _isolate(monkeypatch)
     # Point at an unwritable path; append_jsonl swallows the OSError, and the
