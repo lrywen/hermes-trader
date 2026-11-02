@@ -2000,6 +2000,21 @@ def _debate_per_call_timeout() -> float:
     return max(8.0, dcfg["max_latency_s"] * 0.7)
 
 
+def _debate_bull_bear_outer_timeout() -> float:
+    """Hard wall-clock cap (seconds) for the parallel bull/bear stage.
+
+    Aligned with ``debate_research.max_latency_s`` (55s default) instead of the
+    historical ``per_call + 4`` (0.7×max_latency + 4 = 42.5s). Production logs
+    showed successful analyst legs at 49.9s / 53.6s being cut by the 42.5s
+    deadline → bull_bear_failed → full single-LLM fallback + double token burn.
+    The inner httpx timeout is a per-block read timeout, so it does not bound
+    total latency — this stage deadline is the effective cap. A floor of 8s
+    guards against a degenerate max_latency config.
+    """
+    dcfg = _debate_cfg()
+    return max(8.0, dcfg["max_latency_s"])
+
+
 def _debate_synth_timeout() -> float:
     """Longer timeout for the synth/arbiter call.
 
@@ -2242,18 +2257,21 @@ def _debate_research(
     per_call = _debate_per_call_timeout()
     try:
         if dcfg["parallel"]:
+            outer_timeout = _debate_bull_bear_outer_timeout()
+            deadline = bb_start + outer_timeout
             logger.info(
-                f"[debate] bull/bear PARALLEL start | coin={coin} per_call_s={per_call:.1f}"
+                f"[debate] bull/bear PARALLEL start | coin={coin} "
+                f"per_call_s={per_call:.1f} outer_s={outer_timeout:.1f}"
             )
-            # P1-1: shared pool (no per-call pool churn). Each call has its own
-            # per-call httpx timeout; give the future a few seconds of slack
-            # beyond that so the inner timeout (not the future) is what
-            # enforces the cap and raises a clear error.
+            # P1-1: shared pool (no per-call pool churn). Both legs start
+            # together and share ONE wall-clock deadline: applying the cap
+            # sequentially (as the old per_call+4 did) would allow 2× the
+            # budget when the first leg stalls and the second finishes late.
             pool = _get_pool()
             f_bull = pool.submit(_bull_analysis, ctx_msg)
             f_bear = pool.submit(_bear_analysis, ctx_msg)
-            bull = f_bull.result(timeout=per_call + 4.0)
-            bear = f_bear.result(timeout=per_call + 4.0)
+            bull = f_bull.result(timeout=max(0.1, deadline - time.time()))
+            bear = f_bear.result(timeout=max(0.1, deadline - time.time()))
         else:
             logger.info(f"[debate] bull/bear SERIAL start | coin={coin}")
             bull = _bull_analysis(ctx_msg)

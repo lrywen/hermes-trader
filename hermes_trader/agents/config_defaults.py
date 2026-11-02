@@ -751,6 +751,9 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # out (no residual 12s burning of quota after a debate abort).
         # Audit 2026-09-23: raised from 25 to 55 so the debate legs (bull/bear
         # 0.7×=38.5s, synth 0.92×=50.6s) cover the observed slow-reasoning p85.
+        # P-latency 2026-11-02: the bull/bear parallel stage now runs under ONE
+        # wall-clock deadline equal to this value (was per_call+4=42.5s, which
+        # cut successful 49.9s/53.6s legs → fallback + double token burn).
         "max_latency_s": 55.0,
         # Audit 2026-09-04 P0-1: optional per-leg timeouts. When set they win
         # over the max_latency_s fractions; when unset the legs scale directly
@@ -774,9 +777,10 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # P-latency (2026-11-02): force reasoning_effort on the bull/bear
         # (analyst) legs only. Production logs showed 42% of analyst legs took
         # >38.5s (p75 51.8s / p90 64.5s on Ark deepseek), tripping the outer
-        # 42.5s debate deadline → bull_bear_failed → a full single-LLM fallback
-        # (end-to-end up to 95s, double token burn). "" disables; synth/arbiter
-        # is intentionally NOT covered (it runs once, after bull/bear).
+        # debate deadline (42.5s at the time, now max_latency_s=55s) →
+        # bull_bear_failed → a full single-LLM fallback (end-to-end up to 95s,
+        # double token burn). "" disables; synth/arbiter is intentionally NOT
+        # covered (it runs once, after bull/bear).
         "analyst_reasoning_effort": "low",
         # Shadow A/B (absorbed from TradingAgents). When enabled, run the
         # bull/bear/arbiter debate in the BACKGROUND for eligible candidates

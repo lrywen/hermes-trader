@@ -189,15 +189,16 @@ def test_debate_both_empty_returns_none(monkeypatch, _enable_debate, caplog):
 
 
 def test_debate_timeout_cancels_pending_futures(monkeypatch, _enable_debate, caplog):
-    """A slow bull/bear leg that exceeds the per-call cap must be cancelled
+    """A slow bull/bear leg that exceeds the stage deadline must be cancelled
     instead of lingering on and starving the shared pool."""
     import time as _time
     from concurrent.futures import ThreadPoolExecutor
 
     exe = ThreadPoolExecutor(max_workers=2)
     monkeypatch.setattr(R, "_get_pool", lambda: exe)
-    # The future cap is per_call + 4s; keep the leg sleeping past that.
-    monkeypatch.setattr(R, "_debate_per_call_timeout", lambda: 0.05)
+    # Both legs share one wall-clock deadline (max_latency_s); keep the leg
+    # sleeping past it.
+    monkeypatch.setattr(R, "_debate_bull_bear_outer_timeout", lambda: 0.05)
 
     def _slow(_ctx):
         _time.sleep(6.0)
@@ -212,6 +213,14 @@ def test_debate_timeout_cancels_pending_futures(monkeypatch, _enable_debate, cap
     assert result is None
     assert any("bull/bear FAILED" in m for m in caplog.messages)
     exe.shutdown(wait=False, cancel_futures=True)
+
+
+def test_bull_bear_outer_timeout_tracks_max_latency(monkeypatch, _enable_debate):
+    """The bull/bear stage deadline equals debate_research.max_latency_s (55s
+    in production) instead of the old per_call+4 (42.5s)."""
+    assert R._debate_bull_bear_outer_timeout() == pytest.approx(10.0)
+    monkeypatch.setattr(R, "_debate_cfg", lambda: {"max_latency_s": 55.0})
+    assert R._debate_bull_bear_outer_timeout() == pytest.approx(55.0)
 
 
 def test_debate_serial_mode(monkeypatch, _enable_debate):
