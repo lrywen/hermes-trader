@@ -112,14 +112,25 @@ def load_rows(pattern: str) -> list[dict[str, Any]]:
     rows: dict[tuple, dict[str, Any]] = {}
     for fp in sorted(glob.glob(pattern)):
         try:
-            for line in open(fp, errors="ignore"):
+            fh = open(fp, errors="ignore")
+        except Exception:
+            continue
+        with fh:
+            for line in fh:
                 line = line.strip()
                 if not line:
                     continue
-                r = json.loads(line)
+                # One corrupt line (rotation-race interleaving) must only cost
+                # itself: the previous per-file try aborted the whole file, so a
+                # single bad row at runner_gate_shadow.jsonl.1:84 on 2026-11-02
+                # silently discarded the 75 rows after it. load_rows then saw
+                # 2,386 vs 2,461 physical lines, the truncation guard refused to
+                # publish, and decision_shadow_outcomes.jsonl froze.
+                try:
+                    r = json.loads(line)
+                except Exception:
+                    continue
                 rows[(r.get("ts"), r.get("coin"), r.get("side"), r.get("rule"))] = r
-        except Exception:
-            continue
     return list(rows.values())
 
 

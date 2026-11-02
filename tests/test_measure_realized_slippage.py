@@ -165,3 +165,21 @@ def test_hl_series_missing_coin_returns_none(tmp_path):
     assert mrs._series_hl("NOPE", T0, T0 + BAR, use_network=False) is None
     mrs.hl_cache_load(str(tmp_path / "absent.json"))
     assert mrs._series_hl("NOPE", T0, T0 + BAR, use_network=False) is None
+
+
+def test_load_candidates_skips_corrupt_line_only(tmp_path):
+    """Same per-file try bug as reconcile.load_rows: one torn line must not
+    discard the remaining candidates of that file."""
+    import json as _json
+
+    cands = [{"ts": 1_700_000_000_000 + i * 300_000, "coin": "BTC",
+              "side": "long", "rule": "r%d" % i} for i in range(30)]
+    p = tmp_path / "runner_gate_shadow.jsonl"
+    with open(p, "w") as f:
+        for i, c in enumerate(cands):
+            if i == 7:
+                f.write('{"ts": 1, "coin": "BTC"\n')
+            f.write(_json.dumps(c) + "\n")
+
+    got = mrs.load_candidates(str(p))
+    assert len(got) == 30

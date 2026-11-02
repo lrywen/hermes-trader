@@ -76,6 +76,48 @@ def test_count_source_lines_counts_parseable_only(tmp_path):
     assert rds.count_source_lines(str(p)) == 10
 
 
+
+def test_corrupt_line_does_not_drop_following_rows(tmp_path):
+    """2026-11-02 incident: ONE corrupt line cost 75 rows.
+
+    load_rows used a per-file try, so a JSONDecodeError on line 84 of
+    runner_gate_shadow.jsonl.1 aborted the rest of that file. load_rows returned
+    2,386 against 2,461 physical lines, the 98% guard refused to publish, and
+    decision_shadow_outcomes.jsonl stayed frozen at 2,319 rows since 11-02
+    00:18. A corrupt line must cost exactly itself.
+    """
+    good_head = [_src_row(i) for i in range(5)]
+    good_tail = [_src_row(i) for i in range(5, 80)]
+    p = tmp_path / "runner_gate_shadow.jsonl"
+    with open(p, "w") as f:
+        for r in good_head:
+            f.write(json.dumps(r) + "\n")
+        f.write('{"ts": 1, "coin": "BTC", "side": "long", "rule": "x"\n')  # torn
+        for r in good_tail:
+            f.write(json.dumps(r) + "\n")
+
+    rows = rds.load_rows(str(p))
+    assert len(rows) == 80                      # 5 + 75, the torn row alone lost
+    assert len(rows) == rds.count_source_lines(str(p))
+
+
+def test_main_survives_corrupt_line_and_writes_all_good_rows(tmp_path, monkeypatch):
+    good = [_src_row(i) for i in range(60)]
+    p = tmp_path / "runner_gate_shadow.jsonl"
+    with open(p, "w") as f:
+        for i, r in enumerate(good):
+            if i == 10:
+                f.write("{torn\n")
+            f.write(json.dumps(r) + "\n")
+    out = tmp_path / "decision_shadow_outcomes.jsonl"
+    monkeypatch.setattr("sys.argv", [
+        "reconcile", "--pattern", str(p), "--out", str(out),
+        "--cache", str(tmp_path / "nocache.json"), "--no-network",
+    ])
+    assert rds.main() == 0
+    written = [l for l in out.read_text().splitlines() if l.strip()]
+    assert len(written) == 60
+
 def test_max_rows_bypasses_truncation_guard(tmp_path, monkeypatch):
     # --max-rows intentionally shrinks output; guard must not block it.
     rows = [_src_row(i) for i in range(100)]
