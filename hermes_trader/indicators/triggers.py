@@ -797,6 +797,30 @@ def higher_lows_1h(candles: list[Candle], required: int = 4) -> TriggerHit:
     }
 
 
+def lower_highs_1h(candles: list[Candle], required: int = 4) -> TriggerHit:
+    """At least `required` of the last 6 1h closes printed a lower high.
+
+    Bearish mirror of ``higher_lows_1h`` (ADR-0012 B5): distribution patterns
+    where each rally rolls over below the prior high. Pure structure signal,
+    independent of price direction over the window (works during consolidation
+    / a lower-highs drift). NOT wired into ``build_hits`` in this change — it
+    exists for shadow attribution / backtests until a separate reviewed change
+    adds it to the production hit list (with a weight key starting at 0).
+    """
+    if len(candles) < 7:
+        return {"name": "lowerHighs1h", "score": 0, "reason": "insufficient_history", "fired": False}
+    highs = [candle_val(c, "h") for c in candles[-7:]]
+    lower = sum(1 for i in range(1, len(highs)) if highs[i] < highs[i - 1])
+    fired = lower >= required
+    score = min(10, lower / 6 * 10)
+    return {
+        "name": "lowerHighs1h",
+        "score": score if fired else 0,
+        "reason": f"{lower}/6 lower highs" if fired else f"{lower}/6 (need {required})",
+        "fired": fired,
+    }
+
+
 def momentum_continuation_1h(
     candles: list[Candle],
     min_trend_pct: float = 8.0,
