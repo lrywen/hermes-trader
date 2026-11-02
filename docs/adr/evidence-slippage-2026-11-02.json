@@ -1,0 +1,109 @@
+{
+  "total_pairs": 1717,
+  "overall": {
+    "n": 1717,
+    "mean_adverse_bp": 0.365,
+    "ci95_bp": [
+      -0.112,
+      0.853
+    ],
+    "median_bp": 0.0,
+    "p90_adverse_bp": 9.932,
+    "frac_adverse_pct": 36.4
+  },
+  "by_tier": {
+    "micro_lt5M": {
+      "n": 1296,
+      "mean_adverse_bp": 0.313,
+      "ci95_bp": [
+        -0.307,
+        0.95
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 10.811,
+      "frac_adverse_pct": 36.8
+    },
+    "small_5M_50M": {
+      "n": 278,
+      "mean_adverse_bp": 0.47,
+      "ci95_bp": [
+        -0.151,
+        1.091
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 6.56,
+      "frac_adverse_pct": 36.3
+    },
+    "medium_50M_200M": {
+      "n": 74,
+      "mean_adverse_bp": 0.108,
+      "ci95_bp": [
+        -1.034,
+        1.142
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 4.677,
+      "frac_adverse_pct": 32.4
+    },
+    "large_ge200M": {
+      "n": 69,
+      "mean_adverse_bp": 1.192,
+      "ci95_bp": [
+        -0.905,
+        3.253
+      ],
+      "median_bp": 0.0,
+      "p90_adverse_bp": 19.194,
+      "frac_adverse_pct": 33.3
+    }
+  },
+  "by_side": {
+    "long": {
+      "n": 733,
+      "mean_adverse_bp": 0.088,
+      "ci95_bp": [
+        -0.59,
+        0.758
+      ],
+      "median_bp": 0.0,
+      "p90_adverse_bp": 10.764,
+      "frac_adverse_pct": 39.0
+    },
+    "short": {
+      "n": 984,
+      "mean_adverse_bp": 0.572,
+      "ci95_bp": [
+        -0.091,
+        1.26
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 8.576,
+      "frac_adverse_pct": 34.5
+    }
+  },
+  "small_vs_large": {
+    "small_5_50M": {
+      "n": 278,
+      "mean_adverse_bp": 0.47,
+      "ci95_bp": [
+        -0.151,
+        1.091
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 6.56,
+      "frac_adverse_pct": 36.3
+    },
+    "medium_or_large_ge50M": {
+      "n": 143,
+      "mean_adverse_bp": 0.631,
+      "ci95_bp": [
+        -0.511,
+        1.863
+      ],
+      "median_bp": -0.0,
+      "p90_adverse_bp": 5.233,
+      "frac_adverse_pct": 32.9
+    },
+    "note": "if mean_adverse_bp CIs overlap and are within ~taker cost, the 10x short floor lacks slippage support"
+  }
+}
