@@ -107,6 +107,8 @@ def test_breakout_flow_confirmed_fires_on_single_close():
                           flow_confirm_min=0.7)
     assert r["fired"] is True
     assert "flow-confirmed" in r["reason"]
+    # Structured flag (2026-11-03 observability) must agree with the launch.
+    assert r.get("flow_confirmed") is True
 
 
 def test_breakout_weak_flow_keeps_confirmation():
@@ -119,6 +121,8 @@ def test_breakout_weak_flow_keeps_confirmation():
                           flow_confirm_min=0.7)
     # Only one up-close; weak flow doesn't substitute, so not fired.
     assert r["fired"] is False
+    # The key is always present; weak flow is NOT a flow-confirmed launch.
+    assert r.get("flow_confirmed") is False
 
 
 def test_breakout_no_flow_default_unchanged():
@@ -127,6 +131,9 @@ def test_breakout_no_flow_default_unchanged():
     candles = _flat_candles(53, price=100.0, spread=0.2, vol=100.0)
     r = triggers.breakout(candles, lookback=48, min_rvol=1.5, confirm_bars=2)
     assert r["fired"] is False
+    # No tick read (flow_confirm=None): flag present + False, fail-open hold
+    # behaviour is byte-identical (fired False as before).
+    assert r.get("flow_confirmed") is False
 
 
 # ── time-aligned CVD divergence ─────────────────────────────────────────────

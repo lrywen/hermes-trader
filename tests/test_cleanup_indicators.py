@@ -299,10 +299,17 @@ def test_triggers_return_shape():
     # every trigger still has the four core keys. Assert the common core plus
     # the spike-specific extras rather than one shared exact shape.
     core = {"name", "score", "reason", "fired"}
-    for fn in (breakout, range_compression, trend_strength):
+    # range_compression/trend_strength keep the exact 4-key core.
+    for fn in (range_compression, trend_strength):
         h = fn(cs)
         assert set(h) == core
         assert isinstance(h["fired"], bool)
+    # breakout additionally carries a structured `flow_confirmed` bool
+    # (2026-11-03 entry observability) on every return path.
+    hb = breakout(cs)
+    assert core <= set(hb)
+    assert isinstance(hb["fired"], bool)
+    assert isinstance(hb["flow_confirmed"], bool)
     for fn in (pct_move_spike, volume_spike):
         h = fn(cs)
         assert core <= set(h)

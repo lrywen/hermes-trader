@@ -876,6 +876,38 @@ def _scan_single_market(
             "breakout_onset_ms": breakout_onset_ms,
             "mid": mid,
             "triggers": hits,
+            # ── Entry observability (2026-11-03, additive; never read by the
+            # admit/block path) ─────────────────────────────────────────────
+            # Full per-trigger structured projection. The executor's runner
+            # gate only maps 6 booleans + slowBurn to fired_names, which hides
+            # the highest-weight triggers (trendStrength/pctMoveSpike/...). This
+            # carries EVERY hit (11 base + mc?1 + cp?2 + dailyMover; 14 under
+            # the current config) with fired + continuous score so composite can
+            # be recomputed offline under any candidate weight table. Zero new
+            # computation — `hits` was built at L689 above.
+            "trigger_hits": [
+                {
+                    "name": h.get("name"),
+                    "fired": bool(h.get("fired")),
+                    "score": h.get("score"),
+                    "direction": h.get("direction"),
+                    "flow_confirmed": h.get("flow_confirmed"),
+                }
+                for h in hits
+            ],
+            # Σw that composite_score normalized against THIS scan (the local
+            # build_hits return incl. the dynamic momentumContinuation1h entry).
+            # Must be captured here — downstream executor/research have no
+            # `_score_weights` in scope. With per-hit score + this denominator
+            # the exact composite_score is reconstructible offline.
+            "composite_denominator": float(sum(_score_weights.values())),
+            # Signed directional aggression in [-1,1] that fed the breakout
+            # trigger (None = no tick/microstructure read). Computed at
+            # L560-595 but previously discarded after feeding build_hits.
+            "flow_confirm_raw": _flow_confirm,
+            # Distinguishes "neutral flow" (0.0 with data) from "no tick data"
+            # (None) — the breakout trigger fail-opens to N-bar hold on None.
+            "flow_data_available": _flow_confirm is not None,
             "composite_score": score,
             # Scoring-scale tag so cross-period analyses can split composite
             # values before/after a trigger-score mapping change (see

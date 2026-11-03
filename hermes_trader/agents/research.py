@@ -2618,6 +2618,13 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "created_at": int(time.time() * 1000),
         # Carry forward so risk gates can read own-coin signal strength.
         "composite_score": float(perception.get("composite_score", 0) or 0),
+        # Entry observability (2026-11-03): pass-through only, NOT recomputed.
+        # Full per-trigger hits + the Σw denominator composite normalized
+        # against + raw flow aggression. Additive; never read by a gate.
+        "trigger_hits": perception.get("trigger_hits"),
+        "composite_denominator": perception.get("composite_denominator"),
+        "flow_confirm_raw": perception.get("flow_confirm_raw"),
+        "flow_data_available": perception.get("flow_data_available"),
         # P2-6: all fired-trigger flags derive from the single extracted set.
         "momentum_burst_fired": "momentumBurst" in fired_names,
         # Direction of a fired momentumBurst ("up"/"down") — the trigger itself
@@ -2700,6 +2707,11 @@ def _thin_history_pass(coin: str, perception: dict[str, Any], c4h: list[Any], ne
         "news_context": news, "news_risk": "none",
         "created_at": int(time.time() * 1000),
         "composite_score": float(perception.get("composite_score", 0) or 0),
+        # Entry observability pass-through (2026-11-03); additive, never gated.
+        "trigger_hits": perception.get("trigger_hits"),
+        "composite_denominator": perception.get("composite_denominator"),
+        "flow_confirm_raw": perception.get("flow_confirm_raw"),
+        "flow_data_available": perception.get("flow_data_available"),
         # P1-16: thin-history PASS skips the LLM entirely, so flag
         # ai_down so downstream record/notify sees "no AI decision made"
         # rather than implying a live model produced a PASS.

@@ -191,7 +191,8 @@ def breakout(
     """
     confirm_bars = max(1, int(confirm_bars))
     if len(candles) < lookback + confirm_bars + 1:
-        return {"name": "breakout", "score": 0, "reason": "flat", "fired": False}
+        return {"name": "breakout", "score": 0, "reason": "flat", "fired": False,
+                "flow_confirmed": False}
 
     current = candles[-1]
     cur_close = candle_val(current, "c")
@@ -220,7 +221,8 @@ def breakout(
         bar_high = candle_val(candles[i], "h")
         bar_low = candle_val(candles[i], "l")
         if not (math.isfinite(bar_high) and math.isfinite(bar_low)):
-            return {"name": "breakout", "score": 0, "reason": "flat", "fired": False}
+            return {"name": "breakout", "score": 0, "reason": "flat", "fired": False,
+                    "flow_confirmed": False}
         if bar_high > prior_high:
             prior_high = bar_high
         if bar_low < prior_low:
@@ -286,6 +288,10 @@ def breakout(
                     f"{', ' + held_note if held_note else ''}{flow_note})"
                 ),
                 "fired": True,
+                # Structured flag for decision attribution (do NOT parse the
+                # human reason text). True only when aggressive one-sided flow
+                # substituted for the N-bar hold on this upside launch.
+                "flow_confirmed": bool(flow_confirmed_above),
             }
         # Close beyond the edge on weak volume — structural interest but no
         # institutional confirmation. Record the 0.5x score for near-miss /
@@ -300,6 +306,7 @@ def breakout(
                 f"(RVOL {rvol:.2f}x < {min_rvol}x) — unconfirmed"
             ),
             "fired": False,
+            "flow_confirmed": bool(flow_confirmed_above),
         }
 
     if held_below:
@@ -317,6 +324,7 @@ def breakout(
                     f"{', ' + held_note if held_note else ''}{flow_note})"
                 ),
                 "fired": True,
+                "flow_confirmed": bool(flow_confirmed_below),
             }
         return {
             "name": "breakout",
@@ -326,6 +334,7 @@ def breakout(
                 f"(RVOL {rvol:.2f}x < {min_rvol}x) — unconfirmed"
             ),
             "fired": False,
+            "flow_confirmed": bool(flow_confirmed_below),
         }
 
     # A single (or not-yet-confirmed) close beyond the edge, or inside range.
@@ -342,6 +351,7 @@ def breakout(
                 f"— unconfirmed fakeout risk"
             ),
             "fired": False,
+            "flow_confirmed": False,
         }
     if cur_close < prior_low:
         distance = prior_low - cur_close
@@ -353,6 +363,7 @@ def breakout(
                 f"— unconfirmed fakeout risk"
             ),
             "fired": False,
+            "flow_confirmed": False,
         }
 
     # Inside range: score proportional to distance from nearest edge.
@@ -367,6 +378,7 @@ def breakout(
         "score": score,
         "reason": "inside range",
         "fired": False,
+        "flow_confirmed": False,
     }
 
 

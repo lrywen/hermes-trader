@@ -5110,6 +5110,22 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
             "ai_debate_calls": analysis.get("ai_debate_calls"),
             "ai_debate_state": analysis.get("ai_debate_state") or "",
             "ai_debate_fallback_reason": analysis.get("ai_debate_fallback_reason") or "",
+            # ── Entry observability (2026-11-03), additive; read straight from
+            # the impl's feature vector, missing → None, never raises, never
+            # consumed by a gate. trigger_hits carries every per-trigger
+            # fired/score so composite is reconstructible offline; regime_gate
+            # (macro, what the risk gate sees) vs regime_decision (incl.
+            # coin-breakout override) are recorded side by side. ──
+            "trigger_hits": feats.get("trigger_hits"),
+            "composite_denominator": feats.get("composite_denominator"),
+            "flow_confirm_raw": feats.get("flow_confirm_raw"),
+            "flow_data_available": feats.get("flow_data_available"),
+            "flow_confirmed_breakout": feats.get("flow_confirmed_breakout"),
+            "regime_decision": feats.get("regime_decision"),
+            "regime_gate": feats.get("regime_gate"),
+            "regime_gate_score": feats.get("regime_gate_score"),
+            "mc_enabled": feats.get("mc_enabled"),
+            "cp_enabled": feats.get("cp_enabled"),
         }
         # P2 shadow observation (zero exposure): for SHORT candidates, flag
         # whether the 50M short liquidity floor (risk_gates.short_liquidity_floor)
@@ -5497,6 +5513,18 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
         _cand_floor = 40.0
     _cand_enabled = bool(_cgs.get("enabled", False))
     try:
+        # Entry observability (2026-11-03): resolve the SAME regime the
+        # market_regime risk gate uses (risk_gates.market_regime_gate calls
+        # this identical TTL-cached function). Recorded here because the gate
+        # verdict is logged at wrapper L5306 BEFORE eval_all_gates runs (~L3942),
+        # so gate_output is not available at the record point. Cached → zero
+        # extra candle fetch; never raises (degrades to neutral/0.0).
+        try:
+            from hermes_trader.agents.market_regime import detect_regime_with_score
+            _gr, _gs = detect_regime_with_score(coin)
+        except Exception:
+            _gr, _gs = None, None
+        _th = analysis.get("trigger_hits") or []
         _runner_gate_ctx.feats = {
             "score": round(float(score), 3),
             "min_score": float(min_score),
@@ -5520,6 +5548,28 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
             # reconciliation. Additive/observational only — never read by the
             # admit/block decision. Best-effort (None when unavailable).
             "mid": _safe_float(analysis.get("mid")),
+            # ── Entry observability (2026-11-03), additive; never read by the
+            # admit/block decision. All resolve from names in THIS function's
+            # scope (the whole dict is guarded: any NameError would silently
+            # null feats and drop every field below). ──
+            # runner/sizing/exit regime incl. the coin-breakout override
+            # (cached on analysis; resolve_decision_regime never raises).
+            "regime_decision": resolve_decision_regime(analysis, config),
+            # market_regime GATE's value (macro proxy, no coin override) — the
+            # exact value eval_all_gates' market_regime gate computes.
+            "regime_gate": _gr,
+            "regime_gate_score": _gs,
+            "trigger_hits": analysis.get("trigger_hits"),
+            "flow_confirm_raw": analysis.get("flow_confirm_raw"),
+            "flow_data_available": analysis.get("flow_data_available"),
+            "flow_confirmed_breakout": any(
+                bool(h.get("flow_confirmed")) for h in _th
+                if h.get("name") == "breakout"),
+            "composite_denominator": analysis.get("composite_denominator"),
+            "mc_enabled": bool(
+                (config.get("momentum_continuation") or {}).get("enabled")),
+            "cp_enabled": bool(
+                (config.get("candlestick_patterns") or {}).get("enabled")),
         }
     except Exception:
         _runner_gate_ctx.feats = None

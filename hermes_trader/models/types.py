@@ -18,6 +18,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, TypedDict
 
+from typing_extensions import NotRequired
+
 from pydantic import BaseModel
 
 
@@ -42,6 +44,11 @@ class TriggerHit(TypedDict):
     score: float
     reason: str
     fired: bool
+    # Optional structured attribution (observability only; never read by the
+    # composite/admit path). breakout sets flow_confirmed to mark a launch that
+    # fired on one-sided aggressive flow rather than the N-bar hold.
+    flow_confirmed: NotRequired[bool]
+    direction: NotRequired[str]
 
 
 @dataclass
