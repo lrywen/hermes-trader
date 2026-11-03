@@ -111,11 +111,15 @@ def test_llm_circuit_breaker_tightened():
     assert cb["cooldown_s"] == 300
 
 
-def test_debate_and_llm_timeouts_unified_at_55s():
-    # P0-7 originally unified debate max_latency and research_llm timeout at
-    # 25s. Audit 2026-09-23 raised both to 55s to cover the observed slow-
-    # reasoning p85; they must still agree with each other.
-    assert CANONICAL_DEFAULTS["debate_research"]["max_latency_s"] == 55.0
+def test_debate_and_llm_timeouts_decoupled():
+    # P0-7 originally unified debate max_latency and research_llm timeout.
+    # P-latency 2026-11-03 (plan b): deliberately decoupled — debate's
+    # bull/bear parallel stage needs p95 coverage (75s), while the single-LLM
+    # fallback path is capped by the external HTA service at 60s, so its
+    # research_llm.timeout_sec stays at 55s. Raising the single-LLM timeout
+    # past 60s would be a no-op (HTA cuts it) and let a failed debate + slow
+    # fallback consume 75+75s.
+    assert CANONICAL_DEFAULTS["debate_research"]["max_latency_s"] == 75.0
     assert CANONICAL_DEFAULTS["research_llm"]["timeout_sec"] == 55.0
 
 

@@ -204,14 +204,14 @@
     "cache_max_entries": 128,
     "cache_ttl_s": 300,
     "enabled": true,
-    "max_latency_s": 55,
+    "max_latency_s": 75,
     "parallel": true,
     "shadow_ab": {
       "enabled": true,
       "min_composite": 60,
       "sample_rate": 0.25
     },
-    "synth_timeout_s": null,
+    "synth_timeout_s": 50,
     "use_structured_output": false
   },
   "dsl_exit": {

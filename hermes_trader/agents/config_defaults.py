@@ -754,14 +754,25 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # P-latency 2026-11-02: the bull/bear parallel stage now runs under ONE
         # wall-clock deadline equal to this value (was per_call+4=42.5s, which
         # cut successful 49.9s/53.6s legs → fallback + double token burn).
-        "max_latency_s": 55.0,
+        # P-latency 2026-11-03 (plan b): raised 55→75 to cover analyst-leg p95
+        # (76.2s on n=383 low-effort legs). Historical bull/bear FAILED events:
+        # 279/284 fell in (42.5,55]s (saved by the 55s raise); 5/284 >55s. At
+        # 75s only ~5.5% of legs exceed it → marginal per-debate fallback
+        # drops from ~27.6% to ~10.7%. synth is decoupled (see synth_timeout_s)
+        # so raising this no longer inflates the synth budget.
+        "max_latency_s": 75.0,
         # Audit 2026-09-04 P0-1: optional per-leg timeouts. When set they win
         # over the max_latency_s fractions; when unset the legs scale directly
         # off max_latency_s (bull 0.7×, synth 0.92×) with no hard cap, so a
         # raised max_latency actually lengthens the debate legs. Added because
         # the former hard 18/24s clamps made max_latency_s>25.7s a no-op.
         "bull_timeout_s": None,
-        "synth_timeout_s": None,
+        # P-latency 2026-11-03 (plan b): decouple synth from max_latency_s.
+        # Synth p95 ≈ 51s (n=574); 50s keeps coverage at p95 (≈ same as the
+        # old 0.92×55=50.6s). Without this, max_latency_s=75 would inflate
+        # synth to 0.92×75=69s (synth never needs that long) and bloat the
+        # end-to-end worst case. None falls back to 0.92×max_latency_s.
+        "synth_timeout_s": 50.0,
         "cache_ttl_s": 300.0,
         # P2-2: max entries in the in-process verdict cache (composite key of
         # coin + score bucket + trigger hash); oldest-expiry evicted past cap.
@@ -777,7 +788,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # P-latency (2026-11-02): force reasoning_effort on the bull/bear
         # (analyst) legs only. Production logs showed 42% of analyst legs took
         # >38.5s (p75 51.8s / p90 64.5s on Ark deepseek), tripping the outer
-        # debate deadline (42.5s at the time, now max_latency_s=55s) →
+        # debate deadline (42.5s at the time, now max_latency_s=75s) →
         # bull_bear_failed → a full single-LLM fallback (end-to-end up to 95s,
         # double token burn). "" disables; synth/arbiter is intentionally NOT
         # covered (it runs once, after bull/bear).
