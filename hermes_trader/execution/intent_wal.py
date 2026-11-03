@@ -44,29 +44,34 @@ def wal_path() -> Path:
     return _WAL_PATH
 
 
-def _append(rec: dict) -> None:
-    path = _WAL_PATH
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _append(rec: dict, path: os.PathLike | str | None = None) -> None:
+    # path 显式传入时写到该路径（恢复/演练用）；否则写模块全局 WAL。
+    # 不在这里改全局 _WAL_PATH——恢复一个旁路 WAL 时绝不能把运行中实盘
+    # intent 的后续写入也重定向走（参数穿透，而非 set_wal_path 全局切换）。
+    target = Path(path) if path is not None else _WAL_PATH
+    target.parent.mkdir(parents=True, exist_ok=True)
     line = json.dumps(rec, ensure_ascii=False)
     with _LOCK:
-        with open(path, "a", encoding="utf-8") as f:
+        with open(target, "a", encoding="utf-8") as f:
             f.write(line + "\n")
             f.flush()
             os.fsync(f.fileno())
 
 
-def record_intent(intent: OrderIntent) -> None:
+def record_intent(intent: OrderIntent,
+                  path: os.PathLike | str | None = None) -> None:
     """下单前：写入 INTENT 记录（含完整上下文）。必须在 place_hl_order 之前。"""
     rec = intent.to_dict()
     rec["to"] = OrderState.INTENT.value
     rec["from"] = None
     rec["ts"] = intent.created_ms
-    _append(rec)
+    _append(rec, path)
 
 
-def record_transition(intent: OrderIntent, rec: dict) -> None:
+def record_transition(intent: OrderIntent, rec: dict,
+                      path: os.PathLike | str | None = None) -> None:
     """状态迁移后：追加迁移记录。rec 来自 OrderIntent.transition 返回值。"""
-    _append(rec)
+    _append(rec, path)
 
 
 def _replay(path: Path) -> dict[str, OrderIntent]:

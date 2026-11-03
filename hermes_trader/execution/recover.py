@@ -59,7 +59,7 @@ def recover_pending_orders(*, wal_path: Optional[str] = None,
             if intent.state == OrderState.INTENT:
                 rec = intent.transition(OrderState.FAILED,
                                         reason="crash_before_place")
-                intent_wal.record_transition(intent, rec)
+                intent_wal.record_transition(intent, rec, path=wal_path)
                 summary["failed"] += 1
                 continue
             rc = _reconcile(intent)
@@ -75,7 +75,7 @@ def recover_pending_orders(*, wal_path: Optional[str] = None,
                     OrderState.FILLED, reason="crash_recovered_fill",
                     order_id=rc.get("oid"), avg_px=rc.get("avg_px"),
                     total_sz=rc.get("total_sz"))
-                intent_wal.record_transition(intent, rec)
+                intent_wal.record_transition(intent, rec, path=wal_path)
                 summary["filled"] += 1
                 summary["cloids_filled"].append(intent.cloid)
                 logger.warning(
@@ -92,7 +92,7 @@ def recover_pending_orders(*, wal_path: Optional[str] = None,
             elif status == "not_filled":
                 rec = intent.transition(OrderState.FAILED,
                                         reason="crash_recovered_not_filled")
-                intent_wal.record_transition(intent, rec)
+                intent_wal.record_transition(intent, rec, path=wal_path)
                 summary["failed"] += 1
             else:
                 # 对账本身未决：保持 UNKNOWN，下轮恢复或人工。

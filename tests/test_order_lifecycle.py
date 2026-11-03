@@ -211,3 +211,32 @@ def test_recover_empty_wal(tmp_path):
     summary = recover_pending_orders(wal_path=str(tmp_path / "empty.jsonl"),
                                      notify_fn=lambda *a, **k: None)
     assert summary["scanned"] == 0
+
+
+def test_recover_with_explicit_wal_path_writes_back_to_same_path(tmp_path, monkeypatch):
+    """B6 (2026-11-03): recover_pending_orders(wal_path=X) must read AND write
+    X via parameter pass-through. Before the fix, record_transition ignored the
+    argument and appended to the module-global WAL, so a drill/recovery against
+    a sidecar file leaked ghost cloids into the production WAL. The global path
+    here is a decoy that must stay empty; the explicit path receives the
+    transition.
+    """
+    from hermes_trader.execution import intent_wal as iw
+    side = tmp_path / "side.jsonl"
+    global_decoy = tmp_path / "GLOBAL.jsonl"
+    iw.set_wal_path(global_decoy)  # simulate the production global default
+
+    it = _intent(cloid="side-1", coin="BTC")
+    # write the crashed intent directly to the SIDECAR (not the global)
+    iw.record_intent(it, path=str(side))
+    assert side.exists() and not global_decoy.exists()
+
+    summary = recover_pending_orders(wal_path=str(side),
+                                     notify_fn=lambda *a, **k: None)
+    assert summary["failed"] == 1  # INTENT-only -> crash_before_place
+
+    # transition landed in the sidecar …
+    side_rows = [json.loads(l) for l in side.read_text().splitlines()]
+    assert any(r.get("to") == OrderState.FAILED.value for r in side_rows)
+    # … and the global decoy was never touched (no ghost cloid leak).
+    assert not global_decoy.exists()
