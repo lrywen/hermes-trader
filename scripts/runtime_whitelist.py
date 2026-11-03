@@ -28,10 +28,6 @@ Call sites that justify each entry (verified 2026-09-18):
       cron_shadow_grade.sh -> shadow_grade.py (already listed)
   * Deploy smoke (scripts/deploy_prod.sh `docker exec ... postdeploy_smoke.py`):
       postdeploy_smoke.py
-  * One-shot in-container research runner (2026-10-23, U1):
-      m1_ofi_eval.py  (M-1 OFI evaluator; NOT in the trading runtime path —
-      shipped only because the host cannot read the /data docker volume, so
-      the 2026-10-28 sample-out evaluation runs via `docker exec`)
 
 tests/test_runtime_scripts_whitelist.py enforces that every entry exists, that
 no research/backtest script is listed, and that the Dockerfile COPYs exactly
@@ -81,7 +77,7 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_binance_stream.py",
     "arm_edge_eval.py",
     # Stage-4 one-shot counter-factual gate ablation over bn90d replay; runs
-    # via `docker exec` against /data (same class as m1_ofi_eval.py).
+    # via `docker exec` against /data (read-only research tool).
     "gate_ablation.py",
     # Stage-4 deep slow-burn veto multi-source promotion review (one-shot,
     # docker exec against /data; same class as gate_ablation.py).
@@ -89,16 +85,13 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "promotion_gate.py",
     "real_verdict_eval.py",
     "assemble_veto_evidence.py",
-    # M-1 OFI evaluator (research tool, not in the trading runtime path);
-    # runs one-shot via `docker exec` against the /data volume.
-    "m1_ofi_eval.py",
     # Deploy smoke path.
     "postdeploy_smoke.py",
     # Deploy step 3d: in-container post-deploy shadow health check.
     "postdeploy_shadow_checks.py",
     # P0/P1.5 (2026-10-31): baseline freeze + measurement/validation tooling.
     # freeze_baseline / gate_coverage / wfa_main_strategy run via `docker exec`
-    # against /data (same class as m1_ofi_eval.py). backfill_hist_candles is a
+    # against /data (read-only research tools). backfill_hist_candles is a
     # PRODUCTION data-maintenance job (refreshes /data/.historical-candles.json,
     # the cache every gate reconcile depends on) — NOT a research backtest; it
     # is registered in scheduler.SCHEDULED_JOBS as a weekly job.
@@ -109,6 +102,6 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     # P0-2 (2026-11-02): realized entry-slippage measurement from signal close
     # to next-bar open over runner-gate candidates. Read-only research tool run
     # via `docker exec` against /data (ch_hist_candles.json cache + book-raw);
-    # same class as m1_ofi_eval.py / gate_ablation.py.
+    # same read-only research class as gate_ablation.py.
     "measure_realized_slippage.py",
 )

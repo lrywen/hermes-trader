@@ -90,10 +90,6 @@ COPY scripts/arm_edge_eval.py scripts/arm_edge_eval.py
 COPY scripts/promotion_gate.py scripts/promotion_gate.py
 COPY scripts/real_verdict_eval.py scripts/real_verdict_eval.py
 COPY scripts/assemble_veto_evidence.py scripts/assemble_veto_evidence.py
-# U1 (2026-10-23): M-1 OFI evaluator. Research tool, NOT in the trading
-# runtime path; shipped only because the host cannot read the /data docker
-# volume, so the one-shot 2026-10-28 evaluation runs via `docker exec`.
-COPY scripts/m1_ofi_eval.py scripts/m1_ofi_eval.py
 COPY scripts/postdeploy_smoke.py scripts/postdeploy_smoke.py
 # Read-only post-deploy shadow health check (panic-gate fields + maker v2
 # zero-fill guard); invoked in-container by scripts/deploy_prod.sh step 3d.
@@ -106,10 +102,10 @@ COPY scripts/gate_coverage.py scripts/gate_coverage.py
 COPY scripts/wfa_main_strategy.py scripts/wfa_main_strategy.py
 COPY scripts/backfill_hist_candles.py scripts/backfill_hist_candles.py
 # P0-2 (2026-11-02): realized entry-slippage measurement (docker exec against
-# /data; same class as m1_ofi_eval.py).
+# /data; read-only research tool).
 COPY scripts/measure_realized_slippage.py scripts/measure_realized_slippage.py
 # Stage-4 one-shot research runners (whitelisted but their COPY lines were
-# missing); docker exec against /data, same class as m1_ofi_eval.py.
+# missing); docker exec against /data, read-only research tools.
 COPY scripts/gate_ablation.py scripts/gate_ablation.py
 COPY scripts/deep_slow_burn_review.py scripts/deep_slow_burn_review.py
 # Privilege-drop entrypoint (consumed by the `cp` in the RUN step below).
