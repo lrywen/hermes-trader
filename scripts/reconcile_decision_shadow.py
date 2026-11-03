@@ -220,6 +220,15 @@ def enrich(rows: list[dict[str, Any]], src: CandleSource, bench_coins: list[str]
             entry = cs[j]
         rec["entry_ts"] = ts[j]
         rec["entry_px"] = entry
+        # P0-3 (2026-11-03): gross must be direction-aware. A short profits when
+        # price FALLS, but the prior code always used long-direction gross
+        # (fwd/entry - 1), so the 1,594 source short rows (819 covered) had every
+        # return/excess sign inverted — an up-move (a short loss) was booked as a
+        # gain. sgn flips both leg and benchmark for shorts; excess then equals
+        # sgn*(leg - bench), the correct market-neutral short return. Cost is
+        # paid once per round trip regardless of side, so it is NOT doubled and
+        # stays outside the sign flip.
+        sgn = -1.0 if str(r.get("side")).lower() == "short" else 1.0
         rets: dict[str, Optional[float]] = {}
         bench_ret: dict[str, Optional[float]] = {}
         for hz, n in HORIZONS.items():
@@ -227,13 +236,13 @@ def enrich(rows: list[dict[str, Any]], src: CandleSource, bench_coins: list[str]
                 rets[hz] = None
                 bench_ret[hz] = None
                 continue
-            gross = cs[j + n] / entry - 1.0
+            gross = sgn * (cs[j + n] / entry - 1.0)
             rets[hz] = gross
             vals = []
             for bts, bcs in bench_series:
                 bj = bisect.bisect_right(bts, ts[j] - 1) - 1
                 if bj >= 0 and bj + n < len(bcs) and abs(bts[bj] - ts[j]) <= BAR_MS and bcs[bj] > 0:
-                    vals.append(bcs[bj + n] / bcs[bj] - 1.0)
+                    vals.append(sgn * (bcs[bj + n] / bcs[bj] - 1.0))
             bench_ret[hz] = (sum(vals) / len(vals)) if vals else None
         rec["gross_fwd"] = rets
         for label, cost in COSTS.items():

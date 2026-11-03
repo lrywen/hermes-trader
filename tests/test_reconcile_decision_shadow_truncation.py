@@ -118,6 +118,72 @@ def test_main_survives_corrupt_line_and_writes_all_good_rows(tmp_path, monkeypat
     written = [l for l in out.read_text().splitlines() if l.strip()]
     assert len(written) == 60
 
+class _FakeSrc:
+    """Minimal CandleSource: constant 5m-bar grid with a programmable price path."""
+
+    def __init__(self, path):
+        # path: coin -> list[float] of closes. Grid starts one bar before t0 so
+        # a row at t0 aligns to index 1 (bisect_right(ts, t0-1)-1 == 0 would
+        # otherwise reject it), leaving enough forward bars for every horizon.
+        self.path = path
+        self.t0 = 1_700_000_000_000
+
+    def series(self, coin):
+        if coin not in self.path:
+            return None
+        closes = self.path[coin]
+        # start TWO bars before t0: index0 is the benchmark lead bar, index1
+        # (t0-BAR) is the entry bar a t0 row aligns to.
+        ts = [self.t0 + (i - 2) * rds.BAR_MS for i in range(len(closes))]
+        return ts, closes
+
+
+def _row(side, ts_idx=0, coin="BTC", mid=None):
+    return {"ts": 1_700_000_000_000 + ts_idx * rds.BAR_MS, "coin": coin,
+            "side": side, "rule": "ok", "admitted": False,
+            "mid_price": mid}
+
+
+def _path(up, n=902):
+    # index0 benchmark lead, index1 entry close 100, index 1+12 forward = up.
+    return [100.0, 100.0, 100.0, up] + [up] * (n - 4)
+
+
+def test_p03_short_gross_sign_is_direction_aware():
+    # Price rises 10% over the horizon: a LONG gains, a SHORT loses.
+    src = _FakeSrc({"BTC": _path(110.0)})
+    rows = [_row("long"), _row("short")]
+    out = rds.enrich(rows, src, bench_coins=[])
+    long_g, short_g = out[0]["gross_fwd"]["1h"], out[1]["gross_fwd"]["1h"]
+    assert abs(long_g - 0.10) < 1e-9
+    assert abs(short_g - (-0.10)) < 1e-9          # flipped, not zero/positive
+    assert abs(long_g + short_g) < 1e-9            # long/short symmetric
+
+
+def test_p03_short_profits_when_price_falls():
+    src = _FakeSrc({"BTC": _path(90.0)})           # -10%
+    out = rds.enrich([_row("short")], src, bench_coins=[])
+    assert abs(out[0]["gross_fwd"]["1h"] - 0.10) < 1e-9
+
+
+def test_p03_cost_charged_once_not_doubled_for_short():
+    src = _FakeSrc({"BTC": _path(110.0)})
+    out = rds.enrich([_row("short")], src, bench_coins=[])
+    g = out[0]["gross_fwd"]["1h"]
+    net = out[0]["net_bp9.26"]["1h"]
+    # net = signed gross - one round-trip cost, never gross - 2*cost.
+    assert abs(net - (g - rds.COSTS["bp9.26"])) < 1e-12
+
+
+def test_p03_short_excess_flips_both_leg_and_benchmark():
+    # Both coin and benchmark rise 10% -> market-neutral gross excess is 0 for
+    # either side (sgn applied to both leg and bench, so they cancel); only the
+    # one round-trip cost remains.
+    src = _FakeSrc({"BTC": _path(110.0), "ETH": _path(110.0)})
+    out = rds.enrich([_row("short")], src, bench_coins=["ETH"])
+    assert abs(out[0]["excess_bp9.26"]["1h"] - (-rds.COSTS["bp9.26"])) < 1e-12
+
+
 def test_max_rows_bypasses_truncation_guard(tmp_path, monkeypatch):
     # --max-rows intentionally shrinks output; guard must not block it.
     rows = [_src_row(i) for i in range(100)]
