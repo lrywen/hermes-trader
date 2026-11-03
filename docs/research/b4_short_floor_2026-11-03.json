@@ -1,0 +1,91 @@
+{
+  "meta": {
+    "horizon": "1h",
+    "short_rows": 1597,
+    "floor_usd": 50000000.0,
+    "short_sign": "P0-3-corrected",
+    "interpretation": "lt_floor = candidates the $50M floor would block. If lt_floor mean << ge_floor (and the ge-minus-lt DIFF CI is >0), the floor protects."
+  },
+  "groups": {
+    "lt_floor": {
+      "n": 538,
+      "days": 5,
+      "mean_bp": -10.51,
+      "ci95_bp": [
+        -80.41,
+        15.45
+      ],
+      "win_pct": 44.8
+    },
+    "ge_floor": {
+      "n": 3,
+      "days": 2,
+      "mean_bp": -43.87,
+      "ci95_bp": [
+        -111.02,
+        90.43
+      ],
+      "win_pct": 33.3
+    },
+    "missing_vol": {
+      "n": 266,
+      "days": 6,
+      "mean_bp": -18.87,
+      "ci95_bp": [
+        -55.73,
+        0.14
+      ],
+      "win_pct": 42.1
+    }
+  },
+  "by_volume_tier": {
+    "mega": {
+      "n": 3,
+      "days": 2,
+      "mean_bp": -43.87,
+      "ci95_bp": [
+        -111.02,
+        90.43
+      ],
+      "win_pct": 33.3
+    },
+    "micro": {
+      "n": 498,
+      "days": 5,
+      "mean_bp": -7.68,
+      "ci95_bp": [
+        -79.6,
+        26.01
+      ],
+      "win_pct": 45.4
+    },
+    "mid": {
+      "n": 40,
+      "days": 3,
+      "mean_bp": -45.8,
+      "ci95_bp": [
+        -102.7,
+        -35.79
+      ],
+      "win_pct": 37.5
+    },
+    "unknown": {
+      "n": 266,
+      "days": 6,
+      "mean_bp": -18.87,
+      "ci95_bp": [
+        -55.73,
+        0.14
+      ],
+      "win_pct": 42.1
+    }
+  },
+  "diff_ge_minus_lt": {
+    "common_days": 2,
+    "ge_minus_lt_mean_bp": -22.97,
+    "ci95_bp": [
+      -175.11,
+      129.17
+    ]
+  }
+}

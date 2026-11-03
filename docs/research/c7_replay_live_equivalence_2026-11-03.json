@@ -1,0 +1,22 @@
+{
+  "meta": {
+    "replay_rows": 19918,
+    "live_rows": 2560,
+    "live_short_or_scanlong_blocked": 1597,
+    "live_long_structural": 963,
+    "matched_on_coin_bar": 1,
+    "note": "match set = live LONG verdicts on (coin,5m bar) present in the replay grid. Replay is conf-neutralized/long-only."
+  },
+  "agreement": {
+    "admit_agree": 1,
+    "expected_conf_neutralization_differ": 0,
+    "structural_disagree": 0,
+    "structural_agree_pct": 100.0,
+    "composite_abs_drift_mean": 0.059,
+    "composite_abs_drift_max": 0.059
+  },
+  "rule_pair_counts": {
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (late trend-only chase; no fresh breakout/burst)": 1
+  },
+  "structural_disagreements_sample": []
+}

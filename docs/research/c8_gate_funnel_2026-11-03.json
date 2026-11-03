@@ -1,0 +1,161 @@
+{
+  "meta": {
+    "horizon": "1h",
+    "live_rows": 2560,
+    "outcomes_joined": 1149,
+    "short_sign": "P0-3-corrected",
+    "interpretation": "negative forward mean for a BLOCKED gate = protective (it removed losers); positive = gate may be removing winners."
+  },
+  "funnel": [
+    {
+      "gate": "shorts_disabled(scan_long_only)",
+      "rows": 1273,
+      "pct_of_rows": 49.7,
+      "forward_net_bp19": {
+        "n": 626,
+        "days": 10,
+        "mean_bp": -33.16,
+        "ci95_bp": [
+          -58.5,
+          -14.01
+        ],
+        "win_pct": 38.8
+      }
+    },
+    {
+      "gate": "late_trend_only_chase",
+      "rows": 515,
+      "pct_of_rows": 20.1,
+      "forward_net_bp19": {
+        "n": 203,
+        "days": 9,
+        "mean_bp": -24.8,
+        "ci95_bp": [
+          -79.04,
+          150.18
+        ],
+        "win_pct": 44.8
+      }
+    },
+    {
+      "gate": "fresh_impulse_gate",
+      "rows": 279,
+      "pct_of_rows": 10.9,
+      "forward_net_bp19": {
+        "n": 72,
+        "days": 8,
+        "mean_bp": -49.2,
+        "ci95_bp": [
+          -64.66,
+          101.48
+        ],
+        "win_pct": 29.2
+      }
+    },
+    {
+      "gate": "ai_confidence_floor",
+      "rows": 232,
+      "pct_of_rows": 9.1,
+      "forward_net_bp19": {
+        "n": 105,
+        "days": 10,
+        "mean_bp": 5.27,
+        "ci95_bp": [
+          -76.58,
+          61.72
+        ],
+        "win_pct": 45.7
+      }
+    },
+    {
+      "gate": "overextended_short",
+      "rows": 126,
+      "pct_of_rows": 4.9,
+      "forward_net_bp19": {
+        "n": 80,
+        "days": 3,
+        "mean_bp": 97.89,
+        "ci95_bp": [
+          -35.24,
+          131.82
+        ],
+        "win_pct": 73.8
+      }
+    },
+    {
+      "gate": "ADMITTED",
+      "rows": 69,
+      "pct_of_rows": 2.7,
+      "forward_net_bp19": {
+        "n": 28,
+        "days": 9,
+        "mean_bp": -122.42,
+        "ci95_bp": [
+          -225.83,
+          105.66
+        ],
+        "win_pct": 25.0
+      }
+    },
+    {
+      "gate": "rsi_oversold_short",
+      "rows": 48,
+      "pct_of_rows": 1.9,
+      "forward_net_bp19": {
+        "n": 31,
+        "days": 4,
+        "mean_bp": 47.86,
+        "ci95_bp": [
+          -73.2,
+          65.11
+        ],
+        "win_pct": 64.5
+      }
+    },
+    {
+      "gate": "pullback_long_shadow_record",
+      "rows": 10,
+      "pct_of_rows": 0.4,
+      "forward_net_bp19": {
+        "n": 1,
+        "days": 1,
+        "mean_bp": null,
+        "ci95_bp": [
+          null,
+          null
+        ],
+        "win_pct": null
+      }
+    },
+    {
+      "gate": "weak_trend_adx_shadow",
+      "rows": 7,
+      "pct_of_rows": 0.3,
+      "forward_net_bp19": {
+        "n": 3,
+        "days": 2,
+        "mean_bp": -662.85,
+        "ci95_bp": [
+          -1424.67,
+          -281.95
+        ],
+        "win_pct": 0.0
+      }
+    },
+    {
+      "gate": "other:extension 3.1x ATR above EMA21 — over-ex",
+      "rows": 1,
+      "pct_of_rows": 0.0,
+      "forward_net_bp19": {
+        "n": 0,
+        "days": 0,
+        "mean_bp": null,
+        "ci95_bp": [
+          null,
+          null
+        ],
+        "win_pct": null
+      }
+    }
+  ]
+}

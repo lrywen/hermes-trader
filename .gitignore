@@ -129,3 +129,6 @@ backtest-trades.csv
 
 # Local archive of removed diagnostic/backtest scripts (not part of the app)
 archive/
+
+# Editor workspace settings (local only)
+.vscode/
