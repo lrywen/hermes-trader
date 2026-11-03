@@ -1,0 +1,125 @@
+{
+  "meta": {
+    "grain": "1h finest reliable (5m unrecoverable for Sept entries; local 5m covers 24/158)",
+    "coverage": {
+      "opens": 158,
+      "entry_1h": 142,
+      "h1_h4": 128,
+      "h4_exit": 128,
+      "matched_close": 142
+    },
+    "direction": "sgn=-1 for short; each leg is PnL in position direction",
+    "interpretation": "negative entry_1h mean => edge lost at entry (timing); positive entry_1h but negative h1_h4/h4_exit => hold/exit problem."
+  },
+  "segments_bp": {
+    "entry_1h": {
+      "n": 142,
+      "days": 30,
+      "mean_bp": 25.15,
+      "median_bp": 12.62,
+      "ci95_bp": [
+        -36.29,
+        37.71
+      ]
+    },
+    "h1_h4": {
+      "n": 128,
+      "days": 29,
+      "mean_bp": 15.03,
+      "median_bp": 0.0,
+      "ci95_bp": [
+        -33.23,
+        76.28
+      ]
+    },
+    "h4_exit": {
+      "n": 128,
+      "days": 29,
+      "mean_bp": -25.99,
+      "median_bp": -24.26,
+      "ci95_bp": [
+        -67.76,
+        31.01
+      ]
+    },
+    "entry_exit_actual": {
+      "n": 142,
+      "days": 30,
+      "mean_bp": 9.62,
+      "median_bp": -43.34,
+      "ci95_bp": [
+        -33.83,
+        38.04
+      ]
+    }
+  },
+  "top_coins_entry_exit_gross_bp": [
+    {
+      "coin": "AERO",
+      "mean_bp": 281.9,
+      "n": 3
+    },
+    {
+      "coin": "kPEPE",
+      "mean_bp": 266.7,
+      "n": 4
+    },
+    {
+      "coin": "PONS",
+      "mean_bp": 199.1,
+      "n": 1
+    },
+    {
+      "coin": "BTC",
+      "mean_bp": 185.3,
+      "n": 1
+    },
+    {
+      "coin": "HYPE",
+      "mean_bp": 171.9,
+      "n": 1
+    },
+    {
+      "coin": "ETHFI",
+      "mean_bp": 166.9,
+      "n": 2
+    },
+    {
+      "coin": "ASTER",
+      "mean_bp": 144.7,
+      "n": 1
+    },
+    {
+      "coin": "LINK",
+      "mean_bp": 136.4,
+      "n": 1
+    }
+  ],
+  "bottom_coins_entry_exit_gross_bp": [
+    {
+      "coin": "ETH",
+      "mean_bp": -109.9,
+      "n": 1
+    },
+    {
+      "coin": "BCH",
+      "mean_bp": -119.6,
+      "n": 1
+    },
+    {
+      "coin": "ARB",
+      "mean_bp": -159.5,
+      "n": 1
+    },
+    {
+      "coin": "USELESS",
+      "mean_bp": -189.6,
+      "n": 1
+    },
+    {
+      "coin": "STRK",
+      "mean_bp": -257.5,
+      "n": 1
+    }
+  ]
+}

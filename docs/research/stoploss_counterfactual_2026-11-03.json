@@ -1,0 +1,139 @@
+{
+  "meta": {
+    "groups_kept_separate": true,
+    "max_loss_only": "true hard stops; floor_breach is a profit-taking trailing floor, not a loss stop",
+    "realized_source": "close gross_pnl_usd/notional_usd",
+    "inference": "day-block bootstrap CI of the PAIRED delta (hold24h - realized), BTC-adjusted excess; marginal medians are descriptive only",
+    "benchmark": "same-window BTC 1h return, direction-aware",
+    "btc_benchmark_missing_trades": 0
+  },
+  "max_loss": {
+    "realized_bp": {
+      "n": 61,
+      "days": 18,
+      "mean_bp": -193.0,
+      "median_bp": -152.62,
+      "ci95_bp": [
+        -201.39,
+        -124.5
+      ]
+    },
+    "hold_24h_vs_entry_bp": {
+      "n": 55,
+      "days": 17,
+      "mean_bp": -254.82,
+      "median_bp": -301.08,
+      "ci95_bp": [
+        -532.29,
+        63.79
+      ]
+    },
+    "excess_24h_minus_btc_bp": {
+      "n": 55,
+      "days": 17,
+      "mean_bp": -277.22,
+      "median_bp": -310.15,
+      "ci95_bp": [
+        -519.94,
+        -40.39
+      ]
+    },
+    "paired_delta_hold24h_minus_realized_bp": {
+      "n": 55,
+      "days": 17,
+      "mean_bp": -86.38,
+      "median_bp": -150.4,
+      "ci95_bp": [
+        -386.93,
+        213.88
+      ]
+    },
+    "win_realized_pct": 0.0
+  },
+  "floor_breach_trailing_exit": {
+    "realized_bp": {
+      "n": 49,
+      "days": 15,
+      "mean_bp": 252.65,
+      "median_bp": 173.55,
+      "ci95_bp": [
+        167.4,
+        303.07
+      ]
+    },
+    "hold_24h_vs_entry_bp": {
+      "n": 45,
+      "days": 15,
+      "mean_bp": 128.84,
+      "median_bp": 31.56,
+      "ci95_bp": [
+        -108.73,
+        477.65
+      ]
+    },
+    "excess_24h_minus_btc_bp": {
+      "n": 45,
+      "days": 15,
+      "mean_bp": 142.52,
+      "median_bp": 30.78,
+      "ci95_bp": [
+        -82.4,
+        407.63
+      ]
+    },
+    "paired_delta_hold24h_minus_realized_bp": {
+      "n": 45,
+      "days": 15,
+      "mean_bp": -90.28,
+      "median_bp": -153.8,
+      "ci95_bp": [
+        -294.89,
+        210.1
+      ]
+    },
+    "win_realized_pct": 98.0
+  },
+  "timeout_comparison": {
+    "realized_bp": {
+      "n": 48,
+      "days": 22,
+      "mean_bp": 19.3,
+      "median_bp": 16.43,
+      "ci95_bp": [
+        -33.24,
+        38.73
+      ]
+    },
+    "hold_24h_vs_entry_bp": {
+      "n": 42,
+      "days": 22,
+      "mean_bp": -269.17,
+      "median_bp": -286.01,
+      "ci95_bp": [
+        -418.5,
+        -77.51
+      ]
+    },
+    "excess_24h_minus_btc_bp": {
+      "n": 42,
+      "days": 22,
+      "mean_bp": -183.93,
+      "median_bp": -190.99,
+      "ci95_bp": [
+        -354.67,
+        -4.29
+      ]
+    },
+    "paired_delta_hold24h_minus_realized_bp": {
+      "n": 42,
+      "days": 22,
+      "mean_bp": -287.49,
+      "median_bp": -317.26,
+      "ci95_bp": [
+        -431.64,
+        -77.42
+      ]
+    },
+    "win_realized_pct": 52.1
+  }
+}
