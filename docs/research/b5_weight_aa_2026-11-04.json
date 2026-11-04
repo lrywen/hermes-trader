@@ -1,0 +1,29 @@
+{
+  "report": "B5 weight_shadow A/A validation (offline deterministic)",
+  "generated_utc": "2026-11-04",
+  "mode": "SHADOW zero exposure; pure-logic verification, no live wait, no config write",
+  "background": "weight_shadow arm emits a row ONLY when live vs candidate composite-gate decisions diverge. Production PROMOTED candidate weights on 2026-10-22, so live trigger_weights == weight_shadow.candidate_weights key-for-key; the sole remaining variable is the momentumBurst definition (2bar/4% -> 3bar/3%).",
+  "method": "Drive the REAL perception._record_weight_shadow with a monkeypatched read_agent_config (candidate==live for A/A; candidate momentumBurst=3bar/3% for A/B) over an engineered candle series that makes momentumBurst(2,4%) fire but momentumBurst(3,3%) not fire. append_jsonl is captured, never written to disk.",
+  "results": {
+    "AA_candidate_equals_live": {
+      "config": "candidate_weights==live AND candidate_momentum_lookback=2, pct=4.0",
+      "rows_written": 0,
+      "verdict": "PASS — zero divergence rows when candidate==live"
+    },
+    "AB_divergence_path": {
+      "engineered": "last-2-bar +4.5% (live momentumBurst fires), last-3-bar -0.7% (candidate does not)",
+      "live_momentumBurst": "fired +4.5% over 2 bars up",
+      "cand_momentumBurst": "not fired (flat)",
+      "live_score": 12.22,
+      "cand_score": 5.97,
+      "gate_placed_between": 9.09,
+      "rows_written": 1,
+      "row_would": "would_block",
+      "verdict": "PASS — arm writes exactly one would_block row when candidate drops a live-passing coin"
+    },
+    "invariant_confirmed": "arm writes ONLY on genuine live/candidate decision divergence; identical-config gate (both pass) writes nothing"
+  },
+  "conclusion": "weight_shadow arm logic is correct and behavior-neutral under the current production config (live==candidate weights; only momentumBurst definition differs, which flipped decisions just twice in 28h). The originally-proposed live A/A (temporarily set candidate==live and wait a week for 0 rows) is REPLACED by this deterministic offline proof — zero wait, zero config change, zero exposure.",
+  "live_weight_shadow_rows_observed": 2,
+  "live_weight_shadow_note": "2 historical rows (2026-11-03 KAS would_surface live 51.88 vs cand 54.3 gate 54) confirm the arm fires only on real divergence"
+}

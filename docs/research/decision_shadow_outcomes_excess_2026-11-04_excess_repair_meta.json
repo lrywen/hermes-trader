@@ -1,0 +1,85 @@
+{
+  "meta": {
+    "generated_utc": "2026-11-04T05:25:18Z",
+    "input": "/data/decision_shadow_outcomes.jsonl",
+    "rows": 2886,
+    "bench_basket_req": [
+      "BTC",
+      "ETH",
+      "SOL",
+      "BNB",
+      "XRP",
+      "DOGE",
+      "ADA",
+      "AVAX",
+      "LINK",
+      "LTC",
+      "TRX",
+      "DOT",
+      "MATIC",
+      "NEAR",
+      "ATOM",
+      "UNI",
+      "ETC",
+      "FIL",
+      "APT",
+      "ARB",
+      "OP"
+    ],
+    "bench_basket_resolved": [
+      "ADA",
+      "APT",
+      "ARB",
+      "ATOM",
+      "AVAX",
+      "BNB",
+      "BTC",
+      "DOGE",
+      "DOT",
+      "ETC",
+      "ETH",
+      "FIL",
+      "LINK",
+      "LTC",
+      "NEAR",
+      "OP",
+      "SOL",
+      "TRX",
+      "UNI",
+      "XRP"
+    ],
+    "bench_n": 20,
+    "method": "keep HL gross/net; fill equal-weight Binance benchmark on the same closed entry bar; no leg reprice; unclosed 24h/72h windows left None"
+  },
+  "repaired_per_horizon": {
+    "1h": 1287,
+    "4h": 1269,
+    "24h": 1152,
+    "72h": 1008
+  },
+  "already_had_excess": {
+    "1h": 6,
+    "4h": 0,
+    "24h": 0,
+    "72h": 0
+  },
+  "excess_coverage_after": {
+    "1h": {
+      "bp19": 1293,
+      "bp9.26": 1293
+    },
+    "4h": {
+      "bp19": 1269,
+      "bp9.26": 1269
+    },
+    "24h": {
+      "bp19": 1152,
+      "bp9.26": 1152
+    },
+    "72h": {
+      "bp19": 1008,
+      "bp9.26": 1008
+    }
+  },
+  "gross_rows": 1309
+}

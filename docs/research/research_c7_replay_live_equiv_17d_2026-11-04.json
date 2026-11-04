@@ -1,0 +1,82 @@
+{
+  "meta": {
+    "replay_rows": 17616,
+    "live_rows": 2886,
+    "live_short_or_scanlong_blocked": 1857,
+    "live_long_structural": 1029,
+    "matched_on_coin_bar": 59,
+    "note": "match set = live LONG verdicts on (coin,5m bar) present in the replay grid. Replay is conf-neutralized/long-only."
+  },
+  "agreement": {
+    "admit_agree": 55,
+    "expected_conf_neutralization_differ": 0,
+    "structural_disagree": 4,
+    "structural_agree_pct": 93.22,
+    "composite_abs_drift_mean": 5.238,
+    "composite_abs_drift_max": 36.483
+  },
+  "rule_pair_counts": {
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (late trend-only chase; no fresh breakout/burst)": 36,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=0, slow=1)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=0, slow=1)": 3,
+    "  ==>  runner_gate_blocked (late trend-only chase; no fresh breakout/burst)": 2,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=0, slow=1)": 1,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=6, slow=1)": 1,
+    "runner_gate_blocked (confidence 0.55 < 0.60)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=5, slow=0)": 1,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=17, slow=1)": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=23, slow=1)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=17, slow=0)": 1,
+    "runner_gate_blocked (confidence 0.55 < 0.60)  ==>  runner_gate_blocked (late trend-only chase; no fresh breakout/burst)": 1,
+    "runner_gate_blocked (confidence 0.50 < 0.60)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=15, slow=0)": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=18, slow=0)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=17, slow=0)": 1,
+    "runner_gate_blocked (weak-trend chase: 4h ADX 22 < 25, no trend strength)  ==>  ": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=17, slow=0)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=22, slow=1)": 1,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=16, slow=1)": 1,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=23, slow=0)": 1,
+    "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)  ==>  runner_gate_blocked (M2 mover_bypass_veto ENFORCE; mover-only bypass removed; score=32, slow=1)": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=16, slow=0)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=10, slow=0)": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=14, slow=0)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=13, slow=0)": 1,
+    "runner_gate_blocked (needs fresh breakout/burst and structure; score=11, slow=1)  ==>  runner_gate_blocked (needs fresh breakout/burst and structure; score=12, slow=1)": 1,
+    "runner_gate_blocked (confidence 0.55 < 0.60)  ==>  ": 1
+  },
+  "structural_disagreements_sample": [
+    {
+      "coin": "INIT",
+      "ts": 1793186790179,
+      "live_admitted": false,
+      "replay_admitted": true,
+      "live_rule": "runner_gate_blocked (weak-trend chase: 4h ADX 22 < 25, no trend strength)",
+      "replay_rule": "",
+      "live_comp": 50.261,
+      "replay_comp": 38.657
+    },
+    {
+      "coin": "INIT",
+      "ts": 1793230184210,
+      "live_admitted": true,
+      "replay_admitted": false,
+      "live_rule": "",
+      "replay_rule": "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)",
+      "live_comp": 25.576,
+      "replay_comp": 26.638
+    },
+    {
+      "coin": "ETHFI",
+      "ts": 1793230189943,
+      "live_admitted": true,
+      "replay_admitted": false,
+      "live_rule": "",
+      "replay_rule": "runner_gate_blocked (late trend-only chase; no fresh breakout/burst)",
+      "live_comp": 22.71,
+      "replay_comp": 17.03
+    },
+    {
+      "coin": "REZ",
+      "ts": 1793471111355,
+      "live_admitted": false,
+      "replay_admitted": true,
+      "live_rule": "runner_gate_blocked (confidence 0.55 < 0.60)",
+      "replay_rule": "",
+      "live_comp": 55.335,
+      "replay_comp": 18.852
+    }
+  ]
+}

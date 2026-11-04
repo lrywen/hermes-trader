@@ -1,0 +1,150 @@
+{
+  "report": "U4 short x PIT-BTC-regime (counterfactual) + C8 flow null audit + C9 $50M short floor, historical-only",
+  "generated_utc": "2026-11-04T04:54:57Z",
+  "mode": "SHADOW zero exposure; read-only; no config/gate/admit change",
+  "horizon": "1h",
+  "meta": {
+    "short_rows_total": 1857,
+    "short_rows_with_entry_ts": 949,
+    "pit_regime_resolved": 949,
+    "regime_proxy": "BTC 1h, classify_candles + regime_strength_score, last-100 closed bars as-of entry_ts",
+    "regime_source": "offline Binance closed 1h klines (production uses Hyperliquid BTC; equivalent trend, venue delta noted)",
+    "counterfactual_notice": "shorts are blocked BEFORE the regime gate runs, so regime here is a PIT recompute, not an as-produced gate interaction"
+  },
+  "U4_short_by_pit_btc_regime": {
+    "up": {
+      "candidate_rows": 136,
+      "score_mean": 0.411,
+      "net_bp19": {
+        "n": 135,
+        "days": 6,
+        "mean_bp": 31.06,
+        "ci95_bp": [
+          1.31,
+          119.31
+        ]
+      }
+    },
+    "down": {
+      "candidate_rows": 445,
+      "score_mean": 0.663,
+      "net_bp19": {
+        "n": 439,
+        "days": 9,
+        "mean_bp": -72.21,
+        "ci95_bp": [
+          -75.52,
+          13.4
+        ]
+      }
+    },
+    "neutral": {
+      "candidate_rows": 127,
+      "score_mean": 0.383,
+      "net_bp19": {
+        "n": 127,
+        "days": 5,
+        "mean_bp": -2.02,
+        "ci95_bp": [
+          -13.22,
+          31.78
+        ]
+      }
+    },
+    "chop": {
+      "candidate_rows": 241,
+      "score_mean": 0.245,
+      "net_bp19": {
+        "n": 241,
+        "days": 7,
+        "mean_bp": 13.62,
+        "ci95_bp": [
+          -25.65,
+          36.34
+        ]
+      }
+    }
+  },
+  "C8_flow_null_audit": {
+    "historical_outcome_short_rows": {
+      "flow_data_available": {
+        "non_null": 0,
+        "null": 1857
+      },
+      "flow_confirm_raw": {
+        "non_null": 0,
+        "null": 1857
+      },
+      "flow_confirmed_breakout": {
+        "non_null": 0,
+        "null": 1857
+      }
+    },
+    "interpretation": "flow is WS taker-trade memory, not reconstructible from candles; nulls are honest gaps, never imputed",
+    "post_U1_live_shadow_short_rows_flow_data_available": {
+      "null": 26,
+      "false": 11,
+      "true": 36
+    }
+  },
+  "C9_short_floor_50m": {
+    "floor_usd": 50000000.0,
+    "floor_passed_ge": {
+      "n": 9,
+      "days": 2,
+      "mean_bp": -132.34,
+      "ci95_bp": [
+        -195.7,
+        -100.66
+      ]
+    },
+    "floor_blocked_lt": {
+      "n": 667,
+      "days": 6,
+      "mean_bp": -27.29,
+      "ci95_bp": [
+        -47.14,
+        34.83
+      ]
+    },
+    "missing_volume_rows": 266,
+    "by_volume_tier": {
+      "mega": {
+        "n": 7,
+        "days": 2,
+        "mean_bp": -104.63,
+        "ci95_bp": [
+          -128.43,
+          -100.66
+        ]
+      },
+      "micro": {
+        "n": 625,
+        "days": 6,
+        "mean_bp": -29.66,
+        "ci95_bp": [
+          -55.21,
+          34.07
+        ]
+      },
+      "mid": {
+        "n": 44,
+        "days": 4,
+        "mean_bp": -2.76,
+        "ci95_bp": [
+          -21.94,
+          47.97
+        ]
+      }
+    },
+    "diff_ge_minus_lt": {
+      "common_days": 2,
+      "ge_minus_lt_mean_bp": -97.51,
+      "ci95_bp": [
+        -196.44,
+        1.43
+      ]
+    },
+    "interpretation": "positive ge-minus-lt with CI>0 supports the floor"
+  }
+}

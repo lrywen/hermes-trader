@@ -1,0 +1,354 @@
+{
+  "report": "slowBurn B-binary MARKET-NEUTRAL (excess) recompute",
+  "generated_utc": "2026-11-04T05:28:12Z",
+  "source": "/data/decision_shadow_outcomes_excess_2026-11-04.jsonl",
+  "cost_convention": "excess_bp19 = signed(gross-bench)-0.0019",
+  "bootstrap": "day-block means seed=7 B=4000",
+  "decision": "DESCRIPTIVE ONLY; promotion gate n>=100 AND d>=30 unchanged",
+  "by_horizon": {
+    "1h": {
+      "all": {
+        "T": {
+          "n": 729,
+          "days": 10,
+          "mean_bp": -46.72,
+          "ci95_bp": [
+            -64.57,
+            -8.52
+          ]
+        },
+        "F": {
+          "n": 564,
+          "days": 11,
+          "mean_bp": 3.35,
+          "ci95_bp": [
+            -70.23,
+            17.58
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 10,
+          "delta_bp": -14.18,
+          "ci95_bp": [
+            -60.68,
+            46.66
+          ]
+        }
+      },
+      "long": {
+        "T": {
+          "n": 291,
+          "days": 10,
+          "mean_bp": -43.07,
+          "ci95_bp": [
+            -80.45,
+            54.87
+          ]
+        },
+        "F": {
+          "n": 60,
+          "days": 9,
+          "mean_bp": -43.78,
+          "ci95_bp": [
+            -176.92,
+            59.66
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 8,
+          "delta_bp": 28.1,
+          "ci95_bp": [
+            -71.73,
+            156.86
+          ]
+        }
+      },
+      "short": {
+        "T": {
+          "n": 438,
+          "days": 7,
+          "mean_bp": -49.14,
+          "ci95_bp": [
+            -58.94,
+            2.18
+          ]
+        },
+        "F": {
+          "n": 504,
+          "days": 11,
+          "mean_bp": 8.96,
+          "ci95_bp": [
+            -10.54,
+            22.76
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 7,
+          "delta_bp": -27.76,
+          "ci95_bp": [
+            -70.48,
+            18.95
+          ]
+        }
+      }
+    },
+    "4h": {
+      "all": {
+        "T": {
+          "n": 723,
+          "days": 10,
+          "mean_bp": -112.64,
+          "ci95_bp": [
+            -169.08,
+            1.5
+          ]
+        },
+        "F": {
+          "n": 546,
+          "days": 11,
+          "mean_bp": 43.47,
+          "ci95_bp": [
+            -59.39,
+            121.24
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 10,
+          "delta_bp": -70.01,
+          "ci95_bp": [
+            -183.97,
+            41.97
+          ]
+        }
+      },
+      "long": {
+        "T": {
+          "n": 288,
+          "days": 10,
+          "mean_bp": -101.2,
+          "ci95_bp": [
+            -185.57,
+            157.5
+          ]
+        },
+        "F": {
+          "n": 59,
+          "days": 9,
+          "mean_bp": -209.37,
+          "ci95_bp": [
+            -344.54,
+            -127.25
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 8,
+          "delta_bp": 159.13,
+          "ci95_bp": [
+            -69.24,
+            420.68
+          ]
+        }
+      },
+      "short": {
+        "T": {
+          "n": 435,
+          "days": 7,
+          "mean_bp": -120.21,
+          "ci95_bp": [
+            -159.17,
+            50.28
+          ]
+        },
+        "F": {
+          "n": 487,
+          "days": 11,
+          "mean_bp": 74.1,
+          "ci95_bp": [
+            2.93,
+            151.23
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 7,
+          "delta_bp": -77.73,
+          "ci95_bp": [
+            -192.96,
+            26.03
+          ]
+        }
+      }
+    },
+    "24h": {
+      "all": {
+        "T": {
+          "n": 718,
+          "days": 9,
+          "mean_bp": -275.48,
+          "ci95_bp": [
+            -546.81,
+            -73.76
+          ]
+        },
+        "F": {
+          "n": 434,
+          "days": 10,
+          "mean_bp": 56.41,
+          "ci95_bp": [
+            -157.37,
+            204.06
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 9,
+          "delta_bp": -280.44,
+          "ci95_bp": [
+            -634.73,
+            -5.85
+          ]
+        }
+      },
+      "long": {
+        "T": {
+          "n": 283,
+          "days": 9,
+          "mean_bp": -563.71,
+          "ci95_bp": [
+            -890.42,
+            -210.45
+          ]
+        },
+        "F": {
+          "n": 59,
+          "days": 9,
+          "mean_bp": -665.43,
+          "ci95_bp": [
+            -743.58,
+            -140.78
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 8,
+          "delta_bp": -176.79,
+          "ci95_bp": [
+            -446.67,
+            100.89
+          ]
+        }
+      },
+      "short": {
+        "T": {
+          "n": 435,
+          "days": 7,
+          "mean_bp": -87.97,
+          "ci95_bp": [
+            -132.46,
+            246.35
+          ]
+        },
+        "F": {
+          "n": 375,
+          "days": 10,
+          "mean_bp": 169.98,
+          "ci95_bp": [
+            -35.75,
+            296.76
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 7,
+          "delta_bp": -102.72,
+          "ci95_bp": [
+            -364.25,
+            183.53
+          ]
+        }
+      }
+    },
+    "72h": {
+      "all": {
+        "T": {
+          "n": 703,
+          "days": 8,
+          "mean_bp": -452.08,
+          "ci95_bp": [
+            -774.69,
+            -266.8
+          ]
+        },
+        "F": {
+          "n": 305,
+          "days": 8,
+          "mean_bp": 197.43,
+          "ci95_bp": [
+            -204.18,
+            443.2
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 8,
+          "delta_bp": -598.96,
+          "ci95_bp": [
+            -1038.87,
+            -245.1
+          ]
+        }
+      },
+      "long": {
+        "T": {
+          "n": 268,
+          "days": 8,
+          "mean_bp": -956.96,
+          "ci95_bp": [
+            -1237.69,
+            -436.23
+          ]
+        },
+        "F": {
+          "n": 58,
+          "days": 8,
+          "mean_bp": -706.5,
+          "ci95_bp": [
+            -997.59,
+            -4.91
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 8,
+          "delta_bp": -368.84,
+          "ci95_bp": [
+            -977.23,
+            100.04
+          ]
+        }
+      },
+      "short": {
+        "T": {
+          "n": 435,
+          "days": 7,
+          "mean_bp": -141.03,
+          "ci95_bp": [
+            -252.0,
+            328.2
+          ]
+        },
+        "F": {
+          "n": 247,
+          "days": 8,
+          "mean_bp": 409.69,
+          "ci95_bp": [
+            -50.48,
+            614.95
+          ]
+        },
+        "delta_T_minus_F": {
+          "common_days": 7,
+          "delta_bp": -235.67,
+          "ci95_bp": [
+            -543.62,
+            131.04
+          ]
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,133 @@
+{
+  "report": "D10 gate deadlock attribution, MARKET-NEUTRAL excess",
+  "generated_utc": "2026-11-04T05:31:55Z",
+  "horizon": "1h",
+  "source": "/data/decision_shadow_outcomes_excess_2026-11-04.jsonl",
+  "long_rows": 1029,
+  "admitted": 72,
+  "blocked": 957,
+  "admit_rate_pct": 7.0,
+  "interpretation": "negative excess on a BLOCKED bucket = protective; positive = freezing winners",
+  "by_gate_family": [
+    {
+      "gate": "late_trend_chase",
+      "rows": 540,
+      "pct": 52.5,
+      "blocked_excess": {
+        "n": 204,
+        "days": 10,
+        "mean_bp": -29.53,
+        "ci95_bp": [
+          -70.68,
+          127.96
+        ],
+        "win_pct": 40.7
+      }
+    },
+    {
+      "gate": "needs_fresh_structure",
+      "rows": 306,
+      "pct": 29.7,
+      "blocked_excess": {
+        "n": 76,
+        "days": 9,
+        "mean_bp": -53.05,
+        "ci95_bp": [
+          -145.62,
+          71.72
+        ],
+        "win_pct": 28.9
+      }
+    },
+    {
+      "gate": "ai_confidence",
+      "rows": 92,
+      "pct": 8.9,
+      "blocked_excess": {
+        "n": 38,
+        "days": 11,
+        "mean_bp": -0.19,
+        "ci95_bp": [
+          -93.81,
+          70.66
+        ],
+        "win_pct": 47.4
+      }
+    },
+    {
+      "gate": "ADMIT",
+      "rows": 72,
+      "pct": 7.0,
+      "blocked_excess": {
+        "n": 29,
+        "days": 10,
+        "mean_bp": -114.96,
+        "ci95_bp": [
+          -202.7,
+          92.12
+        ],
+        "win_pct": 24.1
+      }
+    },
+    {
+      "gate": "other:runner_gate_blocked (pullback-long SHADO",
+      "rows": 10,
+      "pct": 1.0,
+      "blocked_excess": {
+        "n": 1,
+        "days": 1,
+        "mean_bp": null,
+        "ci95_bp": [
+          null,
+          null
+        ],
+        "win_pct": null
+      }
+    },
+    {
+      "gate": "weak_trend_adx",
+      "rows": 7,
+      "pct": 0.7,
+      "blocked_excess": {
+        "n": 3,
+        "days": 2,
+        "mean_bp": -627.6,
+        "ci95_bp": [
+          -1415.82,
+          -233.5
+        ],
+        "win_pct": 0.0
+      }
+    },
+    {
+      "gate": "other:runner_gate_blocked (extension 3.1x ATR ",
+      "rows": 1,
+      "pct": 0.1,
+      "blocked_excess": {
+        "n": 0,
+        "days": 0,
+        "mean_bp": null,
+        "ci95_bp": [
+          null,
+          null
+        ],
+        "win_pct": null
+      }
+    },
+    {
+      "gate": "mover_bypass_veto",
+      "rows": 1,
+      "pct": 0.1,
+      "blocked_excess": {
+        "n": 0,
+        "days": 0,
+        "mean_bp": null,
+        "ci95_bp": [
+          null,
+          null
+        ],
+        "win_pct": null
+      }
+    }
+  ]
+}
