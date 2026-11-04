@@ -217,6 +217,36 @@ def build_analysis(data: Data, coin: str, i5: int, c5: list,
             daily_mover_fired = True
 
     mid = float(c5[i5].c)
+    # R1 (2026-11-04): project the same per-trigger vector + dynamic Σw that
+    # perception/research pass through in production, so the REAL gate core's
+    # feature snapshot populates trigger_hits/composite_denominator on replayed
+    # rows too (recomputed-from-candles, not as-produced). flow_* stay None:
+    # flow_confirm comes from the live WS taker-trades memory at scan time and
+    # is not reconstructible from closed candles (tape only logs BTC/ETH).
+    trigger_hits = [{
+        "name": h.get("name"),
+        "fired": bool(h.get("fired")),
+        "score": h.get("score"),
+        "direction": h.get("direction", h.get("dir")),
+        "flow_confirmed": h.get("flow_confirmed"),
+    } for h in hits]
+    # R1 regime: detect_regime_with_score(coin) fetches the CURRENT 1h candles
+    # (no as-of argument), so calling it in a replay stamps today's regime on
+    # every historical row. Recompute the gate's PIT regime from the same
+    # closed 1h bars the live gate would have seen at this 5m bar, using the
+    # pure classifier (the function market_regime_gate calls internally).
+    # decision-side coin-breakout override is NOT replayed (needs live RVOL
+    # state); regime_decision is therefore left to the gate core and reported
+    # separately, while regime_gate/score below are the trustworthy PIT ones.
+    pit_regime = pit_regime_score = None
+    try:
+        from hermes_trader.agents.market_regime import (
+            classify_candles, regime_strength_score)
+        if len(c1h_p) >= 30:
+            pit_regime = classify_candles(c1h_p[-100:])
+            pit_regime_score = float(regime_strength_score(c1h_p[-100:]))
+    except Exception:
+        pit_regime = pit_regime_score = None
     return {
         "coin": coin, "side": "long",
         "composite_score": float(score),
@@ -235,6 +265,12 @@ def build_analysis(data: Data, coin: str, i5: int, c5: list,
         "rsi4h": rsi4, "adx4h": adx4, "ema8_4h": ema8_4,
         "ema21_4h": ema21_4, "atr4h": atr4, "close4h": close4,
         "mid": mid, "mid_price": mid, "price": mid,
+        "trigger_hits": trigger_hits,
+        "composite_denominator": float(sum(sw.values())),
+        "flow_confirm_raw": None,
+        "flow_data_available": False,
+        "_pit_regime_gate": pit_regime,
+        "_pit_regime_score": pit_regime_score,
         "_fired_names": sorted(fired.keys()),
     }
 
@@ -286,10 +322,26 @@ def replay_coin(data: Data, coin: str, start_ms: int, end_ms: int,
             "whale": False, "forced": False, "is_hip3": ":" in coin,
             "mid_price": an["mid"],
             "fired_names": an["_fired_names"],
+            # R1 (2026-11-04): recomputed-from-candles per-trigger vector, the
+            # dynamic weight denominator, and the PIT gate regime (computed from
+            # as-of closed 1h bars, NOT detect_regime_with_score which stamps
+            # today's regime). regime_decision needs the live coin-breakout RVOL
+            # override and is not replayable → null + flagged in replay_note.
+            "trigger_hits": feats.get("trigger_hits"),
+            "composite_denominator": feats.get("composite_denominator"),
+            "regime_gate": an.get("_pit_regime_gate"),
+            "regime_gate_score": an.get("_pit_regime_score"),
+            "regime_decision": None,
+            "regime_replayable": False,
+            "mc_enabled": feats.get("mc_enabled"),
+            "cp_enabled": feats.get("cp_enabled"),
             "replay": True,
             "data_source": getattr(data, "source", "hyperliquid"),
             "replay_note": ("structural gate from candles; AI confidence "
-                            "neutralized; whale/news/account absent"),
+                            "neutralized; whale/news/account absent; "
+                            "regime_gate=PIT classifier on as-of 1h closes, "
+                            "regime_decision not replayable; flow not "
+                            "reconstructed from candles"),
         })
     return rows
 

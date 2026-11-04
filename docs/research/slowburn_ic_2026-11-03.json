@@ -1,0 +1,95 @@
+{
+  "report": "slowBurn binary contrast + ordinal rank IC + R1 recomputed per-hit/per-regime",
+  "generated_utc": "2026-11-04",
+  "plan": "/home/ldy/Hermes_入场可观测性补齐与slowBurnIC_方案_2026-11-03.md (v6) §4",
+  "mode": "SHADOW, zero exposure, read-only analysis; no config/gate change",
+  "decision": "DESCRIPTIVE ONLY — pre-registered gate n>=100 AND d>=30 not met; no de-bypass / weight-table action",
+  "cost_convention": "net_bp9.26 = direction-aware gross minus 0.000926 round trip; bp = fraction*1e4",
+  "bootstrap": "day-block means, seed=7, B=4000",
+  "datasets": {
+    "B_binary": {
+      "source": "/data/decision_shadow_outcomes.jsonl",
+      "rows_total": 2886,
+      "rows_with_fired_names_key": 2886,
+      "distinct_utc_days": 12,
+      "schema": "OLD 7-name fired_names (6 booleans + slowBurn); NOT comparable to new 14-hit trigger_hits",
+      "slowBurn_in_fired_names": {"true": 1646, "false": 910, "false_empty_list": 608, "false_nonempty_other": 302},
+      "side": {"short": 1594, "long": 962},
+      "net_1h_available": 1149,
+      "excess_1h_available": 6,
+      "excess_note": "benchmark series mostly absent (depends on point-in-time cache); long horizons carry market beta and cannot be direction-attributed"
+    },
+    "A_ordinal": {
+      "source": "/data/decision_shadow_outcomes.jsonl",
+      "key": "slow_burn_count in {0,1,2,3} = |{volumeBuildup1h,trendFlip1h,higherLows1h}|",
+      "note": "column is present on ALL historical outcome rows (plan §4 conservatively said to wait; it was already being recorded)",
+      "dist_1h": {"0": 153, "1": 499, "2": 188, "3": 42},
+      "n_1h": 882, "distinct_days_1h": 11
+    },
+    "R1_recomputed": {
+      "source": "/data/research_replay_trigger_hits.jsonl",
+      "generator": "scripts/replay_gate.py (extended 2026-11-04)",
+      "rows": 4785, "coins": 44, "covered_1h": 4752, "distinct_days": 6,
+      "step_bars": 12, "side": "long only",
+      "span_days": 4.5,
+      "provenance": "RECOMPUTED FROM CLOSED CANDLES, not as-produced; AI confidence neutralized to 0.9; whale/news/account absent",
+      "regime_gate": "PIT classify_candles(regime_strength_score) on as-of closed 1h bars",
+      "regime_decision": "NOT replayable (needs live coin-breakout RVOL override); recorded null with regime_replayable=false",
+      "flow": "NOT reconstructible (live WS taker-trades memory; tape logs only BTC/ETH); flow_confirm_raw=null, flow_data_available=false"
+    }
+  },
+  "B_binary_results": {
+    "net_1h": {
+      "all": {"T_mean_bp": -45.61, "T_n": 716, "T_days": 9, "F_mean_bp": 22.97, "F_n": 433, "F_days": 10,
+              "delta_daypaired_bp": -12.51, "ci95": [-66.57, 52.06], "significant": false},
+      "all_note": "clustered-resample (row-weighted) alternative gives -68.58 CI[-107.95,-16.45]; difference is day-weighting; day-paired equal-day is the primary spec; neither conclusive at d<10",
+      "long": {"T": -32.72, "F": -24.70, "delta": 29.89, "ci95": [-73.38, 164.06], "significant": false},
+      "short": {"T": -53.98, "F": 30.64, "delta": -29.75, "ci95": [-81.42, 26.03], "significant": false},
+      "coin_day_equal_weight": {"T": -26.72, "F": 9.77, "delta": -14.43, "ci95": [-69.96, 54.64]}
+    },
+    "net_4h": {"all_delta": -87.65, "ci95": [-211.05, 33.04], "long_delta": 122.53, "short_delta": -77.20, "coin_day_delta": -37.50},
+    "net_24h": {"all_delta": -405.99, "ci95": [-753.18, -136.71], "long_T": -641, "long_F": -643, "long_delta": -194.48,
+      "interpretation": "FALSELY significant: long T and F means are near-identical; the cohort as a whole is negative in a down tape; excess benchmark unavailable so this is beta, NOT a slowBurn effect"},
+    "net_72h": {"all_delta": -737.17, "ci95": [-1207.08, -340.11], "long_delta": -290.83, "short_delta": -288.87, "coin_day_delta": -307.14}
+  },
+  "A_ordinal_results": {
+    "spearman_rho_net_vs_count": {"1h": 0.0227, "4h": -0.0087, "24h": 0.0192, "72h": -0.0075},
+    "bucket_means_1h_bp": {"c0": {"n": 153, "mean": -14.4, "median": -11.3},
+                           "c1": {"n": 499, "mean": -66.8, "median": -60.3},
+                           "c2": {"n": 188, "mean": -0.7, "median": 1.6},
+                           "c3": {"n": 42, "mean": -20.3, "median": -34.1}},
+    "ge1_vs_0_1h_daypaired": {"delta_bp": 8.3, "ci95": [-52.3, 78.2], "days": "10/9"},
+    "ge1_vs_0_4h": {"delta_bp": 31.5, "ci95": [-128.0, 212.8]},
+    "ge1_vs_0_24h": {"delta_bp": -156.8, "ci95": [-548.4, 257.9]},
+    "ge1_vs_0_72h": {"delta_bp": -411.4, "ci95": [-1025.4, 169.3]},
+    "finding": "rho ~ 0 at every horizon and bucket means are NON-monotonic (c1 worst, not c3); rank-IC hypothesis falsified descriptively; every delta CI spans zero"
+  },
+  "R1_recomputed_results": {
+    "pit_regime_dist": {"down": 1926, "chop": 621, "up": 1938, "neutral": 267},
+    "net_1h_by_regime_bp": {"up": {"n": 1938, "mean": -0.6, "median": -7.3},
+                            "down": {"n": 1926, "mean": -14.9, "median": -13.8},
+                            "neutral": {"n": 267, "mean": -20.1, "median": -18.7},
+                            "chop": {"n": 621, "mean": -11.8, "median": -13.8}},
+    "countertrend_long_impulse_in_down_or_chop": {"impulse_n": 94, "other_n": 2453, "impulse_mean_bp": 57.4, "other_mean_bp": -3.9, "delta_bp": 61.3, "ci95": [-86.6, 384.3], "significant": false},
+    "per_hit_1h_delta_bp_fired_vs_not": {
+      "breakout": {"Tn": 123, "T": 64.0, "Fn": 4629, "F": -5.6, "delta": 69.6, "ci95": [-74.5, 388.8]},
+      "trendFlip1h": {"Tn": 284, "T": 45.7, "Fn": 4468, "F": -6.9, "delta": 52.5, "ci95": [-15.1, 210.1]},
+      "uptrendMomentum": {"Tn": 136, "T": 39.3, "Fn": 4616, "F": -6.6, "delta": 45.9, "ci95": [-49.5, 273.2]},
+      "trendStrength": {"Tn": 2662, "T": -2.0, "Fn": 2090, "F": -9.9, "delta": 8.0, "ci95": [-20.1, 31.7]},
+      "pctMoveSpike": {"Tn": 418, "T": 1.7, "Fn": 4334, "F": -7.4, "delta": 9.1, "ci95": [-39.3, 54.8]},
+      "rangeCompression": {"Tn": 624, "T": -1.8, "Fn": 4128, "F": -7.4, "delta": 5.6, "ci95": [-24.9, 41.3]},
+      "volumeSpike": {"Tn": 417, "T": -3.1, "Fn": 4335, "F": -7.1, "delta": 4.0, "ci95": [-20.6, 28.4]},
+      "volumeBuildup1h": {"Tn": 479, "T": -5.3, "Fn": 4273, "F": -7.4, "delta": 2.1, "ci95": [-25.5, 30.6]},
+      "downtrendMomentum": {"Tn": 106, "T": -5.3, "Fn": 4646, "F": -7.1, "delta": 1.8, "ci95": [-28.8, 33.6]},
+      "higherLows1h": {"Tn": 1663, "T": -8.0, "Fn": 3089, "F": -5.3, "delta": -2.7, "ci95": [-28.1, 21.2]}
+    },
+    "sparse_skipped_lt10": ["dailyMover(0)", "momentumBurst(2)"],
+    "finding": "no trigger has a fired-vs-not delta whose 95% CI excludes zero at d=6; breakout/trendFlip/uptrendMomentum show the largest positive point estimates but with very wide CIs"
+  },
+  "independence_warnings": [
+    "R1 samples every 12th 5m bar (hourly) of the SAME coins across 4.5d -> rows within a coin-day are correlated; effective evidence is coin x day, not rows",
+    "R1 is long-only; per-hit signs cannot be extrapolated to shorts",
+    "B-dataset short rows are pre-P0-3 in raw form but outcomes here were regenerated with direction-aware signs (sgn=-1)",
+    "do NOT pool old 7-name fired_names with new 14-hit trigger_hits"
+  ]
+}
