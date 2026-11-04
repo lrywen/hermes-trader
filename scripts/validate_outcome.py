@@ -7,7 +7,14 @@
 三方法（共享同一按天 bps 数据契约）：
   1. block-bootstrap —— 按天块自助 95% CI（与 scripts/bps_block_bootstrap.py 同口径）；
   2. CPCV —— 组合 purged 交叉验证，多路样本外夏普；
-  3. DSR/PBO —— 多重检验校正后"真实夏普为正"的概率 / 回测过拟合概率。
+  3. DSR / oos_negative_fold_ratio —— 多重检验校正后"真实夏普为正"的概率 /
+     样本外负收益折叠占比。
+
+H3 (2026-11-04): 第三个量原字段名 `pbo` 是误称 — probability_of_backtest_overfitting
+在此数据契约下实际返回的是「WFA/CPCV 样本外夏普为负的折叠比例」，不是 Bailey/López
+de Prado CSCV 定义的过拟合概率（真 CSCV 需要一个配置矩阵，单策略无该矩阵，不构造
+假数）。字段已改名为 oos_negative_fold_ratio；所有"过拟合概率"措辞撤回。真 CSCV
+单独立项。
 
 最终 "verdict" 为二值：
   NEGATIVE_EXPECTANCY（三方法一致为负，等同 OUTCOME_B）
@@ -46,8 +53,9 @@ def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
         cpcv = cpcv_paths(s, n_groups=6, n_test_groups=2, embargo=1)
         sr = sharpe(s)
         dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(s))
-        pbo = probability_of_backtest_overfitting([sr] * cpcv.n_paths,
-                                                  list(cpcv.oos_sharpe))
+        # H3: this is the OOS-negative fold ratio, NOT CSCV overfitting prob.
+        oos_neg = probability_of_backtest_overfitting([sr] * cpcv.n_paths,
+                                                      list(cpcv.oos_sharpe))
         rows.append({
             "arm": arm,
             "days": len(s),
@@ -56,7 +64,7 @@ def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
             "cpcv_oos_pos_frac": round(cpcv.oos_win_frac, 3),
             "sharpe": round(sr, 3),
             "dsr_p": round(dsr, 4),
-            "pbo": round(pbo, 3),
+            "oos_negative_fold_ratio": round(oos_neg, 3),
         })
 
     # 二值判定：存在任一臂 bb_positive 且 dsr_p 通过，才可能为 edge
@@ -82,7 +90,7 @@ def main() -> None:
 
     print(f"verdict = {r['verdict']}")
     print(f"{'arm':11s} {'天':>4s} {'block-bootstrap 95%CI':>26s} "
-          f"{'CPCV OOS正占比':>14s} {'SR':>7s} {'DSR P':>7s} {'PBO':>6s}")
+          f"{'CPCV OOS正占比':>14s} {'SR':>7s} {'DSR P':>7s} {'OOS负折':>7s}")
     for x in r["arms"]:
         if "skip" in x:
             print(f"{x['arm']:11s}   {x['skip']}")
@@ -90,7 +98,7 @@ def main() -> None:
             lo, hi = x["bb_ci"]
             print(f"{x['arm']:11s} {x['days']:4d} [{lo:9.2f},{hi:9.2f}] "
                   f"{x['cpcv_oos_pos_frac']:14.2f} {x['sharpe']:7.3f} "
-                  f"{x['dsr_p']:7.4f} {x['pbo']:6.3f}")
+                  f"{x['dsr_p']:7.4f} {x['oos_negative_fold_ratio']:7.3f}")
     print("\n明细 → /tmp/validate_outcome.json")
 
 

@@ -94,7 +94,8 @@ def evaluate_gates(evidence: dict[str, Any],
     than raising — an evidence gap must never be auto-promoted):
 
       mature_outcomes, independent_days, net_edge_bps, bb_ci_lo_bps, dsr_p,
-      pbo, wfr, realistic_fill_positive, killswitch_tested, orderable,
+      oos_negative_fold_ratio (legacy key ``pbo`` still read as fallback),
+      wfr, realistic_fill_positive, killswitch_tested, orderable,
       last_record_ms (P2 staleness).
 
     ``borderline`` is a non-fatal marker list: the arm clears every hard gate
@@ -143,9 +144,15 @@ def evaluate_gates(evidence: dict[str, Any],
     add("deflated_sharpe", v is not None and v >= g["min_dsr_p"],
         f"dsr_p={v} >= {g['min_dsr_p']}")
 
-    v = num("pbo")
-    add("pbo", v is not None and v < g["max_pbo"],
-        f"pbo={v} < {g['max_pbo']}")
+    # H3 (2026-11-04): this is the WFA OOS-negative fold ratio, not the CSCV
+    # probability of backtest overfitting, so it is no longer reported as "pbo".
+    # The pre-registered threshold key stays ``max_pbo`` (config compatibility);
+    # legacy evidence blobs still carrying ``pbo`` are read as a fallback.
+    v = num("oos_negative_fold_ratio")
+    if v is None:
+        v = num("pbo")
+    add("oos_negative_fold_ratio", v is not None and v < g["max_pbo"],
+        f"oos_negative_fold_ratio={v} < {g['max_pbo']}")
 
     v = num("wfr")
     # R5 walk-forward efficiency: must strictly EXCEED the threshold.

@@ -836,7 +836,9 @@ def r5_robustness(records: list[dict],
         lo, hi = block_bootstrap_ci(daily)
         sr = sharpe(daily)
         dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(daily))
-        pbo = probability_of_backtest_overfitting(
+        # H3 (2026-11-04): WFA OOS-negative fold ratio, NOT a CSCV overfitting
+        # probability (single strategy => no config matrix for true CSCV).
+        oos_neg = probability_of_backtest_overfitting(
             [max(v, 0.0) for v in wfa.oos_mean_bps],
             list(wfa.oos_mean_bps))
         import statistics as _st
@@ -851,7 +853,7 @@ def r5_robustness(records: list[dict],
             "net_edge_bps": round(_st.mean(daily), 2),
             "sharpe": round(sr, 3),
             "dsr_p": round(dsr, 4),
-            "pbo": round(pbo, 3),
+            "oos_negative_fold_ratio": round(oos_neg, 3),
             "dsr_passes": dsr >= R5_DSR_ACCEPT_P,
         }
     except Exception as e:  # never let an offline stat break grading

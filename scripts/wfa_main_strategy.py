@@ -2,9 +2,10 @@
 """P1.5 — hook walk-forward analysis onto the MAIN strategy's realized PnL.
 
 Why this exists: ``scripts/shadow_grade.py:r5_robustness`` already computes WFA /
-block-bootstrap / DSR / PBO, but only for *experimental gate arms* (its input is
-per-trade counterfactual ``pnl_pct``). Nothing WFA-graded the main strategy's
-own PnL, so "WFA 通过" could not be claimed for the book that actually trades.
+block-bootstrap / DSR / OOS-negative-fold-ratio, but only for *experimental gate
+arms* (its input is per-trade counterfactual ``pnl_pct``). Nothing WFA-graded the
+main strategy's own PnL, so "WFA 通过" could not be claimed for the book that
+actually trades.
 
 The main strategy's only sufficient PnL history is the taker SHADOW ledger
 (``.shadow-book.json`` → ``accounts.taker.fills``; live ``.agent-memory.json``
@@ -139,7 +140,7 @@ def main_strategy_wfa(series: list[float],
                       train_size: int = WFA_TRAIN_DAYS,
                       test_size: int = WFA_TEST_DAYS,
                       n_trials: int = DEFAULT_N_TRIALS) -> Optional[dict[str, Any]]:
-    """WFA + bootstrap CI + DSR + PBO on the daily bps series (pure).
+    """WFA + bootstrap CI + DSR + OOS-negative-fold-ratio on daily bps (pure).
 
     ``None`` when there are fewer than :data:`MIN_DAYS` days — the caller must
     report "insufficient history", never a pass.
@@ -158,7 +159,12 @@ def main_strategy_wfa(series: list[float],
     lo, hi = block_bootstrap_ci(series)
     sr = sharpe(series)
     dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(series))
-    pbo = probability_of_backtest_overfitting(
+    # H3 (2026-11-04): this is the fraction of WFA OOS folds with negative mean
+    # return, NOT the CSCV probability of backtest overfitting. A single strategy
+    # has no config-comparison matrix, so a true CSCV PBO cannot be computed;
+    # emitting it under the name "pbo" overstated what it means. Renamed to
+    # oos_negative_fold_ratio; true CSCV is a separate future work item.
+    oos_negative_fold_ratio = probability_of_backtest_overfitting(
         [max(v, 0.0) for v in wfa.oos_mean_bps],
         list(wfa.oos_mean_bps))
     mean_bps = statistics.mean(series)
@@ -181,7 +187,7 @@ def main_strategy_wfa(series: list[float],
         "wfr": round(wfa.wfr, 3),
         "wfe": round(wfa.wfe, 3),
         "dsr_p": round(dsr, 4),
-        "pbo": round(pbo, 3),
+        "oos_negative_fold_ratio": round(oos_negative_fold_ratio, 3),
         "checks": checks,
         "verdict": "pass" if all(checks.values()) else "fail",
     }

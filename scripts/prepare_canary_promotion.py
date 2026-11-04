@@ -64,7 +64,11 @@ def gather_evidence(arm: str, grades: dict, *, killswitch_tested: bool,
         "net_edge_bps": stats.get("net_edge_bps"),
         "bb_ci_lo_bps": stats.get("bb_ci_lo_bps"),
         "dsr_p": stats.get("dsr_p"),
-        "pbo": stats.get("pbo"),
+        # H3: renamed from the misleading "pbo" (it is the WFA OOS-negative
+        # fold ratio, not a CSCV overfitting probability). Read new name first,
+        # fall back to legacy grades still carrying the old key.
+        "oos_negative_fold_ratio": stats.get(
+            "oos_negative_fold_ratio", stats.get("pbo")),
         "wfr": stats.get("wfr"),
         "realistic_fill_positive": g.get("realistic_fill_positive"),
         # P2-a: newest graded observation time, for the evidence-freshness gate.

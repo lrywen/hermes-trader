@@ -22,7 +22,7 @@ def _full_evidence(**over):
         "net_edge_bps": 8.0,
         "bb_ci_lo_bps": 5.0,            # clear of the borderline band
         "dsr_p": 0.97,
-        "pbo": 0.3,
+        "oos_negative_fold_ratio": 0.3,
         "wfr": 0.62,
         "realistic_fill_positive": True,
         "killswitch_tested": True,
@@ -48,6 +48,14 @@ def test_missing_dimension_fails_closed():
     assert res["passed"] is False
     failed = {c["gate"] for c in res["checks"] if not c["passed"]}
     assert "deflated_sharpe" in failed
+
+
+def test_legacy_pbo_key_still_read_as_fallback():
+    # H3: old grade blobs store the same ratio under "pbo"; read it rather than
+    # failing the gate closed just because the key name changed.
+    ev = _full_evidence()
+    ev["pbo"] = ev.pop("oos_negative_fold_ratio")
+    assert cp.evaluate_gates(ev, now_ms=NOW_MS)["passed"] is True
 
 
 def test_weak_edge_rejected():

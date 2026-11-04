@@ -42,14 +42,16 @@ def test_r5_block_for_consistent_positive_edge():
     assert block["bb_ci_lo_bps"] > 0
     assert block["wfr"] > 0.5
     assert block["dsr_passes"] in (True, False)
-    assert block["pbo"] == 0.0
+    # H3 (S0-2): renamed from the misleading "pbo" (this is the WFA OOS-negative
+    # fold ratio, not the CSCV probability of backtest overfitting).
+    assert block["oos_negative_fold_ratio"] == 0.0
 
 
 def test_r5_block_for_consistent_negative_edge():
     block = sg.r5_robustness(_records(24, -0.1))
     assert block["net_edge_bps"] < 0
     assert block["wfr"] == 0.0
-    assert block["pbo"] > 0
+    assert block["oos_negative_fold_ratio"] > 0
 
 
 def test_wfa_window_count_and_shapes():

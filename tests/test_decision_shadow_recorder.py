@@ -67,8 +67,15 @@ def test_classify_path_abc():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     assert mod.classify_path({"fresh_impulse": True, "slow_burn_count": 1}) == "A_fresh_slow"
+    # S0-5: the live scan gate is 54, not the old 45. A score of 50 is below
+    # the scan gate so it labels Z_blocked; the legacy 45 label is kept on a
+    # separate audit column (path_legacy_45).
     assert mod.classify_path({"fresh_impulse": True, "slow_burn_count": 0,
-                              "composite_score": 50}) == "B_fresh_score"
+                              "composite_score": 54}) == "B_fresh_score"
+    assert mod.classify_path({"fresh_impulse": True, "slow_burn_count": 0,
+                              "composite_score": 50}) == "Z_blocked"
+    assert mod.legacy_path_45({"fresh_impulse": True, "slow_burn_count": 0,
+                               "composite_score": 50}) == "B_fresh_score"
     assert mod.classify_path({"fresh_impulse": False, "dMover": True,
                               "admitted": True}) == "C_daily_mover"
     assert mod.classify_path({"fresh_impulse": False, "dMover": False,
