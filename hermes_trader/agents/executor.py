@@ -5377,6 +5377,46 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                         f"(E1 choppy-market de-risk overlay)")
         else:
             logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
+        # U1 (2026-11-04): this short-circuit returns BEFORE the full feature
+        # snapshot near the end of the impl, so the verdict recorder would see
+        # feats=None and every entry-observability key (trigger_hits, flow_*,
+        # the two regimes, composite_denominator) landed null on ~92% of rows.
+        # The research-exit analysis already carries trigger_hits/flow_*/
+        # denominator (additive passthrough); snapshot the observation keys
+        # here too so short rows are usable for future per-hit/side research
+        # without waiting for shorts to be enabled. Observational only — it does
+        # NOT change the block above and is wrapped so it can never raise.
+        try:
+            from hermes_trader.agents.market_regime import detect_regime_with_score
+            try:
+                _g_short, _gs_short = detect_regime_with_score(coin)
+            except Exception:
+                _g_short, _gs_short = None, None
+            _th_short = analysis.get("trigger_hits") or []
+            _runner_gate_ctx.feats = {
+                "score": _safe_float(analysis.get("composite_score")),
+                "min_score": float(gate.get("min_composite", 0) or 0),
+                "gate_conf": float(analysis.get("ai_confidence_raw",
+                                                analysis.get("confidence", 0)) or 0),
+                "min_conf": float(gate.get("min_confidence", 0) or 0),
+                "mid": _safe_float(analysis.get("mid")),
+                "regime_decision": resolve_decision_regime(analysis, config),
+                "regime_gate": _g_short,
+                "regime_gate_score": _gs_short,
+                "trigger_hits": analysis.get("trigger_hits"),
+                "flow_confirm_raw": analysis.get("flow_confirm_raw"),
+                "flow_data_available": analysis.get("flow_data_available"),
+                "flow_confirmed_breakout": any(
+                    bool(h.get("flow_confirmed")) for h in _th_short
+                    if h.get("name") == "breakout"),
+                "composite_denominator": analysis.get("composite_denominator"),
+                "mc_enabled": bool(
+                    (config.get("momentum_continuation") or {}).get("enabled")),
+                "cp_enabled": bool(
+                    (config.get("candlestick_patterns") or {}).get("enabled")),
+            }
+        except Exception:
+            _runner_gate_ctx.feats = None
         return "runner_gate_blocked (shorts disabled)"
     conf = float(analysis.get("confidence", 0) or 0)
     # A structural override rewrites confidence up to min_ai_confidence, which

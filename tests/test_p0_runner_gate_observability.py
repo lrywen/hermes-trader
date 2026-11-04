@@ -197,6 +197,38 @@ def test_p2_floor_fields_none_for_long(monkeypatch, tmp_path):
     assert rec["short_floor_would_block"] is None
 
 
+def test_short_circuit_row_still_records_observability(monkeypatch, tmp_path):
+    # U1 (2026-11-04): the short-disabled short-circuit returns before the full
+    # feature snapshot, so the entry-observability keys used to land null on
+    # ~92% of rows. They must now be snapshotted from analysis (+ a same-source
+    # regime call) on that early path, without changing the block.
+    _isolate(monkeypatch)
+    out = tmp_path / "rg_short_obs.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    a = _analysis(
+        side="short", composite_score=33.3, confidence=0.55,
+        trigger_hits=[{"name": "breakout", "fired": True, "score": 12.5,
+                       "direction": "short", "flow_confirmed": False}],
+        composite_denominator=9.0,
+        flow_confirm_raw=0.42, flow_data_available=True,
+    )
+    decision = executor._runner_entry_block_reason(
+        a, _gate(allow_shorts=False))
+    assert "shorts disabled" in decision  # decision unchanged
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["admitted"] is False
+    # passthrough keys survive the early return
+    assert rec["trigger_hits"] == a["trigger_hits"]
+    assert rec["composite_denominator"] == 9.0
+    assert rec["flow_confirm_raw"] == 0.42
+    assert rec["flow_data_available"] is True
+    assert rec["flow_confirmed_breakout"] is False
+    # both regimes resolved (detect_regime_with_score is mocked in _isolate)
+    assert rec["regime_decision"] in ("up", "down", "neutral", "chop")
+    assert rec["regime_gate"] == "up"  # mocked detect_regime_with_score
+    assert rec["composite_score"] == 33.3
+
+
 def test_record_failure_never_breaks_gate(monkeypatch, tmp_path):
     _isolate(monkeypatch)
     # Point at an unwritable path; append_jsonl swallows the OSError, and the
