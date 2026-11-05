@@ -25,9 +25,17 @@ Usage
     python scripts/apply_prod_override.py --snapshot deploy/prod_override.json \
         --config /data/.agent-config.json
 
+    # reverse direction: backflow the live config into the tracked snapshot
+    python scripts/apply_prod_override.py --capture \
+        --config /home/ldy/hermes-deploy/.agent-config.json
+
 The write goes through config_store.write_agent_config (same atomic + backup
 path the app uses), and the snapshot is validated with the production strict
-validator before anything is written.
+validator before anything is written.  ``--capture`` performs the opposite
+(and routine) direction: production tuning evolves on the persistent volume,
+so the tracked snapshot must be refreshed FROM live instead of only being
+re-applied TO it.  It strips ``mode`` (deployment state, never versioned) and
+keeps the snapshot's descriptive ``_comment``.
 """
 from __future__ import annotations
 
@@ -75,6 +83,123 @@ def _diff_leaves(base: dict, over: dict, path: str = ""):
     return out
 
 
+def _flatten(node, prefix: str = "") -> dict:
+    out = {}
+    if isinstance(node, dict) and node:
+        for k, v in node.items():
+            out.update(_flatten(v, f"{prefix}.{k}" if prefix else k))
+    else:
+        out[prefix] = node
+    return out
+
+
+def _unflatten(flat: dict) -> dict:
+    root: dict = {}
+    for path, value in flat.items():
+        node = root
+        parts = path.split(".")
+        for p in parts[:-1]:
+            node = node.setdefault(p, {})
+        node[parts[-1]] = value
+    return root
+
+
+_MISSING = object()
+
+
+def _canonical_delta(live: dict) -> dict:
+    """Leaves of *live* that must be stored in the override snapshot.
+
+    The snapshot is an OVERRIDE, not a full config copy: storing leaves that
+    merely echo today's canonical value would freeze them forever and silently
+    undo future canonical fixes (e.g. the 2026-10-18 detox that removed
+    runner_entry_gate.min_confidence).  Comparison is byte-strict so a genuine
+    type change (int 4 vs float 4.0) is still captured as a delta.
+
+    ``None`` is ALWAYS kept: ``_deep_merge`` treats it as a deletion marker, so
+    dropping it would resurrect the canonical value instead of deleting the
+    key (era-visible: ``dsl_exit.ignite_grace_minutes``).
+    """
+    live_flat = _flatten(live)
+    canon_flat = _flatten(CANONICAL_DEFAULTS)
+    keep = {}
+    for path, value in live_flat.items():
+        if value is not None:
+            canon = canon_flat.get(path, _MISSING)
+            if canon is not _MISSING and (
+                    json.dumps(value, sort_keys=True) == json.dumps(canon, sort_keys=True)):
+                continue
+        keep[path] = value
+    return _unflatten(keep)
+
+
+def _effective_view(raw: dict) -> dict:
+    """Mirror read_agent_config(): deep-merge, then re-materialize top-level
+    canonical None stubs (nested nulls stay deleted, per _deep_merge)."""
+    merged = config_store._deep_merge(CANONICAL_DEFAULTS, raw)
+    for key, default in CANONICAL_DEFAULTS.items():
+        if default is None and key not in merged:
+            merged[key] = None
+    return merged
+
+
+def _tag(value) -> str:
+    return "<ABSENT>" if value is _MISSING else json.dumps(value, sort_keys=True)
+
+
+def _capture(snapshot_path: str, config_path: str) -> int:
+    """Backflow the live config at *config_path* into the tracked snapshot."""
+    with open(config_path, encoding="utf-8") as f:
+        live = json.load(f)
+    carried_mode = live.pop("mode", None)
+    with open(snapshot_path, encoding="utf-8") as f:
+        previous = json.load(f)
+    if previous.get("_comment"):
+        live["_comment"] = previous["_comment"]
+
+    errs = config_store.validate_config_dict(live, strict_keys=True)
+    delta = _canonical_delta(live)
+    # Safety net: the snapshot's effective view must equal live's leaf-for-leaf.
+    want = _flatten(_effective_view(live))
+    got = _flatten(_effective_view(delta))
+    bad = [p for p in set(want) | set(got)
+           if _tag(want.get(p, _MISSING)) != _tag(got.get(p, _MISSING))]
+
+    print(f"source   : {config_path}")
+    print(f"snapshot : {snapshot_path}")
+    print(f"mode     : {carried_mode!r} stripped (deployment state)")
+    print(f"validation: {'OK' if not errs else str(len(errs)) + ' message(s)'}")
+    for e in errs[:20]:
+        print("   -", e)
+
+    diffs = _diff_leaves(previous, delta)
+    print(f"snapshot leaves stored (delta vs canonical): {len(_flatten(delta))}")
+    print(f"leaves changed vs previous snapshot: {len(diffs)}")
+    for p, c, l in sorted(diffs, key=lambda x: x[0]):
+        cs = json.dumps(c, ensure_ascii=False)[:36]
+        ls = json.dumps(l, ensure_ascii=False)[:36]
+        print(f"   {p}: {cs} -> {ls}")
+
+    if errs:
+        print("\nREFUSING to capture: live config failed strict validation.",
+              file=sys.stderr)
+        return 2
+    if bad:
+        print(f"\nREFUSING to capture: delta view differs from live at {bad[:5]}",
+              file=sys.stderr)
+        return 2
+
+    tmp = snapshot_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        # sort_keys matches the artifact's existing canonical form, so a capture
+        # diff shows only leaves that actually changed, not a whole-file reorder.
+        json.dump(delta, f, indent=2, ensure_ascii=False, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, snapshot_path)
+    print(f"\ncaptured live config -> {snapshot_path}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--snapshot", default=DEFAULT_SNAPSHOT)
@@ -82,11 +207,19 @@ def main(argv=None) -> int:
                     help="target config path (default: config_store.CONFIG_PATH)")
     ap.add_argument("--apply", action="store_true",
                     help="write the snapshot (default is dry-run)")
+    ap.add_argument("--capture", action="store_true",
+                    help="reverse direction: read --config and write it to --snapshot "
+                         "(strips 'mode', keeps the snapshot _comment)")
     ap.add_argument("--with-mode", action="store_true",
                     help="also carry the runtime 'mode' (OFF/SHADOW/LIVE) from the "
                          "snapshot. Default strips it so a rebuild stays on the safe "
                          "canonical OFF and never starts trading without an explicit choice.")
     args = ap.parse_args(argv)
+
+    if args.capture:
+        if args.apply or args.with_mode:
+            ap.error("--capture is incompatible with --apply/--with-mode")
+        return _capture(args.snapshot, args.config)
 
     with open(args.snapshot) as f:
         snapshot = json.load(f)

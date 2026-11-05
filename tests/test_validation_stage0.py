@@ -32,6 +32,22 @@ from hermes_trader.validation import (
 )
 from hermes_trader.validation.portfolio_sim import PortfolioResult
 
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _cli_env() -> dict:
+    """Environment for invoking scripts/ by absolute path.
+
+    ``python <abs>/scripts/x.py`` puts the *script* dir on sys.path, not the
+    repo root, so the child cannot import ``hermes_trader`` unless PYTHONPATH
+    says so. Relying on the ambient PYTHONPATH made these tests pass locally
+    and fail in a clean shell — inject it explicitly.
+    """
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(
+        [str(_REPO_ROOT), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+    return env
+
 
 # ── iron-law 1: fixed-effect / scale-factor rejection ──────────────────────
 
@@ -426,9 +442,7 @@ def test_stage0_audit_cli_edge_clears_null_rejects_and_logs(tmp_path):
     _write_dataset(null, edge=False)
 
     def run(src, hyp):
-        env = dict(os.environ)
-        env["PYTHONPATH"] = os.pathsep.join(
-            [str(repo), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
+        env = _cli_env()
         return subprocess.run(
             [sys.executable, str(script), "--input", str(src),
              "--hypothesis", hyp, "--feature", "feat", "--ret", "ret",
@@ -479,7 +493,7 @@ def test_stage0_audit_cli_dry_run_does_not_write(tmp_path):
         [sys.executable, str(script), "--input", str(src), "--hypothesis", "h",
          "--feature", "feat", "--ret", "ret", "--vol", "vol",
          "--ledger", str(ledger), "--dry-run"],
-        capture_output=True, text=True, cwd=str(repo))
+        capture_output=True, text=True, cwd=str(repo), env=_cli_env())
     assert r.returncode in (0, 1)
     assert not ledger.exists()
 
@@ -510,7 +524,7 @@ def test_stage0_audit_cli_missing_coin_is_rc3_and_writes_nothing(tmp_path):
         [sys.executable, str(script), "--input", str(src), "--hypothesis", "h",
          "--feature", "feat", "--ret", "ret", "--vol", "vol",
          "--ledger", str(ledger)],
-        capture_output=True, text=True, cwd=str(repo))
+        capture_output=True, text=True, cwd=str(repo), env=_cli_env())
     assert r.returncode == 3, r.stdout + r.stderr
     payload = json.loads(r.stderr.strip().splitlines()[-1])
     assert payload["verdict"] == "invalid"

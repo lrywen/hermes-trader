@@ -246,3 +246,50 @@ def test_real_sequence_value_change_is_still_flagged():
     c = {"dsl_exit": {"ignite_periods": ("5m", "15m", "1h")}}
     l = {"dsl_exit": {"ignite_periods": ["15m", "1h"]}}
     assert "dsl_exit.ignite_periods" in g.uncovered_divergences(c, l)
+
+
+# ── P0 (2026-11-05): 生产调优必须单向回流到版本化快照 ─────────────────────
+def _merge_era(path: str) -> str:
+    from hermes_trader.agents.config_store import _deep_merge, compute_config_era
+    with open(path, encoding="utf-8") as f:
+        raw = json.load(f)
+    return compute_config_era(_deep_merge(CANONICAL_DEFAULTS, raw))["era_id"]
+
+
+def test_tracked_snapshot_era_matches_live():
+    """deploy/prod_override.json 是生产调优的版本化快照。
+
+    若它落后于 live，重新 apply 会把生产静默回退（历史上已发生：
+    chop.allow_shorts true、panic gate 缺失、trigger_weights 0.55/0.0）。
+    因此 era（入场选择/风控/仓位/实验臂阈值指纹）必须与 live 一致。
+    """
+    live = _live_config_path()
+    if live is None:
+        pytest.skip("live 配置文件不在本环境（仅本机/容器做零漂移守卫）")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    snapshot = os.path.join(root, "deploy", "prod_override.json")
+    if not os.path.isfile(snapshot):
+        pytest.skip("deploy/prod_override.json 不在本环境")
+    assert _merge_era(snapshot) == _merge_era(live), (
+        "deploy/prod_override.json 的 era 与 live 不一致：生产调优未回流。"
+        "运行 python scripts/apply_prod_override.py --capture "
+        f"--config {live} 重新捕获快照。")
+
+
+def test_repo_local_config_era_matches_live():
+    """仓库本地 .agent-config.json（gitignored 副本）也必须与 live 同 era。
+
+    它被 era_attribution / wfa / freeze_baseline 等离线工具读取；副本落后会
+    让离线归因的 era 与生产记账 era 对不上。仓库只读研究臂（reentry_cap /
+    signal_age_decay）不在 ERA_TRACKED_PATHS 内，因此不阻碍本条断言。
+    """
+    live = _live_config_path()
+    if live is None:
+        pytest.skip("live 配置文件不在本环境")
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    local = os.path.join(root, ".agent-config.json")
+    if not os.path.isfile(local):
+        pytest.skip("仓库本地 .agent-config.json 不在本环境")
+    assert _merge_era(local) == _merge_era(live), (
+        "仓库 .agent-config.json 的 era 与 live 不一致：本地副本已陈旧。"
+        "用 scripts/apply_prod_override.py 的捕获结果覆盖它（保留仓库只读研究臂）。")
