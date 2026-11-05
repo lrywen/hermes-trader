@@ -32,6 +32,48 @@ def _synthetic_candles(n=800, seed=7):
     return cs
 
 
+def test_quote_volume_24h_matches_naive_loop_with_gaps(monkeypatch):
+    """New prefix-sum path must equal the original 288-iteration loop exactly,
+    including missing bars (skip-None) and the all-missing -> None boundary."""
+    m = _mod()
+    from hermes_trader.data import binance_candles as B
+    BAR5 = m.BAR5
+    t0 = 1_700_000_000_000 - (1_700_000_000_000 % BAR5)
+    # Build a quote series with deliberate gaps (missing bars).
+    present = {}
+    for k in range(0, 400):
+        if k % 17 == 0:        # drop every 17th bar -> gaps inside the window
+            continue
+        present[t0 + k * BAR5] = float(1000 + k)
+    monkeypatch.setattr(B, "_QUOTE", {("AAA", "5m"): dict(present)}, raising=False)
+    monkeypatch.setattr(B, "_LOCK", __import__("threading").Lock(), raising=False)
+
+    data = m.Data(source="binance", use_network=False)
+
+    def naive(t5):
+        tot = 0.0
+        found = False
+        for k in range(288):
+            qv = present.get(t5 - k * BAR5)
+            if qv is not None:
+                tot += qv
+                found = True
+        return tot if found else None
+
+    for t5 in [t0 + 100 * BAR5, t0 + 287 * BAR5, t0 + 288 * BAR5,
+               t0 + 399 * BAR5, t0 + 500 * BAR5, t0 - 50 * BAR5]:
+        assert data.quote_volume_24h("AAA", t5) == naive(t5)
+
+
+def test_quote_volume_24h_none_when_no_bars(monkeypatch):
+    m = _mod()
+    from hermes_trader.data import binance_candles as B
+    monkeypatch.setattr(B, "_QUOTE", {}, raising=False)
+    monkeypatch.setattr(B, "_LOCK", __import__("threading").Lock(), raising=False)
+    data = m.Data(source="binance", use_network=False)
+    assert data.quote_volume_24h("NOPE", 1_700_000_000_000) is None
+
+
 def test_resample_4h_is_epoch_aligned_and_ohlcv():
     m = _mod()
     c5 = _synthetic_candles(800)

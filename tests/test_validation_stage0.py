@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 from pathlib import Path
 
 import pytest
@@ -425,11 +426,14 @@ def test_stage0_audit_cli_edge_clears_null_rejects_and_logs(tmp_path):
     _write_dataset(null, edge=False)
 
     def run(src, hyp):
+        env = dict(os.environ)
+        env["PYTHONPATH"] = os.pathsep.join(
+            [str(repo), env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
         return subprocess.run(
             [sys.executable, str(script), "--input", str(src),
              "--hypothesis", hyp, "--feature", "feat", "--ret", "ret",
              "--vol", "vol", "--ledger", str(ledger)],
-            capture_output=True, text=True, cwd=str(repo))
+            capture_output=True, text=True, cwd=str(repo), env=env)
 
     r1 = run(edge, "edge H1")
     assert r1.returncode == 0, r1.stdout + r1.stderr

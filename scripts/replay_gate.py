@@ -116,20 +116,49 @@ class Data:
             return None
         return [c for c in s if start_ms <= c.t <= end_ms]
 
+    def _qv_series(self, coin: str):
+        """Sorted (times, prefix-sums) of cached 5m quote notional for a coin.
+
+        Built once per coin from the same ``_QUOTE`` store ``quote_volume``
+        reads, so the trailing-24h window becomes O(log N) instead of 288 dict
+        gets per bar. Values are identical to the per-bar loop; missing bars are
+        simply absent from the series (matching the loop's skip-None semantics).
+        """
+        cache = getattr(self, "_qv_prefix", None)
+        if cache is None:
+            cache = self._qv_prefix = {}
+        from hermes_trader.data import binance_candles as B
+        with B._LOCK:
+            src = B._QUOTE.get((coin, "5m"), {})
+            n = len(src)
+            cached = cache.get(coin)
+            if cached is not None and cached[0] == n:
+                return cached[1]
+            # Copy only when (re)building: the store grew since last call.
+            qk = dict(src)
+        times = sorted(qk)
+        prefix = [0.0] * (len(times) + 1)
+        for i, t in enumerate(times):
+            prefix[i + 1] = prefix[i] + qk[t]
+        cache[coin] = (n, (times, prefix))
+        return cache[coin][1]
+
     def quote_volume_24h(self, coin: str, t5_ms: int) -> Optional[float]:
         """Trailing-24h USDT notional ending at t5_ms (binance only)."""
         if self.source != "binance":
             return None
         try:
-            from hermes_trader.data import binance_candles as B
-            tot = 0.0
-            found = False
-            for k in range(288):
-                qv = B.quote_volume(coin, "5m", t5_ms - k * BAR5)
-                if qv is not None:
-                    tot += qv
-                    found = True
-            return tot if found else None
+            from bisect import bisect_right
+            times, prefix = self._qv_series(coin)
+            if not times:
+                return None
+            # Window covers bar-open times (t5_ms - 287*BAR5) .. t5_ms inclusive,
+            # i.e. the same 288 bars the loop sums (k = 0..287).
+            hi = bisect_right(times, t5_ms)
+            lo = bisect_right(times, t5_ms - 288 * BAR5)
+            if hi <= lo:
+                return None
+            return prefix[hi] - prefix[lo]
         except Exception:
             return None
 

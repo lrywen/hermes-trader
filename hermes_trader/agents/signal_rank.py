@@ -250,6 +250,44 @@ def rank_jobs(
     return scored
 
 
+def orthogonal_rank_score(
+    perception: dict,
+    composite: float,
+    *,
+    weights: dict[str, float] | None = None,
+) -> float:
+    """Shadow-only counterfactual without composite/trigger double counting.
+
+    Removes the two trigger-derived terms (composite, trigger_quality) so the
+    remaining orthogonal signals (whale, cvd, liquidity, class_penalty) are
+    renormalised to fill the score. Used only for shadow attribution — never
+    reorders the live candidate list.
+    """
+    base = dict(DEFAULT_SCORE_WEIGHTS)
+    if weights:
+        for k, v in weights.items():
+            if k in base:
+                try:
+                    base[k] = max(0.0, float(v))
+                except (TypeError, ValueError):
+                    pass
+    # Zero the trigger-derived terms and renormalise ONLY over the orthogonal
+    # components, computing directly so rank_score's default-merge cannot
+    # re-introduce composite/trigger_quality.
+    base["composite"] = 0.0
+    base["trigger_quality"] = 0.0
+    total = sum(base.values())
+    if total <= 0:
+        return 0.0
+    positive = (
+        base["whale"] * _whale_component(perception)
+        + base["cvd"] * _cvd_component(perception)
+        + base["liquidity"] * _liquidity_component(perception)
+    ) / total
+    penalty = base["class_penalty"] * _class_penalty_component(perception) / total
+    return max(0.0, min(100.0, positive - penalty))
+
+
 def select_top_jobs(
     jobs: Sequence[Job],
     top_k: int,

@@ -130,11 +130,15 @@ def daily_realized_bps(state: Any, account: str = "taker") -> dict[str, Any]:
     if base <= 0:
         out["reason"] = "base_equity_non_positive"
         return out
-    days = sorted(by_day)
+    active_days = sorted(by_day)
+    days = (list(range(active_days[0], active_days[-1] + 1))
+            if active_days else [])
     out.update({
         "ok": True,
-        "series": [by_day[d] / base * 1e4 for d in days],
+        "series": [by_day.get(d, 0.0) / base * 1e4 for d in days],
         "days": days,
+        "active_days": len(active_days),
+        "calendar_days": len(days),
         "start_day": _utc_day(days[0]) if days else None,
         "end_day": _utc_day(days[-1]) if days else None,
     })
@@ -161,7 +165,7 @@ def main_strategy_wfa(
         return None
     from hermes_trader.validation import (
         block_bootstrap_ci,
-        probability_of_backtest_overfitting,
+        negative_oos_fold_ratio,
         sharpe,
         walk_forward_analysis,
     )
@@ -192,9 +196,7 @@ def main_strategy_wfa(
     # has no config-comparison matrix, so a true CSCV PBO cannot be computed;
     # emitting it under the name "pbo" overstated what it means. Renamed to
     # oos_negative_fold_ratio; true CSCV is a separate future work item.
-    oos_negative_fold_ratio = probability_of_backtest_overfitting(
-        [max(v, 0.0) for v in wfa.oos_mean_bps],
-        list(wfa.oos_mean_bps))
+    oos_negative_fold_ratio = negative_oos_fold_ratio(list(wfa.oos_mean_bps))
     mean_bps = statistics.mean(series)
     mean_oos_bps = statistics.mean(wfa.oos_mean_bps)
     dsr_statistical_passes = dsr is not None and dsr >= DSR_ACCEPT_P

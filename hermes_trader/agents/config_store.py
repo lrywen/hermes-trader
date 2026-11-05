@@ -90,6 +90,8 @@ ERA_TRACKED_PATHS: tuple[str, ...] = (
     "score_invariant_enabled",
     "scan.minCompositeScore",
     "runner_entry_gate.*",
+    "trigger_weights.*",
+    "trigger_thresholds.*",
     "ta_late_entry.*",
     # 风控 / 熔断类
     "market_circuit.*",

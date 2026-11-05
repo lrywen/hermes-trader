@@ -153,6 +153,26 @@ def test_custom_weights_respected_and_normalised():
     assert s == pytest.approx(40.0)
 
 
+def test_orthogonal_counterfactual_removes_only_reused_trigger_terms():
+    # High composite but no orthogonal signals: original is composite-driven,
+    # orthogonal must collapse to the neutral-liquidity-only floor.
+    p = _perception("AAA", composite=90.0)
+    # composite-only reference (what the score would be if composite dominated).
+    composite_only = sr.rank_score(p, 90.0, weights={
+        "composite": 1.0, "trigger_quality": 0.0, "whale": 0.0,
+        "cvd": 0.0, "liquidity": 0.0, "class_penalty": 0.0})
+    orthogonal = sr.orthogonal_rank_score(p, 90.0)
+    # composite term is gone: orthogonal ignores the 90 composite entirely.
+    assert orthogonal != composite_only
+    # only liquidity (neutral 50) and zero whale/cvd remain after renormalise.
+    assert orthogonal == pytest.approx(10.0)
+    # A whale-bearing perception keeps a non-trivial orthogonal score.
+    pw = _perception("AAA", composite=90.0, whale=True)
+    w = {"composite": 0.0, "trigger_quality": 0.0, "whale": 1.0,
+         "cvd": 0.0, "liquidity": 0.0, "class_penalty": 0.0}
+    assert sr.orthogonal_rank_score(pw, 90.0, weights=w) == pytest.approx(70.0)
+
+
 def test_bullish_fired_count_and_conjunction_view():
     # Names use the raw perception trigger naming (camelCase), unlike the
     # _trigger helper used elsewhere which is fine with arbitrary names.

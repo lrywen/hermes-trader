@@ -234,20 +234,44 @@ def deflated_sharpe_prob(
     return _norm_cdf(z)
 
 
-def probability_of_backtest_overfitting(
-    is_sharpe: list[float], oos_sharpe: list[float]
-) -> float:
-    """PBO：样本内最优策略在样本外落到中位数以下的路径占比。
+def negative_oos_fold_ratio(oos_returns: list[float]) -> float:
+    """负 OOS 折收益占比；这不是 CSCV/PBO。"""
+    if not oos_returns:
+        raise ValueError("OOS 收益序列须非空")
+    return sum(1 for value in oos_returns if value < 0) / len(oos_returns)
 
-    入参为按 CPCV 路径对齐的"各候选策略 IS 夏普矩阵 → 选中策略 OOS 夏普"。
-    简化接口：直接给每条路径上"被选中策略"的 IS 与 OOS 夏普，本函数据 OOS
-    相对该路径 OOS 横截面中位的位置估计；当只评估单一策略时，OOS 夏普<0
-    （即劣于零基准）即记为过拟合路径。
+
+def probability_of_backtest_overfitting(
+    is_sharpe: list[list[float]], oos_sharpe: list[list[float]]
+) -> float:
+    """CSCV PBO：IS 最优候选在 OOS 横截面中落到中位数以下的路径占比。
+
+    两个入参均为 ``paths × candidates`` 夏普矩阵。每条路径独立按 IS 选优，
+    再计算其 OOS logit 相对全部候选 OOS logit 的秩。单候选或一维序列没有
+    横截面选择信息，必须拒绝，不能退化成负 OOS 折比例。
     """
     if len(is_sharpe) != len(oos_sharpe) or not oos_sharpe:
-        raise ValueError("is/oos 夏普序列须等长且非空")
-    bad = sum(1 for s in oos_sharpe if s < 0)
-    return bad / len(oos_sharpe)
+        raise ValueError("IS/OOS 必须为等长、非空的路径×候选矩阵")
+    for is_row, oos_row in zip(is_sharpe, oos_sharpe):
+        if (not isinstance(is_row, (list, tuple))
+                or not isinstance(oos_row, (list, tuple))
+                or len(is_row) != len(oos_row) or len(is_row) < 2):
+            raise ValueError("PBO 需要每条路径至少两个候选，单策略不可计算")
+        if any(not math.isfinite(v) for v in (*is_row, *oos_row)):
+            raise ValueError("PBO 夏普矩阵必须全部为有限数")
+    overfit = 0
+    for is_row, oos_row in zip(is_sharpe, oos_sharpe):
+        selected = max(range(len(is_row)), key=lambda j: is_row[j])
+        cross = [math.log((1.0 + max(-0.999999, min(0.999999, v)))
+                          / (1.0 - max(-0.999999, min(0.999999, v))))
+                 for v in oos_row]
+        rank = 1 + sum(v < cross[selected] for v in cross)
+        # CSCV: relative rank ω = rank/(N+1) in (0,1); overfit when the IS-best
+        # candidate lands at or below the OOS cross-sectional median (ω ≤ 0.5,
+        # i.e. logit ω ≤ 0). Best candidate (rank=N) gives ω=N/(N+1)>0.5.
+        if rank / (len(oos_row) + 1.0) <= 0.5:
+            overfit += 1
+    return overfit / len(oos_sharpe)
 
 
 # --- 标准正态 CDF / PPF（Acklam / 误差函数近似），标准库实现 ---

@@ -61,6 +61,15 @@ def test_daily_bps_groups_same_day_and_uses_constant_base():
     assert out["sum_realized_net_usd"] == 0.8
 
 
+def test_daily_bps_fills_zero_return_calendar_days():
+    state = _state([_close(100, 0.5), _close(103, -0.2)], wallet=100.3)
+    out = w.daily_realized_bps(state)
+    assert out["days"] == [100, 101, 102, 103]
+    assert out["series"] == [50.0, 0.0, 0.0, -20.0]
+    assert out["active_days"] == 2
+    assert out["calendar_days"] == 4
+
+
 def test_daily_bps_drops_unparseable_fills_and_reports_counts():
     state = _state([
         {"type": "close", "realized_pnl_usd": 1.0},          # no ts

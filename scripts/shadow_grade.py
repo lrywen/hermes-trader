@@ -827,7 +827,7 @@ def r5_robustness(records: list[dict], n_trials: Optional[int] = None,
     if len(daily) < R5_MIN_DAYS:
         return None
     from hermes_trader.validation import (
-        block_bootstrap_ci, probability_of_backtest_overfitting, sharpe,
+        block_bootstrap_ci, negative_oos_fold_ratio, sharpe,
         walk_forward_analysis,
     )
     try:
@@ -835,9 +835,7 @@ def r5_robustness(records: list[dict], n_trials: Optional[int] = None,
             daily, train_size=R5_WFA_TRAIN_DAYS, test_size=R5_WFA_TEST_DAYS)
         lo, hi = block_bootstrap_ci(daily)
         sr = sharpe(daily)
-        oos_neg = probability_of_backtest_overfitting(
-            [max(v, 0.0) for v in wfa.oos_mean_bps],
-            list(wfa.oos_mean_bps))
+        oos_neg = negative_oos_fold_ratio(list(wfa.oos_mean_bps))
     except Exception as e:  # unrelated statistic failures retain old behavior
         logger.debug("r5_robustness failed: %s", e)
         return None

@@ -24,6 +24,7 @@ from .significance import (
     cpcv_paths,
     day_bps_series,
     deflated_sharpe_prob,
+    negative_oos_fold_ratio,
     probability_of_backtest_overfitting,
     sharpe,
     walk_forward_analysis,
@@ -92,6 +93,7 @@ __all__ = [
     "cpcv_paths",
     "walk_forward_analysis",
     "deflated_sharpe_prob",
+    "negative_oos_fold_ratio",
     "probability_of_backtest_overfitting",
     "sharpe",
     # P0-3 LLM 训练截止日污染标注

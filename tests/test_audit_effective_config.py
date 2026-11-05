@@ -75,3 +75,16 @@ def test_new_drift_is_unregistered(monkeypatch):
     })
     unregistered, _ = mod._audit()
     assert any(r["leaf"] == "thresholds.sigmaThreshold" for r in unregistered)
+
+
+def test_provenance_pins_source_hash_era_commit_and_effective_values():
+    mod = _load()
+    p = mod._provenance()
+    assert p["config_path"]
+    assert len(p["config_sha256"]) == 64
+    assert len(p["era"]["era_id"]) == 12
+    assert "trigger_weights" in p["era"]["tracked"]
+    assert "trigger_thresholds" in p["era"]["tracked"]
+    assert p["code_commit"] is None or len(p["code_commit"]) == 40
+    assert p["trigger_weights"] == mod.trigger_weights_params()
+    assert p["trigger_thresholds"] == mod.trigger_thresholds_params()

@@ -209,7 +209,30 @@ def test_axis_curve_covers_all_grid_values_off_baseline():
     curve_adx = mod.axis_curve(rows, "adx_floor", adxs)
     assert [p["axis"] for p in curve_ext] == exts
     assert [p["axis"] for p in curve_adx] == adxs
-    assert all(p["n"] == 30 and p["sign_consistent"] for p in curve_ext)
+    assert all(p["n"] == 20 and p["sign_consistent"] for p in curve_ext)
+    assert all(set(p["evs"]) == {"train", "val"} for p in curve_ext)
+
+
+def test_axis_curve_and_plateau_pick_ignore_test_outcomes():
+    mod = _load_module()
+
+    def _row(ext, test_ev, test_n):
+        return {
+            "params": {"rsi_ob": mod.BASE_PARAMS["rsi_ob"], "ext_ob": ext,
+                       "adx_floor": mod.BASE_PARAMS["adx_trend_threshold"],
+                       "relax": mod.BASE_PARAMS["trend_relax_enabled"]},
+            "train": {"blocked": {"ev": -1.0, "n": 40}},
+            "val": {"blocked": {"ev": -0.5, "n": 40}},
+            "test": {"blocked": {"ev": test_ev, "n": test_n}},
+        }
+
+    exts = [2.0, 2.25, 2.5]
+    before = [_row(e, -100.0 if e == 2.0 else 100.0, 1) for e in exts]
+    after = [_row(e, 100.0 if e == 2.0 else -100.0, 10_000) for e in exts]
+    assert mod.axis_curve(before, "ext_ob", exts) == mod.axis_curve(
+        after, "ext_ob", exts)
+    assert mod.plateau_pick(mod.axis_curve(before, "ext_ob", exts)) == \
+        mod.plateau_pick(mod.axis_curve(after, "ext_ob", exts))
 
 
 # ---------------------------------------------------------------------------

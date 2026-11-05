@@ -12,6 +12,7 @@ from hermes_trader.validation import (
     cpcv_paths,
     day_bps_series,
     deflated_sharpe_prob,
+    negative_oos_fold_ratio,
     probability_of_backtest_overfitting,
     sharpe,
 )
@@ -106,21 +107,28 @@ def test_dsr_validates_inputs():
         deflated_sharpe_prob(0.1, n_trials=1, n_obs=1)
 
 
-def test_pbo_all_negative_is_one():
-    p = probability_of_backtest_overfitting([0.1, 0.2], [-0.1, -0.3])
-    assert p == 1.0
-
-
-def test_pbo_all_positive_is_zero():
-    p = probability_of_backtest_overfitting([0.1, 0.2], [0.1, 0.3])
-    assert p == 0.0
-
-
-def test_pbo_validates_lengths():
+def test_negative_oos_fold_ratio_is_not_pbo():
+    assert negative_oos_fold_ratio([-0.1, -0.3]) == 1.0
+    assert negative_oos_fold_ratio([0.1, 0.3]) == 0.0
     with pytest.raises(ValueError):
-        probability_of_backtest_overfitting([0.1], [])
+        negative_oos_fold_ratio([])
+
+
+def test_pbo_uses_is_selected_candidate_oos_cross_section():
+    # Path 1: IS best = candidate 0, but OOS candidate 0 is worst -> overfit.
+    # Path 2: IS best = candidate 1, and OOS candidate 1 is best -> not overfit.
+    is_matrix = [[0.9, 0.1], [0.1, 0.9]]
+    oos_matrix = [[-0.5, 0.5], [-0.5, 0.9]]
+    assert probability_of_backtest_overfitting(is_matrix, oos_matrix) == 0.5
+
+
+def test_pbo_rejects_single_candidate_and_malformed_matrices():
+    with pytest.raises(ValueError, match="至少两个候选"):
+        probability_of_backtest_overfitting([[0.1]], [[-0.1]])
     with pytest.raises(ValueError):
-        probability_of_backtest_overfitting([0.1, 0.2], [0.1])
+        probability_of_backtest_overfitting([0.1, 0.2], [0.1, 0.3])
+    with pytest.raises(ValueError):
+        probability_of_backtest_overfitting([[0.1, 0.2]], [[0.1]])
 
 
 def test_norm_ppf_cdf_roundtrip():

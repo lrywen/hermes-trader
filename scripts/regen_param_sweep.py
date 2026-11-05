@@ -570,9 +570,11 @@ def plateau_pick(curve: list[dict[str, Any]], *, value_key: str = "ev",
 
 def axis_curve(rows: list[dict[str, Any]], axis: str,
                values: list[float]) -> list[dict[str, Any]]:
-    """Single-axis curve (other axes fixed at baseline): blocked-set EV per
-    segment, sign consistency, and the validate+test agreement the plateau
-    picker needs."""
+    """Single-axis selection curve using train/validation data only.
+
+    Test outcomes remain in the sweep rows for the final untouched evaluation,
+    but must not affect the axis EV, sample count, sign consistency or pick.
+    """
     base = BASE_PARAMS
     out: list[dict[str, Any]] = []
     for v in values:
@@ -591,15 +593,15 @@ def axis_curve(rows: list[dict[str, Any]], axis: str,
                 break
         if match is None:
             continue
-        evs = {seg: match[seg]["blocked"].get("ev")
-               for seg in ("train", "val", "test")}
-        have = [e for e in evs.values() if e is not None]
+        selection_evs = {seg: match[seg]["blocked"].get("ev")
+                         for seg in ("train", "val")}
+        have = [e for e in selection_evs.values() if e is not None]
         out.append({
             "axis": v,
-            "ev": evs.get("val"),
-            "evs": evs,
+            "ev": selection_evs.get("val"),
+            "evs": selection_evs,
             "n": sum(match[seg]["blocked"].get("n", 0)
-                     for seg in ("train", "val", "test")),
+                     for seg in ("train", "val")),
             "sign_consistent": bool(have) and
                 (all(e < 0 for e in have) or all(e > 0 for e in have)),
         })

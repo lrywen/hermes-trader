@@ -35,7 +35,7 @@ from hermes_trader.validation import (
     block_bootstrap_ci,
     cpcv_paths,
     day_bps_series,
-    probability_of_backtest_overfitting,
+    negative_oos_fold_ratio,
     sharpe,
 )
 from hermes_trader.validation.trial_ledger import (
@@ -129,8 +129,7 @@ def evaluate(
         cpcv = cpcv_paths(s, n_groups=6, n_test_groups=2, embargo=1)
         sr = sharpe(s)
         # H3: this is the OOS-negative fold ratio, NOT CSCV overfitting prob.
-        oos_neg = probability_of_backtest_overfitting([sr] * cpcv.n_paths,
-                                                      list(cpcv.oos_sharpe))
+        oos_neg = negative_oos_fold_ratio(list(cpcv.oos_sharpe))
         row = {
             "arm": arm,
             "days": len(s),

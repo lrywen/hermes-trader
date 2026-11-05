@@ -56,6 +56,17 @@ def test_era_subtree_wildcard_sensitive():
     assert "market_circuit" not in missing["tracked"]
 
 
+def test_era_tracks_effective_trigger_weights_and_thresholds():
+    base = {"trigger_weights": {"breakout": 0.3},
+            "trigger_thresholds": {"breakout_lookback": 48}}
+    weights = {"trigger_weights": {"breakout": 0.4},
+               "trigger_thresholds": {"breakout_lookback": 48}}
+    thresholds = {"trigger_weights": {"breakout": 0.3},
+                  "trigger_thresholds": {"breakout_lookback": 24}}
+    assert compute_config_era(base)["era_id"] != compute_config_era(weights)["era_id"]
+    assert compute_config_era(base)["era_id"] != compute_config_era(thresholds)["era_id"]
+
+
 def test_compute_config_era_never_raises(monkeypatch):
     # 记账埋点在下单热路径上，任何异常都必须被吞掉。
     monkeypatch.setattr(cs, "_extract_tracked_subset", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("boom")))

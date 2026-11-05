@@ -14,7 +14,9 @@ Exit codes: 0 = no unregistered divergence; 1 = unregistered divergence found;
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import subprocess
 import sys
 
 from hermes_trader.agents.config import (
@@ -75,18 +77,45 @@ def _audit() -> tuple[list[dict], list[dict]]:
     return unregistered, reviewed
 
 
+def _provenance() -> dict:
+    from hermes_trader.agents.config_store import (
+        CONFIG_PATH,
+        compute_config_era,
+        read_agent_config,
+    )
+
+    raw = read_agent_config()
+    raw_bytes = json.dumps(raw, sort_keys=True, separators=(",", ":")).encode()
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True,
+            stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.SubprocessError):
+        commit = None
+    return {
+        "config_path": CONFIG_PATH,
+        "config_sha256": hashlib.sha256(raw_bytes).hexdigest(),
+        "era": compute_config_era(raw),
+        "code_commit": commit,
+        "trigger_weights": trigger_weights_params(),
+        "trigger_thresholds": trigger_thresholds_params(),
+    }
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--json", action="store_true", help="machine-readable output")
     args = ap.parse_args()
     try:
         unregistered, reviewed = _audit()
+        provenance = _provenance()
     except Exception as e:  # resolution failure must be loud, never silent-green
         print(f"effective-config audit ERROR: {e!r}", file=sys.stderr)
         return 2
 
     if args.json:
-        print(json.dumps({"unregistered": unregistered, "reviewed": reviewed},
+        print(json.dumps({"provenance": provenance,
+                          "unregistered": unregistered, "reviewed": reviewed},
                          ensure_ascii=False, indent=2))
     else:
         print("== reviewed (sanctioned, value-bound) ==")

@@ -147,7 +147,7 @@ from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
-from hermes_trader.agents.signal_rank import RANK_CALIBER, conjunction_view, rank_jobs, rank_score, select_top_jobs
+from hermes_trader.agents.signal_rank import RANK_CALIBER, conjunction_view, orthogonal_rank_score, rank_jobs, rank_score, select_top_jobs
 from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
@@ -2788,9 +2788,13 @@ while True:
                     "ts": now_ms,
                     "mode": _sr_mode,
                     "rank_caliber": RANK_CALIBER,
+                    "counterfactual_caliber": "orthogonal_no_trigger_reuse_v1",
                     "n": len(_sr_ranked),
                     "ranking": [
                         {"coin": _j[0], "score": round(_rs, 2),
+                         "orthogonal_score": round(
+                             orthogonal_rank_score(
+                                 _j[1], _j[2], weights=_sr_weights), 2),
                          "composite": round(float(_j[2]), 1)}
                         for _j, _rs in _sr_ranked],
                 }, stream="signal_ranking")
