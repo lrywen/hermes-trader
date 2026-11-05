@@ -169,6 +169,12 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "runner_entry_gate.mover_bypass_veto.shadow_mode": (False, True),
     "runner_entry_gate.mover_bypass_veto.enforce": (False, True),
     "runner_entry_gate.overextension_veto.shadow_mode": (False, True),
+    # 2026-11-06: 影子观测阈值 3.0 -> 2.0。零记录的根因是上游遮蔽：
+    # ta_late_entry.ext_ob=2.5 会把所有 extension_4h>2.5 的长单提前 return，
+    # 而影子臂只在 >=3.0 才记录，可达区间只剩 relaxed 的 (2.5,3.5] 且需再穿过
+    # 其它门。降到 2.0 让 (2.0,2.5] 这一段真正被观测到。该臂只有记录分支
+    # （executor 无 enforce 分支），降低观测阈值不可能放宽任何资金保护。
+    "runner_entry_gate.overextension_veto.max_extension_atr": (3.0, 2.0),
     # Stage-4 deep slow-burn veto: production records would-blocks for real
     # forward reconciliation; admission/orders unchanged. enforce stays false.
     "runner_entry_gate.deep_slow_burn_veto.shadow_mode": (False, True),
@@ -182,6 +188,12 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "loop_runtime.ws_status_event": (False, True),
     "regime_risk_overlay.enabled": (False, True),
     "runner_entry_gate.pullback_long.enabled": (False, True),
+    # 2026-11-06：S3 影子空单通道在生产开启。它是纯决策层
+    # （s3_shadow_gate.shadow_short_allowed）：仅当 mode=SHADOW 且 resolved
+    # regime ∈ allow_regimes 时，把空头候选放进影子账簿（零交易所敞口）；
+    # LIVE/OFF 恒返回 False（fail-closed）。三个冻结开关
+    # （scan_long_only / allow_shorts / min_short_volume_usd）保持原值未动。
+    "s3_shadow_shorts.enabled": (False, True),
     # P0-2 (2026-10-19)：long-only 研究节流。live=true 让 loop 在付费 LLM research
     # 前砍掉纯空头候选（allow_shorts=false 时反正会被末端闸门拒），只省 token/降噪，
     # 不放宽任何资金保护；terminal runner_entry_gate.allow_shorts 仍是权威空头开关。
@@ -221,6 +233,10 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "max_daily_loss_usd": (-2.0, -3),
     "tp_scale_fraction": (0.5, 0.4),
     "debate_research.use_structured_output": (True, False),
+    # 2026-11-06：生产把辩论研究的总时延预算从 canonical 75s 收到 55s（live 更严，
+    # 超时即跳过辩论回落到基础信号，不放宽任何下单/风控约束）。这是已有的生产调优，
+    # 本轮仅补登记以闭合启动门禁；值被改会重新变红。
+    "debate_research.max_latency_s": (75.0, 55),
     # recheck-4 P0-C：live-only 叶（canonical 无此键，canonical 侧为 None）。
     # HYPE 币级 ATR 止损 override，为生产新增的 per-coin 收紧，无风险内容。值绑定
     # (None, live) 使「新增未被登记的 live-only 叶」或「这些叶值被改」都会变红。

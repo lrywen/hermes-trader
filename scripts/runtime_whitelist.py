@@ -50,6 +50,8 @@ RUNTIME_SCRIPTS: tuple[str, ...] = (
     "reconcile_xs_reversal_shadow.py",
     "reconcile_relax_tier_shadow.py",
     "macro_regime_watch.py",
+    # P0 (2026-11-06): hourly universe-wide xs_reversal shadow sweep.
+    "xs_reversal_sweep.py",
     "prepare_canary_promotion.py",
     # Web UI spawn / lazy import.
     "regen_param_sweep.py",

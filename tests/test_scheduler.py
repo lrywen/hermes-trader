@@ -43,7 +43,7 @@ def _job(name: str) -> ScheduledJob:
 
 def test_job_table_has_six_jobs_and_existing_scripts() -> None:
     repo_root = Path(scheduler.__file__).resolve().parent.parent
-    assert len(SCHEDULED_JOBS) == 12
+    assert len(SCHEDULED_JOBS) == 13
     for job in SCHEDULED_JOBS:
         assert (repo_root / job.argv[0]).is_file(), job.argv[0]
 
@@ -117,6 +117,13 @@ def test_hourly_job_table_matches_compose_window() -> None:
     assert job.minute_of_hour == 5
     assert tuple(job.argv) == ("scripts/macro_regime_watch.py", "--push")
     assert job.log_name == "macro-regime-watch.log"
+
+    # P0 (2026-11-06): universe-wide xs_reversal sweep, hourly at :45.
+    sweep = _job("xs_reversal_sweep")
+    assert sweep.minute_of_day is None
+    assert sweep.minute_of_hour == 45
+    assert tuple(sweep.argv) == ("scripts/xs_reversal_sweep.py",)
+    assert sweep.log_name == "xs-reversal-sweep.log"
 
 
 # ---------------------------------------------------------------------------

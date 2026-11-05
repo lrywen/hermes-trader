@@ -73,7 +73,7 @@
     "bull_timeout_s": null,
     "cache_ttl_s": 300,
     "enabled": true,
-    "max_latency_s": 75,
+    "max_latency_s": 55,
     "shadow_ab": {
       "min_composite": 60
     },
@@ -87,7 +87,6 @@
     "breach_confirm_sec": 4,
     "hard_stop_confirm_sec": 1,
     "hard_timeout_minutes": 240,
-    "ignite_grace_minutes": null,
     "ignite_grace_shadow": {
       "shadow_mode": true
     },
@@ -346,6 +345,7 @@
     },
     "mover_min_composite": 30,
     "overextension_veto": {
+      "max_extension_atr": 2.0,
       "shadow_mode": true
     },
     "per_coin_cooldown": {
@@ -370,6 +370,9 @@
     "min_crypto_24h_pct": 10,
     "min_hip3_24h_pct": 8
   },
+  "s3_shadow_shorts": {
+    "enabled": true
+  },
   "scan_budget": {
     "hip3_movers_floor_usd": 1000000,
     "movers_min_pct": 1,
@@ -381,6 +384,9 @@
     "maker_fill_model": "v2",
     "maker_limit_offset_bps": 12.0,
     "maker_v2_base_fill_prob": 0.22,
+    "maker_v2_coins": [
+      "BTC"
+    ],
     "starting_balance": 20
   },
   "short_volume": {

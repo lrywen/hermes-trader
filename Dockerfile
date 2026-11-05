@@ -68,6 +68,7 @@ COPY scripts/reconcile_ta_late_entry_shadow.py scripts/reconcile_ta_late_entry_s
 COPY scripts/reconcile_xs_reversal_shadow.py scripts/reconcile_xs_reversal_shadow.py
 COPY scripts/reconcile_relax_tier_shadow.py scripts/reconcile_relax_tier_shadow.py
 COPY scripts/macro_regime_watch.py scripts/macro_regime_watch.py
+COPY scripts/xs_reversal_sweep.py scripts/xs_reversal_sweep.py
 COPY scripts/prepare_canary_promotion.py scripts/prepare_canary_promotion.py
 COPY scripts/regen_param_sweep.py scripts/regen_param_sweep.py
 COPY scripts/shadow_grade.py scripts/shadow_grade.py

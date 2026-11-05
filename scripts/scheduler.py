@@ -15,6 +15,12 @@ with testable data + pure functions. The schedule (UTC):
   00:50  reconcile_relax_tier_shadow --write
   00:55  prepare_canary_promotion --write
   HH:05  macro_regime_watch --push (every hour)
+  HH:45  xs_reversal_sweep (every hour; universe-wide shadow scan)
+
+P0 (2026-11-06): xs_reversal_sweep. The oversold-bounce shadow arm was only
+evaluated when a coin happened to be an entry candidate, so it went 3.3 days
+without a trigger while its heartbeat stayed fresh. The sweep evaluates the
+whole universe once per hour, off the trade path (record-only).
 
 P1 (2026-11-01): reconcile_fills joins the daily table at 00:35. The script
 existed but was never scheduled, so local↔exchange fill drift (the "measurement
@@ -148,6 +154,16 @@ SCHEDULED_JOBS: tuple[ScheduledJob, ...] = (
         argv=("scripts/macro_regime_watch.py", "--push"),
         log_name="macro-regime-watch.log",
         minute_of_hour=5,
+    ),
+    # P0 (2026-11-06): universe-wide xs_reversal shadow sweep. Runs at :45 so
+    # it never shares a window with macro_regime_watch (:05) or the 00:xx
+    # daily batch; the 44-coin serial walk is budget-capped well inside the
+    # 900s job timeout.
+    ScheduledJob(
+        name="xs_reversal_sweep",
+        argv=("scripts/xs_reversal_sweep.py",),
+        log_name="xs-reversal-sweep.log",
+        minute_of_hour=45,
     ),
     # P1 (2026-11-01): weekly refresh of the production 1d candle cache so the
     # 400-day history every gate reconcile depends on never goes stale again.

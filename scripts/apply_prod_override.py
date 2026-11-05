@@ -116,19 +116,27 @@ def _canonical_delta(live: dict) -> dict:
     runner_entry_gate.min_confidence).  Comparison is byte-strict so a genuine
     type change (int 4 vs float 4.0) is still captured as a delta.
 
-    ``None`` is ALWAYS kept: ``_deep_merge`` treats it as a deletion marker, so
-    dropping it would resurrect the canonical value instead of deleting the
-    key (era-visible: ``dsl_exit.ignite_grace_minutes``).
+    ``None`` is kept only when it actually deletes something: if the canonical
+    value is also ``None`` (or absent), storing the null would turn an
+    already-unset key into an absent one. Both are the same effective state
+    (``_reify_none_defaults``) but the era fingerprint hashes the raw merged
+    node, so the spurious null made the snapshot's era drift from live
+    (``dsl_exit.ignite_grace_minutes``, caught by
+    test_tracked_snapshot_era_matches_live).
     """
     live_flat = _flatten(live)
     canon_flat = _flatten(CANONICAL_DEFAULTS)
     keep = {}
     for path, value in live_flat.items():
-        if value is not None:
-            canon = canon_flat.get(path, _MISSING)
-            if canon is not _MISSING and (
-                    json.dumps(value, sort_keys=True) == json.dumps(canon, sort_keys=True)):
+        canon = canon_flat.get(path, _MISSING)
+        if value is None:
+            if canon is _MISSING or canon is None:
                 continue
+            keep[path] = value
+            continue
+        if canon is not _MISSING and (
+                json.dumps(value, sort_keys=True) == json.dumps(canon, sort_keys=True)):
+            continue
         keep[path] = value
     return _unflatten(keep)
 
