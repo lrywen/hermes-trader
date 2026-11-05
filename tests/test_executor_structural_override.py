@@ -90,6 +90,27 @@ def test_upgrade_mutates_verdict_side_and_confidence(monkeypatch):
     assert an["reasoning"].startswith("[structural override] ")
 
 
+def test_news_boosted_upgrade_writes_bypass_audit(monkeypatch):
+    _patch(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        executor, "_record_regime_bypass",
+        lambda analysis, override, **details: calls.append(
+            (analysis["id"], override, details)))
+    enf = types.SimpleNamespace(
+        veto=False, boost=True, boost_reason="economic news surge")
+    an = _an()
+    res = override_path(
+        an, {}, "LIVE", override_strong=True,
+        od=_od(enf=enf, bar=55.0, base_bar=65.0, composite_strong=True))
+    assert res is None
+    assert an["verdict"] == "LONG"
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("a1", "news")
+    assert calls[0][2]["boost_reason"] == "economic news surge"
+    assert calls[0][2]["base_bar_would_block"] is True
+
+
 def test_ta_sidestep_sets_flag(monkeypatch):
     _patch(monkeypatch)
     an = _an()

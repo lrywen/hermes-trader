@@ -28,22 +28,98 @@ from __future__ import annotations
 
 import argparse
 import json
+from datetime import datetime, timezone
+from typing import Optional
 
 from hermes_trader.validation import (
     block_bootstrap_ci,
     cpcv_paths,
     day_bps_series,
-    deflated_sharpe_prob,
     probability_of_backtest_overfitting,
     sharpe,
+)
+from hermes_trader.validation.trial_ledger import (
+    TrialLedger,
+    TrialLedgerError,
+    deflated_sharpe_from_ledger,
 )
 
 DSR_ACCEPT_P = 0.95
 
 
-def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
-             n_trials: int) -> dict:
+def _input_as_of(path: str, arms: tuple[str, ...]) -> Optional[str]:
+    """Latest source-trade timestamp, used as one auditable as-of for all arms."""
+    latest = None
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            rec = json.loads(line)
+            if rec.get("type") != "trade" or rec.get("arm") not in arms:
+                continue
+            try:
+                ts = int(rec["entry_t"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            latest = ts if latest is None else max(latest, ts)
+    if latest is None:
+        return None
+    return datetime.fromtimestamp(latest / 1000, timezone.utc).isoformat().replace(
+        "+00:00", "Z")
+
+
+def evaluate(
+        path: str,
+        arms: tuple[str, ...],
+        boot: int,
+        seed: int,
+        n_trials: Optional[int] = None,
+        *,
+        as_of=None,
+        ledger_path=None,
+        ledger: Optional[TrialLedger] = None,
+        output_path: Optional[str] = "/tmp/validate_outcome.json") -> dict:
+    """Validate every arm against its own ``arm×daily_outcome`` ledger family.
+
+    ``n_trials`` is accepted only for positional compatibility and is ignored.
+    Any family/as-of/ledger failure is returned as machine-readable evidence and
+    makes the overall verdict fail closed; no implicit multiplicity is used.
+    """
+    as_of = as_of or _input_as_of(path, arms)
     rows: list[dict] = []
+    dsr_errors: list[dict] = []
+
+    def attach_dsr(row: dict, arm: str, sr: float) -> None:
+        try:
+            evidence = deflated_sharpe_from_ledger(
+                observed_sharpe=sr,
+                n_obs=row["days"],
+                arm=arm,
+                paradigm="daily_outcome",
+                as_of=as_of,
+                ledger_path=ledger_path,
+                ledger=ledger,
+            )
+        except TrialLedgerError as exc:
+            error = exc.as_dict()
+            error["arm"] = arm
+            row.update({
+                "dsr_p": None,
+                "n_trials": None,
+                "trial_evidence": None,
+                "dsr_error": error,
+                "dsr_statistical_passes": False,
+                "dsr_promotion_eligible": False,
+            })
+            dsr_errors.append(error)
+            return
+        row.update({
+            "dsr_p": round(evidence["dsr_p"], 4),
+            "n_trials": evidence["n_trials"],
+            "trial_evidence": evidence,
+            "dsr_error": None,
+            "dsr_statistical_passes": evidence["dsr_p"] >= DSR_ACCEPT_P,
+            "dsr_promotion_eligible": evidence["promotion_eligible"],
+        })
+
     for arm in arms:
         s = day_bps_series(path, arm)
         if len(s) < 12:
@@ -52,28 +128,43 @@ def evaluate(path: str, arms: tuple[str, ...], boot: int, seed: int,
         lo, hi = block_bootstrap_ci(s, boot, seed)
         cpcv = cpcv_paths(s, n_groups=6, n_test_groups=2, embargo=1)
         sr = sharpe(s)
-        dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(s))
         # H3: this is the OOS-negative fold ratio, NOT CSCV overfitting prob.
         oos_neg = probability_of_backtest_overfitting([sr] * cpcv.n_paths,
                                                       list(cpcv.oos_sharpe))
-        rows.append({
+        row = {
             "arm": arm,
             "days": len(s),
             "bb_ci": [round(lo, 2), round(hi, 2)],
             "bb_positive": lo > 0,
             "cpcv_oos_pos_frac": round(cpcv.oos_win_frac, 3),
             "sharpe": round(sr, 3),
-            "dsr_p": round(dsr, 4),
             "oos_negative_fold_ratio": round(oos_neg, 3),
-        })
+        }
+        attach_dsr(row, arm, sr)
+        rows.append(row)
 
-    # 二值判定：存在任一臂 bb_positive 且 dsr_p 通过，才可能为 edge
-    any_pos = any(r.get("bb_positive") and r.get("dsr_p", 0) >= DSR_ACCEPT_P
+    any_pos = any(r.get("bb_positive") and r.get("dsr_statistical_passes")
                   for r in rows if "skip" not in r)
-    verdict = "POSITIVE_EDGE_POSSIBLE" if any_pos else "NEGATIVE_EXPECTANCY"
-    result = {"verdict": verdict, "arms": rows}
-    json.dump(result, open("/tmp/validate_outcome.json", "w", encoding="utf-8"),
-              ensure_ascii=False, indent=2)
+    statistical_verdict = (
+        "POSITIVE_EDGE_POSSIBLE" if any_pos else "NEGATIVE_EXPECTANCY")
+    promotion_eligible = not dsr_errors and any(
+        r.get("bb_positive") and r.get("dsr_statistical_passes")
+        and r.get("dsr_promotion_eligible")
+        for r in rows if "skip" not in r)
+    result = {
+        "verdict": "fail_closed" if dsr_errors else statistical_verdict,
+        "statistical_verdict": statistical_verdict,
+        "as_of": as_of,
+        "arms": rows,
+        "dsr_errors": dsr_errors,
+        "promotion_eligible": promotion_eligible,
+        "promotion_block": (
+            "dsr_fail_closed" if dsr_errors else
+            None if promotion_eligible else "legacy_import_only"),
+    }
+    if output_path:
+        with open(output_path, "w", encoding="utf-8") as fh:
+            json.dump(result, fh, ensure_ascii=False, indent=2)
     return result
 
 
@@ -83,10 +174,13 @@ def main() -> None:
     ap.add_argument("--arms", default="filt,filt_exch,filt_ra,baseline")
     ap.add_argument("--boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=20260920)
-    ap.add_argument("--n-trials", type=int, default=16,
-                    help="DSR 多重试验次数口径（臂数×已试范式/周期）")
+    ap.add_argument("--as-of", default=None,
+                    help="DSR 账本截止时刻；默认取输入交易的最新 entry_t")
+    ap.add_argument("--trial-ledger", default=None,
+                    help="DSR 试验账本 JSONL（默认读包内账本或环境变量）")
     a = ap.parse_args()
-    r = evaluate(a.input, tuple(a.arms.split(",")), a.boot, a.seed, a.n_trials)
+    r = evaluate(a.input, tuple(a.arms.split(",")), a.boot, a.seed,
+                 as_of=a.as_of, ledger_path=a.trial_ledger)
 
     print(f"verdict = {r['verdict']}")
     print(f"{'arm':11s} {'天':>4s} {'block-bootstrap 95%CI':>26s} "
@@ -96,9 +190,11 @@ def main() -> None:
             print(f"{x['arm']:11s}   {x['skip']}")
         else:
             lo, hi = x["bb_ci"]
+            dsr_text = (f"{x['dsr_p']:7.4f}" if x.get("dsr_p") is not None
+                        else "  closed")
             print(f"{x['arm']:11s} {x['days']:4d} [{lo:9.2f},{hi:9.2f}] "
                   f"{x['cpcv_oos_pos_frac']:14.2f} {x['sharpe']:7.3f} "
-                  f"{x['dsr_p']:7.4f} {x['oos_negative_fold_ratio']:7.3f}")
+                  f"{dsr_text} {x['oos_negative_fold_ratio']:7.3f}")
     print("\n明细 → /tmp/validate_outcome.json")
 
 

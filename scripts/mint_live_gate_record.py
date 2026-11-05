@@ -39,8 +39,19 @@ from hermes_trader.agents import config_store, live_gate
 from hermes_trader.agents.config_store import (
     read_agent_config,
 )
+from hermes_trader.validation.trial_ledger import (
+    TrialLedger,
+    TrialLedgerError,
+    deflated_sharpe_from_ledger,
+)
 
 DSR_ACCEPT_P = 0.95
+
+
+def _refuse(code: str, message: str, **details) -> None:
+    error = {"code": code, "message": message, "details": details}
+    raise SystemExit("refusing to mint: " + json.dumps(
+        {"error": error}, ensure_ascii=False, sort_keys=True))
 
 
 def _load_validation_result(args: argparse.Namespace) -> dict:
@@ -56,7 +67,8 @@ def _load_validation_result(args: argparse.Namespace) -> dict:
         spec.loader.exec_module(mod)  # type: ignore[union-attr]
         return mod.evaluate(
             args.input, tuple(args.arms.split(",")),
-            args.boot, args.seed, args.n_trials)
+            args.boot, args.seed, as_of=args.as_of,
+            ledger_path=args.trial_ledger)
     # Default: the file validate_outcome writes.
     default = "/tmp/validate_outcome.json"
     if not os.path.exists(default):
@@ -67,22 +79,84 @@ def _load_validation_result(args: argparse.Namespace) -> dict:
         return json.load(fh)
 
 
-def _select_positive_arm(result: dict) -> dict:
+def _select_positive_arm(
+        result: dict,
+        *,
+        as_of=None,
+        ledger_path=None,
+        ledger: TrialLedger | None = None) -> dict:
+    """Recompute every candidate's DSR from current ledger evidence.
+
+    A validation JSON is data, not authorization: stale/default trial counts,
+    incomplete family coverage and legacy-only families are all rejected.
+    """
+    as_of = as_of or result.get("as_of")
+    if result.get("verdict") == "fail_closed" or result.get("dsr_errors"):
+        _refuse("validation_fail_closed", "validation result has DSR errors",
+                as_of=as_of, dsr_errors=result.get("dsr_errors", []))
     rows = result.get("arms", [])
-    ok = [
-        r for r in rows
-        if "skip" not in r
-        and r.get("bb_positive")
-        and float(r.get("bb_ci", [0, 0])[0]) > 0
-        and float(r.get("dsr_p", 0)) >= DSR_ACCEPT_P
-    ]
+    ok = []
+    coverage_errors = []
+    legacy_statistical_passes = []
+    for source in rows:
+        if "skip" in source:
+            continue
+        arm_name = str(source.get("arm", ""))
+        try:
+            evidence = deflated_sharpe_from_ledger(
+                observed_sharpe=float(source["sharpe"]),
+                n_obs=int(source["days"]),
+                arm=arm_name,
+                paradigm="daily_outcome",
+                as_of=as_of,
+                ledger_path=ledger_path,
+                ledger=ledger,
+            )
+            reported_dsr = float(source["dsr_p"])
+            if abs(reported_dsr - evidence["dsr_p"]) > 0.000051:
+                raise TrialLedgerError(
+                    "validation_evidence_mismatch",
+                    "validation DSR does not match current ledger evidence",
+                    path=evidence["ledger_path"],
+                    details={"arm": arm_name, "reported": reported_dsr,
+                             "recomputed": evidence["dsr_p"]},
+                )
+        except TrialLedgerError as exc:
+            error = exc.as_dict()
+            error["arm"] = arm_name
+            coverage_errors.append(error)
+            continue
+        except (KeyError, TypeError, ValueError) as exc:
+            coverage_errors.append({
+                "code": "invalid_validation_row", "arm": arm_name,
+                "message": str(exc),
+            })
+            continue
+        row = dict(source)
+        row["n_trials"] = evidence["n_trials"]
+        row["trial_evidence"] = evidence
+        statistically_positive = (
+            row.get("bb_positive")
+            and float(row.get("bb_ci", [0, 0])[0]) > 0
+            and evidence["dsr_p"] >= DSR_ACCEPT_P)
+        if statistically_positive and not evidence["promotion_eligible"]:
+            legacy_statistical_passes.append({
+                "arm": arm_name, "block": evidence["promotion_block"]})
+        if statistically_positive and evidence["promotion_eligible"]:
+            ok.append(row)
+    if coverage_errors:
+        _refuse("dsr_fail_closed", "ledger coverage or evidence is incomplete",
+                as_of=as_of, errors=coverage_errors)
     if not ok:
-        verdict = result.get("verdict", "?")
-        raise SystemExit(
-            f"refusing to mint: verdict={verdict}; no arm has a strictly "
-            "positive block-bootstrap CI (lo>0) with DSR P>= "
-            f"{DSR_ACCEPT_P}. An outcome-B/C (negative-expectancy) result can "
-            "never become a LIVE record.")
+        code = ("legacy_import_only" if legacy_statistical_passes
+                else "no_eligible_positive_arm")
+        _refuse(
+            code,
+            "no preregistered arm has positive CI and passing DSR",
+            verdict=result.get("verdict", "?"),
+            as_of=as_of,
+            legacy_statistical_passes=legacy_statistical_passes,
+        )
     return ok[0]
 
 
@@ -122,7 +196,10 @@ def main() -> None:
     ap.add_argument("--arms", default="filt")
     ap.add_argument("--boot", type=int, default=5000)
     ap.add_argument("--seed", type=int, default=20260920)
-    ap.add_argument("--n-trials", type=int, default=16)
+    ap.add_argument("--as-of", default=None,
+                    help="must match the validation result as-of when both are set")
+    ap.add_argument("--trial-ledger", default=None,
+                    help="DSR trial ledger used to revalidate the signed mandate")
     ap.add_argument("--operator", default=os.environ.get("USER", "unknown"))
     ap.add_argument("--ttl-days", type=int, default=live_gate.DEFAULT_TTL_DAYS,
                     help="mandate horizon; the record stops authorizing NEW "
@@ -139,7 +216,13 @@ def main() -> None:
             "process uses to verify). Export it and re-run.")
 
     result = _load_validation_result(args)
-    arm = _select_positive_arm(result)
+    result_as_of = result.get("as_of")
+    if args.as_of and result_as_of and args.as_of != result_as_of:
+        _refuse("as_of_mismatch", "CLI and validation result as-of differ",
+                cli_as_of=args.as_of, result_as_of=result_as_of)
+    arm = _select_positive_arm(
+        result, as_of=args.as_of or result_as_of,
+        ledger_path=args.trial_ledger)
     lo, hi = arm["bb_ci"]
 
     live_cfg = _live_effective_config()
@@ -152,6 +235,7 @@ def main() -> None:
         operator=str(args.operator),
         utc_iso=utc_iso,
         ttl_days=int(args.ttl_days),
+        extra={"dsr_trial_evidence": arm["trial_evidence"]},
     )
 
     payload = json.dumps(record, ensure_ascii=False, indent=2)

@@ -43,6 +43,7 @@ line is tagged "enforce not implemented, recording only".
 from __future__ import annotations
 
 import bisect
+import fcntl
 import logging
 import math
 import os
@@ -77,6 +78,7 @@ _STREAM = "xs_reversal"
 # signal-day gate structurally unreachable). Applied once per resolved path.
 _RETENTION_DAYS = 90
 _RETENTION_PATHS: set[str] = set()
+_DEDUP_LOCK = threading.RLock()
 
 # Fixed geometry of the signal (byte-for-byte the M1 backtest windows).
 LOOKBACK_BARS = 72          # 3d rolling highest-high window (lookback_d=3)
@@ -141,6 +143,7 @@ def _already_logged(path: str, key: tuple[Any, Any]) -> bool:
     try:
         import json as _json
         with open(path, encoding="utf-8") as f:
+            fcntl.flock(f.fileno(), fcntl.LOCK_SH)
             for line in f:
                 line = line.strip()
                 if not line:
@@ -535,19 +538,20 @@ def gather_xs_reversal(coin: str, side: str = "long", *,
         # De-dupe repeated emissions of the same closed bar across ~8s scans
         # (and worker restarts): one shadow record per (bar_ts, coin).
         key = _bar_key(rec)
-        if key is not None and _already_logged(path, key):
-            _write_heartbeat(config, coin, data_ok=True, triggered=True,
-                             pctile=rec.get("ext_percentile"),
-                             ext_pct=rec.get("ext_pct"))
-            return rec
-        try:
-            from hermes_trader.shadow_log import append_jsonl, set_retention
-            if path not in _RETENTION_PATHS:
-                set_retention(path, _RETENTION_DAYS)
-                _RETENTION_PATHS.add(path)
-            append_jsonl(path, rec, stream=_STREAM)
-        except Exception as e:  # pragma: no cover - writer never raises
-            logger.debug(f"[xs_reversal] shadow write failed ({coin}): {e}")
+        with _DEDUP_LOCK:
+            if key is not None and _already_logged(path, key):
+                _write_heartbeat(config, coin, data_ok=True, triggered=True,
+                                 pctile=rec.get("ext_percentile"),
+                                 ext_pct=rec.get("ext_pct"))
+                return rec
+            try:
+                from hermes_trader.shadow_log import append_jsonl, set_retention
+                if path not in _RETENTION_PATHS:
+                    set_retention(path, _RETENTION_DAYS)
+                    _RETENTION_PATHS.add(path)
+                append_jsonl(path, rec, stream=_STREAM)
+            except Exception as e:  # pragma: no cover - writer never raises
+                logger.debug(f"[xs_reversal] shadow write failed ({coin}): {e}")
         _write_heartbeat(config, coin, data_ok=True, triggered=True,
                          pctile=rec.get("ext_percentile"),
                          ext_pct=rec.get("ext_pct"))

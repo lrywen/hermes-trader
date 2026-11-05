@@ -148,7 +148,7 @@ from hermes_trader.agents.perception import scan_once, signal_fingerprint
 from hermes_trader.agents.regime_overlay import evaluate_risk_overlay
 from hermes_trader.agents.research import research
 from hermes_trader.agents.signal_rank import RANK_CALIBER, conjunction_view, rank_jobs, rank_score, select_top_jobs
-from hermes_trader.agents.ta_filter import analyze_perception, long_only_should_skip
+from hermes_trader.agents.ta_filter import analyze_perception
 from hermes_trader.agents.unstick import from_hl_position, select_unstucks
 from hermes_trader.client.exchange import (
     MID_FEED_MAX_STALE_S,
@@ -2176,6 +2176,15 @@ while True:
             _cycle_sleep(_sleep_s)
             continue
 
+        # S5: execute persisted operator commands only after exit monitoring and
+        # the OFF/feed-freshness gates. This is the sole order-owning process.
+        try:
+            from hermes_trader.agents.manual_execution import process_pending_commands
+            for _manual_outcome in process_pending_commands(_cfg):
+                log_event({"event": "manual_command", "command": _manual_outcome})
+        except Exception as _manual_e:
+            logger.error(f"[manual_control] command consumer failed: {_manual_e}")
+
         # Hot-toggle `enable_hip3`: the universe is a startup snapshot (see the
         # comment above line "HIP-3 toggle: read once at startup"), so flipping
         # the flag mid-run previously required a restart to add/drop HIP-3
@@ -2690,15 +2699,27 @@ while True:
             # short-intent candidate. Held coins are exempt — the AI
             # close-check for an open position must still run. A candidate
             # with any long intent is kept (only pure short-intent is cut).
-            if long_only_should_skip(
-                coin, ta, held_coins,
-                bool(cfg_get("scan_long_only", config=_cfg_cd)),
-            ):
+            from hermes_trader.agents.s3_shadow_gate import (
+                adaptive_long_only_decision,
+            )
+            _scan_long_only = bool(cfg_get("scan_long_only", config=_cfg_cd))
+            _s3_scan = adaptive_long_only_decision(
+                mode=str(cfg_get("mode", config=_cfg_cd) or "OFF"),
+                coin=coin, ta=ta, held_coins=held_coins,
+                scan_long_only=_scan_long_only, config=_cfg_cd,
+            )
+            if _s3_scan["s3_scan_bypass"]:
+                log_event({"event": "s3_scan_bypass", "coin": coin,
+                           "side": "short", "regime": _s3_scan["regime"],
+                           "score": round(float(score), 1),
+                           "trigger_score": round(float(score), 1)})
+            if _s3_scan["skip"]:
                 logger.info(f"{coin}: long-only scan — skip AI research for short-intent setup")
                 log_event({"event": "ta_skip", "coin": coin,
                            "signal": "LONG_ONLY_SKIP_SHORT",
                            "score": round(float(score), 1),
-                           "trigger_score": round(float(score), 1)})
+                           "trigger_score": round(float(score), 1),
+                           "s3_regime": _s3_scan["regime"]})
                 _cycle_outcomes.append((coin, "skip", False, "long-only skip short"))
                 continue
             # O-2 content-level dedup: TA passed on a setup (coin + closed bar

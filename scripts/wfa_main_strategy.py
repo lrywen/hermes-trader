@@ -36,6 +36,12 @@ import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
 
+from hermes_trader.validation.trial_ledger import (
+    TrialLedger,
+    TrialLedgerError,
+    deflated_sharpe_from_ledger,
+)
+
 DAY_MS = 86_400_000
 
 # Same acceptance constants shadow_grade uses for R5, kept in one family so the
@@ -43,7 +49,6 @@ DAY_MS = 86_400_000
 MIN_DAYS = 20
 WFA_TRAIN_DAYS = 12
 WFA_TEST_DAYS = 4
-DEFAULT_N_TRIALS = 16
 DSR_ACCEPT_P = 0.95
 WFR_MIN = 0.5
 
@@ -136,20 +141,26 @@ def daily_realized_bps(state: Any, account: str = "taker") -> dict[str, Any]:
     return out
 
 
-def main_strategy_wfa(series: list[float],
-                      train_size: int = WFA_TRAIN_DAYS,
-                      test_size: int = WFA_TEST_DAYS,
-                      n_trials: int = DEFAULT_N_TRIALS) -> Optional[dict[str, Any]]:
-    """WFA + bootstrap CI + DSR + OOS-negative-fold-ratio on daily bps (pure).
+def main_strategy_wfa(
+        series: list[float],
+        train_size: int = WFA_TRAIN_DAYS,
+        test_size: int = WFA_TEST_DAYS,
+        n_trials: Optional[int] = None,
+        *,
+        as_of=None,
+        ledger_path=None,
+        ledger: Optional[TrialLedger] = None) -> Optional[dict[str, Any]]:
+    """WFA + bootstrap CI + ledger-backed DSR on daily bps (pure).
 
-    ``None`` when there are fewer than :data:`MIN_DAYS` days — the caller must
-    report "insufficient history", never a pass.
+    ``n_trials`` remains only for positional call compatibility and is ignored.
+    Missing ledger coverage or an unknown ``as_of`` produces a structured
+    fail-closed result, never a default trial count. Fewer than ``MIN_DAYS``
+    days still returns ``None`` for insufficient history.
     """
     if len(series) < MIN_DAYS:
         return None
     from hermes_trader.validation import (
         block_bootstrap_ci,
-        deflated_sharpe_prob,
         probability_of_backtest_overfitting,
         sharpe,
         walk_forward_analysis,
@@ -158,7 +169,24 @@ def main_strategy_wfa(series: list[float],
     wfa = walk_forward_analysis(series, train_size=train_size, test_size=test_size)
     lo, hi = block_bootstrap_ci(series)
     sr = sharpe(series)
-    dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(series))
+    dsr = None
+    ledger_n_trials = None
+    evidence = None
+    dsr_error = None
+    try:
+        evidence = deflated_sharpe_from_ledger(
+            observed_sharpe=sr,
+            n_obs=len(series),
+            arm="main",
+            paradigm="wfa_main_strategy",
+            as_of=as_of,
+            ledger_path=ledger_path,
+            ledger=ledger,
+        )
+        dsr = evidence["dsr_p"]
+        ledger_n_trials = evidence["n_trials"]
+    except TrialLedgerError as exc:
+        dsr_error = exc.as_dict()
     # H3 (2026-11-04): this is the fraction of WFA OOS folds with negative mean
     # return, NOT the CSCV probability of backtest overfitting. A single strategy
     # has no config-comparison matrix, so a true CSCV PBO cannot be computed;
@@ -169,14 +197,19 @@ def main_strategy_wfa(series: list[float],
         list(wfa.oos_mean_bps))
     mean_bps = statistics.mean(series)
     mean_oos_bps = statistics.mean(wfa.oos_mean_bps)
+    dsr_statistical_passes = dsr is not None and dsr >= DSR_ACCEPT_P
+    dsr_promotion_eligible = bool(evidence and evidence["promotion_eligible"])
     checks = {
         "wfr_gt_min": wfa.wfr > WFR_MIN,
         "oos_mean_bps_gt_0": mean_oos_bps > 0,
-        "dsr_p_ge_accept": dsr >= DSR_ACCEPT_P,
+        "dsr_p_ge_accept": dsr_statistical_passes and dsr_promotion_eligible,
         "bb_ci_lo_gt_0": lo > 0,
     }
+    verdict = "pass" if all(checks.values()) else (
+        "fail_closed" if dsr_error is not None else "fail")
     return {
         "days": len(series),
+        "as_of": evidence["as_of"] if evidence else as_of,
         "mean_bps": round(mean_bps, 2),
         "sharpe": round(sr, 3),
         "bb_ci_lo_bps": round(lo, 2),
@@ -186,10 +219,15 @@ def main_strategy_wfa(series: list[float],
         "oos_win_frac": round(wfa.oos_win_frac, 3),
         "wfr": round(wfa.wfr, 3),
         "wfe": round(wfa.wfe, 3),
-        "dsr_p": round(dsr, 4),
+        "dsr_p": round(dsr, 4) if dsr is not None else None,
+        "n_trials": ledger_n_trials,
+        "trial_evidence": evidence,
+        "dsr_error": dsr_error,
+        "dsr_statistical_passes": dsr_statistical_passes,
+        "dsr_promotion_eligible": dsr_promotion_eligible,
         "oos_negative_fold_ratio": round(oos_negative_fold_ratio, 3),
         "checks": checks,
-        "verdict": "pass" if all(checks.values()) else "fail",
+        "verdict": verdict,
     }
 
 
@@ -226,21 +264,29 @@ def config_pin(config_file: str) -> dict[str, Any]:
             os.environ["HERMES_AGENT_CONFIG_FILE"] = prev
 
 
-def evaluate(state: Any, account: str = "taker",
-             config_file: str = DEFAULT_CONFIG_FILE,
-             train_size: int = WFA_TRAIN_DAYS,
-             test_size: int = WFA_TEST_DAYS,
-             n_trials: int = DEFAULT_N_TRIALS) -> dict[str, Any]:
-    """Full report: ledger aggregation + WFA stats + the parameters they ran on."""
+def evaluate(
+        state: Any,
+        account: str = "taker",
+        config_file: str = DEFAULT_CONFIG_FILE,
+        train_size: int = WFA_TRAIN_DAYS,
+        test_size: int = WFA_TEST_DAYS,
+        n_trials: Optional[int] = None,
+        *,
+        as_of=None,
+        ledger_path=None,
+        ledger: Optional[TrialLedger] = None) -> dict[str, Any]:
+    """Full report: realized PnL, WFA statistics and ledger-backed DSR."""
     led = daily_realized_bps(state, account=account)
+    if as_of is None and led.get("end_day"):
+        as_of = f"{led['end_day']}T23:59:59Z"
     report: dict[str, Any] = {
         "schema": 1,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "as_of": as_of,
         "account": account,
         "params": {
             "train_days": train_size,
             "test_days": test_size,
-            "n_trials": n_trials,
             "min_days": MIN_DAYS,
             "wfr_min": WFR_MIN,
             "dsr_accept_p": DSR_ACCEPT_P,
@@ -254,8 +300,9 @@ def evaluate(state: Any, account: str = "taker",
     if not led["ok"]:
         report["verdict"] = "cannot_grade"
         return report
-    stats = main_strategy_wfa(led["series"], train_size=train_size,
-                              test_size=test_size, n_trials=n_trials)
+    stats = main_strategy_wfa(
+        led["series"], train_size=train_size, test_size=test_size,
+        as_of=as_of, ledger_path=ledger_path, ledger=ledger)
     if stats is None:
         return report
     report["wfa"] = stats
@@ -278,7 +325,10 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--account", default="taker")
     ap.add_argument("--train", type=int, default=WFA_TRAIN_DAYS)
     ap.add_argument("--test", type=int, default=WFA_TEST_DAYS)
-    ap.add_argument("--n-trials", type=int, default=DEFAULT_N_TRIALS)
+    ap.add_argument("--as-of", default=None,
+                    help="DSR 账本截止时刻；默认取最后收益日 UTC 日终")
+    ap.add_argument("--trial-ledger", default=None,
+                    help="DSR 试验账本 JSONL（默认读包内账本或环境变量）")
     ap.add_argument("--out", default=None)
     ap.add_argument("--strict", action="store_true",
                     help="exit 2 unless verdict == pass")
@@ -288,7 +338,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     report = evaluate(state or {}, account=args.account,
                       config_file=args.config_file,
                       train_size=args.train, test_size=args.test,
-                      n_trials=args.n_trials)
+                      as_of=args.as_of, ledger_path=args.trial_ledger)
     blob = json.dumps(report, indent=2, sort_keys=True, default=str)
     if args.out:
         with open(args.out, "w", encoding="utf-8") as f:

@@ -16,7 +16,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 
 from hermes_trader import session_log
-from hermes_trader.agents import dsl_exit
+from hermes_trader.agents import dsl_exit, manual_control, manual_execution
 from hermes_trader.agents.config_store import read_agent_config
 from hermes_trader.dashboard import (
     _TERMINAL_HANDLERS,
@@ -28,6 +28,15 @@ from hermes_trader.dashboard import (
 )
 
 logger = logging.getLogger("hermes-dashboard")
+
+
+def _actor(request: Request) -> str:
+    return str(request.headers.get("x-portal-user") or "operator")
+
+
+def _normalized_coin(value: object) -> str:
+    coin = str(value or "")
+    return coin if ":" in coin else coin.upper()
 
 
 def register_operator_routes(app: FastAPI) -> None:
@@ -74,23 +83,16 @@ def register_operator_routes(app: FastAPI) -> None:
             body = await request.json()
         except Exception:
             raise HTTPException(422, "invalid JSON body")
-        # F8: normalize bare tickers to upper-case but preserve HIP-3 namespaced
-        # coins (e.g. "xyz:vntl") exactly as given — upper-casing the namespace
-        # breaks close_position_market's market routing. Same rule as terminal.
-        coin = body.get("coin") or ""
-        if ":" not in coin:
-            coin = coin.upper()
+        coin = _normalized_coin(body.get("coin"))
         if not coin:
             raise HTTPException(400, "coin required")
-        from hermes_trader.agents.executor import close_position_market
-        # Run the blocking exchange call off the event loop (same pattern as
-        # mode/config writes), then F22: persist the manual-close audit event
-        # regardless of ok/noop so failed attempts are traceable too.
-        result = await asyncio.to_thread(close_position_market, coin)
-        _log_operator_action("close", via="web", coin=coin, result=result)
-        logger.info("manual close via dashboard: %s -> %s", coin,
-                    {k: result.get(k) for k in ("ok", "noop", "error") if k in result})
-        return JSONResponse(result)
+        # S5: dashboard never crosses the process boundary to place an order.
+        # The trading loop consumes this command after its normal safety gates.
+        result = await asyncio.to_thread(
+            manual_control.enqueue_command, "close", {"coin": coin},
+            actor=_actor(request), reason=str(body.get("reason") or ""),
+        )
+        return JSONResponse({"ok": True, "queued": True, "command": result})
 
     @app.post("/api/dashboard/operator/mode")
     async def operator_mode(request: Request) -> JSONResponse:
@@ -121,6 +123,123 @@ def register_operator_routes(app: FastAPI) -> None:
         })
         logger.info("trading mode switch via dashboard: %s -> %s", old_mode, mode)
         return JSONResponse({"mode": mode})
+
+    @app.get("/api/dashboard/operator/interventions")
+    async def operator_interventions(request: Request) -> JSONResponse:
+        _require_operator(request)
+        return JSONResponse(await asyncio.to_thread(manual_control.snapshot))
+
+    @app.post("/api/dashboard/operator/interventions/mode")
+    async def operator_intervention_mode(request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+            result = await asyncio.to_thread(
+                manual_control.set_mode, str(body.get("mode") or ""),
+                actor=_actor(request), reason=str(body.get("reason") or ""),
+            )
+            return JSONResponse(result)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(422, "invalid JSON body")
+
+    @app.post("/api/dashboard/operator/interventions/pause")
+    async def operator_pause_coin(request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        coin = _normalized_coin(body.get("coin"))
+        if not coin:
+            raise HTTPException(400, "coin required")
+        result = await asyncio.to_thread(
+            manual_control.pause_coin, coin, actor=_actor(request),
+            reason=str(body.get("reason") or ""), until=body.get("until"),
+        )
+        return JSONResponse(result)
+
+    @app.post("/api/dashboard/operator/interventions/resume")
+    async def operator_resume_coin(request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        coin = _normalized_coin(body.get("coin"))
+        if not coin:
+            raise HTTPException(400, "coin required")
+        return JSONResponse(await asyncio.to_thread(
+            manual_control.resume_coin, coin, actor=_actor(request),
+            reason=str(body.get("reason") or ""),
+        ))
+
+    @app.post("/api/dashboard/operator/interventions/enter")
+    async def operator_manual_enter(request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        payload = dict(body)
+        payload["coin"] = _normalized_coin(body.get("coin"))
+        if not payload["coin"]:
+            raise HTTPException(400, "coin required")
+        try:
+            manual_execution._manual_analysis(payload)
+            result = await asyncio.to_thread(
+                manual_control.enqueue_command, "manual_enter", payload,
+                actor=_actor(request), reason=str(body.get("reason") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return JSONResponse({"ok": True, "queued": True, "command": result})
+
+    @app.post("/api/dashboard/operator/interventions/{confirmation_id}/decision")
+    async def operator_confirmation_decision(confirmation_id: str, request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        if not isinstance(body.get("approve"), bool):
+            raise HTTPException(400, "approve boolean required")
+        try:
+            result = await asyncio.to_thread(
+                manual_control.decide_confirmation, confirmation_id,
+                approve=body["approve"], actor=_actor(request),
+                reason=str(body.get("reason") or ""),
+            )
+        except KeyError:
+            raise HTTPException(404, "confirmation not found")
+        except ValueError as exc:
+            raise HTTPException(409, str(exc))
+        return JSONResponse(result)
+
+    @app.post("/api/dashboard/operator/interventions/adjust-exit")
+    async def operator_adjust_exit(request: Request) -> JSONResponse:
+        _require_operator(request, write=True)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(422, "invalid JSON body")
+        coin = _normalized_coin(body.get("coin"))
+        payload = {
+            "coin": coin, "side": body.get("side"),
+            "sl_pct": body.get("sl_pct"), "tp_pct": body.get("tp_pct"),
+        }
+        try:
+            manual_execution.validate_adjust_exit(payload)
+            result = await asyncio.to_thread(
+                manual_control.enqueue_command, "adjust_exit", payload,
+                actor=_actor(request), reason=str(body.get("reason") or ""),
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return JSONResponse({"ok": True, "queued": True, "command": result})
 
     @app.post("/api/dashboard/operator/terminal")
     async def operator_terminal(request: Request) -> JSONResponse:

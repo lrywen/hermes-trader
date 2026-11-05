@@ -32,6 +32,8 @@ atexit.register(shutil.rmtree, _tmp, ignore_errors=True)
 os.environ["HERMES_AGENT_MEMORY_FILE"] = os.path.join(_tmp, ".agent-memory.json")
 os.environ["HERMES_AGENT_CONFIG_FILE"] = os.path.join(_tmp, ".agent-config.json")
 os.environ["HERMES_DSL_STATE_FILE"] = os.path.join(_tmp, ".dsl-state.json")
+os.environ["HERMES_SHADOW_EXIT_COUNTERFACTUAL_FILE"] = os.path.join(
+    _tmp, "shadow-exit-counterfactual.jsonl")
 # P0-1 (2026-09-12): production LIVE entries require the explicit
 # HERMES_ENABLE_LIVE=true grant on top of mode=LIVE. The test sandbox never
 # touches real money (all order I/O is mocked), so grant it here — mirroring

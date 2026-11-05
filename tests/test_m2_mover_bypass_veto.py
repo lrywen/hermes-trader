@@ -83,6 +83,20 @@ def test_r1_disabled_is_strict_noop(isolated, monkeypatch):
     assert calls == []
 
 
+def test_daily_mover_admission_writes_one_bypass_record(isolated, monkeypatch):
+    _spy(monkeypatch)
+    calls = []
+    monkeypatch.setattr(
+        executor, "_record_regime_bypass",
+        lambda analysis, override, **details: calls.append(
+            (analysis["id"], override, details)))
+    analysis = _mover_analysis(id="a-daily")
+    assert executor._runner_entry_block_reason_impl(analysis, _gate()) == ""
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("a-daily", "daily-mover")
+    assert calls[0][2]["daily_mover_fired"] is True
+
+
 def test_r1_shadow_records_but_still_admits(isolated, monkeypatch):
     calls = _spy(monkeypatch)
     cfg = _gate(mover_bypass_veto={"shadow_mode": True})

@@ -46,6 +46,40 @@ def test_coin_breakout_overrides_macro(patched):
     assert _resolve({"coin": "T"}, patched) == "up"
 
 
+def test_coin_breakout_writes_joinable_unified_audit(patched, monkeypatch):
+    import hermes_trader.shadow_log as sl
+
+    rows = []
+    monkeypatch.setattr(sl, "append_jsonl",
+                        lambda path, rec, stream="shadow": rows.append((stream, rec)))
+    patched["macro"] = "neutral"
+    patched["coin"] = "up"
+    analysis = {"id": "a-brk", "coin": "T", "side": "long",
+                "composite_score": 55.0, "breakout_fired": True}
+    assert executor.resolve_decision_regime(analysis, {}) == "up"
+    assert len(rows) == 1
+    stream, row = rows[0]
+    assert stream == row["stream"] == "regime_bypass"
+    assert row["override"] == "coin_breakout"
+    assert row["analysis_id"] == "a-brk"
+    assert row["trace_id"] == "a-brk"
+    assert row["macro_regime"] == "neutral"
+    assert row["coin_regime"] == "up"
+
+
+def test_scan_probe_can_suppress_duplicate_coin_breakout_audit(patched, monkeypatch):
+    import hermes_trader.shadow_log as sl
+
+    monkeypatch.setattr(
+        sl, "append_jsonl",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("duplicate audit")))
+    patched["macro"] = "neutral"
+    patched["coin"] = "down"
+    analysis = {"coin": "T", "side": "short"}
+    assert executor.resolve_decision_regime(
+        analysis, {}, record_bypass=False) == "down"
+
+
 def test_resolve_cached_and_stable(patched):
     patched["macro"] = "down"
     analysis = {"coin": "T"}

@@ -178,6 +178,24 @@ def test_recent_breakout_inside_window_admits(isolated_gate):
     assert _block(a, _gate()) == ""
 
 
+def test_recent_breakout_admission_writes_one_bypass_record(
+        isolated_gate, monkeypatch):
+    calls = []
+    monkeypatch.setattr(executor, "_record_runner_gate_verdict",
+                        lambda *a, **k: None)
+    monkeypatch.setattr(
+        executor, "_record_regime_bypass",
+        lambda analysis, override, **details: calls.append(
+            (analysis["id"], override, details)))
+    now_ms = int(time.time() * 1000)
+    a = _analysis(id="a-recent", confidence=0.9, breakout_fired=False,
+                  breakout_onset_ms=now_ms - 10 * 60_000)
+    assert _block(a, _gate()) == ""
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("a-recent", "recent")
+    assert calls[0][2]["fresh_src"] == "recent_brk"
+
+
 def test_recent_breakout_outside_window_blocks(isolated_gate):
     # onset 早于 validity 窗口 → 不算 fresh；无其他结构 → 被闸门拦截
     # （fresh-impulse 检查先于 late-chase，故只断言被 block）。
@@ -223,6 +241,52 @@ def test_shorts_disabled_blocks(isolated_gate):
     a = _analysis(side="short", confidence=0.95, composite_score=80.0,
                   downtrend_momentum_fired=True)
     assert _block(a, _gate(allow_shorts=False)) == \
+        "runner_gate_blocked (shorts disabled)"
+
+
+# ── 5b. S3 shadow-shorts channel wiring ─────────────────────────────────────
+# The pure predicate is covered in test_s3_shadow_gate.py; these pin the
+# EXECUTOR wiring, where a try/except/else once overwrote the block flag and
+# silently fail-opened the short gate (caught by the 2026-11-05 full run).
+
+def _s3_short_analysis():
+    return _analysis(side="short", confidence=0.95, composite_score=80.0,
+                     downtrend_momentum_fired=True)
+
+
+def _s3_gate(mode, **blk):
+    cfg = _gate(allow_shorts=False)
+    cfg["mode"] = mode
+    cfg["s3_shadow_shorts"] = {"enabled": True, "allow_regimes": ["down"], **blk}
+    return cfg
+
+
+def test_s3_shadow_short_admits_in_shadow_when_enabled(isolated_gate, monkeypatch):
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda a, c: "down")
+    assert _block(_s3_short_analysis(), _s3_gate("SHADOW")) == ""
+
+
+def test_s3_shadow_short_never_admits_in_live_or_off(isolated_gate, monkeypatch):
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda a, c: "down")
+    for mode in ("LIVE", "OFF"):
+        assert _block(_s3_short_analysis(), _s3_gate(mode)) == \
+            "runner_gate_blocked (shorts disabled)", mode
+
+
+def test_s3_shadow_short_regime_not_allowed_blocks(isolated_gate, monkeypatch):
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda a, c: "up")
+    assert _block(_s3_short_analysis(), _s3_gate("SHADOW")) == \
+        "runner_gate_blocked (shorts disabled)"
+
+
+def test_s3_shadow_short_unresolved_regime_blocks(isolated_gate, monkeypatch):
+    # Fail-closed: a lookup failure (None) must never open the short gate.
+    monkeypatch.setattr(executor, "resolve_decision_regime",
+                        lambda a, c: None)
+    assert _block(_s3_short_analysis(), _s3_gate("SHADOW")) == \
         "runner_gate_blocked (shorts disabled)"
 
 

@@ -21,6 +21,7 @@ import datetime
 import json
 import math
 import random
+import statistics
 from collections import defaultdict
 
 COST19 = 0.0019
@@ -134,11 +135,67 @@ def load(replay, outcome):
     return rows
 
 
+def c4_realistic_by_side(fills):
+    """Offline C4 reality check for measured taker-close impact.
+
+    The input is the shadow book's close-fill list. Both position sides are
+    always reported; below 50 backfilled drifts the side stays latency-only and
+    insufficient rather than borrowing the conservative synthetic impact.
+    """
+    values = {"long": [], "short": []}
+    records = {"long": 0, "short": 0}
+    for fill in fills:
+        if fill.get("type") != "close":
+            continue
+        if fill.get("execution") != "taker" and fill.get("fill_model") != "taker":
+            continue
+        side = fill.get("side") if fill.get("side") in ("long", "short") else fill.get("position_side")
+        if side not in values:
+            continue
+        records[side] += 1
+        try:
+            drift = float(fill.get("post_fill_mid_drift_bps"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(drift):
+            values[side].append(drift)
+    by_side = {}
+    for side, sample in values.items():
+        n = len(sample)
+        insufficient = n < 50
+        ordered = sorted(sample)
+        p95 = None
+        if ordered:
+            pos = (len(ordered) - 1) * 0.95
+            lo = int(math.floor(pos))
+            hi = int(math.ceil(pos))
+            p95 = ordered[lo] + (ordered[hi] - ordered[lo]) * (pos - lo)
+        by_side[side] = {
+            "n": n,
+            "records": records[side],
+            "pending": records[side] - n,
+            "status": "insufficient" if insufficient else "measured",
+            "latency_only": insufficient,
+            "insufficient": insufficient,
+            "mean_bps": round(statistics.fmean(sample), 4) if sample else None,
+            "median_bps": round(statistics.median(sample), 4) if sample else None,
+            "p95_bps": round(p95, 4) if p95 is not None else None,
+            "impact_source": "latency_only" if insufficient else "post_fill_mid_drift",
+        }
+    return {
+        "metric": "taker_close_post_fill_mid_adverse_drift_bps",
+        "minimum_measured_n": 50,
+        "by_side": by_side,
+    }
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--replay", default="/data/decision_shadow_replay_bn90d.jsonl")
     ap.add_argument("--outcome", default="/data/bn90_outcomes_1h.jsonl")
     ap.add_argument("--arms", default=",".join(ARMS))
+    ap.add_argument("--shadow-book", default=None,
+                    help="optional shadow book JSON for measured C4 taker-close drift")
     a = ap.parse_args()
     rows = load(a.replay, a.outcome)
     admitted = [(f, o) for f, o in rows if f.get("admitted")]
@@ -155,6 +212,11 @@ def main():
         },
         "arms": {},
     }
+    if a.shadow_book:
+        with open(a.shadow_book) as fh:
+            shadow_book = json.load(fh)
+        taker_fills = shadow_book.get("accounts", {}).get("taker", {}).get("fills", [])
+        report["C4_realistic"] = c4_realistic_by_side(taker_fills)
     for name in a.arms.split(","):
         name = name.strip()
         fn = ARMS[name]

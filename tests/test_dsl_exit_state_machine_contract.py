@@ -306,3 +306,101 @@ def test_short_max_loss_index_suppresses(monkeypatch):
     v = tr.check(102.0, index_px=101.0)
     assert v.exit is False
     assert v.reason == ""
+
+
+# ── S4-1 soft timeout ───────────────────────────────────────────────────────
+
+def _soft_policy(**kw):
+    base = dict(
+        hard_timeout_minutes=100.0,
+        soft_timeout_enabled=True,
+        soft_timeout_default_extra_min=60.0,
+        soft_timeout_extra_min={"up": 120.0, "down": 120.0,
+                                "neutral": 60.0, "chop": 30.0},
+    )
+    base.update(kw)
+    return _policy(**base)
+
+
+def test_soft_timeout_disabled_preserves_legacy_hard_timeout(monkeypatch):
+    """Default-off: hard timeout fires exactly as before, no deferral."""
+    old = time.time() - 200 * 60
+    tr = _tracker(monkeypatch,
+                  policy=_policy(hard_timeout_minutes=100.0,
+                                 soft_timeout_enabled=False),
+                  entry_time=old)
+    v = tr.check(100.0)
+    assert v.exit is True
+    assert "soft-extended" not in v.reason
+    assert tr.soft_timeout_extended is False
+
+
+def test_soft_timeout_defers_unignited_unarmed_position(monkeypatch):
+    """No exhaustion (not ignited, peak below protect) → one-shot extension."""
+    old = time.time() - 120 * 60  # past 100min hard timeout
+    tr = _tracker(monkeypatch, policy=_soft_policy(), entry_time=old)
+    v = tr.check(100.0)  # flat, never ignited, never armed phase2
+    assert v.exit is False
+    assert tr.soft_timeout_extended is True
+
+
+def test_soft_timeout_does_not_defer_ignited_position(monkeypatch):
+    """An ignited position has an exhaustion signal → hard timeout still fires."""
+    old = time.time() - 120 * 60
+    tr = _tracker(monkeypatch, policy=_soft_policy(), entry_time=old)
+    tr.ignited = True
+    v = tr.check(100.0)
+    assert v.exit is True
+    assert "hard_timeout" in v.reason
+    assert tr.soft_timeout_extended is False
+
+
+def test_soft_timeout_does_not_defer_phase2_armed_position(monkeypatch):
+    """Peak reached protect (phase-2 armed) → hard timeout still fires."""
+    old = time.time() - 120 * 60
+    pol = _soft_policy(protect_pct=1.25)
+    tr = _tracker(monkeypatch, policy=pol, entry_time=old)
+    # Push peak above protect so phase-2 is armed.
+    tr.check(102.0)  # +2% peak > 1.25% protect
+    v = tr.check(100.0)
+    assert v.exit is True
+    assert "hard_timeout" in v.reason
+    assert tr.soft_timeout_extended is False
+
+
+def test_soft_timeout_extended_deadline_eventually_exits(monkeypatch):
+    """After deferral, the extended deadline (hard + extra) exits unconditionally."""
+    # neutral regime default extra = 60min; hard=100 → extended = 160min.
+    old = time.time() - 170 * 60
+    tr = _tracker(monkeypatch,
+                  policy=_soft_policy(entry_regime="") if False else _soft_policy(),
+                  entry_time=old)
+    v = tr.check(100.0)
+    assert v.exit is True
+    assert "soft-extended" in v.reason
+    assert tr.soft_timeout_extended is True
+
+
+def test_soft_timeout_regime_scaled_extra(monkeypatch):
+    """chop regime gets a shorter extension than trend regimes."""
+    pol = _soft_policy()
+    # At 120min: hard(100) passed, chop extra=30 → extended=130, not yet.
+    old_chop = time.time() - 120 * 60
+    tr_chop = _tracker(monkeypatch, policy=pol, entry_time=old_chop)
+    tr_chop.entry_regime = "chop"
+    v = tr_chop.check(100.0)
+    assert v.exit is False  # 120 < 130 extended deadline
+    assert tr_chop.soft_timeout_extended is True
+
+
+def test_soft_timeout_roundtrip_persists_extension_flag(monkeypatch):
+    """soft_timeout_extended survives serialize/deserialize."""
+    from hermes_trader.agents import dsl_exit
+    old = time.time() - 120 * 60
+    tr = _tracker(monkeypatch, policy=_soft_policy(), entry_time=old)
+    tr.check(100.0)  # triggers deferral
+    assert tr.soft_timeout_extended is True
+    blob = dsl_exit._tracker_to_dict(tr)
+    assert blob["soft_timeout_extended"] is True
+    restored = dsl_exit._tracker_from_dict(blob)
+    assert restored.soft_timeout_extended is True

@@ -32,13 +32,16 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
+import statistics
 import threading
 import time
 import uuid
 from typing import Any, Optional
 
 from hermes_trader.agents import atomic_io
+from hermes_trader.indicators.math import adx as _calculate_adx, atr as _calculate_atr
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +51,10 @@ SHADOW_BOOK_FILE = os.environ.get(
     os.path.join(_REPO_ROOT, ".shadow-book.json"),
 )
 SHADOW_BOOK_LOCK_FILE = SHADOW_BOOK_FILE + ".lock"
+SHADOW_EXIT_COUNTERFACTUAL_FILE = os.environ.get(
+    "HERMES_SHADOW_EXIT_COUNTERFACTUAL_FILE",
+    os.path.join(_REPO_ROOT, ".shadow-exit-counterfactual.jsonl"),
+)
 
 _STATE_VERSION = 2
 # Canonical account ids. ``taker`` is the default/legacy view; ``maker_shadow``
@@ -548,8 +555,8 @@ def _fresh_account() -> dict[str, Any]:
         "wallet_balance": bal,     # starting + realized PnL (fees deducted on close)
         "positions": [],
         "pending_orders": [],      # maker_shadow-only: resting unfilled limits
-        "pending_drift": [],       # maker_shadow-only: filled opens awaiting the
-                                   # next 1m bar to backfill post-fill mid drift
+        "pending_drift": [],       # filled opens/closes awaiting the next 1m
+                                   # bar to backfill post-fill mid drift
         "fills": [],
         "equity_curve": [],
         "closed_count": 0,
@@ -642,8 +649,12 @@ def _tracker_policy_snapshot(tracker: Any) -> dict[str, Any]:
 class ShadowBook:
     """In-process singleton wrapping the two virtual accounts + DSL trackers."""
 
-    def __init__(self, path: str = SHADOW_BOOK_FILE) -> None:
+    def __init__(self, path: str = SHADOW_BOOK_FILE, *,
+                 exit_counterfactual_path: str = SHADOW_EXIT_COUNTERFACTUAL_FILE) -> None:
         self.path = path
+        self.exit_counterfactual_path = exit_counterfactual_path
+        self._exit_counterfactual_keys: set[tuple[str, str, str]] = set()
+        self._exit_cf_floor_state: dict[tuple[str, str], dict[str, Any]] = {}
         self._lock = threading.RLock()
         # key (account, f"{coin}_{side}") -> DSLTracker (filled positions)
         self._trackers: dict[tuple[str, str], Any] = {}
@@ -658,6 +669,7 @@ class ShadowBook:
         # counter also sidesteps cross-process save/reload merge races.
         self._would_execute_dropped = 0
         self.state: dict[str, Any] = self._fresh_state()
+        self._load_exit_counterfactual_keys()
         self._load()
 
     def reload_if_changed(self) -> bool:
@@ -791,6 +803,10 @@ class ShadowBook:
                         )
                         if p.get("peak_px"):
                             t.peak_px = float(p["peak_px"])
+                        if p.get("sl_px"):
+                            t.sl_px = float(p["sl_px"])
+                        if p.get("tp_px"):
+                            t.tp_px = float(p["tp_px"])
                         self._trackers[(acct, self._key(coin, side))] = t
                         kept.append(p)
                     except (AttributeError, TypeError, ValueError, KeyError) as e:
@@ -813,6 +829,8 @@ class ShadowBook:
                 t = self._trackers.get((acct, self._key(p["coin"], p["side"])))
                 if t is not None:
                     p["peak_px"] = t.peak_px
+                    p["sl_px"] = t.sl_px
+                    p["tp_px"] = t.tp_px
         if _write_atomic(self.path, self.state):
             try:
                 self._last_mtime = os.path.getmtime(self.path)
@@ -896,6 +914,196 @@ class ShadowBook:
         }
 
     # -- mutations ----------------------------------------------------------
+
+    # ------------------------------------------------------------------
+    # Exit counterfactual observers (JSONL only; never position/fill mutations)
+
+    def _load_exit_counterfactual_keys(self) -> None:
+        """Restore (account, position_id, signal) dedupe from the JSONL log."""
+        try:
+            with open(self.exit_counterfactual_path, encoding="utf-8") as fh:
+                for line in fh:
+                    try:
+                        row = json.loads(line)
+                        key = (str(row["account"]), str(row["position_id"]),
+                               str(row["signal"]))
+                        self._exit_counterfactual_keys.add(key)
+                    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                        continue
+        except OSError:
+            return
+
+    def _record_exit_counterfactual(self, account: str, position_id: str,
+                                    signal: str, mid: float, reason: str,
+                                    evidence: dict[str, Any]) -> bool:
+        """Append one virtual exit; return False when already observed."""
+        key = (account, position_id, signal)
+        with self._lock:
+            if key in self._exit_counterfactual_keys:
+                return False
+            ts = _now_ms()
+            row = {
+                "ts": ts,
+                "virtual_exit_ts": ts,
+                "account": account,
+                "position_id": position_id,
+                "signal": signal,
+                "mid": float(mid),
+                "reason": reason,
+                "evidence": evidence,
+                "observer_only": True,
+            }
+            try:
+                parent = os.path.dirname(self.exit_counterfactual_path)
+                if parent:
+                    os.makedirs(parent, exist_ok=True)
+                with open(self.exit_counterfactual_path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps(row, sort_keys=True, default=str) + "\n")
+            except OSError as e:
+                logger.warning(f"[shadow_book] exit counterfactual append failed: {e}")
+                return False
+            self._exit_counterfactual_keys.add(key)
+            return True
+
+    def _detect_cvd_for_counterfactual(self, coin: str) -> tuple[Any, dict[str, Any]]:
+        """Run the production CVD detector with its production scan/config."""
+        from hermes_trader.agents.config_store import read_agent_config
+        from hermes_trader.agents.microstructure import (
+            detect_cvd_divergence, get_microstructure)
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+
+        cfg = read_agent_config()
+        scan = cfg.get("scan", {}) if isinstance(cfg, dict) else {}
+        cvd_cfg = (cfg.get("launch_capture", {}).get("cvd_divergence", {})
+                   if isinstance(cfg, dict) else {})
+        params = {
+            "left": int(cvd_cfg.get("left", 8)),
+            "right": int(cvd_cfg.get("right", 5)),
+            "min_strength": float(cvd_cfg.get("min_strength_pct", 10.0)),
+        }
+        cvd = [{"t": p.t * 1000, "cvd": p.cvd}
+               for p in get_microstructure().cvd_series(coin)]
+        # No production CVD capture means no candidate; avoid an unnecessary
+        # candle request in the shadow observer on dormant coins.
+        if len(cvd) < 2 * (params["left"] + params["right"]) + 2:
+            return None, params
+        interval = str(scan.get("candleInterval", "5m"))
+        count = int(scan.get("candleCount", 100))
+        candles = fetch_hl_candles(coin, interval, count, opportunistic=True)
+        if bool(scan.get("evaluateClosedBarsOnly", True)):
+            candles, _ = _drop_forming_bar(candles, interval)
+        prices = [{"t": c.t, "price": c.c} for c in candles]
+        divergence = detect_cvd_divergence(
+            prices, cvd,
+            left=params["left"], right=params["right"],
+            min_strength=params["min_strength"],
+        )
+        return divergence, params
+
+    def _observe_candle_exhaustion_counterfactuals(
+            self, account: str, position_id: str, coin: str, side: str,
+            mid: float) -> None:
+        """Record fixed, closed-bar S4 observers without touching exit state."""
+        from hermes_trader.agents.perception import _drop_forming_bar
+        from hermes_trader.client.hl_client import fetch_hl_candles
+        candles = fetch_hl_candles(coin, "15m", 80, opportunistic=True)
+        candles, _ = _drop_forming_bar(candles, "15m")
+        if len(candles) < 21:
+            return
+        adx_values = _calculate_adx(candles)
+        atr_values = _calculate_atr(candles)
+        adx_tail = adx_values[-3:]
+        atr_tail = atr_values[-3:]
+        if (all(v is not None and math.isfinite(v) for v in adx_tail + atr_tail)
+                and adx_tail[0] > adx_tail[1] > adx_tail[2]
+                and atr_tail[0] > atr_tail[1] > atr_tail[2]):
+            self._record_exit_counterfactual(
+                account, position_id, "adx_atr_decay", mid,
+                "s4_observer:adx_atr_decay", {
+                    "interval": "15m",
+                    "adx_last_3": adx_tail,
+                    "atr_last_3": atr_tail,
+                    "rule": "three consecutive strictly decaying closed-bar values",
+                })
+
+        latest = candles[-1]
+        baseline = [float(c.v) for c in candles[-21:-1]
+                    if getattr(c, "v", None) is not None and float(c.v) >= 0]
+        open_px = float(getattr(latest, "o", 0.0) or 0.0)
+        close_px = float(getattr(latest, "c", 0.0) or 0.0)
+        volume = float(getattr(latest, "v", 0.0) or 0.0)
+        if len(baseline) != 20 or open_px <= 0:
+            return
+        baseline_median = statistics.median(baseline)
+        direction = -1 if side == "short" else 1
+        directional_bar_bp = direction * (close_px - open_px) / open_px * 10_000.0
+        if (baseline_median > 0 and volume >= 2.0 * baseline_median
+                and directional_bar_bp <= 10.0):
+            self._record_exit_counterfactual(
+                account, position_id, "volume_stagnation", mid,
+                "s4_observer:volume_stagnation", {
+                    "interval": "15m",
+                    "volume": volume,
+                    "baseline_20_median_volume": baseline_median,
+                    "volume_multiple": round(volume / baseline_median, 6),
+                    "directional_bar_bp": round(directional_bar_bp, 6),
+                    "rule": "volume>=2x median20 and directional bar<=10bp",
+                })
+
+    def _observe_phase2_floor_counterfactual(
+            self, account: str, position_id: str, side: str, mid: float,
+            index_px: float | None, tracker: Any) -> None:
+        """Observe floor confirmation on independent state, read-only.
+
+        ``tracker.check`` owns the real shadow exit and its production logging.
+        This observer reuses only its floor/peak/policy snapshot; its own
+        2-tick/4-second/index state cannot mutate the tracker or ledger.
+        """
+        floor = getattr(tracker, "_last_floor", None)
+        if floor is None or tracker._phase_label() != "phase2":
+            self._exit_cf_floor_state.pop((account, position_id), None)
+            return
+        floor = float(floor)
+        if floor <= 0 or mid <= 0:
+            return
+        pol = tracker.policy
+        sgn = 1.0 if side == "long" else -1.0
+        breached = (sgn * (mid - floor) <= 0
+                    or math.isclose(mid, floor, rel_tol=1e-9, abs_tol=1e-12))
+        state_key = (account, position_id)
+        if not breached:
+            self._exit_cf_floor_state.pop(state_key, None)
+            return
+        now_mono = time.monotonic()
+        state = self._exit_cf_floor_state.setdefault(
+            state_key, {"count": 0, "first_ts": now_mono})
+        state["count"] += 1
+        held_sec = max(0.0, now_mono - float(state["first_ts"]))
+        index_aligned = True
+        if index_px is not None and index_px > 0:
+            index_aligned = (sgn * (float(index_px) - floor) <= 0
+                             or math.isclose(float(index_px), floor,
+                                             rel_tol=1e-9, abs_tol=1e-12))
+        required_ticks = int(pol.consecutive_breaches_required)
+        required_sec = float(pol.breach_confirm_sec)
+        if (state["count"] < required_ticks or held_sec < required_sec
+                or not index_aligned):
+            return
+        evidence = {
+            "phase": "phase2",
+            "floor_px": floor,
+            "peak_px": float(tracker.peak_px),
+            "breach_ticks": int(state["count"]),
+            "required_breach_ticks": required_ticks,
+            "breach_confirm_sec": round(held_sec, 6),
+            "required_breach_confirm_sec": required_sec,
+            "index_aligned": index_aligned,
+            "index_px": index_px,
+        }
+        self._record_exit_counterfactual(
+            account, position_id, "phase2_trailing_floor", mid,
+            "phase2_trailing_floor_breach", evidence)
 
     def shadow_open(self, *, coin: str, side: str, entry_px: float,
                     size_usd: float, leverage: int, entry_atr_pct: float = 0.0,
@@ -1276,9 +1484,10 @@ class ShadowBook:
                         touched=getattr(verdict, "touch_bar_idx", None) is not None)
 
     def _resolve_pending_drift(self) -> None:
-        """Backfill post-fill mid drift for maker opens that filled before the
-        next 1m bar existed. Statistics ONLY: writes ``post_fill_mid_drift_bps``
-        onto the existing open fill; never touches fill price, size, or PnL.
+        """Backfill post-fill mid drift for maker opens and taker closes that
+        filled before the next 1m bar existed. Statistics ONLY: writes
+        ``post_fill_mid_drift_bps``
+        onto the existing fill; never touches fill price, size, or PnL.
 
         For each pending entry we need the bar starting at ``fill_bar_t + 60s``
         to have CLOSED, then use its (h+l)/2 as the post-fill mid. A fetch miss
@@ -1288,46 +1497,42 @@ class ShadowBook:
         """
         from hermes_trader.client.hl_client import fetch_hl_candles
 
-        acc = self._account("maker_shadow")
-        pending = acc.get("pending_drift")
-        if not pending:
-            return
         now_ms = _now_ms()
-        # index open fills by id for the backfill
-        fills_by_id = {f.get("id"): f for f in acc["fills"]
-                       if f.get("type") == "open"}
-        remaining: list[dict[str, Any]] = []
-        for pend in list(pending):
-            fill_id = pend.get("fill_id")
-            target_t = int(pend["fill_bar_t"]) + 60_000
-            fill_px = float(pend["fill_px"])
-            # Open fill vanished (shouldn't happen) or deadline passed → drop.
-            if fill_id not in fills_by_id or now_ms >= int(pend["deadline_t"]):
+        for acct_name in ACCOUNTS:
+            acc = self._account(acct_name)
+            pending = acc.get("pending_drift")
+            if not pending:
                 continue
-            # Need the target bar closed: fetch a small window ending at/after it.
-            age_bars = max(2, int((now_ms - int(pend["fill_bar_t"])) / 60_000.0) + 1)
-            try:
-                bars = fetch_hl_candles(
-                    pend["coin"], "1m", min(age_bars, _MAX_MAKER_FETCH_BARS),
-                    opportunistic=True)
-            except Exception as e:
-                logger.debug(f"[shadow_book] drift candles miss {pend['coin']}: {e}")
-                remaining.append(pend)
-                continue
-            post_bar = next((b for b in bars if int(b.t) == target_t), None)
-            # Bar not present, or it is the still-forming last bar → wait.
-            if post_bar is None or int(post_bar.t) + 60_000 > now_ms:
-                remaining.append(pend)
-                continue
-            post_mid = (float(post_bar.h) + float(post_bar.l)) / 2.0
-            if post_mid <= 0 or fill_px <= 0:
-                continue  # drop the junk entry rather than looping forever
-            if pend.get("is_buy", True):
-                drift = (fill_px - post_mid) / fill_px * 1e4
-            else:
-                drift = (post_mid - fill_px) / fill_px * 1e4
-            fills_by_id[fill_id]["post_fill_mid_drift_bps"] = round(float(drift), 4)
-        acc["pending_drift"] = remaining
+            fills_by_id = {f.get("id"): f for f in acc["fills"]}
+            remaining: list[dict[str, Any]] = []
+            for pend in list(pending):
+                fill_id = pend.get("fill_id")
+                target_t = int(pend["fill_bar_t"]) + 60_000
+                fill_px = float(pend["fill_px"])
+                if fill_id not in fills_by_id or now_ms >= int(pend["deadline_t"]):
+                    continue
+                age_bars = max(2, int((now_ms - int(pend["fill_bar_t"])) / 60_000.0) + 1)
+                try:
+                    bars = fetch_hl_candles(
+                        pend["coin"], "1m", min(age_bars, _MAX_MAKER_FETCH_BARS),
+                        opportunistic=True)
+                except Exception as e:
+                    logger.debug(f"[shadow_book] drift candles miss {pend['coin']}: {e}")
+                    remaining.append(pend)
+                    continue
+                post_bar = next((b for b in bars if int(b.t) == target_t), None)
+                if post_bar is None or int(post_bar.t) + 60_000 > now_ms:
+                    remaining.append(pend)
+                    continue
+                post_mid = (float(post_bar.h) + float(post_bar.l)) / 2.0
+                if post_mid <= 0 or fill_px <= 0:
+                    continue
+                if pend.get("is_buy", True):
+                    drift = (fill_px - post_mid) / fill_px * 1e4
+                else:
+                    drift = (post_mid - fill_px) / fill_px * 1e4
+                fills_by_id[fill_id]["post_fill_mid_drift_bps"] = round(float(drift), 4)
+            acc["pending_drift"] = remaining
 
     def _close_position(self, acct: str, pos: dict[str, Any], exit_px: float,
                         reason: str, hold_min: float = 0.0,
@@ -1401,11 +1606,31 @@ class ShadowBook:
             # does not touch PnL or the exit decision.
             "exit_policy": dict(policy_snapshot or {}),
             "fill_model": acct,
+            "execution": "taker" if acct == "taker" else "maker",
+            "phase": "close",
+            "is_buy": side == "short",
+            "post_fill_mid_drift_bps": None,
             "entry_regime": pos.get("entry_regime", ""),
             "analysis_id": pos.get("analysis_id", ""),
             "opened_at": pos.get("opened_at"),
         }
         acc["fills"].append(close_fill)
+        if acct == "taker":
+            # The close executes sell for a long and buy for a short. Keep that
+            # execution direction in the pending row: reversing it would measure
+            # favorable move as adverse drift on one side. This is the same
+            # persisted next-bar backfill mechanism used by maker opens.
+            fill_bar_t = closed_at - closed_at % 60_000
+            acc["pending_drift"].append({
+                "fill_id": close_fill["id"],
+                "coin": coin,
+                "is_buy": side == "short",
+                "fill_px": float(fill_exit_px),
+                "fill_bar_t": fill_bar_t,
+                "deadline_t": fill_bar_t + _MAKER_DRIFT_WAIT_BARS * 60_000,
+                "execution": "taker",
+                "phase": "close",
+            })
         _trim_fills(acc)
 
         acc["wallet_balance"] = float(acc["wallet_balance"]) + net_pnl
@@ -1450,11 +1675,12 @@ class ShadowBook:
                     self._resolve_pending_maker_orders(mids)
                 except Exception as e:
                     logger.warning(f"[shadow_book] maker resolve failed: {e}")
-                try:
-                    self._resolve_pending_drift()
-                except Exception as e:
-                    logger.warning(f"[shadow_book] maker drift backfill failed: {e}")
+            try:
+                self._resolve_pending_drift()
+            except Exception as e:
+                logger.warning(f"[shadow_book] drift backfill failed: {e}")
             index_prices = index_prices or {}
+            cvd_cache: dict[str, tuple[Any, dict[str, Any]]] = {}
             for acct in ACCOUNTS:
                 acc = self._account(acct)
                 if not acc["positions"]:
@@ -1472,6 +1698,17 @@ class ShadowBook:
                     hold_min = (time.time() - float(pos["opened_at"]) / 1000.0) / 60.0
                     mfe = 0.0
                     if tracker is not None:
+                        sl_px = getattr(tracker, "sl_px", None)
+                        tp_px = getattr(tracker, "tp_px", None)
+                        if sl_px is not None and ((side == "long" and mark <= sl_px)
+                                                  or (side == "short" and mark >= sl_px)):
+                            exit_now = True
+                            reason = "manual_sl"
+                        elif tp_px is not None and ((side == "long" and mark >= tp_px)
+                                                    or (side == "short" and mark <= tp_px)):
+                            exit_now = True
+                            reason = "manual_tp"
+                    if tracker is not None and not exit_now:
                         try:
                             v = tracker.check(float(mark), float(idx) if idx else None)
                             exit_now = bool(getattr(v, "exit", False))
@@ -1530,6 +1767,51 @@ class ShadowBook:
                         pos["unrealized_pnl_usd"] = float(pos["size_usd"]) * upct / 100.0
                         pos["marked_at"] = _now_ms()
 
+                    # Counterfactuals run AFTER the real shadow bookkeeping so
+                    # observation latency/failures cannot change real exits.
+                    position_id = str(pos.get("position_id") or pos.get("id") or "")
+                    if tracker is not None and position_id:
+                        try:
+                            self._observe_phase2_floor_counterfactual(
+                                acct, position_id, side, float(mark), idx, tracker)
+                        except Exception as e:
+                            logger.debug(f"[shadow_book] floor counterfactual {coin}: {e}")
+                    if position_id:
+                        try:
+                            if coin not in cvd_cache:
+                                cvd_cache[coin] = self._detect_cvd_for_counterfactual(coin)
+                            divergence, production_params = cvd_cache[coin]
+                        except Exception as e:
+                            cvd_cache[coin] = (None, {})
+                            logger.debug(f"[shadow_book] CVD counterfactual {coin}: {e}")
+                            divergence, production_params = (None, {})
+                        bullish = bool(getattr(divergence, "bullish", False))
+                        bearish = bool(getattr(divergence, "bearish", False))
+                        direction = ("bearish" if bearish and not bullish else
+                                     "bullish" if bullish and not bearish else "")
+                        exhausted = ((side == "long" and direction == "bearish")
+                                     or (side == "short" and direction == "bullish"))
+                        if exhausted:
+                            evidence = {
+                                "coin": coin,
+                                "position_side": side,
+                                "direction": direction,
+                                "bullish": bool(getattr(divergence, "bullish", False)),
+                                "bearish": bool(getattr(divergence, "bearish", False)),
+                                "strength_pct": float(getattr(divergence, "strength_pct", 0.0)),
+                                "detector_reason": str(getattr(divergence, "reason", "")),
+                                "production_params": production_params,
+                            }
+                            self._record_exit_counterfactual(
+                                acct, position_id, "cvd_divergence", float(mark),
+                                f"cvd_{direction}_divergence_{side}_exhaustion",
+                                evidence)
+                        try:
+                            self._observe_candle_exhaustion_counterfactuals(
+                                acct, position_id, coin, side, float(mark))
+                        except Exception as e:
+                            logger.debug(f"[shadow_book] candle exhaustion counterfactual {coin}: {e}")
+
                 snap = self._account_metrics(acct)
                 now_mono = time.monotonic()
                 if (now_mono - self._last_equity_ts) >= _EQUITY_MIN_INTERVAL_S:
@@ -1576,6 +1858,55 @@ class ShadowBook:
                 self._save(force=True)
                 return fill
         return None
+
+    def adjust_bracket(self, coin: str, *, side: Optional[str] = None,
+                       sl_pct: Optional[float] = None,
+                       tp_pct: Optional[float] = None) -> dict[str, Any]:
+        """Persist manual brackets on matching paper positions (both accounts)."""
+        self.reload_if_changed()
+        with self._lock:
+            for value in (sl_pct, tp_pct):
+                if value is not None and (not math.isfinite(float(value))
+                                          or not 0 < float(value) <= 100):
+                    raise ValueError("SL/TP percentages must be finite and in (0,100]")
+            staged: list[tuple[dict[str, Any], Any, Optional[float], Optional[float]]] = []
+            for acct in ACCOUNTS:
+                for pos in self._account(acct)["positions"]:
+                    if pos["coin"] != coin or (side and pos["side"] != side):
+                        continue
+                    pos_side = str(pos["side"])
+                    entry = float(pos["entry_px"])
+                    tracker = self._trackers.get((acct, self._key(coin, pos_side)))
+                    if tracker is None:
+                        continue
+                    requested_sl = None
+                    if sl_pct is not None:
+                        requested_sl = entry * (1.0 - float(sl_pct) / 100.0) if pos_side == "long" \
+                            else entry * (1.0 + float(sl_pct) / 100.0)
+                        old_sl = getattr(tracker, "sl_px", None)
+                        if old_sl is not None and ((pos_side == "long" and requested_sl < old_sl)
+                                                   or (pos_side == "short" and requested_sl > old_sl)):
+                            raise ValueError("manual SL can only tighten")
+                    requested_tp = None
+                    if tp_pct is not None:
+                        requested_tp = entry * (1.0 + float(tp_pct) / 100.0) if pos_side == "long" \
+                            else entry * (1.0 - float(tp_pct) / 100.0)
+                    staged.append((pos, tracker, requested_sl, requested_tp))
+            if not staged:
+                return {"ok": False, "error": "shadow position not found"}
+            adjusted: list[dict[str, Any]] = []
+            for pos, tracker, requested_sl, requested_tp in staged:
+                if requested_sl is not None:
+                    tracker.sl_px = requested_sl
+                if requested_tp is not None:
+                    tracker.tp_px = requested_tp
+                pos["sl_px"] = tracker.sl_px
+                pos["tp_px"] = tracker.tp_px
+                adjusted.append({"account": acct, "coin": coin,
+                                 "side": pos["side"], "sl_px": tracker.sl_px,
+                                 "tp_px": tracker.tp_px})
+            self._save(force=True)
+            return {"ok": True, "adjusted": adjusted}
 
     def reset(self, starting_balance: Optional[float] = None) -> dict[str, Any]:
         """Wipe BOTH paper accounts back to a fresh bankroll (operator)."""
@@ -1891,6 +2222,10 @@ def get_equity_curve() -> dict[str, Any]:
 
 def get_stats() -> dict[str, Any]:
     return get_book().get_stats()
+
+
+def adjust_bracket(coin: str, **kwargs: Any) -> dict[str, Any]:
+    return get_book().adjust_bracket(coin, **kwargs)
 
 
 def reset(starting_balance: Optional[float] = None) -> dict[str, Any]:

@@ -72,10 +72,16 @@ from .portfolio_sim import (
     tradability_verdict,
 )
 from .trial_ledger import (
+    DEFAULT_TRIAL_LEDGER_PATH,
+    LEDGER_PATH_ENV,
     LEDGER_VERSION,
     Trial,
     TrialLedger,
+    TrialLedgerError,
     bonferroni,
+    deflated_sharpe_from_ledger,
+    dsr_trial_evidence,
+    family_key,
 )
 
 __all__ = [
@@ -123,7 +129,13 @@ __all__ = [
     "simulate_sizes",
     "tradability_verdict",
     "LEDGER_VERSION",
+    "LEDGER_PATH_ENV",
+    "DEFAULT_TRIAL_LEDGER_PATH",
     "Trial",
     "TrialLedger",
+    "TrialLedgerError",
     "bonferroni",
+    "family_key",
+    "dsr_trial_evidence",
+    "deflated_sharpe_from_ledger",
 ]

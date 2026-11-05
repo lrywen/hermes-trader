@@ -1235,6 +1235,26 @@ class ExitPolicy:
     time_scratch_min_peak_pct: float = 0.3
     time_scratch_giveback_pct: float = 0.3
 
+    # ── S4-1 soft timeout (regime-scaled extension, DEFAULT OFF) ──────────
+    # When enabled, a hard_timeout trigger does NOT immediately exit if the
+    # position shows NO exhaustion signal (never ignited AND never armed
+    # phase-2). Instead the deadline is extended once by a regime-scaled
+    # amount. Positions that ignited or armed phase-2 keep the original
+    # hard_timeout (the timeout family's +11.4bp evidence comes from agers
+    # that peaked — those are not the target). The extension is one-shot:
+    # once the extended deadline is reached the exit fires unconditionally.
+    # 0 / disabled preserves byte-identical legacy behaviour.
+    soft_timeout_enabled: bool = False
+    # Extra minutes granted per regime on the first hard_timeout hit with no
+    # exhaustion. Regime missing/unknown falls back to `default_extra_min`.
+    soft_timeout_extra_min: dict = field(default_factory=lambda: {
+        "up": 120.0,       # trends get the longest leash
+        "down": 120.0,
+        "neutral": 60.0,
+        "chop": 30.0,      # chop gets the shortest extension
+    })
+    soft_timeout_default_extra_min: float = 60.0
+
 
 def _ignite_grace_from_cfg(raw: Any) -> float:
     """D2 (2026-10-22): canonical dsl_exit.ignite_grace_minutes ships as an
@@ -1343,6 +1363,10 @@ class DSLTracker:
         # restart, and a missing value simply suppresses that one record).
         self._sc_first_ts: Optional[float] = None
         self._sc_first_px: Optional[float] = None
+        # S4-1 soft timeout: one-shot extension guard. False until the first
+        # hard_timeout hit is deferred via soft timeout; then True so the
+        # extended deadline exits unconditionally. Persisted across restarts.
+        self.soft_timeout_extended: bool = False
 
         # Exchange-side bracket order IDs (for the static backup SL / TP scale-out).
         # Persisted across restarts so the dynamic SL mover (batchModify) can target
@@ -1639,16 +1663,66 @@ class DSLTracker:
 
         # ── Hard timeout ──────────────────────────────────────────────
         if elapsed_min >= pol.hard_timeout_minutes:
-            _record_exit("hard_timeout")
-            _record_exit_outcome_shadow(
-                self, pol, "hard_timeout", upct, effective_max_loss,
-                spot_cap_display, atr_active)
-            _request_save(force=True)
-            return self._verdict(
-                exit=True, reason=f"hard_timeout ({elapsed_min:.0f}min)",
-                floor_price=None, peak_price=self.peak_px, phase="timeout",
-                unrealized_pct=upct,
-            )
+            # S4-1 soft timeout: when enabled and this is the first hit, defer
+            # the exit for a position showing no exhaustion signal (never
+            # ignited AND never armed phase-2). One-shot; the extended deadline
+            # below exits unconditionally. Legacy behaviour is byte-identical
+            # when soft_timeout_enabled is False (default).
+            _soft_defer = False
+            if (getattr(pol, "soft_timeout_enabled", False)
+                    and not self.soft_timeout_extended):
+                _armed_phase2 = self._peak_profit_pct() >= pol.protect_pct
+                _has_exhaustion = self.ignited or _armed_phase2
+                if not _has_exhaustion:
+                    extra_map = getattr(pol, "soft_timeout_extra_min", {}) or {}
+                    extra = float(extra_map.get(
+                        self.entry_regime,
+                        getattr(pol, "soft_timeout_default_extra_min", 60.0)))
+                    if extra > 0:
+                        self.soft_timeout_extended = True
+                        _soft_defer = True
+                        _record_exit("soft_timeout_deferred")
+                        logger.info(
+                            "[dsl_exit] %s %s soft-timeout deferral: "
+                            "elapsed=%.0fmin hard=%.0fmin +%.0fmin "
+                            "(regime=%s, ignited=%s, phase2=%s)",
+                            self.coin, self.side, elapsed_min,
+                            pol.hard_timeout_minutes, extra,
+                            self.entry_regime or "unknown",
+                            self.ignited, _armed_phase2)
+            if not _soft_defer:
+                _record_exit("hard_timeout")
+                _record_exit_outcome_shadow(
+                    self, pol, "hard_timeout", upct, effective_max_loss,
+                    spot_cap_display, atr_active)
+                _request_save(force=True)
+                return self._verdict(
+                    exit=True, reason=f"hard_timeout ({elapsed_min:.0f}min)",
+                    floor_price=None, peak_price=self.peak_px, phase="timeout",
+                    unrealized_pct=upct,
+                )
+            # Soft deferral: fall through to floor computation this tick; the
+            # extended deadline is enforced on a subsequent tick below.
+        # S4-1: enforce the one-shot extended deadline.
+        if (getattr(pol, "soft_timeout_enabled", False)
+                and self.soft_timeout_extended):
+            extra_map = getattr(pol, "soft_timeout_extra_min", {}) or {}
+            _extra = float(extra_map.get(
+                self.entry_regime,
+                getattr(pol, "soft_timeout_default_extra_min", 60.0)))
+            if elapsed_min >= pol.hard_timeout_minutes + _extra:
+                _record_exit("hard_timeout")
+                _record_exit_outcome_shadow(
+                    self, pol, "hard_timeout", upct, effective_max_loss,
+                    spot_cap_display, atr_active)
+                _request_save(force=True)
+                return self._verdict(
+                    exit=True,
+                    reason=(f"hard_timeout ({elapsed_min:.0f}min, "
+                            f"soft-extended +{_extra:.0f}min)"),
+                    floor_price=None, peak_price=self.peak_px,
+                    phase="timeout", unrealized_pct=upct,
+                )
 
         # ── Compute floor ───────────────────────────────────────────
         # Floor only moves in the favorable direction (up for longs, down for
@@ -2041,6 +2115,7 @@ def _tracker_to_dict(t: DSLTracker) -> dict[str, Any]:
         "ignite_ts": t.ignite_ts,
         "ignite_period": t.ignite_period,
         "ignite_cf_recorded": t.ignite_cf_recorded,
+        "soft_timeout_extended": getattr(t, "soft_timeout_extended", False),
         "last_floor": t._last_floor,
         "policy": asdict(t.policy),
         # v2: exchange bracket order IDs / prices (None when no resting order).
@@ -2176,6 +2251,8 @@ def _tracker_from_dict(d: dict[str, Any]) -> DSLTracker:
     # D2 record-only guard; absent in older state files -> False (snapshots
     # once after upgrade if the position is still un-ignited past the cutoff).
     t.ignite_cf_recorded = bool(d.get("ignite_cf_recorded", False))
+    # S4-1 soft timeout one-shot guard; absent in older state -> False.
+    t.soft_timeout_extended = bool(d.get("soft_timeout_extended", False))
     # Audit 2026-09-06 (E5, P2): validate a persisted last_floor before
     # trusting it as the ratchet anchor. The floor is always a positive PRICE
     # (long: a stop below entry that ratchets up; short: a stop above entry
@@ -2611,6 +2688,8 @@ def active_tracker_snapshots() -> list[dict[str, Any]]:
             "entry_px": t.entry_px, "peak_px": t.peak_px,
             "floor_px": t._last_floor, "entry_time": t.entry_time,
             "consecutive_breaches": t.consecutive_breaches,
+            "sl_oid": t.sl_oid, "sl_px": t.sl_px, "sl_size": t.sl_size,
+            "tp_oid": t.tp_oid, "tp_px": t.tp_px,
         })
     return out
 
@@ -2630,6 +2709,9 @@ def tracker_view(coin: str, side: str) -> Optional[dict[str, Any]]:
     return {
         "peak_px": t.peak_px,
         "floor_px": floor,
+        "entry_px": t.entry_px,
+        "sl_oid": t.sl_oid, "sl_px": t.sl_px, "sl_size": t.sl_size,
+        "tp_oid": t.tp_oid, "tp_px": t.tp_px,
         "phase": "phase2" if floor and (
             (side == "long" and floor > t.entry_px)
             or (side == "short" and floor < t.entry_px)

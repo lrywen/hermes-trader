@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from hermes_trader.agents import shadow_book as sb
 from hermes_trader.models.types import Candle
 
@@ -498,6 +500,77 @@ def test_drift_pending_survives_reload(tmp_path, monkeypatch):
     assert of["post_fill_mid_drift_bps"] is not None and of["post_fill_mid_drift_bps"] > 0
 
 
+def _book_taker_close(book, side):
+    pos = {
+        "id": f"pos-{side}", "coin": "BTC", "side": side,
+        "entry_px": 100.0, "size_usd": 1000.0, "size_coin": 10.0,
+        "leverage": 1, "entry_regime": "trend", "analysis_id": "a-close",
+        "opened_at": _T0 - 600_000,
+    }
+    return book._close_position("taker", pos, 100.0, "contract_test")
+
+
+@pytest.mark.parametrize("side,post_mid", [("long", 101.0), ("short", 99.0)])
+def test_taker_close_drift_uses_close_execution_direction(
+        tmp_path, monkeypatch, side, post_mid):
+    fill_t = _T0 - 2 * 60_000
+    _patch_cfg(monkeypatch)
+    monkeypatch.setattr(sb, "_now_ms", lambda: fill_t)
+    book = sb.ShadowBook(path=str(tmp_path / f"{side}.json"))
+    close = _book_taker_close(book, side)
+    acc = book.state["accounts"]["taker"]
+    pend = acc["pending_drift"][0]
+
+    assert close["execution"] == "taker"
+    assert close["phase"] == "close"
+    assert close["post_fill_mid_drift_bps"] is None
+    assert pend["is_buy"] is (side == "short")
+    assert pend["execution"] == "taker" and pend["phase"] == "close"
+
+    monkeypatch.setattr(sb, "_now_ms", lambda: _T0)
+    bars = [Candle(t=fill_t + 60_000, o=100.0, h=post_mid,
+                   l=post_mid, c=post_mid, v=1.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    with book._lock:
+        book._resolve_pending_drift()
+
+    expected = ((close["price"] - post_mid) / close["price"] * 1e4
+                if side == "short" else
+                (post_mid - close["price"]) / close["price"] * 1e4)
+    assert close["post_fill_mid_drift_bps"] == pytest.approx(expected, abs=1e-4)
+    assert close["post_fill_mid_drift_bps"] > 0
+    assert acc["pending_drift"] == []
+
+
+def test_taker_close_pending_drift_backfills_after_reload(tmp_path, monkeypatch):
+    fill_t = _T0 - 2 * 60_000
+    path = str(tmp_path / "reload-taker-close.json")
+    _patch_cfg(monkeypatch)
+    monkeypatch.setattr(sb, "_now_ms", lambda: fill_t)
+    book = sb.ShadowBook(path=path)
+    close = _book_taker_close(book, "long")
+    close_id = close["id"]
+    book._save(force=True)
+
+    monkeypatch.setattr(sb, "_now_ms", lambda: _T0)
+    reloaded = sb.ShadowBook(path=path)
+    acc = reloaded.state["accounts"]["taker"]
+    assert len(acc["pending_drift"]) == 1
+    assert acc["pending_drift"][0]["fill_id"] == close_id
+    bars = [Candle(t=fill_t + 60_000, o=100.0, h=101.0,
+                   l=101.0, c=101.0, v=1.0)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *a, **k: bars)
+    reloaded.mark_to_market({"BTC": 100.0})
+
+    saved_close = next(f for f in acc["fills"] if f["id"] == close_id)
+    assert saved_close["post_fill_mid_drift_bps"] > 0
+    assert acc["pending_drift"] == []
+
+
 def test_immediate_drift_does_not_queue_pending(tmp_path, monkeypatch):
     """When the simulator already has a next bar (drift non-None), no
     pending_drift row is created — the deferred path is only for the
@@ -516,3 +589,197 @@ def test_immediate_drift_does_not_queue_pending(tmp_path, monkeypatch):
     book.mark_to_market({"BTC": 100.0})
     acc = book.state["accounts"]["maker_shadow"]
     assert acc["pending_drift"] == []
+
+
+def _seed_counterfactual_position(book, side):
+    pos = {
+        "id": f"cf-{side}", "coin": "BTC", "side": side,
+        "entry_px": 100.0, "size_usd": 1000.0, "size_coin": 10.0,
+        "leverage": 1, "entry_atr_pct": 0.0, "entry_regime": "trend",
+        "analysis_id": "counterfactual-test", "opened_at": _T0,
+    }
+    book.state["accounts"]["taker"]["positions"].append(pos)
+    return pos
+
+
+@pytest.mark.parametrize("side,direction", [("long", "bearish"), ("short", "bullish")])
+def test_cvd_counterfactual_is_deduped_and_never_closes_ledger(
+        tmp_path, monkeypatch, side, direction):
+    import json
+    from hermes_trader.agents.microstructure import CVDDivergence
+
+    state_path = tmp_path / f"cvd-{side}-state.json"
+    event_path = tmp_path / f"cvd-{side}-events.jsonl"
+    book = sb.ShadowBook(path=str(state_path),
+                         exit_counterfactual_path=str(event_path))
+    _seed_counterfactual_position(book, side)
+    divergence = CVDDivergence(
+        bullish=direction == "bullish", bearish=direction == "bearish",
+        strength_pct=12.5, reason="production detector test")
+    params = {"left": 8, "right": 5, "min_strength": 10.0}
+    monkeypatch.setattr(book, "_detect_cvd_for_counterfactual",
+                        lambda coin: (divergence, params))
+
+    def forbidden_close(*args, **kwargs):
+        raise AssertionError("counterfactual must not call _close_position")
+
+    monkeypatch.setattr(book, "_close_position", forbidden_close)
+    book.mark_to_market({"BTC": 105.0 if side == "long" else 95.0})
+    book.mark_to_market({"BTC": 105.0 if side == "long" else 95.0})
+    rows = [json.loads(line) for line in event_path.read_text().splitlines()]
+    rows = [row for row in rows if row["signal"] == "cvd_divergence"]
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["account"] == "taker" and row["position_id"] == f"cf-{side}"
+    assert row["signal"] == "cvd_divergence"
+    assert row["virtual_exit_ts"] == row["ts"] and row["mid"] > 0
+    assert direction in row["reason"] and side in row["reason"]
+    assert row["evidence"]["production_params"] == params
+    assert book.state["accounts"]["taker"]["fills"] == []
+    assert len(book.state["accounts"]["taker"]["positions"]) == 1
+
+    book._save(force=True)
+    reloaded = sb.ShadowBook(path=str(state_path),
+                             exit_counterfactual_path=str(event_path))
+    monkeypatch.setattr(reloaded, "_detect_cvd_for_counterfactual",
+                        lambda coin: (divergence, params))
+    reloaded.mark_to_market({"BTC": 105.0 if side == "long" else 95.0})
+    persisted = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert sum(row["signal"] == "cvd_divergence" for row in persisted) == 1
+
+
+def test_cvd_counterfactual_uses_production_detector_params(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from hermes_trader.client.hl_client import Candle
+
+    book = sb.ShadowBook(path=str(tmp_path / "params-state.json"),
+                         exit_counterfactual_path=str(tmp_path / "params-events.jsonl"))
+    cfg = {
+        "scan": {"candleInterval": "5m", "candleCount": 100,
+                 "evaluateClosedBarsOnly": True},
+        "launch_capture": {"cvd_divergence": {
+            "left": 2, "right": 1, "min_strength_pct": 3.0}},
+    }
+    monkeypatch.setattr(
+        "hermes_trader.agents.config_store.read_agent_config", lambda: cfg)
+    points = [SimpleNamespace(t=float(i), cvd=float(i)) for i in range(8)]
+    monkeypatch.setattr(
+        "hermes_trader.agents.microstructure.get_microstructure",
+        lambda: SimpleNamespace(cvd_series=lambda coin: points))
+    candles = [Candle(t=i * 300_000, o=100.0, h=101.0, l=99.0,
+                      c=100.0 + i, v=1.0) for i in range(8)]
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *args, **kwargs: candles)
+    captured = {}
+
+    def fake_detect(prices, cvd, *, left, right, min_strength):
+        captured.update(left=left, right=right, min_strength=min_strength,
+                        prices=prices, cvd=cvd)
+        return None
+
+    monkeypatch.setattr(
+        "hermes_trader.agents.microstructure.detect_cvd_divergence", fake_detect)
+    divergence, params = book._detect_cvd_for_counterfactual("BTC")
+    assert divergence is None
+    assert params == {"left": 2, "right": 1, "min_strength": 3.0}
+    assert captured["left"] == 2 and captured["right"] == 1
+    assert captured["min_strength"] == 3.0
+    assert len(captured["prices"]) == 8 and len(captured["cvd"]) == 8
+
+
+def test_phase2_floor_counterfactual_requires_ticks_time_and_index(
+        tmp_path, monkeypatch):
+    import copy
+    import json
+    from hermes_trader.agents.dsl_exit import DSLTracker, ExitPolicy
+
+    event_path = tmp_path / "floor-events.jsonl"
+    book = sb.ShadowBook(path=str(tmp_path / "floor-state.json"),
+                         exit_counterfactual_path=str(event_path))
+    _seed_counterfactual_position(book, "long")
+    policy = ExitPolicy(protect_pct=1.0, retrace_threshold=0.20,
+                        consecutive_breaches_required=2, breach_confirm_sec=4.0)
+    tracker = DSLTracker("BTC", "long", entry_px=100.0,
+                         entry_time=_T0 / 1000.0, policy=policy,
+                         entry_atr_pct=0.0)
+    tracker.check(105.0, 105.0)  # phase2, floor = 104
+    assert tracker._phase_label() == "phase2"
+    assert tracker._last_floor == pytest.approx(104.0)
+    tracker_before = copy.deepcopy(tracker.__dict__)
+    ledger_before = copy.deepcopy(book.state)
+    clock = [100.0]
+    monkeypatch.setattr(sb.time, "monotonic", lambda: clock[0])
+
+    def forbidden_close(*args, **kwargs):
+        raise AssertionError("counterfactual must not call _close_position")
+
+    monkeypatch.setattr(book, "_close_position", forbidden_close)
+    observe = lambda: book._observe_phase2_floor_counterfactual(
+        "taker", "cf-long", "long", 103.0, 102.0, tracker)
+    observe()                       # first breach tick
+    clock[0] = 101.0
+    observe()                       # two ticks, but only one second
+    assert not event_path.exists()
+    clock[0] = 105.0
+    book._observe_phase2_floor_counterfactual(
+        "taker", "cf-long", "long", 103.0, 105.0, tracker)
+    assert not event_path.exists()  # index still above the floor
+    observe()                       # time + ticks + index now all confirmed
+    observe()                       # same account/position/signal deduped
+
+    rows = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert len(rows) == 1
+    evidence = rows[0]["evidence"]
+    assert rows[0]["signal"] == "phase2_trailing_floor"
+    assert rows[0]["reason"] == "phase2_trailing_floor_breach"
+    assert rows[0]["virtual_exit_ts"] == rows[0]["ts"]
+    assert rows[0]["mid"] == 103.0
+    assert evidence["required_breach_ticks"] == 2
+    assert evidence["required_breach_confirm_sec"] == 4.0
+    assert evidence["breach_confirm_sec"] >= 4.0
+    assert evidence["index_aligned"] is True and evidence["floor_px"] == 104.0
+    assert tracker.__dict__ == tracker_before
+    assert book.state == ledger_before
+    assert book.state["accounts"]["taker"]["fills"] == []
+
+
+def test_adx_atr_and_volume_stagnation_counterfactuals_are_observer_only(
+        tmp_path, monkeypatch):
+    import json
+    from hermes_trader.client.hl_client import Candle
+
+    event_path = tmp_path / "candle-exhaustion-events.jsonl"
+    book = sb.ShadowBook(path=str(tmp_path / "candle-exhaustion-state.json"),
+                         exit_counterfactual_path=str(event_path))
+    candles = [Candle(t=i * 900_000, o=100.0, h=101.0, l=99.0,
+                      c=100.0, v=10.0) for i in range(80)]
+    candles[-1] = Candle(t=79 * 900_000, o=100.0, h=100.1, l=99.9,
+                         c=100.05, v=25.0)
+    monkeypatch.setattr(
+        "hermes_trader.client.hl_client.fetch_hl_candles",
+        lambda *args, **kwargs: candles)
+    monkeypatch.setattr(
+        "hermes_trader.agents.perception._drop_forming_bar",
+        lambda rows, interval: (rows, 0))
+    monkeypatch.setattr(sb, "_calculate_adx",
+                        lambda rows: [30.0] * (len(rows) - 3) + [30.0, 29.0, 28.0])
+    monkeypatch.setattr(sb, "_calculate_atr",
+                        lambda rows: [4.0] * (len(rows) - 3) + [4.0, 3.0, 2.0])
+    ledger_before = book.state
+
+    observe = lambda: book._observe_candle_exhaustion_counterfactuals(
+        "taker", "cf-long", "BTC", "long", 100.0)
+    observe()
+    observe()
+
+    rows = [json.loads(line) for line in event_path.read_text().splitlines()]
+    assert {row["signal"] for row in rows} == {"adx_atr_decay", "volume_stagnation"}
+    assert len(rows) == 2
+    assert all(row["observer_only"] is True for row in rows)
+    assert all(row["virtual_exit_ts"] == row["ts"] for row in rows)
+    volume = next(row for row in rows if row["signal"] == "volume_stagnation")
+    assert volume["evidence"]["volume_multiple"] == 2.5
+    assert volume["evidence"]["directional_bar_bp"] == pytest.approx(5.0)
+    assert book.state == ledger_before
+    assert book.state["accounts"]["taker"]["fills"] == []

@@ -553,41 +553,28 @@ def test_operator_mode_paper_rejected_400(client):
     assert read_agent_config().get("mode") != "PAPER"
 
 
-def test_operator_close_writes_audit_event(client, monkeypatch, tmp_path):
-    """F22: a web operator close must persist an operator_action event to the
-    session log AND fork it into the authoritative events.jsonl."""
-    from hermes_trader import event_log, session_log
-    sess = tmp_path / "session.jsonl"
-    ev = tmp_path / "events.jsonl"
-    monkeypatch.setattr(session_log, "SESSION_LOG_FILE", str(sess))
-    monkeypatch.setattr(event_log, "EVENTS_FILE", str(ev))
+def test_operator_close_persists_queued_command(client, monkeypatch, tmp_path):
+    """The dashboard writes intent; only the trading-loop process may close."""
+    from hermes_trader.agents import manual_control
+    monkeypatch.setattr(manual_control, "_state_path",
+                        lambda: str(tmp_path / "manual_control.json"))
+    monkeypatch.setattr(manual_control, "_audit_path",
+                        lambda: str(tmp_path / "manual_control_audit.jsonl"))
     monkeypatch.setattr(
         "hermes_trader.agents.executor.close_position_market",
-        lambda coin: {"ok": True, "coin": coin, "side": "long",
-                      "fill_px": 50000.0, "realized_pnl_pct": 1.2,
-                      "leverage": 10},
+        lambda coin: (_ for _ in ()).throw(AssertionError("dashboard executed an order")),
     )
     r = client.post("/api/dashboard/operator/close",
                     json={"coin": "btc"}, headers=_auth())
     assert r.status_code == 200, r.text
-    assert r.json()["ok"] is True
+    assert r.json()["queued"] is True
 
-    sess_rows = [json.loads(l) for l in sess.read_text().splitlines() if l.strip()]
-    op = [e for e in sess_rows if e.get("event") == "operator_action"]
-    assert op, "operator_action event missing from session log"
-    rec = op[-1]
-    assert rec["action"] == "close"
-    assert rec["coin"] == "BTC"          # bare ticker normalized to upper
-    assert rec["via"] == "web"
-    assert rec["result"]["ok"] is True
-    assert rec["result"]["fill_px"] == 50000.0
-
-    # Forked into events.jsonl (authoritative feed).
-    assert ev.exists()
-    ev_rows = [json.loads(l) for l in ev.read_text().splitlines() if l.strip()]
-    assert any(e.get("event") == "operator_action"
-               and e.get("payload", {}).get("action") == "close"
-               for e in ev_rows)
+    commands = manual_control.list_commands()
+    assert len(commands) == 1
+    assert commands[0]["action"] == "close"
+    assert commands[0]["payload"]["coin"] == "BTC"
+    assert commands[0]["status"] == "queued"
+    assert commands[0]["actor"] == "operator"
 
 
 # ── F20: POST /api/agent/config RMW must be serialized ─────────────────────

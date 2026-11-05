@@ -132,14 +132,20 @@ def test_nginx_trader_prefix_is_allowlist_when_config_present():
 def test_nginx_bare_trader_paths_are_private_network_only():
     """Q2 remainder: /api/dashboard/ and /api/feed/ bypass the portal BFF and
     reach trader directly, where public.py / shadow.py / audit.py read routes are
-    anonymous by design (their RBAC lives in the BFF's _PATH_RULES). Those two
-    locations must therefore stay reachable from the LAN only, never from the
-    public edge on 0.0.0.0:8443."""
+    anonymous by design (their RBAC lives in the BFF's _PATH_RULES). Each bare
+    path must therefore either be absent — P1-1 (2026-11-01) deleted the
+    /api/dashboard/ location so every read goes through the BFF's RBAC — or stay
+    reachable from the LAN only, never from the public edge on 0.0.0.0:8443."""
     text = _deployed_nginx_conf().read_text(encoding="utf-8")
     blocks = _location_bodies(text)
     for path in ("/api/dashboard/", "/api/feed/"):
         body = blocks.get(path)
-        assert body is not None, f"location {path} missing from deployed config"
+        if body is None:
+            # Absent is stricter than a LAN allowlist; only /api/dashboard/ may
+            # be gone (P1-1). /api/feed/ still exists and must keep its rules.
+            assert path == "/api/dashboard/", \
+                f"location {path} missing from deployed config"
+            continue
         for rule in (
             "allow 127.0.0.1;",
             "allow 10.0.0.0/8;",

@@ -110,3 +110,34 @@ def test_load_meta_accepts_universe_shape(tmp_path):
     p2.write_text('{"ETH": 4}')
     assert ft.load_meta(str(p2)) == {"ETH": 4}
     assert ft.load_meta(None) == {}
+
+
+def test_c4_realistic_side_stats_require_50_measured_taker_closes():
+    fills = []
+    for i in range(49):
+        fills.append({"type": "close", "execution": "taker", "side": "long",
+                      "post_fill_mid_drift_bps": float(i)})
+    fills.append({"type": "close", "execution": "taker", "side": "long",
+                  "post_fill_mid_drift_bps": None})
+    for _ in range(50):
+        fills.append({"type": "close", "fill_model": "taker", "side": "short",
+                      "post_fill_mid_drift_bps": 2.0})
+    fills.append({"type": "close", "execution": "maker", "side": "long",
+                  "post_fill_mid_drift_bps": 999.0})
+
+    report = ft.c4_realistic_by_side(fills)
+    long = report["by_side"]["long"]
+    short = report["by_side"]["short"]
+    assert long["n"] == 49 and long["records"] == 50 and long["pending"] == 1
+    assert long["status"] == "insufficient"
+    assert long["latency_only"] is True and long["insufficient"] is True
+    assert long["impact_source"] == "latency_only"
+    assert short["n"] == 50 and short["status"] == "measured"
+    assert short["latency_only"] is False and short["insufficient"] is False
+    assert short["mean_bps"] == 2.0 and short["impact_source"] == "post_fill_mid_drift"
+
+    arm_path = _SCRIPT.with_name("arm_edge_eval.py")
+    spec = importlib.util.spec_from_file_location("arm_edge_eval_c4_test", arm_path)
+    arm = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(arm)  # type: ignore[union-attr]
+    assert arm.c4_realistic_by_side(fills) == report

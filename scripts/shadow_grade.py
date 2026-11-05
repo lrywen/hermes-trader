@@ -44,6 +44,9 @@ from typing import Optional
 # 复用同目录 shadow_progress 的臂表与解析逻辑（路径已在 Audit 2026-09-07 修正）。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import shadow_progress as sp
+from hermes_trader.validation.trial_ledger import (
+    TrialLedger, TrialLedgerError, deflated_sharpe_from_ledger,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -87,8 +90,7 @@ STALE_WINDOW_H = 24
 R5_MIN_DAYS = 20
 R5_WFA_TRAIN_DAYS = 12
 R5_WFA_TEST_DAYS = 4
-# DSR 的多重试验口径：臂数 × 已尝试范式，保守给一个固定默认（可被配置覆盖）。
-R5_DEFAULT_N_TRIALS = 16
+# DSR 的 n_trials 由 arm×paradigm 账本族在 as_of 时点决定；禁止固定默认值。
 R5_DSR_ACCEPT_P = 0.95
 # Audit 2026-09-10 (M13 修正)：部分臂是「每 tick 评估、仅在极端/候选事件发生
 # 时才往事件 JSONL 落一条」。对这类臂，事件流 24h 零写入是正常的（市场无极端
@@ -812,60 +814,83 @@ def _r5_daily_bps(records: list[dict]) -> list[float]:
     return [_st.mean(byday[k]) for k in sorted(byday)]
 
 
-def r5_robustness(records: list[dict],
-                  n_trials: int = R5_DEFAULT_N_TRIALS) -> Optional[dict]:
-    """Run WFA + block-bootstrap + DSR/PBO on the arm's daily bps series.
+def r5_robustness(records: list[dict], n_trials: Optional[int] = None,
+                  *, arm: str = "", paradigm: str = "shadow_forward",
+                  as_of=None, ledger_path=None,
+                  ledger: Optional[TrialLedger] = None) -> Optional[dict]:
+    """Run WFA/bootstrap and ledger-backed DSR on daily net bps.
 
-    Returns a compact stats block for the rating card, or ``None`` when there
-    is insufficient history (fewer than :data:`R5_MIN_DAYS`) — never guessed.
-    Read-only and pure (no I/O).
+    ``n_trials`` is retained for positional compatibility but is never used.
+    Ledger failures are explicit, machine-readable and fail the DSR check.
     """
     daily = _r5_daily_bps(records)
     if len(daily) < R5_MIN_DAYS:
         return None
+    from hermes_trader.validation import (
+        block_bootstrap_ci, probability_of_backtest_overfitting, sharpe,
+        walk_forward_analysis,
+    )
     try:
-        from hermes_trader.validation import (
-            block_bootstrap_ci,
-            deflated_sharpe_prob,
-            probability_of_backtest_overfitting,
-            sharpe,
-            walk_forward_analysis,
-        )
         wfa = walk_forward_analysis(
             daily, train_size=R5_WFA_TRAIN_DAYS, test_size=R5_WFA_TEST_DAYS)
         lo, hi = block_bootstrap_ci(daily)
         sr = sharpe(daily)
-        dsr = deflated_sharpe_prob(sr, n_trials=n_trials, n_obs=len(daily))
-        # H3 (2026-11-04): WFA OOS-negative fold ratio, NOT a CSCV overfitting
-        # probability (single strategy => no config matrix for true CSCV).
         oos_neg = probability_of_backtest_overfitting(
             [max(v, 0.0) for v in wfa.oos_mean_bps],
             list(wfa.oos_mean_bps))
-        import statistics as _st
-        return {
-            "days": len(daily),
-            "wfr": round(wfa.wfr, 3),
-            "wfe": round(wfa.wfe, 3),
-            "wfa_windows": wfa.n_windows,
-            "oos_win_frac": round(wfa.oos_win_frac, 3),
-            "bb_ci_lo_bps": round(lo, 2),
-            "bb_ci_hi_bps": round(hi, 2),
-            "net_edge_bps": round(_st.mean(daily), 2),
-            "sharpe": round(sr, 3),
-            "dsr_p": round(dsr, 4),
-            "oos_negative_fold_ratio": round(oos_neg, 3),
-            "dsr_passes": dsr >= R5_DSR_ACCEPT_P,
-        }
-    except Exception as e:  # never let an offline stat break grading
+    except Exception as e:  # unrelated statistic failures retain old behavior
         logger.debug("r5_robustness failed: %s", e)
         return None
+    import statistics as _st
+    out = {
+        "days": len(daily),
+        "wfr": round(wfa.wfr, 3),
+        "wfe": round(wfa.wfe, 3),
+        "wfa_windows": wfa.n_windows,
+        "oos_win_frac": round(wfa.oos_win_frac, 3),
+        "bb_ci_lo_bps": round(lo, 2),
+        "bb_ci_hi_bps": round(hi, 2),
+        "net_edge_bps": round(_st.mean(daily), 2),
+        "sharpe": round(sr, 3),
+        "dsr_p": None,
+        "n_trials": None,
+        "trial_evidence": None,
+        "dsr_error": None,
+        "oos_negative_fold_ratio": round(oos_neg, 3),
+        "dsr_passes": False,
+    }
+    try:
+        evidence = deflated_sharpe_from_ledger(
+            observed_sharpe=sr, n_obs=len(daily), arm=arm,
+            paradigm=paradigm, as_of=as_of, ledger_path=ledger_path,
+            ledger=ledger,
+        )
+    except TrialLedgerError as exc:
+        out["dsr_error"] = exc.as_dict()
+        out["verdict"] = "fail_closed"
+        return out
+    dsr = float(evidence["dsr_p"])
+    out.update({
+        "dsr_p": round(dsr, 4),
+        "n_trials": evidence["n_trials"],
+        "trial_evidence": evidence,
+        "dsr_statistical_passes": dsr >= R5_DSR_ACCEPT_P,
+        "dsr_promotion_eligible": evidence["promotion_eligible"],
+        "dsr_passes": bool(dsr >= R5_DSR_ACCEPT_P
+                           and evidence["promotion_eligible"]),
+        "verdict": "pass" if dsr >= R5_DSR_ACCEPT_P
+                   and evidence["promotion_eligible"] else "fail",
+    })
+    return out
 
 
 def grade_arm(arm: str, mode: str, path: str, windows: list[int],
               now_ms: float | None = None,
               records: list[dict] | None = None,
               heartbeat_age_sec: float | None = None,
-              macro_regime: str | None = None) -> dict:
+              macro_regime: str | None = None,
+              trial_ledger_path=None,
+              trial_ledger: Optional[TrialLedger] = None) -> dict:
     """Grade one arm purely from its records + mode. Pure function (no I/O when
     ``records`` is supplied) so it is unit-testable.
 
@@ -1059,7 +1084,9 @@ def grade_arm(arm: str, mode: str, path: str, windows: list[int],
         out["sv2_cost"] = grade_sizing_v2_cost(
             records, window_h=SV2_COST_WINDOW_H, now_ms=now_ms)
     # R5：离线 WFA + DSR/PBO 稳健性块（样本不足时为 None，不猜测）。
-    r5 = r5_robustness(records)
+    r5 = r5_robustness(
+        records, arm=arm, as_of=now_ms, ledger_path=trial_ledger_path,
+        ledger=trial_ledger)
     if r5 is not None:
         out["r5_stats"] = r5
         out["independent_days"] = r5["days"]
@@ -1442,7 +1469,8 @@ def _shadow_verdict(arm: str, kind: str, s: dict, w_long: int,
         "无有效证据，不作晋升评价；先跑 reconcile 补回填")
 
 
-def collect_grades(windows: list[int]) -> dict:
+def collect_grades(windows: list[int], trial_ledger_path=None,
+                   trial_ledger: Optional[TrialLedger] = None) -> dict:
     """Read config, grade every arm, attach real-trade baseline. Read-only."""
     cfg = {}
     try:
@@ -1466,7 +1494,9 @@ def collect_grades(windows: list[int]) -> dict:
         hb_age = _heartbeat_age_sec(label, now_ms) if label in ARM_HEARTBEAT_FILE else None
         arm_macro = macro_regime if label in MACRO_LONG_ONLY_ARMS else None
         arms.append(grade_arm(label, mode, path, windows, now_ms=now_ms,
-                              heartbeat_age_sec=hb_age, macro_regime=arm_macro))
+                              heartbeat_age_sec=hb_age, macro_regime=arm_macro,
+                              trial_ledger_path=trial_ledger_path,
+                              trial_ledger=trial_ledger))
 
     baseline = {"real_closes": 0, "real_win_rate": None, "note": ""}
     try:
@@ -1834,6 +1864,8 @@ def main() -> int:
     ap.add_argument("--push", action="store_true", help="推送飞书风险卡片（不抛异常）")
     ap.add_argument("--windows", type=int, nargs="+", default=[24, 72, 168],
                     help="统计窗口（小时），默认 24 72 168（空格分隔）")
+    ap.add_argument("--trial-ledger", default=None,
+                    help="DSR 试验账本 JSONL（默认读包内账本或 HERMES_TRIAL_LEDGER_PATH）")
     # Audit 2026-09-10 (M9)：CLI 手工运行默认标记 manual，避免污染夜间趋势；
     # cron 包装脚本（cron_shadow_grade.sh）显式传 --history-source=cron。
     ap.add_argument("--history-source", choices=("cron", "manual"),
@@ -1843,7 +1875,7 @@ def main() -> int:
                     help="只输出评级，不向 history 追加快照（零污染复核用）")
     args = ap.parse_args()
 
-    d = collect_grades(args.windows)
+    d = collect_grades(args.windows, trial_ledger_path=args.trial_ledger)
     if args.push:
         _push_feishu(d)
     # Audit 2026-09-07 (M1): persist the nightly snapshot for the dashboard

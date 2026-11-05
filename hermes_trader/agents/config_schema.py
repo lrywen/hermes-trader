@@ -360,6 +360,9 @@ class _ConfigPatch(BaseModel):
     reflection: dict[str, Any] = Field(default_factory=lambda: _dict_default("reflection"))
     # Audit 2026-09-06 (E1, Q2): choppy-market auto de-risk overlay.
     regime_risk_overlay: dict[str, Any] = Field(default_factory=lambda: _dict_default("regime_risk_overlay"))
+    # S3 (2026-11-05): shadow-only short channel admitted under the relaxed
+    # gate. Default enabled=false; LIVE is inert regardless of the flag.
+    s3_shadow_shorts: dict[str, Any] = Field(default_factory=lambda: _dict_default("s3_shadow_shorts"))
     # Audit 2026-09-07 (E6): xs_reversal oversold-bounce LONG shadow arm
     # (off|shadow|enforce; enforce is record-only in M2).
     xs_reversal: dict[str, Any] = Field(default_factory=lambda: _dict_default("xs_reversal"))

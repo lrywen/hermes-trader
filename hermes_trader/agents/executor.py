@@ -1407,8 +1407,34 @@ def coin_breakout_regime(analysis: dict[str, Any]) -> str:
         return ""
 
 
+def _record_regime_bypass(
+    analysis: dict[str, Any], override: str, **details: Any
+) -> None:
+    """Best-effort, unified audit for the four regime/runner bypass routes."""
+    try:
+        from hermes_trader.shadow_log import append_jsonl
+
+        rec = {
+            "ts": int(time.time() * 1000),
+            "trace_id": str(analysis.get("trace_id") or analysis.get("id")
+                            or f"trc-{uuid.uuid4().hex[:12]}"),
+            "analysis_id": analysis.get("id"),
+            "stream": "regime_bypass",
+            "override": override,
+            "coin": analysis.get("coin"),
+            "side": (analysis.get("side") or analysis.get("action") or "").lower(),
+            "macro_regime": analysis.get("macro_regime"),
+            "composite_score": _safe_float(analysis.get("composite_score")),
+        }
+        rec.update(details)
+        append_jsonl(_REGIME_BYPASS_FILE, rec, stream="regime_bypass")
+    except Exception as _rb_e:  # audit must never alter admission
+        logger.debug("[regime_bypass] audit failed: %s", _rb_e)
+
+
 def resolve_decision_regime(analysis: dict[str, Any],
-                            config: dict[str, Any]) -> str:
+                            config: dict[str, Any], *,
+                            record_bypass: bool = True) -> str:
     """Single authoritative regime for ONE entry decision.
 
     Resolves the macro (BTC-proxy) regime once, then applies the coin-local
@@ -1438,6 +1464,12 @@ def resolve_decision_regime(analysis: dict[str, Any],
             logger.info(
                 f"[regime] {analysis.get('coin')} coin-breakout override: "
                 f"macro={regime} → trend({_coin_regime})")
+            # S3-3: observation only; never blocks or deletes the bypass.
+            if record_bypass:
+                _record_regime_bypass(
+                    analysis, "coin_breakout", macro_regime=regime,
+                    coin_regime=_coin_regime,
+                    breakout_fired=bool(analysis.get("breakout_fired")))
             regime = _coin_regime
     except Exception:
         pass
@@ -2575,6 +2607,7 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
     shadow_book / market_regime keeps working.
     """
     _record_decision("shadow")
+    _sh_fill = None
     try:
         from hermes_trader.agents import shadow_book
         _sh_entry = mid_price if mid_price > 0 else 0.0
@@ -2609,7 +2642,7 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
                 })
             except Exception as _sig_e:
                 logger.warning(f"[shadow_book] signal_meta build failed (non-fatal): {_sig_e}")
-            shadow_book.shadow_open(
+            _sh_fill = shadow_book.shadow_open(
                 coin=coin, side=trade_side, entry_px=_sh_entry,
                 size_usd=trade_notional, leverage=leverage,
                 entry_atr_pct=_sh_atr_pct, entry_regime=_sh_regime,
@@ -2617,13 +2650,16 @@ def _shadow_mode_result(*, mode: str, analysis_id: str, coin: str,
             )
     except Exception as _shadow_e:
         logger.warning(f"[shadow_book] open failed (non-fatal): {_shadow_e}")
-    return {
+    result = {
         "executed": False, "mode": mode,
         "analysis_id": analysis_id,
         "reason": "shadow_mode_would_execute",
         "gate_results": gate_results,
         "size_usd": trade_notional,
     }
+    if isinstance(_sh_fill, dict):
+        result["shadow"] = _sh_fill
+    return result
 
 
 def _reconstruct_live_positions(state: dict[str, Any],
@@ -3118,6 +3154,14 @@ def _structural_override_path(analysis: dict[str, Any], config: dict[str, Any],
             )
         analysis["verdict"] = "LONG"
         analysis["side"] = "long"
+        if _enf is not None and getattr(_enf, "boost", False):
+            _record_regime_bypass(
+                analysis, "news",
+                boost_reason=getattr(_enf, "boost_reason", ""),
+                base_composite_floor=od["base_bar"],
+                applied_composite_floor=override_composite,
+                base_bar_would_block=bool(
+                    composite_strong and _composite < od["base_bar"]))
         # Preserve the model's own conviction before the floor masks it. The
         # runner gate judges on this raw value so a structural override can
         # still route/size as a LONG without laundering a 0.40 PASS into a
@@ -3259,6 +3303,19 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "executed": False, "mode": mode,
             "analysis_id": analysis["id"], "reason": "mode_off",
         }
+    # S5: an approved command bypasses ONLY this intervention gate. It still
+    # reruns LIVE authorization and every hard risk gate below.
+    manual_approved = bool(analysis.get("_manual_approved"))
+    manual_gate = {"allowed": True, "confirmation_required": False, "reason": ""}
+    if not manual_approved:
+        from hermes_trader.agents import manual_control
+        manual_gate = manual_control.automatic_entry_gate(str(_coin or ""))
+        if not manual_gate["allowed"]:
+            _record_decision("manual_gate_blocked")
+            return {
+                "executed": False, "mode": mode, "analysis_id": analysis["id"],
+                "reason": manual_gate["reason"],
+            }
     # P0-1 (2026-09-12): LIVE money requires an explicit process-env grant on
     # top of mode=LIVE in the config file. Fail-closed without it so a fresh
     # deploy / copied config can never place real orders; SHADOW/paper modes
@@ -3831,6 +3888,18 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
                                f"${trade_notional:.2f}, HL minimum after precision "
                                f"${min_notional:.2f}; gap {bump_gap*100:.0f}% > 50% — refusing auto-bump)"),
                 }
+        if manual_approved and analysis.get("_manual_notional_usd") is not None:
+            try:
+                requested_notional = float(analysis["_manual_notional_usd"])
+            except (TypeError, ValueError):
+                requested_notional = 0.0
+            if not math.isfinite(requested_notional) or requested_notional <= 0:
+                return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
+                        "reason": "manual_notional_invalid"}
+            trade_notional = min(trade_notional, requested_notional)
+            if min_notional > 0 and trade_notional + 1e-9 < min_notional:
+                return {"executed": False, "mode": mode, "analysis_id": analysis["id"],
+                        "reason": "manual_notional_below_exchange_minimum"}
         size_in_coin = entry_size_for_notional(coin, trade_notional, mid_price)
     except Exception as e:
         return {
@@ -4027,6 +4096,20 @@ def maybe_execute(analysis: dict[str, Any], _rotation_retry: bool = False) -> di
             "analysis_id": analysis["id"],
             "blocked_by": gate_output["block_reasons"],
             "gate_results": gate_output["results"],
+        }
+
+    # S5: queue only a fully gated candidate. Approval reruns this entire
+    # function; no candidate data is treated as a permanent risk exemption.
+    if manual_gate["confirmation_required"]:
+        from hermes_trader.agents import manual_control
+        confirmation = manual_control.request_confirmation(analysis)
+        _record_decision("pending_manual_confirmation")
+        return {
+            "executed": False, "pending_confirmation": True,
+            "confirmation_id": confirmation["id"], "mode": mode,
+            "analysis_id": analysis["id"], "coin": coin, "trade_side": trade_side,
+            "gate_results": gate_output["results"],
+            "reason": "pending_manual_confirmation",
         }
 
     if shadow_mode:
@@ -4971,6 +5054,8 @@ def _default_runner_gate_shadow_file() -> str:
 
 
 _RUNNER_GATE_SHADOW_FILE = _default_runner_gate_shadow_file()
+_REGIME_BYPASS_FILE = _default_shadow_log_path(
+    "HERMES_REGIME_BYPASS_SHADOW_FILE", "regime_bypass_shadow.jsonl")
 # M1 (2026-10-29): the decision-shadow evidence stream must survive long enough
 # for forward-return reconciliation (1h..72h) and >=40-60 independent trading
 # days of promotion-gate stats. The default rotates to only 5 daily siblings
@@ -5042,7 +5127,10 @@ def _runner_gate_volume_tier(vol_usd: Optional[float]) -> Optional[str]:
     return "micro"
 
 
-def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None:
+def _record_runner_gate_verdict(
+    analysis: dict[str, Any], decision: Any,
+    config: Optional[dict[str, Any]] = None,
+) -> None:
     """Append one structured runner-gate verdict. Best-effort, never raises.
 
     ``decision`` is the raw impl result ("" admitted, str blocked, None for the
@@ -5061,6 +5149,7 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
         score_v = feats.get("score")
         rec = {
             "ts": int(time.time() * 1000),
+            "analysis_id": analysis.get("id"),
             "coin": analysis.get("coin") or "",
             "side": (analysis.get("side") or "").lower(),
             "admitted": admitted,
@@ -5136,7 +5225,7 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
         try:
             _side_v = rec["side"]
             _vol_v = rec.get("volume_24h_usd")
-            _floor_v = float(cfg_get("min_short_volume_usd") or 0)
+            _floor_v = float(cfg_get("min_short_volume_usd", config=config) or 0)
             rec["short_floor_usd"] = _floor_v if _side_v == "short" else None
             rec["short_floor_would_block"] = (
                 bool(_side_v == "short" and _floor_v > 0 and _vol_v is not None
@@ -5145,6 +5234,17 @@ def _record_runner_gate_verdict(analysis: dict[str, Any], decision: Any) -> None
         except Exception:
             rec["short_floor_usd"] = None
             rec["short_floor_would_block"] = None
+        # S3 alternative-floor measurement is additive and observation-only;
+        # the frozen min_short_volume_usd result above remains authoritative.
+        try:
+            from hermes_trader.agents.s3_shadow_gate import impact_floor_tag
+
+            rec.update(impact_floor_tag(
+                side=rec["side"], volume_24h_usd=rec.get("volume_24h_usd"),
+                config=config))
+        except Exception:
+            rec["s3_alt_floor_usd"] = None
+            rec["s3_alt_floor_would_block"] = None
         from hermes_trader.shadow_log import append_jsonl
         append_jsonl(_RUNNER_GATE_SHADOW_FILE, rec, stream="runner_gate")
     except Exception as _rg_rec_e:  # never break the trade path
@@ -5319,7 +5419,7 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
         analysis["_runner_fresh_src"] = (
             str((_feats or {}).get("fresh_src") or "")
             if isinstance(_feats, dict) else "")
-        _record_runner_gate_verdict(analysis, decision)
+        _record_runner_gate_verdict(analysis, decision, config=config)
         return decision
     return _wrapped(analysis, config)
 
@@ -5371,53 +5471,82 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     # evaluation order changes: short-disabled is decided from config/overlay
     # alone, which needs none of the long-side fields.
     if side == "short" and not _ov_allow_shorts:
-        if bool(gate.get("allow_shorts", False)):
-            # Base config allows shorts but the overlay turned them off.
-            logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
-                        f"(E1 choppy-market de-risk overlay)")
-        else:
-            logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
-        # U1 (2026-11-04): this short-circuit returns BEFORE the full feature
-        # snapshot near the end of the impl, so the verdict recorder would see
-        # feats=None and every entry-observability key (trigger_hits, flow_*,
-        # the two regimes, composite_denominator) landed null on ~92% of rows.
-        # The research-exit analysis already carries trigger_hits/flow_*/
-        # denominator (additive passthrough); snapshot the observation keys
-        # here too so short rows are usable for future per-hit/side research
-        # without waiting for shorts to be enabled. Observational only — it does
-        # NOT change the block above and is wrapped so it can never raise.
+        # S3 shadow-shorts channel (user-approved relaxed gate, 2026-11-05):
+        # when enabled and running in SHADOW, a short in an allowed regime is
+        # admitted to the shadow book only. The frozen production switches are
+        # untouched; LIVE/OFF always falls through to the block below.
+        _s3_blocked = True
         try:
-            from hermes_trader.agents.market_regime import detect_regime_with_score
+            from hermes_trader.agents.s3_shadow_gate import (
+                s3_config, shadow_short_allowed)
+            _s3_cfg = s3_config(config)
+            _s3_mode = str(config.get("mode", "")).upper()
+            # Cheap pre-check: with the channel disabled (the default) or
+            # outside SHADOW, never pay for a regime detection — the frozen
+            # production path stays byte-for-byte identical in cost.
+            if _s3_cfg["enabled"] and _s3_mode == "SHADOW":
+                _s3_regime = resolve_decision_regime(analysis, config)
+                if shadow_short_allowed(mode=_s3_mode, side=side,
+                                        regime=_s3_regime, config=config):
+                    logger.info(f"[runner_gate] {coin} S3 shadow short admitted "
+                                f"(regime={_s3_regime}); production allow_shorts "
+                                f"stays false, shadow book only")
+                    # Fall through to the normal long-side gate chain; the shadow
+                    # book path downstream handles zero-exposure recording.
+                    _s3_blocked = False
+        except Exception as _s3_e:
+            logger.debug(f"[runner_gate] S3 shadow gate eval failed for "
+                         f"{coin}: {_s3_e} — keeping short block")
+            _s3_blocked = True
+        if _s3_blocked:
+            if bool(gate.get("allow_shorts", False)):
+                # Base config allows shorts but the overlay turned them off.
+                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled "
+                            f"(E1 choppy-market de-risk overlay)")
+            else:
+                logger.info(f"[runner_gate] {coin} BLOCKED: shorts disabled")
+            # U1 (2026-11-04): this short-circuit returns BEFORE the full feature
+            # snapshot near the end of the impl, so the verdict recorder would see
+            # feats=None and every entry-observability key (trigger_hits, flow_*,
+            # the two regimes, composite_denominator) landed null on ~92% of rows.
+            # The research-exit analysis already carries trigger_hits/flow_*/
+            # denominator (additive passthrough); snapshot the observation keys
+            # here too so short rows are usable for future per-hit/side research
+            # without waiting for shorts to be enabled. Observational only — it does
+            # NOT change the block above and is wrapped so it can never raise.
             try:
-                _g_short, _gs_short = detect_regime_with_score(coin)
+                from hermes_trader.agents.market_regime import detect_regime_with_score
+                try:
+                    _g_short, _gs_short = detect_regime_with_score(coin)
+                except Exception:
+                    _g_short, _gs_short = None, None
+                _th_short = analysis.get("trigger_hits") or []
+                _runner_gate_ctx.feats = {
+                    "score": _safe_float(analysis.get("composite_score")),
+                    "min_score": float(gate.get("min_composite", 0) or 0),
+                    "gate_conf": float(analysis.get("ai_confidence_raw",
+                                                    analysis.get("confidence", 0)) or 0),
+                    "min_conf": float(gate.get("min_confidence", 0) or 0),
+                    "mid": _safe_float(analysis.get("mid")),
+                    "regime_decision": resolve_decision_regime(analysis, config),
+                    "regime_gate": _g_short,
+                    "regime_gate_score": _gs_short,
+                    "trigger_hits": analysis.get("trigger_hits"),
+                    "flow_confirm_raw": analysis.get("flow_confirm_raw"),
+                    "flow_data_available": analysis.get("flow_data_available"),
+                    "flow_confirmed_breakout": any(
+                        bool(h.get("flow_confirmed")) for h in _th_short
+                        if h.get("name") == "breakout"),
+                    "composite_denominator": analysis.get("composite_denominator"),
+                    "mc_enabled": bool(
+                        (config.get("momentum_continuation") or {}).get("enabled")),
+                    "cp_enabled": bool(
+                        (config.get("candlestick_patterns") or {}).get("enabled")),
+                }
             except Exception:
-                _g_short, _gs_short = None, None
-            _th_short = analysis.get("trigger_hits") or []
-            _runner_gate_ctx.feats = {
-                "score": _safe_float(analysis.get("composite_score")),
-                "min_score": float(gate.get("min_composite", 0) or 0),
-                "gate_conf": float(analysis.get("ai_confidence_raw",
-                                                analysis.get("confidence", 0)) or 0),
-                "min_conf": float(gate.get("min_confidence", 0) or 0),
-                "mid": _safe_float(analysis.get("mid")),
-                "regime_decision": resolve_decision_regime(analysis, config),
-                "regime_gate": _g_short,
-                "regime_gate_score": _gs_short,
-                "trigger_hits": analysis.get("trigger_hits"),
-                "flow_confirm_raw": analysis.get("flow_confirm_raw"),
-                "flow_data_available": analysis.get("flow_data_available"),
-                "flow_confirmed_breakout": any(
-                    bool(h.get("flow_confirmed")) for h in _th_short
-                    if h.get("name") == "breakout"),
-                "composite_denominator": analysis.get("composite_denominator"),
-                "mc_enabled": bool(
-                    (config.get("momentum_continuation") or {}).get("enabled")),
-                "cp_enabled": bool(
-                    (config.get("candlestick_patterns") or {}).get("enabled")),
-            }
-        except Exception:
-            _runner_gate_ctx.feats = None
-        return "runner_gate_blocked (shorts disabled)"
+                _runner_gate_ctx.feats = None
+            return "runner_gate_blocked (shorts disabled)"
+        # S3 shadow short admitted: continue into the normal gate chain below.
     conf = float(analysis.get("confidence", 0) or 0)
     # A structural override rewrites confidence up to min_ai_confidence, which
     # is — by the confidence_guard single-source rule (P0-1) — the SAME value as
@@ -6296,6 +6425,18 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
         logger.warning(f"[runner_gate] deep_slow_burn_veto shadow failed "
                        f"(non-fatal): {_ds_e}")
 
+    # Unified S3 bypass evidence: record only admitted candidates, once per
+    # matching route, with ids that can be joined to downstream outcomes.
+    if fresh_src == "recent_brk":
+        _record_regime_bypass(
+            analysis, "recent", fresh_src=fresh_src,
+            recent_breakout=bool(recent_breakout),
+            base_confidence_would_block=bool(gate_conf < min_conf))
+    if structured_daily_mover:
+        _record_regime_bypass(
+            analysis, "daily-mover", daily_mover_fired=True,
+            base_confidence_would_block=bool(gate_conf < min_conf),
+            base_composite_would_block=bool(score < min_score))
     logger.info(
         f"[runner_gate] {coin} long ADMITTED: score={score:.0f}, slow={slow_count}, "
         f"fresh={int(fresh_impulse)}, dMover={int(structured_daily_mover)}, "

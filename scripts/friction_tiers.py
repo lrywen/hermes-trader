@@ -311,6 +311,57 @@ def analyze_account(book: dict[str, Any], acct: str, tiers: tuple[float, ...],
         "reasons": dict(Counter(r["reason"] for r in rows).most_common()),
         "tp_scale_out": tp_scale,
         "tiers": tier_summary,
+        "C4_realistic": c4_realistic_by_side(rows if acct == "taker" else []),
+    }
+
+
+# --------------------------------------------------------------------------- C4 measured close drift
+
+def c4_realistic_by_side(fills: list[dict[str, Any]]) -> dict[str, Any]:
+    """Report measured taker-close adverse drift by position side.
+
+    This is an additive offline diagnostic, not a trading gate. A side with
+    fewer than 50 backfilled closes remains ``latency_only``/``insufficient``;
+    synthetic slippage is never presented as measured taker impact.
+    """
+    values = {"long": [], "short": []}
+    records = {"long": 0, "short": 0}
+    for fill in fills:
+        if fill.get("type") != "close":
+            continue
+        if fill.get("execution") != "taker" and fill.get("fill_model") != "taker":
+            continue
+        side = fill.get("side") if fill.get("side") in ("long", "short") else fill.get("position_side")
+        if side not in values:
+            continue
+        records[side] += 1
+        try:
+            drift = float(fill.get("post_fill_mid_drift_bps"))
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(drift):
+            values[side].append(drift)
+    by_side = {}
+    for side in ("long", "short"):
+        sample = values[side]
+        n = len(sample)
+        insufficient = n < 50
+        by_side[side] = {
+            "n": n,
+            "records": records[side],
+            "pending": records[side] - n,
+            "status": "insufficient" if insufficient else "measured",
+            "latency_only": insufficient,
+            "insufficient": insufficient,
+            "mean_bps": round(statistics.fmean(sample), 4) if sample else None,
+            "median_bps": round(statistics.median(sample), 4) if sample else None,
+            "p95_bps": round(_pct(sample, 0.95), 4) if sample else None,
+            "impact_source": "latency_only" if insufficient else "post_fill_mid_drift",
+        }
+    return {
+        "metric": "taker_close_post_fill_mid_adverse_drift_bps",
+        "minimum_measured_n": 50,
+        "by_side": by_side,
     }
 
 

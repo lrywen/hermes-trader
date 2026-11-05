@@ -1420,6 +1420,28 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # HERMES_REGIME_OVERLAY_SHADOW_FILE ---
         "shadow_log_path": "",
     },
+    # S3 shadow-shorts channel (user-approved 2026-11-05, relaxed gate).
+    # DEFAULT OFF — when enabled AND mode=SHADOW, shorts are admitted to the
+    # shadow book only under regime conditions, producing real shadow fills and
+    # a real real_verdict for C6 without any exchange exposure. The three
+    # frozen production switches (scan_long_only / allow_shorts /
+    # min_short_volume_usd) keep their current values; this block is an
+    # independent additive channel that only relaxes the runner-gate short
+    # circuit inside SHADOW. In LIVE it is inert regardless of `enabled`.
+    "s3_shadow_shorts": {
+        "enabled": False,
+        # Regimes in which shadow shorts may enter. "down" = confirmed
+        # downtrend (aligned short); "up" is deliberately excluded by default
+        # because counter-trend shorts need separate evidence.
+        "allow_regimes": ["down"],
+        # When True, scan_long_only also becomes regime-adaptive in SHADOW:
+        # pure-short candidates in an allowed regime reach the AI debate.
+        "adaptive_scan_long_only": True,
+        # Impact-measurement floor: when > 0, records how many shadow shorts
+        # would be blocked at this alternative floor vs the frozen 50M.
+        # Does not replace min_short_volume_usd; observation only.
+        "impact_measure_floor_usd": 5_000_000.0,
+    },
     # ta_late_entry (deep audit 高危项, 2026-08-30): late-entry hard gate.
     # The same late_entry_check() pure function (agents/ta_filter.py) runs in
     # three places with ONE source of truth for thresholds:

@@ -1,6 +1,7 @@
 """P1.5 wfa_main_strategy: ledger→daily bps aggregation + WFA wiring."""
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -9,6 +10,25 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import wfa_main_strategy as w  # noqa: E402
 
 DAY_MS = 86_400_000
+AS_OF = "2026-01-01T00:00:00Z"
+
+
+def _ledger(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    rec = {
+        "ledger_version": 2, "trial_id": "main-prospective",
+        "family": "main::wfa_main_strategy",
+        "arm": "main", "paradigm": "wfa_main_strategy", "iteration": 1,
+        "test_at": "2025-01-02T00:00:00Z", "recorded_at": "2025-01-02T00:00:00Z",
+        "preregistration": {
+            "status": "preregistered", "registered_at": "2025-01-01T00:00:00Z",
+            "prospective": True,
+        },
+        "source": "preregistered", "status": "active",
+        "provenance": {"adr": "docs/adr/test.md"},
+    }
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+    return str(path)
 
 
 def _state(closes, wallet, account="taker"):
@@ -67,9 +87,10 @@ def test_main_strategy_wfa_insufficient_history_returns_none():
     assert w.main_strategy_wfa([1.0] * (w.MIN_DAYS - 1)) is None
 
 
-def test_main_strategy_wfa_passes_on_consistent_positive_series():
+def test_main_strategy_wfa_passes_on_consistent_positive_series(tmp_path):
     series = ([5.0, 3.0, 7.0, 1.0] * 6)[:24]
-    stats = w.main_strategy_wfa(series)
+    stats = w.main_strategy_wfa(series, n_trials=999, as_of=AS_OF,
+                                ledger_path=_ledger(tmp_path))
     assert stats is not None
     assert stats["days"] == 24
     assert stats["wfa_windows"] == 3
@@ -79,9 +100,10 @@ def test_main_strategy_wfa_passes_on_consistent_positive_series():
     assert stats["checks"]["bb_ci_lo_gt_0"] is True
 
 
-def test_main_strategy_wfa_fails_on_negative_series():
+def test_main_strategy_wfa_fails_on_negative_series(tmp_path):
     series = [-5.0, -3.0, -7.0, -1.0] * 6
-    stats = w.main_strategy_wfa(series)
+    stats = w.main_strategy_wfa(series, as_of=AS_OF,
+                                ledger_path=_ledger(tmp_path))
     assert stats is not None
     assert stats["verdict"] == "fail"
     assert stats["checks"]["oos_mean_bps_gt_0"] is False
@@ -92,13 +114,17 @@ def test_evaluate_pins_params_and_config(tmp_path):
                    wallet=100.0 + 36.0)
     cfg = tmp_path / "cfg.json"
     cfg.write_text("{}", encoding="utf-8")
-    rep = w.evaluate(state, config_file=str(cfg))
+    ledger = _ledger(tmp_path)
+    rep = w.evaluate(state, config_file=str(cfg), as_of=AS_OF,
+                     ledger_path=ledger)
     assert rep["ledger"]["closes_used"] == 24
     assert rep["params"]["train_days"] == w.WFA_TRAIN_DAYS
-    assert rep["params"]["n_trials"] == w.DEFAULT_N_TRIALS
+    assert "n_trials" not in rep["params"]
+    assert rep["wfa"]["n_trials"] == 1
     assert rep["config"]["era_id"] is not None
     assert rep["verdict"] in ("pass", "fail")
     # missing config is recorded, not raised
-    rep2 = w.evaluate(state, config_file=str(tmp_path / "absent.json"))
+    rep2 = w.evaluate(state, config_file=str(tmp_path / "absent.json"),
+                      as_of=AS_OF, ledger_path=ledger)
     assert rep2["config"]["era_id"] is None
     assert rep2["config"]["reason"] == "config_file_missing"
