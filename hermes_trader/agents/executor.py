@@ -5502,9 +5502,12 @@ def _runner_gate_late_entry_observation(
     ema21 = _number(analysis.get("ema21_4h"))
     close = _number(analysis.get("close4h"))
     atr = _number(analysis.get("atr4h"))
+    # Match the authoritative late-entry basis: EMA21 first, EMA8 fallback.
+    ema_basis = "ema21_4h" if ema21 is not None else "ema8_4h"
+    ema = ema21 if ema21 is not None else ema8
     extension = None
-    if close is not None and ema8 is not None and atr is not None and atr > 0:
-        extension = (close - ema8) / atr
+    if close is not None and ema is not None and atr is not None and atr > 0:
+        extension = (close - ema) / atr
 
     le_cfg = config.get("ta_late_entry")
     if not isinstance(le_cfg, dict) or not le_cfg:
@@ -5516,13 +5519,156 @@ def _runner_gate_late_entry_observation(
     from hermes_trader.agents.ta_filter import late_entry_limits_from_snapshot
     limits = late_entry_limits_from_snapshot(
         side, rsi4h, adx4h, ema8, ema21, extension, le_cfg)
+    strict_cfg = dict(le_cfg)
+    strict_cfg["trend_relax_enabled"] = False
+    strict_limits = late_entry_limits_from_snapshot(
+        side, rsi4h, adx4h, ema8, ema21, extension, strict_cfg)
     return {
         "rsi4h": rsi4h,
         "adx4h": adx4h,
         "extension_4h": extension,
         "relaxed_by_trend": (bool(limits.get("relaxed"))
                              if limits.get("data_ok") else None),
+        "ema_basis": ema_basis,
+        "rsi_ob_base": strict_limits.get("rsi_limit") if side == "long" else None,
+        "rsi_ob_eff": limits.get("rsi_limit") if side == "long" else None,
+        "rsi_os_base": strict_limits.get("rsi_limit") if side == "short" else None,
+        "rsi_os_eff": limits.get("rsi_limit") if side == "short" else None,
+        "extension_cap_base": strict_limits.get("ext_limit"),
+        "extension_cap_eff": limits.get("ext_limit"),
     }
+
+
+def _record_entry_chase_shadows(
+    analysis: dict[str, Any],
+    side: str,
+    observation: dict[str, Any],
+) -> None:
+    """Record the document's C2/C3/C5 arms without changing admission.
+
+    C2 is the fixed joint block, C3 the fixed conditional-release band, and
+    C5 compares the existing strict and strong-trend limits. Shorts use the
+    directional mirror (100-RSI and negated extension). Missing inputs yield
+    null counterfactuals rather than a fabricated pass or block.
+    """
+    if not isinstance(analysis, dict) or side not in ("long", "short"):
+        return
+
+    def _finite(value: Any) -> Optional[float]:
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        return number if math.isfinite(number) else None
+
+    rsi = _finite(observation.get("rsi4h"))
+    adx = _finite(observation.get("adx4h"))
+    extension = _finite(observation.get("extension_4h"))
+    chase_rsi = (rsi if side == "long" else 100.0 - rsi) if rsi is not None else None
+    chase_extension = (
+        extension if side == "long" else -extension
+    ) if extension is not None else None
+    base_missing = [
+        name for name, value in (("rsi4h", rsi), ("extension_4h", extension))
+        if value is None
+    ]
+    base_ok = not base_missing
+    c2_would_block = (
+        bool(chase_rsi >= 75.0 and chase_extension >= 3.0)
+        if base_ok else None
+    )
+    c3_would_admit = (
+        bool(65.0 <= chase_rsi < 75.0 and chase_extension < 3.0)
+        if base_ok else None
+    )
+
+    c5_missing = list(base_missing)
+    if adx is None:
+        c5_missing.append("adx4h")
+    c5_ok = not c5_missing
+    rsi_limit = _finite(
+        observation.get("rsi_ob_eff" if side == "long" else "rsi_os_eff"))
+    ext_limit = _finite(observation.get("extension_cap_eff"))
+    strict_rsi_limit = _finite(
+        observation.get("rsi_ob_base" if side == "long" else "rsi_os_base"))
+    strict_ext_limit = _finite(observation.get("extension_cap_base"))
+    if side == "short":
+        rsi_limit = 100.0 - rsi_limit if rsi_limit is not None else None
+        strict_rsi_limit = (
+            100.0 - strict_rsi_limit if strict_rsi_limit is not None else None)
+        ext_limit = -ext_limit if ext_limit is not None else None
+        strict_ext_limit = (
+            -strict_ext_limit if strict_ext_limit is not None else None)
+    limits_ok = None not in (
+        rsi_limit, ext_limit, strict_rsi_limit, strict_ext_limit)
+    if c5_ok and limits_ok:
+        rsi_would_block = bool(chase_rsi >= rsi_limit)
+        extension_would_block = bool(chase_extension > ext_limit)
+        strict_would_block = bool(
+            chase_rsi >= strict_rsi_limit
+            or chase_extension > strict_ext_limit)
+        c5_would_block = bool(rsi_would_block or extension_would_block)
+        relaxation_would_admit = bool(strict_would_block and not c5_would_block)
+    else:
+        rsi_would_block = None
+        extension_would_block = None
+        strict_would_block = None
+        c5_would_block = None
+        relaxation_would_admit = None
+        if c5_ok:
+            c5_missing.append("effective_limits")
+
+    common = {
+        "kind": "entry_chase",
+        "enforced": False,
+        "analysis_id": str(analysis.get("id") or analysis.get("trace_id") or ""),
+        "rsi4h": rsi,
+        "adx4h": adx,
+        "extension_4h": extension,
+        "chase_rsi": chase_rsi,
+        "chase_extension": chase_extension,
+        "ema_basis": observation.get("ema_basis"),
+        "relaxed_by_trend": observation.get("relaxed_by_trend"),
+        "rsi_ob_eff": rsi_limit,
+        "extension_cap_eff": ext_limit,
+    }
+    records = (
+        ("c2_joint_block", "would_block", c2_would_block, {
+            "data_status": "ok" if base_ok else "missing",
+            "missing_fields": base_missing,
+            "rsi_threshold": 75.0,
+            "extension_threshold": 3.0,
+            "threshold_source": "document_fixed_20261106",
+        }),
+        ("c3_conditional_release", "would_admit", c3_would_admit, {
+            "data_status": "ok" if base_ok else "missing",
+            "missing_fields": base_missing,
+            "rsi_min": 65.0,
+            "rsi_max_exclusive": 75.0,
+            "extension_max_exclusive": 3.0,
+            "threshold_source": "document_fixed_20261106",
+        }),
+        ("c5_strong_trend_relax", "would_block", c5_would_block, {
+            "data_status": "ok" if c5_ok and limits_ok else "missing",
+            "missing_fields": c5_missing,
+            "rsi_would_block": rsi_would_block,
+            "extension_would_block": extension_would_block,
+            "strict_would_block": strict_would_block,
+            "relaxation_would_admit": relaxation_would_admit,
+            "strict_rsi_limit": strict_rsi_limit,
+            "strict_extension_cap": strict_ext_limit,
+            "threshold_source": "ta_late_entry_snapshot",
+        }),
+    )
+    for arm, verdict_key, verdict, detail in records:
+        _record_risk_tuning_shadow(
+            rule="entry_chase",
+            coin=str(analysis.get("coin") or ""),
+            side=side,
+            would="observe",
+            detail={**common, "arm": arm, verdict_key: verdict, **detail},
+            trace_id=str(analysis.get("id") or analysis.get("trace_id") or ""),
+        )
 
 
 def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, Any]) -> str:
@@ -5568,6 +5714,10 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     except Exception:
         _late_obs = {"rsi4h": None, "adx4h": None, "extension_4h": None,
                      "relaxed_by_trend": None}
+    try:
+        _record_entry_chase_shadows(analysis, side, _late_obs)
+    except Exception:
+        logger.debug("C2/C3/C5 entry-chase shadow failed", exc_info=True)
     # R1 (2026-10-30): short-circuit shorts BEFORE the long-only computation
     # below (fresh-impulse resolution, weak-trend chase, mover veto, GEX, ...).
     # With scan_long_only=true / allow_shorts=false, ~92% of evaluated

@@ -172,7 +172,7 @@ def test_c1_late_entry_snapshot_passthrough_and_decision_unchanged(
     rec = json.loads(out.read_text().strip().splitlines()[0])
     assert rec["rsi4h"] == 82.0
     assert rec["adx4h"] == 40.0
-    assert rec["extension_4h"] == 3.0
+    assert rec["extension_4h"] == 4.0
     assert rec["relaxed_by_trend"] is True
     assert rec["admitted"] is False
     assert rec["rule"] == decision
@@ -273,8 +273,137 @@ def test_short_circuit_row_still_records_observability(monkeypatch, tmp_path):
     assert rec["composite_score"] == 33.3
     assert rec["rsi4h"] == 28.0
     assert rec["adx4h"] == 40.0
-    assert rec["extension_4h"] == -3.0
+    assert rec["extension_4h"] == -4.0
     assert rec["relaxed_by_trend"] is True
+
+
+def _capture_entry_chase(monkeypatch, analysis):
+    rows = []
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kwargs: rows.append(kwargs))
+    side = analysis["side"]
+    observation = executor._runner_gate_late_entry_observation(
+        analysis, side, _gate())
+    executor._record_entry_chase_shadows(analysis, side, observation)
+    return observation, {
+        row["detail"]["arm"]: row["detail"]
+        for row in rows if row["rule"] == "entry_chase"
+    }
+
+
+def test_c1_extension_uses_ema21_then_ema8_fallback():
+    analysis = _analysis(
+        rsi4h=70.0, adx4h=20.0, ema8_4h=100.0, ema21_4h=90.0,
+        close4h=130.0, atr4h=10.0,
+    )
+    observation = executor._runner_gate_late_entry_observation(
+        analysis, "long", _gate())
+    assert observation["extension_4h"] == 4.0
+    assert observation["ema_basis"] == "ema21_4h"
+
+    analysis["ema21_4h"] = None
+    fallback = executor._runner_gate_late_entry_observation(
+        analysis, "long", _gate())
+    assert fallback["extension_4h"] == 3.0
+    assert fallback["ema_basis"] == "ema8_4h"
+
+
+def test_c2_joint_block_and_c3_release_boundaries(monkeypatch):
+    at_boundary = _analysis(
+        rsi4h=75.0, adx4h=20.0, ema8_4h=90.0, ema21_4h=90.0,
+        close4h=97.5, atr4h=2.5,
+    )
+    _, arms = _capture_entry_chase(monkeypatch, at_boundary)
+    assert arms["c2_joint_block"]["would_block"] is True
+    assert arms["c3_conditional_release"]["would_admit"] is False
+
+    release = _analysis(
+        rsi4h=65.0, adx4h=20.0, ema8_4h=90.0, ema21_4h=90.0,
+        close4h=95.0, atr4h=2.5,
+    )
+    _, arms = _capture_entry_chase(monkeypatch, release)
+    assert arms["c2_joint_block"]["would_block"] is False
+    assert arms["c3_conditional_release"]["would_admit"] is True
+
+
+def test_c5_strong_trend_relaxation_and_short_mirror(monkeypatch):
+    long_analysis = _analysis(
+        rsi4h=76.0, adx4h=40.0, ema8_4h=102.0, ema21_4h=100.0,
+        close4h=106.0, atr4h=2.0,
+    )
+    _, arms = _capture_entry_chase(monkeypatch, long_analysis)
+    c5 = arms["c5_strong_trend_relax"]
+    assert c5["relaxed_by_trend"] is True
+    assert c5["would_block"] is False
+    assert c5["strict_would_block"] is True
+    assert c5["relaxation_would_admit"] is True
+
+    short_analysis = _analysis(
+        side="short", rsi4h=24.0, adx4h=40.0,
+        ema8_4h=98.0, ema21_4h=100.0, close4h=94.0, atr4h=2.0,
+    )
+    _, arms = _capture_entry_chase(monkeypatch, short_analysis)
+    assert arms["c2_joint_block"]["chase_rsi"] == 76.0
+    assert arms["c2_joint_block"]["chase_extension"] == 3.0
+    assert arms["c2_joint_block"]["would_block"] is True
+    c5 = arms["c5_strong_trend_relax"]
+    assert c5["would_block"] is False
+    assert c5["strict_would_block"] is True
+    assert c5["relaxation_would_admit"] is True
+
+
+def test_chase_shadow_missing_values_are_not_false(monkeypatch):
+    analysis = _analysis(
+        rsi4h=76.0, adx4h=40.0, ema8_4h=102.0, ema21_4h=100.0,
+        close4h=None, atr4h=2.0,
+    )
+    _, arms = _capture_entry_chase(monkeypatch, analysis)
+    assert arms["c2_joint_block"]["would_block"] is None
+    assert arms["c3_conditional_release"]["would_admit"] is None
+    c5 = arms["c5_strong_trend_relax"]
+    assert c5["data_status"] == "missing"
+    assert c5["missing_fields"] == ["extension_4h"]
+    assert c5["would_block"] is None
+    assert c5["extension_would_block"] is None
+
+
+def test_c2_c3_c5_record_before_live_early_returns(monkeypatch, tmp_path):
+    out = tmp_path / "rg_chase_preblock.jsonl"
+    _isolate(monkeypatch)
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    rows = []
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kwargs: rows.append(kwargs))
+    analysis = _analysis(
+        id="chase-low-conf", composite_score=20.0, confidence=0.2,
+        rsi4h=76.0, adx4h=40.0, ema8_4h=102.0, ema21_4h=100.0,
+        close4h=106.0, atr4h=2.0,
+    )
+    decision = executor._runner_entry_block_reason(analysis, _gate())
+    assert decision == "runner_gate_blocked (confidence 0.20 < 0.70)"
+    assert {row["detail"]["arm"] for row in rows} == {
+        "c2_joint_block", "c3_conditional_release", "c5_strong_trend_relax"}
+
+    rows.clear()
+    short = _analysis(side="short", rsi4h=24.0, adx4h=40.0,
+                      ema8_4h=98.0, ema21_4h=100.0,
+                      close4h=94.0, atr4h=2.0)
+    decision = executor._runner_entry_block_reason(
+        short, _gate(allow_shorts=False))
+    assert "shorts disabled" in decision
+    assert len([row for row in rows if row["rule"] == "entry_chase"]) == 3
+
+
+def test_chase_shadow_failure_cannot_change_live_gate(monkeypatch, tmp_path):
+    out = tmp_path / "rg_chase_failure.jsonl"
+    _isolate(monkeypatch)
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    monkeypatch.setattr(
+        executor, "_record_entry_chase_shadows",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("shadow write failed")))
+    analysis = _analysis(composite_score=20.0, confidence=0.2)
+    decision = executor._runner_entry_block_reason(analysis, _gate())
+    assert decision == "runner_gate_blocked (confidence 0.20 < 0.70)"
 
 
 def test_record_failure_never_breaks_gate(monkeypatch, tmp_path):
