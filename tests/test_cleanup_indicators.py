@@ -867,3 +867,115 @@ def test_classify_candles_trend_overrides_chop():
     down = [_mk_candle(i, 200 - i * 0.5, 201 - i * 0.5, 199 - i * 0.5, 200 - i * 0.5, 1000)
             for i in range(100)]
     assert _classify_candles(down) == "down"
+
+
+@pytest.fixture
+def research_4h_cache():
+    from hermes_trader.agents import research
+    with research._indicator_4h_cache_lock:
+        research._indicator_4h_cache.clear()
+    yield research
+    with research._indicator_4h_cache_lock:
+        research._indicator_4h_cache.clear()
+
+
+def test_4h_cache_hit_is_exact_and_mutation_isolated(research_4h_cache, monkeypatch):
+    research = research_4h_cache
+    candles = _candles(40)
+    expected = research._compute_indicators(candles)
+    calls = []
+    original = research._compute_indicators
+
+    def counted(rows):
+        calls.append(len(rows))
+        return original(rows)
+
+    monkeypatch.setattr(research, "_compute_indicators", counted)
+    first = research._compute_4h_indicators_cached("BTC", candles)
+    assert first == expected
+    first["ema8"] = -999.0
+    second = research._compute_4h_indicators_cached("BTC", candles)
+    assert second == expected
+    assert calls == [40]
+
+
+def test_4h_cache_key_separates_coin_and_closed_bar(research_4h_cache, monkeypatch):
+    research = research_4h_cache
+    candles = _candles(40)
+    calls = []
+    original = research._compute_indicators
+
+    def counted(rows):
+        calls.append(rows[-1].t)
+        return original(rows)
+
+    monkeypatch.setattr(research, "_compute_indicators", counted)
+    research._compute_4h_indicators_cached("BTC", candles)
+    research._compute_4h_indicators_cached("ETH", candles)
+    shifted = [_mk_candle(c.t + 14_400_000, c.o, c.h, c.l, c.c, c.v)
+               for c in candles]
+    research._compute_4h_indicators_cached("BTC", shifted)
+    assert calls == [39, 39, 14_400_039]
+    assert set(research._indicator_4h_cache) == {
+        ("BTC", 39), ("ETH", 39), ("BTC", 14_400_039)}
+
+
+def test_4h_cache_expires_at_300_seconds(research_4h_cache, monkeypatch):
+    research = research_4h_cache
+    candles = _candles(40)
+    clock = [1000.0]
+    monkeypatch.setattr(research.time, "monotonic", lambda: clock[0])
+    calls = []
+    original = research._compute_indicators
+
+    def counted(rows):
+        calls.append(clock[0])
+        return original(rows)
+
+    monkeypatch.setattr(research, "_compute_indicators", counted)
+    research._compute_4h_indicators_cached("BTC", candles)
+    clock[0] += 299.0
+    research._compute_4h_indicators_cached("BTC", candles)
+    assert calls == [1000.0]
+    clock[0] += 1.0
+    research._compute_4h_indicators_cached("BTC", candles)
+    assert calls == [1000.0, 1300.0]
+
+
+def test_4h_cache_excludes_forming_bar_from_key_and_value(research_4h_cache):
+    research = research_4h_cache
+    import time
+    four_h = 14_400_000
+    now_ms = int(time.time() * 1000)
+    forming_open = now_ms - now_ms % four_h
+    closed = [
+        _mk_candle(forming_open - (40 - i) * four_h,
+                   100 + i, 101 + i, 99 + i, 100 + i, 1000)
+        for i in range(40)
+    ]
+    forming = _mk_candle(forming_open, 140, 9999, 1, 8888, 1000)
+    expected = research._compute_indicators(closed)
+    result = research._compute_4h_indicators_cached("BTC", closed + [forming])
+    assert result == expected
+    assert result["last_time"] == closed[-1].t
+    assert set(research._indicator_4h_cache) == {("BTC", closed[-1].t)}
+
+
+def test_4h_cache_empty_input_bypasses_cache(research_4h_cache):
+    research = research_4h_cache
+    assert research._compute_4h_indicators_cached("BTC", []) == \
+        research._compute_indicators([])
+    assert research._indicator_4h_cache == {}
+
+
+def test_4h_cache_concurrent_results_are_identical(research_4h_cache):
+    from concurrent.futures import ThreadPoolExecutor
+    research = research_4h_cache
+    candles = _candles(40)
+    expected = research._compute_indicators(candles)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(
+            lambda _: research._compute_4h_indicators_cached("BTC", candles),
+            range(32)))
+    assert all(result == expected for result in results)
+    assert len(research._indicator_4h_cache) == 1

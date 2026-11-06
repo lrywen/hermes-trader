@@ -591,6 +591,51 @@ def _compute_indicators(candles: list[Candle]) -> dict[str, Any]:
     }
 
 
+_INDICATOR_4H_CACHE_TTL_S = 300.0
+_indicator_4h_cache: dict[tuple[str, int], tuple[float, dict[str, Any]]] = {}
+_indicator_4h_cache_lock = threading.RLock()
+
+
+def _compute_4h_indicators_cached(
+    coin: str, candles: list[Candle]
+) -> dict[str, Any]:
+    """C6: cache closed-4h indicator CPU work for five minutes.
+
+    The network snapshot is still refreshed by the caller. Only its immutable
+    closed-bar calculation is reused, keyed by ``(coin, last_closed_bar_ts)``.
+    Values are copied on both write and read so a consumer cannot poison later
+    results. Empty/invalid series bypass the cache.
+    """
+    from hermes_trader.agents.perception import _drop_forming_bar
+
+    closed, _ = _drop_forming_bar(candles, "4h")
+    if not closed:
+        return _compute_indicators(closed)
+    try:
+        bar_ts = int(candle_val(closed[-1], "t"))
+    except (TypeError, ValueError):
+        return _compute_indicators(closed)
+    key = (str(coin), bar_ts)
+    now = time.monotonic()
+    with _indicator_4h_cache_lock:
+        hit = _indicator_4h_cache.get(key)
+        if hit is not None and hit[0] > now:
+            return dict(hit[1])
+        if hit is not None:
+            _indicator_4h_cache.pop(key, None)
+
+    result = _compute_indicators(closed)
+    write_now = time.monotonic()
+    expires_at = write_now + _INDICATOR_4H_CACHE_TTL_S
+    with _indicator_4h_cache_lock:
+        stale = [k for k, value in _indicator_4h_cache.items()
+                 if value[0] <= write_now]
+        for k in stale:
+            _indicator_4h_cache.pop(k, None)
+        _indicator_4h_cache[key] = (expires_at, dict(result))
+    return dict(result)
+
+
 # Audit 2026-09-06 (C10): a hung fundingHistory call (AZTEC — observed to burn
 # the whole per-source budget and trip the 600s watchdog on a 3-trigger cycle)
 # now runs in a dedicated single-worker pool with a hard per-attempt wall-clock
@@ -2853,7 +2898,7 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     c4h_closed, _ = _drop_forming_bar(c4h, "4h")
     c1d_closed, _ = _drop_forming_bar(c1d, "1d")
     tf1h = _compute_indicators(c1h_closed)
-    tf4h = _compute_indicators(c4h_closed)
+    tf4h = _compute_4h_indicators_cached(coin, c4h_closed)
     plunge4h = recent_4h_plunge(c4h_closed)
     tf1d = _compute_indicators(c1d_closed)
 
