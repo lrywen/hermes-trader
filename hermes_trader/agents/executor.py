@@ -1460,6 +1460,7 @@ def resolve_decision_regime(analysis: dict[str, Any],
                        f"{analysis.get('coin')}: {_e}")
     try:
         _coin_regime = coin_breakout_regime(analysis)
+        analysis["_decision_coin_regime"] = _coin_regime
         if _coin_regime:
             logger.info(
                 f"[regime] {analysis.get('coin')} coin-breakout override: "
@@ -1475,6 +1476,63 @@ def resolve_decision_regime(analysis: dict[str, Any],
         pass
     analysis["_decision_regime"] = regime
     return str(regime)
+
+
+# Pre-registered 2026-11-06 before reading forward returns: shadow-book old=up
+# entries, last 3 closed 4h bars, p90=2.836621%, n=87 / 32 coins / 21 days.
+_C4_PLUNGE_THRESHOLD_PCT = 2.84
+_C4_RSI_RELAX_DELTA = 5.0
+
+
+def _record_c4_regime_shadow(
+    analysis: dict[str, Any], old_regime: str, gate_regime: str, rsi_ob: float,
+) -> None:
+    """Record the post-plunge candidate without mutating the enforce regime."""
+    if str(analysis.get("side") or "").lower() != "long":
+        return
+    if not analysis.get("recent_4h_plunge_data_ok"):
+        return
+    try:
+        plunge_pct = float(analysis.get("recent_4h_plunge_pct"))
+    except (TypeError, ValueError):
+        return
+    plunge = plunge_pct >= _C4_PLUNGE_THRESHOLD_PCT
+    coin_override = str(analysis.get("_decision_coin_regime") or "")
+    candidate = old_regime
+    if plunge:
+        candidate = "neutral" if gate_regime == "up" else gate_regime
+    rsi_ob_eff = rsi_ob - _C4_RSI_RELAX_DELTA if plunge else rsi_ob
+    would_block = candidate == "down"
+    _record_risk_tuning_shadow(
+        rule="entry_regime",
+        coin=str(analysis.get("coin") or ""),
+        side="long",
+        would="observe",
+        detail={
+            "kind": "entry_regime",
+            "arm": "c4_post_plunge",
+            "enforced": False,
+            "would_block": would_block,
+            "threshold_source": "shadowbook_old_up_p90_n87_20261106",
+            "plunge_threshold_pct": _C4_PLUNGE_THRESHOLD_PCT,
+            "plunge_pct": plunge_pct,
+            "plunge_detected": plunge,
+            "plunge_bar_ts": analysis.get("recent_4h_plunge_bar_ts"),
+            "plunge_body_drop_pct": analysis.get("recent_4h_plunge_body_pct"),
+            "plunge_close_drop_pct": analysis.get("recent_4h_plunge_close_pct"),
+            "regime_old": old_regime,
+            "regime_macro": gate_regime,
+            "regime_candidate": candidate,
+            "regime_would_change": candidate != old_regime,
+            "coin_breakout_override": coin_override or None,
+            "coin_override_would_be_disabled": bool(plunge and coin_override),
+            "rsi_ob_base": rsi_ob,
+            "rsi_ob_eff": rsi_ob_eff,
+            "rsi_relax_would_apply": plunge,
+            "counter_regime_would_block": would_block,
+        },
+        trace_id=str(analysis.get("id") or ""),
+    )
 
 
 def regime_direction_observe(analysis: dict[str, Any],
@@ -5792,6 +5850,19 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
         }
     except Exception:
         _runner_gate_ctx.feats = None
+
+    if side == "long" and _gr:
+        try:
+            _c4_le_cfg = config.get("ta_late_entry")
+            if not isinstance(_c4_le_cfg, dict) or not _c4_le_cfg:
+                _c4_rsi_ob = gate.get("rsi_overbought", 75)
+            else:
+                _c4_rsi_ob = _c4_le_cfg.get("rsi_ob", 75)
+            _record_c4_regime_shadow(
+                analysis, resolve_decision_regime(analysis, config), _gr,
+                float(_c4_rsi_ob))
+        except Exception:
+            logger.debug("C4 regime shadow failed", exc_info=True)
 
     logger.info(
         f"[runner_gate] {coin} side={side} conf={gate_conf:.2f}/{min_conf:.2f} "

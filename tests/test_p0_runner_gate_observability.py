@@ -288,6 +288,54 @@ def test_record_failure_never_breaks_gate(monkeypatch, tmp_path):
     assert "runner_gate_blocked" in decision
 
 
+# ── C4: post-plunge regime is observation-only ─────────────────────────────
+
+def test_c4_shadow_records_before_confidence_block_without_changing_decision(monkeypatch, tmp_path):
+    out = tmp_path / "rg_c4.jsonl"
+    _isolate(monkeypatch)
+    import hermes_trader.agents.market_regime as mr
+    monkeypatch.setattr(mr, "detect_regime", lambda coin: "up")
+    monkeypatch.setattr(executor, "coin_breakout_regime", lambda analysis: "")
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    rows = []
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kwargs: rows.append(kwargs))
+    a = _analysis(id="c4-runner", composite_score=20.0, confidence=0.2,
+                  recent_4h_plunge_data_ok=True, recent_4h_plunge_pct=3.0,
+                  recent_4h_plunge_bar_ts=123000)
+
+    decision = executor._runner_entry_block_reason(a, _gate())
+
+    assert decision == "runner_gate_blocked (confidence 0.20 < 0.70)"
+    row = next(row for row in rows if row["rule"] == "entry_regime")
+    assert row["trace_id"] == "c4-runner"
+    assert row["detail"]["regime_old"] == "up"
+    assert row["detail"]["regime_candidate"] == "neutral"
+    assert row["detail"]["enforced"] is False
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["admitted"] is False
+
+
+def test_c4_shadow_failure_cannot_change_live_gate(monkeypatch, tmp_path):
+    out = tmp_path / "rg_c4_failure.jsonl"
+    _isolate(monkeypatch)
+    import hermes_trader.agents.market_regime as mr
+    monkeypatch.setattr(mr, "detect_regime", lambda coin: "up")
+    monkeypatch.setattr(executor, "coin_breakout_regime", lambda analysis: "")
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    monkeypatch.setattr(
+        executor, "_record_c4_regime_shadow",
+        lambda *args: (_ for _ in ()).throw(RuntimeError("shadow write failed")))
+    a = _analysis(composite_score=20.0, confidence=0.2,
+                  recent_4h_plunge_data_ok=True, recent_4h_plunge_pct=3.0)
+
+    decision = executor._runner_entry_block_reason(a, _gate())
+
+    assert decision == "runner_gate_blocked (confidence 0.20 < 0.70)"
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["admitted"] is False
+
+
 # ── L5-A1: effective exit-policy snapshot on close ──────────────────────────
 
 def test_tracker_policy_snapshot_reads_effective_clocks():

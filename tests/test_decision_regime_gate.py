@@ -134,3 +134,76 @@ def test_unknown_side_not_would_block(patched):
     patched["macro"] = "down"
     rec = _observe({"coin": "T"}, patched)
     assert rec["would_block"] is False
+
+
+def _capture_c4(monkeypatch):
+    rows = []
+    monkeypatch.setattr(executor, "_record_risk_tuning_shadow",
+                        lambda **kwargs: rows.append(kwargs))
+    return rows
+
+
+def _plunge_analysis(pct=3.0):
+    return {
+        "id": "c4-test",
+        "coin": "T",
+        "side": "long",
+        "recent_4h_plunge_data_ok": True,
+        "recent_4h_plunge_pct": pct,
+        "recent_4h_plunge_bar_ts": 123000,
+        "recent_4h_plunge_body_pct": pct,
+        "recent_4h_plunge_close_pct": pct,
+    }
+
+
+def test_c4_plunge_neutralizes_up_without_mutating_live_regime(patched, monkeypatch):
+    rows = _capture_c4(monkeypatch)
+    patched["macro"] = "up"
+    patched["coin"] = "up"
+    analysis = _plunge_analysis()
+    assert _resolve(analysis, patched) == "up"
+    monkeypatch.setattr(executor, "coin_breakout_regime",
+                        lambda _: (_ for _ in ()).throw(AssertionError("recalculated")))
+
+    executor._record_c4_regime_shadow(analysis, "up", "up", 75.0)
+
+    assert analysis["_decision_regime"] == "up"
+    detail = rows[0]["detail"]
+    assert detail["arm"] == "c4_post_plunge"
+    assert detail["enforced"] is False
+    assert detail["regime_candidate"] == "neutral"
+    assert detail["regime_would_change"] is True
+    assert detail["coin_override_would_be_disabled"] is True
+    assert detail["rsi_ob_eff"] == 70.0
+    assert detail["would_block"] is False
+
+
+def test_c4_plunge_preserves_down_candidate_and_counterfactual_block(patched, monkeypatch):
+    rows = _capture_c4(monkeypatch)
+    analysis = _plunge_analysis(2.84)
+    executor._record_c4_regime_shadow(analysis, "down", "down", 80.0)
+    detail = rows[0]["detail"]
+    assert detail["regime_candidate"] == "down"
+    assert detail["would_block"] is True
+    assert detail["rsi_ob_eff"] == 75.0
+
+
+def test_c4_non_plunge_keeps_regime_override_and_rsi(patched, monkeypatch):
+    rows = _capture_c4(monkeypatch)
+    analysis = _plunge_analysis(2.83)
+    analysis["_decision_coin_regime"] = "up"
+    executor._record_c4_regime_shadow(analysis, "up", "neutral", 75.0)
+    detail = rows[0]["detail"]
+    assert detail["regime_candidate"] == "up"
+    assert detail["regime_would_change"] is False
+    assert detail["coin_override_would_be_disabled"] is False
+    assert detail["rsi_ob_eff"] == 75.0
+
+
+def test_c4_skips_missing_or_short_snapshots(patched, monkeypatch):
+    rows = _capture_c4(monkeypatch)
+    executor._record_c4_regime_shadow({"coin": "T", "side": "long"}, "up", "up", 75.0)
+    analysis = _plunge_analysis()
+    analysis["side"] = "short"
+    executor._record_c4_regime_shadow(analysis, "up", "up", 75.0)
+    assert rows == []

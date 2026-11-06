@@ -514,6 +514,43 @@ def detect_regime_with_score(coin: str, *, force: bool = False) -> tuple[Regime,
     return regime, score
 
 
+def recent_4h_plunge(candles: list, lookback: int = 3) -> dict:
+    """Largest bearish 4h excursion in the last closed bars (percent)."""
+    result = {
+        "data_ok": False,
+        "plunge_pct": None,
+        "bar_ts": None,
+        "body_drop_pct": None,
+        "close_drop_pct": None,
+    }
+    if len(candles) < lookback + 1:
+        return result
+    result["data_ok"] = True
+    best = None
+    for idx in range(len(candles) - lookback, len(candles)):
+        candle = candles[idx]
+        if candle.c >= candle.o or candle.o <= 0:
+            continue
+        prev_close = candles[idx - 1].c
+        body_drop = (candle.o - candle.c) / candle.o * 100.0
+        close_drop = (max(0.0, (prev_close - candle.c) / prev_close * 100.0)
+                      if prev_close > 0 else 0.0)
+        magnitude = max(body_drop, close_drop)
+        if best is None or magnitude > best[0]:
+            best = (magnitude, candle, body_drop, close_drop)
+    if best is not None:
+        magnitude, candle, body_drop, close_drop = best
+        result.update({
+            "plunge_pct": magnitude,
+            "bar_ts": int(candle.t * 1000),
+            "body_drop_pct": body_drop,
+            "close_drop_pct": close_drop,
+        })
+    else:
+        result["plunge_pct"] = 0.0
+    return result
+
+
 def detect_regime(coin: str, *, force: bool = False) -> Regime:
     """Return the regime applicable to a trade in `coin`. Cached for TTL.
 

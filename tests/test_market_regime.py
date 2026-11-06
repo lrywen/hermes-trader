@@ -408,3 +408,34 @@ def test_strength_score_clamped_to_unit_interval():
     s_flat = mr.regime_strength_score(flat)
     assert 0.0 <= s_flat <= s_up <= 1.0
     assert s_up > 0.5
+
+
+# ── 8. C4: largest bearish excursion over closed 4h bars ────────────────
+
+def test_recent_4h_plunge_uses_body_and_close_to_close_maximum():
+    candles = [
+        _mk(0, 100, 101, 99, 100),
+        _mk(1, 100, 101, 99, 100),
+        _mk(2, 95, 96, 93, 94),
+        _mk(3, 98, 99, 93, 94),
+    ]
+    result = mr.recent_4h_plunge(candles)
+    assert result["data_ok"] is True
+    assert result["plunge_pct"] == pytest.approx(6.0)
+    assert result["bar_ts"] == 2000
+    assert result["body_drop_pct"] == pytest.approx((95 - 94) / 95 * 100)
+    assert result["close_drop_pct"] == pytest.approx(6.0)
+
+
+def test_recent_4h_plunge_returns_zero_without_bearish_bar():
+    candles = [_mk(i, 100 + i, 102 + i, 99 + i, 101 + i) for i in range(4)]
+    result = mr.recent_4h_plunge(candles)
+    assert result["data_ok"] is True
+    assert result["plunge_pct"] == 0.0
+    assert result["bar_ts"] is None
+
+
+def test_recent_4h_plunge_requires_previous_close():
+    result = mr.recent_4h_plunge([_mk(i, 100, 101, 99, 100) for i in range(3)])
+    assert result["data_ok"] is False
+    assert result["plunge_pct"] is None

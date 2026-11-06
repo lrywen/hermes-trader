@@ -24,7 +24,7 @@ import httpx
 
 from hermes_trader.agents.config_store import cfg_get, read_agent_config
 from hermes_trader.agents.llm_circuit_breaker import LLMCircuitBreaker
-from hermes_trader.agents.market_regime import _obv_slope_sign
+from hermes_trader.agents.market_regime import _obv_slope_sign, recent_4h_plunge
 from hermes_trader.agents.memory import memory
 from hermes_trader.agents.perception import extract_fired_triggers
 from hermes_trader.agents.research_schema import (
@@ -2559,7 +2559,7 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
                     as_of_date: Optional[str],
                     fired_names: set,
                     tf1h: dict[str, Any], tf4h: dict[str, Any],
-                    c1h: list[Any],
+                    c1h: list[Any], plunge4h: Optional[dict[str, Any]] = None,
                     debate_state: str = "disabled",
                     debate_fallback_reason: str = "") -> dict[str, Any]:
     """Assemble the persisted analysis record from the researched verdict.
@@ -2569,6 +2569,7 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
     from the single extracted fired-trigger set. P2-1 extraction keeps
     research() as the orchestration layer.
     """
+    plunge4h = plunge4h or {}
     analysis = {
         "id": str(uuid.uuid4()),
         "trace_id": trace_id,
@@ -2666,6 +2667,11 @@ def _build_analysis(coin: str, perception: dict[str, Any], *,
         "ema8_4h": tf4h.get("ema8"),
         "ema21_4h": tf4h.get("ema21"),
         "close4h": tf4h.get("last_close"),
+        "recent_4h_plunge_data_ok": plunge4h.get("data_ok", False),
+        "recent_4h_plunge_pct": plunge4h.get("plunge_pct"),
+        "recent_4h_plunge_bar_ts": plunge4h.get("bar_ts"),
+        "recent_4h_plunge_body_pct": plunge4h.get("body_drop_pct"),
+        "recent_4h_plunge_close_pct": plunge4h.get("close_drop_pct"),
         # 1h indicator snapshot — feeds the executor's Plan-B regime-strength
         # score (5-component weighted, byte-aligned with backtest_ab_compare).
         # Used to distinguish mid-strength TREND (size x0.5) from STRONG_TREND
@@ -2848,6 +2854,7 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
     c1d_closed, _ = _drop_forming_bar(c1d, "1d")
     tf1h = _compute_indicators(c1h_closed)
     tf4h = _compute_indicators(c4h_closed)
+    plunge4h = recent_4h_plunge(c4h_closed)
     tf1d = _compute_indicators(c1d_closed)
 
     # P2-6: canonical fired-trigger names once, reused by every signal flag.
@@ -2978,7 +2985,7 @@ def research(coin: str, perception: dict[str, Any], *, account_snapshot: Optiona
         debate_used=debate_used, trace_id=trace_id,
         as_of_date=as_of_date,
         fired_names=fired_names,
-        tf1h=tf1h, tf4h=tf4h, c1h=c1h_closed,
+        tf1h=tf1h, tf4h=tf4h, c1h=c1h_closed, plunge4h=plunge4h,
         debate_state=debate_state,
         debate_fallback_reason=debate_fallback_reason,
     )
