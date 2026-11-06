@@ -9,21 +9,33 @@ takes.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 from hermes_trader import contracts, positions_snapshot
+from hermes_trader.contracts import heartbeat as heartbeat_contract
+from hermes_trader.contracts import positions as positions_contract
+
+_FIXTURES = Path(__file__).parent / "fixtures" / "contracts"
+
+
+def _load_fixture(name: str) -> dict:
+    return json.loads((_FIXTURES / name).read_text())
+
+
+def test_versioned_domain_modules_reexport_stable_public_api():
+    assert contracts.CONTRACT_VERSION == "1.0.0"
+    assert contracts.EnvelopePosition is positions_contract.EnvelopePosition
+    assert contracts.SnapshotMeta is positions_contract.SnapshotMeta
+    assert contracts.parse_snapshot is positions_contract.parse_snapshot
+    assert contracts.LoopHeartbeat is heartbeat_contract.LoopHeartbeat
+    assert contracts.parse_heartbeat is heartbeat_contract.parse_heartbeat
+
 
 # ── parse_snapshot ───────────────────────────────────────────────────────────
 
 def test_parse_snapshot_valid_payload_roundtrip():
-    rows = [
-        {"type": "oneWay", "position": {"coin": "BTC", "szi": "1.0",
-                                        "entryPx": "50000", "unrealizedPnl": "12.5"}},
-        {"type": "oneWay", "position": {"coin": "ETH", "szi": "-2.0",
-                                        "entryPx": "2500"}},
-    ]
-    parsed = contracts.parse_snapshot(
-        {"version": 1, "saved_at": 1_700_000_000_000, "asset_positions": rows}
-    )
+    payload = _load_fixture("positions_snapshot_v1.json")
+    parsed = contracts.parse_snapshot(payload)
     assert parsed is not None
     assert parsed["version"] == 1
     assert parsed["saved_at"] == 1_700_000_000_000
@@ -31,6 +43,13 @@ def test_parse_snapshot_valid_payload_roundtrip():
     btc = parsed["asset_positions"][0]["position"]
     assert btc["coin"] == "BTC"
     assert btc["unrealizedPnl"] == "12.5"
+    assert btc["leverage"] == {"type": "cross", "value": 5}
+
+    # A newer writer can add envelope fields without breaking this reader.
+    payload["future_writer_field"] = {"ignored": True}
+    parsed = positions_contract.parse_snapshot(payload)
+    assert parsed is not None
+    assert "future_writer_field" not in parsed
 
 
 def test_parse_snapshot_legacy_unversioned_payload_defaults():
@@ -98,19 +117,7 @@ def test_read_snapshot_skips_bad_rows_but_returns_good_ones(tmp_path, monkeypatc
 # ── parse_heartbeat ──────────────────────────────────────────────────────────
 
 def _good_heartbeat() -> dict:
-    return {
-        "event": "loop_heartbeat",
-        "ts": 1_700_000_000_000,
-        "equity": 100000.0,
-        "available": 80000.0,
-        "dex_equity": {"main": 50000.0},
-        "dex_available": {"main": 40000.0},
-        "spot_usdc": 100.0,
-        "daily_pnl": -250.0,
-        "cum_contrib": 5000.0,
-        "open_positions": 3,
-        "config": {"mode": "LIVE", "lev": 5, "kill": -1000},
-    }
+    return _load_fixture("loop_heartbeat_v1.json")
 
 
 def test_parse_heartbeat_valid_payload_passthrough():

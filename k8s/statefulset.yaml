@@ -29,6 +29,9 @@ spec:
       # fsGroup so the mounted PVC is group-writable for state files.
       securityContext:
         fsGroup: 1000
+      # P1 (2026-11-06): the pod's own service-account token is not needed by
+      # any container here (no Kubernetes API calls) — don't mount it.
+      automountServiceAccountToken: false
       containers:
         # ── web: FastAPI dashboard + JSON API + /metrics ──────────────────────
         - name: web
@@ -36,11 +39,20 @@ spec:
           imagePullPolicy: IfNotPresent
           # P1-5: run as the image's non-root `hermes` user (uid/gid 1000).
           # uid 1000 + pod fsGroup 1000 keeps the PVC group-writable.
+          # P1 (2026-11-06): depth-in-defense hardening — seccomp runtime
+          # default profile, read-only root filesystem (all writes go to /data),
+          # and drop every Linux capability.
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             runAsGroup: 1000
             allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           command: ["python3", "-m", "hermes_trader.server"]
           ports:
             - name: http
@@ -53,6 +65,15 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            # Shared with loop: universe cache AND the cross-process entry-order
+            # flock both live below ~/.hermes. Separate container root filesystems
+            # must not silently turn that lock into two independent locks.
+            - name: hermes-home
+              mountPath: /home/hermes/.hermes
+            # shadow-arms manual regen writes its log and isolated candle cache
+            # below /tmp; keep only that scratch space writable.
+            - name: web-tmp
+              mountPath: /tmp
           # P1-3: split liveness vs readiness semantics.
           #  * liveness  -> /api/health : process-level only; a failure RESTARTS
           #    the pod, so it must never check the feed/loop (an HL API blip
@@ -88,11 +109,20 @@ spec:
         - name: loop
           image: hermes-trader:local
           imagePullPolicy: IfNotPresent
+          # P1 (2026-11-06): depth-in-defense hardening — seccomp runtime
+          # default profile, read-only root filesystem (all writes go to /data),
+          # and drop every Linux capability.
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             runAsGroup: 1000
             allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           command: ["python3", "scripts/trading_loop.py"]
           envFrom:
             - configMapRef:
@@ -102,6 +132,8 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+            - name: hermes-home
+              mountPath: /home/hermes/.hermes
           # No HTTP to probe — this is a worker. A startupProbe waits for the
           # first positions snapshot (proves it booted AND reached Hyperliquid);
           # after that, a process crash is the failure signal (restartPolicy
@@ -132,11 +164,20 @@ spec:
         - name: ipdrift
           image: hermes-trader:local
           imagePullPolicy: IfNotPresent
+          # P1 (2026-11-06): depth-in-defense hardening — seccomp runtime
+          # default profile, read-only root filesystem (all writes go to /data),
+          # and drop every Linux capability.
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
             runAsGroup: 1000
             allowPrivilegeEscalation: false
+            seccompProfile:
+              type: RuntimeDefault
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           command: ["python3", "scripts/ip_drift_watch.py"]
           envFrom:
             - configMapRef:
@@ -153,6 +194,12 @@ spec:
             limits:
               cpu: "100m"
               memory: "128Mi"
+      volumes:
+        # Pod-scoped so web + loop share the same cache and order flock.
+        - name: hermes-home
+          emptyDir: {}
+        - name: web-tmp
+          emptyDir: {}
   volumeClaimTemplates:
     - metadata:
         name: data

@@ -18,3 +18,6 @@ data:
   HERMES_IP_DRIFT_WATCH: "0"
   HERMES_IP_DRIFT_CHECK_S: "300"
   HERMES_EVENTS_FILE: "/data/events.jsonl"
+  # Keep dashboard secret CRUD writable with readOnlyRootFilesystem enabled;
+  # environment variables from hermes-secrets still take precedence on read.
+  HERMES_SECRETS_FILE: "/data/.secrets.json"

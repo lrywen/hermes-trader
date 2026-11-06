@@ -1,0 +1,21 @@
+{
+  "event": "loop_heartbeat",
+  "ts": 1700000000000,
+  "equity": 100000.0,
+  "available": 80000.0,
+  "daily_pnl": -250.0,
+  "cum_contrib": 5000.0,
+  "spot_usdc": 100.0,
+  "open_positions": 3,
+  "dex_equity": {
+    "main": 50000.0
+  },
+  "dex_available": {
+    "main": 40000.0
+  },
+  "config": {
+    "mode": "LIVE",
+    "lev": 5,
+    "kill": -1000
+  }
+}

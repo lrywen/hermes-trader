@@ -1,4 +1,6 @@
-FROM python:3.11-slim AS base
+# P1 (2026-11-06): pin the multi-arch manifest, not a mutable tag. Digest
+# resolved from the locally cached python:3.11-slim image (RepoDigests).
+FROM python:3.11-slim@sha256:9534e5a8e315485d4061ed659af0fd78a284c015f9b73661b41d6bab25604534 AS base
 
 # Build-time source commit provenance. deploy.sh passes `--build-arg GIT_COMMIT=$(git rev-parse HEAD)`
 # so the running image always records which source commit it was built from (read via
