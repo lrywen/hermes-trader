@@ -5213,6 +5213,10 @@ def _record_runner_gate_verdict(
             "regime_decision": feats.get("regime_decision"),
             "regime_gate": feats.get("regime_gate"),
             "regime_gate_score": feats.get("regime_gate_score"),
+            "rsi4h": feats.get("rsi4h"),
+            "adx4h": feats.get("adx4h"),
+            "extension_4h": feats.get("extension_4h"),
+            "relaxed_by_trend": feats.get("relaxed_by_trend"),
             "mc_enabled": feats.get("mc_enabled"),
             "cp_enabled": feats.get("cp_enabled"),
         }
@@ -5424,6 +5428,45 @@ def _runner_entry_block_reason(analysis: dict[str, Any], config: dict[str, Any])
     return _wrapped(analysis, config)
 
 
+def _runner_gate_late_entry_observation(
+    analysis: dict[str, Any], side: str, config: dict[str, Any],
+) -> dict[str, Any]:
+    """C1: research-pass 4h readings, computed with the live gate's SSOT."""
+    def _number(value: Any) -> Optional[float]:
+        try:
+            return float(value) if value is not None else None
+        except (TypeError, ValueError):
+            return None
+
+    rsi4h = _number(analysis.get("rsi4h"))
+    adx4h = _number(analysis.get("adx4h"))
+    ema8 = _number(analysis.get("ema8_4h"))
+    ema21 = _number(analysis.get("ema21_4h"))
+    close = _number(analysis.get("close4h"))
+    atr = _number(analysis.get("atr4h"))
+    extension = None
+    if close is not None and ema8 is not None and atr is not None and atr > 0:
+        extension = (close - ema8) / atr
+
+    le_cfg = config.get("ta_late_entry")
+    if not isinstance(le_cfg, dict) or not le_cfg:
+        rg = config.get("runner_entry_gate", {})
+        le_cfg = {
+            "trend_relax_enabled": rg.get("trend_relax_enabled", True),
+            "adx_trend_threshold": rg.get("adx_trend_threshold", 35),
+        }
+    from hermes_trader.agents.ta_filter import late_entry_limits_from_snapshot
+    limits = late_entry_limits_from_snapshot(
+        side, rsi4h, adx4h, ema8, ema21, extension, le_cfg)
+    return {
+        "rsi4h": rsi4h,
+        "adx4h": adx4h,
+        "extension_4h": extension,
+        "relaxed_by_trend": (bool(limits.get("relaxed"))
+                             if limits.get("data_ok") else None),
+    }
+
+
 def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, Any]) -> str:
     """Block entries that are not fresh runner setups.
 
@@ -5462,6 +5505,11 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
     coin = analysis.get("coin") or ""
     is_hip3 = ":" in coin
     side = (analysis.get("side") or "").lower()
+    try:
+        _late_obs = _runner_gate_late_entry_observation(analysis, side, config)
+    except Exception:
+        _late_obs = {"rsi4h": None, "adx4h": None, "extension_4h": None,
+                     "relaxed_by_trend": None}
     # R1 (2026-10-30): short-circuit shorts BEFORE the long-only computation
     # below (fresh-impulse resolution, weak-trend chase, mover veto, GEX, ...).
     # With scan_long_only=true / allow_shorts=false, ~92% of evaluated
@@ -5538,6 +5586,7 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                         bool(h.get("flow_confirmed")) for h in _th_short
                         if h.get("name") == "breakout"),
                     "composite_denominator": analysis.get("composite_denominator"),
+                    **_late_obs,
                     "mc_enabled": bool(
                         (config.get("momentum_continuation") or {}).get("enabled")),
                     "cp_enabled": bool(
@@ -5735,6 +5784,7 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                 bool(h.get("flow_confirmed")) for h in _th
                 if h.get("name") == "breakout"),
             "composite_denominator": analysis.get("composite_denominator"),
+            **_late_obs,
             "mc_enabled": bool(
                 (config.get("momentum_continuation") or {}).get("enabled")),
             "cp_enabled": bool(

@@ -151,6 +151,48 @@ def test_p1_ai_telemetry_absent_defaults_safe(monkeypatch, tmp_path):
     assert rec["ai_debate_calls"] is None
     assert rec["ai_debate_state"] == ""
     assert rec["ai_debate_fallback_reason"] == ""
+    assert rec["rsi4h"] is None
+    assert rec["adx4h"] is None
+    assert rec["extension_4h"] is None
+    assert rec["relaxed_by_trend"] is None
+
+
+def test_c1_late_entry_snapshot_passthrough_and_decision_unchanged(
+        monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    out = tmp_path / "rg_c1.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    a = _analysis(
+        breakout_fired=True, volumeSpike=True,
+        rsi4h=82.0, adx4h=40.0, ema8_4h=100.0, ema21_4h=90.0,
+        close4h=130.0, atr4h=10.0,
+    )
+    decision = executor._runner_entry_block_reason(a, _gate())
+    assert "extension 4.0x ATR" in decision
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["rsi4h"] == 82.0
+    assert rec["adx4h"] == 40.0
+    assert rec["extension_4h"] == 3.0
+    assert rec["relaxed_by_trend"] is True
+    assert rec["admitted"] is False
+    assert rec["rule"] == decision
+
+
+def test_c1_snapshot_failure_does_not_clear_existing_features(
+        monkeypatch, tmp_path):
+    _isolate(monkeypatch)
+    out = tmp_path / "rg_c1_bad.jsonl"
+    monkeypatch.setattr(executor, "_RUNNER_GATE_SHADOW_FILE", str(out))
+    monkeypatch.setattr(executor, "_runner_gate_late_entry_observation",
+                        lambda *a: (_ for _ in ()).throw(ValueError("bad snapshot")))
+    a = _analysis(composite_score=20.0, confidence=0.2)
+    decision = executor._runner_entry_block_reason(a, _gate())
+    assert "runner_gate_blocked" in decision
+    rec = json.loads(out.read_text().strip().splitlines()[0])
+    assert rec["composite_score"] == 20.0
+    assert rec["confidence"] == 0.2
+    assert rec["rsi4h"] is None
+    assert rec["relaxed_by_trend"] is None
 
 
 def _isolate_p2(monkeypatch, volume_usd):
@@ -211,6 +253,8 @@ def test_short_circuit_row_still_records_observability(monkeypatch, tmp_path):
                        "direction": "short", "flow_confirmed": False}],
         composite_denominator=9.0,
         flow_confirm_raw=0.42, flow_data_available=True,
+        rsi4h=28.0, adx4h=40.0, ema8_4h=90.0, ema21_4h=100.0,
+        close4h=60.0, atr4h=10.0,
     )
     decision = executor._runner_entry_block_reason(
         a, _gate(allow_shorts=False))
@@ -227,6 +271,10 @@ def test_short_circuit_row_still_records_observability(monkeypatch, tmp_path):
     assert rec["regime_decision"] in ("up", "down", "neutral", "chop")
     assert rec["regime_gate"] == "up"  # mocked detect_regime_with_score
     assert rec["composite_score"] == 33.3
+    assert rec["rsi4h"] == 28.0
+    assert rec["adx4h"] == 40.0
+    assert rec["extension_4h"] == -3.0
+    assert rec["relaxed_by_trend"] is True
 
 
 def test_record_failure_never_breaks_gate(monkeypatch, tmp_path):
