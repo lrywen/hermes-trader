@@ -69,6 +69,26 @@ def test_rotation_resets_to_bounded_full_read(tmp_path: Path) -> None:
     assert [r["i"] for r in rows] == [102, 103, 104]
 
 
+def test_complete_corrupt_line_is_skipped(tmp_path: Path) -> None:
+    """A historical bad row must not hide newer events or pin the offset."""
+    path = tmp_path / "log.jsonl"
+    cache, lock = _new_cache(), threading.Lock()
+
+    _write_rows(path, 0, 1)
+    with path.open("a") as f:
+        f.write("{bad json}\n")
+    _write_rows(path, 1, 1)
+
+    rows = dashboard._read_jsonl_incremental(path, cache, lock, max_lines=100)
+
+    assert [r["i"] for r in rows] == [0, 1]
+    assert cache["offset"] == path.stat().st_size
+
+    _write_rows(path, 2, 1)
+    rows = dashboard._read_jsonl_incremental(path, cache, lock, max_lines=100)
+    assert [r["i"] for r in rows] == [0, 1, 2]
+
+
 def test_partial_last_line_re_read_on_next_call(tmp_path: Path) -> None:
     path = tmp_path / "log.jsonl"
     cache, lock = _new_cache(), threading.Lock()

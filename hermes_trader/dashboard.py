@@ -357,21 +357,30 @@ def _read_jsonl_incremental(
         lines: list[dict[str, Any]] = [] if rotated else list(cache.get("lines", []))
     new_lines: list[dict[str, Any]] = []
     try:
-        with path.open() as f:
+        with path.open("rb") as f:
             f.seek(offset)
             tail = f.read()
             new_offset = f.tell()
-        for line in tail.splitlines():
-            line = line.strip()
+        raw_lines = tail.splitlines(keepends=True)
+        for i, raw_line in enumerate(raw_lines):
+            line = raw_line.strip()
             if not line:
                 continue
             try:
                 parsed = json.loads(line)
-            except json.JSONDecodeError:
-                # A partially-flushed last line: keep the old offset so it is
-                # re-read (and completed) on the next call.
-                new_offset = offset + tail.rfind(line)
-                break
+            except json.JSONDecodeError as e:
+                if i == len(raw_lines) - 1 and not tail.endswith(b"\n"):
+                    # An unterminated final row may still be mid-write. Keep
+                    # its byte offset so the next read can retry the full row.
+                    new_offset = offset + sum(len(raw) for raw in raw_lines[:-1])
+                    break
+                # A newline-terminated row is complete and will never become
+                # valid. Skip it so one historical bad row cannot hide every
+                # later heartbeat. Do not log row content (it may be sensitive).
+                logger.warning(
+                    "[dashboard] skipping malformed JSONL row in %s: %s", path, e
+                )
+                continue
             if keep_event is None or keep_event(parsed):
                 new_lines.append(parsed)
     except OSError:
