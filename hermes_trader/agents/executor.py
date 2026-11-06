@@ -5826,6 +5826,53 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
 
     _lim = late_entry_limits_from_snapshot(
         side, _f(rsi4h), _f(adx4h), _f(ema8_4h), _f(ema21_4h), extension_4h, _le_cfg)
+
+    # ── M2 over-extension SHADOW, observation point moved UPSTREAM (2026-11-06)
+    # Why: the original recorder sits at the END of the gate chain, so it only
+    # ever saw candidates that had already survived every upstream veto. With
+    # ta_late_entry.ext_ob=2.5 returning early on every long stretched past
+    # 2.5 ATR, and the arm only recording at >=3.0, the reachable band was
+    # empty — the arm logged ZERO rows since 2026-10-29. Recording here, BEFORE
+    # the hard late-entry veto below, captures the stretched candidates that
+    # the hard gate rejects (the exact population the arm exists to measure).
+    #
+    # This is a RECORD-ONLY change: no admission decision is altered, no
+    # threshold is re-tuned here, and the hard veto below still returns the
+    # identical verdict string. `would` distinguishes the two populations:
+    #   would="block"            -> extension >= max (arm's own rule fired)
+    #   detail.hard_gate_ext_limit -> the live hard-gate limit in force, so the
+    #                                 offline analysis can separate "arm would
+    #                                 block" from "hard gate already blocked".
+    # Rows are tagged stage="pre_late_entry" so they never double-count against
+    # the legacy end-of-chain rows (stage absent on those).
+    try:
+        _oc_pre = gate.get("overextension_veto") or {}
+        if (bool(_oc_pre.get("shadow_mode", False)) and side == "long"
+                and extension_4h is not None):
+            _oc_pre_max = float(_oc_pre.get("max_extension_atr", 3.0) or 0.0)
+            if _oc_pre_max > 0 and extension_4h >= _oc_pre_max:
+                _record_risk_tuning_shadow(
+                    rule="overextension_veto", coin=coin, side=side,
+                    would="block",
+                    detail={
+                        "stage": "pre_late_entry",
+                        "extension_4h_atr": round(float(extension_4h), 4),
+                        "max_extension_atr": _oc_pre_max,
+                        "hard_gate_ext_limit": _f(_lim.get("ext_limit")),
+                        "hard_gate_relaxed": bool(_lim.get("relaxed")),
+                        "rsi4h": _f(rsi4h),
+                        "adx4h": _f(adx4h),
+                        "composite_score": _safe_float(
+                            analysis.get("composite_score")),
+                        "entry_px": float(analysis.get("mid")
+                                          or analysis.get("price") or 0.0),
+                    },
+                    trace_id=str(analysis.get("id") or ""),
+                )
+    except Exception as _oc_pre_e:
+        logger.warning(f"[runner_gate] M2 overextension pre-late-entry shadow "
+                       f"failed (non-fatal): {_oc_pre_e}")
+
     if _lim["data_ok"]:
         _rsi_limit = _lim["rsi_limit"]
         _ext_limit = _lim["ext_limit"]
@@ -6368,6 +6415,7 @@ def _runner_entry_block_reason_impl(analysis: dict[str, Any], config: dict[str, 
                     rule="overextension_veto", coin=coin, side=side,
                     would="block",
                     detail={
+                        "stage": "post_gate_chain",
                         "extension_4h_atr": round(float(extension_4h), 4),
                         "max_extension_atr": _oc_max,
                         "composite_score": round(float(score), 4),

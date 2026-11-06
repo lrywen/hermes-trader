@@ -183,6 +183,49 @@ def test_weight_shadow_emits_on_decision_flip(monkeypatch, tmp_path):
     assert rec["detail"]["live_passes_gate"] is False
 
 
+def test_weight_shadow_records_both_sides_of_the_burst(monkeypatch, tmp_path):
+    """Q4 (2026-11-06): a divergence row must be readable WITHOUT algebra.
+
+    The five 2026-11-05 production rows only carried the LIVE fired-trigger
+    list, so momentumBurst — the sole remaining degree of freedom in this arm —
+    was absent from every row even though it fully explained the score delta.
+    The candidate side's burst state is now mandatory on every emitted row.
+    """
+    f = tmp_path / "w.jsonl"
+    monkeypatch.setenv("HERMES_WEIGHT_SHADOW_FILE", str(f))
+    _enable_weight_arm(monkeypatch)
+
+    def fake_burst(candles, lb, pct):
+        # live definition (2, 4.0) stays flat; candidate (3, 3.0) fires.
+        if (lb, pct) == (3, 3.0):
+            return {"name": "momentumBurst", "score": 7.479,
+                    "reason": "+4.5% over 3 bars up", "fired": True,
+                    "direction": "up"}
+        return {"name": "momentumBurst", "score": 0, "reason": "flat",
+                "fired": False, "direction": "flat"}
+
+    monkeypatch.setattr(perception.trigger_mod, "momentum_burst", fake_burst)
+    live_weights = dict(CANONICAL_DEFAULTS["weight_shadow"]["candidate_weights"])
+    live_hits = [_hit("trendStrength", 30, True),
+                 _hit("momentumBurst", 0, False)]
+    perception._record_weight_shadow(
+        coin="WLFI", hits=live_hits, candles=[{}, {}, {}, {}],
+        live_weights=live_weights, live_score=52.78, gate=54.0,
+        fired_count=1, now_ms=int(time.time() * 1000))
+    rec = json.loads(f.read_text().strip())["detail"]
+    assert rec["live_burst_fired"] is False
+    assert rec["candidate_burst_fired"] is True
+    assert rec["candidate_burst_reason"] == "+4.5% over 3 bars up"
+    assert rec["candidate_burst_score"] == 7.479
+    # The live list omits the burst; the candidate list must include it.
+    assert "momentumBurst" not in rec["fired_triggers"]
+    assert "momentumBurst" in rec["candidate_fired_triggers"]
+    # Denominators are recorded so weight drift is distinguishable from the
+    # burst swap at a glance.
+    assert rec["live_denominator"] == rec["candidate_denominator"]
+    assert rec["live_weights"] == live_weights
+
+
 def test_weight_shadow_silent_without_flip(monkeypatch, tmp_path):
     f = tmp_path / "w.jsonl"
     monkeypatch.setenv("HERMES_WEIGHT_SHADOW_FILE", str(f))

@@ -135,9 +135,59 @@ def test_r3_shadow_flags_extended_but_still_admits(isolated, monkeypatch):
     assert executor._runner_entry_block_reason_impl(
         _fresh_analysis(), cfg) == ""
     flagged = [c for c in calls if c.get("rule") == "overextension_veto"]
+    # 2026-11-06: the arm now records at TWO observation points — upstream of
+    # the hard late-entry veto (stage=pre_late_entry) and at the end of the
+    # gate chain (stage=post_gate_chain). A candidate that survives every gate
+    # lands in both; the stage tag is what keeps offline analysis from
+    # double-counting. Admission is still unchanged (return "").
+    assert len(flagged) == 2
+    assert {c["detail"]["stage"] for c in flagged} == {
+        "pre_late_entry", "post_gate_chain"}
+    assert all(c["would"] == "block" for c in flagged)
+    assert all(c["detail"]["extension_4h_atr"] == 3.2 for c in flagged)
+
+
+def test_r3_pre_late_entry_captures_hard_gate_rejected(isolated, monkeypatch):
+    """The whole point of moving the recorder upstream: a long so stretched
+    that the HARD late-entry veto rejects it must still be observed.
+
+    Before 2026-11-06 this population was invisible — the end-of-chain
+    recorder never ran because the hard veto returned first, which is exactly
+    why the arm had logged zero rows since 2026-10-29.
+    """
+    calls = _spy(monkeypatch)
+    cfg = _gate(overextension_veto={"shadow_mode": True,
+                                    "max_extension_atr": 2.0})
+    # adx4h=20 (< adx_trend_threshold 35) keeps the hard gate on the STRICT
+    # limit ext_ob=2.5 rather than the relaxed 3.5, so extension 3.2 is vetoed.
+    verdict = executor._runner_entry_block_reason_impl(
+        _fresh_analysis(adx4h=20.0), cfg)
+    assert "extension" in verdict
+    assert "over-extended long" in verdict
+    flagged = [c for c in calls if c.get("rule") == "overextension_veto"]
+    # Only the upstream recorder ran; the chain returned before the end one.
     assert len(flagged) == 1
-    assert flagged[0]["would"] == "block"
+    assert flagged[0]["detail"]["stage"] == "pre_late_entry"
     assert flagged[0]["detail"]["extension_4h_atr"] == 3.2
+    assert flagged[0]["detail"]["max_extension_atr"] == 2.0
+    assert flagged[0]["would"] == "block"
+
+
+def test_r3_pre_late_entry_band_now_observable(isolated, monkeypatch):
+    """The (2.0, 2.5] band: below the hard veto, above the arm threshold.
+
+    This is the band the 2026-11-06 threshold change (3.0 -> 2.0) was meant to
+    open up. It must record at both points and still be admitted.
+    """
+    calls = _spy(monkeypatch)
+    cfg = _gate(overextension_veto={"shadow_mode": True,
+                                    "max_extension_atr": 2.0})
+    # extension = (102.2 - 100) / 1.0 = 2.2 -> in (2.0, 2.5].
+    assert executor._runner_entry_block_reason_impl(
+        _fresh_analysis(close4h=102.2), cfg) == ""
+    flagged = [c for c in calls if c.get("rule") == "overextension_veto"]
+    assert len(flagged) == 2
+    assert all(c["detail"]["extension_4h_atr"] == 2.2 for c in flagged)
 
 
 def test_r3_skips_low_extension(isolated, monkeypatch):

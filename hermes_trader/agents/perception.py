@@ -184,6 +184,15 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
 
     Pure observation; live score/gate unchanged. Only emits on a live-vs-
     candidate decision divergence so the JSONL stays signal-rich.
+
+    2026-11-06 (Q4): this arm is NOT an A/A null control. Weights are already
+    identical to live, so every emitted row is a REAL divergence driven by the
+    momentum-burst definition swap — verified by reverse-engineering the five
+    2026-11-05 rows (implied candidate burst scores 5.20/7.48/7.79, all inside
+    [0,10], implying 3.12%-4.67% 3-bar moves that 2bar/4% cannot see). The
+    defect was legibility, not validity: `fired_triggers` reflected only the
+    live hits, hiding the very trigger that caused the divergence. Both sides
+    are now recorded.
     """
     try:
         from hermes_trader.agents.config_store import read_agent_config
@@ -211,6 +220,18 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
             return
         from datetime import datetime, timezone
 
+        # 2026-11-06 (Q4 A/A forensics): the five rows logged on 2026-11-05 were
+        # initially unreadable — `fired_triggers` is derived from the LIVE hits,
+        # so momentumBurst was absent from every row even though the score delta
+        # was entirely explained by the CANDIDATE burst firing (3bar/3% catches a
+        # move that 2bar/4% misses). Reverse-engineering each row gave an implied
+        # candidate burst score in [5.20, 7.79] i.e. a 3.12%-4.67% 3-bar move,
+        # which is self-consistent — but an observation arm must not require
+        # algebra to interpret. Record BOTH sides' burst state explicitly, plus
+        # the live weights actually in force, so a future reader can tell a real
+        # candidate divergence from a weights/config drift at a glance.
+        live_burst = next(
+            (h for h in hits if h.get("name") == "momentumBurst"), {})
         from hermes_trader.shadow_log import append_jsonl
         append_jsonl(_weight_shadow_path(), {
             "ts": int(now_ms),
@@ -226,6 +247,23 @@ def _record_weight_shadow(*, coin: str, hits: list, candles: list,
                 "live_passes_gate": bool(live_pass),
                 "candidate_passes_gate": bool(alt_pass),
                 "fired_triggers": [h["name"] for h in hits if h.get("fired")],
+                "candidate_fired_triggers": [
+                    h["name"] for h in alt_hits if h.get("fired")],
+                # The ONLY degree of freedom left in this arm (weights are
+                # already identical to live since the 2026-10-22 promotion).
+                "live_burst_fired": bool(live_burst.get("fired")),
+                "live_burst_reason": live_burst.get("reason", ""),
+                "candidate_burst_fired": bool(cand_burst.get("fired")),
+                "candidate_burst_reason": cand_burst.get("reason", ""),
+                "candidate_burst_score": round(
+                    float(cand_burst.get("score") or 0.0), 4),
+                # Live weights in force, so a divergence caused by weight drift
+                # rather than the burst swap is visible without a config dump.
+                "live_weights": dict(live_weights or {}),
+                "live_denominator": round(
+                    float(sum((live_weights or {}).values())), 6),
+                "candidate_denominator": round(
+                    float(sum(cand_weights.values())), 6),
                 "candidate_weights": cand_weights,
                 "candidate_momentum_lookback": cand_lb,
                 "candidate_momentum_pct": cand_pct,
