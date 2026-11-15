@@ -259,6 +259,31 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     # affects shadow ledger accounting, never real capital. Value-bound:
     # any further change re-reviews.
     "shadow_book.maker_v2_base_fill_prob": (0.30, 0.22),
+    # 2026-11-15: momentum_exhaustion exit arm (new module exit_momentum.py) went
+    # live in the production /data config, plus a dynamic_regime hysteresis gate.
+    # Both default to mode="shadow": they are record-only exit counterfactuals that
+    # append would-have-exited rows and NEVER route an order or mutate the real
+    # stop (same inert semantics as dsl_exit.stop_confirm_shadow / ignite_grace_shadow
+    # above — mode=SHADOW cannot place orders). The remaining leaves are pure tuning
+    # parameters consumed only inside that shadow branch.
+    # Value-bound (None, live): a later change to any of these values — or a flip to
+    # mode="enforce" — re-reviews red and blocks startup until a human re-signs.
+    "dsl_exit.dynamic_regime.mode": (None, "shadow"),
+    "dsl_exit.dynamic_regime.hysteresis_ticks": (None, 3),
+    "dsl_exit.momentum_exhaustion.mode": (None, "shadow"),
+    "dsl_exit.momentum_exhaustion.atr_period": (None, 14),
+    "dsl_exit.momentum_exhaustion.atr_contract_ratio": (None, 0.8),
+    "dsl_exit.momentum_exhaustion.volume_window": (None, 20),
+    "dsl_exit.momentum_exhaustion.volume_ratio": (None, 0.5),
+    "dsl_exit.momentum_exhaustion.min_unrealized_pct": (None, 0.0),
+    # 2026-11-15: the operator deliberately re-tuned the stop-confirm shadow
+    # candidate gate from 1 breach -> 3 breaches (config_defaults.py canonical
+    # moved 1 -> 3 in the same change; both sides now 3, so this row only exists
+    # to keep the value-bound review honest if either side drifts again).
+    "dsl_exit.stop_confirm_shadow.candidate_consecutive_breaches": (3, 3),
+    # 2026-11-15: new slippage-validation sample floor, live-only leaf (canonical
+    # default lands in the next release; value-bound so any silent change is red).
+    "memory_quality.slip_validation_min_samples": (None, 30),
 }
 
 
