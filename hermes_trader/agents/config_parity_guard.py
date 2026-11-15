@@ -90,6 +90,22 @@ _SANCTIONED_LOOSER_LEAVES: frozenset[str] = frozenset({
 })
 
 
+# 2026-11-16：叶名已复核、但「取值」由受控自动化改写，因此不做值绑定。
+# regime_classifier 的四项由 scripts/weekly_calibrate_regime.sh --apply 每周自动
+# 提升，且带三重护栏（MIN_DELTA>=0.01 / MAX_FALSE_TREND<=0.35 / MIN_EMA_GAP>=5），
+# 只有 verdict=PROMOTE 才写入 live。若仍做值绑定，每周标定后门禁必红 → 容器 exit 1
+# → 撞满 restart 上限停机（2026-11-15 16:54 标定后 20:11 实际发生，服务中断约 3h）。
+# 语义边界：**只豁免「已登记叶的取值变化」**；未登记的新叶仍会判红并阻断启动。
+# 这些是信号生成参数（EMA 周期 / ADX 切分），不涉及仓位、杠杆、止损、日亏上限，
+# 不属于 LEAF_DANGER_KIND 保护的资金类叶。
+_VALUE_UNBOUND_LEAVES: frozenset[str] = frozenset({
+    "regime_classifier.fast_ema",
+    "regime_classifier.slow_ema",
+    "regime_classifier.chop_adx_max",
+    "regime_classifier.slope_threshold",
+})
+
+
 # recheck 2026-10-18 §5.1 / fix-verification 2026-10-18 §11③: 门禁「有效覆盖为 0」
 # 与「三代假绿」的补强。
 #
@@ -220,15 +236,8 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "trigger_weights.trend_strength": (0.3, 0.55),
     "trigger_weights.uptrend_momentum": (0.2, 0),
     "momentum_continuation.min_trend_pct": (8.0, 5),
-    # 2026-11-15 (2026-W46 周度标定, verdict=PROMOTE)：weekly_calibrate_regime.sh
-    # 把 regime_classifier 从 (fast 20 / slow 50 / slope 0.0010 / adx<20) 自动提升到
-    # (fast 10 / slow 30 / slope 0.0020 / adx<22)。30 天 x 20 币网格实测：
-    # cost 30.79%->22.04%、agreement 69.1%->74.8%、false_trend 36.4%->26.7%。
-    # 三项值绑定登记随之更新——这一步就是「人工复核后重新签字」。
-    # 注意：下次标定再改这些值仍会判红，需再次复核（这是设计意图，不是缺陷）。
-    "regime_classifier.chop_adx_max": (20.0, 22.0),
-    "regime_classifier.fast_ema": (20, 10),
-    "regime_classifier.slow_ema": (30, 30),
+    # 2026-11-16：regime_classifier.{fast_ema,slow_ema,chop_adx_max,slope_threshold}
+    # 已移入 _VALUE_UNBOUND_LEAVES（周度标定自动改写取值，不做值绑定）。
     "regime_risk_overlay.chop.allow_shorts": (False, True),
     "runner_entry_gate.trend_rsi_overbought": (80.0, 82.0),
     "analyst_scoring.analyst5_whale_or_conf": (0.6, 0.62),
@@ -297,6 +306,9 @@ def _covered_by_review(leaf: str, canon: object, live: object) -> bool:
     """判定一个漂移叶是否「已复核安全」——叶名已登记且 (canonical, live) 与复核
     当时一致。值不一致（如 max_daily_loss_usd 从 -3 改 -500）即视为未复核 → 红。
     """
+    if leaf in _VALUE_UNBOUND_LEAVES:
+        # 叶名已登记，但取值由受控自动化（周度标定）改写 —— 只认叶名，不锁值。
+        return True
     reg = _REVIEWED_SAFE_DIVERGENCES.get(leaf)
     if reg is None:
         return False
