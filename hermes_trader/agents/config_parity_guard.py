@@ -220,9 +220,15 @@ _REVIEWED_SAFE_DIVERGENCES: dict[str, tuple[object, object]] = {
     "trigger_weights.trend_strength": (0.3, 0.55),
     "trigger_weights.uptrend_momentum": (0.2, 0),
     "momentum_continuation.min_trend_pct": (8.0, 5),
-    "regime_classifier.chop_adx_max": (20.0, 25),
-    "regime_classifier.fast_ema": (20, 15),
-    "regime_classifier.slow_ema": (30, 21),
+    # 2026-11-15 (2026-W46 周度标定, verdict=PROMOTE)：weekly_calibrate_regime.sh
+    # 把 regime_classifier 从 (fast 20 / slow 50 / slope 0.0010 / adx<20) 自动提升到
+    # (fast 10 / slow 30 / slope 0.0020 / adx<22)。30 天 x 20 币网格实测：
+    # cost 30.79%->22.04%、agreement 69.1%->74.8%、false_trend 36.4%->26.7%。
+    # 三项值绑定登记随之更新——这一步就是「人工复核后重新签字」。
+    # 注意：下次标定再改这些值仍会判红，需再次复核（这是设计意图，不是缺陷）。
+    "regime_classifier.chop_adx_max": (20.0, 22.0),
+    "regime_classifier.fast_ema": (20, 10),
+    "regime_classifier.slow_ema": (30, 30),
     "regime_risk_overlay.chop.allow_shorts": (False, True),
     "runner_entry_gate.trend_rsi_overbought": (80.0, 82.0),
     "analyst_scoring.analyst5_whale_or_conf": (0.6, 0.62),
