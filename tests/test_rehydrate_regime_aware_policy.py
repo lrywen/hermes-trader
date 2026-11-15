@@ -40,6 +40,8 @@ DSL_CFG = {
 
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
+    # Existing cases exercise LIVE adoption; SHADOW has a dedicated regression.
+    monkeypatch.setenv("HERMES_CFG_MODE", "LIVE")
     monkeypatch.setattr(
         "hermes_trader.agents.config_store.read_agent_config",
         lambda: {"dsl_exit": DSL_CFG})
@@ -140,6 +142,18 @@ def test_rehydrate_detect_regime_failure_fails_open(monkeypatch, tmp_path):
     t = d._active_positions["BTC_long"]
     assert t.entry_regime == "neutral"
     assert t.policy.max_loss_roe_pct == pytest.approx(5.0)
+
+
+def test_shadow_rehydrate_never_adopts_external_position(monkeypatch, tmp_path):
+    d = _isolate(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_CFG_MODE", "SHADOW")
+    # The entry grant must not make SHADOW adopt and auto-exit manual positions.
+    monkeypatch.setenv("HERMES_ENABLE_LIVE", "1")
+
+    dropped = d.rehydrate_from_exchange(_positions(("ETH", 1, 200.0)))
+
+    assert dropped == []
+    assert "ETH_long" not in d._active_positions
 
 
 def test_regime_aware_policy_builder_fails_open(monkeypatch):

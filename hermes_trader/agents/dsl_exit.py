@@ -2997,6 +2997,19 @@ def rehydrate_from_exchange(asset_positions: Iterable[dict[str, Any]],
         if not lev:
             lev = default_leverage
         if key not in _active_positions:
+            # SHADOW guard: in SHADOW the engine never placed a real entry, so
+            # any position on the venue is external/manual and must NOT be
+            # adopted into the exit engine. A synthesized tracker here was
+            # later market-closed by risk-control paths (market_circuit /
+            # bm11 / DSL floor / timeouts) with REAL reduce-only orders,
+            # flattening the operator's hand-opened position.
+            if str(cfg_get("mode") or "SHADOW").strip().upper() == "SHADOW":
+                logger.warning(
+                    f"[dsl] SHADOW: external position {key} @ {entry} "
+                    f"({lev}x) detected on exchange — NOT adopting a "
+                    f"tracker (no auto-exit / no real close orders); "
+                    f"manage it manually or set mode=LIVE")
+                continue
             # Inherit the CURRENT config exit policy, never the bare ExitPolicy()
             # default. A synthesize happens after a blackout-induced drop (the
             # exchange momentarily reported the position gone), and the default

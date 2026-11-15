@@ -402,7 +402,7 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
 
     Shared by the per-cycle monitor pass and the intra-cycle checkpoint so a
     close is executed/logged identically regardless of where it fired. Returns
-    the number of closes attempted. Never raises into the caller.
+    the number of confirmed successful closes. Never raises into the caller.
     """
     n = 0
     for ex in exits:
@@ -413,7 +413,7 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
         _hold = ex.get("hold_min") or 0.0
         _mfe = ex.get("mfe_pct") or 0.0
         _tag = "DSL" if source == "dsl" else "DSL-CHECKPOINT"
-        logger.info(f"[{_tag}] Closing {coin} {ex.get('side','?')} ({lev}x): "
+        logger.info(f"[{_tag}] Exit requested for {coin} {ex.get('side','?')} ({lev}x): "
                     f"{ex['reason']} (margin {lpct:+.2f}% · spot {ex['unrealized_pct']:+.2f}%)")
         _r = ex["reason"]
         _canon = "trailing_stop" if _r.startswith("floor_breach") else (
@@ -448,11 +448,20 @@ def _process_exits(exits, *, source: str = "dsl") -> int:
             evt["realized_spot_pct"] = res.get("spot_pct")
             evt["realized_pnl_pct"] = res.get("realized_pnl_pct")
             evt["fees_pct"] = res.get("fees_pct")
+        evt["shadow_skip"] = bool(res.get("shadow_skip"))
         log_event(evt)
-        # Feed the market-circuit stop-cluster window (roadmap §3 trigger 2).
-        # Best-effort; covers both the per-cycle and checkpoint close paths.
-        market_circuit_record_stop(coin)
-        n += 1
+        if res.get("shadow_skip"):
+            logger.warning(
+                f"[dsl:exit:{source}] {coin}: SHADOW skip — no real close "
+                "order; position remains open")
+        elif not res.get("ok"):
+            logger.warning(
+                f"[dsl:exit:{source}] {coin} close failed: {res.get('error')}")
+        else:
+            # Only confirmed closes count toward the stop-cluster window and
+            # the caller's "positions closed" checkpoint metric.
+            market_circuit_record_stop(coin)
+            n += 1
     return n
 
 
@@ -1048,6 +1057,8 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
     Returns the set of coins actually flattened.
     """
     flattened: set = set()
+    attempted: set = set()
+    shadow_skipped: set = set()
     if not (equity > 0 and positions):
         return flattened
     pos_coins = [(_p.get("position") or {}).get("coin") for _p in positions]
@@ -1063,14 +1074,26 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
         if _grem > 0:
             logger.warning(
                 f"[killswitch] B-M11 global halt armed ({int(_grem)}min) and "
-                f"auto_flatten_on_global_halt=ON — flattening {len(pos_coins)} "
-                f"open position(s)")
+                f"auto_flatten_on_global_halt=ON — risk-close pass for "
+                f"{len(pos_coins)} open position(s)")
             _gfailed = []
             for _coin in pos_coins:
+                attempted.add(_coin)
                 try:
                     _res = flattener(_coin)
-                    logger.warning(f"[killswitch] halt-flatten {_coin}: ok={_res.get('ok')}")
-                    flattened.add(_coin)
+                    if _res.get("shadow_skip"):
+                        shadow_skipped.add(_coin)
+                        logger.warning(
+                            f"[killswitch] SHADOW halt-skip {_coin}: no close "
+                            "order; position remains open")
+                    elif _res.get("ok"):
+                        flattened.add(_coin)
+                        logger.warning(f"[killswitch] halt-flatten {_coin}: ok=True")
+                    else:
+                        _gfailed.append(_coin)
+                        logger.error(
+                            f"[killswitch] halt-flatten {_coin} failed: "
+                            f"{_res.get('error')}")
                 except Exception as _e:
                     logger.error(f"[killswitch] halt-flatten failed for {_coin}: {_e}")
                     _gfailed.append(_coin)
@@ -1082,10 +1105,11 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
             event_log({"event": "global_halt_auto_flatten",
                        "remaining_min": round(_grem, 1),
                        "flattened": len(flattened),
-                       "failed": _gfailed})
+                       "failed": _gfailed,
+                       "shadow_skipped": sorted(shadow_skipped)})
     if bool(cfg_get("auto_flatten_on_coin_circuit", config=cfg)):
         for _coin in pos_coins:
-            if _coin in flattened:
+            if _coin in attempted:
                 continue
             try:
                 _crem = float(mem.coin_circuit_remaining_min(_coin) or 0.0)
@@ -1098,10 +1122,24 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
                 f"[killswitch] B-M11 coin circuit armed on {_coin} ({int(_crem)}min) "
                 f"and auto_flatten_on_coin_circuit=ON — flattening")
             _cfailed = []
+            _cshadow = False
+            attempted.add(_coin)
             try:
                 _res = flattener(_coin)
-                logger.warning(f"[killswitch] circuit-flatten {_coin}: ok={_res.get('ok')}")
-                flattened.add(_coin)
+                if _res.get("shadow_skip"):
+                    _cshadow = True
+                    shadow_skipped.add(_coin)
+                    logger.warning(
+                        f"[killswitch] SHADOW circuit-skip {_coin}: no close "
+                        "order; position remains open")
+                elif _res.get("ok"):
+                    flattened.add(_coin)
+                    logger.warning(f"[killswitch] circuit-flatten {_coin}: ok=True")
+                else:
+                    _cfailed.append(_coin)
+                    logger.error(
+                        f"[killswitch] circuit-flatten {_coin} failed: "
+                        f"{_res.get('error')}")
             except Exception as _e:
                 logger.error(f"[killswitch] circuit-flatten failed for {_coin}: {_e}")
                 _cfailed.append(_coin)
@@ -1112,7 +1150,8 @@ def bm11_breaker_flatten(equity, positions, cfg, mem,
                     pass
             event_log({"event": "coin_circuit_auto_flatten", "coin": _coin,
                        "remaining_min": round(_crem, 1),
-                       "failed": _cfailed})
+                       "flattened": _coin in flattened,
+                       "shadow_skip": _cshadow, "failed": _cfailed})
     return flattened
 
 
@@ -1166,9 +1205,14 @@ def market_circuit_tick(cfg, mem, equity, positions, *,
                     "停机时长(分)": f"{halt_min:.0f}",
                     "详情": reasons[:400],
                 },
-                markdown="检测到市场级尾部风险（指数急跌/多币联动止损/资金费率极端），"
+                markdown=(
+                    "检测到市场级尾部风险，已进入全局停机。当前为 SHADOW 模式，"
+                    "不会发送真实平仓单；交易所仓位仍需人工管理。"
+                    if str(cfg_get("mode", config=cfg) or "SHADOW").strip().upper() == "SHADOW"
+                    else "检测到市场级尾部风险（指数急跌/多币联动止损/资金费率极端），"
                          "已进入全局停机并按配置全平。请立即人工核查行情与仓位，"
-                         "确认后再手动恢复。",
+                         "确认后再手动恢复。"
+                ),
                 dedup_key=f"market_circuit:{trigger}",
             )
         except Exception as _ne:
@@ -1191,7 +1235,16 @@ def market_circuit_tick(cfg, mem, equity, positions, *,
                 continue
             try:
                 _res = flattener(_coin)
-                logger.warning(f"[market_circuit] halt-flatten {_coin}: ok={_res.get('ok')}")
+                if _res.get("shadow_skip"):
+                    logger.warning(
+                        f"[market_circuit] SHADOW halt-skip {_coin}: no close "
+                        "order; position remains open")
+                elif _res.get("ok"):
+                    logger.warning(f"[market_circuit] halt-flatten {_coin}: ok=True")
+                else:
+                    logger.error(
+                        f"[market_circuit] halt-flatten {_coin} failed: "
+                        f"{_res.get('error')}")
             except Exception as _e:
                 logger.error(f"[market_circuit] halt-flatten failed for {_coin}: {_e}")
                 try:
@@ -1654,11 +1707,20 @@ while True:
                         _coin = _j.get("coin")
                         try:
                             _res = close_position_market(_coin)
-                            logger.warning(
-                                f"[unstucking] reduce-only close {_coin}: "
-                                f"ok={_res.get('ok')} (trigger={_us_reason})")
-                            log_event({"event": "unstuck_close", "coin": _coin,
-                                       "trigger": _us_reason})
+                            if _res.get("shadow_skip"):
+                                logger.warning(
+                                    f"[unstucking] SHADOW skip {_coin}: no close "
+                                    f"order; position remains open (trigger={_us_reason})")
+                            elif _res.get("ok"):
+                                logger.warning(
+                                    f"[unstucking] reduce-only close {_coin}: ok=True "
+                                    f"(trigger={_us_reason})")
+                                log_event({"event": "unstuck_close", "coin": _coin,
+                                           "trigger": _us_reason})
+                            else:
+                                logger.error(
+                                    f"[unstucking] close {_coin} failed: "
+                                    f"{_res.get('error')} (trigger={_us_reason})")
                         except Exception as _ce:
                             logger.error(
                                 f"[unstucking] close failed for {_coin}: {_ce}")
@@ -1709,14 +1771,26 @@ while True:
             # events.jsonl so the fund-safety guard never fails silently.
             _ks_ok = 0
             _ks_failed = []
+            _ks_shadow = []
             for _p in positions:
                 _coin = (_p.get("position") or {}).get("coin")
                 if not _coin:
                     continue
                 try:
                     _res = close_position_market(_coin)
-                    logger.warning(f"[killswitch] flattened {_coin}: ok={_res.get('ok')}")
-                    _ks_ok += 1
+                    if _res.get("shadow_skip"):
+                        _ks_shadow.append(_coin)
+                        logger.warning(
+                            f"[killswitch] SHADOW skip {_coin}: no close order; "
+                            "position remains open")
+                    elif _res.get("ok"):
+                        _ks_ok += 1
+                        logger.warning(f"[killswitch] flattened {_coin}: ok=True")
+                    else:
+                        _ks_failed.append(_coin)
+                        logger.error(
+                            f"[killswitch] failed to flatten {_coin}: "
+                            f"{_res.get('error')}")
                 except Exception as _e:
                     logger.error(f"[killswitch] failed to flatten {_coin}: {_e}")
                     _ks_failed.append(_coin)
@@ -1727,7 +1801,8 @@ while True:
                         pass
             log_event({"event": "hard_killswitch", "daily_pnl": round(daily_pnl, 2),
                        "limit": _max_daily_loss, "flattened": _ks_ok,
-                       "failed": _ks_failed})
+                       "failed": _ks_failed,
+                       **({"shadow_skipped": _ks_shadow} if _ks_shadow else {})})
 
         # ── B-M11: optional HARD flatten on circuit breakers ───────────────
         # global_halt_gate / coin_circuit_breaker_gate only block NEW entries

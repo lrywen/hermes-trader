@@ -180,6 +180,20 @@ def test_ks_breach_flattens_every_position_once_and_logs():
     assert not [e for e in events if e.get("event") == "error"]
 
 
+def test_ks_shadow_skip_is_not_counted_as_flattened():
+    run = _load_killswitch_block()
+    events = []
+    run(cfg={"max_daily_loss_usd": -3.0},
+        equity=100.0, positions=_positions("BTC", "ETH"), daily_pnl=-3.5,
+        flattener=lambda _coin: {"ok": False, "shadow_skip": True},
+        events=events)
+
+    ev = next(e for e in events if e.get("event") == "hard_killswitch")
+    assert ev["flattened"] == 0
+    assert ev["failed"] == []
+    assert ev["shadow_skipped"] == ["BTC", "ETH"]
+
+
 @pytest.mark.parametrize("equity,positions,pnl", [
     (0.0, _positions("BTC"), -10.0),       # degraded account read
     (-1.0, _positions("BTC"), -10.0),      # non-positive equity
@@ -311,6 +325,9 @@ def _close_wire(monkeypatch, tmp_path):
 
     monkeypatch.setattr(notify, "send_text", lambda *a, **kw: False)
     monkeypatch.setattr(notify, "send_card", lambda *a, **kw: False)
+    # These cases exercise real risk-reducing closes, independent of the
+    # developer's local .agent-config.json mode.
+    monkeypatch.setenv("HERMES_CFG_MODE", "LIVE")
     monkeypatch.setattr(executor, "resolve_user_address", lambda: "0xUSER")
     monkeypatch.setattr(executor, "get_hl_price", lambda c: 94.0)
     monkeypatch.setattr(executor, "cancel_open_orders_for_coin", lambda c: None)
@@ -353,6 +370,22 @@ def test_close_without_live_grant_is_reduce_only(monkeypatch, tmp_path):
     assert len(orders) == 1
     assert orders[0]["reduce_only"] is True
     assert orders[0]["cloid"] is not None
+
+
+def test_shadow_close_never_places_order_even_with_live_grant(monkeypatch, tmp_path):
+    executor, orders = _close_wire(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_CFG_MODE", "SHADOW")
+    # HERMES_ENABLE_LIVE is entry-only and must not override this close guard.
+    monkeypatch.setenv("HERMES_ENABLE_LIVE", "1")
+
+    res = executor.close_position_market("ETH", reason="market_circuit")
+
+    assert res["ok"] is False
+    assert res["shadow_skip"] is True
+    assert res["error"] == "shadow_mode_close_disabled"
+    assert orders == []
+    # A skipped close must not deregister the still-open position.
+    assert executor.active_position_coins().get("ETH") == "long"
 
 
 def test_close_source_never_calls_live_authorization():
@@ -437,6 +470,58 @@ def test_bm11_global_halt_failed_flatten_is_recorded():
     assert "exchange down" in err[0]["error"]
 
 
+def test_bm11_shadow_skip_is_not_counted_as_flattened():
+    events = []
+    calls = []
+
+    def _flattener(coin):
+        calls.append(coin)
+        return {"ok": False, "shadow_skip": True,
+                "error": "shadow_mode_close_disabled"}
+
+    bm11 = _load_bm11(flattener=_flattener, event_log=events.append)
+    out = bm11(equity=1_000.0, positions=_positions("ETH", "BTC"),
+               cfg={"auto_flatten_on_global_halt": True,
+                    "auto_flatten_on_coin_circuit": True},
+               mem=_HaltMem(30.0))
+
+    assert out == set()
+    assert calls == ["ETH", "BTC"]
+    summary = next(e for e in events
+                   if e["event"] == "global_halt_auto_flatten")
+    assert summary["flattened"] == 0
+    assert summary["failed"] == []
+    assert summary["shadow_skipped"] == ["BTC", "ETH"]
+
+
+def test_dsl_shadow_skip_is_not_closed_or_stop_cluster():
+    events = []
+    stop_calls = []
+    ns = {
+        "time": time,
+        "logger": logging.getLogger("test.contract.dsl"),
+        "close_position_market": lambda coin, reason="": {
+            "ok": False, "shadow_skip": True,
+            "error": "shadow_mode_close_disabled"},
+        "log_event": events.append,
+        "market_circuit_record_stop": stop_calls.append,
+    }
+    exec(compile(_extract_function("_process_exits"),
+                 "<trading_loop dsl extracted>", "exec"), ns)
+
+    n = ns["_process_exits"]([{
+        "coin": "ETH", "side": "long", "leverage": 5,
+        "unrealized_pct": -1.2, "leveraged_pct": -6.0,
+        "reason": "max_loss 1.2%", "mfe_pct": 0.0,
+        "entry_regime": "trend",
+    }])
+
+    assert n == 0
+    assert stop_calls == []
+    assert events[0]["executed"] is False
+    assert events[0]["shadow_skip"] is True
+
+
 class _CoinHaltMem:
     def global_halt_remaining_min(self):
         return 0.0
@@ -462,6 +547,23 @@ def test_bm11_coin_circuit_failed_flatten_is_recorded():
     err = next(e for e in events if e.get("event") == "error")
     assert err["scope"] == "bm11_coin_circuit"
     assert err["coin"] == "ETH"
+
+
+def test_bm11_coin_circuit_shadow_skip_is_not_counted_as_flattened():
+    events = []
+    bm11 = _load_bm11(
+        flattener=lambda _coin: {"ok": False, "shadow_skip": True},
+        event_log=events.append)
+    out = bm11(equity=1_000.0, positions=_positions("ETH"),
+               cfg={"auto_flatten_on_coin_circuit": True},
+               mem=_CoinHaltMem())
+
+    assert out == set()
+    summary = next(e for e in events
+                   if e["event"] == "coin_circuit_auto_flatten")
+    assert summary["flattened"] is False
+    assert summary["shadow_skip"] is True
+    assert summary["failed"] == []
 
 
 def test_market_circuit_failed_flatten_is_recorded():

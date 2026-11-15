@@ -6792,7 +6792,26 @@ def _close_position_market_locked(coin: str, reason: str = "") -> dict[str, Any]
 
     Hemostat (2026-10-11): ``reason`` is the DSL exit label (if the caller has
     one) and is persisted on the outcome close row as ``exit_reason``.
+
+    SHADOW guard: in explicit ``mode=SHADOW`` this function never places a
+    real close/flatten order on the exchange. Any real venue position is
+    external/manual and must not be touched by risk-control flatten paths.
+    LIVE and OFF retain their existing risk-reducing close behaviour;
+    HERMES_ENABLE_LIVE is an entry-only gate and is deliberately not used.
     """
+    if str(cfg_get("mode") or "SHADOW").strip().upper() == "SHADOW":
+        logger.warning(
+            f"[shadow_close_skip] {coin}: SHADOW mode — no real close order "
+            f"sent; position remains open (reason={reason or '(none)'})")
+        try:
+            from hermes_trader.session_log import append as log_event
+            log_event({"event": "shadow_close_skip", "coin": coin,
+                       "reason": reason or "(none)", "closed": False})
+        except Exception:
+            pass
+        return {"ok": False, "coin": coin, "shadow_skip": True,
+                "error": "shadow_mode_close_disabled"}
+
     user = resolve_user_address()
     if not user:
         return {"ok": False, "coin": coin, "error": "no_user_address"}

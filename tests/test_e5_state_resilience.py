@@ -51,6 +51,8 @@ DSL_CFG = {
 
 @pytest.fixture(autouse=True)
 def _hermetic(monkeypatch):
+    # These resilience cases exercise LIVE exchange-position adoption.
+    monkeypatch.setenv("HERMES_CFG_MODE", "LIVE")
     monkeypatch.setattr(
         "hermes_trader.agents.config_store.read_agent_config",
         lambda: {"dsl_exit": DSL_CFG})
