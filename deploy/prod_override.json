@@ -70,14 +70,12 @@
   },
   "daily_giveback_min_peak_usd": 2,
   "debate_research": {
-    "bull_timeout_s": null,
     "cache_ttl_s": 300,
     "enabled": true,
     "max_latency_s": 55,
     "shadow_ab": {
       "min_composite": 60
     },
-    "synth_timeout_s": 50,
     "use_structured_output": false
   },
   "dsl_exit": {
@@ -290,9 +288,8 @@
     "timeout_s": 20
   },
   "regime_classifier": {
-    "chop_adx_max": 25,
-    "fast_ema": 15,
-    "slow_ema": 21
+    "chop_adx_max": 22.0,
+    "fast_ema": 10
   },
   "regime_risk_overlay": {
     "enabled": true,
@@ -383,7 +380,6 @@
   "shadow_book": {
     "maker_fill_model": "v2",
     "maker_limit_offset_bps": 12.0,
-    "maker_v2_base_fill_prob": 0.22,
     "maker_v2_coins": [
       "BTC"
     ],

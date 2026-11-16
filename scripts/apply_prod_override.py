@@ -116,13 +116,11 @@ def _canonical_delta(live: dict) -> dict:
     runner_entry_gate.min_confidence).  Comparison is byte-strict so a genuine
     type change (int 4 vs float 4.0) is still captured as a delta.
 
-    ``None`` is kept only when it actually deletes something: if the canonical
-    value is also ``None`` (or absent), storing the null would turn an
-    already-unset key into an absent one. Both are the same effective state
-    (``_reify_none_defaults``) but the era fingerprint hashes the raw merged
-    node, so the spurious null made the snapshot's era drift from live
-    (``dsl_exit.ignite_grace_minutes``, caught by
-    test_tracked_snapshot_era_matches_live).
+    An explicit ``None`` is retained whenever canonical has that key, including
+    a canonical ``None`` stub: the live merge deletes the stub, so the snapshot
+    must delete it too. Although null and missing are equivalent in the
+    normalized effective view, the era fingerprint hashes the raw merged node.
+    A null whose key is absent from canonical remains unnecessary.
     """
     live_flat = _flatten(live)
     canon_flat = _flatten(CANONICAL_DEFAULTS)
@@ -130,7 +128,7 @@ def _canonical_delta(live: dict) -> dict:
     for path, value in live_flat.items():
         canon = canon_flat.get(path, _MISSING)
         if value is None:
-            if canon is _MISSING or canon is None:
+            if canon is _MISSING:
                 continue
             keep[path] = value
             continue
@@ -142,13 +140,8 @@ def _canonical_delta(live: dict) -> dict:
 
 
 def _effective_view(raw: dict) -> dict:
-    """Mirror read_agent_config(): deep-merge, then re-materialize top-level
-    canonical None stubs (nested nulls stay deleted, per _deep_merge)."""
-    merged = config_store._deep_merge(CANONICAL_DEFAULTS, raw)
-    for key, default in CANONICAL_DEFAULTS.items():
-        if default is None and key not in merged:
-            merged[key] = None
-    return merged
+    """Mirror the canonical write-audit view, including nested None stubs."""
+    return config_store._effective_view_for_diff(raw)
 
 
 def _tag(value) -> str:
