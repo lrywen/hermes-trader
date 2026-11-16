@@ -16,6 +16,7 @@ has to be hand-maintained alongside the defaults.
 from __future__ import annotations
 
 import json
+import math
 from copy import deepcopy
 from typing import Any, Optional, get_origin
 
@@ -532,6 +533,18 @@ _DSL_EXIT_SPEC: dict[str, Any] = {
         "enabled": ("bool",),
         "band_pct": _num_leaf(0.0, 50.0),
     },
+    "dynamic_regime": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "hysteresis_ticks": ("int", 1, 2_147_483_647),
+    },
+    "momentum_exhaustion": {
+        "mode": ("enum", ("off", "shadow", "enforce")),
+        "atr_period": ("int", 1, 2_147_483_647),
+        "atr_contract_ratio": ("num_gt", 0.0),
+        "volume_window": ("int", 1, 2_147_483_647),
+        "volume_ratio": ("num_gt", 0.0),
+        "min_unrealized_pct": ("num_ge", 0.0),
+    },
     # Audit 2026-09-06 (E3, P2): time-based scratch exit. Default OFF (inert).
     # minutes = hold-age gate; min_peak_pct = smallest favorable pulse that
     # qualifies; giveback_pct = peak-to-current retrace required to fire.
@@ -621,6 +634,16 @@ _SIGNAL_ENFORCEMENT_SPEC: dict[str, Any] = {
 
 _NESTED_BLOCK_SPECS: dict[str, dict[str, Any]] = {
     "dsl_exit": _DSL_EXIT_SPEC,
+    "memory_quality": {
+        "implausible_pct": _num_leaf(0.0, 1_000_000_000.0),
+        "crash_down_pct": _num_leaf(0.0, 1_000_000_000.0),
+        "filter_window_sec": ("int", 0, 2_147_483_647),
+        "reconfirm_streak": ("int", 1, 2_147_483_647),
+        "slip_window_days": _num_leaf(0.0, 1_000_000_000.0),
+        "slip_min_samples": ("int", 1, 2_147_483_647),
+        "slip_validation_min_samples": ("int", 1, 2_147_483_647),
+        "flush_throttle_s": _num_leaf(0.0, 1_000_000_000.0),
+    },
     # Audit 2026-10-11: counter-factual composite reweight arm (record-only).
     # candidate_weights is a trigger-name -> weight number map.
     "weight_shadow": {
@@ -1100,6 +1123,16 @@ def _validate_nested_spec(path: str, val: Any, spec: Any, errors: list[str]) -> 
             errors.append(
                 f"{path}: must be between {spec[1]} and {spec[2]} (got {val})"
             )
+    elif kind in ("num_gt", "num_ge"):
+        if isinstance(val, bool) or not isinstance(val, _NUM):
+            errors.append(f"{path}: expected number, got {type(val).__name__}")
+        elif not math.isfinite(val):
+            errors.append(f"{path}: expected a finite number")
+        elif (kind == "num_gt" and val <= spec[1]) or (
+            kind == "num_ge" and val < spec[1]
+        ):
+            operator = ">" if kind == "num_gt" else ">="
+            errors.append(f"{path}: must be {operator} {spec[1]} (got {val})")
     elif kind == "num_or_none":
         # D2 (2026-10-22): None = unset → built-in dataclass fallback; same
         # bounds as the "num" leaf when a value is provided.

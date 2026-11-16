@@ -316,3 +316,83 @@ def test_agent_config_endpoint_rejects_malformed_nested_block(server_client):
     assert r.status_code == 422
     assert "dsl_exit.max_loss_pct" in r.text
     assert read_agent_config()["dsl_exit"]["max_loss_pct"] != -999.0
+
+
+def test_dsl_exit_dynamic_regime_and_momentum_exhaustion_defaults():
+    from hermes_trader.agents.config_store import CANONICAL_DEFAULTS as _CD
+
+    dsl = _CD["dsl_exit"]
+    assert dsl["dynamic_regime"] == {
+        "mode": "shadow",
+        "hysteresis_ticks": 3,
+    }
+    assert dsl["momentum_exhaustion"] == {
+        "mode": "shadow",
+        "atr_period": 14,
+        "atr_contract_ratio": 0.8,
+        "volume_window": 20,
+        "volume_ratio": 0.5,
+        "min_unrealized_pct": 0.0,
+    }
+    for block in ("dynamic_regime", "momentum_exhaustion"):
+        assert validate_config_updates({"dsl_exit": {block: dsl[block]}}) == []
+
+
+@pytest.mark.parametrize("block,leaf,value", [
+    ("dynamic_regime", "mode", "live"),
+    ("dynamic_regime", "mode", True),
+    ("dynamic_regime", "hysteresis_ticks", 0),
+    ("dynamic_regime", "hysteresis_ticks", 1.5),
+    ("dynamic_regime", "hysteresis_ticks", True),
+    ("momentum_exhaustion", "mode", "disabled"),
+    ("momentum_exhaustion", "mode", 1),
+    ("momentum_exhaustion", "atr_period", 0),
+    ("momentum_exhaustion", "atr_period", 14.0),
+    ("momentum_exhaustion", "atr_contract_ratio", 0.0),
+    ("momentum_exhaustion", "atr_contract_ratio", -0.1),
+    ("momentum_exhaustion", "atr_contract_ratio", float("nan")),
+    ("momentum_exhaustion", "volume_window", 0),
+    ("momentum_exhaustion", "volume_window", True),
+    ("momentum_exhaustion", "volume_ratio", 0.0),
+    ("momentum_exhaustion", "volume_ratio", float("inf")),
+    ("momentum_exhaustion", "min_unrealized_pct", -0.01),
+    ("momentum_exhaustion", "min_unrealized_pct", "0"),
+])
+def test_dsl_exit_new_blocks_reject_invalid_modes_and_numbers(block, leaf, value):
+    errors = validate_config_updates(
+        {"dsl_exit": {block: {leaf: value}}}, strict_keys=True
+    )
+    assert any(f"dsl_exit.{block}.{leaf}" in error for error in errors), errors
+
+
+def test_dsl_exit_new_blocks_accept_numeric_boundaries():
+    assert validate_config_updates({
+        "dsl_exit": {
+            "dynamic_regime": {"mode": "off", "hysteresis_ticks": 1},
+            "momentum_exhaustion": {
+                "mode": "enforce",
+                "atr_period": 1,
+                "atr_contract_ratio": 1e-9,
+                "volume_window": 1,
+                "volume_ratio": 1e-9,
+                "min_unrealized_pct": 0.0,
+            },
+        }
+    }) == []
+
+
+@pytest.mark.parametrize("value", [0, -1, 1.5, True, "30"])
+def test_memory_quality_slip_validation_min_samples_must_be_positive_int(value):
+    errors = validate_config_updates(
+        {"memory_quality": {"slip_validation_min_samples": value}},
+        strict_keys=True,
+    )
+    assert any("memory_quality.slip_validation_min_samples" in error
+               for error in errors), errors
+
+
+def test_memory_quality_slip_validation_min_samples_accepts_positive_int():
+    assert validate_config_updates(
+        {"memory_quality": {"slip_validation_min_samples": 1}},
+        strict_keys=True,
+    ) == []

@@ -43,7 +43,8 @@ from typing import List, Tuple
 # silent production failure.
 CRITICAL_SYMBOLS: List[Tuple[str, List[str]]] = [
     ("hermes_trader.agents.dsl_exit",
-     ["resolve_close_fill", "rehydrate_from_exchange"]),
+     ["resolve_close_fill", "rehydrate_from_exchange",
+      "configure_dynamic_exit_policy", "build_regime_exit_policies"]),
     ("hermes_trader.agents.memory",
      ["AgentMemory", "memory"]),
     ("hermes_trader.client.cache",
@@ -135,7 +136,8 @@ def check_memory_rebuild() -> bool:
         assert hasattr(m, "_rebuild_from_events"), "missing _rebuild_from_events"
         assert hasattr(m, "record_trade"), "missing record_trade"
         assert hasattr(m, "record_close"), "missing record_close"
-        _ok("_rebuild_from_events + record_trade/close present")
+        assert hasattr(m, "slippage_summary"), "missing slippage_summary"
+        _ok("_rebuild_from_events + record_trade/close + slippage_summary present")
         return True
     except Exception as e:
         _fail(f"memory rebuild check: {e}")

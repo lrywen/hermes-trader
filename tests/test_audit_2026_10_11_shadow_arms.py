@@ -26,7 +26,9 @@ from hermes_trader.agents.config_schema import validate_config_updates
 def test_stop_confirm_shadow_registered_default_off():
     blk = CANONICAL_DEFAULTS["dsl_exit"]["stop_confirm_shadow"]
     assert blk["shadow_mode"] is False
-    assert blk["candidate_consecutive_breaches"] == 1
+    # Aligned with production: candidate gate tightened to 3 consecutive breaches
+    # (matches the production value; see parity guard & 953b73cd fix)
+    assert blk["candidate_consecutive_breaches"] == 3
     assert blk["candidate_breach_confirm_sec"] == 1.0
 
 

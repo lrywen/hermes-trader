@@ -305,6 +305,18 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             "enabled": False,
             "band_pct": 1.0,
         },
+        "dynamic_regime": {
+            "mode": "shadow",
+            "hysteresis_ticks": 3,
+        },
+        "momentum_exhaustion": {
+            "mode": "shadow",
+            "atr_period": 14,
+            "atr_contract_ratio": 0.8,
+            "volume_window": 20,
+            "volume_ratio": 0.5,
+            "min_unrealized_pct": 0.0,
+        },
         # Audit 2026-09-06 (E3, P2): time-based scratch exit. Closes a choppy
         # position that has aged past `minutes`, never armed phase-2, printed a
         # small favorable pop (>= min_peak_pct) but has since given back
@@ -1017,6 +1029,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         "reconfirm_streak": 2,
         "slip_window_days": 30.0,
         "slip_min_samples": 3,
+        "slip_validation_min_samples": 30,
         "flush_throttle_s": 0.2,
     },
     # R13-B11: dashboard equity read-side quality-gate knobs (dashboard.py).
