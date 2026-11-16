@@ -263,16 +263,17 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
             # 0.0 / omitted to make inert. Observation only, never moves a stop.
             "candidate_protect_pct_by_regime": {"trend": 1.5, "non_trend": 1.0},
         },
-        # Audit 2026-10-11: tighter floor-breach confirmation counter-factual.
+        # Audit 2026-10-11: record-only floor-breach confirmation counter-factual.
         # Live exit requires consecutive_breaches_required (2) + breach_confirm_sec
         # (4s) + index confirm; in fast moves that dwell overshot the spot cap by
         # up to 1.19pp (9 max_loss trades, shadow 15d). This arm records whether a
-        # tighter candidate gate (1 breach / 1.0s, index still required) would have
-        # exited earlier and by how much. Default OFF (inert); operator arms it by
-        # setting shadow_mode=true in the override file. Live path never changes.
+        # candidate gate (default 3 breaches / 1.0s, index still required) would
+        # have exited earlier and by how much. Default OFF (inert); operator arms
+        # it by setting shadow_mode=true in the override file. Live path never
+        # changes.
         "stop_confirm_shadow": {
             "shadow_mode": False,
-            "candidate_consecutive_breaches": 1,
+            "candidate_consecutive_breaches": 3,
             "candidate_breach_confirm_sec": 1.0,
         },
         # D2 (2026-10-22): record-only counterfactual for a SHORTER non_trend
