@@ -27,6 +27,7 @@ dev = [
 
 [project.scripts]
 hermes-trader = "hermes_trader.__main__:main"
+hermes-solo = "hermes_trader.solo:main"
 
 [tool.hatch.version]
 path = "hermes_trader/__init__.py"

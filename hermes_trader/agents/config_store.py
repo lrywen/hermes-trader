@@ -57,6 +57,8 @@ _BACKUP_PATH = CONFIG_PATH + ".bak"
 _RAW_CACHE: Optional[dict[str, Any]] = None
 _RAW_CACHE_SIG: Optional[tuple] = None
 _RAW_CACHE_LOCK = threading.Lock()
+_LAST_VALIDATION_WARNING_SIG: Optional[tuple] = None
+_VALIDATION_WARNING_LOCK = threading.Lock()
 
 
 def _config_sig() -> Optional[tuple]:
@@ -70,10 +72,12 @@ def _config_sig() -> Optional[tuple]:
 
 def _invalidate_raw_cache() -> None:
     """Drop the cached raw config (call after a local write)."""
-    global _RAW_CACHE, _RAW_CACHE_SIG
+    global _RAW_CACHE, _RAW_CACHE_SIG, _LAST_VALIDATION_WARNING_SIG
     with _RAW_CACHE_LOCK:
         _RAW_CACHE = None
         _RAW_CACHE_SIG = None
+    with _VALIDATION_WARNING_LOCK:
+        _LAST_VALIDATION_WARNING_SIG = None
 
 
 # ── CS-E (2026-09-09): 阈值 era 分段归因 ─────────────────────────────
@@ -782,12 +786,19 @@ def _log_validation_warnings(
     (those round-trip as-is and may be the operator's deliberate custom
     keys).
     """
+    global _LAST_VALIDATION_WARNING_SIG
     errors = validate_config_dict(cfg, strict_keys=strict_keys)
-    if errors:
-        logger.warning(
-            f"[config] {source} loaded config with {len(errors)} schema "
-            f"warning(s): " + "; ".join(errors)
-        )
+    sig = (CONFIG_PATH, _config_sig(), tuple(errors))
+    with _VALIDATION_WARNING_LOCK:
+        if errors and sig != _LAST_VALIDATION_WARNING_SIG:
+            logger.warning(
+                f"[config] {source} loaded config with {len(errors)} schema "
+                f"warning(s): " + "; ".join(errors)
+            )
+        if errors:
+            _LAST_VALIDATION_WARNING_SIG = sig
+        else:
+            _LAST_VALIDATION_WARNING_SIG = None
     return errors
 
 
