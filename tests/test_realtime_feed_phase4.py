@@ -17,6 +17,7 @@ from hermes_trader.realtime_feed import (
     FEED_OK,
     FeedStatusTracker,
     classify_feed_status,
+    closed_bar_sleep_seconds,
     dynamic_scan_interval,
 )
 
@@ -51,6 +52,14 @@ class TestDynamicScanInterval:
     def test_bad_age_input_does_not_raise(self):
         assert dynamic_scan_interval(15, ws_age_s="nonsense", dynamic_on=True) == 20
 
+
+class TestClosedBarAlignment:
+    def test_aligns_just_after_next_five_minute_close(self):
+        assert closed_bar_sleep_seconds("5m", now_s=0.0) == 302
+        assert closed_bar_sleep_seconds("5m", now_s=100.0) == 202
+
+    def test_unknown_interval_keeps_legacy_cadence(self):
+        assert closed_bar_sleep_seconds("2m", now_s=0.0) == 0
 
 # ── P0-3: classify_feed_status ────────────────────────────────────────────────
 

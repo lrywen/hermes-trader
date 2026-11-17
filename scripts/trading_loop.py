@@ -22,6 +22,7 @@ import sys
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
 
 # Load .env.local (CWD-relative, matches skill restart command). Use setdefault
 # (N4-e): docker-compose already injects this same file via `env_file:`, and a
@@ -622,29 +623,40 @@ def _exit_checkpoint(mids, *, tag: str = "intra-cycle") -> int:
     return 0
 
 
-def _effective_scan_interval() -> int:
-    """Effective inter-cycle sleep seconds (P0-1).
+def _effective_scan_interval(config: Optional[dict] = None) -> int:
+    """Effective inter-cycle sleep, optionally aligned to a closed candle.
 
-    Fixed ``scan_interval`` unless HERMES_SCAN_DYNAMIC is enabled, in which
-    case a fresh allMids WS feed yields the fast cadence and a stopped/stale
-    WS (REST fallback) yields the slow cadence. Never raises — on any
-    diagnostic failure the fixed cadence is used.
+    The dynamic WS/REST cadence remains the baseline. In personal/closed-bar
+    mode, a full candle scan is deferred until just after the next interval
+    closes because scanning the still-forming bar cannot create a new trigger.
     """
-    if not _scan_dynamic_on:
-        return scan_interval
+    base = scan_interval
+    if _scan_dynamic_on:
+        try:
+            base = dynamic_scan_interval(
+                scan_interval,
+                ws_age_s=ws_feed_age_seconds(),
+                dynamic_on=_scan_dynamic_on,
+                fresh_s=_scan_dynamic_fresh_s,
+                fast_s=_scan_interval_fast,
+                slow_s=_scan_interval_slow,
+            )
+        except Exception as _dyn_e:
+            logger.warning(f"[phase4] dynamic interval failed (using fixed): {_dyn_e}")
+    if not _scan_bar_aligned:
+        return base
     try:
-        return dynamic_scan_interval(
-            scan_interval,
-            ws_age_s=ws_feed_age_seconds(),
-            dynamic_on=_scan_dynamic_on,
-            fresh_s=_scan_dynamic_fresh_s,
-            fast_s=_scan_interval_fast,
-            slow_s=_scan_interval_slow,
-        )
-    except Exception as _dyn_e:
-        logger.warning(f"[phase4] dynamic interval failed (using fixed): {_dyn_e}")
-        return scan_interval
+        from hermes_trader.agents.config_store import read_agent_config
+        from hermes_trader.realtime_feed import closed_bar_sleep_seconds
 
+        cfg = config if config is not None else read_agent_config()
+        if not bool((cfg.get("scan") or {}).get("evaluateClosedBarsOnly", True)):
+            return base
+        interval = str((cfg.get("scan") or {}).get("candleInterval", "5m"))
+        return max(base, closed_bar_sleep_seconds(interval))
+    except Exception as _bar_e:
+        logger.warning(f"[scan] closed-bar alignment failed (using dynamic): {_bar_e}")
+        return base
 
 def _cycle_sleep(seconds: int) -> None:
     """Sleep between cycles, interruptible by a WS userFill (P0-2).
@@ -958,6 +970,7 @@ except Exception as _uf_err:
 # (50s) is keyed by candle timestamp so repeated reads within a TTL still see
 # the same closed candle; intra-candle price is fetched live via midpoint.
 scan_interval = _rt["scan_interval"]
+_scan_bar_aligned = _rt["scan_bar_aligned"]
 min_score = config['scan']['minCompositeScore']
 
 # ── Phase 4 realtime optimisations (all default OFF → Phase-1 behaviour) ──────
@@ -2231,7 +2244,7 @@ while True:
         # only things that ever change trading behaviour.
         _maybe_emit_ws_status()
 
-        _sleep_s = _effective_scan_interval()
+        _sleep_s = _effective_scan_interval(_cfg)
         if str(_cfg.get("mode", "OFF")).upper() == "OFF":
             logger.info("[mode] OFF — skipping scan/research/execution; exits still monitored")
             _last_progress_ts = time.time()
@@ -3276,6 +3289,6 @@ while True:
     except Exception as e:
         logger.error(f"Trading loop error: {e}")
         log_event({"event": "error", "error": str(e)})
-        _retry_s = _effective_scan_interval()
+        _retry_s = _effective_scan_interval(locals().get("_cfg"))
         logger.info(f"Sleeping {_retry_s}s before retry...")
         _cycle_sleep(_retry_s)

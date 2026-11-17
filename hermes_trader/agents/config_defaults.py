@@ -2038,6 +2038,7 @@ CANONICAL_DEFAULTS: dict[str, Any] = {
         # the literal default — deleting it would silently hand the value back
         # to the loop's env/literal channel. Do not remove.
         "scan_interval": 15,
+        "scan_bar_aligned": False,
         "scan_dynamic": False,
         "scan_fresh_s": 10.0,
         "scan_interval_fast": 8,

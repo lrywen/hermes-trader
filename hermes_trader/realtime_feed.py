@@ -57,6 +57,33 @@ def dynamic_scan_interval(
     return int(slow_s)
 
 
+def closed_bar_sleep_seconds(
+    interval: str,
+    *,
+    now_s: Optional[float] = None,
+    grace_s: float = 2.0,
+) -> int:
+    """Seconds until the next closed candle plus a publication grace.
+
+    Full candle scans in ``evaluateClosedBarsOnly`` mode otherwise repeat the
+    same closed bar every fixed scan tick. Unknown intervals fail to zero so
+    callers can retain their existing cadence.
+    """
+    seconds_by_interval = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "1h": 3600,
+        "4h": 14_400,
+        "1d": 86_400,
+    }
+    period = seconds_by_interval.get(str(interval).strip().lower())
+    if period is None:
+        return 0
+    now = time.time() if now_s is None else float(now_s)
+    wait = period - (now % period) + max(0.0, float(grace_s))
+    return max(1, int(wait + 0.999))
+
 def classify_feed_status(
     *,
     ws_age_s: Optional[float],
