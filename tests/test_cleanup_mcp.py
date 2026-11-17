@@ -81,17 +81,15 @@ def test_mcp_stub_table_and_tool_coverage():
     # Audit 2026-09-06 (F1): deep_research is dropped from tools/list at
     # startup when its HermesTradingAgents dependency directory is absent, so
     # the advertised count is 101 with the dep present and 100 without.
-    expected_tools = 101 if mod._DEEP_RESEARCH_AVAILABLE else 100
-    assert len({t["name"] for t in mod.TOOLS}) == expected_tools
+    expected_tools = 53 if mod._DEEP_RESEARCH_AVAILABLE else 52
+    names = {t["name"] for t in mod.TOOLS}
+    assert len(names) == expected_tools
+    assert names.isdisjoint(set(mod._STUB_TOOL_NAMES))
     if mod._DEEP_RESEARCH_AVAILABLE:
         assert "deep_research" in {t["name"] for t in mod.TOOLS}
     else:
         assert "deep_research" not in {t["name"] for t in mod.TOOLS}
-    handler = mod._make_stub_handler("get_rewards")
-    res = json.loads(handler({}))
-    assert res["error"] == "not_implemented"
-    assert res["tool"] == "get_rewards"
-    assert "stub" in res["reason"].lower()
+    assert "get_rewards" not in {t["name"] for t in mod.TOOLS}
 
 
 def test_mcp_server_stdio_end_to_end():
@@ -109,8 +107,7 @@ def test_mcp_server_stdio_end_to_end():
     assert resps[0]["result"]["serverInfo"]["name"] == "hermes-trader"
     # Audit 2026-09-06 (F1): deep_research is unadvertised when the
     # HermesTradingAgents dependency directory is absent on this host.
-    expected_tools = 101 if _load_mcp()._DEEP_RESEARCH_AVAILABLE else 100
+    expected_tools = 53 if _load_mcp()._DEEP_RESEARCH_AVAILABLE else 52
     assert len(resps[1]["result"]["tools"]) == expected_tools
-    call = json.loads(resps[2]["result"]["content"][0]["text"])
-    assert call["error"] == "not_implemented"
-    assert call["tool"] == "get_rewards"
+    call = resps[2]["result"]["content"][0]["text"]
+    assert "Unknown tool" in call

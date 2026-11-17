@@ -948,6 +948,11 @@ TOOLS = [
 ]
 
 
+_STUB_TOOL_SET = frozenset(_STUB_TOOL_NAMES)
+TOOLS = [
+    tool for tool in TOOLS if tool.get("name") not in _STUB_TOOL_SET
+]
+
 def _hermes_trading_agents_path() -> str:
     """Resolve the sibling HermesTradingAgents checkout (single source of truth).
 
@@ -1415,8 +1420,6 @@ def run() -> None:
         "query_order_by_cloid": handle_query_order_by_cloid,
     }
 
-    for _name in _STUB_TOOL_NAMES:
-        tool_handlers[_name] = _make_stub_handler(_name)
 
     # MCP handshake
     while True:
