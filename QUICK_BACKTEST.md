@@ -36,4 +36,20 @@ config, or the repository-local snapshot.
 
 - Data must load successfully.
 - A result with no trades is not a pass; it is an insufficient sample.
-- Treat the result as one fast screen, not proof of durable statistical edge.
+- Treat the result as one fast screen, not proof of durable statistical edge.- A background job must end as `completed` with `exit_code=0`; `failed`, `lost`, or a live PID after an unreasonable runtime requires log inspection.
+
+## Background Jobs
+
+For a non-blocking run:
+
+```bash
+hermes-solo backtest --days 7 --coins-count 10 --interval 1h --background
+# job=bt-...
+hermes-solo backtest --result bt-...
+hermes-solo backtest --result bt-... --json
+```
+
+The background command returns immediately. Status, worker PID, exit code, log
+path and result are stored under the system temporary directory by default
+(`/tmp/hermes-solo-jobs` on the server). Set `HERMES_SOLO_JOB_DIR` to use a
+separate scratch directory. Quick backtests never write to `/data` runtime state.

@@ -10,10 +10,14 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
+import tempfile
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +34,7 @@ _SAFE_KEYS = {
     "dsl_exit.retrace_threshold",
     "scan.minCompositeScore",
 }
+_JOB_ID_RE = re.compile(r"^bt-\d{8}T\d{6}Z-[0-9a-f]{10}$")
 
 
 def _install_config_path() -> None:
@@ -92,6 +97,236 @@ def _coerce(raw: str) -> Any:
     except ValueError:
         return raw
 
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def _job_root() -> Path:
+    configured = os.environ.get("HERMES_SOLO_JOB_DIR", "").strip()
+    return Path(configured).expanduser() if configured else Path(tempfile.gettempdir()) / "hermes-solo-jobs"
+
+
+def _validate_job_id(job_id: str) -> str:
+    if not _JOB_ID_RE.fullmatch(job_id):
+        raise SystemExit(f"invalid backtest job id {job_id!r}")
+    return job_id
+
+
+def _job_paths(job_id: str) -> tuple[Path, Path, Path]:
+    _validate_job_id(job_id)
+    root = _job_root() / job_id
+    return root / "job.json", root / "backtest.log", root
+
+
+def _write_job_meta(job_id: str, payload: dict[str, Any]) -> None:
+    meta_path, _, job_dir = _job_paths(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    tmp_path = meta_path.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(tmp_path, meta_path)
+
+
+def _read_job_meta(job_id: str) -> dict[str, Any]:
+    meta_path, _, _ = _job_paths(job_id)
+    if not meta_path.is_file():
+        raise SystemExit(f"backtest job not found: {job_id}")
+    try:
+        payload = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"backtest job metadata is unreadable: {job_id}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise SystemExit(f"backtest job metadata is invalid: {job_id}")
+    return payload
+
+
+def _update_job_meta(job_id: str, **changes: Any) -> dict[str, Any]:
+    payload = _read_job_meta(job_id)
+    payload.update(changes)
+    _write_job_meta(job_id, payload)
+    return payload
+
+
+def _pid_is_running(pid: Any) -> bool:
+    try:
+        pid_int = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid_int <= 0:
+        return False
+    try:
+        os.kill(pid_int, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _backtest_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        sys.executable,
+        str(_REPO_ROOT / "scripts" / "backtest_quick.py"),
+        "--days",
+        str(args.days),
+        "--coins-count",
+        str(args.coins_count),
+        "--interval",
+        args.interval,
+    ]
+    if args.coins:
+        command.extend(["--coins", args.coins])
+    return command
+
+
+def _backtest_env(config_path: str) -> dict[str, str]:
+    env = dict(os.environ)
+    env["HERMES_AGENT_CONFIG_FILE"] = config_path
+    env["HERMES_BACKTEST"] = "1"
+    return env
+
+
+def _active_result_state(payload: dict[str, Any]) -> dict[str, Any]:
+    if payload.get("status") in {"queued", "running"} and not _pid_is_running(payload.get("pid")):
+        payload = dict(payload)
+        payload["status"] = "lost"
+        payload["message"] = "worker exited before recording a terminal state"
+    return payload
+
+
+def _print_backtest_result(job_id: str, *, as_json: bool) -> int:
+    meta_path, log_path, _ = _job_paths(job_id)
+    payload = _active_result_state(_read_job_meta(job_id))
+    log_text = ""
+    if log_path.is_file():
+        try:
+            log_text = log_path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            log_text = f"<unable to read log: {exc}>"
+    view = {
+        "job_id": job_id,
+        "status": payload.get("status", "unknown"),
+        "pid": payload.get("pid"),
+        "exit_code": payload.get("exit_code"),
+        "created_at": payload.get("created_at"),
+        "started_at": payload.get("started_at"),
+        "finished_at": payload.get("finished_at"),
+        "parameters": payload.get("parameters", {}),
+        "meta_path": str(meta_path),
+        "log_path": str(log_path),
+        "result": log_text,
+    }
+    if payload.get("message"):
+        view["message"] = payload["message"]
+    if as_json:
+        print(json.dumps(view, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"job={job_id} status={view['status']} pid={view['pid']} "
+            f"exit_code={view['exit_code']} log={log_path}"
+        )
+        if view.get("message"):
+            print(f"message={view['message']}")
+        if log_text:
+            print(log_text, end="" if log_text.endswith("\n") else "\n")
+    return 0 if payload.get("status") == "completed" else 2
+
+
+def _run_background_worker(job_id: str, args: argparse.Namespace, config_path: str) -> int:
+    _, log_path, job_dir = _job_paths(job_id)
+    job_dir.mkdir(parents=True, exist_ok=True)
+    _update_job_meta(job_id, status="running", pid=os.getpid(), started_at=_utc_now())
+    command = _backtest_command(args)
+    env = _backtest_env(config_path)
+    try:
+        with log_path.open("wb") as output:
+            completed = subprocess.run(
+                command,
+                cwd=_REPO_ROOT,
+                env=env,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        exit_code = int(completed.returncode)
+    except Exception as exc:
+        with log_path.open("a", encoding="utf-8") as output:
+            output.write(f"worker error: {type(exc).__name__}: {exc}\n")
+        exit_code = 127
+    _update_job_meta(
+        job_id,
+        status="completed" if exit_code == 0 else "failed",
+        exit_code=exit_code,
+        finished_at=_utc_now(),
+    )
+    return exit_code
+
+
+def _start_background_backtest(args: argparse.Namespace, config_path: str) -> int:
+    now = datetime.now(timezone.utc)
+    job_id = f"bt-{now:%Y%m%dT%H%M%SZ}-{uuid.uuid4().hex[:10]}"
+    parameters = {
+        "days": args.days,
+        "coins": args.coins,
+        "coins_count": args.coins_count,
+        "interval": args.interval,
+    }
+    _write_job_meta(
+        job_id,
+        {
+            "version": 1,
+            "job_id": job_id,
+            "status": "queued",
+            "pid": 0,
+            "exit_code": None,
+            "created_at": now.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+            "parameters": parameters,
+        },
+    )
+    worker_args = [
+        sys.executable,
+        "-m",
+        "hermes_trader.solo",
+        "backtest",
+        "--days",
+        str(args.days),
+        "--coins-count",
+        str(args.coins_count),
+        "--interval",
+        args.interval,
+        "--job-id",
+        job_id,
+    ]
+    if args.coins:
+        worker_args.extend(["--coins", args.coins])
+    try:
+        worker = subprocess.Popen(
+            worker_args,
+            cwd=_REPO_ROOT,
+            env=_backtest_env(config_path),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as exc:
+        _update_job_meta(
+            job_id,
+            status="failed",
+            exit_code=127,
+            finished_at=_utc_now(),
+            message=f"failed to start worker: {type(exc).__name__}: {exc}",
+        )
+        raise SystemExit(f"failed to start backtest worker: {exc}") from exc
+    print(f"job={job_id}")
+    print("status=queued")
+    print(f"result=hermes-solo backtest --result {job_id}")
+    print(f"log={_job_paths(job_id)[1]}")
+    return 0
 
 def _human_status(payload: dict[str, Any]) -> str:
     summary = payload.get("summary") or {}
@@ -182,22 +417,18 @@ def cmd_backtest(args: argparse.Namespace) -> int:
     config_path = os.environ.get("HERMES_AGENT_CONFIG_FILE")
     if not config_path:
         raise SystemExit("no runtime config found")
-    command = [
-        sys.executable,
-        str(_REPO_ROOT / "scripts" / "backtest_quick.py"),
-        "--days",
-        str(args.days),
-        "--coins-count",
-        str(args.coins_count),
-        "--interval",
-        args.interval,
-    ]
-    if args.coins:
-        command.extend(["--coins", args.coins])
-    env = dict(os.environ)
-    env["HERMES_AGENT_CONFIG_FILE"] = config_path
-    env["HERMES_BACKTEST"] = "1"
-    return subprocess.run(command, cwd=_REPO_ROOT, env=env, check=False).returncode
+    if args.result:
+        return _print_backtest_result(args.result, as_json=args.json)
+    if args.job_id:
+        return _run_background_worker(args.job_id, args, config_path)
+    if args.background:
+        return _start_background_backtest(args, config_path)
+    return subprocess.run(
+        _backtest_command(args),
+        cwd=_REPO_ROOT,
+        env=_backtest_env(config_path),
+        check=False,
+    ).returncode
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
@@ -241,6 +472,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--coins", default="", help="comma-separated symbols")
     p.add_argument("--coins-count", type=int, default=10, choices=range(1, 11))
     p.add_argument("--interval", choices=("15m", "1h", "4h"), default="1h")
+    p.add_argument("--background", action="store_true", help="start a detached quick-backtest job")
+    p.add_argument("--result", metavar="JOB_ID", help="read the latest state and output of a background job")
+    p.add_argument("--json", action="store_true", help="print --result output as JSON")
+    p.add_argument("--job-id", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_backtest)
 
     p = sub.add_parser("preflight", help="validate the small-live safety envelope")
