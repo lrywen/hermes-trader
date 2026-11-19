@@ -45,7 +45,9 @@ def test_background_job_is_created_and_returns_job_id(tmp_path, monkeypatch, cap
         "interval": "1h",
     }
     command, kwargs = calls[0]
-    assert command[-2:] == ["--job-id", job_id]
+    assert "--job-id" in command
+    assert command[command.index("--job-id") + 1] == job_id
+    assert command[-2:] == ["--coins", "BTC,ETH"]
     assert kwargs["env"]["HERMES_AGENT_CONFIG_FILE"] == "/tmp/runtime.json"
     assert kwargs["env"]["HERMES_BACKTEST"] == "1"
     assert kwargs["start_new_session"] is True
