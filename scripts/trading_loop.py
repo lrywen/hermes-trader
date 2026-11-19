@@ -67,7 +67,24 @@ except Exception as _e:  # 绝不能因 secret 加载问题阻断启动
 _parser = argparse.ArgumentParser(add_help=False)
 _parser.add_argument("--env", default="prod")
 _parser.add_argument("--daemon", action="store_true")
+_parser.add_argument("--profile", choices=("shadow", "off", "full"), default=None)
 _args, _unknown = _parser.parse_known_args()
+
+# Runtime profiles are applied before importing executable trading modules.
+# `shadow` and `off` revoke process-level LIVE authorization; `full` preserves
+# the legacy launch path. The config guard below is fail-closed and runs before
+# any network I/O.
+from hermes_trader.runtime_profile import (
+    apply_profile_environment,
+    profile_config_errors,
+    resolve_profile,
+)
+
+try:
+    _runtime_profile = resolve_profile(_args.profile)
+except ValueError as _profile_err:
+    sys.exit(f"[runtime profile] {_profile_err}")
+apply_profile_environment(_runtime_profile)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -734,7 +751,18 @@ logger.info("=== HERMES TRADER - Starting Continuous Trading Loop ===")
 config = get_config()
 startup_agent_config = read_agent_config()
 startup_mode = str(startup_agent_config.get("mode", "OFF")).upper()
-logger.info(f"Mode: {startup_mode}  env={_args.env}  daemon={_args.daemon}")
+logger.info(
+    f"Mode: {startup_mode}  profile={_runtime_profile}  "
+    f"env={_args.env}  daemon={_args.daemon}"
+)
+
+_profile_errors = profile_config_errors(_runtime_profile, startup_agent_config)
+if _profile_errors:
+    for _profile_error in _profile_errors:
+        logger.critical("[runtime profile] %s", _profile_error)
+    sys.exit(78)  # EX_CONFIG - never weaken an explicit profile
+logger.info("[runtime profile] %s guard passed (0 errors)", _runtime_profile)
+
 # P1-14 (audit 2026-09-04): refuse to TRADE when a risk-critical key is
 # outside the conservative startup safety envelope — a hand-edited config or
 # a loosened default must not silently run with ballooned exposure. This is

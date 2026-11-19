@@ -22,6 +22,10 @@ hermes-solo preflight
 
 All checks must report `true`.
 
+The SHADOW loop must be launched with `--profile shadow` (or
+`HERMES_PROFILE=shadow`). This is a startup guard, not a substitute for the
+small-LIVE preflight; change the profile only in a deliberate release step.
+
 ## Observation
 
 - Verify one entry and one exit end-to-end.

@@ -5,8 +5,21 @@
 - Market venue: Hyperliquid perpetuals.
 - Direction: LONG-only.
 - Runtime mode: SHADOW.
+- Explicit launch profile: `shadow` (legacy callers keep the `full` default).
 - HIP-3: disabled unless explicitly enabled.
 - No real order may be produced by a SHADOW run.
+
+## Startup Guard
+
+Use the explicit profile for the single-operator loop:
+
+```bash
+python scripts/trading_loop.py --env prod --profile shadow
+```
+
+The loop refuses to start if the effective config is not SHADOW, LONG-only,
+HIP-3-disabled, short-disabled or short-shadow-disabled. The `shadow` profile
+also forces `HERMES_ENABLE_LIVE=0` in the trading-loop process.
 
 ## Decision Pipeline
 

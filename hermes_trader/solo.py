@@ -99,7 +99,8 @@ def _human_status(payload: dict[str, Any]) -> str:
     shadow = payload.get("shadow") or {}
     mode = risk.get("mode") or summary.get("mode") or "?"
     return (
-        f"mode={mode} equity=${float(summary.get('equity') or 0):.2f} "
+        f"profile={payload.get('profile', 'full')} mode={mode} "
+        f"equity=${float(summary.get('equity') or 0):.2f} "
         f"daily_pnl=${float(summary.get('daily_pnl') or 0):.2f} "
         f"positions={summary.get('open_positions', 0)} "
         f"feed={risk.get('feed_status', '?')} "
@@ -111,6 +112,7 @@ def _human_status(payload: dict[str, Any]) -> str:
 def cmd_status(args: argparse.Namespace) -> int:
     read_agent_config, _, _ = _load_runtime()
     payload: dict[str, Any] = {
+        "profile": os.environ.get("HERMES_PROFILE", "full"),
         "summary": _api_json("/api/dashboard/summary") or {},
         "risk": _api_json("/api/dashboard/risk-status") or {},
         "shadow": _api_json("/api/dashboard/shadow/account") or {},
